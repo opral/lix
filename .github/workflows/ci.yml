@@ -29,9 +29,17 @@ jobs:
       - name: Validate change fragments
         run: node scripts/validate-changes.mjs
 
-  cargo-test:
-    name: Cargo Test
+  cargo:
+    name: Cargo ${{ matrix.name }}
     runs-on: blacksmith-32vcpu-ubuntu-2404
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Clippy
+            task: clippy
+          - name: Test
+            task: test
 
     steps:
       - name: Checkout repository
@@ -78,12 +86,15 @@ jobs:
           EOF
 
       - name: Lint Rust workspace
+        if: matrix.task == 'clippy'
         run: cargo clippy --profile test --workspace --all-targets --all-features -- -D warnings
 
       - name: Compile Rust workspace tests
+        if: matrix.task == 'test'
         run: cargo test --profile test --workspace --all-features --no-run
 
       - name: Run Rust workspace tests
+        if: matrix.task == 'test'
         run: cargo test --profile test --workspace --all-features
 
   js-sdk-test:
