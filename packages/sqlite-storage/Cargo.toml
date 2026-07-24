@@ -12,9 +12,14 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [lints]
 workspace = true
+
+[[test]]
+name = "storage"
+path = "tests/storage/main.rs"
 
 [dependencies]
 lix_engine = { workspace = true }
@@ -22,3 +27,7 @@ lix_engine = { workspace = true }
 bytes = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }

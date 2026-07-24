@@ -12,9 +12,14 @@ readme.workspace = true
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
+autotests = false
 
 [lints]
 workspace = true
+
+[[test]]
+name = "storage"
+path = "tests/storage/main.rs"
 
 [dependencies]
 lix_engine = { workspace = true }
@@ -25,4 +30,4 @@ tempfile = "3"
 tokio = { version = "1", features = ["sync"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "macros"] }

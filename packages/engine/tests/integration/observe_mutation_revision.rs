@@ -1,7 +1,6 @@
 use std::time::Duration;
 
 use lix_engine::{Engine, Memory, ObserveEvent, ObserveEvents, Storage, Value};
-use lix_sqlite_storage::SQLite;
 use serde_json::json;
 
 const NEXT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -248,45 +247,4 @@ async fn observe_external_writes_can_coalesce_to_latest_snapshot() {
     let update = next_event(&mut events, "coalesced external writes").await;
     assert_eq!(update.sequence, 1);
     assert_key_value_row(&update, "mutation-revision-coalesce", "v1");
-}
-
-#[tokio::test]
-async fn observe_emits_when_independently_opened_sqlite_commits() {
-    let tempdir = tempfile::tempdir().expect("tempdir should be created");
-    let path = tempdir.path().join("repo.sqlite");
-    Engine::initialize(SQLite::open(&path).expect("init storage should open"))
-        .await
-        .expect("storage should initialize");
-    let observer_engine =
-        Engine::new(SQLite::open(&path).expect("observer sqlite storage should open"))
-            .await
-            .expect("observer engine should open");
-    let writer_engine =
-        Engine::new(SQLite::open(&path).expect("writer sqlite storage should open"))
-            .await
-            .expect("writer engine should open");
-    let observer_session = observer_engine
-        .open_workspace_session()
-        .await
-        .expect("observer session should open");
-    let writer_session = writer_engine
-        .open_workspace_session()
-        .await
-        .expect("writer session should open");
-    let mut events = observe_key(&observer_session, "mutation-revision-sqlite");
-
-    let initial = next_event(&mut events, "initial empty sqlite snapshot").await;
-    assert!(initial.rows.is_empty());
-
-    writer_session
-        .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('mutation-revision-sqlite', 'v0')",
-            &[],
-        )
-        .await
-        .expect("external sqlite insert should commit");
-
-    let update = next_event(&mut events, "external sqlite storage commit").await;
-    assert_eq!(update.sequence, 1);
-    assert_key_value_row(&update, "mutation-revision-sqlite", "v0");
 }

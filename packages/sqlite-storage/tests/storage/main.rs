@@ -1,3 +1,5 @@
+mod observe_mutation_revision;
+
 use lix_engine::run_storage_conformance;
 use lix_sqlite_storage::SQLiteFactory;
 

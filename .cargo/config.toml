@@ -39,9 +39,10 @@ inherits = "dev"
 debug = true
 
 [profile.test]
-inherits = "release"
+inherits = "dev"
 debug = false
 debug-assertions = true
+opt-level = 1
 
 [profile.test.build-override]
 inherits = "dev"
