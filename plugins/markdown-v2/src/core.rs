@@ -1447,8 +1447,8 @@ pub struct ByteEdit {
 
 #[derive(Clone, Debug)]
 pub struct Document {
-    state: Arc<Vec<EntityState>>,
     bytes: Arc<Vec<u8>>,
+    root: Arc<NodeTree>,
     top_level_ranges: Arc<Vec<Range<usize>>>,
 }
 
@@ -1682,6 +1682,29 @@ fn simple_top_level_ranges(root: &NodeTree, bytes: &[u8]) -> Vec<Range<usize>> {
     ranges
 }
 
+fn projection_after_detected_changes(
+    root: &NodeTree,
+    changes: &[DetectedChange],
+) -> Result<Projection, PluginError> {
+    let mut nodes_by_id = flatten_tree(root);
+    for change in changes {
+        let id = change.entity_pk.first().ok_or_else(|| {
+            PluginError::InvalidInput("Markdown entity_pk must contain one id".into())
+        })?;
+        if let Some(snapshot_content) = &change.snapshot_content {
+            let node: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
+                PluginError::InvalidInput(format!(
+                    "invalid Markdown node snapshot for '{id}': {error}"
+                ))
+            })?;
+            nodes_by_id.insert(id.clone(), node);
+        } else {
+            nodes_by_id.remove(id);
+        }
+    }
+    Ok(Projection { nodes_by_id })
+}
+
 impl Document {
     pub fn open_file(
         bytes: Vec<u8>,
@@ -1697,14 +1720,15 @@ impl Document {
         let top_level_ranges = parsed.top_level_ranges.clone();
         let detected = detect_changes_for_markdown(&Projection::default(), parsed, namespace)?;
         let state = apply_detected_changes(&[], &detected);
+        let root = Projection::from_entity_state(state.iter().cloned())?.to_tree()?;
         let changes = detected
             .into_iter()
             .map(detected_to_entity_change)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
-                state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                root: Arc::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             changes,
@@ -1744,8 +1768,8 @@ impl Document {
         };
         Ok((
             Self {
-                state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                root: Arc::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
@@ -1762,7 +1786,7 @@ impl Document {
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let bytes = apply_input_splices(&self.bytes, splices)?;
-        let (detected, top_level_ranges) = if let Some(incremental) =
+        let (detected, top_level_ranges, root) = if let Some(incremental) =
             self.try_paragraph_replacement(splices, &bytes, namespace)?
         {
             incremental
@@ -1771,24 +1795,24 @@ impl Document {
                 filename: None,
                 data: bytes.clone(),
             };
-            let before = Projection::from_entity_state(self.state.iter().cloned())?;
+            let before = Projection {
+                nodes_by_id: flatten_tree(&self.root),
+            };
             let mut parsed = parse_file(&file)?;
             retain_noncanonical_source(&mut parsed, &file.data)?;
             let top_level_ranges = parsed.top_level_ranges.clone();
-            (
-                detect_changes_for_markdown(&before, parsed, namespace)?,
-                top_level_ranges,
-            )
+            let detected = detect_changes_for_markdown(&before, parsed, namespace)?;
+            let root = projection_after_detected_changes(&self.root, &detected)?.to_tree()?;
+            (detected, top_level_ranges, root)
         };
-        let state = apply_detected_changes(&self.state, &detected);
         let changes = detected
             .into_iter()
             .map(detected_to_entity_change)
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
-                state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                root: Arc::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             changes,
@@ -1803,28 +1827,27 @@ impl Document {
             .into_iter()
             .map(entity_change_to_detected)
             .collect::<Result<Vec<_>, _>>()?;
-        let state = apply_detected_changes(&self.state, &detected);
-        if let Some((bytes, top_level_ranges, edits)) =
+        if let Some((bytes, top_level_ranges, edits, root)) =
             self.try_paragraph_entity_change(&detected)?
         {
             return Ok((
                 Self {
-                    state: Arc::new(state),
                     bytes: Arc::new(bytes),
+                    root: Arc::new(root),
                     top_level_ranges: Arc::new(top_level_ranges),
                 },
                 edits,
             ));
         }
-        let projection = Projection::from_entity_state(state.iter().cloned())?;
+        let projection = projection_after_detected_changes(&self.root, &detected)?;
         let root = projection.to_tree()?;
         let bytes = render_tree_with_lexical_fallback(&root)?;
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
         let edits = minimal_byte_edit(&self.bytes, bytes.clone());
         Ok((
             Self {
-                state: Arc::new(state),
                 bytes: Arc::new(bytes),
+                root: Arc::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
@@ -1834,15 +1857,14 @@ impl Document {
     fn try_paragraph_entity_change(
         &self,
         changes: &[DetectedChange],
-    ) -> Result<Option<(Vec<u8>, Vec<Range<usize>>, Vec<ByteEdit>)>, PluginError> {
+    ) -> Result<Option<(Vec<u8>, Vec<Range<usize>>, Vec<ByteEdit>, NodeTree)>, PluginError> {
         let [change] = changes else {
             return Ok(None);
         };
         let Some(snapshot_content) = &change.snapshot_content else {
             return Ok(None);
         };
-        let projection = Projection::from_entity_state(self.state.iter().cloned())?;
-        let root = projection.to_tree()?;
+        let root = self.root.as_ref();
         if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
             return Ok(None);
         }
@@ -1879,7 +1901,7 @@ impl Document {
         let fragment = render_tree(&NodeTree {
             node: fragment_root,
             children: vec![NodeTree {
-                node: new,
+                node: new.clone(),
                 children: Vec::new(),
             }],
         })?;
@@ -1908,7 +1930,9 @@ impl Document {
             delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
             insert: Arc::new(fragment),
         }];
-        Ok(Some((bytes, top_level_ranges, edits)))
+        let mut successor_root = root.clone();
+        successor_root.children[block_index].node = new;
+        Ok(Some((bytes, top_level_ranges, edits, successor_root)))
     }
 
     fn try_paragraph_replacement(
@@ -1916,7 +1940,7 @@ impl Document {
         splices: &[InputSplice<'_>],
         bytes: &[u8],
         namespace: IdNamespace,
-    ) -> Result<Option<(Vec<DetectedChange>, Vec<Range<usize>>)>, PluginError> {
+    ) -> Result<Option<(Vec<DetectedChange>, Vec<Range<usize>>, NodeTree)>, PluginError> {
         let [splice] = splices else {
             return Ok(None);
         };
@@ -1944,8 +1968,7 @@ impl Document {
             return Ok(None);
         };
 
-        let before = Projection::from_entity_state(self.state.iter().cloned())?;
-        let before_root = before.to_tree()?;
+        let before_root = self.root.as_ref();
         if before_root
             .node
             .format
@@ -2001,7 +2024,13 @@ impl Document {
                 metadata: change_metadata(Some(&old.node), &new.node),
             }]
         };
-        Ok(Some((detected, self.top_level_ranges.as_ref().clone())))
+        let mut successor_root = before_root.clone();
+        successor_root.children[block_index] = new;
+        Ok(Some((
+            detected,
+            self.top_level_ranges.as_ref().clone(),
+            successor_root,
+        )))
     }
 
     #[cfg(test)]
