@@ -115,9 +115,19 @@ current branch head with that branch's newest checkpoint. Creating a checkpoint
 makes the current head the new baseline, so `lix_working_change` is empty until
 another tracked change is committed.
 
-Checkpoint depth is newest-first within each branch: `lixcol_depth = 0` is the
-latest checkpoint, `1` is the previous checkpoint, and larger values walk
-further back. SQL row order is not implicit, so request it explicitly:
+`lix_working_change` reports canonical source changes, like `lix_change`, rather
+than composed filesystem revisions. Group rows by `file_id` to identify files
+whose own descriptor, blob, or plugin state changed. An ancestor-directory
+rename is reported as that directory's source change; it is not expanded into
+one working-change row for every descendant whose composed path changed.
+`lix_file_history` and `lix_directory_history` remain the surfaces for those
+composed historical revisions.
+
+Checkpoint depth is commit distance from the current branch head. A checkpoint
+has `lixcol_depth = 0` only while it is the head; three later auto-commits put
+that checkpoint at depth `3`. Ordering by ascending depth is therefore
+newest-first, but depths are not checkpoint ordinals and may have gaps. SQL row
+order is not implicit, so request it explicitly:
 
 ```sql
 SELECT commit_id, created_at, lixcol_depth

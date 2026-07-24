@@ -51,6 +51,20 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
+                "SELECT commit_id, lixcol_depth \
+                 FROM lix_checkpoint \
+                 WHERE lixcol_depth = 2",
+            )
+            .await,
+            vec![vec![
+                Value::Text(initial_commit_id.clone()),
+                Value::Integer(2),
+            ]],
+            "checkpoint depth is commit distance from the active head"
+        );
+        assert_eq!(
+            select_rows(
+                &session,
                 "SELECT entity_pk, schema_key, change_kind \
                  FROM lix_working_change ORDER BY schema_key, entity_pk",
             )
@@ -60,6 +74,31 @@ simulation_test!(
                 Value::Text("lix_key_value".to_string()),
                 Value::Text("added".to_string()),
             ]]
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT entity_pk, schema_key, change_kind \
+                 FROM lix_working_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"checkpoint-key\"]')",
+            )
+            .await,
+            vec![vec![
+                Value::Json(json!(["checkpoint-key"])),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("added".to_string()),
+            ]]
+        );
+        assert!(
+            select_rows(
+                &session,
+                "SELECT entity_pk \
+                 FROM lix_working_change \
+                 WHERE schema_key = 'other_schema'",
+            )
+            .await
+            .is_empty()
         );
 
         let receipt = session

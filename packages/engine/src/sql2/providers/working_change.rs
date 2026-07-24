@@ -5,20 +5,24 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::TableType;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use tokio::sync::Mutex;
 
-use crate::LixError;
 use crate::branch::BranchRefReader;
 use crate::checkpoint::{CHECKPOINT_MARKER_SCHEMA_KEY, latest_checkpoint_for_branch};
 use crate::commit_graph::CommitGraphReader;
+use crate::entity_pk::EntityPk;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
-use crate::tracked_state::{TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
+};
+use crate::{LixError, NullableKeyFilter};
 
-use super::checkpoint::selected_heads;
+use super::checkpoint::{filter_conjuncts, selected_heads};
 use super::columns::{Col, ColumnTable, ColumnTableError};
+use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 use crate::sql2::error::lix_error_to_datafusion_error;
 
@@ -76,14 +80,28 @@ where
         TableType::View
     }
 
+    fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
+        if filter.column_refs().iter().any(|column| {
+            matches!(
+                column.name.as_str(),
+                "entity_pk" | "schema_key" | "file_id" | "lixcol_branch_id"
+            )
+        }) {
+            TableProviderFilterPushDown::Inexact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
+    }
+
     async fn plan_scan(
         &self,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
+        filters: &[Expr],
         limit: Option<usize>,
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let schema = projected_schema(&self.schema(), projection);
+        let route = WorkingChangeRoute::from_filters(filters)?;
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -94,15 +112,28 @@ where
                     Arc::clone(&self.commit_graph),
                     self.store.clone(),
                     schema,
+                    route,
                 ),
-                move |(active_branch_id, branch_ref, commit_graph, store, schema)| async move {
-                    let heads = selected_heads(branch_ref.as_ref(), active_branch_id.as_deref())
-                        .await
-                        .map_err(lix_error_to_datafusion_error)?;
+                move |(active_branch_id, branch_ref, commit_graph, store, schema, route)| async move {
+                    if route.contradictory {
+                        return WORKING_CHANGE_COLS
+                            .build(schema, &[])
+                            .map_err(working_change_batch_error);
+                    }
+                    let heads = selected_heads(
+                        branch_ref.as_ref(),
+                        active_branch_id.as_deref(),
+                        &route.branch_ids,
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?;
                     let mut graph = commit_graph.lock().await;
                     let mut tracked = TrackedStateContext::new().reader(store);
                     let mut rows = Vec::new();
                     for head in heads {
+                        if limit.is_some_and(|limit| rows.len() >= limit) {
+                            break;
+                        }
                         let checkpoint_commit_id = latest_checkpoint_for_branch(
                             graph.as_mut(),
                             &mut tracked,
@@ -121,15 +152,15 @@ where
                             .diff_commits(
                                 &checkpoint_commit_id.to_string(),
                                 &head.commit_id.to_string(),
-                                &TrackedStateDiffRequest::default(),
+                                &route.diff_request,
                             )
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                        rows.extend(diff.entries.into_iter().filter_map(|entry| {
+                        for entry in diff.entries {
                             if entry.identity.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY {
-                                return None;
+                                continue;
                             }
-                            Some(WorkingChangeSqlRow {
+                            rows.push(WorkingChangeSqlRow {
                                 entity_pk: entry.identity.entity_pk.as_json_array_text(),
                                 schema_key: entry.identity.schema_key,
                                 file_id: entry.identity.file_id,
@@ -141,11 +172,11 @@ where
                                 before_change_id: entry.before.map(|row| row.change_id.to_string()),
                                 after_change_id: entry.after.map(|row| row.change_id.to_string()),
                                 branch_id: head.branch_id.clone(),
-                            })
-                        }));
-                    }
-                    if let Some(limit) = limit {
-                        rows.truncate(limit);
+                            });
+                            if limit.is_some_and(|limit| rows.len() >= limit) {
+                                break;
+                            }
+                        }
                     }
                     WORKING_CHANGE_COLS
                         .build(schema, &rows)
@@ -153,6 +184,68 @@ where
                 },
             ),
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct WorkingChangeRoute {
+    branch_ids: FileIdConstraint,
+    diff_request: TrackedStateDiffRequest,
+    contradictory: bool,
+}
+
+impl WorkingChangeRoute {
+    fn from_filters(filters: &[Expr]) -> Result<Self> {
+        let conjuncts = filter_conjuncts(filters);
+        let branch_ids =
+            exact_string_column_constraint_from_filters(&conjuncts, "lixcol_branch_id")?;
+        let schema_keys = string_constraint_values(exact_string_column_constraint_from_filters(
+            &conjuncts,
+            "schema_key",
+        )?);
+        let entity_pk_values = string_constraint_values(
+            exact_string_column_constraint_from_filters(&conjuncts, "entity_pk")?,
+        );
+        let file_ids = string_constraint_values(exact_string_column_constraint_from_filters(
+            &conjuncts, "file_id",
+        )?);
+
+        let mut contradictory = matches!(branch_ids, FileIdConstraint::None)
+            || schema_keys.as_ref().is_some_and(Vec::is_empty)
+            || entity_pk_values.as_ref().is_some_and(Vec::is_empty)
+            || file_ids.as_ref().is_some_and(Vec::is_empty);
+        let entity_pk_filter_is_explicit = entity_pk_values.is_some();
+        let entity_pks = entity_pk_values
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entity_pk| EntityPk::from_json_array_text(&entity_pk).ok())
+            .collect::<Vec<_>>();
+        contradictory |= entity_pk_filter_is_explicit && entity_pks.is_empty();
+
+        Ok(Self {
+            branch_ids,
+            diff_request: TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: schema_keys.unwrap_or_default(),
+                    entity_pks,
+                    file_ids: file_ids
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(NullableKeyFilter::Value)
+                        .collect(),
+                    include_tombstones: true,
+                },
+            },
+            contradictory,
+        })
+    }
+}
+
+fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>> {
+    match constraint {
+        FileIdConstraint::All => None,
+        FileIdConstraint::None => Some(Vec::new()),
+        FileIdConstraint::Ids(values) => Some(values.into_iter().collect()),
     }
 }
 
@@ -211,5 +304,56 @@ fn working_change_batch_error(error: ColumnTableError) -> DataFusionError {
             DataFusionError::from(error)
         }
         ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use datafusion::prelude::{col, lit};
+
+    use crate::NullableKeyFilter;
+
+    use super::{FileIdConstraint, WorkingChangeRoute};
+
+    #[test]
+    fn routes_exact_branch_and_tracked_identity_filters() {
+        let route = WorkingChangeRoute::from_filters(&[
+            col("lixcol_branch_id").eq(lit("branch-a")),
+            col("schema_key").eq(lit("acme_task")),
+            col("entity_pk").eq(lit("[\"task-a\"]")),
+            col("file_id").eq(lit("file-a")),
+        ])
+        .expect("exact working-change filters should route");
+
+        assert_eq!(
+            route.branch_ids,
+            FileIdConstraint::Ids(["branch-a".to_string()].into())
+        );
+        assert_eq!(
+            route.diff_request.filter.schema_keys,
+            vec!["acme_task".to_string()]
+        );
+        assert_eq!(
+            route.diff_request.filter.entity_pks[0]
+                .as_json_array_text()
+                .expect("entity pk should encode"),
+            "[\"task-a\"]"
+        );
+        assert_eq!(
+            route.diff_request.filter.file_ids,
+            vec![NullableKeyFilter::Value("file-a".to_string())]
+        );
+        assert!(!route.contradictory);
+    }
+
+    #[test]
+    fn contradictory_exact_filters_short_circuit() {
+        let route = WorkingChangeRoute::from_filters(&[
+            col("schema_key").eq(lit("acme_task")),
+            col("schema_key").eq(lit("acme_note")),
+        ])
+        .expect("contradictory filters should still plan");
+
+        assert!(route.contradictory);
     }
 }
