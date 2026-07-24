@@ -1,5 +1,4 @@
-#[macro_use]
-mod support;
+use crate::support;
 use lix_engine::Value;
 
 simulation_test!(branch_ref_advances_after_tracked_commit, |sim| async move {

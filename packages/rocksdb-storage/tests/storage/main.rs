@@ -1,3 +1,7 @@
+mod native_file_read;
+mod native_file_upsert;
+mod rocksdb_specific;
+
 use lix_engine::run_storage_conformance;
 use lix_rocksdb_storage::{RocksDB, RocksDBFactory};
 

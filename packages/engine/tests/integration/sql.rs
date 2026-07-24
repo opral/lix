@@ -1,8 +1,4 @@
-#[macro_use]
-mod support;
-
-mod sql {
-    macro_rules! simulation_test {
+macro_rules! simulation_test {
     ($name:ident, |$sim:ident| $body:expr) => {
         simulation_test!(
             $name,
@@ -12,6 +8,7 @@ mod sql {
     };
     ($name:ident, options = $options:expr, |$sim:ident| $body:expr) => {
         simulation_test!(@single $name, base, Base, $options, |$sim| $body);
+        #[cfg(feature = "all-simulations")]
         simulation_test!(
             @single $name,
             tracked_state_rebuild,
@@ -93,52 +90,51 @@ mod sql {
     };
 }
 
-    mod delete_returning;
-    mod entity_history;
-    mod entity_view;
-    mod errors;
-    mod history_conformance;
-    mod information_schema;
-    mod lix_branch;
-    mod lix_change;
-    mod lix_commit;
-    mod lix_directory;
-    mod lix_directory_history;
-    mod lix_file;
-    mod lix_file_history;
-    mod lix_json;
-    mod lix_key_value;
-    mod lix_label_assignment;
-    mod lix_registered_schema;
-    mod metadata;
-    mod read_only;
-    mod udfs;
-    mod untracked_change_ledger;
+mod delete_returning;
+mod entity_history;
+mod entity_view;
+mod errors;
+mod history_conformance;
+mod information_schema;
+mod lix_branch;
+mod lix_change;
+mod lix_commit;
+mod lix_directory;
+mod lix_directory_history;
+mod lix_file;
+mod lix_file_history;
+mod lix_json;
+mod lix_key_value;
+mod lix_label_assignment;
+mod lix_registered_schema;
+mod metadata;
+mod read_only;
+mod udfs;
+mod untracked_change_ledger;
 
-    use lix_engine::ExecuteResult;
-    use lix_engine::Value;
+use lix_engine::ExecuteResult;
+use lix_engine::Value;
 
-    async fn select_rows(
-        session: &crate::support::simulation_test::engine::SimSession,
-        sql: &str,
-    ) -> Vec<Vec<Value>> {
-        let result = session
-            .execute(sql, &[])
-            .await
-            .expect("SELECT should succeed");
-        rows_from_result(result)
-    }
+async fn select_rows(
+    session: &crate::support::simulation_test::engine::SimSession,
+    sql: &str,
+) -> Vec<Vec<Value>> {
+    let result = session
+        .execute(sql, &[])
+        .await
+        .expect("SELECT should succeed");
+    rows_from_result(result)
+}
 
-    fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
-        assert_eq!(rows_from_result(result), expected);
-    }
+fn assert_rows_eq(result: ExecuteResult, expected: Vec<Vec<Value>>) {
+    assert_eq!(rows_from_result(result), expected);
+}
 
-    fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
-        let row_set = result;
-        row_set
-            .rows()
-            .iter()
-            .map(|row| row.values().to_vec())
-            .collect()
-    }
+fn rows_from_result(result: ExecuteResult) -> Vec<Vec<Value>> {
+    let row_set = result;
+    row_set
+        .rows()
+        .iter()
+        .map(|row| row.values().to_vec())
+        .collect()
 }

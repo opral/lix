@@ -1,7 +1,7 @@
 //! Manual benchmark for warmed exact `lix_file` reads through the public session API.
 //!
 //! Run with:
-//! `cargo test -p lix_engine --release --test exact_file_read_benchmark -- --ignored --nocapture`
+//! `cargo test -p lix_engine_benchmarks --all-features --release --test exact_file_read_benchmark -- --ignored --nocapture`
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

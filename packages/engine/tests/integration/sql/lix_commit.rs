@@ -419,8 +419,8 @@ async fn commit_edges_by_branch(
 
 fn builtin_schema_property_names(schema_key: &str) -> BTreeSet<String> {
     let schema = match schema_key {
-        "lix_commit" => include_str!("../../src/schema/builtin/lix_commit.json"),
-        "lix_commit_edge" => include_str!("../../src/schema/builtin/lix_commit_edge.json"),
+        "lix_commit" => include_str!("../../../src/schema/builtin/lix_commit.json"),
+        "lix_commit_edge" => include_str!("../../../src/schema/builtin/lix_commit_edge.json"),
         other => panic!("unexpected builtin schema key: {other}"),
     };
     let schema = serde_json::from_str::<serde_json::Value>(schema)

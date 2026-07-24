@@ -9,13 +9,13 @@
 Command used for the regular scorecard:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Command used for the accounting scorecard:
 
 ```sh
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 ```
 
 The regular scorecard is intentionally the 1k smoke workload. The full 10k
@@ -31,7 +31,7 @@ excluded from the timed window too.
 
 Workload:
 
-- Source fixture: `packages/engine/benches/fixtures/pnpm-lock.fixture.json`
+- Source fixture: `packages/engine-benchmarks/benches/fixtures/pnpm-lock.fixture.json`
 - Shape: flattened JSON-pointer rows
 - Smoke size: 1,000 rows
 - Criterion: 10 samples, 250 ms warmup, 1 s measurement for smoke groups
@@ -289,7 +289,7 @@ Date: 2026-05-20
 Command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Purpose:
@@ -348,8 +348,8 @@ in routine scorecards.
 Commands:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 ```
 
 Notes:
@@ -430,8 +430,8 @@ Commands:
 
 ```sh
 cargo test -p lix_engine changelog --no-fail-fast
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Notes:
@@ -514,7 +514,7 @@ Commands:
 
 ```sh
 cargo test -p lix_engine changelog --no-fail-fast
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Notes:
@@ -580,7 +580,7 @@ the dictionary codec cut.
 Command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke/insert_all_rows/1k'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke/insert_all_rows/1k'
 ```
 
 Notes:
@@ -613,7 +613,7 @@ caller is actually executing SQL.
 Command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Notes:
@@ -669,7 +669,7 @@ cached baseline.
 Command:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
 ```
 
 Notes:
@@ -738,8 +738,8 @@ significant change.
 Commands:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 ```
 
 Notes:
@@ -853,8 +853,8 @@ Date: 2026-06-09
 Commands:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine
 ```
 
@@ -959,8 +959,8 @@ Date: 2026-06-09
 Commands:
 
 ```sh
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- smoke
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- smoke
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --lib
 ```
 
@@ -1064,9 +1064,9 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-LIX_WRITE_SET_ORDER_STATS=1 LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_WRITE_SET_ORDER_STATS=1 LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --features storage-benches
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'kv_layout/lix_redb/smoke/update_all_rows'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'kv_layout/lix_redb/smoke/update_all_rows'
 ```
 
 The final command above targeted the since-removed Redb implementation and is
@@ -1136,7 +1136,7 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --features storage-benches
 ```
 
@@ -1205,7 +1205,7 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --features storage-benches
 ```
 
@@ -1274,7 +1274,7 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --features storage-benches
 ```
 
@@ -1352,7 +1352,7 @@ Date: 2026-06-10
 Commands:
 
 ```sh
-LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
+LIX_TRACKED_STATE_CRUD_ACCOUNTING=1 cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'no_matching_benchmark_filter'
 cargo test -p lix_engine --features storage-benches
 ```
 
@@ -1491,7 +1491,7 @@ Commands:
 
 ```sh
 cargo bench -p lix_sdk --features sqlite --bench sqlite
-cargo bench -p lix_engine --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke'
+cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_state_crud -- 'transaction/lix_sqlite/smoke'
 LIX_SQLITE_FILE_STATS=1 cargo bench -p lix_sdk --features sqlite --bench sqlite -- 'no_match'
 cargo test -p lix_sdk --features sqlite && cargo test -p lix_engine --features storage-benches
 ```

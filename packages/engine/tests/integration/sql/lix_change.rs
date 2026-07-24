@@ -217,7 +217,7 @@ fn assert_single_count(rows: Vec<Vec<Value>>) {
 
 fn builtin_schema_property_names() -> BTreeSet<String> {
     let schema = serde_json::from_str::<serde_json::Value>(include_str!(
-        "../../src/schema/builtin/lix_change.json"
+        "../../../src/schema/builtin/lix_change.json"
     ))
     .expect("builtin lix_change schema should parse");
     schema

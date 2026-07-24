@@ -417,9 +417,10 @@ async fn new_engine<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
+    #[cfg(feature = "default_wasm_runtime")]
     let wasm_runtime = match wasm_runtime {
         Some(wasm_runtime) => Some(wasm_runtime),
-        None => default_wasm_runtime()?,
+        None => Some(crate::default_wasm_runtime::runtime()?),
     };
     let mut options = EngineOptions::new();
     if let Some(wasm_runtime) = wasm_runtime {
@@ -429,16 +430,6 @@ where
         options = options.with_telemetry(telemetry);
     }
     Engine::new_with_options(storage, options).await
-}
-
-#[cfg(feature = "default_wasm_runtime")]
-fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
-    Ok(Some(crate::default_wasm_runtime::runtime()?))
-}
-
-#[cfg(not(feature = "default_wasm_runtime"))]
-fn default_wasm_runtime() -> Result<Option<Arc<dyn WasmRuntime>>, LixError> {
-    Ok(None)
 }
 
 #[cfg(test)]

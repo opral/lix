@@ -2,21 +2,12 @@
 
 use lix_engine::{Engine, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
 
 #[tokio::test]
 async fn native_file_read_works_with_rocksdb() {
     let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
     let storage =
         RocksDB::open(temp_dir.path().join("native-file-read")).expect("open RocksDB storage");
-    assert_native_file_read(storage).await;
-}
-
-#[tokio::test]
-async fn native_file_read_works_with_slatedb() {
-    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
-    let storage =
-        SlateDB::open(temp_dir.path().join("native-file-read")).expect("open SlateDB storage");
     assert_native_file_read(storage).await;
 }
 

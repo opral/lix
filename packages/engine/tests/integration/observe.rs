@@ -1,5 +1,4 @@
-mod support;
-
+use crate::support;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;

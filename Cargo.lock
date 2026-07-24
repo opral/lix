@@ -3316,23 +3316,16 @@ dependencies = [
  "bytes",
  "cel",
  "chrono",
- "codspeed-criterion-compat",
  "datafusion",
  "fastcdc",
  "futures-util",
  "globset",
  "jiff",
  "jsonschema",
- "lix_rocksdb_storage",
- "lix_slatedb_storage",
- "lix_sqlite_storage",
  "lru",
  "memchr",
  "musli",
- "object_store 0.14.0",
  "paste",
- "rusqlite",
- "rustc-hash",
  "ruzstd",
  "serde",
  "serde_json",
@@ -3344,6 +3337,30 @@ dependencies = [
  "xxhash-rust",
  "zip",
  "zstd",
+]
+
+[[package]]
+name = "lix_engine_benchmarks"
+version = "0.8.4"
+dependencies = [
+ "ahash",
+ "async-trait",
+ "blake3",
+ "bytes",
+ "codspeed-criterion-compat",
+ "futures-util",
+ "lix_engine",
+ "lix_rocksdb_storage",
+ "lix_slatedb_storage",
+ "lix_sqlite_storage",
+ "object_store 0.14.0",
+ "rusqlite",
+ "rustc-hash",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -3474,7 +3491,9 @@ dependencies = [
  "bytes",
  "lix_engine",
  "rusqlite",
+ "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

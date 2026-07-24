@@ -1,6 +1,6 @@
 //! Manual probe for `execute_batch` read-only performance.
 //!
-//! Run with `cargo test -p lix_engine --test execute_batch_benchmark --
+//! Run with `cargo test -p lix_engine --test integration execute_batch_benchmark:: --
 //! --ignored --nocapture`. The probe reuses one warmed session and reports
 //! latency plus storage operations for 1/3/5-statement batches.
 

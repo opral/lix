@@ -1,6 +1,4 @@
-#[macro_use]
-mod support;
-
+use crate::support;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1044,34 +1042,6 @@ async fn plugin_blind_write_uses_current_identity_hint_without_delete_authority(
 #[tokio::test]
 async fn plugin_concurrent_writes_preserve_disjoint_entity_edits() {
     let (_engine, session_a, session_b) = keyed_collaboration_sessions().await;
-    write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
-        .await
-        .expect("seed file should write");
-    read_file(&session_a, "/shared.keyed").await.unwrap();
-    read_file(&session_b, "/shared.keyed").await.unwrap();
-
-    let (write_a, write_b) = tokio::join!(
-        write_file(&session_a, "/shared.keyed", b"a=A\nb=0\n".to_vec()),
-        write_file(&session_b, "/shared.keyed", b"a=0\nb=B\n".to_vec()),
-    );
-    write_a.expect("session A concurrent edit should write");
-    write_b.expect("session B concurrent edit should write");
-
-    assert_eq!(
-        keyed_entity_values(&session_a, "/shared.keyed").await,
-        BTreeMap::from([
-            ("a".to_string(), "A".to_string()),
-            ("b".to_string(), "B".to_string())
-        ])
-    );
-}
-
-#[tokio::test]
-async fn slatedb_plugin_concurrent_writes_preserve_disjoint_entity_edits() {
-    let temp_dir = tempfile::tempdir().expect("SlateDB temp directory should create");
-    let storage = lix_slatedb_storage::SlateDB::open(temp_dir.path().join("collaboration"))
-        .expect("SlateDB storage should open");
-    let (_engine, session_a, session_b) = keyed_collaboration_sessions_with_storage(storage).await;
     write_file(&session_a, "/shared.keyed", b"a=0\nb=0\n".to_vec())
         .await
         .expect("seed file should write");

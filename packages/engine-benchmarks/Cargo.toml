@@ -1,0 +1,119 @@
+[package]
+name = "lix_engine_benchmarks"
+version.workspace = true
+publish = false
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+autobenches = false
+autotests = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["rocksdb"]
+rocksdb = ["dep:lix_rocksdb_storage"]
+sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite"]
+slatedb = ["dep:lix_slatedb_storage", "dep:object_store"]
+storage-benches = ["lix_engine/storage-benches", "rocksdb", "sqlite"]
+
+[dependencies]
+lix_engine = { workspace = true }
+lix_rocksdb_storage = { workspace = true, optional = true }
+lix_slatedb_storage = { workspace = true, optional = true }
+lix_sqlite_storage = { workspace = true, optional = true }
+object_store = { version = "0.14", default-features = false, optional = true }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+
+[dev-dependencies]
+ahash = "0.8"
+async-trait = "0.1"
+blake3 = "1"
+bytes = "1"
+criterion = { package = "codspeed-criterion-compat", version = "*" }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[[test]]
+name = "exact_file_read_benchmark"
+path = "tests/exact_file_read_benchmark.rs"
+required-features = ["rocksdb", "slatedb"]
+
+[[bench]]
+name = "storage_v2"
+path = "benches/storage_v2.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_scorecard"
+path = "benches/changelog/scorecard.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_cpu_profile"
+path = "benches/changelog/profile_cpu.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "changelog_direct_profile"
+path = "benches/changelog/profile_direct.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "untracked_state_crud"
+path = "benches/untracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "tracked_state_crud"
+path = "benches/tracked_state_crud/main.rs"
+harness = false
+required-features = ["storage-benches"]
+
+[[bench]]
+name = "slatedb_file_api"
+path = "benches/slatedb_file_api.rs"
+harness = false
+required-features = ["slatedb"]
+
+[[bench]]
+name = "native_file_upsert_component"
+path = "benches/native_file_upsert_component.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "native_file_read_component"
+path = "benches/native_file_read_component.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "large_blob_updates"
+path = "benches/large_blob_updates.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "small_blob_cas"
+path = "benches/small_blob_cas.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "changelog_history_append"
+path = "benches/changelog_history_append.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]

@@ -2,21 +2,12 @@
 
 use lix_engine::{Blob, Engine, LixError, SessionContext, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
 
 #[tokio::test]
 async fn native_file_upsert_works_with_rocksdb() {
     let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
     let storage =
         RocksDB::open(temp_dir.path().join("native-file-upsert")).expect("open RocksDB storage");
-    assert_native_file_upsert(storage).await;
-}
-
-#[tokio::test]
-async fn native_file_upsert_works_with_slatedb() {
-    let temp_dir = tempfile::tempdir().expect("create SlateDB temp directory");
-    let storage =
-        SlateDB::open(temp_dir.path().join("native-file-upsert")).expect("open SlateDB storage");
     assert_native_file_upsert(storage).await;
 }
 
