@@ -107,10 +107,11 @@ where
 {
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
-        let mut affected = 0;
-        for sql in &self.insert_sql_chunks {
-            affected += execute(&self.session, sql).await.rows_affected();
-        }
+        let affected = Box::pin(execute_many_in_transaction(
+            &self.session,
+            &self.insert_sql_chunks,
+        ))
+        .await;
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -135,10 +136,11 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all(&self) -> usize {
-        let mut affected = 0;
-        for sql in &self.update_all_sql_rows {
-            affected += execute(&self.session, sql).await.rows_affected();
-        }
+        let affected = Box::pin(execute_many_in_transaction(
+            &self.session,
+            &self.update_all_sql_rows,
+        ))
+        .await;
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -250,6 +252,32 @@ where
         .execute(sql, &[])
         .await
         .expect("execute tracked-state crud SQL")
+}
+
+async fn execute_many_in_transaction<StorageImpl>(
+    session: &SessionContext<StorageImpl>,
+    statements: &[String],
+) -> u64
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut transaction = session
+        .begin_transaction()
+        .await
+        .expect("begin tracked-state CRUD transaction");
+    let mut affected = 0;
+    for sql in statements {
+        affected += transaction
+            .execute(sql, &[])
+            .await
+            .expect("execute tracked-state CRUD transaction SQL")
+            .rows_affected();
+    }
+    transaction
+        .commit()
+        .await
+        .expect("commit tracked-state CRUD transaction");
+    affected
 }
 
 fn insert_rows_sql(rows: &[WorkloadRow]) -> String {
