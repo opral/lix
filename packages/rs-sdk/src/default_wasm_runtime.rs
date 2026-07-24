@@ -8,23 +8,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lix_engine::LixError;
-use lix_engine::wasm::{
-    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
-    WasmPluginFile, WasmRuntime,
-};
+use lix_engine::wasm::{WasmLimits, WasmRuntime};
 use lru::LruCache;
 use wasmtime::component::{Component, Linker};
 use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
 };
-
-mod plugin_bindings {
-    wasmtime::component::bindgen!({
-        path: "../engine/wit",
-        world: "plugin",
-    });
-}
 
 #[path = "default_wasm_runtime_v2.rs"]
 mod v2_runtime;
@@ -52,14 +42,12 @@ struct WasmtimePluginRuntime {
 }
 
 struct WasmtimeSharedRuntime {
+    #[cfg(test)]
     engine: Engine,
+    #[cfg(test)]
     fuel_engine: Engine,
     timeout_engine: Engine,
     fuel_timeout_engine: Engine,
-    linker: OnceLock<Result<Linker<WasiHostState>, LixError>>,
-    fuel_linker: OnceLock<Result<Linker<WasiHostState>, LixError>>,
-    timeout_linker: OnceLock<Result<Linker<WasiHostState>, LixError>>,
-    fuel_timeout_linker: OnceLock<Result<Linker<WasiHostState>, LixError>>,
     timeout_ticker: Arc<TimeoutTickerRegistry>,
     fuel_timeout_ticker: Arc<TimeoutTickerRegistry>,
     compiled_components: CompiledComponentCache,
@@ -77,8 +65,10 @@ impl WasmtimePluginRuntime {
 
 impl WasmtimeSharedRuntime {
     fn new() -> Result<Self, LixError> {
+        #[cfg(test)]
         let engine = create_engine(false, false)
             .map_err(|error| wasm_runtime_error("failed to create Wasmtime engine", error))?;
+        #[cfg(test)]
         let fuel_engine = create_engine(true, false)
             .map_err(|error| wasm_runtime_error("failed to create Wasmtime fuel engine", error))?;
         let timeout_engine = create_engine(false, true).map_err(|error| {
@@ -90,14 +80,12 @@ impl WasmtimeSharedRuntime {
         let timeout_ticker = Arc::new(TimeoutTickerRegistry::new(timeout_engine.clone()));
         let fuel_timeout_ticker = Arc::new(TimeoutTickerRegistry::new(fuel_timeout_engine.clone()));
         Ok(Self {
+            #[cfg(test)]
             engine,
+            #[cfg(test)]
             fuel_engine,
             timeout_engine,
             fuel_timeout_engine,
-            linker: OnceLock::new(),
-            fuel_linker: OnceLock::new(),
-            timeout_linker: OnceLock::new(),
-            fuel_timeout_linker: OnceLock::new(),
             timeout_ticker,
             fuel_timeout_ticker,
             compiled_components: CompiledComponentCache::new(COMPILED_COMPONENT_CACHE_CAPACITY),
@@ -106,24 +94,13 @@ impl WasmtimeSharedRuntime {
 
     fn engine(&self, profile: CompileProfile) -> &Engine {
         match profile {
-            CompileProfile::Plain => &self.engine,
-            CompileProfile::Fuel => &self.fuel_engine,
             CompileProfile::Timeout => &self.timeout_engine,
             CompileProfile::FuelAndTimeout => &self.fuel_timeout_engine,
+            #[cfg(test)]
+            CompileProfile::Plain => &self.engine,
+            #[cfg(test)]
+            CompileProfile::Fuel => &self.fuel_engine,
         }
-    }
-
-    fn linker(&self, profile: CompileProfile) -> Result<&Linker<WasiHostState>, LixError> {
-        let linker = match profile {
-            CompileProfile::Plain => &self.linker,
-            CompileProfile::Fuel => &self.fuel_linker,
-            CompileProfile::Timeout => &self.timeout_linker,
-            CompileProfile::FuelAndTimeout => &self.fuel_timeout_linker,
-        };
-        linker
-            .get_or_init(|| create_linker(self.engine(profile)))
-            .as_ref()
-            .map_err(Clone::clone)
     }
 
     fn timeout_ticker(
@@ -131,29 +108,26 @@ impl WasmtimeSharedRuntime {
         profile: CompileProfile,
     ) -> Result<Option<TimeoutTickerLease>, LixError> {
         let registry = match profile {
-            CompileProfile::Plain | CompileProfile::Fuel => return Ok(None),
             CompileProfile::Timeout => &self.timeout_ticker,
             CompileProfile::FuelAndTimeout => &self.fuel_timeout_ticker,
+            #[cfg(test)]
+            CompileProfile::Plain | CompileProfile::Fuel => return Ok(None),
         };
         registry.acquire().map(Some)
     }
 }
 
-fn create_linker(engine: &Engine) -> Result<Linker<WasiHostState>, LixError> {
-    let mut linker = Linker::<WasiHostState>::new(engine);
-    add_to_linker_sync(&mut linker)
-        .map_err(|error| wasm_runtime_error("failed to configure WASI linker", error))?;
-    Ok(linker)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CompileProfile {
-    Plain,
-    Fuel,
     Timeout,
     FuelAndTimeout,
+    #[cfg(test)]
+    Plain,
+    #[cfg(test)]
+    Fuel,
 }
 
+#[cfg(test)]
 impl CompileProfile {
     fn from_limits(limits: WasmLimits) -> Self {
         match (limits.max_fuel.is_some(), limits.timeout_ms.is_some()) {
@@ -245,13 +219,6 @@ impl CompiledComponentCache {
             )
         })
     }
-}
-
-struct WasmtimePluginComponent {
-    store: Mutex<Store<WasiHostState>>,
-    bindings: plugin_bindings::Plugin,
-    limits: WasmLimits,
-    _timeout_ticker: Option<TimeoutTickerLease>,
 }
 
 struct WasiHostState {
@@ -369,39 +336,6 @@ impl WasiView for WasiHostState {
 
 #[async_trait]
 impl WasmRuntime for WasmtimePluginRuntime {
-    async fn init_component(
-        &self,
-        bytes: Vec<u8>,
-        limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        let profile = CompileProfile::from_limits(limits);
-        let engine = self.shared.engine(profile);
-        let key = CompiledComponentKey::new(profile, &bytes);
-        let component = self
-            .shared
-            .compiled_components
-            .get_or_compile(key, || {
-                Component::new(engine, &bytes).map_err(|error| {
-                    wasm_runtime_error("failed to compile plugin component", error)
-                })
-            })
-            .await?;
-        let linker = self.shared.linker(profile)?;
-        let timeout_ticker = self.shared.timeout_ticker(profile)?;
-        // Set an epoch deadline only after hashing/compilation. Once another
-        // component has started the shared ticker, cold preparation must not
-        // consume this component's execution budget before instantiation.
-        let mut store = create_store(engine, limits)?;
-        let bindings = plugin_bindings::Plugin::instantiate(&mut store, &component, linker)
-            .map_err(|error| wasm_runtime_error("failed to instantiate plugin component", error))?;
-        Ok(Arc::new(WasmtimePluginComponent {
-            store: Mutex::new(store),
-            bindings,
-            limits,
-            _timeout_ticker: timeout_ticker,
-        }))
-    }
-
     async fn compile_component_v2(
         &self,
         bytes: Vec<u8>,
@@ -440,62 +374,6 @@ fn create_store(engine: &Engine, limits: WasmLimits) -> Result<Store<WasiHostSta
         store.epoch_deadline_trap();
     }
     Ok(store)
-}
-
-#[async_trait]
-impl WasmComponentInstance for WasmtimePluginComponent {
-    async fn detect_changes(
-        &self,
-        state: Vec<WasmPluginEntityState>,
-        file: WasmPluginFile,
-    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
-        let mut store = self.store("detect-changes")?;
-        self.reset_limits(&mut store)?;
-        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
-        let file = file.into();
-        match self
-            .bindings
-            .lix_plugin_api()
-            .call_detect_changes(&mut *store, &state, &file)
-            .map_err(|error| wasm_runtime_error("failed to call detect-changes", error))?
-        {
-            Ok(changes) => Ok(changes.into_iter().map(Into::into).collect()),
-            Err(error) => Err(plugin_error_from_binding("detect-changes", error)),
-        }
-    }
-
-    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
-        let mut store = self.store("render")?;
-        self.reset_limits(&mut store)?;
-        let state = state.into_iter().map(Into::into).collect::<Vec<_>>();
-        match self
-            .bindings
-            .lix_plugin_api()
-            .call_render(&mut *store, &state)
-            .map_err(|error| wasm_runtime_error("failed to call render", error))?
-        {
-            Ok(bytes) => Ok(bytes),
-            Err(error) => Err(plugin_error_from_binding("render", error)),
-        }
-    }
-}
-
-impl WasmtimePluginComponent {
-    fn store(
-        &self,
-        export_name: &str,
-    ) -> Result<std::sync::MutexGuard<'_, Store<WasiHostState>>, LixError> {
-        self.store.lock().map_err(|_| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("Wasmtime store lock poisoned before calling {export_name}"),
-            )
-        })
-    }
-
-    fn reset_limits(&self, store: &mut Store<WasiHostState>) -> Result<(), LixError> {
-        reset_store_limits(store, self.limits)
-    }
 }
 
 fn reset_store_limits(
@@ -613,55 +491,6 @@ impl Drop for TimeoutTicker {
             let _ = handle.join();
         }
     }
-}
-
-impl From<WasmPluginFile> for plugin_bindings::exports::lix::plugin::api::File {
-    fn from(file: WasmPluginFile) -> Self {
-        Self {
-            filename: file.filename,
-            data: file.data,
-        }
-    }
-}
-
-impl From<WasmPluginEntityState> for plugin_bindings::exports::lix::plugin::api::EntityState {
-    fn from(state: WasmPluginEntityState) -> Self {
-        Self {
-            entity_pk: state.entity_pk,
-            schema_key: state.schema_key,
-            snapshot_content: state.snapshot_content,
-            metadata: state.metadata,
-        }
-    }
-}
-
-impl From<plugin_bindings::exports::lix::plugin::api::DetectedChange> for WasmPluginDetectedChange {
-    fn from(change: plugin_bindings::exports::lix::plugin::api::DetectedChange) -> Self {
-        Self {
-            entity_pk: change.entity_pk,
-            schema_key: change.schema_key,
-            snapshot_content: change.snapshot_content,
-            metadata: change.metadata,
-        }
-    }
-}
-
-fn plugin_error_from_binding(
-    export_name: &str,
-    error: plugin_bindings::exports::lix::plugin::api::PluginError,
-) -> LixError {
-    let (kind, message) = match error {
-        plugin_bindings::exports::lix::plugin::api::PluginError::InvalidInput(message) => {
-            ("invalid-input", message)
-        }
-        plugin_bindings::exports::lix::plugin::api::PluginError::Internal(message) => {
-            ("internal", message)
-        }
-    };
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("{export_name} returned plugin error {kind}: {message}"),
-    )
 }
 
 fn wasm_runtime_error(context: impl Into<String>, error: impl fmt::Display) -> LixError {
@@ -1130,189 +959,5 @@ mod tests {
         component.export("quick", ComponentExportKind::Func, quick, None);
         component.export("spin", ComponentExportKind::Func, spin, None);
         component.finish()
-    }
-}
-
-#[cfg(test)]
-mod benchmark_probe {
-    use std::hint::black_box;
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    use super::*;
-
-    #[derive(Clone, Copy)]
-    enum Operation {
-        Runtime,
-        Hash,
-        Compile,
-        Linker,
-        Store,
-        Instantiate,
-        Init,
-        Call,
-    }
-
-    #[tokio::test]
-    #[ignore = "production Wasmtime lifecycle benchmark probe"]
-    async fn wasm_runtime_lifecycle_benchmark_probe() {
-        let operation = match std::env::var("LIX_WASM_BENCH_OPERATION")
-            .unwrap_or_else(|_| "init".to_string())
-            .as_str()
-        {
-            "runtime" => Operation::Runtime,
-            "hash" => Operation::Hash,
-            "compile" => Operation::Compile,
-            "linker" => Operation::Linker,
-            "store" => Operation::Store,
-            "instantiate" => Operation::Instantiate,
-            "init" => Operation::Init,
-            "call" => Operation::Call,
-            value => panic!(
-                "LIX_WASM_BENCH_OPERATION must be runtime, hash, compile, linker, store, instantiate, init, or call; got {value:?}"
-            ),
-        };
-        let rounds = env_usize("LIX_WASM_BENCH_ROUNDS", 50);
-        let warmups = env_usize("LIX_WASM_BENCH_WARMUPS", 5);
-        assert!(rounds > 0, "benchmark needs at least one measured round");
-
-        let wasm_path = std::env::var_os("LIX_WASM_BENCH_COMPONENT")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                panic!("LIX_WASM_BENCH_COMPONENT must point to a built plugin component")
-            });
-        let wasm_path = Path::new(&wasm_path);
-        let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-            panic!(
-                "failed to read bindep-built CSV plugin wasm at {}: {error}",
-                wasm_path.display()
-            )
-        });
-        let runtime = WasmtimePluginRuntime::new().expect("benchmark runtime should initialize");
-        let engine = runtime.shared.engine(CompileProfile::Plain);
-        let component = Component::new(engine, &wasm).expect("benchmark component should compile");
-        let mut linker = Linker::<WasiHostState>::new(engine);
-        add_to_linker_sync(&mut linker).expect("benchmark linker should initialize");
-        let instance = runtime
-            .init_component(wasm.clone(), WasmLimits::default())
-            .await
-            .expect("benchmark component should initialize");
-
-        for _ in 0..warmups {
-            run_operation(operation, &runtime, &wasm, &component, &linker, &instance).await;
-        }
-        let mut samples = Vec::with_capacity(rounds);
-        for _ in 0..rounds {
-            let started = Instant::now();
-            run_operation(operation, &runtime, &wasm, &component, &linker, &instance).await;
-            samples.push(started.elapsed());
-        }
-        samples.sort_unstable();
-        println!(
-            "wasm_runtime_lifecycle_probe operation={} wasm_bytes={} rounds={} p50_ns={} p95_ns={}",
-            operation_name(operation),
-            wasm.len(),
-            rounds,
-            percentile(&samples, 50, 100).as_nanos(),
-            percentile(&samples, 95, 100).as_nanos(),
-        );
-    }
-
-    async fn run_operation(
-        operation: Operation,
-        runtime: &WasmtimePluginRuntime,
-        wasm: &[u8],
-        component: &Component,
-        linker: &Linker<WasiHostState>,
-        instance: &Arc<dyn WasmComponentInstance>,
-    ) {
-        match operation {
-            Operation::Runtime => {
-                black_box(WasmtimePluginRuntime::new())
-                    .expect("benchmark runtime should initialize");
-            }
-            Operation::Hash => {
-                black_box(blake3::hash(black_box(wasm)));
-            }
-            Operation::Compile => {
-                black_box(Component::new(
-                    runtime.shared.engine(CompileProfile::Plain),
-                    black_box(wasm),
-                ))
-                .expect("benchmark component should compile");
-            }
-            Operation::Linker => {
-                let mut linker =
-                    Linker::<WasiHostState>::new(runtime.shared.engine(CompileProfile::Plain));
-                add_to_linker_sync(&mut linker).expect("benchmark linker should initialize");
-                black_box(linker);
-            }
-            Operation::Store => {
-                black_box(create_store(
-                    runtime.shared.engine(CompileProfile::Plain),
-                    WasmLimits::default(),
-                ))
-                .expect("benchmark Store should initialize");
-            }
-            Operation::Instantiate => {
-                let mut store = create_store(
-                    runtime.shared.engine(CompileProfile::Plain),
-                    WasmLimits::default(),
-                )
-                .expect("benchmark Store should initialize");
-                black_box(plugin_bindings::Plugin::instantiate(
-                    &mut store, component, linker,
-                ))
-                .expect("benchmark component should instantiate");
-            }
-            Operation::Init => {
-                black_box(
-                    runtime
-                        .init_component(black_box(wasm.to_vec()), WasmLimits::default())
-                        .await,
-                )
-                .expect("benchmark component should initialize");
-            }
-            Operation::Call => {
-                black_box(
-                    instance
-                        .detect_changes(
-                            Vec::new(),
-                            WasmPluginFile {
-                                filename: Some("probe.csv".to_string()),
-                                data: Vec::new(),
-                            },
-                        )
-                        .await,
-                )
-                .expect("benchmark guest call should succeed");
-            }
-        }
-    }
-
-    fn operation_name(operation: Operation) -> &'static str {
-        match operation {
-            Operation::Runtime => "runtime",
-            Operation::Hash => "hash",
-            Operation::Compile => "compile",
-            Operation::Linker => "linker",
-            Operation::Store => "store",
-            Operation::Instantiate => "instantiate",
-            Operation::Init => "init",
-            Operation::Call => "call",
-        }
-    }
-
-    fn env_usize(name: &str, default: usize) -> usize {
-        std::env::var(name).map_or(default, |value| {
-            value
-                .parse::<usize>()
-                .unwrap_or_else(|_| panic!("{name} must be a positive integer"))
-        })
-    }
-
-    fn percentile(samples: &[Duration], numerator: usize, denominator: usize) -> Duration {
-        let index = samples.len().saturating_mul(numerator).saturating_sub(1) / denominator;
-        samples[index]
     }
 }

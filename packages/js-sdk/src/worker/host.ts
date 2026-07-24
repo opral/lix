@@ -3,9 +3,8 @@ import type {
 	LixBinding,
 	LixTransactionBinding,
 	ObserveEventsBinding,
-	PluginRuntimeDispatch,
 } from "../binding-types.js";
-import { createPluginRuntimeDispatch } from "../plugin-runtime.js";
+import type { LixTelemetrySpan } from "../types.js";
 import {
 	serializeWorkerError,
 	type WorkerHostEndpoint,
@@ -81,9 +80,9 @@ export function startWorkerHost(endpoint: WorkerHostEndpoint): void {
 				if (lix) throw workerStateError("Lix worker is already open");
 				lix = await openLixBinding(
 					operation.storage,
-					createPluginRuntimeDispatch() as PluginRuntimeDispatch,
 					operation.telemetryEnabled
-						? (span) => endpoint.postMessage({ kind: "telemetry", span })
+						? (span: LixTelemetrySpan) =>
+							endpoint.postMessage({ kind: "telemetry", span })
 						: undefined,
 				);
 				return undefined;

@@ -1,434 +1,123 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError, MutationIdentity,
-    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions,
+    RequestBlobSpliceProvenance, Storage, SwitchBranchOptions, WasmComponentV2Factory, WasmLimits,
+    WasmRuntime,
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
+use sha2::{Digest as _, Sha256};
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+#[derive(Default)]
+struct HistoryRejectingRuntime {
+    compile_calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl WasmRuntime for HistoryRejectingRuntime {
+    async fn compile_component_v2(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
+        self.compile_calls.fetch_add(1, Ordering::SeqCst);
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "file history must not execute a plugin",
+        ))
+    }
+}
+
 #[tokio::test]
-async fn rs_sdk_installs_built_csv_plugin_archive_and_uses_schema() {
-    let archive = build_csv_plugin_archive();
-    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
-
-    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
-    let plugins = list_installed_plugins(&lix).await;
-    assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0].key, "plugin_csv");
-    assert_eq!(
-        plugins[0].schema_keys,
-        vec!["csv_table".to_string(), "csv_row".to_string()]
-    );
-
-    let stored_archive = read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
+async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_execution() {
+    let storage = lix_sdk::Memory::new();
+    let lix = open_lix(OpenLixOptions::new(storage.clone()))
         .await
-        .unwrap();
-    assert_eq!(stored_archive.as_deref(), Some(archive.as_slice()));
-
-    let schemas = lix
-        .execute(
-            "SELECT table_name \
-             FROM information_schema.tables \
-             WHERE table_name IN ('csv_row', 'csv_table') \
-             ORDER BY table_name",
-            &[],
-        )
+        .expect("workspace should open with the production runtime");
+    let archive = build_csv_v2_plugin_archive();
+    install_plugin(&lix, "plugin_csv_v2", &archive)
         .await
-        .unwrap();
-    assert_eq!(
-        schemas
-            .rows()
-            .iter()
-            .map(|row| row.get::<String>("table_name").unwrap())
-            .collect::<Vec<_>>(),
-        vec!["csv_row".to_string(), "csv_table".to_string()]
-    );
+        .expect("CSV v2 plugin should install");
 
-    let original_csv = b"name,age\nAda,37\n".to_vec();
-    write_file(&lix, "/people.csv", original_csv.clone())
+    let path = "/history-materialized.csv";
+    let first = b"name,value\nrow,first\n".to_vec();
+    let second = b"name,value\nrow,second\n".to_vec();
+    write_file(&lix, path, first.clone())
         .await
-        .unwrap();
-    assert_eq!(
-        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
-        Some(original_csv.as_slice())
-    );
-
-    let file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text("/people.csv".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(file_id.len(), 1);
-    let file_id = file_id.rows()[0].get::<String>("id").unwrap();
-    let file_changes_before_update = file_changes(&lix, &file_id).await;
-
-    let updated_csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
-    write_file(&lix, "/people.csv", updated_csv.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
-        Some(updated_csv.as_slice())
-    );
-
-    let file_changes_after_update = file_changes(&lix, &file_id).await;
-    let resulting_diff_changes = file_changes_after_update
-        .into_iter()
-        .skip(file_changes_before_update.len())
-        .collect::<Vec<_>>();
-    assert_eq!(resulting_diff_changes.len(), 1);
-    let change = &resulting_diff_changes[0];
-    assert_eq!(change.schema_key, "csv_row");
-    let snapshot = change
-        .snapshot_content
-        .as_ref()
-        .expect("updated file write should produce a csv row snapshot");
-    assert_eq!(
-        snapshot
-            .get("cells")
-            .and_then(serde_json::Value::as_array)
-            .unwrap(),
-        &vec![
-            serde_json::Value::String("Grace".to_string()),
-            serde_json::Value::String("85".to_string())
-        ]
-    );
-
-    let files = lix
-        .execute(
-            "SELECT path, data FROM lix_file WHERE path = $1",
-            &[Value::Text("/people.csv".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(files.len(), 1);
-    assert_eq!(
-        files.rows()[0].values(),
-        &[
-            Value::Text("/people.csv".to_string()),
-            Value::Blob(updated_csv.clone().into())
-        ]
-    );
-
-    let files_by_id = lix
-        .execute(
-            "SELECT data FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(files_by_id.len(), 1);
-    assert_eq!(
-        files_by_id.rows()[0].values(),
-        &[Value::Blob(updated_csv.clone().into())]
-    );
-
-    let file_changes_before_empty = file_changes(&lix, &file_id).await;
-    let empty_csv = Vec::new();
-    write_file(&lix, "/people.csv", empty_csv.clone())
-        .await
-        .unwrap();
-    assert_eq!(
-        read_file(&lix, "/people.csv").await.unwrap().as_deref(),
-        Some(empty_csv.as_slice())
-    );
-    let files_empty_by_id = lix
-        .execute(
-            "SELECT data FROM lix_file WHERE id = $1",
-            &[Value::Text(file_id.clone())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(files_empty_by_id.len(), 1);
-    assert_eq!(
-        files_empty_by_id.rows()[0].values(),
-        &[Value::Blob(empty_csv.into())]
-    );
-    let empty_changes = file_changes(&lix, &file_id)
-        .await
-        .into_iter()
-        .skip(file_changes_before_empty.len())
-        .collect::<Vec<_>>();
-    assert!(
-        empty_changes
-            .iter()
-            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
-    );
-
-    let sql_csv = b"name,age\nLin,44\n".to_vec();
+        .expect("initial plugin file should materialize");
+    let file_id = file_id_at_path(&lix, path).await;
+    let edited_row_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["row", "first"]);
     lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+        "UPDATE csv_v2_row SET cells = $1 \
+         WHERE id = $2 AND lixcol_file_id = $3",
         &[
-            Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_csv.clone().into()),
+            Value::Json(serde_json::json!(["row", "second"])),
+            Value::Text(edited_row_id),
+            Value::Text(file_id.clone()),
         ],
     )
     .await
-    .unwrap();
+    .expect("sparse semantic edit should materialize durable bytes");
     assert_eq!(
-        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
-        Some(sql_csv.as_slice())
+        read_file(&lix, path)
+            .await
+            .expect("current file should read"),
+        Some(second.clone()),
     );
-
-    let sql_file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text("/sql-people.csv".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(sql_file_id.len(), 1);
-    let sql_file_id = sql_file_id.rows()[0].get::<String>("id").unwrap();
-    let sql_insert_changes = file_changes(&lix, &sql_file_id).await;
-    assert!(
-        sql_insert_changes
-            .iter()
-            .any(|change| change.schema_key == "csv_table")
-    );
-    assert!(
-        sql_insert_changes
-            .iter()
-            .any(|change| change.schema_key == "csv_row")
-    );
-    assert!(
-        !sql_insert_changes
-            .iter()
-            .any(|change| change.schema_key == "lix_binary_blob_ref")
-    );
-
-    let sql_changes_before_update = sql_insert_changes.len();
-    let sql_updated_csv = b"name,age\nLin,44\nMina,29\n".to_vec();
     lix.execute(
-        "UPDATE lix_file SET data = $1 WHERE path = $2",
-        &[
-            Value::Blob(sql_updated_csv.clone().into()),
-            Value::Text("/sql-people.csv".to_string()),
-        ],
+        "INSERT INTO lix_key_value (key, value) VALUES ('history-sidecar', 'later commit')",
+        &[],
     )
     .await
-    .unwrap();
-    assert_eq!(
-        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
-        Some(sql_updated_csv.as_slice())
-    );
-    let sql_update_changes = file_changes(&lix, &sql_file_id)
+    .expect("sidecar commit should advance history depth");
+    let head = lix
+        .execute("SELECT lix_active_branch_commit_id() AS commit_id", &[])
         .await
-        .into_iter()
-        .skip(sql_changes_before_update)
-        .collect::<Vec<_>>();
-    assert!(sql_update_changes.iter().any(|change| {
-        change.schema_key == "csv_row"
-            && change
-                .snapshot_content
-                .as_ref()
-                .and_then(|snapshot| snapshot.get("cells"))
-                .and_then(serde_json::Value::as_array)
-                == Some(&vec![
-                    serde_json::Value::String("Mina".to_string()),
-                    serde_json::Value::String("29".to_string()),
-                ])
-    }));
-    assert!(
-        !sql_update_changes
-            .iter()
-            .any(|change| change.schema_key == "lix_binary_blob_ref")
-    );
+        .expect("active branch head should load")
+        .rows()[0]
+        .get::<String>("commit_id")
+        .expect("active branch head should be text");
+    lix.close().await.expect("production session should close");
 
-    let sql_changes_before_predicate_update = sql_changes_before_update + sql_update_changes.len();
-    let sql_predicate_updated_csv = b"name,age\nLin,44\nMina,29\nKatherine,101\n".to_vec();
-    lix.execute(
-        "UPDATE lix_file SET data = $1 WHERE path = $2 AND data = $3",
-        &[
-            Value::Blob(sql_predicate_updated_csv.clone().into()),
-            Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_updated_csv.clone().into()),
-        ],
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        read_file(&lix, "/sql-people.csv").await.unwrap().as_deref(),
-        Some(sql_predicate_updated_csv.as_slice())
-    );
-    let sql_predicate_update_changes = file_changes(&lix, &sql_file_id)
+    let rejecting_runtime = Arc::new(HistoryRejectingRuntime::default());
+    let wasm_runtime: Arc<dyn WasmRuntime> = rejecting_runtime.clone();
+    let history_lix = open_lix(OpenLixOptions::new(storage).with_wasm_runtime(wasm_runtime))
         .await
-        .into_iter()
-        .skip(sql_changes_before_predicate_update)
-        .collect::<Vec<_>>();
-    assert!(sql_predicate_update_changes.iter().any(|change| {
-        change.schema_key == "csv_row"
-            && change
-                .snapshot_content
-                .as_ref()
-                .and_then(|snapshot| snapshot.get("cells"))
-                .and_then(serde_json::Value::as_array)
-                == Some(&vec![
-                    serde_json::Value::String("Katherine".to_string()),
-                    serde_json::Value::String("101".to_string()),
-                ])
-    }));
-    assert!(
-        !sql_predicate_update_changes
-            .iter()
-            .any(|change| change.schema_key == "lix_binary_blob_ref")
-    );
+        .expect("workspace should reopen without compiling installed plugins");
+    let result = history_lix
+        .execute(
+            "SELECT data, lixcol_depth \
+             FROM lix_file_history \
+             WHERE lixcol_as_of_commit_id = $1 AND id = $2 \
+             ORDER BY lixcol_depth \
+             LIMIT 2",
+            &[Value::Text(head), Value::Text(file_id)],
+        )
+        .await
+        .expect("V2 file history should read durable materialized bytes");
 
-    let sql_empty_target = b"name,age\nNoor,10\n".to_vec();
-    lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-        &[
-            Value::Text("/sql-empty.csv".to_string()),
-            Value::Blob(sql_empty_target.into()),
-        ],
-    )
-    .await
-    .unwrap();
-    let sql_empty_file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text("/sql-empty.csv".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(sql_empty_file_id.len(), 1);
-    let sql_empty_file_id = sql_empty_file_id.rows()[0].get::<String>("id").unwrap();
-    let sql_empty_changes_before_update = file_changes(&lix, &sql_empty_file_id).await;
-    let sql_empty_bytes = Vec::new();
-    lix.execute(
-        "UPDATE lix_file SET data = $1 WHERE path = $2",
-        &[
-            Value::Blob(sql_empty_bytes.clone().into()),
-            Value::Text("/sql-empty.csv".to_string()),
-        ],
-    )
-    .await
-    .unwrap();
+    assert_eq!(result.len(), 2);
     assert_eq!(
-        read_file(&lix, "/sql-empty.csv").await.unwrap().as_deref(),
-        Some(sql_empty_bytes.as_slice())
+        result.rows()[0].values(),
+        &[Value::Blob(second.into()), Value::Integer(1)]
     );
-    let sql_empty_update_changes = file_changes(&lix, &sql_empty_file_id)
-        .await
-        .into_iter()
-        .skip(sql_empty_changes_before_update.len())
-        .collect::<Vec<_>>();
-    assert!(
-        sql_empty_update_changes
-            .iter()
-            .any(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
-    );
-
-    let sql_rename_csv = b"name,age\nRuth,99\n".to_vec();
-    lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-        &[
-            Value::Text("/sql-rename.csv".to_string()),
-            Value::Blob(sql_rename_csv.clone().into()),
-        ],
-    )
-    .await
-    .unwrap();
-    let sql_rename_file_id = lix
-        .execute(
-            "SELECT id FROM lix_file WHERE path = $1",
-            &[Value::Text("/sql-rename.csv".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(sql_rename_file_id.len(), 1);
-    let sql_rename_file_id = sql_rename_file_id.rows()[0].get::<String>("id").unwrap();
-    let rename = lix
-        .execute(
-            "UPDATE lix_file SET path = $1 WHERE path = $2",
-            &[
-                Value::Text("/sql-rename.txt".to_string()),
-                Value::Text("/sql-rename.csv".to_string()),
-            ],
-        )
-        .await
-        .unwrap();
-    assert_eq!(rename.rows_affected(), 1);
-    assert_eq!(read_file(&lix, "/sql-rename.csv").await.unwrap(), None);
     assert_eq!(
-        read_file(&lix, "/sql-rename.txt").await.unwrap().as_deref(),
-        Some(sql_rename_csv.as_slice())
+        result.rows()[1].values(),
+        &[Value::Blob(first.into()), Value::Integer(2)]
     );
-    let renamed_files = lix
-        .execute(
-            "SELECT data FROM lix_file WHERE path = $1",
-            &[Value::Text("/sql-rename.txt".to_string())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(renamed_files.len(), 1);
     assert_eq!(
-        renamed_files.rows()[0].values(),
-        &[Value::Blob(sql_rename_csv.clone().into())]
+        rejecting_runtime.compile_calls.load(Ordering::SeqCst),
+        0,
+        "file history must not compile or invoke an installed V2 plugin",
     );
-    let active_plugin_rows_after_rename = lix
-        .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
-            &[Value::Text(sql_rename_file_id.clone())],
-        )
+    history_lix
+        .close()
         .await
-        .unwrap();
-    assert_eq!(active_plugin_rows_after_rename.len(), 0);
-    let active_blob_rows_after_rename = lix
-        .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key = 'lix_binary_blob_ref'",
-            &[Value::Text(sql_rename_file_id)],
-        )
-        .await
-        .unwrap();
-    assert_eq!(active_blob_rows_after_rename.len(), 1);
-
-    let sql_changes_before_delete =
-        sql_changes_before_predicate_update + sql_predicate_update_changes.len();
-    lix.execute(
-        "DELETE FROM lix_file WHERE path = $1 AND data = $2",
-        &[
-            Value::Text("/sql-people.csv".to_string()),
-            Value::Blob(sql_predicate_updated_csv.into()),
-        ],
-    )
-    .await
-    .unwrap();
-    assert_eq!(read_file(&lix, "/sql-people.csv").await.unwrap(), None);
-    let sql_delete_changes = file_changes(&lix, &sql_file_id)
-        .await
-        .into_iter()
-        .skip(sql_changes_before_delete)
-        .collect::<Vec<_>>();
-    assert!(
-        sql_delete_changes.iter().any(|change| {
-            change.schema_key == "csv_table" && change.snapshot_content.is_none()
-        })
-    );
-    assert!(
-        sql_delete_changes
-            .iter()
-            .filter(|change| change.schema_key == "csv_row" && change.snapshot_content.is_none())
-            .count()
-            >= 2
-    );
-    let active_plugin_rows_after_delete = lix
-        .execute(
-            "SELECT schema_key FROM lix_state \
-             WHERE file_id = $1 AND schema_key IN ('csv_table', 'csv_row')",
-            &[Value::Text(sql_file_id.clone())],
-        )
-        .await
-        .unwrap();
-    assert_eq!(active_plugin_rows_after_delete.len(), 0);
-
-    lix.close().await.unwrap();
+        .expect("history session should close");
 }
 
 #[tokio::test]
@@ -847,6 +536,166 @@ async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
     );
 
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "10 MiB end-to-end Wasm acceptance gate"]
+async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
+    let archive = build_json_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("workspace should open with the production Wasmtime runtime");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/ten-mib.json";
+    let (before, edit_offset, edited_key) = json_ten_mib_flat_fixture();
+    let replacement = alternate_ascii_hex(before[edit_offset]);
+    let mut after = before.clone();
+    after[edit_offset] = replacement;
+
+    lix.reset_plugin_v2_transition_counters();
+    let cold_started = Instant::now();
+    write_file(&lix, path, before.clone())
+        .await
+        .expect("real JSON v2 Wasm should import the 10 MiB fixture");
+    let cold_elapsed = cold_started.elapsed();
+    let cold = lix.plugin_v2_transition_counters();
+    assert_eq!(
+        cold.source_bytes_read, JSON_TEN_MIB_BYTES as u64,
+        "cold hydration must stream the complete fixture through the Component boundary",
+    );
+    assert_eq!(cold.source_read_calls, 10);
+    assert_eq!(cold.component_import_calls, 10);
+    assert_eq!(
+        cold.host_full_content_classification_bytes,
+        JSON_TEN_MIB_BYTES as u64,
+    );
+    assert_eq!(
+        cold.packet_records,
+        (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64,
+        "cold hydration must emit the root plus every top-level property",
+    );
+    assert_eq!(
+        cold.durable_semantic_changes,
+        (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64,
+    );
+    assert_eq!(cold.full_document_reparses, 1);
+    assert_eq!(cold.full_state_semantic_rows_materialized, 0);
+    assert!(
+        (1..=JSON_V2_GUEST_MEMORY_LIMIT_BYTES).contains(&cold.guest_linear_memory_high_water_bytes),
+        "cold guest high-water {} must remain within the configured 128 MiB actor limit",
+        cold.guest_linear_memory_high_water_bytes,
+    );
+
+    let file_id = file_id_at_path(&lix, path).await;
+    let cold_bytes = read_file(&lix, path)
+        .await
+        .expect("materialized JSON should read")
+        .expect("materialized JSON should exist");
+    assert_eq!(cold_bytes, before);
+
+    let after_blob = after.clone().into();
+    let warm_request_started = Instant::now();
+    let provenance = RequestBlobSpliceProvenance::new_validated(
+        &cold_bytes,
+        &after_blob,
+        &sha256_lower_hex(&cold_bytes),
+        &sha256_lower_hex(&after),
+        edit_offset,
+        cold_bytes.len() - edit_offset - 1,
+        vec![replacement],
+    )
+    .expect("the one-byte JSON transport splice should validate");
+
+    lix.reset_plugin_v2_transition_counters();
+    let warm_engine_started = Instant::now();
+    lix.execute_with_options_and_metadata(
+        "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
+         ON CONFLICT (path) DO UPDATE SET data = excluded.data",
+        &[Value::Text(path.to_owned()), Value::Blob(after_blob)],
+        ExecuteOptions::default(),
+        ExecuteStatementMetadata {
+            parameter_blob_splices: vec![None, Some(provenance)],
+            ..ExecuteStatementMetadata::default()
+        },
+    )
+    .await
+    .expect("one localized edit should pass through the real JSON v2 component");
+    let warm_engine_elapsed = warm_engine_started.elapsed();
+    let warm_request_elapsed = warm_request_started.elapsed();
+    let warm = lix.plugin_v2_transition_counters();
+
+    assert_eq!(warm.host_full_diff_bytes_compared, 0);
+    assert_eq!(warm.host_full_content_classification_bytes, 0);
+    assert_eq!(warm.source_read_calls, 0);
+    assert_eq!(warm.source_bytes_read, 0);
+    assert_eq!(warm.component_import_calls, 0);
+    assert_eq!(warm.full_state_semantic_rows_materialized, 0);
+    assert_eq!(warm.packet_pages, 1);
+    assert_eq!(warm.packet_records, 1);
+    assert_eq!(warm.attachment_reads, 0);
+    assert_eq!(warm.attachment_bytes_read, 0);
+    assert_eq!(warm.durable_semantic_changes, 1);
+    assert_eq!(warm.private_document_cache_hits, 1);
+    assert_eq!(warm.full_document_reparses, 0);
+    assert_eq!(warm.full_renderer_invocations, 0);
+    assert_eq!(warm.shared_renderer_cache_hits, 0);
+    assert_eq!(warm.filesystem_sync_full_renders, 0);
+    assert!(
+        warm.component_boundary_bytes < 64 * 1024,
+        "one scalar edit crossed {} Component-boundary bytes",
+        warm.component_boundary_bytes,
+    );
+    assert!(
+        (1..=JSON_V2_GUEST_MEMORY_LIMIT_BYTES).contains(&warm.guest_linear_memory_high_water_bytes),
+        "warm guest high-water {} must remain within the configured 128 MiB actor limit",
+        warm.guest_linear_memory_high_water_bytes,
+    );
+
+    assert_eq!(
+        read_file(&lix, path)
+            .await
+            .expect("edited materialized JSON should read"),
+        Some(after.clone()),
+    );
+    let expected_scalar_json = json_scalar_at_offset(&after, edit_offset);
+    let edited_member = lix
+        .execute(
+            "SELECT scalar_json FROM json_object_member \
+             WHERE parent_id = 'root' AND key = $1 AND lixcol_file_id = $2",
+            &[Value::Text(edited_key), Value::Text(file_id)],
+        )
+        .await
+        .expect("the edited semantic member should query");
+    assert_eq!(edited_member.len(), 1);
+    assert_eq!(
+        edited_member.rows()[0]
+            .get::<String>("scalar_json")
+            .expect("edited scalar_json should be text"),
+        expected_scalar_json,
+    );
+
+    eprintln!(
+        "v2_json_ten_mib bytes={} properties={} cold_ms={:.3} cold_guest_high_water_bytes={} \
+         warm_request_ms={:.3} warm_engine_transition_ms={:.3} warm_boundary_bytes={} \
+         warm_guest_high_water_bytes={}",
+        JSON_TEN_MIB_BYTES,
+        JSON_TEN_MIB_PROPERTY_COUNT,
+        cold_elapsed.as_secs_f64() * 1_000.0,
+        cold.guest_linear_memory_high_water_bytes,
+        warm_request_elapsed.as_secs_f64() * 1_000.0,
+        warm_engine_elapsed.as_secs_f64() * 1_000.0,
+        warm.component_boundary_bytes,
+        warm.guest_linear_memory_high_water_bytes,
+    );
+
+    lix.close().await.expect("workspace should close");
 }
 
 #[tokio::test]
@@ -1337,85 +1186,6 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
 }
 
 #[tokio::test]
-async fn v2_csv_cold_open_preserves_legacy_uuid_rows_while_allocating_new_compact_ids() {
-    let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_csv_v2_plugin_archive();
-    let path = "/legacy-identities.csv";
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-    install_plugin(&lix, "plugin_csv_v2", &archive)
-        .await
-        .unwrap();
-    let initial = b"old,one\nkeep,two\n".to_vec();
-    write_file(&lix, path, initial.clone()).await.unwrap();
-    let file_id = file_id_at_path(&lix, path).await;
-    let compact_rows = active_csv_v2_rows(&lix, &file_id).await;
-    let legacy_ids = [
-        "018f47d2-7b2e-7b4c-8e3a-0123456789ab",
-        "018f47d2-7b2e-7b4c-8e3a-0123456789ac",
-    ];
-
-    // Public semantic DML models a repository created by an older plugin.
-    // Reopening below ensures the v2 component receives these identities from
-    // durable state rather than from the actor that imported the raw bytes.
-    let mut transaction = lix.begin_transaction().await.unwrap();
-    for (row, legacy_id) in compact_rows.iter().zip(legacy_ids) {
-        transaction
-            .execute(
-                "DELETE FROM csv_v2_row WHERE id = $1 AND lixcol_file_id = $2",
-                &[Value::Text(row.id.clone()), Value::Text(file_id.clone())],
-            )
-            .await
-            .unwrap();
-        transaction
-            .execute(
-                "INSERT INTO csv_v2_row (id, order_key, cells, lixcol_file_id) \
-                 VALUES ($1, $2, $3, $4)",
-                &[
-                    Value::Text(legacy_id.to_string()),
-                    Value::Text(row.order_key.clone()),
-                    Value::Json(serde_json::json!(row.cells)),
-                    Value::Text(file_id.clone()),
-                ],
-            )
-            .await
-            .unwrap();
-    }
-    transaction.commit().await.unwrap();
-    lix.close().await.unwrap();
-
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(initial));
-    let cold_rows = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&cold_rows, &["old", "one"]), legacy_ids[0]);
-    assert_eq!(csv_v2_row_id(&cold_rows, &["keep", "two"]), legacy_ids[1]);
-
-    let changed = b"keep,TWO\nnew,three\nold,one\n".to_vec();
-    write_file(&lix, path, changed).await.unwrap();
-    let after_change = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(
-        csv_v2_row_id(&after_change, &["keep", "TWO"]),
-        legacy_ids[1]
-    );
-    assert_eq!(csv_v2_row_id(&after_change, &["old", "one"]), legacy_ids[0]);
-    let compact_id = csv_v2_row_id(&after_change, &["new", "three"]);
-    assert_eq!(compact_id.len(), 32);
-    assert_eq!(URL_SAFE_NO_PAD.decode(&compact_id).unwrap().len(), 24);
-
-    let final_bytes = b"keep,TWO\nnew,three\n".to_vec();
-    write_file(&lix, path, final_bytes.clone()).await.unwrap();
-    let final_rows = active_csv_v2_rows(&lix, &file_id).await;
-    assert_eq!(csv_v2_row_id(&final_rows, &["keep", "TWO"]), legacy_ids[1]);
-    assert_eq!(csv_v2_row_id(&final_rows, &["new", "three"]), compact_id);
-    assert!(!final_rows.iter().any(|row| row.id == legacy_ids[0]));
-    lix.close().await.unwrap();
-
-    let lix = open_lix_with_filesystem(tempdir.path()).await;
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(final_bytes));
-    assert_eq!(active_csv_v2_rows(&lix, &file_id).await, final_rows);
-    lix.close().await.unwrap();
-}
-
-#[tokio::test]
 async fn v2_csv_file_incarnation_fences_old_observations_after_delete_and_recreate() {
     let archive = build_csv_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -1714,10 +1484,16 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
 
 #[tokio::test]
 async fn transaction_lix_file_data_uses_session_plugin_runtime() {
-    let archive = build_csv_plugin_archive();
+    let archive = build_csv_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
 
-    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v2",
+        &archive,
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
     let csv = b"name,age\nAda,37\nGrace,85\n".to_vec();
     write_file(&lix, "/tx-plugin.csv", csv.clone())
         .await
@@ -1753,12 +1529,14 @@ async fn transaction_lix_file_data_uses_session_plugin_runtime() {
 async fn filesystem_materializes_internal_lix_plugin_paths() {
     let tempdir = tempfile::tempdir().unwrap();
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    let archive = build_csv_plugin_archive();
+    let archive = build_csv_v2_plugin_archive();
 
-    install_plugin(&lix, "plugin_csv", &archive).await.unwrap();
+    install_plugin(&lix, "plugin_csv_v2", &archive)
+        .await
+        .unwrap();
 
     wait_for_disk_file(
-        &tempdir.path().join(".lix/plugins/plugin_csv.lixplugin"),
+        &tempdir.path().join(".lix/plugins/plugin_csv_v2.lixplugin"),
         Some(archive.as_slice()),
     );
     lix.close().await.unwrap();
@@ -1767,8 +1545,8 @@ async fn filesystem_materializes_internal_lix_plugin_paths() {
 #[tokio::test]
 async fn filesystem_imports_lix_plugin_archives_from_disk() {
     let tempdir = tempfile::tempdir().unwrap();
-    let archive = build_csv_plugin_archive();
-    let plugin_path = tempdir.path().join(".lix/plugins/plugin_csv.lixplugin");
+    let archive = build_csv_v2_plugin_archive();
+    let plugin_path = tempdir.path().join(".lix/plugins/plugin_csv_v2.lixplugin");
     std::fs::create_dir_all(plugin_path.parent().unwrap()).unwrap();
     std::fs::write(&plugin_path, &archive).unwrap();
 
@@ -1776,22 +1554,15 @@ async fn filesystem_imports_lix_plugin_archives_from_disk() {
 
     let plugins = list_installed_plugins(&lix).await;
     assert_eq!(plugins.len(), 1);
-    assert_eq!(plugins[0].key, "plugin_csv");
+    assert_eq!(plugins[0].key, "plugin_csv_v2");
     assert_eq!(
-        read_file(&lix, "/.lix/plugins/plugin_csv.lixplugin")
+        read_file(&lix, "/.lix/plugins/plugin_csv_v2.lixplugin")
             .await
             .unwrap()
             .as_deref(),
         Some(archive.as_slice())
     );
     lix.close().await.unwrap();
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct FileChange {
-    schema_key: String,
-    entity_pk: serde_json::Value,
-    snapshot_content: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1895,36 +1666,6 @@ fn csv_v2_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
     ids[0].clone()
 }
 
-async fn file_changes(lix: &Lix, file_id: &str) -> Vec<FileChange> {
-    let changes = lix
-        .execute(
-            "SELECT schema_key, entity_pk, snapshot_content \
-             FROM lix_change \
-             WHERE file_id = $1 \
-             ORDER BY created_at, id",
-            &[Value::Text(file_id.to_string())],
-        )
-        .await
-        .unwrap();
-
-    changes
-        .rows()
-        .iter()
-        .map(|row| {
-            let snapshot_content = match row.value("snapshot_content").unwrap() {
-                Value::Json(value) => Some(value.clone()),
-                Value::Null => None,
-                other => panic!("expected JSON or null snapshot_content, got {other:?}"),
-            };
-            FileChange {
-                schema_key: row.get::<String>("schema_key").unwrap(),
-                entity_pk: row.get::<serde_json::Value>("entity_pk").unwrap(),
-                snapshot_content,
-            }
-        })
-        .collect()
-}
-
 async fn plugin_namespace_reservation_count<StorageImpl>(
     lix: &Lix<StorageImpl>,
     file_id: &str,
@@ -1947,7 +1688,7 @@ where
             .and_then(|value| value.as_array().cloned())
             .and_then(|parts| parts.into_iter().next())
             .and_then(|part| part.as_str().map(str::to_string))
-            .is_some_and(|key| key.starts_with("lix_plugin_id_namespace_v1:"))
+            .is_some_and(|key| key.starts_with("lix_plugin_id_namespace_v2:"))
     })
     .count()
 }
@@ -2128,38 +1869,6 @@ fn wait_for_disk_file(path: &Path, expected: Option<&[u8]>) {
     }
 }
 
-fn build_csv_plugin_archive() -> Vec<u8> {
-    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv"));
-    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
-        panic!(
-            "failed to read bindep-built CSV plugin wasm at {}: {error}",
-            wasm_path.display()
-        )
-    });
-    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-    let options =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        (
-            "manifest.json",
-            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
-        ),
-        (
-            "schema/csv_table.json",
-            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
-        ),
-        (
-            "schema/csv_row.json",
-            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
-        writer.start_file(path, options).unwrap();
-        writer.write_all(bytes).unwrap();
-    }
-    writer.finish().unwrap().into_inner()
-}
-
 fn build_csv_v2_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2"));
     let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
@@ -2241,6 +1950,93 @@ fn build_json_v2_plugin_archive() -> Vec<u8> {
         writer.write_all(bytes).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+
+const JSON_TEN_MIB_BYTES: usize = 10 * 1024 * 1024;
+const JSON_TEN_MIB_PROPERTY_COUNT: usize = 39_870;
+const JSON_V2_GUEST_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+
+fn json_ten_mib_flat_fixture() -> (Vec<u8>, usize, String) {
+    const BASE_MEMBER_BYTES: usize = 44;
+    let base_bytes =
+        2 + JSON_TEN_MIB_PROPERTY_COUNT * BASE_MEMBER_BYTES + JSON_TEN_MIB_PROPERTY_COUNT - 1;
+    let padding = JSON_TEN_MIB_BYTES
+        .checked_sub(base_bytes)
+        .expect("10 MiB target should accommodate the fixed JSON members");
+    let padding_per_property = padding / JSON_TEN_MIB_PROPERTY_COUNT;
+    let extra_padding_properties = padding % JSON_TEN_MIB_PROPERTY_COUNT;
+
+    let mut bytes = Vec::with_capacity(JSON_TEN_MIB_BYTES);
+    let mut state = 0x6a73_6f6e_2d31_306du64;
+    let edited_index = JSON_TEN_MIB_PROPERTY_COUNT / 2;
+    let edited_key = format!("property_{edited_index:06}");
+    let mut edit_offset = None;
+    bytes.push(b'{');
+    for index in 0..JSON_TEN_MIB_PROPERTY_COUNT {
+        if index > 0 {
+            bytes.push(b',');
+        }
+        state = splitmix64(state);
+        let first = state;
+        state = splitmix64(state);
+        let second = u32::try_from(state & u64::from(u32::MAX)).expect("masked value fits u32");
+        write!(
+            &mut bytes,
+            "\"property_{index:06}\":\"{first:016x}{second:08x}"
+        )
+        .expect("write deterministic JSON property");
+        if index == edited_index {
+            edit_offset = Some(bytes.len() - 24);
+        }
+        let property_padding = padding_per_property + usize::from(index < extra_padding_properties);
+        bytes.extend(std::iter::repeat_n(b'f', property_padding));
+        bytes.push(b'"');
+    }
+    bytes.push(b'}');
+    assert_eq!(bytes.len(), JSON_TEN_MIB_BYTES);
+    (
+        bytes,
+        edit_offset.expect("middle property should have an edit offset"),
+        edited_key,
+    )
+}
+
+fn alternate_ascii_hex(byte: u8) -> u8 {
+    if byte == b'0' { b'1' } else { b'0' }
+}
+
+fn splitmix64(mut state: u64) -> u64 {
+    state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn sha256_lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn json_scalar_at_offset(bytes: &[u8], offset: usize) -> String {
+    let start = bytes[..offset]
+        .iter()
+        .rposition(|byte| *byte == b'"')
+        .expect("edited JSON scalar should have an opening quote");
+    let end = offset
+        + bytes[offset..]
+            .iter()
+            .position(|byte| *byte == b'"')
+            .expect("edited JSON scalar should have a closing quote");
+    std::str::from_utf8(&bytes[start..=end])
+        .expect("fixture scalar should be UTF-8")
+        .to_owned()
 }
 
 fn build_excalidraw_v2_plugin_archive() -> Vec<u8> {

@@ -24,11 +24,11 @@ pub use lix_engine::telemetry::{
     TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,
     TelemetrySpanStatus, TelemetryValue, TracingTelemetrySink,
 };
-pub use lix_engine::wasm::v2::{WasmComponentV2Factory, WasmTransitionCounters};
-pub use lix_engine::wasm::{
-    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
-    WasmPluginFile, WasmRuntime,
-};
+/// Host-side contract for supplying a custom Component API v2 runtime through
+/// [`OpenLixOptions::with_wasm_runtime`]. This is the engine/embedding boundary,
+/// not a plugin-authoring SDK.
+pub use lix_engine::wasm::v2::*;
+pub use lix_engine::wasm::{WasmLimits, WasmRuntime};
 pub use lix_engine::{
     CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
     CreateBranchReceipt as CreateBranchResult, ExecuteBatchStatement, ExecuteOptions,

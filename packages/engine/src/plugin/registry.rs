@@ -20,18 +20,18 @@ use crate::live_state::MaterializedLiveStateRow;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
+use super::InstalledPlugin;
 use super::manifest::{
     PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
-use super::{InstalledPlugin, InstalledPluginMetadata};
 
-pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v1";
-pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v1";
+pub(crate) const PLUGIN_REGISTRY_KEY: &str = "lix_plugin_registry_v2";
+pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const REGISTRY_FORMAT_VERSION: u32 = 1;
+const REGISTRY_FORMAT_VERSION: u32 = 2;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
 
@@ -121,10 +121,6 @@ impl PluginRegistryEntry {
         &self.key
     }
 
-    pub(crate) fn runtime(&self) -> PluginRuntime {
-        self.runtime
-    }
-
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
     }
@@ -139,17 +135,6 @@ impl PluginRegistryEntry {
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
         &self.archive_blob_hash
-    }
-
-    pub(crate) fn to_installed_plugin_metadata(&self) -> InstalledPluginMetadata {
-        InstalledPluginMetadata {
-            key: self.key.clone(),
-            archive_path: self.archive_path.clone(),
-            archive_blob_hash: self.archive_blob_hash.clone(),
-            path_glob: self.path_glob.clone(),
-            content_type: self.content_type,
-            schema_keys: self.schema_keys.clone(),
-        }
     }
 
     pub(crate) fn wasm_blob_hash(&self) -> &str {
@@ -167,8 +152,6 @@ impl PluginRegistryEntry {
         replacement: &Self,
     ) -> Result<(), LixError> {
         let incompatible = self.key != replacement.key
-            || self.runtime != PluginRuntime::WasmComponentV2
-            || replacement.runtime != PluginRuntime::WasmComponentV2
             || self.api_version != replacement.api_version
             || self.path_glob != replacement.path_glob
             || self.content_type != replacement.content_type
@@ -213,7 +196,7 @@ impl PluginRegistryEntry {
     }
 }
 
-/// Canonical contents of `lix_key_value:lix_plugin_registry_v1`.
+/// Canonical contents of `lix_key_value:lix_plugin_registry_v2`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PluginRegistry {
     plugin_count: u32,
@@ -244,7 +227,7 @@ impl PluginRegistry {
     pub(crate) fn new(mut plugins: Vec<PluginRegistryEntry>) -> Result<Self, LixError> {
         if plugins.len() > MAX_PLUGIN_REGISTRY_ENTRIES {
             return Err(invalid_registry(format!(
-                "plugin_count {} exceeds the v1 limit of {MAX_PLUGIN_REGISTRY_ENTRIES}",
+                "plugin_count {} exceeds the registry capacity of {MAX_PLUGIN_REGISTRY_ENTRIES}",
                 plugins.len()
             )));
         }
@@ -255,7 +238,7 @@ impl PluginRegistry {
         validate_strictly_increasing_plugin_keys(&plugins)?;
 
         let plugin_count = u32::try_from(plugins.len()).map_err(|_| {
-            invalid_registry("plugin_count cannot be represented by the v1 registry format")
+            invalid_registry("plugin_count cannot be represented by the registry format")
         })?;
         let generation = calculate_generation(&plugins)?;
         Ok(Self {
@@ -326,7 +309,7 @@ impl PluginRegistry {
     pub(crate) fn recompute_generation(&mut self) -> Result<(), LixError> {
         if self.plugins.len() > MAX_PLUGIN_REGISTRY_ENTRIES {
             return Err(invalid_registry(format!(
-                "plugin_count {} exceeds the v1 limit of {MAX_PLUGIN_REGISTRY_ENTRIES}",
+                "plugin_count {} exceeds the registry capacity of {MAX_PLUGIN_REGISTRY_ENTRIES}",
                 self.plugins.len()
             )));
         }
@@ -335,7 +318,7 @@ impl PluginRegistry {
             validate_entry(entry)?;
         }
         self.plugin_count = u32::try_from(self.plugins.len()).map_err(|_| {
-            invalid_registry("plugin_count cannot be represented by the v1 registry format")
+            invalid_registry("plugin_count cannot be represented by the registry format")
         })?;
         self.generation = calculate_generation(&self.plugins)?;
         Ok(())
@@ -418,12 +401,12 @@ impl PluginRegistry {
         }
         if wire.plugins.len() > MAX_PLUGIN_REGISTRY_ENTRIES {
             return Err(invalid_registry(format!(
-                "plugin_count {} exceeds the v1 limit of {MAX_PLUGIN_REGISTRY_ENTRIES}",
+                "plugin_count {} exceeds the registry capacity of {MAX_PLUGIN_REGISTRY_ENTRIES}",
                 wire.plugins.len()
             )));
         }
         let actual_count = u32::try_from(wire.plugins.len()).map_err(|_| {
-            invalid_registry("plugin_count cannot be represented by the v1 registry format")
+            invalid_registry("plugin_count cannot be represented by the registry format")
         })?;
         if wire.plugin_count != actual_count {
             return Err(invalid_registry(format!(
@@ -815,15 +798,6 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
             entry.key
         )));
     }
-    if !entry.host_allocated_schema_keys.is_empty()
-        && entry.runtime != PluginRuntime::WasmComponentV2
-    {
-        return Err(invalid_registry(format!(
-            "plugin '{}' may declare host-allocated IDs only for wasm-component-v2",
-            entry.key
-        )));
-    }
-
     let manifest: PluginManifest = serde_json::from_str(&entry.manifest_json).map_err(|error| {
         invalid_registry(format!(
             "plugin '{}' manifest_json has an invalid shape: {error}",
@@ -1098,8 +1072,8 @@ mod tests {
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
                 "match":{{"path_glob":{path_glob:?}{content_type}}},
-                "api_version":"0.1.0",
-                "runtime":"wasm-component-v1",
+                "api_version":"2.0.0",
+                "runtime":"wasm-component-v2",
                 "key":{key:?}
             }}"#
         )
@@ -1117,8 +1091,8 @@ mod tests {
     ) -> PluginRegistryEntry {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -1336,8 +1310,8 @@ mod tests {
         let wasm = b"compiled component".to_vec();
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
             path_glob: "*.json".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),

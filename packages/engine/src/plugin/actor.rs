@@ -1085,7 +1085,7 @@ mod tests {
             file_id: "file".to_owned(),
             path: path.to_owned(),
             owner_change_id: "incarnation".to_owned(),
-            plugin_key: "plugin_csv".to_owned(),
+            plugin_key: "plugin_csv_v2".to_owned(),
             plugin_generation: generation.to_owned(),
         }
     }

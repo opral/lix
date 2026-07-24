@@ -8,33 +8,11 @@ mod component_v2;
 
 pub use component_v2::*;
 
-/// Backward-compatible public path for Component v2 runtime implementations.
+/// Public path for Component v2 runtime implementations.
 ///
 /// Engine code should import these facade types directly from `crate::wasm`.
 pub mod v2 {
     pub use super::component_v2::*;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmPluginFile {
-    pub filename: Option<String>,
-    pub data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmPluginEntityState {
-    pub entity_pk: Vec<String>,
-    pub schema_key: String,
-    pub snapshot_content: String,
-    pub metadata: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WasmPluginDetectedChange {
-    pub entity_pk: Vec<String>,
-    pub schema_key: String,
-    pub snapshot_content: Option<String>,
-    pub metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,43 +38,18 @@ impl Default for WasmLimits {
     }
 }
 
+/// Runtime contract for the incremental Component v2 protocol.
 #[async_trait]
 pub trait WasmRuntime: Send + Sync {
-    async fn init_component(
+    /// Compiles a Component once so immutable machine code can be shared by
+    /// many file actors. Each actor must subsequently call
+    /// [`WasmComponentV2Factory::instantiate_actor`] to obtain an isolated
+    /// Store/instance; document handles never cross actor boundaries.
+    async fn compile_component_v2(
         &self,
         bytes: Vec<u8>,
         limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError>;
-
-    /// Compiles a v2 Component once so its immutable machine code can be
-    /// shared by many file actors. Each actor must subsequently call
-    /// [`WasmComponentV2Factory::instantiate_actor`] to obtain an isolated
-    /// Store/instance; v2 document handles must never be shared across actors.
-    async fn compile_component_v2(
-        &self,
-        _bytes: Vec<u8>,
-        _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
-        Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            "the configured WASM runtime does not support wasm-component-v2",
-        ))
-    }
-}
-
-#[async_trait]
-pub trait WasmComponentInstance: Send + Sync {
-    async fn detect_changes(
-        &self,
-        state: Vec<WasmPluginEntityState>,
-        file: WasmPluginFile,
-    ) -> Result<Vec<WasmPluginDetectedChange>, LixError>;
-
-    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError>;
-
-    async fn close(&self) -> Result<(), LixError> {
-        Ok(())
-    }
+    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -104,14 +57,14 @@ pub struct UnsupportedWasmRuntime;
 
 #[async_trait]
 impl WasmRuntime for UnsupportedWasmRuntime {
-    async fn init_component(
+    async fn compile_component_v2(
         &self,
         _bytes: Vec<u8>,
         _limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
         Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "plugin execution requires a configured WASM component runtime",
+            "plugin execution requires a configured WASM component v2 runtime",
         ))
     }
 }

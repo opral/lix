@@ -4,26 +4,22 @@ import { fileURLToPath } from "node:url";
 import type {
 	LixStorageConfig,
 	LixBinding,
-	PluginRuntimeDispatch,
 	TelemetryDispatch,
 } from "./binding-types.js";
 
 type NativeAddon = {
 	Lix: {
 		openMemory(
-			dispatch: PluginRuntimeDispatch,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 		openSQLite(
 			path: string,
-			dispatch: PluginRuntimeDispatch,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 		openLocalFilesystem(
 			path: string,
 			lixDir: string | undefined,
 			syncAllFiles: boolean,
-			dispatch: PluginRuntimeDispatch,
 			telemetry?: (spanJson: string) => void,
 		): Promise<LixBinding>;
 	};
@@ -75,7 +71,6 @@ try {
 
 export function openLixBinding(
 	storage: LixStorageConfig,
-	dispatch: PluginRuntimeDispatch,
 	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
 	const nativeTelemetry = telemetry
@@ -88,15 +83,14 @@ export function openLixBinding(
 					"Memory snapshots are only available in the browser binding",
 				);
 			}
-			return addon.Lix.openMemory(dispatch, nativeTelemetry);
+			return addon.Lix.openMemory(nativeTelemetry);
 		case "sqlite":
-			return addon.Lix.openSQLite(storage.path, dispatch, nativeTelemetry);
+			return addon.Lix.openSQLite(storage.path, nativeTelemetry);
 		case "localFilesystem":
 			return addon.Lix.openLocalFilesystem(
 				storage.path,
 				storage.lixDir,
 				storage.syncAllFiles,
-				dispatch,
 				nativeTelemetry,
 			);
 	}

@@ -80,7 +80,6 @@ export type ObserveEventsBinding = {
 	close(): void;
 };
 
-export type PluginRuntimeDispatch = (request: unknown) => Promise<unknown>;
 export type TelemetryDispatch = (span: LixTelemetrySpan) => void;
 
 export type LixStorageConfig =

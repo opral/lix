@@ -8,7 +8,7 @@ use lix_sdk::{
     MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent as RsObserveEvent,
     ObserveEvents as RsObserveEvents, OpenLixOptions as RsOpenLixOptions, SQLite, SQLiteOptions,
     SwitchBranchOptions as RsSwitchBranchOptions, SwitchBranchReceipt, TelemetrySink, Value,
-    WasmRuntime, open_lix, open_lix_with_telemetry,
+    open_lix, open_lix_with_telemetry,
 };
 use napi::JsDeferred;
 use napi::bindgen_prelude::*;
@@ -23,8 +23,6 @@ use std::sync::{
 use std::thread;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
-
-use crate::js_wasm_runtime::{JsWasmRuntime, SharedJsWasmRuntimeDispatch};
 
 type JsTelemetryDispatch = ThreadsafeFunction<String, (), String, Status, false>;
 type SharedJsTelemetryDispatch = Arc<JsTelemetryDispatch>;
@@ -718,20 +716,17 @@ pub struct OpenLocalFilesystemTask {
     path: String,
     lix_dir: Option<String>,
     sync_all_files: bool,
-    wasm_runtime_dispatch: Option<SharedJsWasmRuntimeDispatch>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
 #[expect(missing_debug_implementations)]
 pub struct OpenMemoryTask {
-    wasm_runtime_dispatch: Option<SharedJsWasmRuntimeDispatch>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
 #[expect(missing_debug_implementations)]
 pub struct OpenSQLiteTask {
     path: String,
-    wasm_runtime_dispatch: Option<SharedJsWasmRuntimeDispatch>,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 }
 
@@ -740,12 +735,10 @@ impl Task for OpenLocalFilesystemTask {
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let wasm_runtime_dispatch = take_wasm_runtime_dispatch(&mut self.wasm_runtime_dispatch)?;
         Ok(open_local_filesystem_native(
             std::mem::take(&mut self.path),
             self.lix_dir.take(),
             std::mem::take(&mut self.sync_all_files),
-            wasm_runtime_dispatch,
             self.telemetry_dispatch.take(),
         ))
     }
@@ -760,11 +753,7 @@ impl Task for OpenMemoryTask {
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let wasm_runtime_dispatch = take_wasm_runtime_dispatch(&mut self.wasm_runtime_dispatch)?;
-        Ok(open_memory_native(
-            wasm_runtime_dispatch,
-            self.telemetry_dispatch.take(),
-        ))
+        Ok(open_memory_native(self.telemetry_dispatch.take()))
     }
 
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
@@ -777,10 +766,8 @@ impl Task for OpenSQLiteTask {
     type JsValue = NativeLix;
 
     fn compute(&mut self) -> Result<Self::Output> {
-        let wasm_runtime_dispatch = take_wasm_runtime_dispatch(&mut self.wasm_runtime_dispatch)?;
         Ok(open_sqlite_native(
             std::mem::take(&mut self.path),
-            wasm_runtime_dispatch,
             self.telemetry_dispatch.take(),
         ))
     }
@@ -788,17 +775,6 @@ impl Task for OpenSQLiteTask {
     fn resolve(&mut self, env: Env, output: Self::Output) -> Result<Self::JsValue> {
         output.map_err(|error| lix_error_to_napi_error(&env, error))
     }
-}
-
-fn take_wasm_runtime_dispatch(
-    dispatch: &mut Option<SharedJsWasmRuntimeDispatch>,
-) -> Result<SharedJsWasmRuntimeDispatch> {
-    dispatch.take().ok_or_else(|| {
-        Error::new(
-            Status::GenericFailure,
-            "JavaScript WASM runtime dispatch was already consumed",
-        )
-    })
 }
 
 fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink> {
@@ -812,15 +788,13 @@ fn telemetry_sink(dispatch: SharedJsTelemetryDispatch) -> Arc<dyn TelemetrySink>
 }
 
 fn open_memory_native(
-    wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
-    let options = RsOpenLixOptions::default()
-        .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
+    let options = RsOpenLixOptions::default();
     let lix = match telemetry_dispatch.map(telemetry_sink) {
         Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
         None => rt.block_on(open_lix(options))?,
@@ -830,7 +804,6 @@ fn open_memory_native(
 
 fn open_sqlite_native(
     path: String,
-    wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
@@ -838,8 +811,7 @@ fn open_sqlite_native(
         .build()
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let storage = SQLite::new(SQLiteOptions { path: path.into() })?;
-    let options = RsOpenLixOptions::new(storage)
-        .with_wasm_runtime(Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch)));
+    let options = RsOpenLixOptions::new(storage);
     let lix = match telemetry_dispatch.map(telemetry_sink) {
         Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
         None => rt.block_on(open_lix(options))?,
@@ -851,7 +823,6 @@ fn open_local_filesystem_native(
     path: String,
     lix_dir: Option<String>,
     sync_all_files: bool,
-    wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
     telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
 ) -> std::result::Result<NativeLix, LixError> {
     let rt = Builder::new_current_thread()
@@ -860,12 +831,8 @@ fn open_local_filesystem_native(
         .map_err(|error| LixError::unknown(format!("failed to create tokio runtime: {error}")))?;
     let mut options = LocalFilesystemOpenOptions::new(path, sync_all_files);
     options.lix_dir = lix_dir.map(Into::into);
-    let wasm_runtime: Arc<dyn WasmRuntime> = Arc::new(JsWasmRuntime::new(wasm_runtime_dispatch));
-    let storage = rt.block_on(LocalFilesystem::open_with_options_and_wasm_runtime(
-        options,
-        Arc::clone(&wasm_runtime),
-    ))?;
-    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(wasm_runtime);
+    let storage = rt.block_on(LocalFilesystem::open_with_options(options))?;
+    let options = RsOpenLixOptions::new(storage.clone());
     let lix = match telemetry_dispatch.map(telemetry_sink) {
         Some(telemetry) => rt.block_on(open_lix_with_telemetry(options, telemetry))?,
         None => rt.block_on(open_lix(options))?,
@@ -877,24 +844,18 @@ fn open_local_filesystem_native(
 impl NativeLix {
     #[napi(js_name = "openMemory")]
     pub fn open_memory(
-        wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
         telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     ) -> AsyncTask<OpenMemoryTask> {
-        AsyncTask::new(OpenMemoryTask {
-            wasm_runtime_dispatch: Some(wasm_runtime_dispatch),
-            telemetry_dispatch,
-        })
+        AsyncTask::new(OpenMemoryTask { telemetry_dispatch })
     }
 
     #[napi(js_name = "openSQLite")]
     pub fn open_sqlite(
         path: String,
-        wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
         telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     ) -> AsyncTask<OpenSQLiteTask> {
         AsyncTask::new(OpenSQLiteTask {
             path,
-            wasm_runtime_dispatch: Some(wasm_runtime_dispatch),
             telemetry_dispatch,
         })
     }
@@ -904,14 +865,12 @@ impl NativeLix {
         path: String,
         lix_dir: Option<String>,
         sync_all_files: bool,
-        wasm_runtime_dispatch: SharedJsWasmRuntimeDispatch,
         telemetry_dispatch: Option<SharedJsTelemetryDispatch>,
     ) -> AsyncTask<OpenLocalFilesystemTask> {
         AsyncTask::new(OpenLocalFilesystemTask {
             path,
             lix_dir,
             sync_all_files,
-            wasm_runtime_dispatch: Some(wasm_runtime_dispatch),
             telemetry_dispatch,
         })
     }

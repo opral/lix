@@ -653,7 +653,7 @@ test("fs storage imports files through installed WASM plugins", async () => {
 	});
 	const lix = await openLix({ storage });
 	const markdownPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_md_v2",
+		(plugin) => plugin.key === "plugin_markdown_incremental_v2",
 	);
 	if (!markdownPlugin) throw new Error("expected bundled Markdown plugin");
 
@@ -665,7 +665,7 @@ test("fs storage imports files through installed WASM plugins", async () => {
 	await storage.importPaths(["note.md"]);
 
 	const nodes = await lix.execute(
-		"SELECT kind FROM markdown_node ORDER BY kind",
+		"SELECT kind FROM markdown_node_v2 ORDER BY kind",
 	);
 	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
 		"document",
@@ -1033,12 +1033,12 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 		 FROM information_schema.tables \
 		 WHERE table_name IN ($1, $2, $3) \
 		 ORDER BY table_name",
-		["csv_row", "csv_table", "markdown_node"],
+		["csv_v2_row", "csv_v2_table", "markdown_node_v2"],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
-		"csv_row",
-		"csv_table",
-		"markdown_node",
+		"csv_v2_row",
+		"csv_v2_table",
+		"markdown_node_v2",
 	]);
 
 	await lix.close();
@@ -1047,7 +1047,7 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 test("SQL plugin archive upsert stores the archive and installs schemas", async () => {
 	const lix = await openLix();
 	const csvPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_csv",
+		(plugin) => plugin.key === "plugin_csv_v2",
 	);
 	if (!csvPlugin) {
 		throw new Error("expected bundled CSV plugin");
@@ -1066,11 +1066,11 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 		 FROM information_schema.tables \
 		 WHERE table_name IN ($1, $2) \
 		 ORDER BY table_name",
-		["csv_row", "csv_table"],
+		["csv_v2_row", "csv_v2_table"],
 	);
 	expect(schemas.rows.map((row) => row.get("table_name"))).toEqual([
-		"csv_row",
-		"csv_table",
+		"csv_v2_row",
+		"csv_v2_table",
 	]);
 
 	await lix.close();
@@ -1079,7 +1079,7 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 test("bundled Markdown plugin executes detect-changes and render", async () => {
 	const lix = await openLix();
 	const markdownPlugin = (await bundledPluginArchives()).find(
-		(plugin) => plugin.key === "plugin_md_v2",
+		(plugin) => plugin.key === "plugin_markdown_incremental_v2",
 	);
 	if (!markdownPlugin) {
 		throw new Error("expected bundled Markdown plugin");
@@ -1094,7 +1094,7 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 	await writeFile(lix, "/notes.md", new TextEncoder().encode(source));
 
 	const nodes = await lix.execute(
-		"SELECT id, kind FROM markdown_node ORDER BY kind",
+		"SELECT id, kind FROM markdown_node_v2 ORDER BY kind",
 	);
 	expect(nodes.rows.map((row) => row.get("kind"))).toEqual([
 		"document",
@@ -1109,8 +1109,8 @@ test("bundled Markdown plugin executes detect-changes and render", async () => {
 		.find((row) => row.get("kind") === "paragraph")
 		?.get("id");
 	expect(typeof paragraphId).toBe("string");
-	await lix.execute("UPDATE markdown_node SET payload = $1 WHERE id = $2", [
-		{ inline: [{ type: "text", value: "Edited paragraph." }] },
+	await lix.execute("UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2", [
+		JSON.stringify({ inline: [{ type: "text", value: "Edited paragraph." }] }),
 		paragraphId,
 	]);
 	const stateEdited = await readFile(lix, "/notes.md");

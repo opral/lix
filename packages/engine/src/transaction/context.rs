@@ -31,7 +31,7 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, blob_ref_row,
-    blob_ref_tombstone_row, load_path_index_revision,
+    load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::live_state::{
@@ -45,15 +45,14 @@ use crate::plugin::{
     PluginActorLease, PluginArchiveInstallPlan, PluginContentType, PluginDetectedChange,
     PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
     PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, VecEntityChangeSource,
-    VecEntitySource, build_file_update_splices, detect_changes_with_component_instance,
-    drain_entity_transition_edits, drain_file_transition_changes,
-    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
-    inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, plugin_install_plan_from_archive_path,
+    VecEntitySource, build_file_update_splices, drain_entity_transition_edits,
+    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
+    host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
+    is_reservation_key, local_mutation_identity, plugin_install_plan_from_archive_path,
     plugin_key_from_archive_file_id, plugin_state_live_state_projection,
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
-    retain_plugin_state_rows_for_schema_keys, transport_splice_preserves_utf8,
-    validate_host_allocated_changes, validate_namespace_reservation,
+    transport_splice_preserves_utf8, validate_host_allocated_changes,
+    validate_namespace_reservation,
 };
 use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
 use crate::sql2::{
@@ -89,7 +88,6 @@ use crate::wasm::{
     WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
     WasmPluginSelection, WasmTransitionLimits,
 };
-use crate::wasm::{WasmComponentInstance, WasmPluginFile};
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1236,36 +1234,6 @@ where
         }
     }
 
-    fn acknowledged_session_plugin_state(
-        &self,
-        key: &SessionFileViewKey,
-        plugin: &PluginRegistryEntry,
-        owner_change_id: &str,
-    ) -> Option<Vec<MaterializedLiveStateRow>> {
-        if let Some(mutation) = self.pending_file_view_mutations.get(key) {
-            return match mutation {
-                SessionFileViewMutation::Set { view, .. }
-                    if view.plugin_key == plugin.key()
-                        && view.plugin_generation == plugin.archive_blob_hash()
-                        && view.owner_change_id == owner_change_id =>
-                {
-                    Some(view.rows.to_vec())
-                }
-                SessionFileViewMutation::Set { .. } | SessionFileViewMutation::Remove { .. } => {
-                    None
-                }
-            };
-        }
-        self.session_file_views
-            .plugin_file_view(
-                key,
-                plugin.key(),
-                plugin.archive_blob_hash(),
-                owner_change_id,
-            )
-            .map(|view| view.rows.to_vec())
-    }
-
     fn acknowledged_session_plugin_observation(
         &self,
         key: &SessionFileViewKey,
@@ -1947,9 +1915,6 @@ where
                     ),
                 ));
             }
-            if plugin.runtime() != crate::plugin::PluginRuntime::WasmComponentV2 {
-                continue;
-            }
             if file_data_keys.contains(&file_key) {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
@@ -2076,9 +2041,7 @@ where
             // the ordinary full-payload classifier below.
             let warm_owned_plugin = owners.get(&file_key).and_then(|owner| {
                 let plugin = registry.plugin(owner.plugin_key())?;
-                if plugin.runtime() != crate::plugin::PluginRuntime::WasmComponentV2
-                    || !catalog.matches_plugin(plugin.key(), path)
-                {
+                if !catalog.matches_plugin(plugin.key(), path) {
                     return None;
                 }
                 let owner_change_id = owner_change_ids.get(&file_key)?;
@@ -2126,10 +2089,7 @@ where
             // observation and must not hydrate the complete durable graph.
             // Lifecycle removal/reselection still needs the old rows so it
             // can tombstone every schema owned by the previous plugin.
-            if selected.is_some_and(|selected| {
-                selected.key() == owner.plugin_key()
-                    && selected.runtime() == crate::plugin::PluginRuntime::WasmComponentV2
-            }) {
+            if selected.is_some_and(|selected| selected.key() == owner.plugin_key()) {
                 continue;
             }
             let group_key = PluginStateGroupKey {
@@ -2206,44 +2166,27 @@ where
                 .or_insert_with(|| group.plugin.clone());
         }
 
-        // Resolve warm components by their fixed content hash before asking
-        // the CAS for bytes. Keep the returned Arc itself: another branch may
-        // concurrently replace the key-only cache with a different hash.
-        let mut component_instances =
-            BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentInstance>>::new();
+        // Resolve warm factories by their fixed content hash before asking the
+        // CAS for bytes. The factory can then instantiate one isolated actor
+        // per file without recompiling the component.
         let mut component_v2_factories =
             BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentV2Factory>>::new();
-        let mut cold_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
         let mut cold_v2_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
         for (key, entry) in selected_entries {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
-            match entry.runtime() {
-                crate::plugin::PluginRuntime::WasmComponentV1 => {
-                    let cached_instance = self
-                        .plugin_host
-                        .cached_plugin_component(entry.key(), hash)?;
-                    if let Some(instance) = cached_instance {
-                        component_instances.insert(key, instance);
-                    } else {
-                        cold_entries.insert(key, entry);
-                    }
-                }
-                crate::plugin::PluginRuntime::WasmComponentV2 => {
-                    let cached_factory = self
-                        .plugin_host
-                        .cached_plugin_v2_factory(entry.key(), hash)?;
-                    if let Some(factory) = cached_factory {
-                        component_v2_factories.insert(key, factory);
-                    } else {
-                        cold_v2_entries.insert(key, entry);
-                    }
-                }
+            let cached_factory = self
+                .plugin_host
+                .cached_plugin_v2_factory(entry.key(), hash)?;
+            if let Some(factory) = cached_factory {
+                component_v2_factories.insert(key, factory);
+            } else {
+                cold_v2_entries.insert(key, entry);
             }
         }
 
         let mut wasm_by_hash = current_install_wasm;
         let mut missing_hashes = Vec::<BlobHash>::new();
-        for entry in cold_entries.values().chain(cold_v2_entries.values()) {
+        for entry in cold_v2_entries.values() {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
             if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
                 missing_hashes.push(hash);
@@ -2270,22 +2213,6 @@ where
                 })?;
                 wasm_by_hash.insert(hash, bytes);
             }
-        }
-        for (key, entry) in cold_entries {
-            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
-            let wasm = wasm_by_hash.get(&hash).cloned().ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "plugin registry references unavailable WASM blob '{}'",
-                        hash.to_hex()
-                    ),
-                )
-            })?;
-            let plugin = entry.to_installed_plugin(wasm)?;
-            let instance =
-                crate::plugin::load_or_init_plugin_component(&self.plugin_host, &plugin).await?;
-            component_instances.insert(key, instance);
         }
         for (key, entry) in cold_v2_entries {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
@@ -2367,485 +2294,15 @@ where
                 branch_id: write.branch_id.clone(),
                 plugin_key: selected.key().to_string(),
             };
-            if selected.runtime() == crate::plugin::PluginRuntime::WasmComponentV2 {
-                let factory = component_v2_factories
-                    .get(&installed_key)
-                    .expect("selected v2 plugin should have a compiled factory")
-                    .clone();
-                let same_plugin_owner =
-                    owner.is_some_and(|owner| owner.plugin_key() == selected.key());
-                let session_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
-                let current_owner_change_id = same_plugin_owner
-                    .then(|| owner_change_ids.get(&file_key).cloned())
-                    .flatten();
-                let desired_owner =
-                    PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
-                let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
-                let owner_change_id = if owner_needs_write {
-                    let owner_change_id = self.functions.call_uuid_v7().to_string();
-                    let mut owner_row = desired_owner.write_row(&write.branch_id)?;
-                    owner_row.change_id = Some(owner_change_id.clone());
-                    reconciliation.rows.push(owner_row);
-                    owner_change_id
-                } else {
-                    current_owner_change_id.clone().ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "durable v2 plugin owner for file '{}' is missing its incarnation",
-                                write.file_id
-                            ),
-                        )
-                    })?
-                };
-                let path = path.to_string();
-                let actor_key = PluginActorKey {
-                    branch_id: write.branch_id.clone(),
-                    file_id: write.file_id.clone(),
-                    path: path.clone(),
-                    owner_change_id: owner_change_id.clone(),
-                    plugin_key: selected.key().to_string(),
-                    plugin_generation: selected.archive_blob_hash().to_string(),
-                };
-                let view = PendingPluginActorView {
-                    session_key,
-                    plugin_key: selected.key().to_string(),
-                    plugin_generation: selected.archive_blob_hash().to_string(),
-                    owner_change_id,
-                    semantic_chainable: false,
-                };
-                if self
-                    .pending_plugin_actor_publications
-                    .iter()
-                    .chain(reconciliation.actor_publications.iter())
-                    .any(|publication| publication.session_key() == &view.session_key)
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_CONSTRAINT_VIOLATION,
-                        format!(
-                            "one transaction cannot transition v2 plugin file '{}' more than once",
-                            write.file_id
-                        ),
-                    )
-                    .with_hint("combine the byte edits into one file update"));
-                }
-                let descriptor = v2_file_descriptor(write, selected);
-                let limits = WasmTransitionLimits::default();
-                let schemas = V2SchemaAllowlist::from_slice(selected.schema_keys())?;
-                let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
-                    local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
-                });
-                let bound_ids = BoundIdNamespace::bind(mutation_identity, &actor_key);
-                let ids = bound_ids.ids();
-                let existing_id_namespace_reservation =
-                    match self.preflight_v2_id_namespace(bound_ids, &file_key).await {
-                        Ok(existing) => existing,
-                        Err(error) => {
-                            discard_plugin_actor_publications(std::mem::take(
-                                &mut reconciliation.actor_publications,
-                            ))
-                            .await;
-                            return Err(error);
-                        }
-                    };
-                let materialization_version = self.functions.call_uuid_v7().to_string();
-                let submitted_bytes = write.payload().shared_bytes();
-
-                let (changes, publication, materialized_bytes) = if same_plugin_owner {
-                    let observation = self
-                        .acknowledged_session_plugin_observation(
-                            &view.session_key,
-                            selected,
-                            current_owner_change_id
-                                .as_deref()
-                                .expect("same-owner v2 file should have an owner incarnation"),
-                        )
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                                "warm v2 file writes require an exact acknowledged file read",
-                            )
-                            .with_hint("read the exact file bytes again before retrying the edit")
-                        })?;
-                    if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
-                        return Err(LixError::new(
-                            LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                            "the acknowledged v2 file identity no longer matches this write",
-                        )
-                        .with_hint("read the exact file bytes again before retrying the edit"));
-                    }
-                    let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
-                    let after_descriptor = descriptor.clone();
-                    let cache = self.plugin_host.actor_cache();
-                    // Acquire serialization first, then read the root again.
-                    // A second local session may have committed while this
-                    // request waited for the actor; reading before the lease
-                    // would mistake that valid serialization for an external
-                    // stale-cache race.
-                    let mut lease = cache.lease_for_transition(&observation).await?;
-                    let visible_root = self
-                        .visible_v2_materialization_root(&file_key)
-                        .await?
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                                "the acknowledged v2 file no longer has a visible materialization root",
-                            )
-                            .with_hint("read the exact file bytes again before retrying the edit")
-                        })?;
-                    lease.require_accepted_semantic_root(&visible_root)?;
-                    let observation_is_current = observation.semantic_root() == visible_root;
-                    let observed_bytes = lease.observed_bytes();
-                    let built_splices = build_file_update_splices(
-                        &observed_bytes,
-                        lease.observed_bytes_sha256(),
-                        write.data(),
-                        write.splice_provenance(),
-                        limits,
-                    )?;
-                    let submitted_bytes_sha256 = built_splices.after_sha256;
-                    let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
-                    let observed_source = ArcByteSource::new(observed_bytes.clone());
-                    let submitted_source = ArcByteSource::new(submitted_bytes.clone());
-                    let observed_document = lease.observed_document();
-                    lease.begin_guest_call()?;
-                    let detection_input =
-                        match lease.actor_mut().fork_document(observed_document).await {
-                            Ok(document) => document,
-                            Err(error) => return Err(lease.handle_guest_call_error(error)),
-                        };
-                    let detection_transition = match lease
-                        .actor_mut()
-                        .file_changed(
-                            detection_input,
-                            limits,
-                            WasmFileUpdate {
-                                before_descriptor: before_descriptor.clone(),
-                                after_descriptor: after_descriptor.clone(),
-                                before: Arc::new(observed_source),
-                                edits: built_splices.edits,
-                                after: Arc::new(submitted_source),
-                                ids,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(transition) => transition,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    let detected_transition = match drain_file_transition_changes(
-                        lease.actor_mut(),
-                        detection_transition,
-                        &schemas,
-                        limits,
-                    )
-                    .await
-                    {
-                        Ok(transition) => transition,
-                        Err(error) => return Err(lease.handle_guest_call_error(error)),
-                    };
-                    if let Err(error) = lease.actor_mut().drop_document(detection_input).await {
-                        return Err(lease.handle_guest_call_error(error));
-                    }
-
-                    let detection_document = detected_transition.document;
-                    let mut counters = detected_transition.counters;
-                    let changes = match self
-                        .suppress_v2_format_only_noops(detected_transition.changes, &file_key)
-                        .await
-                    {
-                        Ok(changes) => changes,
-                        Err(error) => {
-                            if let Err(cleanup_error) =
-                                lease.actor_mut().drop_document(detection_document).await
-                            {
-                                return Err(lease.handle_guest_call_error(cleanup_error));
-                            }
-                            return Err(lease.handle_guest_call_error(error));
-                        }
-                    };
-                    let (successor_document, materialized_bytes, materialized_bytes_sha256) =
-                        if observation_is_current {
-                            // The actor lease serializes this file and the durable
-                            // root still equals the acknowledged observation. The
-                            // validated file successor is therefore already the
-                            // exact merge result; rendering the same sparse change
-                            // onto the same base would only repeat guest work.
-                            (
-                                detection_document,
-                                submitted_bytes.clone(),
-                                submitted_bytes_sha256,
-                            )
-                        } else {
-                            // Detection happened against a historical session
-                            // document. Apply its sparse merge-resolved delta to
-                            // the actor's current accepted document so concurrent
-                            // different-entity edits compose and same-entity edits
-                            // obey transaction commit order.
-                            if let Err(error) =
-                                lease.actor_mut().drop_document(detection_document).await
-                            {
-                                return Err(lease.handle_guest_call_error(error));
-                            }
-                            let current_document = lease.accepted_document();
-                            let current_bytes = lease.accepted_bytes();
-                            let change_source =
-                                match VecEntityChangeSource::new(changes.clone(), limits) {
-                                    Ok(source) => source,
-                                    Err(error) => {
-                                        return Err(lease.handle_guest_call_error(error));
-                                    }
-                                };
-                            let renderer_input =
-                                match lease.actor_mut().fork_document(current_document).await {
-                                    Ok(document) => document,
-                                    Err(error) => return Err(lease.handle_guest_call_error(error)),
-                                };
-                            let renderer_transition = match lease
-                                .actor_mut()
-                                .entities_changed(
-                                    renderer_input,
-                                    limits,
-                                    WasmEntityUpdate {
-                                        before_descriptor,
-                                        after_descriptor,
-                                        before: Arc::new(ArcByteSource::new(current_bytes.clone())),
-                                        changes: Box::new(change_source),
-                                    },
-                                )
-                                .await
-                            {
-                                Ok(transition) => transition,
-                                Err(error) => return Err(lease.handle_guest_call_error(error)),
-                            };
-                            let rendered_transition = match drain_entity_transition_edits(
-                                lease.actor_mut(),
-                                renderer_transition,
-                                &current_bytes,
-                                None,
-                                None,
-                                limits,
-                            )
-                            .await
-                            {
-                                Ok(transition) => transition,
-                                Err(error) => return Err(lease.handle_guest_call_error(error)),
-                            };
-                            if let Err(error) =
-                                lease.actor_mut().drop_document(renderer_input).await
-                            {
-                                return Err(lease.handle_guest_call_error(error));
-                            }
-                            counters.accumulate(rendered_transition.counters);
-                            counters.shared_renderer_cache_hits = 1;
-                            (
-                                rendered_transition.document,
-                                rendered_transition.bytes.clone(),
-                                rendered_transition.bytes_sha256,
-                            )
-                        };
-                    counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
-                    counters.host_full_content_classification_bytes =
-                        full_content_classification_bytes
-                            .get(&file_key)
-                            .copied()
-                            .unwrap_or(0);
-                    counters.private_document_cache_hits = 1;
-                    counters.durable_semantic_changes =
-                        u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
-                    self.plugin_host.record_v2_transition_counters(counters);
-                    lease.complete_guest_call(
-                        successor_document,
-                        materialized_bytes.clone(),
-                        materialized_bytes_sha256,
-                        materialization_version.clone(),
-                    )?;
-                    (
-                        changes,
-                        PendingPluginActorPublication::Existing {
-                            lease,
-                            successor_key: actor_key,
-                            view,
-                        },
-                        materialized_bytes,
-                    )
-                } else {
-                    let mut actor = factory.instantiate_actor().await?;
-                    let source = ArcByteSource::new(submitted_bytes.clone());
-                    let transition = actor
-                        .open_file(
-                            limits,
-                            WasmOpenFileInput {
-                                descriptor,
-                                file: Arc::new(source),
-                                ids,
-                            },
-                        )
-                        .await?;
-                    let validated =
-                        drain_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
-                            .await?;
-                    let changes = validated.changes;
-                    let mut counters = validated.counters;
-                    counters.host_full_content_classification_bytes =
-                        full_content_classification_bytes
-                            .get(&file_key)
-                            .copied()
-                            .unwrap_or(0);
-                    counters.full_document_reparses = 1;
-                    counters.durable_semantic_changes =
-                        u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
-                    self.plugin_host.record_v2_transition_counters(counters);
-                    (
-                        changes,
-                        PendingPluginActorPublication::New {
-                            cache: self.plugin_host.actor_cache(),
-                            key: actor_key,
-                            actor,
-                            document: validated.document,
-                            bytes: submitted_bytes.clone(),
-                            semantic_root: Arc::from(materialization_version.clone()),
-                            view,
-                        },
-                        submitted_bytes.clone(),
-                    )
-                };
-                let namespace_rows = self
-                    .v2_id_namespace_rows(
-                        selected,
-                        &changes,
-                        bound_ids,
-                        &file_key,
-                        existing_id_namespace_reservation.as_ref(),
-                    )
-                    .await;
-                let namespace_rows = match namespace_rows {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        publication.discard().await;
-                        discard_plugin_actor_publications(std::mem::take(
-                            &mut reconciliation.actor_publications,
-                        ))
-                        .await;
-                        return Err(error);
-                    }
-                };
-                let change_rows = plugin_detected_changes_from_v2(&changes).and_then(|detected| {
-                    plugin_change_rows(
-                        selected,
-                        detected,
-                        &write.file_id,
-                        &context,
-                        "plugin v2 file transition",
-                    )
-                });
-                let change_rows = match change_rows {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        publication.discard().await;
-                        discard_plugin_actor_publications(std::mem::take(
-                            &mut reconciliation.actor_publications,
-                        ))
-                        .await;
-                        return Err(error);
-                    }
-                };
-                reconciliation.rows.extend(namespace_rows);
-                reconciliation.rows.extend(change_rows);
-                if materialized_bytes.as_ref() != write.data() {
-                    write.replace_data(materialized_bytes);
-                }
-                reconciliation
-                    .materialized_file_keys
-                    .insert(file_key.clone());
-                reconciliation
-                    .materialization_versions
-                    .insert(file_key.clone(), materialization_version);
-                reconciliation.actor_publications.push(publication);
-                reconciled_file_keys.insert(file_key);
-                continue;
-            }
-            let component = component_instances
+            let factory = component_v2_factories
                 .get(&installed_key)
-                .expect("selected plugin should have a resolved component");
+                .expect("selected v2 plugin should have a compiled factory")
+                .clone();
             let same_plugin_owner = owner.is_some_and(|owner| owner.plugin_key() == selected.key());
-            if same_plugin_owner {
-                let selected_schema_keys = selected.schema_keys().iter().collect::<BTreeSet<_>>();
-                let obsolete_state = old_state
-                    .iter()
-                    .filter(|row| !selected_schema_keys.contains(&row.schema_key))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                reconciliation.rows.extend(plugin_state_tombstone_rows(
-                    &obsolete_state,
-                    &write.file_id,
-                    &context,
-                ));
-            }
-            let session_file_view_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
+            let session_key = SessionFileViewKey::new(&write.branch_id, &write.file_id);
             let current_owner_change_id = same_plugin_owner
                 .then(|| owner_change_ids.get(&file_key).cloned())
                 .flatten();
-            let acknowledged_state = same_plugin_owner
-                .then(|| {
-                    current_owner_change_id
-                        .as_deref()
-                        .and_then(|owner_change_id| {
-                            self.acknowledged_session_plugin_state(
-                                &session_file_view_key,
-                                selected,
-                                owner_change_id,
-                            )
-                        })
-                })
-                .flatten();
-            let allow_inferred_deletions = acknowledged_state.is_some();
-            let detection_state = if same_plugin_owner {
-                acknowledged_state.unwrap_or_else(|| {
-                    // A blind blob replacement still needs the current rows as
-                    // an identity-matching hint. It does not, however, gain
-                    // authority to delete rows merely because the submitted
-                    // file omitted them; those tombstones are filtered below.
-                    retain_plugin_state_rows_for_schema_keys(selected.schema_keys(), old_state)
-                })
-            } else {
-                // A missing or different durable owner means this is a fresh
-                // raw/plugin ownership transition. A session may still cache
-                // an older incarnation of this file; reusing it would make
-                // unchanged submitted entities disappear.
-                Vec::new()
-            };
-            let changes = detect_changes_with_component_instance(
-                component,
-                &detection_state,
-                WasmPluginFile {
-                    filename: write.filename.clone(),
-                    data: write.data().to_vec(),
-                },
-            )
-            .await?;
-            let submitted_state = session_plugin_state_after_changes(
-                &session_file_view_key,
-                detection_state,
-                &changes,
-            );
-            if write.had_blob_ref {
-                reconciliation.rows.push(blob_ref_tombstone_row(
-                    write.file_id.clone(),
-                    context.clone(),
-                ));
-            }
-            let mut change_rows = plugin_change_rows(
-                selected,
-                changes,
-                &write.file_id,
-                &context,
-                "plugin detect-changes",
-            )?;
-            if !allow_inferred_deletions {
-                change_rows.retain(|row| row.snapshot.is_some());
-            }
-            reconciliation.rows.extend(change_rows);
             let desired_owner =
                 PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
             let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
@@ -2856,31 +2313,378 @@ where
                 reconciliation.rows.push(owner_row);
                 owner_change_id
             } else {
-                current_owner_change_id.ok_or_else(|| {
+                current_owner_change_id.clone().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!(
-                            "durable plugin owner for file '{}' is missing its incarnation",
+                            "durable v2 plugin owner for file '{}' is missing its incarnation",
                             write.file_id
                         ),
                     )
                 })?
             };
-            reconciliation.file_view_mutations.insert(
-                session_file_view_key.clone(),
-                SessionFileViewMutation::Set {
-                    key: session_file_view_key,
-                    view: SessionPluginFileView {
-                        plugin_key: selected.key().to_string(),
-                        plugin_generation: selected.archive_blob_hash().to_string(),
-                        owner_change_id,
-                        observation: None,
-                        rows: submitted_state.into(),
+            let path = path.to_string();
+            let actor_key = PluginActorKey {
+                branch_id: write.branch_id.clone(),
+                file_id: write.file_id.clone(),
+                path: path.clone(),
+                owner_change_id: owner_change_id.clone(),
+                plugin_key: selected.key().to_string(),
+                plugin_generation: selected.archive_blob_hash().to_string(),
+            };
+            let view = PendingPluginActorView {
+                session_key,
+                plugin_key: selected.key().to_string(),
+                plugin_generation: selected.archive_blob_hash().to_string(),
+                owner_change_id,
+                semantic_chainable: false,
+            };
+            if self
+                .pending_plugin_actor_publications
+                .iter()
+                .chain(reconciliation.actor_publications.iter())
+                .any(|publication| publication.session_key() == &view.session_key)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "one transaction cannot transition v2 plugin file '{}' more than once",
+                        write.file_id
+                    ),
+                )
+                .with_hint("combine the byte edits into one file update"));
+            }
+            let descriptor = v2_file_descriptor(write, selected);
+            let limits = WasmTransitionLimits::default();
+            let schemas = V2SchemaAllowlist::from_slice(selected.schema_keys())?;
+            let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
+                local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
+            });
+            let bound_ids = BoundIdNamespace::bind(mutation_identity, &actor_key);
+            let ids = bound_ids.ids();
+            let existing_id_namespace_reservation =
+                match self.preflight_v2_id_namespace(bound_ids, &file_key).await {
+                    Ok(existing) => existing,
+                    Err(error) => {
+                        discard_plugin_actor_publications(std::mem::take(
+                            &mut reconciliation.actor_publications,
+                        ))
+                        .await;
+                        return Err(error);
+                    }
+                };
+            let materialization_version = self.functions.call_uuid_v7().to_string();
+            let submitted_bytes = write.payload().shared_bytes();
+
+            let (changes, publication, materialized_bytes) = if same_plugin_owner {
+                let observation = self
+                    .acknowledged_session_plugin_observation(
+                        &view.session_key,
+                        selected,
+                        current_owner_change_id
+                            .as_deref()
+                            .expect("same-owner v2 file should have an owner incarnation"),
+                    )
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                            "warm v2 file writes require an exact acknowledged file read",
+                        )
+                        .with_hint("read the exact file bytes again before retrying the edit")
+                    })?;
+                if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
+                    return Err(LixError::new(
+                        LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                        "the acknowledged v2 file identity no longer matches this write",
+                    )
+                    .with_hint("read the exact file bytes again before retrying the edit"));
+                }
+                let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
+                let after_descriptor = descriptor.clone();
+                let cache = self.plugin_host.actor_cache();
+                // Acquire serialization first, then read the root again.
+                // A second local session may have committed while this
+                // request waited for the actor; reading before the lease
+                // would mistake that valid serialization for an external
+                // stale-cache race.
+                let mut lease = cache.lease_for_transition(&observation).await?;
+                let visible_root = self
+                    .visible_v2_materialization_root(&file_key)
+                    .await?
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                            "the acknowledged v2 file no longer has a visible materialization root",
+                        )
+                        .with_hint("read the exact file bytes again before retrying the edit")
+                    })?;
+                lease.require_accepted_semantic_root(&visible_root)?;
+                let observation_is_current = observation.semantic_root() == visible_root;
+                let observed_bytes = lease.observed_bytes();
+                let built_splices = build_file_update_splices(
+                    &observed_bytes,
+                    lease.observed_bytes_sha256(),
+                    write.data(),
+                    write.splice_provenance(),
+                    limits,
+                )?;
+                let submitted_bytes_sha256 = built_splices.after_sha256;
+                let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
+                let observed_source = ArcByteSource::new(observed_bytes.clone());
+                let submitted_source = ArcByteSource::new(submitted_bytes.clone());
+                let observed_document = lease.observed_document();
+                lease.begin_guest_call()?;
+                let detection_input = match lease.actor_mut().fork_document(observed_document).await
+                {
+                    Ok(document) => document,
+                    Err(error) => return Err(lease.handle_guest_call_error(error)),
+                };
+                let detection_transition = match lease
+                    .actor_mut()
+                    .file_changed(
+                        detection_input,
+                        limits,
+                        WasmFileUpdate {
+                            before_descriptor: before_descriptor.clone(),
+                            after_descriptor: after_descriptor.clone(),
+                            before: Arc::new(observed_source),
+                            edits: built_splices.edits,
+                            after: Arc::new(submitted_source),
+                            ids,
+                        },
+                    )
+                    .await
+                {
+                    Ok(transition) => transition,
+                    Err(error) => return Err(lease.handle_guest_call_error(error)),
+                };
+                let detected_transition = match drain_file_transition_changes(
+                    lease.actor_mut(),
+                    detection_transition,
+                    &schemas,
+                    limits,
+                )
+                .await
+                {
+                    Ok(transition) => transition,
+                    Err(error) => return Err(lease.handle_guest_call_error(error)),
+                };
+                if let Err(error) = lease.actor_mut().drop_document(detection_input).await {
+                    return Err(lease.handle_guest_call_error(error));
+                }
+
+                let detection_document = detected_transition.document;
+                let mut counters = detected_transition.counters;
+                let changes = match self
+                    .suppress_v2_format_only_noops(detected_transition.changes, &file_key)
+                    .await
+                {
+                    Ok(changes) => changes,
+                    Err(error) => {
+                        if let Err(cleanup_error) =
+                            lease.actor_mut().drop_document(detection_document).await
+                        {
+                            return Err(lease.handle_guest_call_error(cleanup_error));
+                        }
+                        return Err(lease.handle_guest_call_error(error));
+                    }
+                };
+                let (successor_document, materialized_bytes, materialized_bytes_sha256) =
+                    if observation_is_current {
+                        // The actor lease serializes this file and the durable
+                        // root still equals the acknowledged observation. The
+                        // validated file successor is therefore already the
+                        // exact merge result; rendering the same sparse change
+                        // onto the same base would only repeat guest work.
+                        (
+                            detection_document,
+                            submitted_bytes.clone(),
+                            submitted_bytes_sha256,
+                        )
+                    } else {
+                        // Detection happened against a historical session
+                        // document. Apply its sparse merge-resolved delta to
+                        // the actor's current accepted document so concurrent
+                        // different-entity edits compose and same-entity edits
+                        // obey transaction commit order.
+                        if let Err(error) =
+                            lease.actor_mut().drop_document(detection_document).await
+                        {
+                            return Err(lease.handle_guest_call_error(error));
+                        }
+                        let current_document = lease.accepted_document();
+                        let current_bytes = lease.accepted_bytes();
+                        let change_source =
+                            match VecEntityChangeSource::new(changes.clone(), limits) {
+                                Ok(source) => source,
+                                Err(error) => {
+                                    return Err(lease.handle_guest_call_error(error));
+                                }
+                            };
+                        let renderer_input =
+                            match lease.actor_mut().fork_document(current_document).await {
+                                Ok(document) => document,
+                                Err(error) => return Err(lease.handle_guest_call_error(error)),
+                            };
+                        let renderer_transition = match lease
+                            .actor_mut()
+                            .entities_changed(
+                                renderer_input,
+                                limits,
+                                WasmEntityUpdate {
+                                    before_descriptor,
+                                    after_descriptor,
+                                    before: Arc::new(ArcByteSource::new(current_bytes.clone())),
+                                    changes: Box::new(change_source),
+                                },
+                            )
+                            .await
+                        {
+                            Ok(transition) => transition,
+                            Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        };
+                        let rendered_transition = match drain_entity_transition_edits(
+                            lease.actor_mut(),
+                            renderer_transition,
+                            &current_bytes,
+                            None,
+                            None,
+                            limits,
+                        )
+                        .await
+                        {
+                            Ok(transition) => transition,
+                            Err(error) => return Err(lease.handle_guest_call_error(error)),
+                        };
+                        if let Err(error) = lease.actor_mut().drop_document(renderer_input).await {
+                            return Err(lease.handle_guest_call_error(error));
+                        }
+                        counters.accumulate(rendered_transition.counters);
+                        counters.shared_renderer_cache_hits = 1;
+                        (
+                            rendered_transition.document,
+                            rendered_transition.bytes.clone(),
+                            rendered_transition.bytes_sha256,
+                        )
+                    };
+                counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
+                counters.host_full_content_classification_bytes = full_content_classification_bytes
+                    .get(&file_key)
+                    .copied()
+                    .unwrap_or(0);
+                counters.private_document_cache_hits = 1;
+                counters.durable_semantic_changes =
+                    u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+                self.plugin_host.record_v2_transition_counters(counters);
+                lease.complete_guest_call(
+                    successor_document,
+                    materialized_bytes.clone(),
+                    materialized_bytes_sha256,
+                    materialization_version.clone(),
+                )?;
+                (
+                    changes,
+                    PendingPluginActorPublication::Existing {
+                        lease,
+                        successor_key: actor_key,
+                        view,
                     },
-                },
-            );
-            reconciliation.file_keys.insert(file_key.clone());
+                    materialized_bytes,
+                )
+            } else {
+                let mut actor = factory.instantiate_actor().await?;
+                let source = ArcByteSource::new(submitted_bytes.clone());
+                let transition = actor
+                    .open_file(
+                        limits,
+                        WasmOpenFileInput {
+                            descriptor,
+                            file: Arc::new(source),
+                            ids,
+                        },
+                    )
+                    .await?;
+                let validated =
+                    drain_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
+                        .await?;
+                let changes = validated.changes;
+                let mut counters = validated.counters;
+                counters.host_full_content_classification_bytes = full_content_classification_bytes
+                    .get(&file_key)
+                    .copied()
+                    .unwrap_or(0);
+                counters.full_document_reparses = 1;
+                counters.durable_semantic_changes =
+                    u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+                self.plugin_host.record_v2_transition_counters(counters);
+                (
+                    changes,
+                    PendingPluginActorPublication::New {
+                        cache: self.plugin_host.actor_cache(),
+                        key: actor_key,
+                        actor,
+                        document: validated.document,
+                        bytes: submitted_bytes.clone(),
+                        semantic_root: Arc::from(materialization_version.clone()),
+                        view,
+                    },
+                    submitted_bytes.clone(),
+                )
+            };
+            let namespace_rows = self
+                .v2_id_namespace_rows(
+                    selected,
+                    &changes,
+                    bound_ids,
+                    &file_key,
+                    existing_id_namespace_reservation.as_ref(),
+                )
+                .await;
+            let namespace_rows = match namespace_rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    publication.discard().await;
+                    discard_plugin_actor_publications(std::mem::take(
+                        &mut reconciliation.actor_publications,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            };
+            let change_rows = plugin_detected_changes_from_v2(&changes).and_then(|detected| {
+                plugin_change_rows(
+                    selected,
+                    detected,
+                    &write.file_id,
+                    &context,
+                    "plugin v2 file transition",
+                )
+            });
+            let change_rows = match change_rows {
+                Ok(rows) => rows,
+                Err(error) => {
+                    publication.discard().await;
+                    discard_plugin_actor_publications(std::mem::take(
+                        &mut reconciliation.actor_publications,
+                    ))
+                    .await;
+                    return Err(error);
+                }
+            };
+            reconciliation.rows.extend(namespace_rows);
+            reconciliation.rows.extend(change_rows);
+            if materialized_bytes.as_ref() != write.data() {
+                write.replace_data(materialized_bytes);
+            }
+            reconciliation
+                .materialized_file_keys
+                .insert(file_key.clone());
+            reconciliation
+                .materialization_versions
+                .insert(file_key.clone(), materialization_version);
+            reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
+            continue;
         }
 
         for (file_key, group) in semantic_groups {
@@ -4515,7 +4319,6 @@ impl PendingPluginActorPublication {
                 plugin_generation: view.plugin_generation,
                 owner_change_id: view.owner_change_id,
                 observation: Some(observation),
-                rows: Arc::from([]),
             },
         ))
     }
@@ -5180,48 +4983,6 @@ struct PluginV2SemanticWriteGroup {
     filename: String,
     owner_change_id: String,
     rows: Vec<TransactionWriteRow>,
-}
-
-fn session_plugin_state_after_changes(
-    key: &SessionFileViewKey,
-    base: Vec<MaterializedLiveStateRow>,
-    changes: &[PluginDetectedChange],
-) -> Vec<MaterializedLiveStateRow> {
-    let mut rows = base
-        .into_iter()
-        .filter(|row| row.snapshot_content.is_some())
-        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
-        .collect::<BTreeMap<_, _>>();
-
-    for change in changes {
-        let identity = (change.schema_key.clone(), change.entity_pk.clone());
-        let Some(snapshot_content) = change.snapshot_content.clone() else {
-            rows.remove(&identity);
-            continue;
-        };
-        let row = rows
-            .entry(identity)
-            .or_insert_with(|| MaterializedLiveStateRow {
-                entity_pk: change.entity_pk.clone(),
-                schema_key: change.schema_key.clone(),
-                file_id: Some(key.file_id.clone()),
-                snapshot_content: None,
-                metadata: None,
-                deleted: false,
-                created_at: String::new(),
-                updated_at: String::new(),
-                global: false,
-                change_id: None,
-                commit_id: None,
-                untracked: false,
-                branch_id: key.branch_id.clone(),
-            });
-        row.snapshot_content = Some(snapshot_content);
-        row.metadata.clone_from(&change.metadata);
-        row.deleted = false;
-    }
-
-    rows.into_values().collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -6863,7 +6624,7 @@ mod tests {
             file_id: "file-a".to_string(),
             path: "/data.csv".to_string(),
             owner_change_id: "incarnation-a".to_string(),
-            plugin_key: "plugin_csv".to_string(),
+            plugin_key: "plugin_csv_v2".to_string(),
             plugin_generation: "generation-a".to_string(),
         };
         assert_eq!(v2_id_namespace(seed, &key), v2_id_namespace(seed, &key));

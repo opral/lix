@@ -10,7 +10,7 @@ pub const OBJECT_MEMBER_SCHEMA_KEY: &str = "json_object_member";
 pub const ARRAY_ITEM_SCHEMA_KEY: &str = "json_array_item";
 
 const ROOT_ID: &str = "root";
-const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container-v1\0";
+const OBJECT_CONTAINER_DOMAIN: &[u8] = b"lix-json-object-container-v2\0";
 const NODES_PER_SPAN_CHUNK: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -618,7 +618,7 @@ fn identity_fingerprint_node(node: &Node) -> [u8; 16] {
 
 fn fingerprint_components(schema_key: &str, components: &[&str]) -> [u8; 16] {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"lix-json-entity-lookup-v1\0");
+    hasher.update(b"lix-json-entity-lookup-v2\0");
     hasher.update(
         &u64::try_from(schema_key.len())
             .expect("usize fits u64")

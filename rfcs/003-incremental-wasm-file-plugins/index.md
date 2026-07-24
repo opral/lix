@@ -18,9 +18,10 @@ The production contract is WIT package `lix:plugin@2.0.0` and packet format
 
 ## Motivation
 
-API v1 reparses a complete file and materializes every plugin-owned entity for
-each edit and render. That is easy to understand, but work and memory scale
-with document size even when one CSV cell or one JSON leaf changes.
+The predecessor stateless API reparses a complete file and materializes every
+plugin-owned entity for each edit and render. That is easy to understand, but
+work and memory scale with document size even when one CSV cell or one JSON
+leaf changes.
 
 WebAssembly itself is not the bottleneck. The expensive path is repeatedly
 materializing rich state across the component boundary. API v2 keeps the
@@ -155,22 +156,22 @@ helpers are stable.
 ## Limits
 
 The runtime enforces a configurable linear-memory ceiling. The integrated host
-preserves the existing v1 default at 64 MiB and defaults v2 actors to 128 MiB.
-It retains at most four idle/warm v2 file actors, bounding cached guest
-capacity to 512 MiB per workspace before host-side document state. Actors held
-by live transactions and cold-open candidates remain individually capped but
-are not covered by a workspace-wide concurrency limit. Both v2 values are
-configurable through `EngineOptions`; they are deployment policy, not protocol
-guarantees. Correct plugins must also obey per-transition record, page,
-attachment, byte, fuel, and time budgets.
+defaults each v2 actor to 128 MiB and retains at most four idle/warm v2 file
+actors, bounding cached guest capacity to 512 MiB per workspace before
+host-side document state. Actors held by live transactions and cold-open
+candidates remain individually capped but are not covered by a workspace-wide
+concurrency limit. Both values are configurable through `EngineOptions`; they
+are deployment policy, not protocol guarantees. Correct plugins must also obey
+per-transition record, page, attachment, byte, fuel, and time budgets.
 
 Malformed or globally coupled syntax may require a larger invalidation region
 or a bounded full reparse. API v2 optimizes the common localized path; it does
 not promise sublinear work for every possible edit.
 
-## Compatibility and rollout
+## Contract scope
 
-API v1 and v2 runtimes coexist. A plugin opts into v2 with:
+`wasm-component-v2` at API version `2.0.0` is the Component plugin contract.
+A plugin declares it with:
 
 ```json
 {
@@ -179,14 +180,10 @@ API v1 and v2 runtimes coexist. A plugin opts into v2 with:
 }
 ```
 
-The exact v2 API version is checked at installation. Existing v1 manifests and
-plugins retain their current behavior.
-
-The v2 format implementations are opt-in references rather than bundled
-replacements. Their CSV, JSON, and Markdown matchers overlap v1 plugins.
-Evaluation must use a blank registry or remove the overlapping v1 plugin;
-equal-specificity registry-key ordering is deterministic but is not a rollout
-priority contract. Default-plugin migration is follow-up work.
+The exact API version is checked at installation. CSV/TSV, JSON, Markdown, and
+Excalidraw are the in-tree production references. Replacing an owned plugin is
+a compatible generation update: API version, matcher, schema set, and
+ID-allocation contract remain stable.
 
 The rollout gate is end-to-end: format round-trip and stable-identity tests,
 rollback and multiplayer authority tests, bounded-host validation, and
@@ -196,19 +193,24 @@ accepted for measured improvements, not merely lower-level ABI microbenchmarks.
 ## Measured evidence
 
 The full-engine CSV campaign used a 10,680,000-byte, 220,000-row file and one
-localized row edit. On RocksDB, edit p50 fell from 6,507.439 ms on v1 to
-63.610 ms on v2 and exact-render p50 fell from 2,317.470 ms to 18.013 ms. On
+localized row edit. On RocksDB, edit p50 fell from 6,507.439 ms in the
+predecessor implementation to 63.610 ms and exact-render p50 fell from
+2,317.470 ms to 18.013 ms. On
 cached SlateDB, edit p50 fell from 9,659.544 ms to 80.184 ms and exact-render
 p50 from 7,600.187 ms to 6.397 ms. The candidate emitted one durable entity
 change, performed no warm source reads, full semantic materialization, reparse,
 or full render, and observed 58.3125 MiB guest high-water.
 
-The recursive JSON reference gates both flat and nested 10 MB fixtures with one
-changed property and one sparse entity change. Direct cold hydration reduced
-guest high-water from 160,169,984 to 101,056,512 bytes for the flat fixture and
-from 202,833,920 to 101,515,264 bytes for the nested fixture. Warm p50 remained
-about 65–72 ms because the end-to-end result is dominated by durable storage;
-the deterministic guest work stays local.
+The recursive JSON reference has a real-Component, end-to-end acceptance gate:
+an exact 10 MiB flat fixture with 39,870 properties and one byte changed in one
+property. It installs the production Wasm component, verifies the materialized
+bytes and affected semantic member, and requires one sparse semantic change,
+zero warm source reads, and less than 64 KiB across the warm component
+boundary. One recorded gate execution reported 2,412.528 ms cold hydration,
+26,673,152 bytes (25.4375 MiB) guest high-water, 18.993 ms for the warm engine
+transition, and 418 warm boundary bytes. These are single-run acceptance
+measurements, not end-to-end request latency or latency percentiles; provenance
+validation is intentionally measured separately from the transition.
 
 An N=10 authorship evaluation of the immediately preceding WIT surface
 completed successfully for every participant, with median final score 76 (p25
@@ -251,18 +253,6 @@ greater-than-30% memory win, with hot-path non-regression. Neither alternative
 was close on point estimates. These two-block smoke measurements are
 disqualification screening evidence, not an acceptance benchmark campaign.
 
-### WASI Preview 3 streams
-
-Async streams can reduce peak memory during cold hydration. They do not by
-themselves accelerate synchronous random reads or sparse warm output, which
-are the hot-edit path. Preview 3 can be adopted behind compatible lifecycle
-semantics when its implementation is production-ready.
-
-Experimental screening measured cold-stream guest memory falling from
-15.625 MiB to 6.625 MiB (57.6%) at neutral cold p50. Ready async hot reads were
-10.2% slower and one-item async output was 84.2% slower. The resulting
-candidate is cold-only future adoption; the production hot path remains
-synchronous.
 
 ### A universal engine-owned AST
 

@@ -20,8 +20,8 @@ use crate::wasm::{WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmIdName
 use super::{PluginActorKey, PluginRegistryEntry};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const RESERVATION_PREFIX: &str = "lix_plugin_id_namespace_v1:";
-const RESERVATION_VERSION: u32 = 1;
+const RESERVATION_PREFIX: &str = "lix_plugin_id_namespace_v2:";
+const RESERVATION_VERSION: u32 = 2;
 
 /// A mutation identity after it has been bound to one durable plugin-file
 /// authority. Different operation proofs may deliberately yield the same
@@ -42,7 +42,7 @@ impl BoundIdNamespace {
             &[&identity.namespace_seed, &authority_binding],
         );
         let bound_operation_proof = framed_digest(
-            b"lix.plugin-v2.bound-operation-proof.v1\0",
+            b"lix.plugin-v2.bound-operation-proof.v2\0",
             &[&identity.operation_proof, &authority_binding],
         );
         Self {
@@ -80,7 +80,7 @@ pub(crate) fn local_mutation_identity(namespace_seed: [u8; 16]) -> MutationIdent
     MutationIdentity {
         namespace_seed,
         operation_proof: framed_digest(
-            b"lix.plugin-v2.local-operation-proof.v1\0",
+            b"lix.plugin-v2.local-operation-proof.v2\0",
             &[&namespace_seed],
         ),
     }
@@ -88,7 +88,7 @@ pub(crate) fn local_mutation_identity(namespace_seed: [u8; 16]) -> MutationIdent
 
 fn authority_binding(actor_key: &PluginActorKey) -> [u8; 32] {
     framed_digest(
-        b"lix.plugin-v2.id-authority.v1\0",
+        b"lix.plugin-v2.id-authority.v2\0",
         &[
             actor_key.branch_id.as_bytes(),
             actor_key.file_id.as_bytes(),
@@ -121,8 +121,7 @@ pub(crate) struct IdAllocationValidation {
     /// create the corresponding durable reservation before staging changes.
     pub(crate) requires_reservation: bool,
     /// Non-current compact identities are valid only when the exact durable
-    /// entity already exists. UUID identities are the explicit legacy format,
-    /// but they remain authorities only when already durable.
+    /// entity already exists.
     pub(crate) existing_authorities: Vec<WasmEntityKey>,
 }
 
@@ -159,11 +158,9 @@ pub(crate) fn validate_host_allocated_changes<B>(
             } else {
                 validation.existing_authorities.push(entity.key.clone());
             }
-        } else if is_legacy_uuid(component) {
-            validation.existing_authorities.push(entity.key.clone());
         } else {
             return Err(invalid_id(format!(
-                "plugin '{}' emitted malformed host-allocated ID for schema '{}'; expected a 32-character compact ID or a legacy UUID",
+                "plugin '{}' emitted malformed host-allocated ID for schema '{}'; expected a 32-character compact ID",
                 plugin.key(),
                 entity.key.schema_key
             )));
@@ -247,10 +244,6 @@ fn decode_base64url(byte: u8) -> Option<u8> {
         b'_' => Some(63),
         _ => None,
     }
-}
-
-fn is_legacy_uuid(value: &str) -> bool {
-    uuid::Uuid::parse_str(value).is_ok_and(|uuid| uuid.hyphenated().to_string() == value)
 }
 
 #[derive(Debug, Deserialize)]
@@ -540,24 +533,6 @@ mod tests {
         }
     }
 
-    fn authority_row(id: &str) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            entity_pk: EntityPk::single(id),
-            schema_key: "csv_row".to_string(),
-            file_id: Some("file-a".to_string()),
-            snapshot_content: Some(r#"{"id":"legacy"}"#.to_string()),
-            metadata: None,
-            deleted: false,
-            created_at: "1".to_string(),
-            updated_at: "1".to_string(),
-            global: false,
-            change_id: None,
-            commit_id: None,
-            untracked: false,
-            branch_id: "main".to_string(),
-        }
-    }
-
     #[test]
     fn compact_id_decoder_is_strict() {
         let ids = BoundIdNamespace::bind(
@@ -574,7 +549,9 @@ mod tests {
         assert_eq!(namespace[8..], ids.low.to_be_bytes());
         assert_eq!(ordinal, 42);
         assert!(decode_compact_id(&(value.clone() + "=")).is_none());
-        assert!(decode_compact_id(&value.replace('-', "+")).is_none());
+        let mut standard_base64 = value.clone();
+        standard_base64.replace_range(0..1, "+");
+        assert!(decode_compact_id(&standard_base64).is_none());
         assert!(decode_compact_id("short").is_none());
     }
 
@@ -722,42 +699,5 @@ mod tests {
                 .count(),
             1,
         );
-    }
-
-    #[test]
-    fn legacy_uuid_requires_exact_existing_authority() {
-        let bound = BoundIdNamespace::bind(
-            MutationIdentity {
-                namespace_seed: [7; 16],
-                operation_proof: [8; 32],
-            },
-            &actor_key(),
-        );
-        let uuid = "018f47d2-7b2e-7b4c-8e3a-0123456789ab";
-        let changes = WasmEntityChanges {
-            changes: vec![upsert(uuid.to_string())],
-        };
-        let plugin = plugin();
-        let validation =
-            validate_host_allocated_changes(&plugin, &changes, bound).expect("classify UUID");
-        assert_eq!(validation.existing_authorities.len(), 1);
-        assert!(
-            require_existing_id_authorities(
-                &plugin,
-                &validation.existing_authorities,
-                &[None],
-                "file-a",
-                "main",
-            )
-            .is_err()
-        );
-        require_existing_id_authorities(
-            &plugin,
-            &validation.existing_authorities,
-            &[Some(authority_row(uuid))],
-            "file-a",
-            "main",
-        )
-        .expect("durable legacy UUID authority");
     }
 }

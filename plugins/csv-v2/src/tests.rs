@@ -297,14 +297,14 @@ fn exact_220k_cold_import_is_compact_and_shares_renderer_bytes() {
 }
 
 #[test]
-fn cold_open_preserves_legacy_ids_and_warm_change_emits_local_bytes() {
+fn cold_open_preserves_noncompact_ids_and_warm_change_emits_local_bytes() {
     let source = b"alpha,one\nbeta,two\n".to_vec();
     let (warm, initial) = Document::open_file(source.clone(), Some("x.csv"), namespace()).unwrap();
     let initial = initial.collect::<Result<Vec<_>, _>>().unwrap();
-    let legacy_ids = initial
+    let noncompact_ids = initial
         .iter()
         .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
-        .map(|change| format!("legacy-{}", change.entity_pk[0]))
+        .map(|change| format!("noncompact-{}", change.entity_pk[0]))
         .collect::<Vec<_>>();
     let mut records = Vec::new();
     let mut row_index = 0;
@@ -313,9 +313,9 @@ fn cold_open_preserves_legacy_ids_and_warm_change_emits_local_bytes() {
         let mut pk = change.entity_pk;
         if change.schema_key == ROW_SCHEMA_KEY {
             let mut value: Value = serde_json::from_slice(&snapshot).unwrap();
-            value["id"] = Value::String(legacy_ids[row_index].clone());
+            value["id"] = Value::String(noncompact_ids[row_index].clone());
             snapshot = serde_json::to_vec(&value).unwrap();
-            pk[0] = legacy_ids[row_index].clone();
+            pk[0] = noncompact_ids[row_index].clone();
             row_index += 1;
         }
         records.push(EntityRecord {
@@ -332,7 +332,7 @@ fn cold_open_preserves_legacy_ids_and_warm_change_emits_local_bytes() {
         .into_iter()
         .map(|change| change.entity_pk[0].clone())
         .collect::<Vec<_>>();
-    assert_eq!(cold_ids, legacy_ids);
+    assert_eq!(cold_ids, noncompact_ids);
 
     let second = rows(cold.initial_changes())[1].clone();
     let mut snapshot: Value = serde_json::from_slice(second.snapshot.as_ref().unwrap()).unwrap();
@@ -623,15 +623,11 @@ fn cold_and_entity_updates_reject_non_self_openable_dialects() {
 }
 
 #[test]
-fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
+fn noncompact_ids_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
     let source = b"alpha,1\nbeta,2\ngamma,3\n".to_vec();
     let (warm, initial) =
-        Document::open_file(source.clone(), Some("legacy.csv"), namespace()).unwrap();
-    let legacy = [
-        "00000000-0000-4000-8000-000000000001",
-        "00000000-0000-4000-8000-000000000002",
-        "00000000-0000-4000-8000-000000000003",
-    ];
+        Document::open_file(source.clone(), Some("noncompact.csv"), namespace()).unwrap();
+    let noncompact = ["external-row-a", "external-row-b", "external-row-c"];
     let mut imported = Vec::new();
     let mut row = 0usize;
     for change in initial {
@@ -640,8 +636,8 @@ fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
         let mut snapshot = change.snapshot.unwrap();
         if change.schema_key == ROW_SCHEMA_KEY {
             let mut value: Value = serde_json::from_slice(&snapshot).unwrap();
-            value["id"] = Value::String(legacy[row].to_owned());
-            pk[0] = legacy[row].to_owned();
+            value["id"] = Value::String(noncompact[row].to_owned());
+            pk[0] = noncompact[row].to_owned();
             snapshot = serde_json::to_vec(&value).unwrap();
             row += 1;
         }
@@ -654,7 +650,7 @@ fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
     let (cold, _) = Document::open_entities(imported).unwrap();
     assert_eq!(cold.bytes(), source);
 
-    let inserted_id = "00000000-0000-4000-8000-000000000099";
+    let inserted_id = "external-row-inserted";
     let inserted_snapshot = format!(
         "{{\"id\":\"{inserted_id}\",\"order_key\":\"6000000000000001\",\"cells\":[\"inserted\",\"4\"]}}"
     )
@@ -673,7 +669,7 @@ fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
     assert!(inserted.sparse_rows_touched() < 512 * 3);
 
     // Exercise the appended-ID overlay after a cold reopen made every base
-    // identity a legacy UUID.
+    // identity an explicit noncompact value.
     let (reopened, reopened_edit) = Document::open_entities(records(&inserted)).unwrap();
     assert_eq!(reopened_edit.insert.as_slice(), inserted.bytes());
     let edited_snapshot = format!(
@@ -720,7 +716,7 @@ fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
     assert_eq!(edits.len(), 1);
     assert_eq!(apply_edits(&reordered.bytes(), &edits), deleted.bytes());
     assert_eq!(deleted.bytes(), source);
-    assert_eq!(rows(deleted.initial_changes()).len(), legacy.len());
+    assert_eq!(rows(deleted.initial_changes()).len(), noncompact.len());
     assert_eq!(warm.bytes(), source);
 }
 
@@ -728,11 +724,8 @@ fn legacy_uuid_insert_edit_reorder_delete_and_cold_open_stay_sparse() {
 fn file_change_reorder_with_inserted_row_discards_stale_rank_anchor() {
     let initial_bytes = b"old,one\nkeep,two\n".to_vec();
     let (document, initial) =
-        Document::open_file(initial_bytes.clone(), Some("legacy.csv"), namespace()).unwrap();
-    let legacy_ids = [
-        "018f47d2-7b2e-7b4c-8e3a-0123456789ab",
-        "018f47d2-7b2e-7b4c-8e3a-0123456789ac",
-    ];
+        Document::open_file(initial_bytes.clone(), Some("noncompact.csv"), namespace()).unwrap();
+    let noncompact_ids = ["external-row-a", "external-row-b"];
     let mut imported = Vec::new();
     let mut row = 0usize;
     for change in document.initial_changes() {
@@ -741,8 +734,8 @@ fn file_change_reorder_with_inserted_row_discards_stale_rank_anchor() {
         let mut snapshot = change.snapshot.unwrap();
         if change.schema_key == ROW_SCHEMA_KEY {
             let mut value: Value = serde_json::from_slice(&snapshot).unwrap();
-            value["id"] = Value::String(legacy_ids[row].to_owned());
-            entity_pk[0] = legacy_ids[row].to_owned();
+            value["id"] = Value::String(noncompact_ids[row].to_owned());
+            entity_pk[0] = noncompact_ids[row].to_owned();
             snapshot = serde_json::to_vec(&value).unwrap();
             row += 1;
         }
@@ -779,8 +772,8 @@ fn file_change_reorder_with_inserted_row_discards_stale_rank_anchor() {
             (snapshot.cells, change.entity_pk[0].clone())
         })
         .collect::<Vec<_>>();
-    assert_eq!(changed_rows[0].1, legacy_ids[1]);
-    assert_eq!(changed_rows[2].1, legacy_ids[0]);
+    assert_eq!(changed_rows[0].1, noncompact_ids[1]);
+    assert_eq!(changed_rows[2].1, noncompact_ids[0]);
     assert_eq!(changed_rows[1].1.len(), 32);
 }
 
@@ -932,7 +925,7 @@ fn sparse_generated_ordinal_does_not_invalidate_dense_import_lookup() {
 }
 
 #[test]
-fn cold_open_rejects_duplicate_legacy_row_ids() {
+fn cold_open_rejects_duplicate_noncompact_row_ids() {
     let table = EntityRecord {
         schema_key: TABLE_SCHEMA_KEY.to_owned(),
         entity_pk: vec![ROOT_ENTITY_PK.to_owned()],
@@ -941,9 +934,9 @@ fn cold_open_rejects_duplicate_legacy_row_ids() {
     };
     let snapshot = |cell: &str| EntityRecord {
         schema_key: ROW_SCHEMA_KEY.to_owned(),
-        entity_pk: vec!["same-legacy-id".to_owned()],
+        entity_pk: vec!["same-noncompact-id".to_owned()],
         snapshot: format!(
-            "{{\"id\":\"same-legacy-id\",\"order_key\":\"{}\",\"cells\":[\"{cell}\"]}}",
+            "{{\"id\":\"same-noncompact-id\",\"order_key\":\"{}\",\"cells\":[\"{cell}\"]}}",
             if cell == "one" { "4001" } else { "8001" }
         )
         .into_bytes(),

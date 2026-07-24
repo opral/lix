@@ -21,7 +21,7 @@ use crate::json_store::JsonStoreContext;
 use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
-use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
+use crate::plugin::PluginRuntimeHost;
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViews, SqlChangelogQuerySource,
     SqlExecutionContext, SqlHistoryQuerySource, SqlPlanningCache,
@@ -510,22 +510,6 @@ where
         &self,
     ) -> crate::transaction::TransactionCommitBoundary {
         self.transaction_manager.transaction_commit_boundary()
-    }
-}
-
-impl<StorageImpl> PluginComponentHost for SessionContext<StorageImpl>
-where
-    StorageImpl: Storage,
-{
-    fn plugin_component_cache(
-        &self,
-    ) -> &std::sync::Mutex<std::collections::BTreeMap<String, crate::plugin::CachedPluginComponent>>
-    {
-        self.plugin_host.plugin_component_cache()
-    }
-
-    fn wasm_runtime(&self) -> &Arc<dyn crate::wasm::WasmRuntime> {
-        self.plugin_host.wasm_runtime()
     }
 }
 

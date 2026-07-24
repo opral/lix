@@ -8,8 +8,8 @@ pub const ELEMENT_SCHEMA_KEY: &str = "excalidraw_element";
 pub const FILE_SCHEMA_KEY: &str = "excalidraw_file";
 
 const SCENE_ID: &str = "scene";
-const ELEMENTS_MARKER: &str = "\0lix-excalidraw-elements-v1\0";
-const FILES_MARKER: &str = "\0lix-excalidraw-files-v1\0";
+const ELEMENTS_MARKER: &str = "\0lix-excalidraw-elements-v2\0";
+const FILES_MARKER: &str = "\0lix-excalidraw-files-v2\0";
 const MAX_JSON_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

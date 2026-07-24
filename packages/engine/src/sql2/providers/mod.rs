@@ -376,7 +376,6 @@ where
                     ctx.commit_graph(),
                     history_query_source_for_provider()?,
                     ctx.blob_reader(),
-                    ctx.plugin_host(),
                 )
                 .await?;
             }

@@ -47,11 +47,10 @@ use crate::live_state::{
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorColdInstall,
     PluginActorColdOpen, PluginActorKey, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
-    PluginRuntime, PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
+    PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
     plugin_key_from_archive_file_id, plugin_key_from_archive_path,
     plugin_state_live_state_projection, plugin_storage_archive_file_id,
-    render_plugin_state_with_component_instance,
 };
 use crate::sql2::branch_scope::{
     BranchBinding, explicit_branch_ids_from_dml_filters, resolve_provider_branch_ids,
@@ -67,7 +66,6 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::wasm::WasmComponentInstance;
 use crate::wasm::{
     WasmComponentV2Factory, WasmFileDescriptor, WasmHostEntity, WasmOpenEntitiesInput,
     WasmPluginSelection, WasmTransitionLimits,
@@ -3029,11 +3027,9 @@ fn path_update_plugin_rewrite_file_ids(
             .branch(&context.branch_id)
             .and_then(|branch| branch.catalog.select_for_bytes(&assigned_path, &data));
         let assigned_plugin_key = assigned_plugin.map(PluginRegistryEntry::key);
-        let same_v2_owner = assigned_plugin.is_some_and(|plugin| {
-            plugin.runtime() == PluginRuntime::WasmComponentV2
-                && existing_plugin_key == Some(plugin.key())
-        });
-        if existing_plugin_key != assigned_plugin_key || same_v2_owner {
+        let same_plugin_owner =
+            assigned_plugin.is_some_and(|plugin| existing_plugin_key == Some(plugin.key()));
+        if existing_plugin_key != assigned_plugin_key || same_plugin_owner {
             file_ids.insert(file_id);
         }
     }
@@ -4130,8 +4126,7 @@ async fn render_plugin_files_for_sql(
     blob_rows: &BTreeMap<FilesystemBlobRefKey, BlobRefRecord>,
     file_paths: &BTreeMap<FilesystemDescriptorKey, String>,
 ) -> Result<BTreeMap<FilesystemDescriptorKey, Vec<u8>>, LixError> {
-    let mut owned_file_keys = Vec::new();
-    let mut materialized_v2_file_keys = Vec::new();
+    let mut materialized_file_keys = Vec::new();
     for key in file_keys {
         let file = file_rows
             .get(key)
@@ -4145,32 +4140,23 @@ async fn render_plugin_files_for_sql(
         let Some(branch) = plugin_render.branch(key.branch_id()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
-        let Some(plugin) = branch.registry.get(owner.plugin_key()) else {
+        let Some(_plugin) = branch.registry.get(owner.plugin_key()) else {
             return Err(plugin_unavailable_error(file, path, owner));
         };
-        if branch.catalog.matches_plugin(owner.plugin_key(), path) {
-            match (
-                plugin.runtime(),
-                blob_rows.contains_key(&file.blob_ref_key()),
-            ) {
-                (PluginRuntime::WasmComponentV2, true)
-                    if plugin_render.session_file_views.is_some() =>
-                {
-                    materialized_v2_file_keys.push(key.clone());
-                }
-                (PluginRuntime::WasmComponentV2, true) => {}
-                (PluginRuntime::WasmComponentV2, false) => {
-                    return Err(invalid_plugin_read_state(format!(
-                        "v2 plugin-owned file '{}' is missing its durable materialized blob",
-                        file.id
-                    )));
-                }
-                (PluginRuntime::WasmComponentV1, false) => owned_file_keys.push(key.clone()),
-                (PluginRuntime::WasmComponentV1, true) => {}
-            }
+        if !branch.catalog.matches_plugin(owner.plugin_key(), path) {
+            continue;
+        }
+        if !blob_rows.contains_key(&file.blob_ref_key()) {
+            return Err(invalid_plugin_read_state(format!(
+                "plugin-owned file '{}' is missing its durable materialized blob",
+                file.id
+            )));
+        }
+        if plugin_render.session_file_views.is_some() {
+            materialized_file_keys.push(key.clone());
         }
     }
-    for file_key in materialized_v2_file_keys {
+    for file_key in materialized_file_keys {
         acknowledge_materialized_v2_file(
             plugin_render,
             blob_reader,
@@ -4181,228 +4167,10 @@ async fn render_plugin_files_for_sql(
         )
         .await?;
     }
-    if owned_file_keys.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let mut execution_keys = BTreeSet::<(String, String)>::new();
-    for file_key in &owned_file_keys {
-        let owner = plugin_render
-            .owner_for_file(file_key)
-            .expect("owned file key was selected above");
-        execution_keys.insert((
-            file_key.branch_id().to_string(),
-            owner.plugin_key().to_string(),
-        ));
-    }
-
-    let mut component_instances =
-        BTreeMap::<(String, String), Arc<dyn WasmComponentInstance>>::new();
-    let mut cold_entries = BTreeMap::<(String, String), PluginRegistryEntry>::new();
-    for (branch_id, plugin_key) in &execution_keys {
-        let entry = plugin_render
-            .branch(branch_id)
-            .and_then(|branch| branch.registry.get(plugin_key))
-            .ok_or_else(|| invalid_plugin_read_state(format!(
-                "owner references plugin '{plugin_key}' absent from branch '{branch_id}' registry"
-            )))?;
-        let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
-        let key = (branch_id.clone(), plugin_key.clone());
-        if let Some(instance) = plugin_render
-            .host
-            .cached_plugin_component(entry.key(), hash)?
-        {
-            component_instances.insert(key, instance);
-        } else {
-            cold_entries.insert(key, entry.clone());
-        }
-    }
-
-    let wasm_hash_hexes = cold_entries
-        .values()
-        .map(|entry| entry.wasm_blob_hash().to_string())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let wasm_hashes = wasm_hash_hexes
-        .iter()
-        .map(|hash| BlobHash::from_hex(hash))
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let wasm_values = if wasm_hashes.is_empty() {
-        Vec::new()
-    } else {
-        blob_reader.load_bytes_many(&wasm_hashes).await?.into_vec()
-    };
-    if wasm_values.len() != wasm_hashes.len() {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "blob reader returned {} values for {} plugin WASM hashes",
-                wasm_values.len(),
-                wasm_hashes.len()
-            ),
-        ));
-    }
-    let mut wasm_by_hash = BTreeMap::<String, Vec<u8>>::new();
-    for (hash, bytes) in wasm_hash_hexes.into_iter().zip(wasm_values) {
-        let bytes = bytes.ok_or_else(|| {
-            invalid_plugin_read_state(format!(
-                "plugin registry references missing WASM blob '{hash}'"
-            ))
-        })?;
-        wasm_by_hash.insert(hash, bytes);
-    }
-
-    for (key, entry) in cold_entries {
-        let wasm = wasm_by_hash
-            .get(entry.wasm_blob_hash())
-            .expect("distinct plugin WASM hash was loaded")
-            .clone();
-        let plugin = entry.to_installed_plugin(wasm)?;
-        let instance =
-            crate::plugin::load_or_init_plugin_component(&plugin_render.host, &plugin).await?;
-        component_instances.insert(key, instance);
-    }
-
-    let mut file_ids_by_plugin = BTreeMap::<(String, String), BTreeSet<String>>::new();
-    let mut file_key_by_branch_and_id =
-        BTreeMap::<(String, String), FilesystemDescriptorKey>::new();
-    for file_key in &owned_file_keys {
-        let owner = plugin_render
-            .owner_for_file(file_key)
-            .expect("owned file key was selected above");
-        let branch_id = file_key.branch_id().to_string();
-        let file_id = file_key.descriptor_id().to_string();
-        file_ids_by_plugin
-            .entry((branch_id.clone(), owner.plugin_key().to_string()))
-            .or_default()
-            .insert(file_id.clone());
-        if file_key_by_branch_and_id
-            .insert((branch_id.clone(), file_id.clone()), file_key.clone())
-            .is_some()
-        {
-            return Err(invalid_plugin_read_state(format!(
-                "branch '{branch_id}' has multiple plugin-render candidates for file id '{file_id}'"
-            )));
-        }
-    }
-
-    let state_scans = file_ids_by_plugin
-        .into_iter()
-        .map(|(execution_key, file_ids)| {
-            let live_state = Arc::clone(&plugin_render.live_state);
-            let schema_keys = plugin_render
-                .branch(&execution_key.0)
-                .and_then(|branch| branch.registry.get(&execution_key.1))
-                .expect("registry entry exists for every state group")
-                .schema_keys()
-                .to_vec();
-            async move {
-                let branch_id = execution_key.0.clone();
-                let mut rows = live_state
-                    .scan_tracked_rows(&LiveStateScanRequest {
-                        filter: LiveStateFilter {
-                            schema_keys: schema_keys.clone(),
-                            branch_ids: vec![branch_id.clone()],
-                            file_ids: file_ids
-                                .iter()
-                                .cloned()
-                                .map(crate::NullableKeyFilter::Value)
-                                .collect(),
-                            untracked: Some(false),
-                            ..LiveStateFilter::default()
-                        },
-                        projection: plugin_state_live_state_projection(),
-                        limit: None,
-                    })
-                    .await?;
-                rows.retain(|row| {
-                    row.branch_id == branch_id
-                        && !row.global
-                        && !row.untracked
-                        && row
-                            .file_id
-                            .as_ref()
-                            .is_some_and(|file_id| file_ids.contains(file_id))
-                        && row.snapshot_content.is_some()
-                        && schema_keys.binary_search(&row.schema_key).is_ok()
-                });
-                Ok::<_, LixError>((execution_key, rows))
-            }
-        });
-    let state_groups = try_join_all(state_scans).await?;
-    let mut state_by_file = owned_file_keys
-        .iter()
-        .cloned()
-        .map(|key| (key, Vec::<MaterializedLiveStateRow>::new()))
-        .collect::<BTreeMap<_, _>>();
-    for ((branch_id, _plugin_key), rows) in state_groups {
-        for row in rows {
-            let Some(file_id) = row.file_id.as_deref() else {
-                continue;
-            };
-            let key = file_key_by_branch_and_id
-                .get(&(branch_id.clone(), file_id.to_string()))
-                .ok_or_else(|| {
-                    invalid_plugin_read_state(format!(
-                        "plugin state scan returned unexpected file id '{file_id}' in branch '{branch_id}'"
-                    ))
-                })?;
-            state_by_file
-                .get_mut(key)
-                .expect("owned file state bucket exists")
-                .push(row);
-        }
-    }
-    for rows in state_by_file.values_mut() {
-        rows.sort_by(|left, right| {
-            (&left.schema_key, &left.entity_pk).cmp(&(&right.schema_key, &right.entity_pk))
-        });
-    }
-
-    let mut rendered = BTreeMap::new();
-    for file_key in owned_file_keys {
-        let owner = plugin_render
-            .owner_for_file(&file_key)
-            .expect("owned file key was selected above");
-        let execution_key = (
-            file_key.branch_id().to_string(),
-            owner.plugin_key().to_string(),
-        );
-        let component = component_instances
-            .get(&execution_key)
-            .expect("resolved component exists for owned file");
-        let active_state = state_by_file.remove(&file_key).unwrap_or_default();
-        // The owner row, not the presence of plugin state rows, is the durable
-        // materialization signal. Plugins that intentionally emit zero state
-        // must still receive render([]).
-        let bytes = render_plugin_state_with_component_instance(component, &active_state).await?;
-        if let Some(session_file_views) = &plugin_render.session_file_views {
-            let plugin = plugin_render
-                .branch(file_key.branch_id())
-                .and_then(|branch| branch.registry.get(owner.plugin_key()))
-                .expect("rendered plugin should remain in the branch registry");
-            session_file_views.remember_plugin_file_view(
-                SessionFileViewKey::new(file_key.branch_id(), file_key.descriptor_id()),
-                SessionPluginFileView {
-                    plugin_key: owner.plugin_key().to_string(),
-                    plugin_generation: plugin.archive_blob_hash().to_string(),
-                    owner_change_id: plugin_render
-                        .owner_change_id_for_file(&file_key)
-                        .expect("rendered plugin owner should have a change id")
-                        .to_string(),
-                    observation: None,
-                    // Rendering only borrows the materialized state and this
-                    // is its final consumer. Move the row graph into the
-                    // session acknowledgement instead of deep-cloning every
-                    // entity on each exact blob read.
-                    rows: active_state.into(),
-                },
-            );
-        }
-        rendered.insert(file_key, bytes);
-    }
-    Ok(rendered)
+    // Plugin data is durably materialized before SQL reads. Raw blob loading
+    // remains in the caller; this function only restores a cold actor for a
+    // later sparse transition when a session view is requested.
+    Ok(BTreeMap::new())
 }
 
 async fn acknowledge_materialized_v2_file(
@@ -4432,11 +4200,6 @@ async fn acknowledge_materialized_v2_file(
         .branch(file_key.branch_id())
         .and_then(|branch| branch.registry.get(owner.plugin_key()))
         .ok_or_else(|| plugin_unavailable_error(file, path, owner))?;
-    if plugin.runtime() != PluginRuntime::WasmComponentV2 {
-        return Err(invalid_plugin_read_state(
-            "materialized v2 acknowledgement selected a non-v2 plugin",
-        ));
-    }
     let semantic_root = blob
         .live
         .change_id
@@ -4478,7 +4241,6 @@ async fn acknowledge_materialized_v2_file(
                 plugin_generation: plugin.archive_blob_hash().to_string(),
                 owner_change_id: owner_change_id.to_string(),
                 observation: Some(observation),
-                rows: Arc::from([]),
             },
         );
     }
@@ -6074,11 +5836,7 @@ mod tests {
     use crate::transaction::types::{
         TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
     };
-    use crate::wasm::{
-        UnsupportedWasmRuntime, WasmComponentInstance, WasmHostBytes, WasmLimits,
-        WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime,
-        WasmTransitionLimits,
-    };
+    use crate::wasm::{UnsupportedWasmRuntime, WasmHostBytes, WasmTransitionLimits};
     use crate::{LixError, NullableKeyFilter};
 
     use super::{
@@ -7678,21 +7436,6 @@ mod tests {
         bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
     }
 
-    struct RecordingBlobReader {
-        bytes_by_hash: BTreeMap<BlobHash, Vec<u8>>,
-        requests: Arc<Mutex<Vec<Vec<BlobHash>>>>,
-    }
-
-    struct RecordingRenderRuntime {
-        rendered_states: Arc<Mutex<Vec<Vec<WasmPluginEntityState>>>>,
-        rendered_bytes: Vec<u8>,
-    }
-
-    struct RecordingRenderComponent {
-        rendered_states: Arc<Mutex<Vec<Vec<WasmPluginEntityState>>>>,
-        rendered_bytes: Vec<u8>,
-    }
-
     impl StaticBlobReader {
         fn from_blobs(blobs: impl IntoIterator<Item = Vec<u8>>) -> Self {
             Self {
@@ -7738,55 +7481,6 @@ mod tests {
                     .map(|hash| self.bytes_by_hash.get(hash).cloned())
                     .collect(),
             ))
-        }
-    }
-
-    #[async_trait]
-    impl BlobDataReader for RecordingBlobReader {
-        async fn load_bytes_many(&self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
-            self.requests
-                .lock()
-                .expect("blob request mutex should not be poisoned")
-                .push(hashes.to_vec());
-            Ok(BlobBytesBatch::new(
-                hashes
-                    .iter()
-                    .map(|hash| self.bytes_by_hash.get(hash).cloned())
-                    .collect(),
-            ))
-        }
-    }
-
-    #[async_trait]
-    impl WasmRuntime for RecordingRenderRuntime {
-        async fn init_component(
-            &self,
-            _bytes: Vec<u8>,
-            _limits: WasmLimits,
-        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-            Ok(Arc::new(RecordingRenderComponent {
-                rendered_states: Arc::clone(&self.rendered_states),
-                rendered_bytes: self.rendered_bytes.clone(),
-            }))
-        }
-    }
-
-    #[async_trait]
-    impl WasmComponentInstance for RecordingRenderComponent {
-        async fn detect_changes(
-            &self,
-            _state: Vec<WasmPluginEntityState>,
-            _file: WasmPluginFile,
-        ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
-            Ok(Vec::new())
-        }
-
-        async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
-            self.rendered_states
-                .lock()
-                .expect("rendered state mutex should not be poisoned")
-                .push(state);
-            Ok(self.rendered_bytes.clone())
         }
     }
 
@@ -8276,11 +7970,11 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version": "0.1.0",
+            "api_version": "2.0.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
-            "runtime": "wasm-component-v1",
+            "runtime": "wasm-component-v2",
             "schemas": ["schema/plugin.json"],
         });
         if let Some(content_type) = content_type {
@@ -8290,8 +7984,8 @@ mod tests {
         let manifest_json = manifest.to_string();
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -8382,8 +8076,8 @@ mod tests {
         let manifest_json = format!(
             r#"{{
                 "key": "plugin_sentinel",
-                "runtime": "wasm-component-v1",
-                "api_version": "0.1.0",
+                "runtime": "wasm-component-v2",
+                "api_version": "2.0.0",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",
                 "schemas": ["schema/plugin_note.json"]
@@ -9109,130 +8803,6 @@ mod tests {
         assert_eq!(error.code, LixError::CODE_PLUGIN_UNAVAILABLE);
         assert!(error.message.contains("plugin_sentinel"));
         assert!(error.message.contains("/note.sentinel"));
-    }
-
-    #[tokio::test]
-    async fn plugin_owner_renders_empty_state_with_one_wasm_batch() {
-        let wasm = b"test wasm".to_vec();
-        let entry =
-            test_plugin_registry_entry("plugin_sentinel", "*.sentinel", "plugin_note", &wasm);
-        let scan_requests = Arc::new(Mutex::new(Vec::new()));
-        let live_state = Arc::new(RecordingLiveStateReader {
-            rows: vec![
-                live_plugin_registry_row("branch-b", vec![entry]),
-                live_plugin_owner_row(
-                    "branch-b",
-                    "file-note",
-                    "plugin_sentinel",
-                    vec!["plugin_note".to_string()],
-                ),
-            ],
-            scan_requests: Arc::clone(&scan_requests),
-        }) as Arc<dyn LiveStateReader>;
-        let prepared = super::prepare_lix_file_rows(
-            vec![live_file_row(
-                "file-note",
-                "branch-b",
-                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
-            )],
-            &super::FilePathPredicate::All,
-        )
-        .expect("owned blobless file should prepare");
-        let rendered_states = Arc::new(Mutex::new(Vec::new()));
-        let context = super::plugin_render_context_for_lix_file_scan(
-            Arc::clone(&live_state),
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            PluginRuntimeHost::new(Arc::new(RecordingRenderRuntime {
-                rendered_states: Arc::clone(&rendered_states),
-                rendered_bytes: b"rendered empty state".to_vec(),
-            })),
-            &prepared,
-            false,
-        )
-        .await
-        .expect("plugin render context should load")
-        .expect("installed plugin should create a render context");
-        let blob_requests = Arc::new(Mutex::new(Vec::new()));
-        let blob_reader = Arc::new(RecordingBlobReader {
-            bytes_by_hash: BTreeMap::from([(BlobHash::from_content(&wasm), wasm)]),
-            requests: Arc::clone(&blob_requests),
-        }) as Arc<dyn BlobDataReader>;
-
-        let batch = super::lix_file_record_batch_from_prepared(
-            &super::lix_file_schema(),
-            &blob_reader,
-            Some(context.clone()),
-            true,
-            prepared,
-        )
-        .await
-        .expect("owned file should render");
-
-        let data = batch
-            .column(batch.schema().index_of("data").unwrap())
-            .as_any()
-            .downcast_ref::<LargeBinaryArray>()
-            .expect("data should be a large binary array");
-        assert_eq!(data.value(0), b"rendered empty state");
-        assert_eq!(
-            rendered_states
-                .lock()
-                .expect("rendered state mutex")
-                .as_slice(),
-            &[Vec::<WasmPluginEntityState>::new()]
-        );
-        assert_eq!(
-            blob_requests.lock().expect("blob request mutex").as_slice(),
-            &[vec![BlobHash::from_content(b"test wasm")]]
-        );
-
-        let warm_prepared = super::prepare_lix_file_rows(
-            vec![live_file_row(
-                "file-note",
-                "branch-b",
-                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
-            )],
-            &super::FilePathPredicate::All,
-        )
-        .expect("warm owned file should prepare");
-        super::lix_file_record_batch_from_prepared(
-            &super::lix_file_schema(),
-            &blob_reader,
-            Some(context),
-            true,
-            warm_prepared,
-        )
-        .await
-        .expect("warm owned file should render without loading component bytes");
-        assert_eq!(
-            blob_requests.lock().expect("blob request mutex").as_slice(),
-            &[vec![BlobHash::from_content(b"test wasm")]],
-            "warm render must hit the hash cache before CAS"
-        );
-        assert_eq!(
-            rendered_states.lock().expect("rendered state mutex").len(),
-            2
-        );
-        let requests = scan_requests.lock().expect("scan request mutex");
-        assert_eq!(
-            requests.len(),
-            4,
-            "registry, owners, then one grouped state scan per render"
-        );
-        assert_eq!(
-            requests[1].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single(PLUGIN_OWNER_KEY)]
-        );
-        assert_eq!(
-            requests[2].filter.file_ids,
-            vec![NullableKeyFilter::Value("file-note".to_string())]
-        );
     }
 
     #[tokio::test]

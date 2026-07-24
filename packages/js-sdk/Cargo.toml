@@ -21,12 +21,11 @@ crate-type = ["cdylib"]
 path = "native/lib.rs"
 
 [dependencies]
-async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-lix_sdk = { path = "../rs-sdk", version = "0.8.4", default-features = false, features = ["local_filesystem", "sqlite"] }
+lix_sdk = { path = "../rs-sdk", version = "0.8.4", default-features = false, features = ["default_wasm_runtime", "local_filesystem", "sqlite"] }
 napi = { version = "3.9.0", default-features = false, features = ["napi6", "serde-json"] }
 napi-derive = "3.5.6"
 tokio = { version = "1", features = ["rt", "sync"] }

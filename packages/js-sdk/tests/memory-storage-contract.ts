@@ -8,12 +8,14 @@ export type MemoryStorageContractOptions = {
 	name: string;
 	loadSdk: () => Promise<ContractSdk>;
 	operationTimeoutMs?: number;
+	supportsPluginExecution?: boolean;
 };
 
 export function registerMemoryStorageContract({
 	name,
 	loadSdk,
 	operationTimeoutMs = 5_000,
+	supportsPluginExecution = true,
 }: MemoryStorageContractOptions): void {
 	const wait = <T>(promise: Promise<T>, operation: string): Promise<T> =>
 		withTimeout(promise, operation, operationTimeoutMs);
@@ -320,7 +322,7 @@ export function registerMemoryStorageContract({
 			await lix.close();
 		});
 
-		test(
+		test.skipIf(!supportsPluginExecution)(
 			"executes the bundled CSV plugin",
 			async () => {
 				const { bundledPluginArchives, openLix } = await loadSdk();
@@ -330,7 +332,7 @@ export function registerMemoryStorageContract({
 						bundledPluginArchives(),
 						"load bundled plugin archives",
 					);
-					const csv = archives.find((plugin) => plugin.key === "plugin_csv");
+					const csv = archives.find((plugin) => plugin.key === "plugin_csv_v2");
 					if (!csv) throw new Error("expected bundled CSV plugin");
 					await writeBytes(
 						lix,
@@ -345,7 +347,7 @@ export function registerMemoryStorageContract({
 					);
 
 					const rows = await lix.execute(
-						"SELECT cells FROM csv_row ORDER BY order_key",
+						"SELECT cells FROM csv_v2_row ORDER BY order_key",
 					);
 					expect(rows.rows.map((row) => row.get("cells"))).toEqual([
 						["name", "age"],

@@ -12,22 +12,17 @@ use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPu
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use crate::LixError;
 use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
-use crate::plugin::{
-    InstalledPlugin, InstalledPluginMetadata, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
-    PluginFileOwner, PluginRegistry, PluginRuntimeHost, load_installed_plugin_from_archive_bytes,
-    render_plugin_state, retain_plugin_state_rows,
-};
+use crate::plugin::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry};
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest, TrackedStateStoreReader,
 };
-use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -62,7 +57,6 @@ pub(super) async fn register_lix_file_history_surface<S>(
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -74,7 +68,6 @@ where
             commit_graph: Arc::new(Mutex::new(commit_graph)),
             query_source,
             blob_reader,
-            plugin_host,
         }),
         WriteAccess::read_only(),
     )
@@ -89,7 +82,6 @@ struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
 }
 
 #[async_trait]
@@ -154,7 +146,6 @@ where
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),
                     Arc::clone(&self.blob_reader),
-                    self.plugin_host.clone(),
                     route,
                     public_predicate,
                     lookup_ids,
@@ -165,7 +156,6 @@ where
                     commit_graph,
                     query_source,
                     blob_reader,
-                    plugin_host,
                     route,
                     public_predicate,
                     lookup_ids,
@@ -176,7 +166,6 @@ where
                         commit_graph,
                         query_source,
                         &blob_reader,
-                        plugin_host,
                         &route,
                         &public_predicate,
                         lookup_ids.as_ref(),
@@ -465,7 +454,6 @@ struct FileHistoryObservedState {
     descriptors: Vec<FileHistoryDescriptorRecord>,
     directories: Vec<FileHistoryDirectoryRecord>,
     blobs: Vec<FileHistoryBlobRecord>,
-    plugin_state: Vec<FileHistoryPluginStateRecord>,
     plugin_owners: Vec<FileHistoryPluginOwnerRecord>,
     plugin_registry: PluginRegistry,
 }
@@ -524,7 +512,6 @@ async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
-    plugin_host: PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
     lookup_ids: Option<&FileHistoryLookupIds>,
@@ -554,7 +541,6 @@ where
         metadata_projection,
     )
     .await?;
-    let mut installed_plugins_cache = BTreeMap::<(String, String), InstalledPlugin>::new();
     let parent_commit_ids_by_commit =
         load_history_commit_parents(&commit_graph, &context_route.as_of_commit_ids).await?;
     let plugin_discovery = discover_file_history_plugins(
@@ -694,22 +680,11 @@ where
         let data = if needs_data && prepared_row.descriptor.name.is_some() {
             match prepared_row.blob_hash.as_deref() {
                 Some(blob_hash) => blob_bytes.get(blob_hash).cloned().flatten(),
-                None => match prepared_row.path.as_deref() {
-                    Some(path) => {
-                        let rendered = render_plugin_file_history_data(
-                            &plugin_host,
-                            blob_reader,
-                            &mut installed_plugins_cache,
-                            &observed_states,
-                            &prepared_row.descriptor,
-                            &prepared_row.event,
-                            path,
-                        )
-                        .await?;
-                        Some(rendered.unwrap_or_default())
-                    }
-                    None => Some(Vec::new()),
-                },
+                // V2 plugin files persist their materialized bytes. A missing
+                // blob therefore has the same empty-file representation as a
+                // non-plugin file; history never invokes a semantic renderer
+                // while replaying durable materialized bytes.
+                None => Some(Vec::new()),
             }
         } else {
             None
@@ -963,7 +938,6 @@ where
         descriptors: parse_file_history_descriptors(&entries)?,
         directories: parse_file_history_directories(&entries)?,
         blobs: parse_file_history_blobs(&entries)?,
-        plugin_state: parse_file_history_plugin_state(&entries),
         plugin_owners: parse_file_history_plugin_owners(&plugin_owner_entries)?,
         plugin_registry,
     })
@@ -1921,152 +1895,6 @@ fn resolve_file_history_path(
     compose_file_path(Some(&directory_path), name).ok()
 }
 
-async fn render_plugin_file_history_data(
-    plugin_host: &PluginRuntimeHost,
-    blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &mut BTreeMap<(String, String), InstalledPlugin>,
-    observed_states: &BTreeMap<String, FileHistoryObservedState>,
-    descriptor: &FileHistoryDescriptorRecord,
-    event: &FileHistoryEvent,
-    path: &str,
-) -> Result<Option<Vec<u8>>, LixError> {
-    let Some(state) = observed_states.get(&event.observed_commit_id) else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "lix_file_history did not load observed commit '{}'",
-                event.observed_commit_id
-            ),
-        ));
-    };
-    let Some(owner) = live_file_history_plugin_owner(state, &descriptor.id) else {
-        return Ok(None);
-    };
-    let Some(plugin_entry) = state.plugin_registry.get(owner.plugin_key()) else {
-        return Err(plugin_history_unavailable_error(
-            descriptor, event, path, owner,
-        ));
-    };
-    let catalog = plugin_host.compiled_plugin_catalog(&state.plugin_registry)?;
-    if !catalog.matches_plugin(owner.plugin_key(), path) {
-        return Ok(None);
-    }
-    let plugin_metadata = plugin_entry.to_installed_plugin_metadata();
-    let plugin = installed_plugin_at_observed_commit(
-        blob_reader,
-        installed_plugins_cache,
-        &plugin_metadata,
-        &event.observed_commit_id,
-    )
-    .await?;
-    let rows = plugin_state_live_rows_at_observed_commit(&state.plugin_state, plugin, descriptor);
-    let active_state = retain_plugin_state_rows(plugin, rows);
-    Ok(Some(
-        render_plugin_state(plugin_host, plugin, &active_state).await?,
-    ))
-}
-
-fn plugin_history_unavailable_error(
-    descriptor: &FileHistoryDescriptorRecord,
-    event: &FileHistoryEvent,
-    path: &str,
-    owner: &PluginFileOwner,
-) -> LixError {
-    LixError::new(
-        LixError::CODE_PLUGIN_UNAVAILABLE,
-        format!(
-            "file '{path}' requires unavailable plugin '{}'",
-            owner.plugin_key()
-        ),
-    )
-    .with_hint(format!(
-        "Add a valid .lixplugin archive for '{}' to /.lix/plugins/ to render the file again.",
-        owner.plugin_key()
-    ))
-    .with_details(serde_json::json!({
-        "file_id": descriptor.id,
-        "path": path,
-        "plugin_key": owner.plugin_key(),
-        "observed_commit_id": event.observed_commit_id,
-    }))
-}
-
-async fn installed_plugin_at_observed_commit<'a>(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    installed_plugins_cache: &'a mut BTreeMap<(String, String), InstalledPlugin>,
-    plugin_metadata: &InstalledPluginMetadata,
-    observed_commit_id: &str,
-) -> Result<&'a InstalledPlugin, LixError> {
-    let cache_key = (observed_commit_id.to_string(), plugin_metadata.key.clone());
-    if !installed_plugins_cache.contains_key(&cache_key) {
-        let Some(plugin) =
-            load_installed_plugin_for_observed_commit(blob_reader, plugin_metadata).await?
-        else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "installed plugin archive '{}' is unavailable at observed commit '{}'",
-                    plugin_metadata.key, observed_commit_id
-                ),
-            ));
-        };
-        installed_plugins_cache.insert(cache_key.clone(), plugin);
-    }
-    Ok(installed_plugins_cache
-        .get(&cache_key)
-        .expect("plugin should be cached after load"))
-}
-
-async fn load_installed_plugin_for_observed_commit(
-    blob_reader: &Arc<dyn BlobDataReader>,
-    plugin_metadata: &InstalledPluginMetadata,
-) -> Result<Option<InstalledPlugin>, LixError> {
-    let hash = BlobHash::from_hex(&plugin_metadata.archive_blob_hash)?;
-    let mut batch = blob_reader.load_bytes_many(&[hash]).await?.into_vec();
-    let Some(archive_bytes) = batch.pop().flatten() else {
-        return Ok(None);
-    };
-    Ok(Some(load_installed_plugin_from_archive_bytes(
-        &plugin_metadata.key,
-        &plugin_metadata.archive_path,
-        &archive_bytes,
-    )?))
-}
-
-fn plugin_state_live_rows_at_observed_commit(
-    plugin_state: &[FileHistoryPluginStateRecord],
-    plugin: &InstalledPlugin,
-    descriptor: &FileHistoryDescriptorRecord,
-) -> Vec<MaterializedLiveStateRow> {
-    let plugin_schema_keys = plugin.schema_keys.iter().collect::<BTreeSet<_>>();
-    plugin_state
-        .iter()
-        .filter(|record| {
-            record.file_id == descriptor.id
-                && plugin_schema_keys.contains(&record.entry.change.schema_key)
-        })
-        .map(|record| history_entry_to_live_row(&record.entry))
-        .collect()
-}
-
-fn history_entry_to_live_row(entry: &HistoryEntry) -> MaterializedLiveStateRow {
-    MaterializedLiveStateRow {
-        entity_pk: entry.change.entity_pk.clone(),
-        schema_key: entry.change.schema_key.clone(),
-        file_id: entry.change.file_id.clone(),
-        snapshot_content: entry.change.snapshot_content.clone(),
-        metadata: entry.change.metadata.clone(),
-        deleted: entry.change.snapshot_content.is_none(),
-        created_at: entry.change.created_at.clone(),
-        updated_at: entry.change.created_at.clone(),
-        global: false,
-        change_id: None,
-        commit_id: None,
-        untracked: false,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
-    }
-}
-
 static LIX_FILE_HISTORY_COLS: ColumnTable<FileHistoryOutputRow> = ColumnTable {
     columns: &[
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
@@ -2280,7 +2108,6 @@ mod tests {
                 descriptors: context.descriptors.clone(),
                 directories: context.event_directories.clone(),
                 blobs: context.event_blobs.clone(),
-                plugin_state: Vec::new(),
                 plugin_owners: Vec::new(),
                 plugin_registry: PluginRegistry::empty(),
             },
@@ -2331,7 +2158,6 @@ mod tests {
             descriptors: Vec::new(),
             directories: Vec::new(),
             blobs: Vec::new(),
-            plugin_state: Vec::new(),
             plugin_owners: vec![owner_record],
             plugin_registry: PluginRegistry::empty(),
         }
@@ -2340,18 +2166,18 @@ mod tests {
     fn plugin_registry(plugin_key: &str, schema_keys: &[&str]) -> PluginRegistry {
         let wasm = b"test wasm";
         let manifest_json = serde_json::json!({
-            "api_version": "0.1.0",
+            "api_version": "2.0.0",
             "entry": "plugin.wasm",
             "key": plugin_key,
             "match": { "path_glob": "*.plugin-test" },
-            "runtime": "wasm-component-v1",
+            "runtime": "wasm-component-v2",
             "schemas": ["schema/plugin.json"],
         })
         .to_string();
         let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: plugin_key.to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
+            runtime: PluginRuntime::WasmComponentV2,
+            api_version: "2.0.0".to_string(),
             path_glob: "*.plugin-test".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),
@@ -2568,7 +2394,6 @@ mod tests {
             descriptors: descriptors.clone(),
             directories: directories.clone(),
             blobs: Vec::new(),
-            plugin_state: Vec::new(),
             plugin_owners: Vec::new(),
             plugin_registry: PluginRegistry::empty(),
         };

@@ -859,17 +859,6 @@ dependencies = [
 
 [[package]]
 name = "chardetng"
-version = "0.1.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14b8f0b65b7b08ae3c8187e8d77174de20cb6777864c6b832d8ad365999cf1ea"
-dependencies = [
- "cfg-if",
- "encoding_rs",
- "memchr",
-]
-
-[[package]]
-name = "chardetng"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13de944a44b5064ee5d3a5ceccc49a41bfec50f2580e66f82e87703acdb88b53"
@@ -1331,32 +1320,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "criterion"
-version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b12d017a929603d80db1831cd3a24082f8137ce19c69e6447f54f5fc8d692f"
-dependencies = [
- "anes",
- "cast",
- "ciborium",
- "clap",
- "criterion-plot",
- "is-terminal",
- "itertools 0.10.5",
- "num-traits",
- "once_cell",
- "oorandom",
- "plotters",
- "rayon",
- "regex",
- "serde",
- "serde_derive",
- "serde_json",
- "tinytemplate",
- "walkdir",
-]
-
-[[package]]
 name = "criterion-plot"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1468,23 +1431,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
 dependencies = [
  "memchr",
-]
-
-[[package]]
-name = "csv-nose"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6176ac2446fee71be8d38d73af5a8cc03405cd4049cc032e35c34ef236bf86f6"
-dependencies = [
- "bytecount",
- "chardetng 0.1.17",
- "csv",
- "encoding_rs",
- "foldhash 0.2.0",
- "rayon",
- "regex",
- "simdutf8",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2905,16 +2851,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "imara-diff"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f01d462f766df78ab820dd06f5eb700233c51f0f4c2e846520eaf4ba6aa5c5c"
-dependencies = [
- "hashbrown 0.15.5",
- "memchr",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3351,7 +3287,6 @@ dependencies = [
 name = "lix_js_sdk"
 version = "0.8.4"
 dependencies = [
- "async-trait",
  "console_error_panic_hook",
  "futures-util",
  "getrandom 0.3.4",
@@ -3419,16 +3354,15 @@ name = "lix_sdk_tests"
 version = "0.8.4"
 dependencies = [
  "async-trait",
- "base64 0.22.1",
  "codspeed-criterion-compat",
  "lix_sdk",
- "plugin_csv",
  "plugin_csv_v2",
  "plugin_excalidraw_v2",
  "plugin_json_incremental_v2",
  "plugin_markdown_incremental_v2",
  "rand 0.9.2",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "wasmtime",
@@ -4210,23 +4144,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_csv"
-version = "0.8.4"
-dependencies = [
- "bytecount",
- "chardetng 1.0.0",
- "csv",
- "csv-nose",
- "encoding_rs",
- "imara-diff",
- "lix_order_key",
- "rand 0.9.2",
- "serde_json",
- "uuid",
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
 name = "plugin_csv_v2"
 version = "0.8.4"
 dependencies = [
@@ -4255,36 +4172,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "plugin_json_v2"
-version = "0.8.4"
-dependencies = [
- "criterion",
- "serde",
- "serde_json",
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
 name = "plugin_markdown_incremental_v2"
 version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
- "chardetng 1.0.0",
- "encoding_rs",
- "lix_order_key",
- "markdown",
- "markdown-syntax",
- "serde",
- "serde_json",
- "uuid",
- "wit-bindgen 0.57.1",
-]
-
-[[package]]
-name = "plugin_md_v2"
-version = "0.8.4"
-dependencies = [
- "chardetng 1.0.0",
+ "chardetng",
  "encoding_rs",
  "lix_order_key",
  "markdown",
@@ -5066,20 +4958,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06794f8f6c5c898b3275aebefa6b8a1cb24cd2c6c79397ab15774837a0bc5755"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "text_plugin"
-version = "0.8.4"
-dependencies = [
- "chardetng 1.0.0",
- "encoding_rs",
- "imara-diff",
- "lix_order_key",
- "rand 0.9.2",
- "serde_json",
- "uuid",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]

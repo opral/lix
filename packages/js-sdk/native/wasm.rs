@@ -1,14 +1,10 @@
 #![allow(missing_debug_implementations)]
 
 use std::cell::{Cell, RefCell};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use async_trait::async_trait;
 use futures_util::future::{AbortHandle, Abortable};
-use js_sys::{Array, Function, Promise, Reflect};
+use js_sys::{Array, Function, Reflect};
 use lix_sdk::{
     CallbackTelemetrySink, CreateBranchOptions as RsCreateBranchOptions,
     ExecuteBatchStatement as RsExecuteBatchStatement, ExecuteOptions as RsExecuteOptions,
@@ -16,14 +12,12 @@ use lix_sdk::{
     Memory, MergeBranchOptions as RsMergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, ObserveEvents as RsObserveEvents,
     OpenLixOptions as RsOpenLixOptions, SqlScriptPlan,
-    SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, WasmComponentInstance,
-    WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState, WasmPluginFile, WasmRuntime,
-    open_lix, open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
+    SwitchBranchOptions as RsSwitchBranchOptions, TelemetrySink, Value, open_lix,
+    open_lix_with_telemetry, parse_sql_script as parse_rs_sql_script,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_bytes::ByteBuf;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::JsFuture;
 
 type BrowserLix = RsLix<Memory>;
 type BrowserTransaction = RsLixTransaction<Memory>;
@@ -48,28 +42,23 @@ pub struct WasmObserveEvents {
 }
 
 #[wasm_bindgen(js_name = openMemory)]
-pub async fn open_memory(
-    plugin_runtime_dispatch: Function,
-    telemetry_dispatch: Option<Function>,
-) -> Result<WasmLix, JsValue> {
-    open_memory_from_snapshot(plugin_runtime_dispatch, telemetry_dispatch, None).await
+pub async fn open_memory(telemetry_dispatch: Option<Function>) -> Result<WasmLix, JsValue> {
+    open_memory_from_snapshot(telemetry_dispatch, None).await
 }
 
 #[wasm_bindgen(js_name = openMemoryFromSnapshot)]
 pub async fn open_memory_from_snapshot(
-    plugin_runtime_dispatch: Function,
     telemetry_dispatch: Option<Function>,
     snapshot: Option<Vec<u8>>,
 ) -> Result<WasmLix, JsValue> {
     console_error_panic_hook::set_once();
-    let runtime = Arc::new(BrowserJsWasmRuntime::new(plugin_runtime_dispatch));
     let storage = match snapshot {
         Some(snapshot) => {
             Memory::from_snapshot(&snapshot).map_err(|error| lix_error_to_js(error.into()))?
         }
         None => Memory::new(),
     };
-    let options = RsOpenLixOptions::new(storage.clone()).with_wasm_runtime(runtime);
+    let options = RsOpenLixOptions::new(storage.clone());
     let telemetry = telemetry_dispatch.map(|dispatch| {
         let dispatch = BrowserTelemetryDispatch(dispatch);
         let sink: Arc<dyn TelemetrySink> = Arc::new(CallbackTelemetrySink::new(move |span| {
@@ -830,251 +819,4 @@ fn lix_error_to_js(error: LixError) -> JsValue {
         let _ = Reflect::set(object, &JsValue::from_str("details"), &details);
     }
     js_error.into()
-}
-
-#[derive(Clone)]
-struct BrowserJsWasmRuntime {
-    dispatch: Function,
-}
-
-impl BrowserJsWasmRuntime {
-    fn new(dispatch: Function) -> Self {
-        Self { dispatch }
-    }
-
-    async fn dispatch(
-        &self,
-        operation: &str,
-        request: &PluginRuntimeRequestDto,
-    ) -> Result<PluginRuntimeResponseDto, LixError> {
-        let request = to_js(request).map_err(|error| js_runtime_error(operation, error))?;
-        let promise = self
-            .dispatch
-            .call1(&JsValue::UNDEFINED, &request)
-            .map(|value| Promise::resolve(&value))
-            .map_err(|error| js_runtime_error(operation, error))?;
-        let response = SendJsFuture(JsFuture::from(promise))
-            .await
-            .map_err(|error| js_runtime_error(operation, error))?;
-        let response: PluginRuntimeResponseDto = serde_wasm_bindgen::from_value(response)
-            .map_err(|error| js_runtime_error(operation, error))?;
-        if let Some(message) = response.error_message.as_deref() {
-            return Err(js_runtime_error(operation, message));
-        }
-        Ok(response)
-    }
-}
-
-// Browser WASM is single-threaded. The SDK's runtime trait requires Send futures
-// for native implementations, so this wrapper records the target invariant.
-struct SendJsFuture(JsFuture);
-
-#[expect(
-    clippy::non_send_fields_in_send_ty,
-    reason = "browser WASM is single-threaded but the shared runtime trait requires Send"
-)]
-unsafe impl Send for SendJsFuture {}
-
-impl Future for SendJsFuture {
-    type Output = Result<JsValue, JsValue>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Pin::new(&mut self.0).poll(cx)
-    }
-}
-
-unsafe impl Send for BrowserJsWasmRuntime {}
-unsafe impl Sync for BrowserJsWasmRuntime {}
-
-#[async_trait]
-impl WasmRuntime for BrowserJsWasmRuntime {
-    async fn init_component(
-        &self,
-        bytes: Vec<u8>,
-        limits: WasmLimits,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        let response = self
-            .dispatch(
-                "init-component",
-                &PluginRuntimeRequestDto {
-                    operation: "initComponent",
-                    component_id: None,
-                    component_bytes: Some(ByteBuf::from(bytes)),
-                    max_memory_bytes: Some(limits.max_memory_bytes.to_string()),
-                    max_fuel: limits.max_fuel.map(|value| value.to_string()),
-                    timeout_ms: limits.timeout_ms.map(|value| value.to_string()),
-                    state: None,
-                    file: None,
-                },
-            )
-            .await?;
-        let component_id = response.component_id.ok_or_else(|| {
-            js_runtime_error("init-component", "response did not include a component id")
-        })?;
-        Ok(Arc::new(BrowserJsWasmComponent {
-            component_id,
-            runtime: self.clone(),
-        }))
-    }
-}
-
-struct BrowserJsWasmComponent {
-    component_id: u32,
-    runtime: BrowserJsWasmRuntime,
-}
-
-#[async_trait]
-impl WasmComponentInstance for BrowserJsWasmComponent {
-    async fn detect_changes(
-        &self,
-        state: Vec<WasmPluginEntityState>,
-        file: WasmPluginFile,
-    ) -> Result<Vec<WasmPluginDetectedChange>, LixError> {
-        let response = self
-            .runtime
-            .dispatch(
-                "detect-changes",
-                &PluginRuntimeRequestDto {
-                    operation: "detectChanges",
-                    component_id: Some(self.component_id),
-                    component_bytes: None,
-                    max_memory_bytes: None,
-                    max_fuel: None,
-                    timeout_ms: None,
-                    state: Some(state.into_iter().map(Into::into).collect()),
-                    file: Some(file.into()),
-                },
-            )
-            .await?;
-        Ok(response
-            .changes
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect())
-    }
-
-    async fn render(&self, state: Vec<WasmPluginEntityState>) -> Result<Vec<u8>, LixError> {
-        let response = self
-            .runtime
-            .dispatch(
-                "render",
-                &PluginRuntimeRequestDto {
-                    operation: "render",
-                    component_id: Some(self.component_id),
-                    component_bytes: None,
-                    max_memory_bytes: None,
-                    max_fuel: None,
-                    timeout_ms: None,
-                    state: Some(state.into_iter().map(Into::into).collect()),
-                    file: None,
-                },
-            )
-            .await?;
-        response
-            .bytes
-            .map(ByteBuf::into_vec)
-            .ok_or_else(|| js_runtime_error("render", "response did not include bytes"))
-    }
-}
-
-impl Drop for BrowserJsWasmComponent {
-    fn drop(&mut self) {
-        if let Ok(request) = to_js(&PluginRuntimeRequestDto {
-            operation: "closeComponent",
-            component_id: Some(self.component_id),
-            component_bytes: None,
-            max_memory_bytes: None,
-            max_fuel: None,
-            timeout_ms: None,
-            state: None,
-            file: None,
-        }) {
-            let _ = self.runtime.dispatch.call1(&JsValue::UNDEFINED, &request);
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginRuntimeRequestDto {
-    operation: &'static str,
-    component_id: Option<u32>,
-    component_bytes: Option<ByteBuf>,
-    max_memory_bytes: Option<String>,
-    max_fuel: Option<String>,
-    timeout_ms: Option<String>,
-    state: Option<Vec<PluginEntityStateDto>>,
-    file: Option<PluginFileDto>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginRuntimeResponseDto {
-    component_id: Option<u32>,
-    changes: Option<Vec<PluginDetectedChangeDto>>,
-    bytes: Option<ByteBuf>,
-    error_message: Option<String>,
-}
-
-#[derive(Serialize)]
-struct PluginFileDto {
-    filename: Option<String>,
-    data: ByteBuf,
-}
-
-impl From<WasmPluginFile> for PluginFileDto {
-    fn from(file: WasmPluginFile) -> Self {
-        Self {
-            filename: file.filename,
-            data: ByteBuf::from(file.data),
-        }
-    }
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginEntityStateDto {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: String,
-    metadata: Option<String>,
-}
-
-impl From<WasmPluginEntityState> for PluginEntityStateDto {
-    fn from(state: WasmPluginEntityState) -> Self {
-        Self {
-            entity_pk: state.entity_pk,
-            schema_key: state.schema_key,
-            snapshot_content: state.snapshot_content,
-            metadata: state.metadata,
-        }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginDetectedChangeDto {
-    entity_pk: Vec<String>,
-    schema_key: String,
-    snapshot_content: Option<String>,
-    metadata: Option<String>,
-}
-
-impl From<PluginDetectedChangeDto> for WasmPluginDetectedChange {
-    fn from(change: PluginDetectedChangeDto) -> Self {
-        Self {
-            entity_pk: change.entity_pk,
-            schema_key: change.schema_key,
-            snapshot_content: change.snapshot_content,
-            metadata: change.metadata,
-        }
-    }
-}
-
-fn js_runtime_error(operation: &str, error: impl std::fmt::Debug) -> LixError {
-    LixError::new(
-        LixError::CODE_INTERNAL_ERROR,
-        format!("JavaScript WASM runtime {operation} failed: {error:?}"),
-    )
 }
