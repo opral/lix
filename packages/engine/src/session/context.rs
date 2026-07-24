@@ -339,7 +339,7 @@ where
         };
         let write_access = SessionWriteAccess {
             _write_lease: write_lease,
-            _collaboration_write_guard: collaboration_write_guard,
+            collaboration_write_guard,
         };
         self.ensure_open()?;
         Ok(write_access)
@@ -550,12 +550,12 @@ where
 
 pub(super) struct SessionWriteAccess {
     _write_lease: SessionWriteLease,
-    _collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    collaboration_write_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl SessionWriteAccess {
     fn serializes_collaboration_writes(&self) -> bool {
-        self._collaboration_write_guard.is_some()
+        self.collaboration_write_guard.is_some()
     }
 }
 
