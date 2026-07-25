@@ -31,6 +31,34 @@ impl BlobHash {
     }
 }
 
+/// A host-verified fixed-width replacement in an already materialized blob.
+///
+/// The ordinary SQL surface still submits complete replacement bytes. The
+/// transaction layer creates this internal hint only after it has verified a
+/// v2 file transition against the exact accepted document. A CAS writer may
+/// then retain the base blob's chunk boundaries and references for every
+/// non-overlapping chunk instead of rechunking the complete replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlobSameLengthSplice {
+    pub(crate) base_blob_hash: BlobHash,
+    pub(crate) offset: usize,
+    pub(crate) length: usize,
+}
+
+impl BlobSameLengthSplice {
+    pub(crate) fn new(base_blob_hash: BlobHash, offset: usize, length: usize) -> Self {
+        Self {
+            base_blob_hash,
+            offset,
+            length,
+        }
+    }
+
+    pub(crate) fn end(self) -> Option<usize> {
+        self.offset.checked_add(self.length)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobPayload {
     bytes: crate::Blob,

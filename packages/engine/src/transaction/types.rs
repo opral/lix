@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
 
 use crate::LixError;
-use crate::binary_cas::{BlobHash, BlobPayload};
+use crate::binary_cas::{BlobHash, BlobPayload, BlobSameLengthSplice};
 use crate::catalog::SchemaPlanId;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, MutationIdentity, RequestBlobSpliceProvenance};
@@ -187,6 +187,15 @@ pub(crate) struct TransactionFileData {
     /// scanning the filesystem during plugin reconciliation. Inserts and
     /// callers without a prior row leave this false.
     pub(crate) had_blob_ref: bool,
+    /// Content hash of the visible pre-write blob when the SQL lowerer had it
+    /// available without an additional read. This is transient write
+    /// provenance only; it lets a verified v2 same-length edit reuse durable
+    /// CAS chunk references at commit.
+    base_blob_hash: Option<BlobHash>,
+    /// A fixed-width replacement proven by the v2 transition against the
+    /// exact accepted document. The complete output bytes remain authoritative;
+    /// this only permits an internal CAS staging fast path.
+    same_length_blob_splice: Option<BlobSameLengthSplice>,
     /// Validated transport splice that produced `payload`, when the ordinary
     /// SQL blob parameter arrived through the remote splice optimization.
     /// This is transient execution provenance and is never persisted as file
@@ -222,6 +231,8 @@ impl TransactionFileData {
             global,
             untracked,
             had_blob_ref: false,
+            base_blob_hash: None,
+            same_length_blob_splice: None,
             splice_provenance: None,
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
@@ -231,6 +242,12 @@ impl TransactionFileData {
 
     pub(crate) fn with_had_blob_ref(mut self, had_blob_ref: bool) -> Self {
         self.had_blob_ref = had_blob_ref;
+        self
+    }
+
+    pub(crate) fn with_base_blob_hash(mut self, base_blob_hash: Option<BlobHash>) -> Self {
+        self.had_blob_ref |= base_blob_hash.is_some();
+        self.base_blob_hash = base_blob_hash;
         self
     }
 
@@ -266,6 +283,34 @@ impl TransactionFileData {
         // Transport provenance describes the replaced request payload. Once a
         // plugin renderer materializes merged bytes, it no longer applies.
         self.splice_provenance = None;
+        self.base_blob_hash = None;
+        self.same_length_blob_splice = None;
+    }
+
+    /// Marks a single fixed-width replacement that was independently verified
+    /// by the v2 file transition. Invalid/unknown base state intentionally
+    /// leaves this unset so CAS staging follows the normal full path.
+    pub(crate) fn set_verified_same_length_blob_splice(
+        &mut self,
+        visible_base_blob_hash: BlobHash,
+        offset: usize,
+        length: usize,
+    ) {
+        let Some(base_blob_hash) = self.base_blob_hash else {
+            return;
+        };
+        if base_blob_hash != visible_base_blob_hash {
+            return;
+        }
+        if length == 0
+            || offset
+                .checked_add(length)
+                .is_none_or(|end| end > self.payload.len())
+        {
+            return;
+        }
+        self.same_length_blob_splice =
+            Some(BlobSameLengthSplice::new(base_blob_hash, offset, length));
     }
 
     pub(crate) fn blob_hash(&self) -> Option<BlobHash> {
@@ -278,6 +323,15 @@ impl TransactionFileData {
 
     pub(crate) fn payload(&self) -> &BlobPayload {
         &self.payload
+    }
+
+    pub(crate) fn same_length_blob_splice(&self) -> Option<BlobSameLengthSplice> {
+        self.same_length_blob_splice
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_blob_hash(&self) -> Option<BlobHash> {
+        self.base_blob_hash
     }
 
     pub(crate) fn auxiliary_payloads(&self) -> &[BlobPayload] {
@@ -550,5 +604,39 @@ impl StagedCommitChangeRefs {
 
     pub(crate) fn allow_empty(&mut self) {
         self.allow_empty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verified_same_length_splice_requires_the_visible_blob_base() {
+        let base = BlobHash::from_content(b"before");
+        let wrong_base = BlobHash::from_content(b"other!");
+        let mut write = TransactionFileData::new(
+            "file".to_string(),
+            None,
+            None,
+            "main".to_string(),
+            false,
+            false,
+            b"after!".to_vec(),
+        )
+        .with_base_blob_hash(Some(base));
+
+        write.set_verified_same_length_blob_splice(wrong_base, 2, 1);
+        assert_eq!(
+            write.same_length_blob_splice(),
+            None,
+            "a same-sized but different visible blob must not donate chunk references"
+        );
+
+        write.set_verified_same_length_blob_splice(base, 2, 1);
+        assert_eq!(
+            write.same_length_blob_splice(),
+            Some(BlobSameLengthSplice::new(base, 2, 1))
+        );
     }
 }

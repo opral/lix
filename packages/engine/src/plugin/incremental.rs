@@ -256,6 +256,24 @@ pub(crate) struct BuiltInputSplices {
     pub(crate) full_diff_bytes_compared: u64,
 }
 
+impl BuiltInputSplices {
+    /// Returns the one fixed-width base-relative replacement, if this update
+    /// can retain its prior binary-CAS chunk boundaries. This is private host
+    /// staging information; the WIT input remains the ordinary splice vector.
+    pub(crate) fn same_length_replacement(&self) -> Option<(usize, usize)> {
+        let [splice] = self.edits.as_slice() else {
+            return None;
+        };
+        let insert_len = match &splice.insert {
+            WasmInputBytes::Inline(bytes) => bytes.len(),
+            WasmInputBytes::AfterRange(range) => usize::try_from(range.length).ok()?,
+        };
+        let offset = usize::try_from(splice.offset).ok()?;
+        let delete_len = usize::try_from(splice.delete_len).ok()?;
+        (delete_len == insert_len && delete_len != 0).then_some((offset, delete_len))
+    }
+}
+
 /// Builds one coalesced base-relative replacement. Protocol-verified transport
 /// provenance preserves the exact remote splice only when its base digest
 /// names `before`. Without that proof, the fallback compares the full
@@ -1806,6 +1824,7 @@ mod tests {
         assert!(from_transport.used_transport_provenance);
         assert_eq!(from_transport.full_diff_bytes_compared, 0);
         assert_eq!(from_transport.after_sha256, Some(after_sha256));
+        assert_eq!(from_transport.same_length_replacement(), Some((2, 2)));
         assert_eq!(
             from_transport.edits,
             vec![WasmInputSplice {
@@ -1857,6 +1876,17 @@ mod tests {
                 length: 2
             })
         ));
+        assert_eq!(lazy.same_length_replacement(), Some((2, 2)));
+
+        let length_changing = build_file_update_splices(
+            before,
+            before_sha256,
+            b"abXYZef",
+            None,
+            WasmTransitionLimits::default(),
+        )
+        .expect("length-changing splice should still build");
+        assert_eq!(length_changing.same_length_replacement(), None);
     }
 
     #[test]

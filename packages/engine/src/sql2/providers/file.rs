@@ -2045,6 +2045,10 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
 
     for write in parsed_writes {
         if let Some(existing) = filesystem.file_entry(&write.parsed.path).cloned() {
+            let base_blob_hash = existing
+                .blob_hash
+                .as_deref()
+                .and_then(|hash| BlobHash::from_hex(hash).ok());
             if conflict != FastLixFilePathWriteConflict::None {
                 validate_fast_lix_file_path_conflict_pair(
                     existing.scope.untracked,
@@ -2092,6 +2096,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                         write.data,
                         context,
                         existing.blob_hash.is_some(),
+                        base_blob_hash,
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -2125,6 +2130,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                         write.data,
                         context,
                         existing.blob_hash.is_some(),
+                        base_blob_hash,
                         None,
                     )
                     .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -2264,12 +2270,13 @@ async fn stage_indexed_file_path_writes(
         .iter()
         .filter_map(|entry| entry.as_ref().map(Arc::clone))
         .collect::<Vec<_>>();
-    let blob_backed = load_exact_existing_blob_keys(ctx, &existing).await?;
+    let existing_blobs = load_exact_existing_blob_hashes(ctx, &existing).await?;
     let mut staged = LixFileStagedBatch::default();
 
     for (write, entry) in writes.into_iter().zip(indexed.existing) {
         if let Some(entry) = entry {
-            let has_blob_ref = blob_backed.contains(&entry.key);
+            let has_blob_ref = existing_blobs.contains_key(&entry.key);
+            let base_blob_hash = existing_blobs.get(&entry.key).copied().flatten();
             let mut context = FilesystemRowContext {
                 branch_id: entry.key.branch_id().to_string(),
                 global: entry.key.global(),
@@ -2312,6 +2319,7 @@ async fn stage_indexed_file_path_writes(
                 write.data,
                 context,
                 has_blob_ref,
+                base_blob_hash,
                 None,
             )
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -2359,12 +2367,12 @@ async fn stage_indexed_file_path_writes(
     stage_lix_file_fast_batch(ctx, TransactionWriteMode::Replace, staged).await
 }
 
-async fn load_exact_existing_blob_keys(
+async fn load_exact_existing_blob_hashes(
     ctx: &mut dyn SqlWriteExecutionContext,
     entries: &[Arc<FilesystemPathEntry>],
-) -> Result<BTreeSet<FilesystemDescriptorKey>, LixError> {
+) -> Result<BTreeMap<FilesystemDescriptorKey, Option<BlobHash>>, LixError> {
     if entries.is_empty() {
-        return Ok(BTreeSet::new());
+        return Ok(BTreeMap::new());
     }
     let unique = entries
         .iter()
@@ -2385,18 +2393,29 @@ async fn load_exact_existing_blob_keys(
         include_tombstones: false,
     };
     let rows = ctx.load_exact_live_state_rows(&request).await?;
-    Ok(unique
-        .into_keys()
-        .zip(rows)
-        .filter_map(|(key, row)| {
-            row.filter(|row| {
-                row.branch_id.as_ref() == key.branch_id()
-                    && row.global == key.global()
-                    && row.untracked == key.is_untracked()
-            })
-            .map(|_| key)
-        })
-        .collect())
+    let mut blobs = BTreeMap::new();
+    for ((key, entry), row) in unique.into_iter().zip(rows) {
+        let Some(row) = row else {
+            continue;
+        };
+        if row.branch_id.as_ref() != key.branch_id()
+            || row.global != key.global()
+            || row.untracked != key.is_untracked()
+        {
+            continue;
+        }
+        // This exact row is already the authoritative answer to whether the
+        // file has a blob. A malformed old snapshot must preserve that normal
+        // behavior while simply declining the optional manifest-reuse path.
+        let hash = row
+            .snapshot_content
+            .as_deref()
+            .and_then(|snapshot| serde_json::from_str::<BlobRefSnapshot>(snapshot).ok())
+            .filter(|snapshot| snapshot.id == entry.id())
+            .and_then(|snapshot| BlobHash::from_hex(&snapshot.blob_hash).ok());
+        blobs.insert(key, hash);
+    }
+    Ok(blobs)
 }
 
 pub(crate) async fn execute_fast_lix_file_data_update_by_id(
@@ -2451,8 +2470,11 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
                 .get(&key)
                 .cloned()
                 .expect("prepared lix_file descriptor should have a path");
+            let base_blob_hash = blob_rows
+                .get(&file.blob_ref_key())
+                .and_then(|row| BlobHash::from_hex(&row.blob_hash).ok());
             let has_blob_ref = blob_rows.contains_key(&file.blob_ref_key());
-            (path, file, has_blob_ref)
+            (path, file, has_blob_ref, base_blob_hash)
         })
         .collect::<Vec<_>>();
     if existing.is_empty() {
@@ -2460,7 +2482,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     }
 
     let mut staged = LixFileStagedBatch::default();
-    for (path, existing, has_blob_ref) in existing {
+    for (path, existing, has_blob_ref, base_blob_hash) in existing {
         parse_file_upsert_path(&path, TransactionWriteOperation::Update)
             .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
         let mut context = existing.row_context();
@@ -2475,6 +2497,7 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
             data.clone(),
             context,
             has_blob_ref,
+            base_blob_hash,
             None,
         )
         .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
@@ -2801,6 +2824,7 @@ fn lix_file_existing_update_stage_from_batch(
                 context,
                 has_blob_ref,
                 None,
+                None,
             )?;
         }
 
@@ -3032,6 +3056,7 @@ fn lix_file_path_update_stage_from_batch(
                 context,
                 has_blob_ref,
                 None,
+                None,
             )?;
         } else if plugin_rewrite_file_ids.contains(&id) {
             let data = required_binary_value(batch, row_index, "data")?;
@@ -3045,6 +3070,7 @@ fn lix_file_path_update_stage_from_batch(
                 data,
                 context,
                 has_blob_ref,
+                None,
                 None,
             )?;
         }
@@ -3330,6 +3356,7 @@ fn stage_lix_file_data_update_write(
     data: impl Into<crate::Blob>,
     context: FilesystemRowContext,
     has_blob_ref: bool,
+    base_blob_hash: Option<BlobHash>,
     origin: Option<TransactionWriteOrigin>,
 ) -> Result<()> {
     let file_payload = TransactionFileData::new(
@@ -3341,7 +3368,8 @@ fn stage_lix_file_data_update_write(
         context.untracked,
         data,
     )
-    .with_had_blob_ref(has_blob_ref);
+    .with_had_blob_ref(has_blob_ref)
+    .with_base_blob_hash(base_blob_hash);
     if file_payload.is_empty() {
         if has_blob_ref {
             let mut row = blob_ref_tombstone_row(file_id, context.clone());
@@ -10165,6 +10193,11 @@ mod tests {
         assert_eq!(file_data[0].path.as_deref(), Some("/readme.md"));
         assert_eq!(file_data[0].data(), b"new");
         assert!(file_data[0].had_blob_ref);
+        assert_eq!(
+            file_data[0].base_blob_hash(),
+            Some(BlobHash::from_content(old_data)),
+            "the exact indexed blob hash should be retained for optional CAS reuse",
+        );
         let descriptor = rows
             .iter()
             .find(|row| row.schema_key == super::FILE_DESCRIPTOR_SCHEMA_KEY)

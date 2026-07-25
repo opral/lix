@@ -104,6 +104,55 @@ pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
+/// The durable identity and binary base of one plugin materialization.
+///
+/// The semantic root fences actor state, while the blob hash proves the exact
+/// binary base from which a private CAS acceleration may retain chunks.
+#[derive(Debug, Clone)]
+struct VisibleV2Materialization {
+    semantic_root: String,
+    blob_hash: BlobHash,
+}
+
+fn decode_visible_v2_materialization(
+    row: &MaterializedLiveStateRow,
+    file_id: &str,
+) -> Result<VisibleV2Materialization, LixError> {
+    let semantic_root = row.change_id.map(|root| root.to_string()).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("v2 materialization root for file '{file_id}' is missing change_id"),
+        )
+    })?;
+    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned v2 plugin file '{file_id}' materialization is missing its blob reference"
+            ),
+        )
+    })?;
+    let snapshot: PluginUpgradeBlobRefSnapshot =
+        serde_json::from_str(snapshot).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("owned v2 plugin file '{file_id}' has an invalid blob reference: {error}"),
+            )
+        })?;
+    if snapshot.id != file_id {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
+            ),
+        ));
+    }
+    Ok(VisibleV2Materialization {
+        semantic_root,
+        blob_hash: BlobHash::from_hex(&snapshot.blob_hash)?,
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct TransactionPathIndexBuildStats {
@@ -753,10 +802,10 @@ where
         overlay_scan_rows(&base, &staged, request).await
     }
 
-    async fn visible_v2_materialization_root(
+    async fn visible_v2_materialization(
         &mut self,
         key: &PluginFileWriteKey,
-    ) -> Result<Option<String>, LixError> {
+    ) -> Result<Option<VisibleV2Materialization>, LixError> {
         let rows = self
             .scan_visible_live_state(&LiveStateScanRequest {
                 filter: LiveStateFilter {
@@ -782,17 +831,7 @@ where
         }
         rows.into_iter()
             .next()
-            .map(|row| {
-                row.change_id.map(|root| root.to_string()).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "v2 materialization root for file '{}' is missing change_id",
-                            key.file_id
-                        ),
-                    )
-                })
-            })
+            .map(|row| decode_visible_v2_materialization(&row, &key.file_id))
             .transpose()
     }
 
@@ -845,53 +884,15 @@ where
                 ),
             ));
         };
-        let semantic_root = blob_row
-            .change_id
-            .map(|root| root.to_string())
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "owned v2 plugin file '{}' materialization is missing its semantic root",
-                        actor_key.file_id
-                    ),
-                )
-            })?;
+        let materialization = decode_visible_v2_materialization(blob_row, &actor_key.file_id)?;
+        let semantic_root = materialization.semantic_root;
         let cold_open = cache.prepare_cold_open(actor_key, &semantic_root).await?;
         let mut cold_install: PluginActorColdInstall = match cold_open {
             PluginActorColdOpen::Ready(observation) => return Ok(observation),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
         let store_permit = cache.admit_cold_store(&mut cold_install)?;
-        let snapshot = blob_row.snapshot_content.as_deref().ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "owned v2 plugin file '{}' materialization is missing its blob reference",
-                    actor_key.file_id
-                ),
-            )
-        })?;
-        let snapshot: PluginUpgradeBlobRefSnapshot =
-            serde_json::from_str(snapshot).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!(
-                        "owned v2 plugin file '{}' has an invalid blob reference: {error}",
-                        actor_key.file_id
-                    ),
-                )
-            })?;
-        if snapshot.id != actor_key.file_id {
-            return Err(LixError::new(
-                LixError::CODE_INVALID_PLUGIN,
-                format!(
-                    "owned v2 plugin file '{}' materialization identity does not match its file scope",
-                    actor_key.file_id
-                ),
-            ));
-        }
-        let hash = BlobHash::from_hex(&snapshot.blob_hash)?;
+        let hash = materialization.blob_hash;
         let base_blob_reader = self.binary_cas.reader(read);
         let materialized_bytes: crate::Blob =
             load_transaction_blob_bytes(&base_blob_reader, &self.staged_writes, &[hash])
@@ -905,7 +906,8 @@ where
                         LixError::CODE_INVALID_PLUGIN,
                         format!(
                             "owned v2 plugin file '{}' references missing materialized blob '{}'",
-                            actor_key.file_id, snapshot.blob_hash
+                            actor_key.file_id,
+                            hash.to_hex()
                         ),
                     )
                 })?
@@ -2533,6 +2535,7 @@ where
                 };
             let materialization_version = self.functions.call_uuid_v7().to_string();
             let submitted_bytes = write.payload().shared_bytes();
+            let mut verified_same_length_blob_splice = None;
 
             let (changes, publication, materialized_bytes) = if same_plugin_owner {
                 let acknowledged_view = self.acknowledged_session_plugin_view(
@@ -2594,8 +2597,8 @@ where
                 // would mistake that valid serialization for an external
                 // stale-cache race.
                 let mut lease = cache.lease_for_transition(&observation).await?;
-                let visible_root = self
-                    .visible_v2_materialization_root(&file_key)
+                let visible_materialization = self
+                    .visible_v2_materialization(&file_key)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(
@@ -2604,8 +2607,9 @@ where
                         )
                         .with_hint("read the exact file bytes again before retrying the edit")
                     })?;
-                lease.require_accepted_semantic_root(&visible_root)?;
-                let observation_is_current = observation.semantic_root() == visible_root;
+                lease.require_accepted_semantic_root(&visible_materialization.semantic_root)?;
+                let observation_is_current =
+                    observation.semantic_root() == visible_materialization.semantic_root;
                 let observed_bytes = lease.observed_bytes();
                 let built_splices = tracing::debug_span!(
                     target: "lix_perf",
@@ -2622,6 +2626,7 @@ where
                 })?;
                 let submitted_bytes_sha256 = built_splices.after_sha256;
                 let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
+                let same_length_blob_splice = built_splices.same_length_replacement();
                 let observed_source = ArcByteSource::new(observed_bytes.clone());
                 let submitted_source = ArcByteSource::new(submitted_bytes.clone());
                 let observed_document = lease.observed_document();
@@ -2700,6 +2705,10 @@ where
                         // validated file successor is therefore already the
                         // exact merge result; rendering the same sparse change
                         // onto the same base would only repeat guest work.
+                        verified_same_length_blob_splice =
+                            same_length_blob_splice.map(|(offset, length)| {
+                                (visible_materialization.blob_hash, offset, length)
+                            });
                         (
                             detection_document,
                             submitted_bytes.clone(),
@@ -2904,6 +2913,10 @@ where
             reconciliation.rows.extend(change_rows);
             if materialized_bytes.as_ref() != write.data() {
                 write.replace_data(materialized_bytes);
+            } else if let Some((visible_base_blob_hash, offset, length)) =
+                verified_same_length_blob_splice
+            {
+                write.set_verified_same_length_blob_splice(visible_base_blob_hash, offset, length);
             }
             reconciliation
                 .materialized_file_keys
@@ -3033,8 +3046,8 @@ where
                 }
                 None => {
                     let cache = self.plugin_host.actor_cache();
-                    let visible_root = self
-                        .visible_v2_materialization_root(&file_key)
+                    let visible_materialization = self
+                        .visible_v2_materialization(&file_key)
                         .await?
                         .ok_or_else(|| {
                             LixError::new(
@@ -3046,7 +3059,7 @@ where
                             )
                         })?;
                     let cold_open = cache
-                        .prepare_cold_open(&actor_key, &visible_root)
+                        .prepare_cold_open(&actor_key, &visible_materialization.semantic_root)
                         .instrument(tracing::debug_span!(
                             target: "lix_perf",
                             "lix.perf.plugin_semantic_actor_lookup"
@@ -3091,8 +3104,8 @@ where
                     )
                 }
             };
-            let visible_root = match self.visible_v2_materialization_root(&file_key).await {
-                Ok(Some(root)) => root,
+            let visible_materialization = match self.visible_v2_materialization(&file_key).await {
+                Ok(Some(materialization)) => materialization,
                 Ok(None) => {
                     let publication = PendingPluginActorPublication::Existing {
                         lease,
@@ -3133,7 +3146,7 @@ where
                 publication_view,
                 descriptor,
                 changes,
-                &visible_root,
+                &visible_materialization.semantic_root,
                 &materialization_version,
                 limits,
             )
@@ -5635,6 +5648,39 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn visible_materialization_requires_a_matching_blob_ref_identity() {
+        let blob_hash = BlobHash::from_content(b"base");
+        let row = |snapshot_id: &str| MaterializedLiveStateRow {
+            entity_pk: EntityPk::single("file-a"),
+            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+            file_id: Some("file-a".to_string()),
+            snapshot_content: Some(
+                serde_json::json!({
+                    "id": snapshot_id,
+                    "blob_hash": blob_hash.to_hex(),
+                })
+                .to_string(),
+            ),
+            metadata: None,
+            deleted: false,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            global: false,
+            change_id: Some(ChangeId::default()),
+            commit_id: None,
+            untracked: false,
+            branch_id: "main".into(),
+        };
+
+        let visible = decode_visible_v2_materialization(&row("file-a"), "file-a")
+            .expect("matching materialization should decode");
+        assert_eq!(visible.blob_hash, blob_hash);
+        let error = decode_visible_v2_materialization(&row("other-file"), "file-a")
+            .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+    }
 
     #[test]
     fn format_only_equal_snapshots_are_semantic_noops() {
