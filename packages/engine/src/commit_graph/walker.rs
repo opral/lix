@@ -84,44 +84,34 @@ where
         .map(|reachable| reachable.commit.commit_id)
         .collect::<BTreeSet<_>>();
 
-    let mut best = Vec::new();
-    for reachable in left_reachable {
-        let commit_id = &reachable.commit.commit_id;
-        if !common_ids.contains(commit_id) {
+    // The intersection of two ancestor sets is ancestor-closed: every parent
+    // of a common ancestor is itself a common ancestor. Therefore a common
+    // commit is "best" exactly when it is not a direct parent of another
+    // common commit. Marking those direct parents avoids the previous
+    // per-candidate graph walk, which made merge-base discovery quadratic in
+    // the length of ordinary shared history.
+    let mut superseded = BTreeSet::new();
+    for reachable in &left_reachable {
+        if !common_ids.contains(&reachable.commit.commit_id) {
             continue;
         }
-
-        if has_descendant_in_set(reader, commit_id, &common_ids).await? {
-            continue;
+        for parent_commit_id in &reachable.commit.parent_commit_ids {
+            if common_ids.contains(parent_commit_id) {
+                superseded.insert(*parent_commit_id);
+            }
         }
-
-        best.push(reachable.commit);
     }
+
+    let mut best = left_reachable
+        .into_iter()
+        .filter(|reachable| {
+            common_ids.contains(&reachable.commit.commit_id)
+                && !superseded.contains(&reachable.commit.commit_id)
+        })
+        .map(|reachable| reachable.commit)
+        .collect::<Vec<_>>();
     best.sort_by_key(|left| left.commit_id);
     Ok(best)
-}
-
-async fn has_descendant_in_set<S>(
-    reader: &mut CommitGraphStoreReader<S>,
-    commit_id: &CommitId,
-    candidate_descendant_ids: &BTreeSet<CommitId>,
-) -> Result<bool, LixError>
-where
-    S: StorageAdapterRead,
-{
-    for candidate_descendant_id in candidate_descendant_ids {
-        if candidate_descendant_id == commit_id {
-            continue;
-        }
-        let reachable = walk_reachable_commits(reader, candidate_descendant_id).await?;
-        if reachable
-            .iter()
-            .any(|reachable| reachable.commit.commit_id == *commit_id)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 struct CommitTraversalLoader<'a, S>
