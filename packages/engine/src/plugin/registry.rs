@@ -936,7 +936,7 @@ fn validate_live_state_identity(
         || row.file_id.as_deref() != expected_file_id
         || row.global
         || row.untracked
-        || row.branch_id != branch_id
+        || row.branch_id.as_ref() != branch_id
     {
         return Err(invalid_registry(format!(
             "reserved plugin row '{key}' has invalid tracked branch-local storage identity"

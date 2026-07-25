@@ -917,7 +917,7 @@ where
                     continue;
                 };
                 existing_schemas.insert(
-                    (row.branch_id, row.entity_pk),
+                    (row.branch_id.to_string(), row.entity_pk),
                     serde_json::from_str(snapshot).map_err(|error| {
                         LixError::new(
                             LixError::CODE_SCHEMA_DEFINITION,
@@ -985,7 +985,7 @@ where
         let mut registry_rows_by_branch = BTreeMap::<String, MaterializedLiveStateRow>::new();
         for row in registry_rows {
             if registry_rows_by_branch
-                .insert(row.branch_id.clone(), row)
+                .insert(row.branch_id.to_string(), row)
                 .is_some()
             {
                 return Err(LixError::new(
@@ -1131,7 +1131,7 @@ where
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
         let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
         for row in owner_rows {
-            let branch_id = row.branch_id.clone();
+            let branch_id = row.branch_id.to_string();
             let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
                 continue;
             };
@@ -2639,13 +2639,13 @@ fn session_plugin_state_after_changes(
                 snapshot_content: None,
                 metadata: None,
                 deleted: false,
-                created_at: String::new(),
-                updated_at: String::new(),
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
                 global: false,
                 change_id: None,
                 commit_id: None,
                 untracked: false,
-                branch_id: key.branch_id.clone(),
+                branch_id: key.branch_id.clone().into(),
             });
         row.snapshot_content = Some(snapshot_content);
         row.metadata.clone_from(&change.metadata);
@@ -3303,7 +3303,7 @@ mod tests {
             .expect("untracked row should be visible through live state");
         assert!(live_untracked_row.untracked);
         assert!(live_untracked_row.global);
-        assert_eq!(live_untracked_row.branch_id, GLOBAL_BRANCH_ID);
+        assert_eq!(live_untracked_row.branch_id.as_ref(), GLOBAL_BRANCH_ID);
         assert_eq!(
             live_untracked_row.snapshot_content.as_deref(),
             Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
@@ -3383,8 +3383,8 @@ mod tests {
             rows[0].change_id.is_some(),
             "prepared untracked rows must receive a real change id"
         );
-        assert_eq!(rows[0].created_at, "1970-01-01T00:00:00.000Z");
-        assert_eq!(rows[0].updated_at, "2026-04-23T00:00:00.123Z");
+        assert_eq!(rows[0].created_at.to_string(), "1970-01-01T00:00:00.000Z");
+        assert_eq!(rows[0].updated_at.to_string(), "2026-04-23T00:00:00.123Z");
     }
 
     #[tokio::test]

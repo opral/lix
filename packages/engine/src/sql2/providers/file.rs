@@ -1795,7 +1795,7 @@ struct FileDescriptorRecord {
 impl FileDescriptorRecord {
     fn row_context(&self) -> FilesystemRowContext {
         FilesystemRowContext {
-            branch_id: self.live.branch_id.clone(),
+            branch_id: self.live.branch_id.to_string(),
             global: self.live.global,
             untracked: self.live.untracked,
             file_id: self.live.file_id.clone(),
@@ -2332,7 +2332,7 @@ async fn load_exact_existing_blob_keys(
         .zip(rows)
         .filter_map(|(key, row)| {
             row.filter(|row| {
-                row.branch_id == key.branch_id()
+                row.branch_id.as_ref() == key.branch_id()
                     && row.global == key.global()
                     && row.untracked == key.is_untracked()
             })
@@ -3975,12 +3975,12 @@ async fn lix_file_record_batch_from_prepared(
             file_id: live.file_id,
             global: live.global,
             change_id: projected_change_id.map(|id| id.to_string()),
-            created_at: live.created_at,
-            updated_at: live.updated_at,
+            created_at: live.created_at.to_string(),
+            updated_at: live.updated_at.to_string(),
             commit_id: live.commit_id.map(|id| id.to_string()),
             untracked: live.untracked,
             metadata: live.metadata.as_deref().map(serialize_row_metadata),
-            branch_id: live.branch_id,
+            branch_id: live.branch_id.to_string(),
         });
     }
 
@@ -4269,7 +4269,7 @@ async fn render_plugin_files_for_sql(
                     })
                     .await?;
                 rows.retain(|row| {
-                    row.branch_id == branch_id
+                    row.branch_id.as_ref() == branch_id.as_str()
                         && !row.global
                         && !row.untracked
                         && row
@@ -4411,7 +4411,7 @@ async fn load_plugin_render_branches(
                 row.schema_key == "lix_key_value"
                     && row.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
                     && row.file_id.is_none()
-                    && row.branch_id == branch_id
+                    && row.branch_id.as_ref() == branch_id.as_str()
                     && !row.global
                     && !row.untracked
             });
@@ -4499,7 +4499,7 @@ async fn plugin_render_context_with_branches(
             };
             if row.schema_key != "lix_key_value"
                 || row.entity_pk.as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
-                || row.branch_id != branch_id
+                || row.branch_id.as_ref() != branch_id.as_str()
                 || row.global
                 || row.untracked
                 || !file_ids.contains(file_id)
@@ -4570,7 +4570,7 @@ fn plugin_unavailable_error(
         owner.plugin_key()
     ))
     .with_details(serde_json::json!({
-        "branch_id": file.live.branch_id,
+        "branch_id": file.live.branch_id.as_ref(),
         "file_id": file.id,
         "path": path,
         "plugin_key": owner.plugin_key(),
@@ -5751,6 +5751,7 @@ mod tests {
     use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::filesystem::{
         FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemPathIndex,
         FilesystemPathIndexReader, FilesystemPathIndexRequest, FilesystemRowContext,
@@ -6534,8 +6535,14 @@ mod tests {
         assert_eq!(string_value("lixcol_file_id"), "remote-file-target");
         assert!(!boolean_value("lixcol_global"));
         assert!(boolean_value("lixcol_untracked"));
-        assert_eq!(string_value("lixcol_created_at"), "2026-04-23T00:00:00Z");
-        assert_eq!(string_value("lixcol_updated_at"), "2026-04-23T01:00:00Z");
+        assert_eq!(
+            string_value("lixcol_created_at"),
+            "2026-04-23T00:00:00.000Z"
+        );
+        assert_eq!(
+            string_value("lixcol_updated_at"),
+            "2026-04-23T01:00:00.000Z"
+        );
         assert_eq!(string_value("lixcol_branch_id"), "branch-b");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
@@ -7489,18 +7496,18 @@ mod tests {
                         .rows
                         .iter()
                         .filter(matches)
-                        .find(|row| row.branch_id == requested.branch_id)
+                        .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
                         .or_else(|| {
                             self.rows
                                 .iter()
                                 .filter(matches)
-                                .find(|row| row.branch_id == crate::GLOBAL_BRANCH_ID)
+                                .find(|row| row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID)
                         })?
                         .clone();
-                    if row.branch_id == crate::GLOBAL_BRANCH_ID
+                    if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
                         && requested.branch_id != crate::GLOBAL_BRANCH_ID
                     {
-                        row.branch_id.clone_from(&requested.branch_id);
+                        row.branch_id = requested.branch_id.clone().into();
                         row.global = true;
                     }
                     if row.deleted && !request.include_tombstones {
@@ -7708,18 +7715,18 @@ mod tests {
                         .rows
                         .iter()
                         .filter(exact_match)
-                        .find(|row| row.branch_id == requested.branch_id)
+                        .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
                         .or_else(|| {
                             self.rows
                                 .iter()
                                 .filter(exact_match)
-                                .find(|row| row.branch_id == crate::GLOBAL_BRANCH_ID)
+                                .find(|row| row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID)
                         })?
                         .clone();
-                    if row.branch_id == crate::GLOBAL_BRANCH_ID
+                    if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
                         && requested.branch_id != crate::GLOBAL_BRANCH_ID
                     {
-                        row.branch_id.clone_from(&requested.branch_id);
+                        row.branch_id = requested.branch_id.clone().into();
                         row.global = true;
                     }
                     if row.deleted && !request.include_tombstones {
@@ -7829,13 +7836,13 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 
@@ -7851,13 +7858,13 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 

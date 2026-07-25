@@ -26,7 +26,7 @@ impl FilesystemIndex {
 
         for row in rows {
             let scope = RowScope {
-                branch_id: row.branch_id.clone(),
+                branch_id: row.branch_id.to_string(),
                 global: row.global,
                 untracked: row.untracked,
                 file_id: row.file_id.clone(),
@@ -315,6 +315,7 @@ fn filesystem_conflict_error(message: String) -> LixError {
 #[cfg(test)]
 mod tests {
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::live_state::MaterializedLiveStateRow;
 
@@ -481,13 +482,19 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "filesystem read test created_at",
+                "2026-04-23T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "filesystem read test updated_at",
+                "2026-04-23T01:00:00Z",
+            ),
         }
     }
 

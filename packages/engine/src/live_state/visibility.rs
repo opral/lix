@@ -231,7 +231,7 @@ where
             });
             if let Some(mut row) = staged_rows[global_index].clone() {
                 if requested.branch_id != GLOBAL_BRANCH_ID {
-                    row.branch_id.clone_from(&requested.branch_id);
+                    row.branch_id = requested.branch_id.clone().into();
                 }
                 row.global = true;
                 insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedGlobal, row);
@@ -357,7 +357,7 @@ fn can_resolve_uncontested_single_branch_rows(
     staged_rows.is_empty()
         && base_rows
             .iter()
-            .all(|row| !row.global && row.branch_id == *requested_branch_id)
+            .all(|row| !row.global && row.branch_id.as_ref() == requested_branch_id)
 }
 
 /// Resolves candidates which are already scoped to one nonglobal branch.
@@ -417,9 +417,9 @@ fn project_global_rows_into_requested_branches(
     let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
     for requested_branch_id in requested_branch_ids {
         for row in &rows {
-            if row.branch_id == GLOBAL_BRANCH_ID {
+            if row.branch_id.as_ref() == GLOBAL_BRANCH_ID {
                 let mut projected = row.clone();
-                projected.branch_id.clone_from(requested_branch_id);
+                projected.branch_id = requested_branch_id.clone().into();
                 rows_by_identity.insert(LiveStateRowIdentity::from_row(&projected), projected);
             }
         }
@@ -427,7 +427,7 @@ fn project_global_rows_into_requested_branches(
             BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
         for row in rows
             .iter()
-            .filter(|row| row.branch_id == *requested_branch_id)
+            .filter(|row| row.branch_id.as_ref() == requested_branch_id)
         {
             branch_rows_by_identity.insert(LiveStateRowIdentity::from_row(row), row.clone());
         }
@@ -464,9 +464,14 @@ mod tests {
     use super::*;
     use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::live_state::LiveStateRowRequest;
     use async_trait::async_trait;
+
+    fn test_timestamp() -> LixTimestamp {
+        LixTimestamp::expect_parse("test timestamp", "2026-01-01T00:00:00Z")
+    }
 
     #[test]
     fn expands_requested_branch_with_global_candidates() {
@@ -495,7 +500,7 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -527,7 +532,7 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
         assert!(!rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -864,7 +869,7 @@ mod tests {
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
         assert_eq!(rows[0].snapshot_content, None);
     }
 
@@ -917,7 +922,7 @@ mod tests {
         .expect("overlay scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "staged-branch");
+        assert_eq!(rows[0].branch_id.as_ref(), "staged-branch");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -1088,13 +1093,13 @@ mod tests {
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: test_timestamp(),
+            updated_at: test_timestamp(),
             global,
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(CommitId::for_test_label("commit")),
             untracked: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
         }
     }
 
@@ -1131,8 +1136,11 @@ mod tests {
         request: &LiveStateScanRequest,
     ) -> bool {
         let filter = &request.filter;
-        let branch_matches =
-            filter.branch_ids.is_empty() || filter.branch_ids.contains(&row.branch_id);
+        let branch_matches = filter.branch_ids.is_empty()
+            || filter
+                .branch_ids
+                .iter()
+                .any(|branch_id| branch_id == row.branch_id.as_ref());
         let schema_matches =
             filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key);
         let entity_matches =

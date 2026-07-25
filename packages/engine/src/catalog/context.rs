@@ -308,7 +308,7 @@ fn row_belongs_to_schema_catalog_domain(row: &MaterializedLiveStateRow, domain: 
     row.schema_key == REGISTERED_SCHEMA_KEY
         && row.file_id.is_none()
         && row.snapshot_content.is_some()
-        && row.branch_id == domain.branch_id()
+        && row.branch_id.as_ref() == domain.branch_id()
         && row.untracked == domain.untracked()
         && committed_row_is_exact_branch_scoped(row, domain.branch_id())
 }
@@ -354,6 +354,7 @@ mod tests {
     use super::*;
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
+    use crate::common::LixTimestamp;
     use crate::live_state::LiveStateRowRequest;
 
     #[tokio::test]
@@ -633,7 +634,7 @@ mod tests {
         let context = CatalogContext::new();
         let mut global_only = registered_schema_row("global_only_schema");
         global_only.global = true;
-        global_only.branch_id = "main".to_string();
+        global_only.branch_id = "main".into();
 
         let schemas = context
             .schema_jsons_for_sql_read_planning(
@@ -727,7 +728,11 @@ mod tests {
                 })
                 .filter(|row| {
                     request.filter.branch_ids.is_empty()
-                        || request.filter.branch_ids.contains(&row.branch_id)
+                        || request
+                            .filter
+                            .branch_ids
+                            .iter()
+                            .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
                 })
                 .filter(|row| {
                     request
@@ -743,12 +748,13 @@ mod tests {
             &self,
             request: &LiveStateRowRequest,
         ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            let request_branch_id = request.branch_id.as_str();
             Ok(self
                 .rows
                 .iter()
                 .find(|row| {
                     row.schema_key == request.schema_key
-                        && row.branch_id == request.branch_id
+                        && row.branch_id.as_ref() == request_branch_id
                         && row.entity_pk == request.entity_pk
                 })
                 .cloned())
@@ -760,15 +766,21 @@ mod tests {
             entity_pk: registered_schema_entity_pk(schema_key),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.into(),
             metadata: None,
             deleted: false,
             change_id: Some(ChangeId::for_test_label("change-registered-schema")),
             commit_id: None,
             global: true,
             untracked: true,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "registered schema test created_at",
+                "2026-04-23T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "registered schema test updated_at",
+                "2026-04-23T01:00:00Z",
+            ),
             snapshot_content: Some(
                 json!({
                     "value": {

@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 use crate::NullableKeyFilter;
 use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
-use crate::common::compose_file_path;
+use crate::common::{LixTimestamp, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::plugin::{
@@ -2066,13 +2066,13 @@ fn history_entry_to_live_row(entry: &HistoryEntry) -> MaterializedLiveStateRow {
         snapshot_content: entry.change.snapshot_content.clone(),
         metadata: entry.change.metadata.clone(),
         deleted: entry.change.snapshot_content.is_none(),
-        created_at: entry.change.created_at.clone(),
-        updated_at: entry.change.created_at.clone(),
+        created_at: LixTimestamp::expect_parse("file history created_at", &entry.change.created_at),
+        updated_at: LixTimestamp::expect_parse("file history updated_at", &entry.change.created_at),
         global: false,
         change_id: None,
         commit_id: None,
         untracked: false,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
+        branch_id: GLOBAL_BRANCH_ID.into(),
     }
 }
 

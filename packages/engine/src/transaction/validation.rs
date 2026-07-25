@@ -3330,7 +3330,7 @@ mod tests {
                 .chain(test_file_descriptor_rows())
                 .find(|row| {
                     row.schema_key == request.schema_key
-                        && row.branch_id == request.branch_id
+                        && row.branch_id.as_ref() == request.branch_id
                         && row.entity_pk == request.entity_pk
                         && request.file_id.matches(row.file_id.as_ref())
                 }))
@@ -4926,7 +4926,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
-        projected_overlay_row.branch_id = "branch-a".to_string();
+        projected_overlay_row.branch_id = "branch-a".into();
         projected_overlay_row.global = true;
         let live_state = StaticLiveStateReader {
             rows: vec![projected_overlay_row],
@@ -6406,7 +6406,11 @@ mod tests {
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
             && (request.filter.branch_ids.is_empty()
-                || request.filter.branch_ids.contains(&row.branch_id))
+                || request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id == row.branch_id.as_ref()))
             && (request.filter.file_ids.is_empty()
                 || request
                     .filter
@@ -6420,7 +6424,7 @@ mod tests {
         request: &LiveStateRowRequest,
     ) -> bool {
         row.schema_key == request.schema_key
-            && row.branch_id == request.branch_id
+            && row.branch_id.as_ref() == request.branch_id
             && row.entity_pk == request.entity_pk
             && request.file_id.matches(row.file_id.as_ref())
     }
@@ -6795,13 +6799,13 @@ mod tests {
             snapshot_content: row.snapshot.as_ref().map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.as_ref().map(|metadata| metadata.materialize()),
             deleted: row.snapshot.is_none(),
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
             untracked: row.untracked,
-            branch_id: row.branch_id,
+            branch_id: row.branch_id.into(),
         }
     }
 

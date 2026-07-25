@@ -1606,8 +1606,8 @@ fn lix_directory_record_batch_from_rendered(
         file_ids.push(directory.live.file_id);
         globals.push(Some(directory.live.global));
         change_ids.push(directory.live.change_id.map(|id| id.to_string()));
-        created_ats.push(directory.live.created_at);
-        updated_ats.push(directory.live.updated_at);
+        created_ats.push(directory.live.created_at.to_string());
+        updated_ats.push(directory.live.updated_at.to_string());
         commit_ids.push(directory.live.commit_id.map(|id| id.to_string()));
         untracked_values.push(Some(directory.live.untracked));
         metadata_values.push(
@@ -1617,7 +1617,7 @@ fn lix_directory_record_batch_from_rendered(
                 .as_deref()
                 .map(serialize_row_metadata),
         );
-        branch_ids.push(Some(directory.live.branch_id));
+        branch_ids.push(Some(directory.live.branch_id.to_string()));
     }
 
     let mut columns = Vec::<ArrayRef>::with_capacity(schema.fields().len());
@@ -1943,6 +1943,7 @@ mod tests {
     use crate::binary_cas::BlobDataReader;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::filesystem::{
         FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
     };
@@ -2225,13 +2226,13 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 

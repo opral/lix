@@ -141,6 +141,7 @@ mod tests {
 
     use crate::LixError;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemDescriptorKey, FilesystemRowContext};
     use crate::live_state::MaterializedLiveStateRow;
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
@@ -383,7 +384,11 @@ mod tests {
                     (request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key))
                         && (request.filter.branch_ids.is_empty()
-                            || request.filter.branch_ids.contains(&row.branch_id))
+                            || request
+                                .filter
+                                .branch_ids
+                                .iter()
+                                .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref()))
                 })
                 .cloned()
                 .collect())
@@ -421,7 +426,11 @@ mod tests {
                     (request.filter.schema_keys.is_empty()
                         || request.filter.schema_keys.contains(&row.schema_key))
                         && (request.filter.branch_ids.is_empty()
-                            || request.filter.branch_ids.contains(&row.branch_id))
+                            || request
+                                .filter
+                                .branch_ids
+                                .iter()
+                                .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref()))
                 })
                 .cloned()
                 .collect())
@@ -486,13 +495,19 @@ mod tests {
             snapshot_content: snapshot_content.map(ToOwned::to_owned),
             metadata: None,
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "filesystem visibility test created_at",
+                "2026-04-23T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "filesystem visibility test updated_at",
+                "2026-04-23T01:00:00Z",
+            ),
         }
     }
 }

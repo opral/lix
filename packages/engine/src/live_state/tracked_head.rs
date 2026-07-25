@@ -9,6 +9,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 
 use crate::LixError;
@@ -1225,7 +1227,8 @@ async fn materialize_live_entries(
     projection: ChangeRecordProjection,
     branch_id: &str,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    let branch_id = Arc::<str>::from(branch_id);
+    let global = branch_id.as_ref() == crate::GLOBAL_BRANCH_ID;
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
     let mut rows = Vec::with_capacity(entries.len());
@@ -1255,13 +1258,13 @@ async fn materialize_live_entries(
             snapshot_content,
             metadata,
             deleted: value.deleted,
-            created_at: value.created_at.to_string(),
-            updated_at: value.updated_at.to_string(),
+            created_at: value.created_at,
+            updated_at: value.updated_at,
             global,
             change_id: Some(value.change_id),
             commit_id: Some(value.commit_id),
             untracked: false,
-            branch_id: branch_id.to_string(),
+            branch_id: Arc::clone(&branch_id),
         });
     }
     if json_refs.is_empty() {
@@ -1469,7 +1472,7 @@ mod tests {
             metadata_only[0].metadata.as_deref(),
             Some(long_metadata.as_str())
         );
-        assert_eq!(metadata_only[0].branch_id, branch_id);
+        assert_eq!(metadata_only[0].branch_id.as_ref(), branch_id);
         assert!(!metadata_only[0].global);
         assert!(!metadata_only[0].untracked);
 
@@ -1648,6 +1651,10 @@ mod tests {
             .expect("scan")
             .expect("marker should match");
         assert_eq!(rows.len(), expected.len());
+        assert!(
+            Arc::ptr_eq(&rows[0].branch_id, &rows[1].branch_id),
+            "one head scan should share its branch allocation across rows"
+        );
         assert_eq!(
             rows.into_iter()
                 .map(|row| (row.schema_key, row.entity_pk, row.file_id))
@@ -1827,8 +1834,8 @@ mod tests {
             .expect("scan second head")
             .expect("matching marker");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].created_at, "2026-01-01T00:00:00.000Z");
-        assert_eq!(rows[0].updated_at, "2026-01-02T00:00:00.000Z");
+        assert_eq!(rows[0].created_at, ts("2026-01-01T00:00:00Z"));
+        assert_eq!(rows[0].updated_at, ts("2026-01-02T00:00:00Z"));
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("{\"value\":2}"));
     }
 
@@ -1908,7 +1915,7 @@ mod tests {
             rows[0].change_id,
             Some(ChangeId::for_test_label("child-change"))
         );
-        assert_eq!(rows[0].created_at, "2026-01-01T00:00:00.000Z");
+        assert_eq!(rows[0].created_at, ts("2026-01-01T00:00:00Z"));
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("{\"value\":2}"));
     }
 }

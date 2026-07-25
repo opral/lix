@@ -1887,7 +1887,7 @@ mod tests {
             branch_row.change_id,
             Some(change_id("branch-override-change"))
         );
-        assert_eq!(branch_row.branch_id, "branch-a");
+        assert_eq!(branch_row.branch_id.as_ref(), "branch-a");
         assert!(!branch_row.global);
         let fallback_row = scanned
             .iter()
@@ -1897,7 +1897,7 @@ mod tests {
             fallback_row.change_id,
             Some(change_id("global-fallback-change"))
         );
-        assert_eq!(fallback_row.branch_id, "branch-a");
+        assert_eq!(fallback_row.branch_id.as_ref(), "branch-a");
         assert!(fallback_row.global);
 
         let mut branch_tombstone = tracked_branch_row("branch-a", "branch-tombstone-change");

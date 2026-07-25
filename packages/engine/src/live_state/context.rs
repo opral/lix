@@ -402,8 +402,10 @@ where
                     .get(&branch_identity)
                     .or_else(|| candidates.get(&global_identity))?
                     .clone();
-                if row.branch_id == GLOBAL_BRANCH_ID && requested.branch_id != GLOBAL_BRANCH_ID {
-                    row.branch_id.clone_from(&requested.branch_id);
+                if row.branch_id.as_ref() == GLOBAL_BRANCH_ID
+                    && requested.branch_id != GLOBAL_BRANCH_ID
+                {
+                    row.branch_id = requested.branch_id.clone().into();
                     row.global = true;
                 }
                 if row.deleted && !request.include_tombstones {
@@ -642,7 +644,11 @@ async fn scan_commit_derived_rows(
     rows.retain(|row| {
         (request.filter.entity_pks.is_empty() || request.filter.entity_pks.contains(&row.entity_pk))
             && (request.filter.branch_ids.is_empty()
-                || request.filter.branch_ids.contains(&row.branch_id))
+                || request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id == row.branch_id.as_ref()))
     });
     Ok(rows)
 }
@@ -700,13 +706,13 @@ fn commit_row(
         snapshot_content: Some(snapshot_content),
         metadata: None,
         deleted: false,
-        created_at: commit.change.created_at.to_string(),
-        updated_at: commit.change.created_at.to_string(),
+        created_at: commit.change.created_at,
+        updated_at: commit.change.created_at,
         global: true,
         change_id: Some(commit.change.id),
         commit_id: Some(commit.commit_id),
         untracked: false,
-        branch_id: branch_id.to_string(),
+        branch_id: branch_id.into(),
     })
 }
 
@@ -737,13 +743,13 @@ fn commit_edge_row(
         snapshot_content: Some(snapshot_content),
         metadata: None,
         deleted: false,
-        created_at: "1970-01-01T00:00:00.000Z".to_string(),
-        updated_at: "1970-01-01T00:00:00.000Z".to_string(),
+        created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
+        updated_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
         global: true,
         change_id: None,
         commit_id: Some(edge.child_commit_id),
         untracked: false,
-        branch_id: branch_id.to_string(),
+        branch_id: branch_id.into(),
     })
 }
 
@@ -1003,13 +1009,19 @@ fn project_tracked_row(
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
         deleted: row.deleted,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
+        created_at: crate::common::LixTimestamp::expect_parse(
+            "tracked-state row created_at",
+            &row.created_at,
+        ),
+        updated_at: crate::common::LixTimestamp::expect_parse(
+            "tracked-state row updated_at",
+            &row.updated_at,
+        ),
         global: source == TrackedRowSource::Global,
         change_id: Some(row.change_id),
         commit_id: Some(row.commit_id),
         untracked: false,
-        branch_id: view_branch_id.to_string(),
+        branch_id: view_branch_id.into(),
     }
 }
 
@@ -1297,7 +1309,7 @@ mod tests {
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
-                current_rows.push((row.branch_id.clone(), materialized.clone()));
+                current_rows.push((row.branch_id.to_string(), materialized.clone()));
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
@@ -1689,7 +1701,7 @@ mod tests {
             .expect("load should succeed")
             .expect("global row should be visible for requested branch");
 
-        assert_eq!(loaded.branch_id, "branch-a");
+        assert_eq!(loaded.branch_id.as_ref(), "branch-a");
         assert!(loaded.global);
         assert!(!loaded.untracked);
         assert_eq!(
@@ -1745,7 +1757,7 @@ mod tests {
             .await
             .expect("load should succeed")
             .expect("global row should be projected into main");
-        assert_eq!(loaded.branch_id, "main");
+        assert_eq!(loaded.branch_id.as_ref(), "main");
         assert!(loaded.global);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -1805,7 +1817,7 @@ mod tests {
             .expect("load should succeed")
             .expect("branch row should be visible");
 
-        assert_eq!(loaded.branch_id, "branch-a");
+        assert_eq!(loaded.branch_id.as_ref(), "branch-a");
         assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -1859,7 +1871,7 @@ mod tests {
             .expect("load should succeed")
             .expect("main row should be visible");
 
-        assert_eq!(loaded.branch_id, "main");
+        assert_eq!(loaded.branch_id.as_ref(), "main");
         assert!(!loaded.global);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -1913,7 +1925,7 @@ mod tests {
             .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"branch-tracked\"}")
@@ -1963,7 +1975,7 @@ mod tests {
             .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -2065,7 +2077,7 @@ mod tests {
             .await
             .expect("scan should succeed");
         assert_eq!(with_tombstone.len(), 1);
-        assert_eq!(with_tombstone[0].branch_id, "branch-a");
+        assert_eq!(with_tombstone[0].branch_id.as_ref(), "branch-a");
         assert_eq!(with_tombstone[0].snapshot_content, None);
     }
 
@@ -2118,7 +2130,7 @@ mod tests {
             .await
             .expect("scan should succeed");
         assert_eq!(tombstones.len(), 1);
-        assert_eq!(tombstones[0].branch_id, "main");
+        assert_eq!(tombstones[0].branch_id.as_ref(), "main");
         assert!(!tombstones[0].global);
         assert_eq!(tombstones[0].snapshot_content, None);
     }
@@ -2225,7 +2237,7 @@ mod tests {
 
         let fallback = loaded[0].as_ref().expect("global fallback should load");
         assert!(fallback.global);
-        assert_eq!(fallback.branch_id, "branch-a");
+        assert_eq!(fallback.branch_id.as_ref(), "branch-a");
         assert_eq!(
             fallback.snapshot_content.as_deref(),
             Some("{\"value\":\"global-fallback\"}")
@@ -2537,13 +2549,13 @@ mod tests {
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: None,
             deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
             global: branch_id == "global",
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(commit_id),
             untracked: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
         }
     }
 
@@ -2639,13 +2651,13 @@ mod tests {
             ),
             metadata: None,
             deleted: false,
-            created_at: "2026-01-01T00:00:00Z".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
             global: true,
             change_id: Some(ChangeId::for_test_label(&format!("change-{commit_id}"))),
             commit_id: Some(commit_id),
             untracked: false,
-            branch_id: "global".to_string(),
+            branch_id: "global".into(),
         }
     }
 

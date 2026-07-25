@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use crate::changelog::{ChangeId, CommitId};
+use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::live_state::index::MaterializedLiveStateIndexRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
@@ -8,7 +11,7 @@ use crate::{NullableKeyFilter, Value};
 ///
 /// Unlike provider write rows, live-state rows are fully hydrated facts. Missing
 /// generated fields should be caught before this type is constructed.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MaterializedLiveStateRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
@@ -16,13 +19,13 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) deleted: bool,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
-    pub(crate) branch_id: String,
+    pub(crate) branch_id: Arc<str>,
 }
 
 impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
@@ -35,13 +38,13 @@ impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
             snapshot_content: row.snapshot_content,
             metadata: row.metadata,
             deleted: false,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
+            created_at: LixTimestamp::expect_parse("live-state index created_at", &row.created_at),
+            updated_at: LixTimestamp::expect_parse("live-state index updated_at", &row.updated_at),
             global,
             change_id: Some(row.change_id),
             commit_id: None,
             untracked: true,
-            branch_id: row.branch_id,
+            branch_id: row.branch_id.into(),
         }
     }
 }
@@ -76,8 +79,8 @@ impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
             snapshot_content: row.snapshot_content.clone(),
             metadata: row.metadata.clone(),
             deleted: row.deleted,
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             change_id,
             commit_id,
         })
@@ -233,7 +236,7 @@ pub(crate) struct LiveStateRowIdentity {
 impl LiveStateRowIdentity {
     pub(crate) fn from_row(row: &MaterializedLiveStateRow) -> Self {
         Self {
-            branch_id: row.branch_id.clone(),
+            branch_id: row.branch_id.to_string(),
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),

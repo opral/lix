@@ -147,8 +147,14 @@ pub(super) static LIVE_STATE_COLS: ColumnTable<MaterializedLiveStateRow> = Colum
             "metadata",
             Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
         ),
-        ("created_at", Col::Utf8(|row| Some(&row.created_at))),
-        ("updated_at", Col::Utf8(|row| Some(&row.updated_at))),
+        (
+            "created_at",
+            Col::Utf8Owned(|row| Some(row.created_at.to_string())),
+        ),
+        (
+            "updated_at",
+            Col::Utf8Owned(|row| Some(row.updated_at.to_string())),
+        ),
         ("global", Col::Bool(|row| Some(row.global))),
         (
             "change_id",
@@ -159,6 +165,6 @@ pub(super) static LIVE_STATE_COLS: ColumnTable<MaterializedLiveStateRow> = Colum
             Col::Utf8Owned(|row| row.commit_id.map(|id| id.to_string())),
         ),
         ("untracked", Col::Bool(|row| Some(row.untracked))),
-        ("branch_id", Col::Utf8(|row| Some(&row.branch_id))),
+        ("branch_id", Col::Utf8(|row| Some(row.branch_id.as_ref()))),
     ],
 };

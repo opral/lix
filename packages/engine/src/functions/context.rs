@@ -308,7 +308,8 @@ mod tests {
         .expect("sequence row should load")
         .expect("sequence row should exist");
         assert_eq!(
-            row.created_at, "1970-01-01T00:00:00.000Z",
+            row.created_at.to_string(),
+            "1970-01-01T00:00:00.000Z",
             "bookkeeping timestamp must derive from the sequence, not the system clock"
         );
         assert_eq!(row.created_at, row.updated_at);
