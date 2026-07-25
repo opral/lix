@@ -771,10 +771,12 @@ impl SchemaCatalogFact {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn schema(&self) -> &JsonValue {
         &self.schema
     }
 
+    #[cfg(test)]
     pub(crate) fn catalog_key(&self) -> &SchemaCatalogKey {
         &self.catalog_key
     }

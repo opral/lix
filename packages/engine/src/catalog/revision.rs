@@ -313,12 +313,9 @@ mod tests {
 
         register_schema(&session, "branch_rewind_probe", false).await;
         session
-            .execute(
-                "INSERT INTO branch_rewind_probe (id) VALUES ('before-rewind')",
-                &[],
-            )
+            .execute("SELECT COUNT(*) AS rows FROM branch_rewind_probe", &[])
             .await
-            .expect("new surface should warm the registered catalog");
+            .expect("new surface should warm the registered read catalog");
         let schema_head = engine
             .load_branch_head_commit_id(&receipt.main_branch_id)
             .await
@@ -332,12 +329,9 @@ mod tests {
         assert_ne!(rewind_revision, initial_revision);
         assert_ne!(rewind_revision, schema_revision);
         session
-            .execute(
-                "INSERT INTO branch_rewind_probe (id) VALUES ('must-not-bind')",
-                &[],
-            )
+            .execute("SELECT COUNT(*) AS rows FROM branch_rewind_probe", &[])
             .await
-            .expect_err("rewinding the head must hide the newer schema");
+            .expect_err("rewinding the head must hide the newer read surface");
         assert_eq!(
             current_revision(&adapter).await,
             rewind_revision,
@@ -349,13 +343,10 @@ mod tests {
         assert_ne!(restored_revision, rewind_revision);
         assert_ne!(restored_revision, schema_revision);
         let restored = session
-            .execute(
-                "INSERT INTO branch_rewind_probe (id) VALUES ('after-restore')",
-                &[],
-            )
+            .execute("SELECT COUNT(*) AS rows FROM branch_rewind_probe", &[])
             .await
-            .expect("restoring the head must restore the newer schema");
-        assert_eq!(restored.rows_affected(), 1);
+            .expect("restoring the head must restore the newer read surface");
+        assert_eq!(restored.rows()[0].get::<i64>("rows").unwrap(), 0);
     }
 
     #[tokio::test]

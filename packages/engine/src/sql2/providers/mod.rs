@@ -139,8 +139,8 @@ where
     }
     let dynamic_catalog;
     let catalog = if selection.requires_visible_schemas() {
-        dynamic_catalog = PublicCatalog::from_visible_schemas(&ctx.load_visible_schemas().await?)?;
-        &dynamic_catalog
+        dynamic_catalog = ctx.public_catalog().await?;
+        dynamic_catalog.as_ref()
     } else {
         PublicCatalog::fixed_system()
     };
