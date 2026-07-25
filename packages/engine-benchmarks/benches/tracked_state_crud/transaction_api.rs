@@ -7,8 +7,14 @@ use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
 pub(crate) enum TransactionFixture {
-    SQLite(BenchTransactionFixture<SQLite>),
-    RocksDB(BenchTransactionFixture<RocksDB>),
+    SQLite {
+        fixture: BenchTransactionFixture<SQLite>,
+        _dir: tempfile::TempDir,
+    },
+    RocksDB {
+        fixture: BenchTransactionFixture<RocksDB>,
+        _dir: tempfile::TempDir,
+    },
 }
 
 pub(crate) type TransactionWriteAccounting = BenchWriteAccounting;
@@ -20,12 +26,14 @@ pub(crate) async fn empty_fixture(
 ) -> TransactionFixture {
     let rows = bench_rows(rows);
     match profile.storage() {
-        ProfileStorage::SQLite(storage) => TransactionFixture::SQLite(
-            BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
-        ),
-        ProfileStorage::RocksDB(storage) => TransactionFixture::RocksDB(
-            BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
-        ),
+        ProfileStorage::SQLite { storage, _dir: dir } => TransactionFixture::SQLite {
+            fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
+            _dir: dir,
+        },
+        ProfileStorage::RocksDB { storage, _dir: dir } => TransactionFixture::RocksDB {
+            fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
+            _dir: dir,
+        },
     }
 }
 
@@ -41,106 +49,106 @@ pub(crate) async fn seeded_fixture(
 impl TransactionFixture {
     pub(crate) async fn seed(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.seed().await,
-            Self::RocksDB(fixture) => fixture.seed().await,
+            Self::SQLite { fixture, .. } => fixture.seed().await,
+            Self::RocksDB { fixture, .. } => fixture.seed().await,
         }
     }
 
     pub(crate) async fn insert_all(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.insert_all().await,
-            Self::RocksDB(fixture) => fixture.insert_all().await,
+            Self::SQLite { fixture, .. } => fixture.insert_all().await,
+            Self::RocksDB { fixture, .. } => fixture.insert_all().await,
         }
     }
 
     pub(crate) async fn insert_all_accounting(&mut self) -> TransactionWriteAccounting {
         match self {
-            Self::SQLite(fixture) => fixture.insert_all_accounting().await,
-            Self::RocksDB(fixture) => fixture.insert_all_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.insert_all_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.insert_all_accounting().await,
         }
     }
 
     pub(crate) async fn read_all(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_all().await,
-            Self::RocksDB(fixture) => fixture.read_all().await,
+            Self::SQLite { fixture, .. } => fixture.read_all().await,
+            Self::RocksDB { fixture, .. } => fixture.read_all().await,
         }
     }
 
     pub(crate) async fn read_many_by_pk(&self, count: usize) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_many_by_pk(count).await,
-            Self::RocksDB(fixture) => fixture.read_many_by_pk(count).await,
+            Self::SQLite { fixture, .. } => fixture.read_many_by_pk(count).await,
+            Self::RocksDB { fixture, .. } => fixture.read_many_by_pk(count).await,
         }
     }
 
     pub(crate) async fn read_one_by_pk(&self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.read_one_by_pk().await,
-            Self::RocksDB(fixture) => fixture.read_one_by_pk().await,
+            Self::SQLite { fixture, .. } => fixture.read_one_by_pk().await,
+            Self::RocksDB { fixture, .. } => fixture.read_one_by_pk().await,
         }
     }
 
     pub(crate) async fn update_all(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_all().await,
-            Self::RocksDB(fixture) => fixture.update_all().await,
+            Self::SQLite { fixture, .. } => fixture.update_all().await,
+            Self::RocksDB { fixture, .. } => fixture.update_all().await,
         }
     }
 
     pub(crate) async fn update_all_accounting(&mut self) -> TransactionWriteAccounting {
         match self {
-            Self::SQLite(fixture) => fixture.update_all_accounting().await,
-            Self::RocksDB(fixture) => fixture.update_all_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.update_all_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.update_all_accounting().await,
         }
     }
 
     pub(crate) async fn update_one_by_pk(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.update_one_by_pk().await,
-            Self::RocksDB(fixture) => fixture.update_one_by_pk().await,
+            Self::SQLite { fixture, .. } => fixture.update_one_by_pk().await,
+            Self::RocksDB { fixture, .. } => fixture.update_one_by_pk().await,
         }
     }
 
     pub(crate) async fn update_one_by_pk_accounting(&mut self) -> TransactionWriteAccounting {
         match self {
-            Self::SQLite(fixture) => fixture.update_one_by_pk_accounting().await,
-            Self::RocksDB(fixture) => fixture.update_one_by_pk_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.update_one_by_pk_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.update_one_by_pk_accounting().await,
         }
     }
 
     pub(crate) async fn delete_all(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.delete_all().await,
-            Self::RocksDB(fixture) => fixture.delete_all().await,
+            Self::SQLite { fixture, .. } => fixture.delete_all().await,
+            Self::RocksDB { fixture, .. } => fixture.delete_all().await,
         }
     }
 
     pub(crate) async fn delete_all_accounting(&mut self) -> TransactionWriteAccounting {
         match self {
-            Self::SQLite(fixture) => fixture.delete_all_accounting().await,
-            Self::RocksDB(fixture) => fixture.delete_all_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.delete_all_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.delete_all_accounting().await,
         }
     }
 
     pub(crate) async fn delete_one_by_pk(&mut self) -> usize {
         match self {
-            Self::SQLite(fixture) => fixture.delete_one_by_pk().await,
-            Self::RocksDB(fixture) => fixture.delete_one_by_pk().await,
+            Self::SQLite { fixture, .. } => fixture.delete_one_by_pk().await,
+            Self::RocksDB { fixture, .. } => fixture.delete_one_by_pk().await,
         }
     }
 
     pub(crate) async fn delete_one_by_pk_accounting(&mut self) -> TransactionWriteAccounting {
         match self {
-            Self::SQLite(fixture) => fixture.delete_one_by_pk_accounting().await,
-            Self::RocksDB(fixture) => fixture.delete_one_by_pk_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.delete_one_by_pk_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.delete_one_by_pk_accounting().await,
         }
     }
 
     pub(crate) async fn layout_accounting(&self) -> Vec<TransactionLayoutAccounting> {
         match self {
-            Self::SQLite(fixture) => fixture.layout_accounting().await,
-            Self::RocksDB(fixture) => fixture.layout_accounting().await,
+            Self::SQLite { fixture, .. } => fixture.layout_accounting().await,
+            Self::RocksDB { fixture, .. } => fixture.layout_accounting().await,
         }
     }
 }

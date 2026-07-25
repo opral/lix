@@ -20,8 +20,14 @@ struct BenchRow {
 }
 
 enum ProfileStorage {
-    SQLite(StorageAdapter<SQLite>),
-    RocksDB(StorageAdapter<RocksDB>),
+    SQLite {
+        storage: StorageAdapter<SQLite>,
+        _dir: tempfile::TempDir,
+    },
+    RocksDB {
+        storage: StorageAdapter<RocksDB>,
+        _dir: tempfile::TempDir,
+    },
 }
 
 pub(crate) struct KvFixture {
@@ -160,60 +166,68 @@ impl KvFixture {
 impl ProfileStorage {
     async fn insert_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::SQLite(storage) => insert_all_storage(storage, rows).await,
-            Self::RocksDB(storage) => insert_all_storage(storage, rows).await,
+            Self::SQLite { storage, .. } => insert_all_storage(storage, rows).await,
+            Self::RocksDB { storage, .. } => insert_all_storage(storage, rows).await,
         }
     }
 
     async fn update_all(&self, rows: &[BenchRow]) -> KvWriteOutcome {
         match self {
-            Self::SQLite(storage) => update_all_storage(storage, rows).await,
-            Self::RocksDB(storage) => update_all_storage(storage, rows).await,
+            Self::SQLite { storage, .. } => update_all_storage(storage, rows).await,
+            Self::RocksDB { storage, .. } => update_all_storage(storage, rows).await,
         }
     }
 
     async fn delete_all(&self, row_count: usize) -> KvWriteOutcome {
         match self {
-            Self::SQLite(storage) => delete_all_storage(storage, row_count).await,
-            Self::RocksDB(storage) => delete_all_storage(storage, row_count).await,
+            Self::SQLite { storage, .. } => delete_all_storage(storage, row_count).await,
+            Self::RocksDB { storage, .. } => delete_all_storage(storage, row_count).await,
         }
     }
 
     async fn delete_one(&self, row: &BenchRow) -> KvWriteOutcome {
         match self {
-            Self::SQLite(storage) => delete_one_storage(storage, row).await,
-            Self::RocksDB(storage) => delete_one_storage(storage, row).await,
+            Self::SQLite { storage, .. } => delete_one_storage(storage, row).await,
+            Self::RocksDB { storage, .. } => delete_one_storage(storage, row).await,
         }
     }
 
     async fn read_all(&self, expected_rows: usize, projection: StorageCoreProjection) -> usize {
         match self {
-            Self::SQLite(storage) => read_all_storage(storage, expected_rows, projection).await,
-            Self::RocksDB(storage) => read_all_storage(storage, expected_rows, projection).await,
+            Self::SQLite { storage, .. } => {
+                read_all_storage(storage, expected_rows, projection).await
+            }
+            Self::RocksDB { storage, .. } => {
+                read_all_storage(storage, expected_rows, projection).await
+            }
         }
     }
 
     async fn read_points(&self, rows: &[BenchRow]) -> usize {
         match self {
-            Self::SQLite(storage) => read_points_storage(storage, rows).await,
-            Self::RocksDB(storage) => read_points_storage(storage, rows).await,
+            Self::SQLite { storage, .. } => read_points_storage(storage, rows).await,
+            Self::RocksDB { storage, .. } => read_points_storage(storage, rows).await,
         }
     }
 
     async fn layout_accounting(&self) -> Vec<KvLayoutAccounting> {
         match self {
-            Self::SQLite(storage) => layout_accounting_storage(storage).await,
-            Self::RocksDB(storage) => layout_accounting_storage(storage).await,
+            Self::SQLite { storage, .. } => layout_accounting_storage(storage).await,
+            Self::RocksDB { storage, .. } => layout_accounting_storage(storage).await,
         }
     }
 }
 
 fn profile_storage(profile: StorageProfile) -> ProfileStorage {
     match profile.storage() {
-        RawProfileStorage::SQLite(storage) => ProfileStorage::SQLite(StorageAdapter::new(storage)),
-        RawProfileStorage::RocksDB(storage) => {
-            ProfileStorage::RocksDB(StorageAdapter::new(storage))
-        }
+        RawProfileStorage::SQLite { storage, _dir: dir } => ProfileStorage::SQLite {
+            storage: StorageAdapter::new(storage),
+            _dir: dir,
+        },
+        RawProfileStorage::RocksDB { storage, _dir: dir } => ProfileStorage::RocksDB {
+            storage: StorageAdapter::new(storage),
+            _dir: dir,
+        },
     }
 }
 
