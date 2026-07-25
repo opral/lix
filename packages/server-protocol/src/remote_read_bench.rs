@@ -28,7 +28,7 @@ use hyper_util::{
     client::legacy::{Client, connect::HttpConnector},
     rt::TokioExecutor,
 };
-use lix_sdk::{Blob, Lix, OpenLixOptions, Value, open_lix};
+use lix_sdk::{Blob, ExecuteBatchStatement, Lix, ObserveEvents, OpenLixOptions, Value, open_lix};
 use lix_slatedb_storage::{SlateDB, SlateDBCacheOptions, SlateDBObjectStoreOptions};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -53,6 +53,12 @@ use tower::ServiceExt;
 const WORKSPACE_PATH: &str = "remote-read-benchmark";
 const FILE_COUNT: usize = 1_000;
 const LIST_COUNT: usize = 100;
+const STATE_ROW_COUNT: usize = 10_000;
+const STATE_KEY_PREFIX: &str = "perf.observe.state/";
+const STATE_KEY_LIKE: &str = "perf.observe.state/%";
+const STATE_SQL: &str = "SELECT key, value FROM lix_key_value WHERE key LIKE $1 ORDER BY key";
+const STATE_UPDATE_KEY: &str = "perf.observe.state/05000";
+const STATE_UPDATE_SQL: &str = "UPDATE lix_key_value SET value = $1 WHERE key = $2";
 const DEFAULT_SAMPLES: usize = 30;
 const DEFAULT_WARM_MEMORY_SAMPLES: usize = 500;
 const DISK_CACHE_BYTES: usize = 64 * 1024 * 1024;
@@ -82,15 +88,21 @@ impl CacheState {
 enum Operation {
     PointPath,
     ListPaths100,
+    StateRows10k,
+    ObserveState10k,
+    ObserveState10kUpdate,
     Download4KiB,
     Download100KiB,
     Download1MiB,
 }
 
 impl Operation {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 8] = [
         Self::PointPath,
         Self::ListPaths100,
+        Self::StateRows10k,
+        Self::ObserveState10k,
+        Self::ObserveState10kUpdate,
         Self::Download4KiB,
         Self::Download100KiB,
         Self::Download1MiB,
@@ -100,6 +112,9 @@ impl Operation {
         match self {
             Self::PointPath => "point-path",
             Self::ListPaths100 => "list-paths-100",
+            Self::StateRows10k => "state-10k",
+            Self::ObserveState10k => "observe-state-10k",
+            Self::ObserveState10kUpdate => "observe-state-10k-update",
             Self::Download4KiB => "download-4kib",
             Self::Download100KiB => "download-100kib",
             Self::Download1MiB => "download-1mib",
@@ -109,7 +124,10 @@ impl Operation {
     const fn path(self) -> &'static str {
         match self {
             Self::PointPath => "/corpus/file-0000.bin",
-            Self::ListPaths100 => "",
+            Self::ListPaths100
+            | Self::StateRows10k
+            | Self::ObserveState10k
+            | Self::ObserveState10kUpdate => "",
             Self::Download4KiB => "/payload-4k.bin",
             Self::Download100KiB => "/payload-100k.bin",
             Self::Download1MiB => "/payload-1m.bin",
@@ -118,11 +136,33 @@ impl Operation {
 
     const fn payload_bytes(self) -> Option<usize> {
         match self {
-            Self::PointPath | Self::ListPaths100 => None,
+            Self::PointPath
+            | Self::ListPaths100
+            | Self::StateRows10k
+            | Self::ObserveState10k
+            | Self::ObserveState10kUpdate => None,
             Self::Download4KiB => Some(4 * 1024),
             Self::Download100KiB => Some(100 * 1024),
             Self::Download1MiB => Some(1024 * 1024),
         }
+    }
+
+    const fn has_parity_gate(self) -> bool {
+        !matches!(
+            self,
+            Self::StateRows10k | Self::ObserveState10k | Self::ObserveState10kUpdate
+        )
+    }
+
+    const fn has_in_process_profile(self) -> bool {
+        matches!(
+            self,
+            Self::StateRows10k | Self::Download4KiB | Self::Download100KiB | Self::Download1MiB
+        )
+    }
+
+    const fn is_observe_update(self) -> bool {
+        matches!(self, Self::ObserveState10kUpdate)
     }
 }
 
@@ -401,6 +441,7 @@ impl Seed {
         lix.upsert_file_data_batch(files)
             .await
             .expect("seed benchmark files");
+        seed_state_rows(&lix).await;
         lix.close().await.expect("close benchmark seed Lix");
         storage.flush().await.expect("flush benchmark seed storage");
         drop(storage);
@@ -448,6 +489,32 @@ impl Seed {
     }
 }
 
+async fn seed_state_rows(lix: &Lix<SlateDB>) {
+    let statements = (0..STATE_ROW_COUNT)
+        .map(|index| ExecuteBatchStatement {
+            sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)".to_string(),
+            params: vec![
+                Value::Text(format!("{STATE_KEY_PREFIX}{index:05}")),
+                Value::Json(json!({
+                    "ordinal": index,
+                    "label": format!("state row {index:05}"),
+                    "active": true,
+                })),
+            ],
+        })
+        .collect::<Vec<_>>();
+    for batch in statements.chunks(100) {
+        lix.execute_batch(batch)
+            .await
+            .expect("seed benchmark state batch");
+    }
+    let result = lix
+        .execute(STATE_SQL, &[Value::Text(STATE_KEY_LIKE.to_string())])
+        .await
+        .expect("read seeded benchmark state");
+    assert_eq!(result.rows().len(), STATE_ROW_COUNT);
+}
+
 struct OpenFixture {
     root: Arc<Lix<SlateDB>>,
     storage: SlateDB,
@@ -480,6 +547,7 @@ struct Sample {
     elapsed: Duration,
     requests: u64,
     in_process: Option<Duration>,
+    sse_event_bytes: Option<usize>,
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -508,6 +576,18 @@ async fn slatedb_direct_versus_remote_reads() {
             }
             for operation in Operation::ALL {
                 if !selected("LIX_REMOTE_READ_OPERATIONS", operation.label()) {
+                    continue;
+                }
+                if operation.is_observe_update() {
+                    // The meaningful update measurement keeps one observation
+                    // open and times only the write-to-next-event path. That
+                    // is necessarily a warm-runtime workload.
+                    if matches!(cache_state, CacheState::WarmMemory) {
+                        let (direct, remote) =
+                            measure_observe_state_update_distribution(&seed, warm_memory_samples)
+                                .await;
+                        report_and_assert(delay_ms, cache_state, operation, &direct, &remote);
+                    }
                     continue;
                 }
                 if matches!(cache_state, CacheState::WarmMemory) {
@@ -573,7 +653,7 @@ async fn measure_warm_memory_distribution(
     let remote_session = RemoteFixture::open(&remote_fixture.root).await;
     for _ in 0..3 {
         run_direct(&direct_session, operation).await;
-        remote_session.run(operation).await;
+        let _ = remote_session.run(operation).await;
     }
     tokio::join!(
         direct_store.wait_for_quiescence(),
@@ -600,24 +680,26 @@ async fn measure_warm_memory_distribution(
                         elapsed,
                         requests,
                         in_process: None,
+                        sse_event_bytes: None,
                     });
                 }
                 Arm::Remote => {
                     remote_store.reset_reads();
                     let started = Instant::now();
-                    remote_session.run(operation).await;
+                    let sse_event_bytes = remote_session.run(operation).await;
                     let elapsed = started.elapsed();
                     let requests = remote_store.stop_reads().total();
                     remote.push(Sample {
                         elapsed,
                         requests,
                         in_process: None,
+                        sse_event_bytes,
                     });
                 }
             }
         }
     }
-    if operation.payload_bytes().is_some() {
+    if operation.has_in_process_profile() {
         for sample in &mut remote {
             sample.in_process = remote_session.profile_in_process(operation).await;
         }
@@ -628,6 +710,108 @@ async fn measure_warm_memory_distribution(
         .close()
         .await
         .expect("close direct warm-memory session");
+    direct_fixture.close().await;
+    remote_fixture.close().await;
+    seed.delete_database(&direct_database).await;
+    seed.delete_database(&remote_database).await;
+    (direct, remote)
+}
+
+/// Measures the observable effect of a one-row state mutation without
+/// charging the initial 10k-row snapshot to every sample. This is the path
+/// where a snapshot-plus-delta protocol should scale with the changed rows.
+async fn measure_observe_state_update_distribution(
+    seed: &Seed,
+    samples: usize,
+) -> (Vec<Sample>, Vec<Sample>) {
+    let direct_database = seed.clone_database().await;
+    let remote_database = seed.clone_database().await;
+    let direct_store = seed.store.fork_accounting();
+    let remote_store = seed.store.fork_accounting();
+    let direct_fixture = OpenFixture::open(
+        &direct_store,
+        &direct_database,
+        tempfile::tempdir().expect("create direct update cache"),
+    )
+    .await;
+    let remote_fixture = OpenFixture::open(
+        &remote_store,
+        &remote_database,
+        tempfile::tempdir().expect("create remote update cache"),
+    )
+    .await;
+    let direct_session = open_direct_session(&direct_fixture.root).await;
+    let remote_session = RemoteFixture::open(&remote_fixture.root).await;
+    let mut direct_events = open_direct_state_observation(&direct_session).await;
+    let mut remote_events = remote_session.open_state_observe_stream().await;
+
+    let mut direct_revision = 1;
+    let mut remote_revision = 1;
+    for _ in 0..3 {
+        next_direct_state_update(&direct_session, &mut direct_events, direct_revision).await;
+        direct_revision += 1;
+        let _ = remote_session
+            .next_state_observe_update(&mut remote_events, remote_revision)
+            .await;
+        remote_revision += 1;
+    }
+    tokio::join!(
+        direct_store.wait_for_quiescence(),
+        remote_store.wait_for_quiescence()
+    );
+
+    let mut direct = Vec::with_capacity(samples);
+    let mut remote = Vec::with_capacity(samples);
+    for sample_index in 0..samples {
+        let first = if sample_index % 2 == 0 {
+            Arm::Direct
+        } else {
+            Arm::Remote
+        };
+        for arm in [first, opposite(first)] {
+            match arm {
+                Arm::Direct => {
+                    direct_store.reset_reads();
+                    let started = Instant::now();
+                    next_direct_state_update(&direct_session, &mut direct_events, direct_revision)
+                        .await;
+                    direct_revision += 1;
+                    let elapsed = started.elapsed();
+                    let requests = direct_store.stop_reads().total();
+                    direct.push(Sample {
+                        elapsed,
+                        requests,
+                        in_process: None,
+                        sse_event_bytes: None,
+                    });
+                }
+                Arm::Remote => {
+                    remote_store.reset_reads();
+                    let started = Instant::now();
+                    let sse_event_bytes = remote_session
+                        .next_state_observe_update(&mut remote_events, remote_revision)
+                        .await;
+                    remote_revision += 1;
+                    let elapsed = started.elapsed();
+                    let requests = remote_store.stop_reads().total();
+                    remote.push(Sample {
+                        elapsed,
+                        requests,
+                        in_process: None,
+                        sse_event_bytes: Some(sse_event_bytes),
+                    });
+                }
+            }
+        }
+    }
+
+    drop(remote_events);
+    remote_session.close().await;
+    drop(direct_events);
+    direct_session
+        .close()
+        .await
+        .expect("close direct update session");
     direct_fixture.close().await;
     remote_fixture.close().await;
     seed.delete_database(&direct_database).await;
@@ -684,7 +868,7 @@ async fn measure_cold_runtime(
         }
         Arm::Remote => {
             let remote = RemoteFixture::open(&fixture.root).await;
-            remote.run(operation).await;
+            let _ = remote.run(operation).await;
             remote.close().await;
         }
     }
@@ -696,6 +880,7 @@ async fn measure_cold_runtime(
         elapsed,
         requests,
         in_process: None,
+        sse_event_bytes: None,
     }
 }
 
@@ -728,6 +913,27 @@ async fn run_direct(lix: &Lix<SlateDB>, operation: Operation) {
                 .expect("direct path listing");
             assert_eq!(result.rows().len(), LIST_COUNT);
         }
+        Operation::StateRows10k => {
+            let result = lix
+                .execute(STATE_SQL, &[Value::Text(STATE_KEY_LIKE.to_string())])
+                .await
+                .expect("direct state read");
+            assert_eq!(result.rows().len(), STATE_ROW_COUNT);
+        }
+        Operation::ObserveState10k => {
+            let mut events = lix
+                .observe(STATE_SQL, &[Value::Text(STATE_KEY_LIKE.to_string())])
+                .expect("open direct state observation");
+            let event = events
+                .next()
+                .await
+                .expect("read direct state observation")
+                .expect("direct state observation should stay open");
+            assert_eq!(event.rows.rows().len(), STATE_ROW_COUNT);
+        }
+        Operation::ObserveState10kUpdate => {
+            unreachable!("observe update uses its persistent-stream benchmark")
+        }
         _ => {
             let data = lix
                 .read_file_data(operation.path())
@@ -740,6 +946,50 @@ async fn run_direct(lix: &Lix<SlateDB>, operation: Operation) {
             );
         }
     }
+}
+
+async fn open_direct_state_observation(lix: &Lix<SlateDB>) -> ObserveEvents<SlateDB> {
+    let mut events = lix
+        .observe(STATE_SQL, &[Value::Text(STATE_KEY_LIKE.to_string())])
+        .expect("open direct state observation");
+    let initial = events
+        .next()
+        .await
+        .expect("read initial direct state observation")
+        .expect("direct state observation should stay open");
+    assert_eq!(initial.sequence, 0);
+    assert_eq!(initial.rows.rows().len(), STATE_ROW_COUNT);
+    events
+}
+
+async fn next_direct_state_update(
+    lix: &Lix<SlateDB>,
+    events: &mut ObserveEvents<SlateDB>,
+    revision: u64,
+) {
+    update_state_row(lix, revision).await;
+    let update = events
+        .next()
+        .await
+        .expect("read updated direct state observation")
+        .expect("direct state observation should stay open");
+    assert_eq!(update.rows.rows().len(), STATE_ROW_COUNT);
+}
+
+async fn update_state_row(lix: &Lix<SlateDB>, revision: u64) {
+    lix.execute(
+        STATE_UPDATE_SQL,
+        &[
+            Value::Json(json!({
+                "ordinal": 5_000,
+                "revision": revision,
+                "active": revision % 2 == 0,
+            })),
+            Value::Text(STATE_UPDATE_KEY.to_string()),
+        ],
+    )
+    .await
+    .expect("update observed benchmark state row");
 }
 
 struct RemoteFixture {
@@ -801,7 +1051,7 @@ impl RemoteFixture {
         }
     }
 
-    async fn run(&self, operation: Operation) {
+    async fn run(&self, operation: Operation) -> Option<usize> {
         let response = match operation {
             Operation::PointPath => {
                 execute_request(
@@ -823,6 +1073,22 @@ impl RemoteFixture {
                 )
                 .await
             }
+            Operation::StateRows10k => {
+                execute_request(
+                    &self.client,
+                    &self.base_url,
+                    &self.session_id,
+                    STATE_SQL,
+                    state_wire_params(),
+                )
+                .await
+            }
+            Operation::ObserveState10k => {
+                observe_request(&self.client, &self.base_url, &self.session_id).await
+            }
+            Operation::ObserveState10kUpdate => {
+                unreachable!("observe update uses its persistent-stream benchmark")
+            }
             _ => self
                 .client
                 .request(
@@ -841,6 +1107,17 @@ impl RemoteFixture {
                 .expect("file response"),
         };
         assert_eq!(response.status(), StatusCode::OK);
+        if matches!(operation, Operation::ObserveState10k) {
+            let event = first_sse_event(response).await;
+            assert_eq!(
+                event.payload["result"]["rows"]
+                    .as_array()
+                    .expect("remote observed state rows")
+                    .len(),
+                STATE_ROW_COUNT
+            );
+            return Some(event.bytes);
+        }
         let found = response.headers().get(FILE_FOUND_HEADER).cloned();
         let compressed = response.headers().contains_key(CONTENT_ENCODING);
         let content_length = response
@@ -865,17 +1142,90 @@ impl RemoteFixture {
                     serde_json::from_slice(&body).expect("remote execute response JSON");
                 assert_eq!(
                     response["rows"].as_array().expect("remote rows").len(),
-                    if matches!(operation, Operation::ListPaths100) {
-                        LIST_COUNT
-                    } else {
-                        1
+                    match operation {
+                        Operation::ListPaths100 => LIST_COUNT,
+                        Operation::StateRows10k => STATE_ROW_COUNT,
+                        Operation::PointPath => 1,
+                        _ => unreachable!("file operations have a payload size"),
                     }
                 );
             }
         }
+        None
+    }
+
+    async fn open_state_observe_stream(&self) -> SseEventStream {
+        let response = observe_request(&self.client, &self.base_url, &self.session_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut stream = SseEventStream::new(response);
+        let initial = stream.next().await;
+        assert_eq!(
+            initial.payload["result"]["rows"]
+                .as_array()
+                .expect("remote initial observed state rows")
+                .len(),
+            STATE_ROW_COUNT
+        );
+        stream
+    }
+
+    async fn next_state_observe_update(&self, stream: &mut SseEventStream, revision: u64) -> usize {
+        let update = execute_request(
+            &self.client,
+            &self.base_url,
+            &self.session_id,
+            STATE_UPDATE_SQL,
+            state_update_wire_params(revision),
+        )
+        .await;
+        assert_eq!(update.status(), StatusCode::OK);
+        let response = response_json(update).await;
+        assert_eq!(response["rowsAffected"].as_u64(), Some(1));
+
+        let event = stream.next().await;
+        assert_remote_state_update(&event.payload);
+        event.bytes
     }
 
     async fn profile_in_process(&self, operation: Operation) -> Option<Duration> {
+        if matches!(operation, Operation::StateRows10k) {
+            let started = Instant::now();
+            let response = self
+                .router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/lix/v1/execute")
+                        .header(SESSION_ID_HEADER, &self.session_id)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({ "sql": STATE_SQL, "params": state_wire_params() }).to_string(),
+                        ))
+                        .expect("profile state request"),
+                )
+                .await
+                .expect("profile state response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("profile state response body")
+                .to_bytes();
+            let elapsed = started.elapsed();
+            let response: JsonValue =
+                serde_json::from_slice(&body).expect("profile state response JSON");
+            assert_eq!(
+                response["rows"]
+                    .as_array()
+                    .expect("profile state rows")
+                    .len(),
+                STATE_ROW_COUNT
+            );
+            return Some(elapsed);
+        }
+
         let expected = operation.payload_bytes()?;
         let started = Instant::now();
         let response = self
@@ -931,6 +1281,137 @@ async fn execute_request(
         )
         .await
         .expect("execute response")
+}
+
+async fn observe_request(
+    client: &Client<HttpConnector, Full<Bytes>>,
+    base_url: &str,
+    session_id: &str,
+) -> hyper::Response<hyper::body::Incoming> {
+    client
+        .request(
+            Request::builder()
+                .method("POST")
+                .uri(format!("{base_url}/lix/v1/observe/multiplex"))
+                .header(SESSION_ID_HEADER, session_id)
+                .header(CONTENT_TYPE, "application/json")
+                .header(ACCEPT_ENCODING, "zstd")
+                .body(Full::new(Bytes::from(
+                    json!({
+                        "subscriptions": [{
+                            "id": "state",
+                            "sql": STATE_SQL,
+                            "params": state_wire_params(),
+                        }],
+                    })
+                    .to_string(),
+                )))
+                .expect("observe request"),
+        )
+        .await
+        .expect("observe response")
+}
+
+fn state_wire_params() -> JsonValue {
+    json!([{"kind": "text", "value": STATE_KEY_LIKE}])
+}
+
+fn state_update_wire_params(revision: u64) -> JsonValue {
+    json!([
+        {
+            "kind": "json",
+            "value": {
+                "ordinal": 5_000,
+                "revision": revision,
+                "active": revision % 2 == 0,
+            },
+        },
+        {"kind": "text", "value": STATE_UPDATE_KEY},
+    ])
+}
+
+fn assert_remote_state_update(payload: &JsonValue) {
+    if let Some(rows) = payload
+        .get("result")
+        .and_then(|result| result.get("rows"))
+        .and_then(JsonValue::as_array)
+    {
+        assert_eq!(rows.len(), STATE_ROW_COUNT);
+        return;
+    }
+    assert_eq!(
+        payload["delta"]["kind"].as_str(),
+        Some("row-splice"),
+        "state update must carry either a full result or a row splice"
+    );
+}
+
+struct SseEvent {
+    payload: JsonValue,
+    bytes: usize,
+}
+
+struct SseEventStream {
+    body: hyper::body::Incoming,
+    buffered: Vec<u8>,
+}
+
+impl SseEventStream {
+    fn new(response: hyper::Response<hyper::body::Incoming>) -> Self {
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/event-stream")
+        );
+        assert!(
+            response.headers().get(CONTENT_ENCODING).is_none(),
+            "the current protocol keeps SSE events uncompressed"
+        );
+        Self {
+            body: response.into_body(),
+            buffered: Vec::new(),
+        }
+    }
+
+    async fn next(&mut self) -> SseEvent {
+        loop {
+            if let Some(end) = self
+                .buffered
+                .windows(2)
+                .position(|window| window == b"\n\n")
+            {
+                let frame = self.buffered.drain(..end + 2).collect::<Vec<_>>();
+                let frame = std::str::from_utf8(&frame[..end]).expect("SSE event UTF-8");
+                if !frame.starts_with("event: next\n") {
+                    continue;
+                }
+                let data = frame
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .expect("SSE next event data");
+                return SseEvent {
+                    payload: serde_json::from_str(data).expect("SSE next event JSON"),
+                    bytes: end + 2,
+                };
+            }
+            let frame = self
+                .body
+                .frame()
+                .await
+                .expect("SSE stream should yield an event")
+                .expect("SSE stream frame");
+            let Ok(data) = frame.into_data() else {
+                continue;
+            };
+            self.buffered.extend_from_slice(&data);
+        }
+    }
+}
+
+async fn first_sse_event(response: hyper::Response<hyper::body::Incoming>) -> SseEvent {
+    SseEventStream::new(response).next().await
 }
 
 async fn response_json(response: hyper::Response<hyper::body::Incoming>) -> JsonValue {
@@ -1017,8 +1498,17 @@ fn report_and_assert(
     let in_process_p50_us = in_process
         .get(in_process.len() / 2)
         .map_or(0, Duration::as_micros);
+    let mut sse_event_bytes = remote
+        .iter()
+        .filter_map(|sample| sample.sse_event_bytes)
+        .collect::<Vec<_>>();
+    sse_event_bytes.sort_unstable();
+    let remote_sse_event_bytes_p50 = sse_event_bytes
+        .get(sse_event_bytes.len() / 2)
+        .copied()
+        .unwrap_or(0);
     eprintln!(
-        "slatedb_remote_read delay_ms={delay_ms} cache={} operation={} direct_p50_us={} direct_p95_us={} in_process_p50_us={in_process_p50_us} remote_p50_us={} remote_p95_us={} ratio_p50={ratio_p50:.3} ratio_p95={ratio_p95:.3} direct_requests_total={direct_requests_total} remote_requests_total={remote_requests_total} remote_extra_requests_total={remote_extra_requests_total} direct_requests_max={direct_max_requests} remote_requests_max={remote_max_requests} remote_extra_requests_max={remote_max_extra_requests}",
+        "slatedb_remote_protocol delay_ms={delay_ms} cache={} operation={} direct_p50_us={} direct_p95_us={} in_process_p50_us={in_process_p50_us} remote_p50_us={} remote_p95_us={} ratio_p50={ratio_p50:.3} ratio_p95={ratio_p95:.3} remote_sse_event_bytes_p50={remote_sse_event_bytes_p50} direct_requests_total={direct_requests_total} remote_requests_total={remote_requests_total} remote_extra_requests_total={remote_extra_requests_total} direct_requests_max={direct_max_requests} remote_requests_max={remote_max_requests} remote_extra_requests_max={remote_max_extra_requests}",
         cache_state.label(),
         operation.label(),
         direct_p50.as_micros(),
@@ -1026,28 +1516,31 @@ fn report_and_assert(
         remote_p50.as_micros(),
         remote_p95.as_micros(),
     );
-    assert!(
-        ratio_p50 <= 2.0,
-        "{} {}ms {} p50 ratio {ratio_p50:.3} exceeds 2x",
-        cache_state.label(),
-        delay_ms,
-        operation.label(),
-    );
-    assert!(
-        ratio_p95 <= 2.0,
-        "{} {}ms {} p95 ratio {ratio_p95:.3} exceeds 2x",
-        cache_state.label(),
-        delay_ms,
-        operation.label(),
-    );
-    assert!(
-        remote_extra_requests_total <= u64::try_from(remote.len()).expect("sample count fits u64"),
-        "{} {}ms {} remote made {remote_extra_requests_total} additional requests across {} samples",
-        cache_state.label(),
-        delay_ms,
-        operation.label(),
-        remote.len(),
-    );
+    if operation.has_parity_gate() {
+        assert!(
+            ratio_p50 <= 2.0,
+            "{} {}ms {} p50 ratio {ratio_p50:.3} exceeds 2x",
+            cache_state.label(),
+            delay_ms,
+            operation.label(),
+        );
+        assert!(
+            ratio_p95 <= 2.0,
+            "{} {}ms {} p95 ratio {ratio_p95:.3} exceeds 2x",
+            cache_state.label(),
+            delay_ms,
+            operation.label(),
+        );
+        assert!(
+            remote_extra_requests_total
+                <= u64::try_from(remote.len()).expect("sample count fits u64"),
+            "{} {}ms {} remote made {remote_extra_requests_total} additional requests across {} samples",
+            cache_state.label(),
+            delay_ms,
+            operation.label(),
+            remote.len(),
+        );
+    }
 }
 
 fn open_storage(

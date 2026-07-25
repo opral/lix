@@ -154,7 +154,7 @@ the same active-branch, plugin rendering, and per-session acknowledgement
 semantics as `SELECT data FROM lix_file WHERE path = $1`; it is not a generic
 SQL read endpoint.
 
-## Remote read qualification
+## Remote protocol qualification
 
 The ignored release benchmark compares a direct pinned Lix session backed by
 SlateDB with the same operation through a loopback
@@ -169,13 +169,23 @@ cargo test -p lix_server_protocol --release \
 
 The matrix covers exact-path reads, ordered listings of 100 paths, and raw
 4 KiB, 100 KiB, and 1 MiB file downloads with warm memory, warm disk, and cold
-caches at 0, 10, and 25 milliseconds of object-store latency. It fails when
-the remote p50 or p95 exceeds twice its direct counterpart, or when the remote
-arm averages more than one additional object-store read per measured
-operation. Remote requests advertise zstd and materialize and decode the full
+caches at 0, 10, and 25 milliseconds of object-store latency. It also seeds
+10,000 ordered `lix_key_value` rows and measures a state query, its initial
+observation snapshot, and the write-to-next-event path for one changed row.
+The update measurement opens and consumes the initial snapshot before starting
+the timer, so it reports the steady-state observation cost rather than hiding
+it behind setup. Its output includes `remote_sse_event_bytes_p50`, which makes
+full-snapshot versus delta transport cost directly visible.
+
+File and listing operations fail when the remote p50 or p95 exceeds twice its
+direct counterpart, or when the remote arm averages more than one additional
+object-store read per measured operation. The 10k state operations are
+diagnostic baselines rather than parity gates; `observe-state-10k-update` runs
+only against a warm live runtime because it intentionally keeps one stream
+open. Remote requests advertise zstd and materialize and decode the full
 response inside the timer, matching browser content negotiation. Output also
 reports per-arm request totals and maxima and separately sampled in-process
-handler time for raw downloads.
+handler time for raw downloads and the 10k state query.
 
 Use `LIX_REMOTE_READ_SAMPLES` and
 `LIX_REMOTE_READ_WARM_MEMORY_SAMPLES` to change distribution sizes. Comma-
