@@ -299,7 +299,7 @@ impl FilesystemPathFilter {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MaterializedSnapshot {
-    disk: Snapshot,
+    disk: Arc<Snapshot>,
     lix_revision: LixRevision,
     lix_file_paths: BTreeSet<String>,
 }
@@ -798,7 +798,7 @@ where
         }
         let previous = self.last_materialized_disk();
         let lix = self
-            .apply_local_snapshot_to_lix_with_filter(&local, previous.as_ref(), &path_filter)
+            .apply_local_snapshot_to_lix_with_filter(&local, previous.as_deref(), &path_filter)
             .await?;
         let materialized =
             self.materialize_snapshot_with_filter(&lix.snapshot, Some(&local), &path_filter)?;
@@ -1107,7 +1107,9 @@ where
             }
         }
 
-        self.remembered_snapshot_for_filter(target, path_filter)
+        let mut remembered = target.filtered(path_filter);
+        remembered.unmanaged_paths = local.unmanaged_paths;
+        Ok(remembered)
     }
 
     fn remembered_snapshot_for_filter(
@@ -1132,13 +1134,13 @@ where
             .lock()
             .expect("filesystem materialized snapshot lock should not poison") =
             Some(MaterializedSnapshot {
-                disk,
+                disk: Arc::new(disk),
                 lix_revision,
                 lix_file_paths,
             });
     }
 
-    fn last_materialized_disk(&self) -> Option<Snapshot> {
+    fn last_materialized_disk(&self) -> Option<Arc<Snapshot>> {
         self.last_materialized
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
@@ -1159,7 +1161,7 @@ where
             .lock()
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
-            .is_some_and(|materialized| &materialized.disk == snapshot)
+            .is_some_and(|materialized| materialized.disk.as_ref() == snapshot)
     }
 
     fn is_last_materialized_lix_revision(&self, lix_revision: &LixRevision) -> bool {
@@ -1176,7 +1178,7 @@ where
             .expect("filesystem materialized snapshot lock should not poison")
             .as_ref()
             .is_some_and(|materialized| {
-                &materialized.disk == disk && &materialized.lix_revision == lix_revision
+                materialized.disk.as_ref() == disk && &materialized.lix_revision == lix_revision
             })
     }
 }
@@ -2859,7 +2861,7 @@ mod tests {
         let local = collect_local_snapshot(&state.layout, &path_filter).unwrap();
         let previous = state.last_materialized_disk();
         state
-            .apply_local_snapshot_to_lix_with_filter(&local, previous.as_ref(), &path_filter)
+            .apply_local_snapshot_to_lix_with_filter(&local, previous.as_deref(), &path_filter)
             .await
             .unwrap();
 
