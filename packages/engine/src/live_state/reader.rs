@@ -16,6 +16,21 @@ pub(crate) trait LiveStateReader: Send + Sync {
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
 
+    /// Attempts the narrow, current-head serving lane for an exact set of
+    /// entity primary keys.
+    ///
+    /// `None` is deliberately a normal result: readers with a transaction
+    /// overlay, an untracked sidecar, or no current v5 head projection must
+    /// let the caller use [`Self::scan_rows`] instead. Keeping this capability
+    /// at the live-state boundary means SQL can take the direct path without
+    /// learning about storage layouts or bypassing visibility semantics.
+    async fn try_scan_clean_tracked_entity_primary_keys(
+        &self,
+        _request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        Ok(None)
+    }
+
     /// Scans the immutable tracked head selected by the current branch ref.
     ///
     /// Normal SQL reads use [`Self::scan_rows`] and therefore see exactly one

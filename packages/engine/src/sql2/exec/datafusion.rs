@@ -2235,6 +2235,11 @@ mod tests {
         rows: Vec<MaterializedLiveStateRow>,
         scans: Arc<AtomicUsize>,
     }
+    struct CleanRowsLiveStateReader {
+        rows: Vec<MaterializedLiveStateRow>,
+        clean_reads: Arc<AtomicUsize>,
+        scans: Arc<AtomicUsize>,
+    }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
     fn test_read_scope(storage: &StorageAdapter<Memory>) -> StorageAdapterReadScope<MemoryRead> {
@@ -2903,6 +2908,39 @@ mod tests {
     }
 
     #[async_trait]
+    impl LiveStateReader for CleanRowsLiveStateReader {
+        async fn try_scan_clean_tracked_entity_primary_keys(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+            self.clean_reads.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(filter_live_state_rows(&self.rows, request)))
+        }
+
+        async fn load_exact_rows(
+            &self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        }
+
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            self.scans.fetch_add(1, Ordering::SeqCst);
+            Ok(filter_live_state_rows(&self.rows, request))
+        }
+
+        async fn load_row(
+            &self,
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_bytes_many(
             &self,
@@ -3195,6 +3233,68 @@ mod tests {
                     Value::Text("B".to_string())
                 ],
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn native_entity_primary_key_read_uses_clean_live_state_lane_when_available() {
+        let sql = "SELECT id, value FROM test_state_schema \
+                   WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
+        let clean_reads = Arc::new(AtomicUsize::new(0));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let ctx = DummySqlExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader: Arc::new(DummyBlobReader),
+            live_state: Arc::new(CleanRowsLiveStateReader {
+                rows: vec![
+                    live_test_state_row("entity-b", "branch-a", "B", false),
+                    live_test_state_row("entity-a", "branch-a", "A", false),
+                ],
+                clean_reads: Arc::clone(&clean_reads),
+                scans: Arc::clone(&scans),
+            }),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "value"],
+                "additionalProperties": false
+            })],
+        };
+        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
+
+        let result = super::super::bound_public_read::try_execute_bound_public_read(
+            &ctx,
+            sql,
+            &statement,
+            &[],
+        )
+        .await
+        .expect("native route should execute")
+        .expect("exact public primary-key read should use native route");
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Text("entity-a".to_string()),
+                    Value::Text("A".to_string())
+                ],
+                vec![
+                    Value::Text("entity-b".to_string()),
+                    Value::Text("B".to_string())
+                ],
+            ]
+        );
+        assert_eq!(clean_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            0,
+            "a clean-capable reader must not re-enter the generic scan path"
         );
     }
 

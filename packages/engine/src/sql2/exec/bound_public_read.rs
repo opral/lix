@@ -71,22 +71,28 @@ where
         .into_iter()
         .map(EntityPk::single)
         .collect::<Vec<_>>();
-    let mut rows = ctx
-        .live_state()
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![schema_key.clone()],
-                entity_pks,
-                branch_ids: vec![ctx.active_branch_id().to_string()],
-                include_tombstones: false,
-                ..LiveStateFilter::default()
-            },
-            projection: LiveStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
-            limit: None,
-        })
-        .await?;
+    let request = LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![schema_key.clone()],
+            entity_pks,
+            branch_ids: vec![ctx.active_branch_id().to_string()],
+            include_tombstones: false,
+            ..LiveStateFilter::default()
+        },
+        projection: LiveStateProjection {
+            columns: vec!["snapshot_content".to_string()],
+        },
+        limit: None,
+    };
+    let live_state = ctx.live_state();
+    let mut rows = if let Some(rows) = live_state
+        .try_scan_clean_tracked_entity_primary_keys(&request)
+        .await?
+    {
+        rows
+    } else {
+        live_state.scan_rows(&request).await?
+    };
 
     // The accepted ORDER BY is the complete one-column primary key. Retain
     // multiple file-backed identities for one logical primary key; `file_id`

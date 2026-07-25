@@ -17,7 +17,7 @@ use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
-    expanded_branch_ids, resolve_visible_rows,
+    expanded_branch_ids, load_local_sidecar_branch_token, resolve_visible_rows,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -176,6 +176,95 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    /// Serves the strict public entity-PK read shape directly from current v5
+    /// tracked-head groups when all mutable overlays are proven irrelevant.
+    ///
+    /// This is intentionally an all-or-nothing capability. A normal
+    /// `scan_rows` remains the semantic authority whenever an assumption is
+    /// not durable: transaction readers do not override this method, a local
+    /// sidecar marker declines the lane, a matching global sidecar declines
+    /// it, and a missing/stale v5 marker declines it. In each case the caller
+    /// must take the ordinary visible-state path.
+    pub(crate) async fn try_scan_clean_tracked_entity_primary_keys(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        let Some(_requested_branch_id) = clean_tracked_entity_primary_key_branch(request) else {
+            return Ok(None);
+        };
+
+        // This is the same branch-ref snapshot resolution used by normal
+        // reads. It yields the active branch plus its global fallback source,
+        // without opening the broad tracked or flat scans below.
+        let scope = scan_scope(&self.store, &self.live_index, request, true).await?;
+        if scope.projection_branch_ids.is_empty() {
+            // A missing active branch has no visible rows in the general
+            // path either. Returning an empty successful fast result avoids a
+            // needless fallback while preserving that contract.
+            return Ok(Some(Vec::new()));
+        }
+
+        // The durable marker is a branch-wide proof that a local mutable
+        // sidecar has never participated in this branch's current serving
+        // state. Probe every tracked source (active and global) conservatively
+        // so a present token always uses the fully general visibility path.
+        for branch_id in &scope.storage_branch_ids {
+            if load_local_sidecar_branch_token(&self.store, branch_id)
+                .await?
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+
+        // Global state intentionally has no branch-wide sidecar marker: it
+        // also owns engine configuration. A bounded exact-PK probe is enough
+        // here because only rows matching this request could affect its
+        // visible result. It keeps the native lane correct without turning an
+        // ordinary tracked query into a global flat-state scan.
+        if !self
+            .live_index
+            .reader(&self.store)
+            .scan_index_rows(&index_scan_request_from_live(request, GLOBAL_BRANCH_ID))
+            .await?
+            .is_empty()
+        {
+            return Ok(None);
+        }
+
+        let tracked_request = tracked_scan_request_from_live(request);
+        let mut tracked_rows = Vec::new();
+        for branch_id in &scope.storage_branch_ids {
+            let Some(commit_id) = scope.branch_commit_ids.get(branch_id) else {
+                continue;
+            };
+            let Some(rows) = self
+                .tracked_head
+                .reader(&self.store)
+                .scan_live_rows_if_current(branch_id, commit_id, &tracked_request)
+                .await?
+            else {
+                // A head projection is a cache-like serving structure. Do not
+                // infer emptiness from an absent or stale marker; fall back to
+                // the historical tracked-state path instead.
+                return Ok(None);
+            };
+            tracked_rows.extend(rows);
+        }
+
+        Ok(Some(resolve_visible_rows(
+            tracked_rows,
+            Vec::new(),
+            &VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids,
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
+        )))
     }
 
     pub(crate) async fn load_row(
@@ -518,6 +607,13 @@ where
         Self::scan_rows(self, request).await
     }
 
+    async fn try_scan_clean_tracked_entity_primary_keys(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        Self::try_scan_clean_tracked_entity_primary_keys(self, request).await
+    }
+
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
@@ -744,6 +840,31 @@ fn index_scan_request_from_live(
         projection: request.projection.columns.clone(),
         limit: None,
     }
+}
+
+/// Recognizes the deliberately small request shape backed by a v5 group
+/// point read. The SQL direct route is currently its only caller, but this
+/// guard lives beside the storage implementation so future callers cannot
+/// accidentally skip untracked or visibility semantics with a wider scan.
+fn clean_tracked_entity_primary_key_branch(request: &LiveStateScanRequest) -> Option<&str> {
+    let [branch_id] = request.filter.branch_ids.as_slice() else {
+        return None;
+    };
+    if !matches!(
+        request.filter.rows,
+        crate::live_state::LiveStateRowFilter::All
+    ) || request.filter.schema_keys.len() != 1
+        || request.filter.entity_pks.is_empty()
+        || !request.filter.file_ids.is_empty()
+        || request.filter.untracked.is_some()
+        || !request.filter.constraints.is_empty()
+        || request.filter.include_tombstones
+        || request.limit.is_some()
+        || request_may_include_commit_derived(request)
+    {
+        return None;
+    }
+    Some(branch_id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -991,7 +1112,9 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
     use crate::entity_pk::EntityPk;
-    use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
+    use crate::json_store::{
+        JsonRef, JsonSlot, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
+    };
     use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::live_state::{
         LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
@@ -1124,15 +1247,11 @@ mod tests {
                         snapshot: row
                             .snapshot_content
                             .as_deref()
-                            .map_or(crate::json_store::JsonSlot::None, |snapshot| {
-                                crate::json_store::JsonSlot::from_json(snapshot)
-                            }),
+                            .map_or(JsonSlot::None, JsonSlot::from_json),
                         metadata: row
                             .metadata
                             .as_deref()
-                            .map_or(crate::json_store::JsonSlot::None, |metadata| {
-                                crate::json_store::JsonSlot::from_json(metadata)
-                            }),
+                            .map_or(JsonSlot::None, JsonSlot::from_json),
                         created_at: ts(&row.updated_at),
                         origin_key: None,
                     },
@@ -1367,6 +1486,80 @@ mod tests {
             index_writer.stage_branch_rows(branch_id, deltas).await?;
         }
         Ok(())
+    }
+
+    /// Seeds tracked roots and their matching v5 serving heads in one atomic
+    /// write. Tests which exercise the clean lane must use current markers;
+    /// an ordinary tracked-root fixture intentionally exercises the historical
+    /// fallback instead.
+    async fn write_v5_tracked_heads(
+        storage: &StorageAdapter,
+        heads: &[(&str, &str, &[MaterializedLiveStateRow])],
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("v5 tracked-head read should open");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        let rows = heads
+            .iter()
+            .flat_map(|(_, _, rows)| rows.iter().cloned())
+            .collect::<Vec<_>>();
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &rows)
+            .await
+            .expect("v5 tracked roots should stage");
+
+        for &(branch_id, commit_id, rows) in heads {
+            let slots = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.snapshot_content
+                            .as_deref()
+                            .map_or(JsonSlot::None, JsonSlot::from_json),
+                        row.metadata
+                            .as_deref()
+                            .map_or(JsonSlot::None, JsonSlot::from_json),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let deltas = rows
+                .iter()
+                .zip(&slots)
+                .map(
+                    |(row, (snapshot, metadata))| crate::live_state::TrackedHeadDeltaRef {
+                        schema_key: &row.schema_key,
+                        file_id: row.file_id.as_deref(),
+                        entity_pk: &row.entity_pk,
+                        change_id: row.change_id.expect("tracked fixture needs a change id"),
+                        commit_id: CommitId::for_test_label(commit_id),
+                        deleted: row.deleted,
+                        created_at: row.created_at,
+                        updated_at: row.updated_at,
+                        snapshot: snapshot.as_ref_slot(),
+                        metadata: metadata.as_ref_slot(),
+                    },
+                )
+                .collect::<Vec<_>>();
+            TrackedHeadContext::new()
+                .writer(&read, &mut writes)
+                .stage_commit(
+                    branch_id,
+                    None,
+                    CommitId::for_test_label(commit_id),
+                    &deltas,
+                    &std::collections::BTreeSet::new(),
+                    None,
+                )
+                .await
+                .expect("v5 tracked head should stage");
+        }
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("v5 tracked heads should commit");
     }
 
     fn stage_json_payloads_from_materialized(
@@ -2395,6 +2588,226 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn clean_v5_entity_pk_lane_resolves_global_local_and_tombstones() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+
+        let mut global_visible = tracked_row_at_with_commit(
+            GLOBAL_BRANCH_ID,
+            "global-visible",
+            Some("global-visible-change"),
+            "clean-global",
+        );
+        global_visible.entity_pk = identity("visible");
+        let mut global_hidden = tracked_row_at_with_commit(
+            GLOBAL_BRANCH_ID,
+            "global-hidden",
+            Some("global-hidden-change"),
+            "clean-global",
+        );
+        global_hidden.entity_pk = identity("hidden");
+        let mut local_visible = tracked_row_at_with_commit(
+            "branch-a",
+            "local-visible",
+            Some("local-visible-change"),
+            "clean-branch",
+        );
+        local_visible.entity_pk = identity("visible");
+        let mut local_tombstone = tombstone_tracked_row_at_with_commit(
+            "branch-a",
+            Some("local-hidden-tombstone"),
+            "clean-branch",
+        );
+        local_tombstone.entity_pk = identity("hidden");
+
+        write_v5_tracked_heads(
+            &storage,
+            &[
+                (
+                    GLOBAL_BRANCH_ID,
+                    "clean-global",
+                    &[global_visible, global_hidden],
+                ),
+                (
+                    "branch-a",
+                    "clean-branch",
+                    &[local_visible, local_tombstone],
+                ),
+            ],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch refs read should open");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row(GLOBAL_BRANCH_ID, "clean-global"),
+                branch_ref_row("branch-a", "clean-branch"),
+            ],
+        )
+        .await;
+
+        let rows = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("clean v5 read should open"),
+            )
+            .try_scan_clean_tracked_entity_primary_keys(&clean_entity_pk_request(
+                "branch-a",
+                &["visible", "hidden"],
+            ))
+            .await
+            .expect("clean v5 lane should read")
+            .expect("matching v5 heads without sidecars should use clean lane");
+
+        assert_eq!(rows.len(), 1, "local tombstone must hide global fallback");
+        assert_eq!(rows[0].entity_pk, identity("visible"));
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"local-visible\"}")
+        );
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert!(!rows[0].global);
+        assert!(!rows[0].untracked);
+    }
+
+    #[tokio::test]
+    async fn clean_v5_entity_pk_lane_declines_matching_global_sidecar() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let global_rows = [tracked_row_at_with_commit(
+            GLOBAL_BRANCH_ID,
+            "tracked-global",
+            Some("tracked-global-change"),
+            "sidecar-global",
+        )];
+        write_v5_tracked_heads(
+            &storage,
+            &[
+                (GLOBAL_BRANCH_ID, "sidecar-global", &global_rows),
+                ("branch-a", "sidecar-branch", &[]),
+            ],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch refs read should open");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row(GLOBAL_BRANCH_ID, "sidecar-global"),
+                branch_ref_row("branch-a", "sidecar-branch"),
+                untracked_row("global-sidecar"),
+            ],
+        )
+        .await;
+
+        let request = clean_entity_pk_request("branch-a", &["selected-tab"]);
+        let direct = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("clean v5 read should open"),
+            )
+            .try_scan_clean_tracked_entity_primary_keys(&request)
+            .await
+            .expect("clean v5 lane should probe sidecar");
+        assert_eq!(
+            direct, None,
+            "a matching global mutable row must retain ordinary visibility resolution"
+        );
+
+        let rows = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("fallback read should open"),
+            )
+            .scan_rows(&request)
+            .await
+            .expect("ordinary visibility path should read sidecar");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].untracked);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"global-sidecar\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_v5_entity_pk_lane_declines_branch_with_sidecar_marker() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let global_rows = [tracked_row_at_with_commit(
+            GLOBAL_BRANCH_ID,
+            "tracked-global",
+            Some("marker-global-change"),
+            "marker-global",
+        )];
+        let branch_rows = [tracked_row_at_with_commit(
+            "branch-a",
+            "tracked-branch",
+            Some("marker-branch-change"),
+            "marker-branch",
+        )];
+        write_v5_tracked_heads(
+            &storage,
+            &[
+                (GLOBAL_BRANCH_ID, "marker-global", &global_rows),
+                ("branch-a", "marker-branch", &branch_rows),
+            ],
+        )
+        .await;
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch refs read should open");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[
+                branch_ref_row(GLOBAL_BRANCH_ID, "marker-global"),
+                branch_ref_row("branch-a", "marker-branch"),
+            ],
+        )
+        .await;
+        let mut writes = StorageWriteSet::new();
+        crate::live_state::stage_local_sidecar_branch_marker(&mut writes, "branch-a")
+            .expect("sidecar marker should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("sidecar marker should commit");
+
+        let direct = live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("clean v5 read should open"),
+            )
+            .try_scan_clean_tracked_entity_primary_keys(&clean_entity_pk_request(
+                "branch-a",
+                &["selected-tab"],
+            ))
+            .await
+            .expect("clean v5 lane should probe marker");
+        assert_eq!(
+            direct, None,
+            "the monotonic branch-sidecar marker must conservatively reject the clean lane"
+        );
+    }
+
     async fn load_selected_tab(
         live_state: &LiveStateContext,
         storage: &StorageAdapter,
@@ -2461,6 +2874,24 @@ mod tests {
                 ..LiveStateScanRequest::default()
             })
             .await
+    }
+
+    fn clean_entity_pk_request(branch_id: &str, entity_pks: &[&str]) -> LiveStateScanRequest {
+        LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec!["lix_key_value".to_string()],
+                entity_pks: entity_pks
+                    .iter()
+                    .map(|entity_pk| identity(entity_pk))
+                    .collect(),
+                branch_ids: vec![branch_id.to_string()],
+                ..LiveStateFilter::default()
+            },
+            projection: LiveStateProjection {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            limit: None,
+        }
     }
 
     async fn scan_tracked_root(
