@@ -190,7 +190,7 @@ fn parsed_source_retains_spans_after_a_layout_shifting_file_change() {
         .expect("layout-shifting source edit");
 
     let mut expected = before;
-    expected.splice(version..version + 1, b"200".iter().copied());
+    expected.splice(version..=version, b"200".iter().copied());
     assert_eq!(after.bytes(), expected);
     assert_source_spans_match_entities(&after);
     assert_eq!(
