@@ -262,6 +262,17 @@ impl StorageRead for RocksDBRead<'_> {
         opts: GetOptions,
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
+            if let [key] = keys {
+                let physical_key = physical_key(space, key);
+                let value = self
+                    .snapshot
+                    .get(physical_key.0.as_ref())
+                    .map_err(rocksdb_error)?;
+                return Ok(GetManyResult::new(vec![
+                    value.map(|value| project_owned_value(value, opts.projection)),
+                ]));
+            }
+
             let physical_keys = keys
                 .iter()
                 .map(|key| physical_key(space, key))
@@ -631,9 +642,10 @@ where
 {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        // `Snapshot::multi_get` yields Rust-owned `Vec<u8>` values and the
-        // standard iterator yields Rust-owned `Box<[u8]>` values. Retaining
-        // those allocations in `Bytes` avoids a second full value copy.
+        // `Snapshot::get` and `Snapshot::multi_get` yield Rust-owned
+        // `Vec<u8>` values, while the standard iterator yields Rust-owned
+        // `Box<[u8]>` values. Retaining those allocations in `Bytes` avoids a
+        // second full value copy.
         CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::from(value)),
     }
 }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId, Storage,
-    StorageRead, StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId,
+    Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 use lix_rocksdb_storage::RocksDB;
 
@@ -40,6 +40,56 @@ fn same_process_open_reuses_shared_database_handle() {
         read_one(&storage_a, space, Key(Bytes::from_static(b"from-b"))),
         Some(Bytes::from_static(b"b"))
     );
+}
+
+#[test]
+fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("storage.rocksdb");
+    let storage = RocksDB::open(&path).expect("open storage");
+    let space = SpaceId(0x0005_0003);
+    let key = Key(Bytes::from_static(b"tracked-key"));
+
+    put_one(
+        &storage,
+        space,
+        key.clone(),
+        Bytes::from_static(b"before-snapshot"),
+    );
+    let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin read");
+    put_one(
+        &storage,
+        space,
+        key.clone(),
+        Bytes::from_static(b"after-snapshot"),
+    );
+
+    let full = block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
+        .expect("read full value");
+    assert_eq!(
+        full.values,
+        vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+            b"before-snapshot"
+        )))]
+    );
+
+    let key_only = block_on(read.get_many(
+        space,
+        std::slice::from_ref(&key),
+        GetOptions {
+            projection: CoreProjection::KeyOnly,
+        },
+    ))
+    .expect("read key-only value");
+    assert_eq!(key_only.values, vec![Some(ProjectedValue::KeyOnly)]);
+
+    let missing = block_on(read.get_many(
+        space,
+        &[Key(Bytes::from_static(b"missing-key"))],
+        GetOptions::default(),
+    ))
+    .expect("read missing value");
+    assert_eq!(missing.values, vec![None]);
 }
 
 #[test]
