@@ -64,6 +64,15 @@ impl SqlFixture {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn read_all_result(&self) -> ExecuteResult {
+        match self {
+            Self::SQLite(fixture) => fixture.read_all_result().await,
+            Self::RocksDB(fixture) => fixture.read_all_result().await,
+        }
+    }
+
     pub(crate) async fn read_many_by_pk(&self) -> usize {
         match self {
             Self::SQLite(fixture) => fixture.read_many_by_pk().await,
@@ -71,10 +80,28 @@ impl SqlFixture {
         }
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn read_many_by_pk_result(&self) -> ExecuteResult {
+        match self {
+            Self::SQLite(fixture) => fixture.read_many_by_pk_result().await,
+            Self::RocksDB(fixture) => fixture.read_many_by_pk_result().await,
+        }
+    }
+
     pub(crate) async fn read_one_by_pk(&self) -> usize {
         match self {
             Self::SQLite(fixture) => fixture.read_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.read_one_by_pk().await,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) async fn read_one_by_pk_result(&self) -> ExecuteResult {
+        match self {
+            Self::SQLite(fixture) => fixture.read_one_by_pk_result().await,
+            Self::RocksDB(fixture) => fixture.read_one_by_pk_result().await,
         }
     }
 
@@ -123,21 +150,33 @@ where
     }
 
     async fn read_all(&self) -> usize {
-        let result = execute(&self.session, &self.select_all_sql).await;
+        let result = std::hint::black_box(self.read_all_result().await);
         assert_eq!(result.len(), self.row_count);
         result.len()
     }
 
+    async fn read_all_result(&self) -> ExecuteResult {
+        execute(&self.session, &self.select_all_sql).await
+    }
+
     async fn read_many_by_pk(&self) -> usize {
-        let result = execute(&self.session, &self.select_many_by_pk_sql).await;
+        let result = std::hint::black_box(self.read_many_by_pk_result().await);
         assert_eq!(result.len(), READ_MANY_PK_COUNT.min(self.row_count));
         result.len()
     }
 
+    async fn read_many_by_pk_result(&self) -> ExecuteResult {
+        execute(&self.session, &self.select_many_by_pk_sql).await
+    }
+
     async fn read_one_by_pk(&self) -> usize {
-        let result = execute(&self.session, &self.select_one_by_pk_sql).await;
+        let result = std::hint::black_box(self.read_one_by_pk_result().await);
         assert_eq!(result.len(), 1);
         result.len()
+    }
+
+    async fn read_one_by_pk_result(&self) -> ExecuteResult {
+        execute(&self.session, &self.select_one_by_pk_sql).await
     }
 
     #[expect(clippy::cast_possible_truncation)]

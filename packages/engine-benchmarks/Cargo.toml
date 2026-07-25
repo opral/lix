@@ -46,6 +46,11 @@ name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
 required-features = ["rocksdb", "slatedb"]
 
+[[test]]
+name = "tracked_state_crud_public_result"
+path = "tests/tracked_state_crud_public_result.rs"
+required-features = ["storage-benches"]
+
 [[bench]]
 name = "storage_v2"
 path = "benches/storage_v2.rs"

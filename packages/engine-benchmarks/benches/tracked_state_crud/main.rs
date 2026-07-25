@@ -44,7 +44,7 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
 /// operation. Criterion's CodSpeed-compatible harness intentionally delegates
 /// timing to the runner, while this opt-in mode is useful for local profiling
 /// and before/after investigation. Each sample starts from an independently
-/// seeded RocksDB fixture, matching the benchmark's measurement boundary.
+/// seeded fixture, matching the benchmark's measurement boundary.
 fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
     let operation = match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref() {
         Ok("insert_all") => TransactionBenchOp::InsertAll,
@@ -87,17 +87,19 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             profile_kv_layout_operation(runtime, rows, operation, sample_count);
         }
         Ok("raw_sqlite") => {
+            let output = raw_sqlite_profile_output(operation);
             if let Some(repeats) = hot_repeats {
-                profile_hot_raw_sqlite_operations(rows, operation, repeats);
+                profile_hot_raw_sqlite_operations(rows, operation, repeats, output);
             } else {
-                profile_raw_sqlite_operation(rows, operation, sample_count);
+                profile_raw_sqlite_operation(rows, operation, sample_count, output);
             }
         }
         Ok("sql_session") => {
+            let profile = profile_sql_session_storage();
             if let Some(repeats) = hot_repeats {
-                profile_hot_sql_session_operations(runtime, rows, operation, repeats);
+                profile_hot_sql_session_operations(runtime, rows, operation, repeats, profile);
             } else {
-                profile_sql_session_operation(runtime, rows, operation, sample_count);
+                profile_sql_session_operation(runtime, rows, operation, sample_count, profile);
             }
         }
         Ok("transaction") | Err(_) => {
@@ -109,6 +111,52 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
         }
         Ok(other) => panic!(
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, kv_layout, or raw_sqlite"
+        ),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum RawSqliteProfileOutput {
+    Borrowed,
+    PublicResult,
+}
+
+impl RawSqliteProfileOutput {
+    const fn layer(self) -> &'static str {
+        match self {
+            Self::Borrowed => "raw_sqlite",
+            Self::PublicResult => "raw_sqlite/public_result",
+        }
+    }
+}
+
+fn raw_sqlite_profile_output(operation: TransactionBenchOp) -> RawSqliteProfileOutput {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OUTPUT").as_deref() {
+        Ok("public_result") => {
+            assert!(
+                matches!(
+                    operation,
+                    TransactionBenchOp::ReadAll
+                        | TransactionBenchOp::ReadOneByPk
+                        | TransactionBenchOp::ReadManyByPk
+                ),
+                "LIX_TRACKED_STATE_CRUD_PROFILE_OUTPUT=public_result only supports read_all, read_one, or read_many"
+            );
+            RawSqliteProfileOutput::PublicResult
+        }
+        Ok("borrowed") | Err(_) => RawSqliteProfileOutput::Borrowed,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_OUTPUT '{other}'; expected borrowed or public_result"
+        ),
+    }
+}
+
+fn profile_sql_session_storage() -> StorageProfile {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE").as_deref() {
+        Ok("sqlite") => StorageProfile::SQLite,
+        Ok("rocksdb") | Err(_) => StorageProfile::RocksDB,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb or sqlite"
         ),
     }
 }
@@ -149,11 +197,12 @@ fn profile_hot_sql_session_operations(
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
     repeats: usize,
+    profile: StorageProfile,
 ) {
     operation.assert_supports_hot_repeats();
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
-    let fixture = runtime.block_on(sql_session::seeded_fixture(StorageProfile::RocksDB, rows));
+    let fixture = runtime.block_on(sql_session::seeded_fixture(profile, rows));
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
@@ -161,7 +210,8 @@ fn profile_hot_sql_session_operations(
     }
     let elapsed = start.elapsed();
     println!(
-        "tracked_state_crud hot profile: sql_session/lix_rocksdb/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        "tracked_state_crud hot profile: sql_session/{}/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        profile.name(),
         profile_operation_name(operation),
         repeats,
         elapsed / repeats_u32,
@@ -173,6 +223,7 @@ fn profile_hot_raw_sqlite_operations(
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
     repeats: usize,
+    output: RawSqliteProfileOutput,
 ) {
     operation.assert_supports_hot_repeats();
     let repeats_u32 =
@@ -181,11 +232,12 @@ fn profile_hot_raw_sqlite_operations(
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
-        row_count += run_raw_sqlite_operation(operation, &mut fixture);
+        row_count += run_raw_sqlite_operation(operation, &mut fixture, output);
     }
     let elapsed = start.elapsed();
     println!(
-        "tracked_state_crud hot profile: raw_sqlite/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        "tracked_state_crud hot profile: {}/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        output.layer(),
         profile_operation_name(operation),
         repeats,
         elapsed / repeats_u32,
@@ -261,6 +313,7 @@ fn profile_raw_sqlite_operation(
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
     sample_count: usize,
+    output: RawSqliteProfileOutput,
 ) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
@@ -270,11 +323,11 @@ fn profile_raw_sqlite_operation(
             raw_sqlite::empty_fixture(rows)
         };
         let start = Instant::now();
-        let result = run_raw_sqlite_operation(operation, &mut fixture);
+        let result = run_raw_sqlite_operation(operation, &mut fixture, output);
         samples.push(start.elapsed());
         black_box(result);
     }
-    print_profile_samples("raw_sqlite", operation, samples);
+    print_profile_samples(output.layer(), operation, samples);
 }
 
 fn profile_sql_session_operation(
@@ -282,20 +335,25 @@ fn profile_sql_session_operation(
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
     sample_count: usize,
+    profile: StorageProfile,
 ) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let fixture = if operation.needs_seed() {
-            runtime.block_on(sql_session::seeded_fixture(StorageProfile::RocksDB, rows))
+            runtime.block_on(sql_session::seeded_fixture(profile, rows))
         } else {
-            runtime.block_on(sql_session::empty_fixture(StorageProfile::RocksDB, rows))
+            runtime.block_on(sql_session::empty_fixture(profile, rows))
         };
         let start = Instant::now();
         let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
         samples.push(start.elapsed());
         black_box(result);
     }
-    print_profile_samples("sql_session/lix_rocksdb", operation, samples);
+    print_profile_samples(
+        &format!("sql_session/{}", profile.name()),
+        operation,
+        samples,
+    );
 }
 
 async fn run_sql_session_operation(
@@ -317,16 +375,26 @@ async fn run_sql_session_operation(
 fn run_raw_sqlite_operation(
     operation: TransactionBenchOp,
     fixture: &mut raw_sqlite::RawSqliteFixture,
+    output: RawSqliteProfileOutput,
 ) -> usize {
-    match operation {
-        TransactionBenchOp::InsertAll => fixture.insert_all(),
-        TransactionBenchOp::ReadAll => fixture.read_all(),
-        TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk(),
-        TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT),
-        TransactionBenchOp::UpdateAll => fixture.update_all(),
-        TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk(),
-        TransactionBenchOp::DeleteAll => fixture.delete_all(),
-        TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk(),
+    match (operation, output) {
+        (TransactionBenchOp::ReadAll, RawSqliteProfileOutput::PublicResult) => {
+            black_box(fixture.read_all_public_result()).len()
+        }
+        (TransactionBenchOp::ReadOneByPk, RawSqliteProfileOutput::PublicResult) => {
+            black_box(fixture.read_one_by_pk_public_result()).len()
+        }
+        (TransactionBenchOp::ReadManyByPk, RawSqliteProfileOutput::PublicResult) => {
+            black_box(fixture.read_many_by_pk_public_result(READ_MANY_PK_COUNT)).len()
+        }
+        (TransactionBenchOp::InsertAll, _) => fixture.insert_all(),
+        (TransactionBenchOp::ReadAll, _) => fixture.read_all(),
+        (TransactionBenchOp::ReadOneByPk, _) => fixture.read_one_by_pk(),
+        (TransactionBenchOp::ReadManyByPk, _) => fixture.read_many_by_pk(READ_MANY_PK_COUNT),
+        (TransactionBenchOp::UpdateAll, _) => fixture.update_all(),
+        (TransactionBenchOp::UpdateOneByPk, _) => fixture.update_one_by_pk(),
+        (TransactionBenchOp::DeleteAll, _) => fixture.delete_all(),
+        (TransactionBenchOp::DeleteOneByPk, _) => fixture.delete_one_by_pk(),
     }
 }
 
@@ -374,6 +442,19 @@ fn bench_raw_sqlite(c: &mut Criterion, rows: &[WorkloadRow], label: &str) {
             BatchSize::LargeInput,
         );
     });
+    // Lix SQL-session `read_all_rows` already returns an owned public
+    // ExecuteResult. This companion control separates that common result
+    // materialization from the deliberately borrowed raw SQLite lower bound.
+    group.bench_function(
+        format!("read_all_public_result_rows/{}", row_label(rows.len())),
+        |b| {
+            b.iter_batched_ref(
+                || raw_sqlite::seeded_fixture(&rows),
+                |fixture| black_box(fixture.read_all_public_result()),
+                BatchSize::LargeInput,
+            );
+        },
+    );
     group.bench_function(format!("read_one_by_pk/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || raw_sqlite::seeded_fixture(&rows),
@@ -381,6 +462,16 @@ fn bench_raw_sqlite(c: &mut Criterion, rows: &[WorkloadRow], label: &str) {
             BatchSize::LargeInput,
         );
     });
+    group.bench_function(
+        format!("read_one_by_pk_public_result/{}", row_label(rows.len())),
+        |b| {
+            b.iter_batched_ref(
+                || raw_sqlite::seeded_fixture(&rows),
+                |fixture| black_box(fixture.read_one_by_pk_public_result()),
+                BatchSize::LargeInput,
+            );
+        },
+    );
     group.bench_function(format!("read_many_by_pk/{READ_MANY_PK_COUNT}"), |b| {
         b.iter_batched_ref(
             || raw_sqlite::seeded_fixture(&rows),
@@ -388,6 +479,16 @@ fn bench_raw_sqlite(c: &mut Criterion, rows: &[WorkloadRow], label: &str) {
             BatchSize::LargeInput,
         );
     });
+    group.bench_function(
+        format!("read_many_by_pk_public_result/{READ_MANY_PK_COUNT}"),
+        |b| {
+            b.iter_batched_ref(
+                || raw_sqlite::seeded_fixture(&rows),
+                |fixture| black_box(fixture.read_many_by_pk_public_result(READ_MANY_PK_COUNT)),
+                BatchSize::LargeInput,
+            );
+        },
+    );
     group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || raw_sqlite::seeded_fixture(&rows),

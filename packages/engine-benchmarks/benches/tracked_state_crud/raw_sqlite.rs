@@ -1,7 +1,8 @@
-use rusqlite::{Connection, params, params_from_iter};
+use rusqlite::{Connection, Rows, params, params_from_iter};
 use tempfile::TempDir;
 
 use crate::workload::WorkloadRow;
+use lix_engine::{ExecuteResult, Value};
 
 pub(crate) struct RawSqliteFixture {
     connection: Connection,
@@ -94,6 +95,24 @@ impl RawSqliteFixture {
         count
     }
 
+    /// Reads through standalone SQLite, then constructs the same public
+    /// `ExecuteResult` value shape that the Lix SQL session returns.
+    ///
+    /// Keep this separate from [`Self::read_all`]. The latter intentionally
+    /// borrows SQLite text values, which is the storage-engine lower bound;
+    /// this control attributes the unavoidable owned `Value`/JSON-DOM result
+    /// construction independently from the Lix SQL and storage layers.
+    pub(crate) fn read_all_public_result(&self) -> ExecuteResult {
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT path, value FROM json_pointer ORDER BY path")
+            .expect("prepare raw sqlite public-result read all");
+        let query = statement
+            .query([])
+            .expect("query all raw sqlite public-result rows");
+        Self::public_result_from_query(query, self.rows.len())
+    }
+
     pub(crate) fn read_one_by_pk(&self) -> usize {
         let row = &self.rows[self.rows.len() / 2];
         let mut statement = self
@@ -124,6 +143,18 @@ impl RawSqliteFixture {
                 .is_none()
         );
         1
+    }
+
+    pub(crate) fn read_one_by_pk_public_result(&self) -> ExecuteResult {
+        let row = &self.rows[self.rows.len() / 2];
+        let mut statement = self
+            .connection
+            .prepare_cached("SELECT path, value FROM json_pointer WHERE path = ?1")
+            .expect("prepare raw sqlite public-result point read");
+        let query = statement
+            .query(params![row.path])
+            .expect("query raw sqlite public-result point row");
+        Self::public_result_from_query(query, 1)
     }
 
     pub(crate) fn read_many_by_pk(&self, count: usize) -> usize {
@@ -157,6 +188,24 @@ impl RawSqliteFixture {
         }
         assert_eq!(found, count);
         found
+    }
+
+    pub(crate) fn read_many_by_pk_public_result(&self, count: usize) -> ExecuteResult {
+        let count = count.min(self.rows.len());
+        assert_eq!(
+            count, self.read_many_by_pk_count,
+            "read-many benchmark must use the fixture's setup-excluded query shape"
+        );
+        let mut statement = self
+            .connection
+            .prepare_cached(&self.read_many_by_pk_sql)
+            .expect("prepare raw sqlite public-result multi-point read");
+        let query = statement
+            .query(params_from_iter(
+                self.rows[..count].iter().map(|row| row.path.as_str()),
+            ))
+            .expect("query raw sqlite public-result multi-point rows");
+        Self::public_result_from_query(query, count)
     }
 
     pub(crate) fn update_all(&mut self) -> usize {
@@ -215,6 +264,35 @@ impl RawSqliteFixture {
             .expect("delete one raw sqlite row");
         assert_eq!(affected, 1);
         affected
+    }
+
+    fn public_result_from_query(mut query: Rows<'_>, expected_rows: usize) -> ExecuteResult {
+        let mut rows = Vec::with_capacity(expected_rows);
+        while let Some(row) = query
+            .next()
+            .expect("read next raw sqlite public-result row")
+        {
+            // `String` ownership and the JSON parse intentionally mirror
+            // `query_result_from_batches` -> `string_scalar_to_lix_value`.
+            let path = row
+                .get::<_, String>(0)
+                .expect("read raw sqlite public-result path");
+            let value_json = row
+                .get::<_, String>(1)
+                .expect("read raw sqlite public-result value");
+            let value =
+                serde_json::from_str(&value_json).expect("raw sqlite fixture JSON must be valid");
+            // Entity projection represents JSON `null` as an Arrow null, so
+            // the public Lix result is `Value::Null` rather than
+            // `Value::Json(JsonValue::Null)`.
+            let value = match value {
+                serde_json::Value::Null => Value::Null,
+                value => Value::Json(value),
+            };
+            rows.push(vec![Value::Text(path), value]);
+        }
+        assert_eq!(rows.len(), expected_rows);
+        ExecuteResult::from_rows(vec!["path".to_string(), "value".to_string()], rows)
     }
 }
 
