@@ -44,7 +44,6 @@ pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRo
         metadata: None,
         origin: None,
         created_at: None,
-        created_at_from_visible_row: false,
         updated_at: None,
         global: false,
         change_id: None,

@@ -521,7 +521,6 @@ fn entity_delete_stage_rows_from_batch(
                 metadata,
                 origin: None,
                 created_at: None,
-                created_at_from_visible_row: false,
                 updated_at: None,
                 global,
                 change_id: None,

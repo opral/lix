@@ -1485,7 +1485,6 @@ fn partial_state_row(
         metadata: context.metadata,
         origin: None,
         created_at: None,
-        created_at_from_visible_row: false,
         updated_at: None,
         global: context.global,
         change_id: None,

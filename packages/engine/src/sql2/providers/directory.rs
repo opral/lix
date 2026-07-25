@@ -2582,7 +2582,6 @@ mod tests {
                 )),
                 origin: Some(lix_directory_insert_origin("lix_directory", "dir-docs")),
                 created_at: None,
-                created_at_from_visible_row: false,
                 updated_at: None,
                 global: false,
                 change_id: None,
@@ -2753,7 +2752,6 @@ mod tests {
                         "dir-docs"
                     )),
                     created_at: None,
-                    created_at_from_visible_row: false,
                     updated_at: None,
                     global: false,
                     change_id: None,

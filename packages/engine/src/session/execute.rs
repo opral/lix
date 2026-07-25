@@ -2487,6 +2487,8 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entity_pk::EntityPk;
+    use crate::transaction::types::{TransactionJson, TransactionWriteRow};
     use crate::{Engine, Memory};
 
     async fn open_session() -> SessionContext<Memory> {
@@ -3192,6 +3194,84 @@ mod tests {
             before_changed_catalog_read,
             "the next catalog generation must still avoid the uncached schema projection"
         );
+    }
+
+    #[tokio::test]
+    async fn programmatic_replace_then_sql_update_preserves_durable_created_at() {
+        const KEY: &str = "created-at-overlay";
+        const FIRST_CREATED_AT: &str = "2020-01-01T00:00:00.000Z";
+
+        fn row(value: &str, created_at: Option<&str>) -> TransactionWriteRow {
+            TransactionWriteRow {
+                entity_pk: Some(EntityPk::single(KEY)),
+                schema_key: "lix_key_value".to_string(),
+                file_id: None,
+                snapshot: Some(TransactionJson::from_value_for_test(serde_json::json!({
+                    "key": KEY,
+                    "value": value,
+                }))),
+                metadata: None,
+                origin: None,
+                created_at: created_at.map(str::to_owned),
+                updated_at: None,
+                global: true,
+                change_id: None,
+                commit_id: None,
+                untracked: false,
+                branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+            }
+        }
+
+        let session = open_session().await;
+
+        let mut seed = session
+            .begin_transaction()
+            .await
+            .expect("seed transaction should begin");
+        seed.transaction_mut()
+            .expect("seed transaction should be open")
+            .stage_rows(vec![row("seed", Some(FIRST_CREATED_AT))])
+            .await
+            .expect("programmatic seed should stage");
+        seed.commit()
+            .await
+            .expect("programmatic seed should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .transaction_mut()
+            .expect("transaction should be open")
+            .stage_rows(vec![row("programmatic replacement", None)])
+            .await
+            .expect("programmatic replacement should stage");
+        transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'sql replacement' \
+                 WHERE key = 'created-at-overlay'",
+                &[],
+            )
+            .await
+            .expect("SQL update should read and replace the staged row");
+        transaction
+            .commit()
+            .await
+            .expect("transaction should commit");
+
+        let created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM lix_key_value \
+                 WHERE key = 'created-at-overlay'",
+                &[],
+            )
+            .await
+            .expect("final row should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created timestamp should be text");
+        assert_eq!(created_at, FIRST_CREATED_AT);
     }
 
     #[tokio::test]
