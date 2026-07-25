@@ -627,22 +627,20 @@ fn bench_sql_session(
             BatchSize::LargeInput,
         );
     });
-    if std::env::var_os("LIX_TRACKED_STATE_CRUD_SQL_UPDATE").is_some() {
-        group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
-            b.iter_batched_ref(
-                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
-                |fixture| black_box(runtime.block_on(fixture.update_all())),
-                BatchSize::LargeInput,
-            );
-        });
-        group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
-            b.iter_batched_ref(
-                || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
-                |fixture| black_box(runtime.block_on(fixture.update_one_by_pk())),
-                BatchSize::LargeInput,
-            );
-        });
-    }
+    group.bench_function(format!("update_all_rows/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(fixture.update_all())),
+            BatchSize::LargeInput,
+        );
+    });
+    group.bench_function(format!("update_one_by_pk/{}", row_label(rows.len())), |b| {
+        b.iter_batched_ref(
+            || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
+            |fixture| black_box(runtime.block_on(fixture.update_one_by_pk())),
+            BatchSize::LargeInput,
+        );
+    });
     group.bench_function(format!("delete_all_rows/{}", row_label(rows.len())), |b| {
         b.iter_batched_ref(
             || runtime.block_on(sql_session::seeded_fixture(profile, &rows)),
