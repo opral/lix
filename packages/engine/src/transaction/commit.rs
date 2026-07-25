@@ -3272,13 +3272,11 @@ mod tests {
         }
         write_batches.store(0, Ordering::SeqCst);
         let runtime_functions = {
-            let reader = live_state.reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            );
-            FunctionContext::prepare(&reader)
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            FunctionContext::prepare(&read)
                 .await
                 .expect("runtime context should prepare")
         };

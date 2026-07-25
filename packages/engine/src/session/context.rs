@@ -335,8 +335,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        let live_state = self.live_state.reader(&read);
-        crate::functions::deterministic_mode_enabled(&live_state).await
+        crate::functions::deterministic_mode_enabled(&read).await
     }
 
     pub(super) async fn lock_deterministic_runtime(

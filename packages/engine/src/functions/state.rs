@@ -2,6 +2,7 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
 };
@@ -9,25 +10,29 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::{DeterministicMode, DeterministicSequence};
 use crate::json_store::NormalizedJson;
-use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
-use crate::live_state::{LiveStateReader, LiveStateRowRequest, MaterializedLiveStateRow};
+use crate::live_state::{
+    LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexRowRequest,
+    MaterializedLiveStateIndexRow,
+};
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::StorageWriteSet;
-use crate::{LixError, NullableKeyFilter};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 pub(crate) const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
-/// Loads deterministic-mode settings from visible live state.
+/// Loads deterministic-mode settings from the canonical untracked index.
 ///
 /// Missing mode means deterministic execution is disabled. Malformed mode rows
-/// are errors because they would make runtime function behavior ambiguous.
+/// are errors because they would make runtime function behavior ambiguous. This
+/// is engine-owned global state, not branch-visible tracked state, so a generic
+/// live-state lookup would unnecessarily probe the tracked head on every
+/// execution.
 pub(crate) async fn load_mode(
-    live_state: &dyn LiveStateReader,
+    read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<DeterministicMode, LixError> {
-    let Some(row) = load_key_value_row(live_state, DETERMINISTIC_MODE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, DETERMINISTIC_MODE_KEY).await? else {
         return Ok(DeterministicMode::disabled());
     };
     let value = key_value_payload(&row, DETERMINISTIC_MODE_KEY)?;
@@ -39,9 +44,9 @@ pub(crate) async fn load_mode(
 /// Missing sequence means no deterministic values have been produced yet, so
 /// execution starts at sequence zero.
 pub(crate) async fn load_sequence(
-    live_state: &dyn LiveStateReader,
+    read: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<DeterministicSequence, LixError> {
-    let Some(row) = load_key_value_row(live_state, DETERMINISTIC_SEQUENCE_KEY).await? else {
+    let Some(row) = load_key_value_row(read, DETERMINISTIC_SEQUENCE_KEY).await? else {
         return Ok(DeterministicSequence::uninitialized());
     };
     let value = key_value_payload(&row, DETERMINISTIC_SEQUENCE_KEY)?;
@@ -133,20 +138,24 @@ pub(crate) async fn stage_sequence(
 }
 
 async fn load_key_value_row(
-    live_state: &dyn LiveStateReader,
+    read: &(impl StorageAdapterRead + ?Sized),
     key: &str,
-) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-    live_state
-        .load_row(&LiveStateRowRequest {
+) -> Result<Option<MaterializedLiveStateIndexRow>, LixError> {
+    LiveStateIndexContext::new()
+        .reader(read)
+        .load_row(&LiveStateIndexRowRequest {
             schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             entity_pk: EntityPk::single(key),
-            file_id: NullableKeyFilter::Null,
+            file_id: None,
         })
         .await
 }
 
-fn key_value_payload(row: &MaterializedLiveStateRow, key: &str) -> Result<JsonValue, LixError> {
+fn key_value_payload(
+    row: &MaterializedLiveStateIndexRow,
+    key: &str,
+) -> Result<JsonValue, LixError> {
     let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -211,6 +220,7 @@ fn parse_sequence_value(value: JsonValue) -> Result<DeterministicSequence, LixEr
 
 #[cfg(test)]
 mod tests {
+    use crate::NullableKeyFilter;
     use crate::live_state::LiveStateIndexContext;
     use crate::live_state::{LiveStateContext, LiveStateRowRequest};
     use crate::storage_adapter::StorageAdapter;
@@ -229,17 +239,12 @@ mod tests {
     #[tokio::test]
     async fn missing_mode_is_disabled() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-
-        let mode = load_mode(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
             .await
-            .expect("missing mode should decode");
+            .expect("read should open");
+
+        let mode = load_mode(&read).await.expect("missing mode should decode");
 
         assert_eq!(mode, DeterministicMode::disabled());
     }
@@ -247,7 +252,6 @@ mod tests {
     #[tokio::test]
     async fn valid_mode_decodes_flags() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
@@ -259,13 +263,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let mode = load_mode(&reader).await.expect("valid mode should decode");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mode = load_mode(&read).await.expect("valid mode should decode");
 
         assert_eq!(
             mode,
@@ -279,15 +281,12 @@ mod tests {
     #[tokio::test]
     async fn missing_sequence_is_uninitialized() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
 
-        let sequence = load_sequence(&reader)
+        let sequence = load_sequence(&read)
             .await
             .expect("missing sequence should decode");
 
@@ -297,7 +296,6 @@ mod tests {
     #[tokio::test]
     async fn valid_sequence_decodes_highest_seen() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_test_key_value(
             storage.clone(),
@@ -306,13 +304,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let sequence = load_sequence(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let sequence = load_sequence(&read)
             .await
             .expect("valid sequence should decode");
 

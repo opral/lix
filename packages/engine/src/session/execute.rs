@@ -1302,7 +1302,7 @@ where
         let live_state: Arc<dyn crate::live_state::LiveStateReader> =
             Arc::new(self.live_state.reader(read_store.clone()));
         let runtime_functions = if has_durable_runtime_function {
-            Some(FunctionContext::prepare(live_state.as_ref()).await?)
+            Some(FunctionContext::prepare(&read_store).await?)
         } else {
             None
         };

@@ -32,6 +32,7 @@ pub(crate) trait LiveStateReader: Send + Sync {
         self.scan_rows(&request).await
     }
 
+    #[allow(dead_code)]
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
