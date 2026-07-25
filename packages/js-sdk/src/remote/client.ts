@@ -947,12 +947,13 @@ class RemoteObservationHub {
 							);
 						}
 						const observation = this.#observation(subscriptionId);
+						const transportDelta = payload.delta !== undefined;
 						const event = decodeObserveEvent(
 							payload,
 							transportBases.get(subscriptionId),
 						);
 						transportBases.set(subscriptionId, event);
-						observation.accept(event);
+						observation.accept(event, transportDelta);
 						this.#retryAttempt = 0;
 					} catch (error) {
 						this.#failStream(asObserveProtocolError(error, "next"), controller);
@@ -1133,9 +1134,10 @@ class RemoteObservation implements ObserveEventsBinding {
 		this.#onClose();
 	}
 
-	accept(event: BindingObserveEvent): void {
+	accept(event: BindingObserveEvent, transportDelta = false): void {
 		if (this.#closed || this.#terminalError !== undefined) return;
 		if (
+			!transportDelta &&
 			this.#lastRows !== undefined &&
 			executeResultsEqual(this.#lastRows, event.rows)
 		) {
