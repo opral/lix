@@ -230,18 +230,9 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let deleted = b"first,ONE\nthird,THREE-B\n".to_vec();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(deleted.clone()));
 
-    // A session that never received the file has no omission authority. V2
-    // fails that blind replacement closed and leaves durable bytes untouched.
+    // Conflict objects are not modeled yet. A session that never received the
+    // file therefore applies its complete submitted document as last-write-wins.
     let blind = lix.open_workspace_session().await.unwrap();
-    let error = write_file(&blind, path, b"first,ONE\n".to_vec())
-        .await
-        .expect_err("blind v2 overwrite must require an exact observation");
-    assert_eq!(error.code, LixError::CODE_PLUGIN_OBSERVATION_STALE);
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(deleted.clone()));
-
-    // Once the session receives the complete blob, omitting the row is an
-    // acknowledged deletion.
-    assert_eq!(read_file(&blind, path).await.unwrap(), Some(deleted));
     write_file(&blind, path, b"first,ONE\n".to_vec())
         .await
         .unwrap();
@@ -1613,26 +1604,29 @@ async fn v2_csv_exact_read_replaces_a_stale_actor_after_an_independent_engine_co
     let advanced = b"first,ONE\nsecond,two\n".to_vec();
     write_file(&lix_b, path, advanced.clone()).await.unwrap();
 
-    // Engine A still owns the root-old actor. Its exact SQL read must cold-open
-    // root-new and replace only that captured stale slot, rather than returning
-    // observation-stale forever.
+    // Engine A still owns the root-old actor. Its exact SQL read returns the
+    // durable materialized bytes without hydrating Wasm; the next write
+    // cold-opens root-new and replaces only that captured stale slot.
     lix_a.reset_plugin_v2_transition_counters();
     assert_eq!(
         read_file(&lix_a, path).await.unwrap(),
         Some(advanced.clone())
     );
     let counters = lix_a.plugin_v2_transition_counters();
+    assert_eq!(counters.full_state_semantic_rows_materialized, 0);
+    assert_eq!(counters.full_renderer_invocations, 0);
+
+    let final_bytes = b"first,ONE\nsecond,TWO\n".to_vec();
+    lix_a.reset_plugin_v2_transition_counters();
+    write_file(&lix_a, path, final_bytes.clone())
+        .await
+        .expect("the next write restores root-new authority and applies the sparse edit");
+    let counters = lix_a.plugin_v2_transition_counters();
     assert_eq!(
         counters.full_state_semantic_rows_materialized, 3,
         "cold reconstruction materializes the table entity and both row entities"
     );
     assert_eq!(counters.full_renderer_invocations, 1);
-
-    // The recovered read published root-new authority into A's session.
-    let final_bytes = b"first,ONE\nsecond,TWO\n".to_vec();
-    write_file(&lix_a, path, final_bytes.clone())
-        .await
-        .expect("the recovered root-new observation authorizes the next sparse edit");
     assert_eq!(read_file(&lix_a, path).await.unwrap(), Some(final_bytes));
 
     lix_b.close().await.unwrap();

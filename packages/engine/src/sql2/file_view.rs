@@ -35,6 +35,7 @@ impl SessionFileViewKey {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SessionPluginFileView {
+    pub(crate) path: String,
     pub(crate) plugin_key: String,
     pub(crate) plugin_generation: String,
     /// The durable owner row is the file incarnation boundary. Its change ID
@@ -58,6 +59,13 @@ pub(crate) enum SessionFileViewMutation {
 }
 
 impl SessionFileViews {
+    pub(crate) fn has_plugin_file_at_path(&self, branch_id: &str, path: &str) -> bool {
+        self.lock()
+            .plugin_files
+            .iter()
+            .any(|(key, view)| key.branch_id == branch_id && view.path == path)
+    }
+
     pub(crate) fn plugin_file_view(
         &self,
         key: &SessionFileViewKey,

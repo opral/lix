@@ -947,6 +947,7 @@ where
                 WasmOpenEntitiesInput {
                     descriptor,
                     entities: Box::new(source),
+                    accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
                 },
             )
             .await
@@ -960,7 +961,7 @@ where
         let validated = match drain_entity_transition_edits(
             actor.as_mut(),
             transition,
-            &[],
+            materialized_bytes.as_ref(),
             Some(materialized_bytes.clone()),
             None,
             limits,
@@ -1360,12 +1361,12 @@ where
         }
     }
 
-    fn acknowledged_session_plugin_observation(
+    fn acknowledged_session_plugin_view(
         &self,
         key: &SessionFileViewKey,
         plugin: &PluginRegistryEntry,
         owner_change_id: &str,
-    ) -> Option<PluginObservation> {
+    ) -> Option<SessionPluginFileView> {
         if let Some(mutation) = self.pending_file_view_mutations.get(key) {
             return match mutation {
                 SessionFileViewMutation::Set { view, .. }
@@ -1373,20 +1374,28 @@ where
                         && view.plugin_generation == plugin.archive_blob_hash()
                         && view.owner_change_id == owner_change_id =>
                 {
-                    view.observation.clone()
+                    Some(view.clone())
                 }
                 SessionFileViewMutation::Set { .. } | SessionFileViewMutation::Remove { .. } => {
                     None
                 }
             };
         }
-        self.session_file_views
-            .plugin_file_view(
-                key,
-                plugin.key(),
-                plugin.archive_blob_hash(),
-                owner_change_id,
-            )
+        self.session_file_views.plugin_file_view(
+            key,
+            plugin.key(),
+            plugin.archive_blob_hash(),
+            owner_change_id,
+        )
+    }
+
+    fn acknowledged_session_plugin_observation(
+        &self,
+        key: &SessionFileViewKey,
+        plugin: &PluginRegistryEntry,
+        owner_change_id: &str,
+    ) -> Option<PluginObservation> {
+        self.acknowledged_session_plugin_view(key, plugin, owner_change_id)
             .and_then(|view| view.observation)
     }
 
@@ -2503,21 +2512,49 @@ where
             let submitted_bytes = write.payload().shared_bytes();
 
             let (changes, publication, materialized_bytes) = if same_plugin_owner {
-                let observation = self
-                    .acknowledged_session_plugin_observation(
-                        &view.session_key,
-                        selected,
-                        current_owner_change_id
-                            .as_deref()
-                            .expect("same-owner v2 file should have an owner incarnation"),
-                    )
-                    .ok_or_else(|| {
-                        LixError::new(
+                let acknowledged_view = self.acknowledged_session_plugin_view(
+                    &view.session_key,
+                    selected,
+                    current_owner_change_id
+                        .as_deref()
+                        .expect("same-owner v2 file should have an owner incarnation"),
+                );
+                let observation = match acknowledged_view {
+                    Some(view) => match view.observation {
+                        Some(observation) => observation,
+                        None => {
+                            self.cold_open_v2_semantic_actor(
+                                &actor_key,
+                                selected,
+                                descriptor.clone(),
+                                Arc::clone(&factory),
+                            )
+                            .await?
+                        }
+                    },
+                    None if self
+                        .pending_file_view_mutations
+                        .contains_key(&view.session_key)
+                        || self
+                            .session_file_views
+                            .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
+                    {
+                        return Err(LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                            "warm v2 file writes require an exact acknowledged file read",
+                            "the acknowledged v2 file identity no longer matches this write",
                         )
-                        .with_hint("read the exact file bytes again before retrying the edit")
-                    })?;
+                        .with_hint("read the exact file bytes again before retrying the edit"));
+                    }
+                    None => {
+                        self.cold_open_v2_semantic_actor(
+                            &actor_key,
+                            selected,
+                            descriptor.clone(),
+                            Arc::clone(&factory),
+                        )
+                        .await?
+                    }
+                };
                 if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
                     return Err(LixError::new(
                         LixError::CODE_PLUGIN_OBSERVATION_STALE,
@@ -3970,7 +4007,10 @@ where
     }
 
     fn session_file_views(&self) -> Option<SessionFileViews> {
-        Some(self.session_file_views.clone())
+        // A read in an explicit transaction may expose staged plugin bytes.
+        // Publishing that observation into the session would leak uncommitted
+        // state and can wait forever behind this transaction's actor lease.
+        None
     }
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError> {
@@ -4510,12 +4550,15 @@ impl PendingPluginActorPublication {
     }
 
     async fn publish(self) -> Result<(SessionFileViewKey, SessionPluginFileView), LixError> {
-        let (observation, view) = match self {
+        let (observation, view, path) = match self {
             Self::Existing {
                 lease,
                 successor_key,
                 view,
-            } => (lease.commit_successor_as(successor_key).await?, view),
+            } => {
+                let path = successor_key.path.clone();
+                (lease.commit_successor_as(successor_key).await?, view, path)
+            }
             Self::New {
                 cache,
                 key,
@@ -4524,14 +4567,19 @@ impl PendingPluginActorPublication {
                 bytes,
                 semantic_root,
                 view,
-            } => (
-                cache.install(key, store, document, bytes, semantic_root),
-                view,
-            ),
+            } => {
+                let path = key.path.clone();
+                (
+                    cache.install(key, store, document, bytes, semantic_root),
+                    view,
+                    path,
+                )
+            }
         };
         Ok((
             view.session_key,
             SessionPluginFileView {
+                path,
                 plugin_key: view.plugin_key,
                 plugin_generation: view.plugin_generation,
                 owner_change_id: view.owner_change_id,
@@ -5134,6 +5182,7 @@ async fn preflight_rendered_v2_file(
             WasmOpenEntitiesInput {
                 descriptor,
                 entities: Box::new(source),
+                accepted: None,
             },
         )
         .await?;
