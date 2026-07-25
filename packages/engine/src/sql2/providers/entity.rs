@@ -26,6 +26,7 @@ use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
     entity_surface_schema,
 };
+use crate::sql2::entity_projection::EntityProjectionDecoder;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
@@ -320,6 +321,7 @@ impl TableSpec for EntitySpec {
     ) -> Result<PlannedScan> {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
+        let batch_projection = EntityBatchProjection::for_request(&request);
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -330,14 +332,15 @@ impl TableSpec for EntitySpec {
                     schema,
                     request,
                     row_filters,
+                    batch_projection,
                 ),
-                |(spec, live_state, schema, request, row_filters)| async move {
+                |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
                     let mut rows = live_state
                         .scan_rows(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
                     apply_entity_row_filters(&mut rows, &row_filters)?;
-                    entity_record_batch(&spec, schema, &rows)
+                    entity_record_batch(&spec, schema, &rows, batch_projection)
                 },
             ),
         })
@@ -373,6 +376,7 @@ impl TableSpec for EntitySpec {
             );
         }
         let (schema, request, row_filters) = self.plan_scan_parts(None, filters, None).await?;
+        let batch_projection = EntityBatchProjection::for_request(&request);
         let source = row_source(
             (
                 Arc::clone(&self.spec),
@@ -380,14 +384,15 @@ impl TableSpec for EntitySpec {
                 schema,
                 request,
                 row_filters,
+                batch_projection,
             ),
-            |(spec, live_state, schema, request, row_filters)| async move {
+            |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
                 let mut rows = live_state
                     .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
                 apply_entity_row_filters(&mut rows, &row_filters)?;
-                entity_record_batch(&spec, schema, &rows)
+                entity_record_batch(&spec, schema, &rows, batch_projection)
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -1298,10 +1303,34 @@ fn projection_column_names(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
+/// Selects the snapshot-to-Arrow implementation once per provider batch.
+///
+/// Exact primary-key scans are latency-sensitive and keep their established
+/// serde-value path. Broad scans are dominated by decoding every snapshot, so
+/// they use the raw projection decoder that visits only selected fields. This
+/// is a physical execution choice; the SQL schema and result contract are the
+/// same in both cases.
+#[derive(Clone, Copy)]
+enum EntityBatchProjection {
+    ParsedSnapshots,
+    RawTrackedProjection,
+}
+
+impl EntityBatchProjection {
+    fn for_request(request: &LiveStateScanRequest) -> Self {
+        if request.filter.entity_pks.is_empty() {
+            Self::RawTrackedProjection
+        } else {
+            Self::ParsedSnapshots
+        }
+    }
+}
+
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
     rows: &[MaterializedLiveStateRow],
+    projection: EntityBatchProjection,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
@@ -1309,6 +1338,27 @@ fn entity_record_batch(
             .map_err(DataFusionError::from);
     }
 
+    match projection {
+        EntityBatchProjection::ParsedSnapshots => {
+            entity_record_batch_from_snapshots(spec, schema, rows)
+        }
+        EntityBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked) => {
+            entity_record_batch_from_raw_projection(spec, schema, rows)
+        }
+        // Raw projection depends on the tracked write invariant: compact
+        // TransactionJson bytes with no duplicate-key recovery semantics.
+        // Keep every sidecar/mixed batch on the established parser path.
+        EntityBatchProjection::RawTrackedProjection => {
+            entity_record_batch_from_snapshots(spec, schema, rows)
+        }
+    }
+}
+
+fn entity_record_batch_from_snapshots(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &[MaterializedLiveStateRow],
+) -> Result<RecordBatch> {
     let snapshots = rows
         .iter()
         .map(|row| parse_snapshot(row.snapshot_content.as_deref()))
@@ -1321,6 +1371,59 @@ fn entity_record_batch(
         .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+fn entity_record_batch_from_raw_projection(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &[MaterializedLiveStateRow],
+) -> Result<RecordBatch> {
+    let decoder = EntityProjectionDecoder::new(
+        spec,
+        schema.fields().iter().filter_map(|field| {
+            (!field.name().starts_with("lixcol_")).then_some(field.name().as_str())
+        }),
+    )
+    .map_err(entity_projection_error_to_datafusion_error)?;
+    // The tracked write path persists TransactionJson-normalized bytes.
+    // Visibility is resolved by the existing live-state reader first.
+    let mut visible_columns = decoder
+        .decode_arrow_columns(
+            rows.iter()
+                .map(|row| row.snapshot_content.as_deref().map(str::as_bytes)),
+        )
+        .map_err(entity_projection_error_to_datafusion_error)?
+        .into_iter();
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            field.name().strip_prefix("lixcol_").map_or_else(
+                || {
+                    visible_columns.next().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "entity projection decoder did not return a visible column".to_string(),
+                        )
+                    })
+                },
+                |property_name| entity_system_column_array(property_name, rows),
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
+}
+
+/// Keep malformed snapshots and provider-shape failures on the same
+/// DataFusion `Execution` error path as the pre-projection implementation.
+/// Typed value failures already carry a Lix error code and retain that
+/// existing SQL error contract.
+fn entity_projection_error_to_datafusion_error(error: LixError) -> DataFusionError {
+    if error.code == LixError::CODE_INTERNAL_ERROR {
+        DataFusionError::Execution(error.message)
+    } else {
+        lix_error_to_datafusion_error(error)
+    }
 }
 
 #[expect(trivial_casts)]
@@ -1464,6 +1567,7 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
     use datafusion::common::{Column, ScalarValue};
     use datafusion::logical_expr::expr::InList;
@@ -1477,7 +1581,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+        LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
+        LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
@@ -1853,8 +1958,13 @@ mod tests {
         );
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
 
-        let batch =
-            entity_record_batch(&spec, schema, &[live_row()]).expect("entity batch should build");
+        let batch = entity_record_batch(
+            &spec,
+            schema,
+            &[live_row()],
+            super::EntityBatchProjection::ParsedSnapshots,
+        )
+        .expect("entity batch should build");
 
         assert_eq!(batch.num_rows(), 1);
         assert_eq!(
@@ -1906,6 +2016,250 @@ mod tests {
                 .expect("branch id is string")
                 .value(0),
             "branch-a"
+        );
+    }
+
+    #[test]
+    fn exact_primary_key_batches_keep_the_existing_json_and_scalar_projection_contract() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "x-lix-primary-key": ["/body"],
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "rating": { "type": "number" },
+                    "count": { "type": "integer" },
+                    "enabled": { "type": "boolean" },
+                    "meta": { "type": "object" }
+                }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::Active);
+        // Deliberately noncanonical nested JSON distinguishes the established
+        // serde-value projection from the broad tracked raw-byte path.
+        let row = MaterializedLiveStateRow {
+            snapshot_content: Some(
+                r#"{"body":"hello","rating":4.5,"count":7,"enabled":true,"meta":{"z":2,"a":1}}"#
+                    .to_string(),
+            ),
+            ..live_row()
+        };
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                entity_pks: vec![row.entity_pk.clone()],
+                ..LiveStateFilter::default()
+            },
+            projection: LiveStateProjection::default(),
+            limit: None,
+        };
+        let projection = super::EntityBatchProjection::for_request(&request);
+        assert!(matches!(
+            projection,
+            super::EntityBatchProjection::ParsedSnapshots
+        ));
+
+        let batch = entity_record_batch(&spec, schema, &[row], projection)
+            .expect("exact primary-key batch should build");
+        assert_eq!(
+            batch
+                .column_by_name("meta")
+                .expect("meta column")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("meta is JSON text")
+                .value(0),
+            r#"{"a":1,"z":2}"#,
+            "exact primary-key reads retain the old parse-and-render JSON semantics"
+        );
+        assert_eq!(
+            batch
+                .column_by_name("count")
+                .expect("count column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is i64")
+                .value(0),
+            7,
+            "exact primary-key reads retain scalar projection semantics"
+        );
+    }
+
+    #[test]
+    fn untracked_broad_batches_keep_duplicate_key_last_wins_scalar_semantics() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "count": { "type": "integer" }
+                }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let batch = entity_record_batch(
+            &spec,
+            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            &[MaterializedLiveStateRow {
+                snapshot_content: Some(r#"{"body":"sidecar","count":"bad","count":7}"#.to_string()),
+                untracked: true,
+                ..live_row()
+            }],
+            super::EntityBatchProjection::RawTrackedProjection,
+        )
+        .expect("untracked broad batch must use the established parser path");
+
+        assert_eq!(
+            batch
+                .column_by_name("count")
+                .expect("count column")
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("count is i64")
+                .value(0),
+            7,
+            "the later duplicate value must replace an earlier invalid value"
+        );
+    }
+
+    #[test]
+    fn canonical_tracked_raw_batch_matches_parsed_batch_for_all_system_columns() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "x-lix-primary-key": ["/body"],
+                "type": "object",
+                "properties": {
+                    "body": { "type": "string" },
+                    "rating": { "type": "number" },
+                    "count": { "type": "integer" },
+                    "enabled": { "type": "boolean" },
+                    "meta": { "type": "object" }
+                }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let branch_snapshot = crate::transaction::types::TransactionJson::from_value(
+            json!({
+                "body": "branch-row",
+                "rating": 4.5,
+                "count": 7,
+                "enabled": true,
+                "meta": {"z": 2, "a": 1}
+            }),
+            "canonical branch projection test",
+        )
+        .expect("branch snapshot should normalize");
+        let global_snapshot = crate::transaction::types::TransactionJson::from_value(
+            json!({
+                "body": "global-row",
+                "rating": 1.5,
+                "count": 9,
+                "enabled": false,
+                "meta": {"d": 4, "c": 3}
+            }),
+            "canonical global projection test",
+        )
+        .expect("global snapshot should normalize");
+        let branch_row = MaterializedLiveStateRow {
+            entity_pk: crate::entity_pk::EntityPk::single("branch-row"),
+            file_id: Some("file-branch".to_string()),
+            snapshot_content: Some(branch_snapshot.normalized().to_string()),
+            metadata: Some(r#"{"source":"branch"}"#.to_string()),
+            ..live_row()
+        };
+        let global_row = MaterializedLiveStateRow {
+            entity_pk: crate::entity_pk::EntityPk::single("global-row"),
+            file_id: None,
+            snapshot_content: Some(global_snapshot.normalized().to_string()),
+            metadata: Some(r#"{"source":"global"}"#.to_string()),
+            branch_id: "global".into(),
+            global: true,
+            change_id: Some(ChangeId::for_test_label("change-global")),
+            commit_id: Some(CommitId::for_test_label("commit-global")),
+            ..live_row()
+        };
+        let rows = vec![branch_row, global_row];
+        let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
+        let parsed = entity_record_batch(
+            &spec,
+            Arc::clone(&schema),
+            &rows,
+            super::EntityBatchProjection::ParsedSnapshots,
+        )
+        .expect("parsed batch should build");
+        let raw = entity_record_batch(
+            &spec,
+            schema,
+            &rows,
+            super::EntityBatchProjection::RawTrackedProjection,
+        )
+        .expect("raw tracked batch should build");
+
+        for field in [
+            "lixcol_metadata",
+            "lixcol_entity_pk",
+            "lixcol_file_id",
+            "lixcol_branch_id",
+            "lixcol_global",
+            "lixcol_untracked",
+        ] {
+            assert!(
+                raw.schema().field_with_name(field).is_ok(),
+                "missing {field}"
+            );
+        }
+        assert_eq!(raw.schema(), parsed.schema());
+        assert_eq!(record_batch_scalars(&raw), record_batch_scalars(&parsed));
+    }
+
+    fn record_batch_scalars(batch: &RecordBatch) -> Vec<Vec<ScalarValue>> {
+        (0..batch.num_rows())
+            .map(|row_index| {
+                batch
+                    .columns()
+                    .iter()
+                    .map(|array| {
+                        ScalarValue::try_from_array(array.as_ref(), row_index)
+                            .expect("test record batch value should materialize")
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn broad_raw_projection_keeps_invalid_snapshot_errors_on_the_execution_path() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "type": "object",
+                "properties": { "body": { "type": "string" } }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let error = entity_record_batch(
+            &spec,
+            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            &[MaterializedLiveStateRow {
+                snapshot_content: Some("{not-json".to_string()),
+                ..live_row()
+            }],
+            super::EntityBatchProjection::RawTrackedProjection,
+        )
+        .expect_err("malformed snapshot must fail");
+
+        assert!(matches!(
+            error,
+            datafusion::common::DataFusionError::Execution(_)
+        ));
+        assert!(
+            error
+                .to_string()
+                .contains("sql2 entity provider expected valid snapshot_content JSON"),
+            "unexpected error: {error}"
         );
     }
 
