@@ -4071,6 +4071,13 @@ fn parse_inlines(
     definitions: &[String],
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Vec<Inline> {
+    if is_single_text_inline(input) {
+        return vec![Inline::Text(Text {
+            meta: NodeMeta::new(Some(Span::new(base_offset, base_offset + input.len()))),
+            value: input.into(),
+        })];
+    }
+
     parse_inlines_with_context(
         input,
         base_offset,
@@ -4079,6 +4086,58 @@ fn parse_inlines(
         diagnostics,
         InlineContext::default(),
     )
+}
+
+/// Whether the inline scanner can only produce one literal [`Inline::Text`].
+///
+/// This is deliberately a *superset* of the scanner's possible syntax
+/// starters: a false positive merely keeps the established parser path, while
+/// a false negative would change the AST. It is consequently independent of
+/// `SyntaxOptions`; disabled syntax still takes the fallback. `www.` is the
+/// only literal-autolink prefix without one of the punctuation starters, so it
+/// is checked separately (case-insensitively, as the GFM parser does).
+///
+/// NUL is included because the generic scanner replaces it with U+FFFD. Empty
+/// input keeps the generic empty-vector result rather than manufacturing an
+/// empty text node.
+fn is_single_text_inline(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(
+            byte,
+            b'\\'
+                | b'&'
+                | b'\n'
+                | b'\r'
+                | b'`'
+                | b'|'
+                | b'*'
+                | b'_'
+                | b'+'
+                | b'='
+                | b'~'
+                | b'^'
+                | b'!'
+                | b'['
+                | b'$'
+                | b'<'
+                | b'{'
+                | b':'
+                | b'@'
+                | b'\0'
+        ) {
+            return false;
+        }
+        if byte == b'.' && index >= 3 && bytes[index - 3..index].eq_ignore_ascii_case(b"www") {
+            return false;
+        }
+    }
+
+    true
 }
 
 #[derive(Clone, Copy)]
@@ -8278,6 +8337,99 @@ mod tests {
 
     fn parse_with_legacy_definition_prepass(input: &str, options: &SyntaxOptions) -> ParseOutput {
         parse_with_definitions(input, options, collect_definitions(input, options))
+    }
+
+    fn assert_inline_parse_matches_legacy(input: &str, options: &SyntaxOptions) {
+        let definitions = vec![String::from("known-reference")];
+        let mut optimized_diagnostics = Vec::new();
+        let mut legacy_diagnostics = Vec::new();
+        let optimized = parse_inlines(input, 17, options, &definitions, &mut optimized_diagnostics);
+        let legacy = parse_inlines_with_context(
+            input,
+            17,
+            options,
+            &definitions,
+            &mut legacy_diagnostics,
+            InlineContext::default(),
+        );
+
+        assert_eq!(optimized, legacy, "inline AST must match for {input:?}");
+        assert_eq!(
+            optimized_diagnostics, legacy_diagnostics,
+            "inline diagnostics must match for {input:?}"
+        );
+    }
+
+    #[test]
+    fn plain_inlines_use_one_literal_text_node() {
+        let options = lix_gfm_options();
+        for input in [
+            "A calm sentence. It has commas, quotes \"like this\", and parentheses (too).",
+            "Unicode café — 東京 … with a #hash and 42%.",
+            "A / slash; a question? and a greater-than > stay literal.",
+            "\ttabs and trailing spaces  ",
+        ] {
+            assert!(
+                is_single_text_inline(input),
+                "expected no inline syntax trigger in {input:?}"
+            );
+            assert_inline_parse_matches_legacy(input, &options);
+
+            let mut diagnostics = Vec::new();
+            assert_eq!(
+                parse_inlines(input, 17, &options, &[], &mut diagnostics),
+                vec![Inline::Text(Text {
+                    meta: NodeMeta::new(Some(Span::new(17, 17 + input.len()))),
+                    value: input.into(),
+                })],
+            );
+            assert!(diagnostics.is_empty());
+        }
+    }
+
+    #[test]
+    fn every_inline_syntax_trigger_uses_the_legacy_parser() {
+        let options = [
+            SyntaxOptions::commonmark(),
+            lix_gfm_options(),
+            SyntaxOptions::default(),
+            SyntaxOptions::mdx(),
+        ];
+        for input in [
+            "\\\\escape",
+            "&amp;",
+            "line\nnext",
+            "`code`",
+            "||spoiler||",
+            "*emphasis*",
+            "_emphasis_",
+            "++insert++",
+            "==mark==",
+            "~subscript~",
+            "~~delete~~",
+            "^[note]",
+            "^sup^",
+            "![alt](https://example.test)",
+            "[label](https://example.test)",
+            "$math$",
+            "<https://example.test>",
+            "{expression}",
+            ":shortcode:",
+            "https://example.test",
+            "ftp://example.test",
+            "www.example.test",
+            "WwW.example.test",
+            "person@example.test",
+            "nul\0byte",
+        ] {
+            assert!(
+                !is_single_text_inline(input),
+                "every possible syntax starter must retain the fallback for {input:?}"
+            );
+            for options in &options {
+                assert_inline_parse_matches_legacy(input, options);
+            }
+        }
     }
 
     #[test]
