@@ -77,6 +77,58 @@ simulation_test!(lix_key_value_duplicate_insert_rejects, |sim| async move {
 });
 
 simulation_test!(
+    lix_key_value_update_preserves_created_at,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('kv-created-at', 'first')",
+                &[],
+            )
+            .await
+            .expect("initial insert should succeed");
+        let first_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM lix_key_value WHERE key = 'kv-created-at'",
+                &[],
+            )
+            .await
+            .expect("initial created timestamp should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created timestamp should be text");
+
+        session
+            .execute(
+                "UPDATE lix_key_value SET value = 'second' WHERE key = 'kv-created-at'",
+                &[],
+            )
+            .await
+            .expect("update should succeed");
+        let updated_created_at = session
+            .execute(
+                "SELECT lixcol_created_at FROM lix_key_value WHERE key = 'kv-created-at'",
+                &[],
+            )
+            .await
+            .expect("updated created timestamp should be readable")
+            .rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("updated created timestamp should be text");
+
+        assert_eq!(updated_created_at, first_created_at);
+    }
+);
+
+simulation_test!(
     lix_key_value_insert_after_delete_resurrects_key,
     |sim| async move {
         let engine = sim.boot_engine().await;

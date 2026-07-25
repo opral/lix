@@ -145,6 +145,7 @@ pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) commit_id: CommitId,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
+    pub(crate) created_at_from_visible_row: bool,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) snapshot: JsonSlotRef<'a>,
     pub(crate) metadata: JsonSlotRef<'a>,
@@ -365,14 +366,23 @@ where
             && let [delta] = deltas
         {
             let identity = delta.identity(branch_id, generation);
-            let prior_created_at = load_entry_bytes(self.store, std::slice::from_ref(&identity))
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
-                .map(|value| decode_head_created_at(&value))
-                .transpose()?
-                .unwrap_or(delta.created_at);
+            let prior_created_at = if delta.created_at_from_visible_row {
+                // Bound public UPDATE/DELETE/UPSERT already selected this
+                // exact visible row from the transaction snapshot or overlay. The
+                // singleton fast path is fenced by its matching parent and
+                // tracked-mutation precondition, so avoid re-reading the
+                // same head entry only to recover this timestamp.
+                delta.created_at
+            } else {
+                load_entry_bytes(self.store, std::slice::from_ref(&identity))
+                    .await?
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .map(|value| decode_head_created_at(&value))
+                    .transpose()?
+                    .unwrap_or(delta.created_at)
+            };
             stage_put_ref(self.writes, &identity, &delta.value_ref(prior_created_at))?;
             stage_marker(
                 self.writes,
@@ -1819,6 +1829,7 @@ mod tests {
                     commit_id: first_head,
                     deleted: false,
                     created_at: ts("2026-01-01T00:00:00Z"),
+                    created_at_from_visible_row: false,
                     updated_at: ts("2026-01-01T00:00:00Z"),
                     snapshot: JsonSlotRef::Inline("{\"value\":1}"),
                     metadata: JsonSlotRef::None,
@@ -1853,6 +1864,7 @@ mod tests {
                     commit_id: second_head,
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
+                    created_at_from_visible_row: false,
                     updated_at: ts("2026-01-02T00:00:00Z"),
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
@@ -1942,6 +1954,7 @@ mod tests {
                     commit_id: second_head,
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
+                    created_at_from_visible_row: false,
                     updated_at: ts("2026-01-02T00:00:00Z"),
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
@@ -1992,6 +2005,7 @@ mod tests {
                     commit_id: child_head,
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
+                    created_at_from_visible_row: false,
                     updated_at: ts("2026-01-02T00:00:00Z"),
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
