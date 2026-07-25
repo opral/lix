@@ -273,8 +273,14 @@ impl Guest for MarkdownGuest {
         budget: &TransitionBudget,
         input: OpenEntitiesInput,
     ) -> Result<EntityTransition, PluginError> {
+        let accepted = input
+            .accepted
+            .as_ref()
+            .map(|source| read_source(source, budget))
+            .transpose()?;
         let records = drain_entities(&input.entities, budget)?;
-        let (document, edits) = CoreDocument::open_entities(records).map_err(core_error)?;
+        let (document, edits) =
+            CoreDocument::open_entities(records, accepted).map_err(core_error)?;
         Ok(entity_transition(document, edits))
     }
 }

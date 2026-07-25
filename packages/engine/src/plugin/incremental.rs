@@ -285,7 +285,8 @@ pub(crate) fn build_file_update_splices(
                 0,
             )
         } else {
-            if before == after {
+            let (prefix, prefix_bytes_compared) = common_prefix_len(before, after);
+            if prefix == before.len() && prefix == after.len() {
                 return Ok(BuiltInputSplices {
                     edits: Vec::new(),
                     used_transport_provenance: false,
@@ -293,7 +294,6 @@ pub(crate) fn build_file_update_splices(
                     full_diff_bytes_compared: 0,
                 });
             }
-            let (prefix, prefix_bytes_compared) = common_prefix_len(before, after);
             let max_suffix = before
                 .len()
                 .saturating_sub(prefix)
@@ -427,11 +427,34 @@ fn validate_transport_splice(
 }
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> (usize, u64) {
+    const WORD_BYTES: usize = size_of::<u64>();
+    let max = left.len().min(right.len());
     let mut common = 0usize;
     let mut bytes_compared = 0u64;
-    for (left, right) in left.iter().zip(right) {
+
+    while common + WORD_BYTES <= max {
+        let left_word = u64::from_le_bytes(
+            left[common..common + WORD_BYTES]
+                .try_into()
+                .expect("fixed-size prefix word"),
+        );
+        let right_word = u64::from_le_bytes(
+            right[common..common + WORD_BYTES]
+                .try_into()
+                .expect("fixed-size prefix word"),
+        );
+        let different = left_word ^ right_word;
+        bytes_compared = bytes_compared.saturating_add((WORD_BYTES * 2) as u64);
+        if different != 0 {
+            common += (different.trailing_zeros() / u8::BITS) as usize;
+            return (common, bytes_compared);
+        }
+        common += WORD_BYTES;
+    }
+
+    while common < max {
         bytes_compared = bytes_compared.saturating_add(2);
-        if left != right {
+        if left[common] != right[common] {
             break;
         }
         common += 1;
@@ -440,11 +463,35 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> (usize, u64) {
 }
 
 fn common_suffix_len(left: &[u8], right: &[u8], max: usize) -> (usize, u64) {
+    const WORD_BYTES: usize = size_of::<u64>();
     let mut common = 0usize;
     let mut bytes_compared = 0u64;
-    for (left, right) in left.iter().rev().take(max).zip(right.iter().rev()) {
+
+    while common + WORD_BYTES <= max {
+        let left_end = left.len() - common;
+        let right_end = right.len() - common;
+        let left_word = u64::from_le_bytes(
+            left[left_end - WORD_BYTES..left_end]
+                .try_into()
+                .expect("fixed-size suffix word"),
+        );
+        let right_word = u64::from_le_bytes(
+            right[right_end - WORD_BYTES..right_end]
+                .try_into()
+                .expect("fixed-size suffix word"),
+        );
+        let different = left_word ^ right_word;
+        bytes_compared = bytes_compared.saturating_add((WORD_BYTES * 2) as u64);
+        if different != 0 {
+            common += (different.leading_zeros() / u8::BITS) as usize;
+            return (common, bytes_compared);
+        }
+        common += WORD_BYTES;
+    }
+
+    while common < max {
         bytes_compared = bytes_compared.saturating_add(2);
-        if left != right {
+        if left[left.len() - common - 1] != right[right.len() - common - 1] {
             break;
         }
         common += 1;
@@ -1783,6 +1830,26 @@ mod tests {
                 length: 2
             })
         ));
+    }
+
+    #[test]
+    fn word_scans_find_prefix_and_suffix_mismatches_at_every_alignment() {
+        let baseline = (0u8..96).collect::<Vec<_>>();
+        for mismatch in 0..baseline.len() {
+            let mut changed = baseline.clone();
+            changed[mismatch] ^= 0xff;
+
+            assert_eq!(common_prefix_len(&baseline, &changed).0, mismatch);
+            assert_eq!(
+                common_suffix_len(&baseline, &changed, baseline.len()).0,
+                baseline.len() - mismatch - 1
+            );
+        }
+        assert_eq!(common_prefix_len(&baseline, &baseline).0, baseline.len());
+        assert_eq!(
+            common_suffix_len(&baseline, &baseline, baseline.len()).0,
+            baseline.len()
+        );
     }
 
     #[test]
