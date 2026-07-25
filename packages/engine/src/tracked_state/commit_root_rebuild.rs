@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -158,6 +158,84 @@ where
             return Ok(plans);
         };
         current_commit_id = parent_commit_id.to_string();
+    }
+}
+
+/// Locates a rootless first-parent interval for an identity-routed read.
+///
+/// Unlike [`load_first_parent_replay_plans`], this reads commit records only:
+/// the caller consults the commit-delta index for the requested identities, so
+/// it must not hydrate every change ref just to discover unrelated keys.
+pub(crate) async fn load_first_parent_point_replay_interval<S>(
+    store: &S,
+    commit_id: &str,
+    cached_intervals: &HashMap<String, (Vec<CommitId>, Option<TrackedStateRootId>)>,
+) -> Result<(Vec<CommitId>, Option<TrackedStateRootId>), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut commits = Vec::new();
+    let mut current_commit_id =
+        CommitId::parse_lix(commit_id, "tracked-state point replay commit_id")?;
+    let mut seen_commit_ids = HashSet::new();
+    let mut reader = ChangelogContext::new().reader(store);
+    loop {
+        if !seen_commit_ids.insert(current_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot point-replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
+        }
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[current_commit_id],
+                projection: CommitProjection::Record,
+            })
+            .await?;
+        let record = match batch.entries.into_iter().next().flatten() {
+            Some(CommitLoadEntry::Record(record)) => record,
+            Some(CommitLoadEntry::Full { .. }) => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "changelog returned a full commit load for tracked-state point replay",
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot point-replay tracked_state for unknown commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+        };
+        if record.tracked_state_rootless && record.parent_commit_ids.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rootless tracked-state commit '{current_commit_id}' has {} parents",
+                    record.parent_commit_ids.len()
+                ),
+            ));
+        }
+        if !record.tracked_state_rootless
+            && let Some(root_id) = storage::load_root(store, &current_commit_id.to_string()).await?
+        {
+            return Ok((commits, Some(root_id)));
+        }
+        commits.push(current_commit_id);
+        let Some(parent_commit_id) = first_parent_commit_id(&record) else {
+            return Ok((commits, None));
+        };
+        if let Some((tail_commits, baseline_root)) =
+            cached_intervals.get(&parent_commit_id.to_string())
+        {
+            commits.extend(tail_commits.iter().copied());
+            return Ok((commits, baseline_root.clone()));
+        }
+        current_commit_id = parent_commit_id;
     }
 }
 

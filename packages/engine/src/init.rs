@@ -342,6 +342,7 @@ async fn stage_init_changelog_commit(
         format_version: 1,
         commit_id: plan.commit.id,
         parent_commit_ids: plan.commit.parent_ids.clone(),
+        tracked_state_rootless: false,
         change_id: plan.commit.change_id,
         author_account_ids: plan.commit.author_account_ids.clone(),
         created_at: plan.commit.created_at,

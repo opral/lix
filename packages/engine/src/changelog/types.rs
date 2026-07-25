@@ -301,6 +301,10 @@ pub(crate) struct CommitRecord {
     pub(crate) format_version: u32,
     pub(crate) commit_id: CommitId,
     pub(crate) parent_commit_ids: Vec<CommitId>,
+    /// Normal serial tracked commits carry all required state in the
+    /// changelog/delta index and intentionally omit an immutable root. Root
+    /// fences remain the topology and checkpoint fallback.
+    pub(crate) tracked_state_rootless: bool,
     pub(crate) change_id: ChangeId,
     #[musli(with = crate::storage_codec::id_string_seq)]
     pub(crate) author_account_ids: Vec<String>,

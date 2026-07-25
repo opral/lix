@@ -351,6 +351,7 @@ where
         parent_head: Option<CommitId>,
         new_head: CommitId,
         deltas: &[TrackedHeadDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<(), LixError> {
         let marker = load_marker(self.store, branch_id).await?;
@@ -379,13 +380,30 @@ where
             let values = load_entry_bytes(self.store, &identities).await?;
             for (identity, value) in identities.into_iter().zip(values) {
                 if let Some(value) = value {
-                    prior_created_at.insert(identity, decode_head_value(&value)?.created_at);
+                    let value = decode_head_value(&value)?;
+                    let key = TrackedStateKey {
+                        schema_key: identity.schema_key.clone(),
+                        entity_pk: identity.entity_pk.clone(),
+                        file_id: identity.file_id.clone(),
+                    };
+                    if absence_guards.contains(&key) && !value.deleted {
+                        return Err(tracked_head_duplicate_insert_error(&key));
+                    }
+                    prior_created_at.insert(identity, value.created_at);
                 }
             }
         } else if let Some(rows) = parent_rows {
             self.writes
                 .reserve_space(TRACKED_HEAD_ROW_SPACE, rows.len() + deltas.len(), 0);
             for row in rows {
+                let key = TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                    file_id: row.file_id.clone(),
+                };
+                if absence_guards.contains(&key) && !row.deleted {
+                    return Err(tracked_head_duplicate_insert_error(&key));
+                }
                 let identity = HeadIdentity {
                     branch_id: branch_id.to_string(),
                     generation,
@@ -446,6 +464,20 @@ where
         )?;
         Ok(())
     }
+}
+
+fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
+    let entity_pk = key
+        .entity_pk
+        .as_json_array_text()
+        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+            key.schema_key
+        ),
+    )
 }
 
 async fn load_marker(
@@ -1736,6 +1768,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":1}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 None,
             )
             .await
@@ -1769,6 +1802,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 None,
             )
             .await
@@ -1841,6 +1875,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 Some(parent_rows),
             )
             .await

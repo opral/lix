@@ -1199,6 +1199,7 @@ mod tests {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id_text),
                 parent_commit_ids: Vec::new(),
+                tracked_state_rootless: false,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
@@ -1307,6 +1308,7 @@ mod tests {
                     .iter()
                     .map(|id| CommitId::for_test_label(id))
                     .collect(),
+                tracked_state_rootless: false,
                 change_id: ChangeId::for_test_label(&commit_change_id),
                 author_account_ids: Vec::new(),
                 created_at: commit_created_at,

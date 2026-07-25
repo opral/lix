@@ -25,9 +25,9 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, encode_key_ref,
+    TRACKED_STATE_COMMIT_DELTA_SPACE, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref, stage_commit_delta,
 };
 use crate::transaction::staging::{
     PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
@@ -152,12 +152,21 @@ pub(crate) async fn commit_prepared_writes(
         &compactable_change_ids,
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
+        has_checkpoint_publication,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.materialization.changelog"
     ))
     .await?;
+
+    stage_tracked_commit_delta_index(
+        &mut writes,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &tracked_roots,
+        &staged_commits,
+    )?;
 
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
 
@@ -183,6 +192,7 @@ pub(crate) async fn commit_prepared_writes(
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
         &staged_commits,
+        &insert_identities,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -288,6 +298,7 @@ async fn stage_changelog_commits(
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
+    force_root_fence: bool,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
@@ -332,6 +343,9 @@ async fn stage_changelog_commits(
             format_version: 1,
             commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            tracked_state_rootless: !force_root_fence
+                && commit_row.parent_commit_ids.len() <= 1
+                && commit_row.selected_change_refs.is_empty(),
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
@@ -891,6 +905,59 @@ fn tracked_head_delta_from_state_row(
     })
 }
 
+/// Stages a compact, identity-addressable change record for every tracked
+/// commit. Sparse immutable roots remain the scan/checkpoint structure; this
+/// index is the missing point-read structure for rootless first-parent
+/// history.
+fn stage_tracked_commit_delta_index(
+    writes: &mut StorageWriteSet,
+    state_rows: &[PreparedStateRow],
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_roots: &[PendingTrackedRoot],
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+) -> Result<(), LixError> {
+    let delta_count = tracked_roots
+        .iter()
+        .map(|root| {
+            tracked_row_indices_by_commit
+                .get(&root.commit_id)
+                .map_or(0, Vec::len)
+                + staged_commits
+                    .get(&root.commit_id)
+                    .map_or(0, |staged| staged.selected_change_refs.len())
+        })
+        .sum::<usize>();
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SPACE, delta_count, 0);
+    for root in tracked_roots {
+        for &row_index in tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            stage_commit_delta(
+                writes,
+                tracked_delta_from_state_row(&state_rows[row_index])?,
+            )?;
+        }
+        let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked commit '{}' has no changelog facts for commit-delta staging",
+                    root.commit_id
+                ),
+            )
+        })?;
+        for change_ref in &staged.selected_change_refs {
+            stage_commit_delta(
+                writes,
+                tracked_delta_from_selected_change_ref(change_ref, root.commit_id)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Stages the generation-keyed head projection only for normal prepared
 /// rows. Merge/checkpoint selected references stay on the immutable-root
 /// fallback until their next ordinary child commit bootstraps a generation.
@@ -902,6 +969,7 @@ async fn stage_tracked_head(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
 ) -> Result<(), LixError> {
     let tracked_head = TrackedHeadContext::new();
     let mut writer = tracked_head.writer(read, writes);
@@ -926,6 +994,17 @@ async fn stage_tracked_head(
             .iter()
             .map(|&row_index| tracked_head_delta_from_state_row(&state_rows[row_index]))
             .collect::<Result<Vec<_>, _>>()?;
+        let absence_guards = state_row_indices
+            .iter()
+            .filter_map(|&row_index| {
+                let row = &state_rows[row_index];
+                tracked_row_requires_absence(row, insert_identities).then(|| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+            })
+            .collect::<BTreeSet<_>>();
 
         // The v4 marker is the durable authority for current state. It is
         // intentionally bound only to the first-parent commit: serial normal
@@ -977,6 +1056,7 @@ async fn stage_tracked_head(
                 root.parent_commit_id,
                 root.commit_id,
                 &deltas,
+                &absence_guards,
                 parent_rows,
             )
             .await?;
@@ -2381,6 +2461,7 @@ mod tests {
                 (CommitId::for_test_label("child-commit"), vec![1]),
             ]),
             &commits,
+            false,
         )
         .await
         .expect("child-before-parent input should still stage parent first");
