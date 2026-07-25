@@ -83,7 +83,11 @@ simulation_test!(
             .await
             .expect("broad tracked entity scan should succeed");
         assert_eq!(
-            result.rows().iter().map(|row| row.values()).collect::<Vec<_>>(),
+            result
+                .rows()
+                .iter()
+                .map(lix_engine::Row::values)
+                .collect::<Vec<_>>(),
             vec![
                 &[
                     Value::Text("kv-canonical-persisted-active".to_string()),
