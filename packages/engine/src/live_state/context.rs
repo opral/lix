@@ -13,6 +13,7 @@ use crate::filesystem::{
 use crate::live_state::index::{
     LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexScanRequest,
 };
+use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
     LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
@@ -39,6 +40,7 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 /// identity-to-change index, then both sources are combined for serving.
 pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
+    tracked_head: TrackedHeadContext,
     live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -52,6 +54,7 @@ impl LiveStateContext {
     ) -> Self {
         Self {
             tracked_state,
+            tracked_head: TrackedHeadContext::new(),
             live_index,
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
@@ -66,6 +69,7 @@ impl LiveStateContext {
         LiveStateStoreReader {
             store,
             tracked_state: self.tracked_state.clone(),
+            tracked_head: self.tracked_head,
             live_index: self.live_index.clone(),
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
@@ -91,6 +95,7 @@ impl LiveStateContext {
 pub(crate) struct LiveStateStoreReader<S> {
     store: S,
     tracked_state: TrackedStateContext,
+    tracked_head: TrackedHeadContext,
     live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -108,16 +113,20 @@ where
         let reads_tracked =
             request.filter.untracked != Some(true) && !is_commit_derived_only_request(request);
         let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
-        let mut rows = Vec::new();
-        if request.filter.untracked != Some(true) {
-            rows.extend(
-                scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
-            );
-            if !is_commit_derived_only_request(request) {
-                rows.extend(self.scan_tracked_branch_rows(request, &scope).await?);
-            }
-        }
-        if request.filter.untracked != Some(false) && !is_commit_derived_only_request(request) {
+        let commit_derived_rows = if request.filter.untracked != Some(true) {
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?
+        } else {
+            Vec::new()
+        };
+        let mut tracked_branch_rows =
+            if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
+                self.scan_tracked_branch_rows(request, &scope).await?
+            } else {
+                Vec::new()
+            };
+        let untracked_rows = if request.filter.untracked != Some(false)
+            && !is_commit_derived_only_request(request)
+        {
             let branch_rows = stream::iter(scope.storage_branch_ids.clone())
                 .map(|branch_id| async move {
                     let rows: Vec<_> = self
@@ -133,9 +142,29 @@ where
                 .buffered(BRANCH_READ_CONCURRENCY)
                 .try_collect::<Vec<_>>()
                 .await?;
-            rows.extend(branch_rows.into_iter().flatten());
+            branch_rows.into_iter().flatten().collect()
+        } else {
+            Vec::new()
+        };
+        if commit_derived_rows.is_empty()
+            && untracked_rows.is_empty()
+            && let Some(index) =
+                ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
+        {
+            return Ok(finalize_ordered_unique_rows(
+                std::mem::take(&mut tracked_branch_rows[index].rows),
+                request.filter.include_tombstones,
+                request.limit,
+            ));
         }
-        rows = resolve_visible_rows(
+        let mut rows = commit_derived_rows;
+        rows.extend(
+            tracked_branch_rows
+                .into_iter()
+                .flat_map(|branch_rows| branch_rows.rows),
+        );
+        rows.extend(untracked_rows);
+        Ok(resolve_visible_rows(
             rows,
             Vec::new(),
             &VisibilityRequest {
@@ -145,8 +174,7 @@ where
                 include_tombstones: request.filter.include_tombstones,
                 limit: request.limit,
             },
-        );
-        Ok(rows)
+        ))
     }
 
     pub(crate) async fn load_row(
@@ -273,11 +301,34 @@ where
                                 file_id: identity.file_id.clone(),
                             })
                             .collect::<Vec<_>>();
-                        let rows = self
-                            .tracked_state
-                            .reader(&self.store)
-                            .load_projected_rows_at_commit(&commit_id, &keys, &projection)
-                            .await?;
+                        let rows = if let Some(root_id) =
+                            crate::tracked_state::load_root(&self.store, &commit_id).await?
+                        {
+                            if let Some(rows) = self
+                                .tracked_head
+                                .reader(&self.store)
+                                .load_projected_rows_if_current(
+                                    &branch_id,
+                                    &commit_id,
+                                    &root_id,
+                                    &keys,
+                                    &projection,
+                                )
+                                .await?
+                            {
+                                rows
+                            } else {
+                                self.tracked_state
+                                    .reader(&self.store)
+                                    .load_projected_rows_at_commit(&commit_id, &keys, &projection)
+                                    .await?
+                            }
+                        } else {
+                            self.tracked_state
+                                .reader(&self.store)
+                                .load_projected_rows_at_commit(&commit_id, &keys, &projection)
+                                .await?
+                        };
                         Ok::<_, LixError>((branch_id, identities, rows))
                     }
                 })
@@ -361,10 +412,29 @@ where
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
-        let mut rows = scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
-        if !is_commit_derived_only_request(request) {
-            rows.extend(self.scan_tracked_branch_rows(request, &scope).await?);
+        let commit_derived_rows =
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
+        let mut tracked_branch_rows = if !is_commit_derived_only_request(request) {
+            self.scan_tracked_branch_rows(request, &scope).await?
+        } else {
+            Vec::new()
+        };
+        if commit_derived_rows.is_empty()
+            && let Some(index) =
+                ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
+        {
+            return Ok(finalize_ordered_unique_rows(
+                std::mem::take(&mut tracked_branch_rows[index].rows),
+                request.filter.include_tombstones,
+                request.limit,
+            ));
         }
+        let mut rows = commit_derived_rows;
+        rows.extend(
+            tracked_branch_rows
+                .into_iter()
+                .flat_map(|branch_rows| branch_rows.rows),
+        );
         Ok(resolve_visible_rows(
             rows,
             Vec::new(),
@@ -382,7 +452,7 @@ where
         &self,
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<Vec<TrackedBranchRows>, LixError> {
         let store = &self.store;
         let tracked_request = tracked_scan_request_from_live(request);
         let branches = scope
@@ -400,21 +470,53 @@ where
                 let tracked_request = tracked_request.clone();
                 async move {
                     let source = tracked_source_from_branch_id(&branch_id);
-                    let rows = self
-                        .tracked_state
-                        .reader(store)
-                        .scan_rows_at_commit(&commit_id, &tracked_request)
-                        .await?
-                        .into_iter()
-                        .map(|row| project_tracked_row(row, &branch_id, source))
-                        .collect::<Vec<_>>();
-                    Ok::<_, LixError>(rows)
+                    let (rows, ordered_unique) = if let Some(root_id) =
+                        crate::tracked_state::load_root(store, &commit_id).await?
+                    {
+                        if let Some(rows) = self
+                            .tracked_head
+                            .reader(store)
+                            .scan_rows_if_current(
+                                &branch_id,
+                                &commit_id,
+                                &root_id,
+                                &tracked_request,
+                            )
+                            .await?
+                        {
+                            (rows, true)
+                        } else {
+                            (
+                                self.tracked_state
+                                    .reader(store)
+                                    .scan_rows_at_commit(&commit_id, &tracked_request)
+                                    .await?,
+                                false,
+                            )
+                        }
+                    } else {
+                        (
+                            self.tracked_state
+                                .reader(store)
+                                .scan_rows_at_commit(&commit_id, &tracked_request)
+                                .await?,
+                            false,
+                        )
+                    };
+                    Ok::<_, LixError>(TrackedBranchRows {
+                        branch_id: branch_id.clone(),
+                        rows: rows
+                            .into_iter()
+                            .map(|row| project_tracked_row(row, &branch_id, source))
+                            .collect(),
+                        ordered_unique,
+                    })
                 }
             })
             .buffered(BRANCH_READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
-        Ok(branch_rows.into_iter().flatten().collect())
+        Ok(branch_rows)
     }
 }
 
@@ -661,6 +763,60 @@ struct LiveStateScanScope {
     branch_commit_ids: BranchCommitIds,
 }
 
+/// Rows read from one durable tracked branch source.
+///
+/// A matching tracked-head projection is storage-key ordered by visible
+/// identity and has one row per identity. Immutable-root fallback rows retain
+/// their existing, more general materialization behavior and therefore never
+/// claim this fast-path contract.
+struct TrackedBranchRows {
+    branch_id: String,
+    rows: Vec<MaterializedLiveStateRow>,
+    ordered_unique: bool,
+}
+
+/// Returns the only nonempty branch candidate when it can be served without
+/// overlay arbitration. Global rows, multiple requested branches, an
+/// immutable-root fallback, and staged/untracked candidates all stay on the
+/// general visibility path.
+fn ordered_unique_branch_row_index(
+    branch_rows: &[TrackedBranchRows],
+    projection_branch_ids: &[String],
+) -> Option<usize> {
+    let [requested_branch_id] = projection_branch_ids else {
+        return None;
+    };
+    let mut candidates = branch_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, branch_rows)| !branch_rows.rows.is_empty());
+    let (index, candidate) = candidates.next()?;
+    if candidates.next().is_some()
+        || !candidate.ordered_unique
+        || candidate.branch_id != *requested_branch_id
+    {
+        return None;
+    }
+    Some(index)
+}
+
+/// Finalizes a table scan whose rows are already ordered and unique for the
+/// sole requested branch. This intentionally does no identity sort or
+/// deduplication; the tracked-head key codec proves both properties.
+fn finalize_ordered_unique_rows(
+    mut rows: Vec<MaterializedLiveStateRow>,
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<MaterializedLiveStateRow> {
+    if !include_tombstones {
+        rows.retain(|row| !row.deleted);
+    }
+    if let Some(limit) = limit {
+        rows.truncate(limit);
+    }
+    rows
+}
+
 async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
     live_index: &LiveStateIndexContext,
@@ -878,6 +1034,58 @@ mod tests {
             LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         )
+    }
+
+    #[test]
+    fn ordered_head_fast_path_requires_one_matching_branch_candidate() {
+        let requested_branch_ids = vec!["branch".to_string()];
+        let branch = TrackedBranchRows {
+            branch_id: "branch".to_string(),
+            rows: vec![tracked_row_at_with_commit(
+                "branch", "branch", None, "branch",
+            )],
+            ordered_unique: true,
+        };
+        assert_eq!(
+            ordered_unique_branch_row_index(&[branch], &requested_branch_ids),
+            Some(0)
+        );
+
+        let branch = TrackedBranchRows {
+            branch_id: "branch".to_string(),
+            rows: vec![tracked_row_at_with_commit(
+                "branch", "branch", None, "branch",
+            )],
+            ordered_unique: true,
+        };
+        let global = TrackedBranchRows {
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            rows: vec![tracked_row_at_with_commit(
+                GLOBAL_BRANCH_ID,
+                "global",
+                None,
+                "global",
+            )],
+            ordered_unique: true,
+        };
+        assert_eq!(
+            ordered_unique_branch_row_index(&[branch, global], &requested_branch_ids),
+            None,
+            "a global candidate needs normal overlay arbitration"
+        );
+
+        let immutable_fallback = TrackedBranchRows {
+            branch_id: "branch".to_string(),
+            rows: vec![tracked_row_at_with_commit(
+                "branch", "branch", None, "branch",
+            )],
+            ordered_unique: false,
+        };
+        assert_eq!(
+            ordered_unique_branch_row_index(&[immutable_fallback], &requested_branch_ids),
+            None,
+            "the immutable-root fallback does not make the table ordering promise"
+        );
     }
 
     async fn write_untracked_rows_to_store(

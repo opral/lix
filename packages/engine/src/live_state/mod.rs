@@ -1,6 +1,7 @@
 mod context;
 mod index;
 mod reader;
+mod tracked_head;
 mod types;
 pub(crate) mod visibility;
 
@@ -17,6 +18,10 @@ pub(crate) use index::{
 pub(crate) use reader::LiveStateReader;
 #[cfg(test)]
 pub(crate) use reader::load_exact_rows_via_scan_for_test;
+#[allow(unused_imports)]
+pub(crate) use tracked_head::{
+    TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_ROW_SPACE, TrackedHeadContext, TrackedHeadDeltaRef,
+};
 #[allow(unused_imports)]
 pub(crate) use types::{
     Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,

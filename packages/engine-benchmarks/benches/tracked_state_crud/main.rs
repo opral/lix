@@ -23,6 +23,10 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
         .build()
         .expect("create tokio runtime for tracked_state_crud benchmarks");
     let rows = fixture_rows();
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE").is_some() {
+        profile_operation(&runtime, &rows[..REAL_WORKLOAD_ROWS]);
+        return;
+    }
     io_stats::maybe_print_io_report();
     accounting::maybe_print_accounting_report(&runtime, &rows[..SMOKE_ROWS]);
 
@@ -33,6 +37,160 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
+    }
+}
+
+/// Reproducible, setup-excluded latency samples for one production transaction
+/// operation. Criterion's CodSpeed-compatible harness intentionally delegates
+/// timing to the runner, while this opt-in mode is useful for local profiling
+/// and before/after investigation. Each sample starts from an independently
+/// seeded RocksDB fixture, matching the benchmark's measurement boundary.
+fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
+    let operation = match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_OP").as_deref() {
+        Ok("insert_all") => TransactionBenchOp::InsertAll,
+        Ok("read_one") => TransactionBenchOp::ReadOneByPk,
+        Ok("read_many") => TransactionBenchOp::ReadManyByPk,
+        Ok("update_all") => TransactionBenchOp::UpdateAll,
+        Ok("update_one") => TransactionBenchOp::UpdateOneByPk,
+        Ok("delete_all") => TransactionBenchOp::DeleteAll,
+        Ok("delete_one") => TransactionBenchOp::DeleteOneByPk,
+        Ok("read_all") | Err(_) => TransactionBenchOp::ReadAll,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_OP '{other}'; expected insert_all, read_all, read_one, read_many, update_all, update_one, delete_all, or delete_one"
+        ),
+    };
+    let sample_count = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&count| count > 0)
+        .unwrap_or(15);
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_LAYER").as_deref() {
+        Ok("kv_layout") => profile_kv_layout_operation(runtime, rows, operation, sample_count),
+        Ok("raw_sqlite") => profile_raw_sqlite_operation(rows, operation, sample_count),
+        Ok("transaction") | Err(_) => {
+            profile_transaction_operation(runtime, rows, operation, sample_count);
+        }
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, kv_layout, or raw_sqlite"
+        ),
+    }
+}
+
+fn profile_transaction_operation(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    sample_count: usize,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let mut fixture = if operation.needs_seed() {
+            runtime.block_on(transaction_api::seeded_fixture(
+                StorageProfile::RocksDB,
+                rows,
+            ))
+        } else {
+            runtime.block_on(transaction_api::empty_fixture(
+                StorageProfile::RocksDB,
+                rows,
+            ))
+        };
+        let start = Instant::now();
+        let result = runtime.block_on(operation.run(&mut fixture));
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples("transaction/lix_rocksdb", operation, samples);
+}
+
+fn profile_kv_layout_operation(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    sample_count: usize,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let mut fixture = if operation.needs_seed() {
+            runtime.block_on(kv_layout::seeded_fixture(StorageProfile::RocksDB, rows))
+        } else {
+            runtime.block_on(kv_layout::empty_fixture(StorageProfile::RocksDB, rows))
+        };
+        let start = Instant::now();
+        let result = runtime.block_on(run_kv_layout_operation(operation, &mut fixture));
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples("kv_layout/lix_rocksdb", operation, samples);
+}
+
+async fn run_kv_layout_operation(
+    operation: TransactionBenchOp,
+    fixture: &mut kv_layout::KvFixture,
+) -> usize {
+    match operation {
+        TransactionBenchOp::InsertAll => fixture.insert_all().await,
+        TransactionBenchOp::ReadAll => fixture.read_all().await,
+        TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk().await,
+        TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT).await,
+        TransactionBenchOp::UpdateAll => fixture.update_all().await,
+        TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk().await,
+        TransactionBenchOp::DeleteAll => fixture.delete_all().await,
+        TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk().await,
+    }
+}
+
+fn profile_raw_sqlite_operation(
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    sample_count: usize,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let mut fixture = if operation.needs_seed() {
+            raw_sqlite::seeded_fixture(rows)
+        } else {
+            raw_sqlite::empty_fixture(rows)
+        };
+        let start = Instant::now();
+        let result = match operation {
+            TransactionBenchOp::InsertAll => fixture.insert_all(),
+            TransactionBenchOp::ReadAll => fixture.read_all(),
+            TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk(),
+            TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT),
+            TransactionBenchOp::UpdateAll => fixture.update_all(),
+            TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk(),
+            TransactionBenchOp::DeleteAll => fixture.delete_all(),
+            TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk(),
+        };
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples("raw_sqlite", operation, samples);
+}
+
+fn print_profile_samples(layer: &str, operation: TransactionBenchOp, mut samples: Vec<Duration>) {
+    samples.sort_unstable();
+    let median = samples[samples.len() / 2];
+    println!(
+        "tracked_state_crud profile: {layer}/{}/{} samples: median={median:?} min={:?} max={:?}",
+        profile_operation_name(operation),
+        samples.len(),
+        samples[0],
+        samples[samples.len() - 1],
+    );
+}
+
+const fn profile_operation_name(operation: TransactionBenchOp) -> &'static str {
+    match operation {
+        TransactionBenchOp::InsertAll => "insert_all",
+        TransactionBenchOp::ReadAll => "read_all",
+        TransactionBenchOp::ReadOneByPk => "read_one",
+        TransactionBenchOp::ReadManyByPk => "read_many",
+        TransactionBenchOp::UpdateAll => "update_all",
+        TransactionBenchOp::UpdateOneByPk => "update_one",
+        TransactionBenchOp::DeleteAll => "delete_all",
+        TransactionBenchOp::DeleteOneByPk => "delete_one",
     }
 }
 
@@ -239,24 +397,17 @@ fn bench_transaction_op(
 ) {
     let rows = rows.to_vec();
     group.bench_function(name, |b| {
-        b.iter_custom(|iterations| {
-            let mut fixtures = Vec::with_capacity(iterations as usize);
-            let mut elapsed = Duration::ZERO;
-            for _ in 0..iterations {
-                let mut fixture = if op.needs_seed() {
+        b.iter_batched_ref(
+            || {
+                if op.needs_seed() {
                     runtime.block_on(transaction_api::seeded_fixture(profile, &rows))
                 } else {
                     runtime.block_on(transaction_api::empty_fixture(profile, &rows))
-                };
-                let start = Instant::now();
-                let rows = runtime.block_on(op.run(&mut fixture));
-                elapsed += start.elapsed();
-                black_box(rows);
-                fixtures.push(fixture);
-            }
-            drop(fixtures);
-            elapsed
-        });
+                }
+            },
+            |fixture| black_box(runtime.block_on(op.run(fixture))),
+            BatchSize::LargeInput,
+        );
     });
 }
 
