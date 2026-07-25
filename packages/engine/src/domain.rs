@@ -40,7 +40,11 @@ impl Domain {
     }
 
     pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
-        Self::exact_file(row.branch_id.clone(), row.untracked, row.file_id.clone())
+        Self::exact_file(
+            row.branch_id.to_string(),
+            row.untracked,
+            row.file_id.clone(),
+        )
     }
 
     pub(crate) fn schema_catalog_domain(&self) -> Self {
@@ -105,7 +109,7 @@ impl Domain {
     }
 
     pub(crate) fn contains(&self, row: &MaterializedLiveStateRow) -> bool {
-        row.branch_id == self.branch_id
+        row.branch_id.as_ref() == self.branch_id
             && row.untracked == self.untracked
             && committed_row_is_exact_branch_scoped(row, &self.branch_id)
             && match &self.file_scope {
@@ -310,7 +314,8 @@ pub(crate) fn committed_row_is_exact_branch_scoped(
     row: &MaterializedLiveStateRow,
     branch_id: &str,
 ) -> bool {
-    row.branch_id == branch_id && row.global == (row.branch_id == GLOBAL_BRANCH_ID)
+    row.branch_id.as_ref() == branch_id
+        && row.global == (row.branch_id.as_ref() == GLOBAL_BRANCH_ID)
 }
 
 fn nullable_filter_from_option(value: Option<&String>) -> NullableKeyFilter<String> {

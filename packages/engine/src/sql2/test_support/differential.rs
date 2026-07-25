@@ -567,7 +567,7 @@ mod tests {
                     &[
                         entity_pk_value(row),
                         value,
-                        Value::Text(row.branch_id.clone()),
+                        Value::Text(row.branch_id.to_string()),
                         row.metadata
                             .as_deref()
                             .map(serialize_row_metadata)

@@ -1185,7 +1185,7 @@ impl From<&MaterializedLiveStateRow> for PreparedStateRowIdentity {
             schema_key: row.schema_key.clone(),
             entity_pk: row.entity_pk.clone(),
             file_id: row.file_id.clone(),
-            branch_id: row.branch_id.clone(),
+            branch_id: row.branch_id.to_string(),
         }
     }
 }
@@ -2294,7 +2294,7 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_pk == EntityPk::single("shared-entity")
-                    && row.branch_id == "global"
+                    && row.branch_id.as_ref() == "global"
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),

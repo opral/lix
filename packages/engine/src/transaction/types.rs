@@ -384,13 +384,13 @@ impl From<PreparedStateRow> for MaterializedLiveStateRow {
             snapshot_content: row.snapshot.map(|snapshot| snapshot.materialize()),
             metadata: row.metadata.map(|metadata| metadata.materialize()),
             deleted,
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
             untracked: row.untracked,
-            branch_id: row.branch_id,
+            branch_id: row.branch_id.into(),
         }
     }
 }
@@ -404,13 +404,13 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
             snapshot_content: row.snapshot.as_ref().map(StageJson::materialize),
             metadata: row.metadata.as_ref().map(StageJson::materialize),
             deleted: row.snapshot.is_none(),
-            created_at: row.created_at.to_string(),
-            updated_at: row.updated_at.to_string(),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
             global: row.global,
             change_id: row.change_id,
             commit_id: row.commit_id,
             untracked: row.untracked,
-            branch_id: row.branch_id.clone(),
+            branch_id: row.branch_id.clone().into(),
         }
     }
 }

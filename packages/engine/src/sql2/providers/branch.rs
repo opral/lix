@@ -965,6 +965,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+    use crate::common::LixTimestamp;
     use crate::live_state::LiveStateRowRequest;
     use datafusion::common::Column;
 
@@ -1102,13 +1103,19 @@ mod tests {
             ),
             metadata: None,
             deleted: false,
-            created_at: "2026-07-12T00:00:00Z".to_string(),
-            updated_at: "2026-07-12T00:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "branch descriptor test created_at",
+                "2026-07-12T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "branch descriptor test updated_at",
+                "2026-07-12T00:00:00Z",
+            ),
             global: true,
             change_id: None,
             commit_id: None,
             untracked: false,
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.into(),
         }
     }
 

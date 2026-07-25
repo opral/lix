@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::{compose_directory_path, compose_file_path};
+use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
@@ -103,13 +103,19 @@ impl FilesystemPathEntry {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: self.metadata.clone(),
             deleted: false,
-            created_at: self.created_at.clone(),
-            updated_at: self.updated_at.clone(),
+            created_at: LixTimestamp::expect_parse(
+                "filesystem path entry created_at",
+                &self.created_at,
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "filesystem path entry updated_at",
+                &self.updated_at,
+            ),
             global: self.key.global(),
             change_id: self.change_id,
             commit_id: self.commit_id,
             untracked: self.key.is_untracked(),
-            branch_id: self.key.branch_id().to_string(),
+            branch_id: self.key.branch_id().into(),
         }
     }
 
@@ -280,8 +286,8 @@ impl FilesystemPathIndex {
                             parent_id: snapshot.parent_id,
                             name: snapshot.name,
                             metadata: row.metadata,
-                            created_at: row.created_at,
-                            updated_at: row.updated_at,
+                            created_at: row.created_at.to_string(),
+                            updated_at: row.updated_at.to_string(),
                             change_id: row.change_id,
                             commit_id: row.commit_id,
                         },
@@ -302,8 +308,8 @@ impl FilesystemPathIndex {
                             directory_id: snapshot.directory_id,
                             name: snapshot.name,
                             metadata: row.metadata,
-                            created_at: row.created_at,
-                            updated_at: row.updated_at,
+                            created_at: row.created_at.to_string(),
+                            updated_at: row.updated_at.to_string(),
                             change_id: row.change_id,
                             commit_id: row.commit_id,
                         },
@@ -495,7 +501,11 @@ impl FilesystemPathIndex {
             if !matches!(
                 row.schema_key.as_str(),
                 FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            ) || (!row.global && !request.branch_ids.contains(&row.branch_id))
+            ) || (!row.global
+                && !request
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref()))
             {
                 continue;
             }
@@ -610,8 +620,8 @@ impl FilesystemPathIndex {
             key,
             parent_identity: None,
             metadata: row.metadata.clone(),
-            created_at: row.created_at.clone(),
-            updated_at: row.updated_at.clone(),
+            created_at: row.created_at.to_string(),
+            updated_at: row.updated_at.to_string(),
             change_id: row.change_id,
             commit_id: row.commit_id,
         };
@@ -1403,13 +1413,19 @@ mod tests {
             snapshot_content: Some(snapshot_content),
             metadata: None,
             deleted: false,
-            created_at: "2026-01-01T00:00:00.000Z".to_string(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "filesystem path index test created_at",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "filesystem path index test updated_at",
+                "2026-01-01T00:00:00.000Z",
+            ),
             global,
             change_id: Some(ChangeId::for_test_label(id)),
             commit_id: Some(CommitId::for_test_label(id)),
             untracked: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
         }
     }
 }

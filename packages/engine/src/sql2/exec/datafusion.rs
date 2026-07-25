@@ -2181,6 +2181,7 @@ mod tests {
         CommitGraphChangeHistoryEntry, CommitGraphChangeHistoryRequest, CommitGraphCommit,
         CommitGraphReader, ReachableCommitGraphCommit,
     };
+    use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{
@@ -2783,7 +2784,11 @@ mod tests {
                     && (request.filter.entity_pks.is_empty()
                         || request.filter.entity_pks.contains(&row.entity_pk))
                     && (request.filter.branch_ids.is_empty()
-                        || request.filter.branch_ids.contains(&row.branch_id))
+                        || request
+                            .filter
+                            .branch_ids
+                            .iter()
+                            .any(|branch_id| branch_id == row.branch_id.as_ref()))
                     && request
                         .filter
                         .untracked
@@ -2919,13 +2924,13 @@ mod tests {
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 
@@ -2961,13 +2966,13 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 
@@ -2991,13 +2996,13 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 
@@ -3020,7 +3025,7 @@ mod tests {
             ),
             metadata: Some(json!({ "source": entity_pk }).to_string()),
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!(
                 "change-{entity_pk}-blob"
             ))),
@@ -3029,8 +3034,8 @@ mod tests {
             ))),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 

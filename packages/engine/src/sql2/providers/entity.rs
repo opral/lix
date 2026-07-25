@@ -1475,6 +1475,7 @@ mod tests {
     use crate::LixError;
     use crate::branch::{BranchHead, BranchRefReader};
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::live_state::{
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
@@ -1635,13 +1636,13 @@ mod tests {
             ),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
-            branch_id: "branch-a".to_string(),
+            branch_id: "branch-a".into(),
             change_id: Some(ChangeId::for_test_label("change-a")),
             commit_id: Some(CommitId::for_test_label("commit-a")),
             global: false,
             untracked: false,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
+            updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
     }
 

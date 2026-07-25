@@ -997,7 +997,7 @@ fn candidate_matches_insert_identity(
 ) -> bool {
     candidate.entity_pk == *inserted_entity_pk
         && candidate.file_id == insert_row.file_id
-        && candidate.branch_id == insert_row.branch_id
+        && candidate.branch_id.as_ref() == insert_row.branch_id
         && candidate.global == insert_row.global
         && candidate.untracked == insert_row.untracked
 }
@@ -1506,7 +1506,7 @@ fn reject_projected_global_write(
         &plan.bound.target,
         BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
     );
-    if target_is_by_branch && row.global && row.branch_id != crate::GLOBAL_BRANCH_ID {
+    if target_is_by_branch && row.global && row.branch_id.as_ref() != crate::GLOBAL_BRANCH_ID {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!(
@@ -1558,7 +1558,7 @@ fn entity_replace_row_from_live(
         branch_id: if row.global {
             crate::GLOBAL_BRANCH_ID.to_string()
         } else {
-            row.branch_id.clone()
+            row.branch_id.to_string()
         },
     })
 }
@@ -2732,10 +2732,10 @@ fn column_eval_value(
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_created_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.created_at.clone(),
+            row.created_at.to_string(),
         ))),
         "lixcol_updated_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.updated_at.clone(),
+            row.updated_at.to_string(),
         ))),
         "lixcol_commit_id" => Ok(row
             .commit_id
@@ -2745,7 +2745,7 @@ fn column_eval_value(
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
         "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
         "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.branch_id.clone(),
+            row.branch_id.to_string(),
         ))),
         _ => Ok(EntityEvalValue::SqlNull),
     }

@@ -154,6 +154,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::live_state::LiveStateFilter;
 
@@ -285,13 +286,13 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            created_at: "2026-01-01T00:00:00.000Z".to_string(),
-            updated_at: "2026-01-01T00:00:00.000Z".to_string(),
+            created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),
+            updated_at: LixTimestamp::expect_parse("updated_at", "2026-01-01T00:00:00.000Z"),
             global: false,
             change_id: None,
             commit_id: None,
             untracked,
-            branch_id: "main".to_string(),
+            branch_id: "main".into(),
         }
     }
 
@@ -299,7 +300,11 @@ mod tests {
         (request.filter.schema_keys.is_empty()
             || request.filter.schema_keys.contains(&row.schema_key))
             && (request.filter.branch_ids.is_empty()
-                || request.filter.branch_ids.contains(&row.branch_id))
+                || request
+                    .filter
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id == row.branch_id.as_ref()))
             && request
                 .filter
                 .untracked

@@ -100,7 +100,7 @@ impl FilesystemDescriptorKey {
         descriptor_id: impl Into<String>,
     ) -> Self {
         Self {
-            branch_id: row.branch_id.clone(),
+            branch_id: row.branch_id.to_string(),
             global: row.global,
             untracked: row.untracked,
             file_id: row.file_id.clone(),
@@ -1280,7 +1280,7 @@ pub(crate) fn directory_path_resolvers_from_state_rows(
         let storage_branch_id = if row.global {
             GLOBAL_BRANCH_ID
         } else {
-            row.branch_id.as_str()
+            row.branch_id.as_ref()
         };
         let resolver_key = filesystem_storage_scope_key(
             storage_branch_id,
@@ -1557,6 +1557,7 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::binary_cas::BlobHash;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
     use crate::transaction::types::TransactionJson;
 
@@ -2611,13 +2612,19 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
             commit_id: Some(CommitId::for_test_label(&format!("commit-{entity_pk}"))),
             global,
             untracked,
-            created_at: "2026-04-23T00:00:00Z".to_string(),
-            updated_at: "2026-04-23T01:00:00Z".to_string(),
+            created_at: LixTimestamp::expect_parse(
+                "filesystem planner test created_at",
+                "2026-04-23T00:00:00Z",
+            ),
+            updated_at: LixTimestamp::expect_parse(
+                "filesystem planner test updated_at",
+                "2026-04-23T01:00:00Z",
+            ),
         }
     }
 }
