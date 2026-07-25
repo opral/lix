@@ -136,3 +136,32 @@ The successful response has `Content-Type: application/octet-stream`,
 the same active-branch, plugin rendering, and per-session acknowledgement
 semantics as `SELECT data FROM lix_file WHERE path = $1`; it is not a generic
 SQL read endpoint.
+
+## Remote read qualification
+
+The ignored release benchmark compares a direct pinned Lix session backed by
+SlateDB with the same operation through a loopback
+`LixProtocolServer`. Both arms use immutable clones of one physical fixture,
+the same accounted object store and injected latency, independent equivalent
+cache directories, and fully materialized results:
+
+```sh
+cargo test -p lix_server_protocol --release \
+  slatedb_direct_versus_remote_reads -- --ignored --nocapture
+```
+
+The matrix covers exact-path reads, ordered listings of 100 paths, and raw
+4 KiB, 100 KiB, and 1 MiB file downloads with warm memory, warm disk, and cold
+caches at 0, 10, and 25 milliseconds of object-store latency. It fails when
+the remote p50 or p95 exceeds twice its direct counterpart, or when the remote
+arm averages more than one additional object-store read per measured
+operation. Remote requests advertise zstd and materialize and decode the full
+response inside the timer, matching browser content negotiation. Output also
+reports per-arm request totals and maxima and separately sampled in-process
+handler time for raw downloads.
+
+Use `LIX_REMOTE_READ_SAMPLES` and
+`LIX_REMOTE_READ_WARM_MEMORY_SAMPLES` to change distribution sizes. Comma-
+separated `LIX_REMOTE_READ_LATENCIES_MS`,
+`LIX_REMOTE_READ_CACHE_STATES`, and `LIX_REMOTE_READ_OPERATIONS` select a
+diagnostic subset without changing the fixtures or measurement path.

@@ -30,8 +30,16 @@ tower-http = { version = "0.6", features = ["compression-gzip", "decompression-g
 tracing = "0.1"
 
 [dev-dependencies]
+async-trait = "0.1"
 flate2 = "1"
+futures-util = "0.3"
 http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+lix_slatedb_storage = { workspace = true }
+object_store = { version = "0.14", default-features = false }
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }
 tracing-subscriber = "0.3"
+zstd = "0.13"

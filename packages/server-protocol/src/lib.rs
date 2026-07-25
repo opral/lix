@@ -45,6 +45,9 @@ use tower_http::{
 };
 use tracing::{Instrument as _, instrument::WithSubscriber as _};
 
+#[cfg(test)]
+mod remote_read_bench;
+
 /// Stable URL prefix owned by the Lix server protocol.
 pub const PROTOCOL_PATH: &str = "/lix/v1";
 /// Current wire protocol version.
