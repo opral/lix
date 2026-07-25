@@ -31,17 +31,26 @@ use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateKey, TrackedStateScanRequest,
 };
 
-// v4 makes the durable tracked head authoritative for normal current reads.
-// It uses new physical spaces as well as a new marker shape: a v3 marker
-// carried a root id and cannot authorize v4 row bytes. Mixed repositories
-// safely use the historical fallback until their next ordinary tracked commit
-// publishes a complete v4 generation.
-pub(crate) const TRACKED_HEAD_ROW_NAMESPACE: &str = "live_state.tracked_head_row.v4";
-pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v4";
-pub(crate) const TRACKED_HEAD_ROW_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_000d), TRACKED_HEAD_ROW_NAMESPACE);
+// v5 makes the durable tracked head authoritative for normal current reads.
+// A physical record owns every file-backed member of one logical entity PK.
+// Public entity reads know `(branch, schema, entity_pk)` but intentionally do
+// not invent a `file_id`; keeping those members together lets that common
+// lookup be a RocksDB point get rather than a prefix scan. Repositories use a
+// protocol gate, so v4 bytes are never interpreted as v5 groups.
+pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.tracked_head_group.v5";
+pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.tracked_head_member.v5";
+pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v5";
+pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0012), TRACKED_HEAD_GROUP_NAMESPACE);
+/// Exact projection for explicit file-backed identities.
+///
+/// The group value remains authoritative for normal logical-PK reads. This
+/// narrow projection avoids turning `file_id = ?` point reads into an
+/// unbounded group-value fetch when a logical PK has many file members.
+pub(crate) const TRACKED_HEAD_MEMBER_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0013), TRACKED_HEAD_MEMBER_NAMESPACE);
 pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_000e), TRACKED_HEAD_MARKER_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_0014), TRACKED_HEAD_MARKER_NAMESPACE);
 
 /// Immutable manifest for the currently readable generation of a branch.
 ///
@@ -66,6 +75,19 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
+/// The physical v5 key for all current members of one logical entity PK.
+///
+/// `file_id` is deliberately not a key part. It remains part of the packed
+/// group value so a tombstone or a file-backed variant affects only its own
+/// full row identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HeadGroupIdentity {
+    branch_id: String,
+    generation: CommitId,
+    schema_key: String,
+    entity_pk: EntityPk,
+}
+
 /// The portion of a head-row key that varies within one branch generation.
 ///
 /// A full table scan already constrains `branch_id` and `generation` in the
@@ -84,6 +106,24 @@ impl HeadIdentity {
             schema_key: self.schema_key,
             entity_pk: self.entity_pk,
             file_id: self.file_id,
+        }
+    }
+
+    fn into_group_identity(self) -> HeadGroupIdentity {
+        HeadGroupIdentity {
+            branch_id: self.branch_id,
+            generation: self.generation,
+            schema_key: self.schema_key,
+            entity_pk: self.entity_pk,
+        }
+    }
+
+    fn group_identity(&self) -> HeadGroupIdentity {
+        HeadGroupIdentity {
+            branch_id: self.branch_id.clone(),
+            generation: self.generation,
+            schema_key: self.schema_key.clone(),
+            entity_pk: self.entity_pk.clone(),
         }
     }
 }
@@ -281,27 +321,61 @@ where
                 .or_default()
                 .push(index);
         }
-        let identities = output_indices.keys().cloned().collect::<Vec<_>>();
-        let values = load_entry_bytes(&self.store, &identities).await?;
-        let entries = identities
+        let groups = output_indices
+            .keys()
+            .filter(|identity| identity.file_id.is_none())
+            .map(HeadIdentity::group_identity)
+            .collect::<BTreeSet<_>>()
             .into_iter()
-            .zip(values)
-            .filter_map(|(identity, value)| {
-                value.map(|value| (identity.into_row_identity(), value))
-            })
-            .collect();
-        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        let mut output = vec![None; keys.len()];
-        for row in rows {
-            let identity = HeadIdentity {
-                branch_id: branch_id.to_string(),
-                generation: marker.generation,
-                schema_key: row.schema_key.clone(),
-                entity_pk: row.entity_pk.clone(),
-                file_id: row.file_id.clone(),
+            .collect::<Vec<_>>();
+        let member_identities = output_indices
+            .keys()
+            .filter(|identity| identity.file_id.is_some())
+            .cloned()
+            .collect::<Vec<_>>();
+        let values = load_group_bytes(&self.store, &groups).await?;
+        let mut entries = Vec::new();
+        for (group, value) in groups.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
             };
-            if let Some(indices) = output_indices.get(&identity) {
-                for &index in indices {
+            for member in decode_head_group_members(&value)? {
+                let identity = HeadIdentity {
+                    branch_id: group.branch_id.clone(),
+                    generation: group.generation,
+                    schema_key: group.schema_key.clone(),
+                    entity_pk: group.entity_pk.clone(),
+                    file_id: member.file_id,
+                };
+                if output_indices.contains_key(&identity) {
+                    entries.push((identity.into_row_identity(), member.value));
+                }
+            }
+        }
+        let member_values = load_member_bytes(&self.store, &member_identities).await?;
+        for (identity, value) in member_identities.into_iter().zip(member_values) {
+            if let Some(value) = value {
+                entries.push((identity.into_row_identity(), value));
+            }
+        }
+        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
+        let rows_by_identity = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    HeadRowIdentity {
+                        schema_key: row.schema_key.clone(),
+                        entity_pk: row.entity_pk.clone(),
+                        file_id: row.file_id.clone(),
+                    },
+                    row,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut output = vec![None; keys.len()];
+        for (identity, indices) in output_indices {
+            if let Some(row) = rows_by_identity.get(&identity.into_row_identity()) {
+                for index in indices {
                     output[index] = Some(row.clone());
                 }
             }
@@ -360,61 +434,42 @@ where
         let matches_parent = parent_generation.is_some();
         let generation = parent_generation.unwrap_or(new_head);
 
-        if matches_parent
-            && absence_guards.is_empty()
-            && let [delta] = deltas
-        {
+        let mut seen_delta_identities = BTreeSet::new();
+        for delta in deltas {
             let identity = delta.identity(branch_id, generation);
-            let prior_created_at = load_entry_bytes(self.store, std::slice::from_ref(&identity))
-                .await?
-                .into_iter()
-                .next()
-                .flatten()
-                .map(|value| decode_head_created_at(&value))
-                .transpose()?
-                .unwrap_or(delta.created_at);
-            stage_put_ref(self.writes, &identity, &delta.value_ref(prior_created_at))?;
-            stage_marker(
-                self.writes,
-                branch_id,
-                &TrackedHeadMarker {
-                    head_commit_id: new_head,
-                    generation,
-                },
-            )?;
-            return Ok(());
+            if !seen_delta_identities.insert(identity.clone()) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked-head commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
+                        identity.schema_key, identity.entity_pk, identity.file_id
+                    ),
+                ));
+            }
         }
 
-        let delta_identities = deltas
-            .iter()
-            .map(|delta| delta.identity(branch_id, generation))
-            .collect::<BTreeSet<_>>();
-
-        let mut prior_created_at = BTreeMap::<HeadIdentity, LixTimestamp>::new();
-        if matches_parent {
-            let identities = deltas
+        let mut groups = if matches_parent {
+            let group_identities = deltas
                 .iter()
-                .map(|delta| delta.identity(branch_id, generation))
+                .map(|delta| delta.identity(branch_id, generation).into_group_identity())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
                 .collect::<Vec<_>>();
-            let values = load_entry_bytes(self.store, &identities).await?;
-            for (identity, value) in identities.into_iter().zip(values) {
-                if let Some(value) = value {
-                    let value = decode_head_value(&value)?;
-                    let key = TrackedStateKey {
-                        schema_key: identity.schema_key.clone(),
-                        entity_pk: identity.entity_pk.clone(),
-                        file_id: identity.file_id.clone(),
-                    };
-                    if absence_guards.contains(&key) && !value.deleted {
-                        return Err(tracked_head_duplicate_insert_error(&key));
-                    }
-                    prior_created_at.insert(identity, value.created_at);
-                }
+            let values = load_group_bytes(self.store, &group_identities).await?;
+            let mut groups = BTreeMap::new();
+            for (identity, value) in group_identities.into_iter().zip(values) {
+                let members = value
+                    .as_deref()
+                    .map(decode_head_group_member_map)
+                    .transpose()?
+                    .unwrap_or_default();
+                groups.insert(identity, members);
             }
-        } else if let Some(rows) = parent_rows {
-            self.writes
-                .reserve_space(TRACKED_HEAD_ROW_SPACE, rows.len() + deltas.len(), 0);
-            for row in rows {
+            groups
+        } else {
+            let mut groups =
+                BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, Vec<u8>>>::new();
+            for row in parent_rows.unwrap_or_default() {
                 let key = TrackedStateKey {
                     schema_key: row.schema_key.clone(),
                     entity_pk: row.entity_pk.clone(),
@@ -451,27 +506,61 @@ where
                         .as_deref()
                         .map_or(JsonSlot::None, JsonSlot::from_json),
                 };
-                // The child delta below owns the final mutation for an
-                // overlapping key. Keep its parent value only to preserve
-                // `created_at`; staging both would violate the write-set's
-                // one-put-per-key invariant.
-                if !delta_identities.contains(&identity) {
-                    stage_put(self.writes, &identity, &value)?;
+                let members = groups.entry(identity.group_identity()).or_default();
+                if members
+                    .insert(
+                        identity.file_id.clone(),
+                        encode_head_value(&value.as_ref())?,
+                    )
+                    .is_some()
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked-head bootstrap contains duplicate full row identity",
+                    ));
                 }
-                prior_created_at.insert(identity, value.created_at);
             }
-        } else {
-            self.writes
-                .reserve_space(TRACKED_HEAD_ROW_SPACE, deltas.len(), 0);
-        }
+            groups
+        };
 
         for delta in deltas {
             let identity = delta.identity(branch_id, generation);
-            let created_at = prior_created_at
-                .get(&identity)
-                .copied()
-                .unwrap_or(delta.created_at);
-            stage_put_ref(self.writes, &identity, &delta.value_ref(created_at))?;
+            let key = TrackedStateKey {
+                schema_key: identity.schema_key.clone(),
+                entity_pk: identity.entity_pk.clone(),
+                file_id: identity.file_id.clone(),
+            };
+            let members = groups.entry(identity.group_identity()).or_default();
+            let created_at = if let Some(existing) = members.get(&identity.file_id) {
+                let existing = decode_head_value(existing)?;
+                if absence_guards.contains(&key) && !existing.deleted {
+                    return Err(tracked_head_duplicate_insert_error(&key));
+                }
+                existing.created_at
+            } else {
+                delta.created_at
+            };
+            members.insert(
+                identity.file_id,
+                encode_head_value(&delta.value_ref(created_at))?,
+            );
+        }
+
+        self.writes
+            .reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
+        let explicit_member_count = groups
+            .values()
+            .map(|members| members.keys().filter(|file_id| file_id.is_some()).count())
+            .sum();
+        self.writes
+            .reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
+        for (identity, members) in groups {
+            stage_put_group_members(self.writes, &identity, &members)?;
+            for (file_id, value) in &members {
+                if file_id.is_some() {
+                    stage_put_member_bytes(self.writes, &identity, file_id.as_deref(), value)?;
+                }
+            }
         }
         stage_marker(
             self.writes,
@@ -516,21 +605,44 @@ async fn load_marker(
         .transpose()
 }
 
-/// Loads the physical v3 values without decoding them. This keeps the owning
-/// `Bytes` allocation alive until the direct materializer has copied only the
-/// selected output fields into the final serving row.
-async fn load_entry_bytes(
+/// Loads packed v5 groups without materializing their members.
+async fn load_group_bytes(
     store: &(impl StorageAdapterRead + ?Sized),
-    identities: &[HeadIdentity],
+    identities: &[HeadGroupIdentity],
 ) -> Result<Vec<Option<Bytes>>, LixError> {
     if identities.is_empty() {
         return Ok(Vec::new());
     }
     let keys = identities
         .iter()
-        .map(|identity| StorageKey(Bytes::from(encode_row_key(identity))))
+        .map(|identity| StorageKey(Bytes::from(encode_group_key(identity))))
         .collect::<Vec<_>>();
-    let result = PointReadPlan::new(TRACKED_HEAD_ROW_SPACE, &keys)
+    let result = PointReadPlan::new(TRACKED_HEAD_GROUP_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    result
+        .value
+        .into_iter()
+        .map(|value| value.map(full_value_bytes).transpose())
+        .collect()
+}
+
+/// Loads the explicit-file member projection. Its physical access pattern is
+/// intentionally the same single-key point lookup as v4 so file-id queries
+/// do not become proportional to the size of their logical PK group.
+async fn load_member_bytes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    identities: &[HeadIdentity],
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    debug_assert!(identities.iter().all(|identity| identity.file_id.is_some()));
+    let keys = identities
+        .iter()
+        .map(|identity| StorageKey(Bytes::from(encode_member_key(identity))))
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(TRACKED_HEAD_MEMBER_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
     result
@@ -547,8 +659,8 @@ async fn scan_entries(
     filter: &TrackedStateFilter,
     limit: Option<usize>,
 ) -> Result<Vec<(HeadRowIdentity, Bytes)>, LixError> {
-    if let Some(identities) = exact_filter_identities(branch_id, generation, filter) {
-        let values = load_entry_bytes(store, &identities).await?;
+    if let Some(identities) = exact_explicit_member_identities(branch_id, generation, filter) {
+        let values = load_member_bytes(store, &identities).await?;
         return Ok(identities
             .into_iter()
             .zip(values)
@@ -558,6 +670,20 @@ async fn scan_entries(
             .take(limit.unwrap_or(usize::MAX))
             .collect());
     }
+    if let Some(groups) = exact_group_identities(branch_id, generation, filter) {
+        let values = load_group_bytes(store, &groups).await?;
+        let mut rows = Vec::new();
+        for (group, value) in groups.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            extend_group_entries(&mut rows, group, value, filter, limit)?;
+            if limit.is_some_and(|limit| rows.len() >= limit) {
+                return Ok(rows);
+            }
+        }
+        return Ok(rows);
+    }
 
     let scope = encode_scope_prefix(branch_id, generation);
     let mut prefixes = scan_prefixes(&scope, filter);
@@ -566,7 +692,7 @@ async fn scan_entries(
     let mut rows = Vec::new();
     for prefix in prefixes {
         let plan = ScanPlan::prefix(
-            TRACKED_HEAD_ROW_SPACE,
+            TRACKED_HEAD_GROUP_SPACE,
             StoragePrefix {
                 bytes: Bytes::from(prefix),
             },
@@ -590,11 +716,19 @@ async fn scan_entries(
                 .await?;
             resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
-                let identity = decode_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
-                if !matches_filter(&identity, filter) {
-                    continue;
-                }
-                rows.push((identity, full_value_bytes(entry.value)?));
+                let identity = decode_group_key_in_scope(entry.key.0.as_ref(), &scope)?;
+                extend_group_entries(
+                    &mut rows,
+                    HeadGroupIdentity {
+                        branch_id: branch_id.to_string(),
+                        generation,
+                        schema_key: identity.schema_key,
+                        entity_pk: identity.entity_pk,
+                    },
+                    full_value_bytes(entry.value)?,
+                    filter,
+                    limit,
+                )?;
                 if limit.is_some_and(|limit| rows.len() >= limit) {
                     return Ok(rows);
                 }
@@ -607,18 +741,41 @@ async fn scan_entries(
     Ok(rows)
 }
 
-fn exact_filter_identities(
+fn exact_group_identities(
+    branch_id: &str,
+    generation: CommitId,
+    filter: &TrackedStateFilter,
+) -> Option<Vec<HeadGroupIdentity>> {
+    if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
+        return None;
+    }
+    let mut identities = Vec::with_capacity(filter.schema_keys.len() * filter.entity_pks.len());
+    for schema_key in &filter.schema_keys {
+        for entity_pk in &filter.entity_pks {
+            identities.push(HeadGroupIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: schema_key.clone(),
+                entity_pk: entity_pk.clone(),
+            });
+        }
+    }
+    identities.sort();
+    identities.dedup();
+    Some(identities)
+}
+
+fn exact_explicit_member_identities(
     branch_id: &str,
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Option<Vec<HeadIdentity>> {
-    if filter.schema_keys.is_empty()
-        || filter.entity_pks.is_empty()
-        || filter.file_ids.is_empty()
+    exact_group_identities(branch_id, generation, filter)?;
+    if filter.file_ids.is_empty()
         || filter
             .file_ids
             .iter()
-            .any(|filter| matches!(filter, NullableKeyFilter::Any))
+            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
     {
         return None;
     }
@@ -628,17 +785,15 @@ fn exact_filter_identities(
     for schema_key in &filter.schema_keys {
         for entity_pk in &filter.entity_pks {
             for file_id in &filter.file_ids {
-                let file_id = match file_id {
-                    NullableKeyFilter::Null => None,
-                    NullableKeyFilter::Value(value) => Some(value.clone()),
-                    NullableKeyFilter::Any => unreachable!("Any rejected above"),
+                let NullableKeyFilter::Value(file_id) = file_id else {
+                    unreachable!("explicit member filter checked above");
                 };
                 identities.push(HeadIdentity {
                     branch_id: branch_id.to_string(),
                     generation,
                     schema_key: schema_key.clone(),
                     entity_pk: entity_pk.clone(),
-                    file_id,
+                    file_id: Some(file_id.clone()),
                 });
             }
         }
@@ -663,28 +818,33 @@ fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
         for entity_pk in &filter.entity_pks {
             let mut entity_prefix = schema_prefix.clone();
             write_entity_pk(&mut entity_prefix, entity_pk);
-            if filter.file_ids.is_empty()
-                || filter
-                    .file_ids
-                    .iter()
-                    .any(|filter| matches!(filter, NullableKeyFilter::Any))
-            {
-                prefixes.push(entity_prefix);
-                continue;
-            }
-            for file_id in &filter.file_ids {
-                let file_id = match file_id {
-                    NullableKeyFilter::Null => None,
-                    NullableKeyFilter::Value(value) => Some(value.as_str()),
-                    NullableKeyFilter::Any => unreachable!("Any handled above"),
-                };
-                let mut prefix = entity_prefix.clone();
-                write_file_id(&mut prefix, file_id);
-                prefixes.push(prefix);
-            }
+            prefixes.push(entity_prefix);
         }
     }
     prefixes
+}
+
+fn extend_group_entries(
+    rows: &mut Vec<(HeadRowIdentity, Bytes)>,
+    group: HeadGroupIdentity,
+    value: Bytes,
+    filter: &TrackedStateFilter,
+    limit: Option<usize>,
+) -> Result<(), LixError> {
+    for member in decode_head_group_members(&value)? {
+        let identity = HeadRowIdentity {
+            schema_key: group.schema_key.clone(),
+            entity_pk: group.entity_pk.clone(),
+            file_id: member.file_id,
+        };
+        if matches_filter(&identity, filter) {
+            rows.push((identity, member.value));
+            if limit.is_some_and(|limit| rows.len() >= limit) {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
@@ -713,6 +873,7 @@ fn stage_marker(
     Ok(())
 }
 
+#[cfg(test)]
 fn stage_put(
     writes: &mut StorageWriteSet,
     identity: &HeadIdentity,
@@ -721,16 +882,65 @@ fn stage_put(
     stage_put_ref(writes, identity, &value.as_ref())
 }
 
+#[cfg(test)]
 fn stage_put_ref(
     writes: &mut StorageWriteSet,
     identity: &HeadIdentity,
     value: &HeadValueRef<'_>,
 ) -> Result<(), LixError> {
+    let mut members = BTreeMap::new();
+    members.insert(identity.file_id.clone(), encode_head_value(value)?);
+    stage_put_group_members(writes, &identity.group_identity(), &members)?;
+    if identity.file_id.is_some() {
+        stage_put_member_bytes(
+            writes,
+            &identity.group_identity(),
+            identity.file_id.as_deref(),
+            &members[&identity.file_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn stage_put_group_members(
+    writes: &mut StorageWriteSet,
+    identity: &HeadGroupIdentity,
+    members: &BTreeMap<Option<String>, Vec<u8>>,
+) -> Result<(), LixError> {
     writes.put(
-        TRACKED_HEAD_ROW_SPACE,
-        StorageKey(Bytes::from(encode_row_key(identity))),
+        TRACKED_HEAD_GROUP_SPACE,
+        StorageKey(Bytes::from(encode_group_key(identity))),
         StorageValue {
-            bytes: Bytes::from(encode_head_value(value)?),
+            bytes: Bytes::from(encode_head_group_members(members)?),
+        },
+    );
+    Ok(())
+}
+
+fn stage_put_member_bytes(
+    writes: &mut StorageWriteSet,
+    group: &HeadGroupIdentity,
+    file_id: Option<&str>,
+    value: &[u8],
+) -> Result<(), LixError> {
+    let Some(file_id) = file_id else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked-head explicit member projection requires a file_id",
+        ));
+    };
+    let identity = HeadIdentity {
+        branch_id: group.branch_id.clone(),
+        generation: group.generation,
+        schema_key: group.schema_key.clone(),
+        entity_pk: group.entity_pk.clone(),
+        file_id: Some(file_id.to_string()),
+    };
+    writes.put(
+        TRACKED_HEAD_MEMBER_SPACE,
+        StorageKey(Bytes::from(encode_member_key(&identity))),
+        StorageValue {
+            bytes: Bytes::copy_from_slice(value),
         },
     );
     Ok(())
@@ -740,16 +950,46 @@ fn marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("tracked-head marker key", &BranchRef { branch_id })
 }
 
-fn encode_row_key(identity: &HeadIdentity) -> Vec<u8> {
+fn encode_group_key(identity: &HeadGroupIdentity) -> Vec<u8> {
     let mut out = encode_scope_prefix(&identity.branch_id, identity.generation);
     write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
     write_entity_pk(&mut out, &identity.entity_pk);
+    out
+}
+
+fn encode_member_key(identity: &HeadIdentity) -> Vec<u8> {
+    debug_assert!(identity.file_id.is_some());
+    let mut out = encode_group_key(&identity.group_identity());
     write_file_id(&mut out, identity.file_id.as_deref());
     out
 }
 
 #[cfg(test)]
-fn decode_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
+fn decode_group_key(bytes: &[u8]) -> Result<HeadGroupIdentity, LixError> {
+    let mut offset = 0usize;
+    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("branch id has an invalid terminator"));
+    }
+    let generation = read_generation(bytes, &mut offset)?;
+    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
+    if schema_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("schema key has an invalid terminator"));
+    }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("group key has trailing bytes"));
+    }
+    Ok(HeadGroupIdentity {
+        branch_id,
+        generation,
+        schema_key,
+        entity_pk,
+    })
+}
+
+#[cfg(test)]
+fn decode_member_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     let mut offset = 0usize;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
     if branch_terminator != KEY_PART_FINAL {
@@ -762,8 +1002,11 @@ fn decode_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     }
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
+    if file_id.is_none() {
+        return Err(key_codec_error("member key must contain a file id"));
+    }
     if offset != bytes.len() {
-        return Err(key_codec_error("has trailing bytes"));
+        return Err(key_codec_error("member key has trailing bytes"));
     }
     Ok(HeadIdentity {
         branch_id,
@@ -774,12 +1017,12 @@ fn decode_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     })
 }
 
-/// Decodes only the mutable suffix of a row key from a prefix-scoped scan.
+/// Decodes only the mutable suffix of a group key from a prefix-scoped scan.
 ///
 /// `ScanPlan::prefix` already constrains the branch and generation. We still
 /// verify the fixed scope before parsing the suffix so a malformed storage key
 /// cannot be interpreted as a row from the wrong generation.
-fn decode_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
+fn decode_group_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
     if !bytes.starts_with(scope) {
         return Err(key_codec_error(
             "does not begin with the scanned branch-generation scope",
@@ -791,14 +1034,13 @@ fn decode_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity
         return Err(key_codec_error("schema key has an invalid terminator"));
     }
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    let file_id = read_file_id(bytes, &mut offset)?;
     if offset != bytes.len() {
-        return Err(key_codec_error("has trailing bytes"));
+        return Err(key_codec_error("group key has trailing bytes"));
     }
     Ok(HeadRowIdentity {
         schema_key,
         entity_pk,
-        file_id,
+        file_id: None,
     })
 }
 
@@ -894,6 +1136,7 @@ fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError
     })
 }
 
+#[cfg(test)]
 fn read_file_id(bytes: &[u8], offset: &mut usize) -> Result<Option<String>, LixError> {
     let tag = *bytes
         .get(*offset)
@@ -988,6 +1231,184 @@ fn decode_marker_value(value: StorageProjectedValue) -> Result<TrackedHeadMarker
         ));
     };
     storage_codec::decode("tracked-head marker", &bytes)
+}
+
+/// v5 packs all file-backed members of one logical entity PK into one
+/// canonical current-state group. The individual member payload is the proven
+/// fixed-header v3 value below; only the outer framing is new.
+///
+/// ```text
+///  0      group format version (1)
+///  1..5   member count (big endian u32)
+///  repeated:
+///    0      file-id tag (0 = none, 1 = UTF-8 string)
+///    1..5   file-id byte length when tag = 1 (big endian u32)
+///    ...    file-id UTF-8 bytes when tag = 1
+///    ...    v3 member byte length (big endian u32)
+///    ...    v3 member bytes
+/// ```
+///
+/// Members are strictly sorted by Rust's `Option<String>` ordering. This
+/// makes scans deterministic and, more importantly, rejects silently
+/// duplicated full identities at the storage boundary.
+const HEAD_GROUP_VALUE_VERSION: u8 = 1;
+const HEAD_GROUP_HEADER_BYTES: usize = 5;
+
+struct HeadGroupMemberBytes {
+    file_id: Option<String>,
+    value: Bytes,
+}
+
+fn encode_head_group_members(
+    members: &BTreeMap<Option<String>, Vec<u8>>,
+) -> Result<Vec<u8>, LixError> {
+    let member_count =
+        u32::try_from(members.len()).map_err(|_| head_group_error("member count exceeds u32"))?;
+    let payload_len = members.iter().try_fold(0usize, |total, (file_id, value)| {
+        let file_id_len = file_id.as_ref().map_or(0, String::len);
+        u32::try_from(file_id_len).map_err(|_| head_group_error("file id exceeds u32"))?;
+        let file_id_bytes = if file_id.is_some() {
+            4usize
+                .checked_add(file_id_len)
+                .ok_or_else(|| head_group_error("group value length overflow"))?
+        } else {
+            0
+        };
+        u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
+        decode_head_value(value)?;
+        let member_len = 1usize
+            .checked_add(file_id_bytes)
+            .and_then(|length| length.checked_add(4))
+            .and_then(|length| length.checked_add(value.len()))
+            .ok_or_else(|| head_group_error("group value length overflow"))?;
+        total
+            .checked_add(member_len)
+            .ok_or_else(|| head_group_error("group value length overflow"))
+    })?;
+    let capacity = HEAD_GROUP_HEADER_BYTES
+        .checked_add(payload_len)
+        .ok_or_else(|| head_group_error("group value length overflow"))?;
+    let mut encoded = Vec::with_capacity(capacity);
+    encoded.push(HEAD_GROUP_VALUE_VERSION);
+    encoded.extend_from_slice(&member_count.to_be_bytes());
+    for (file_id, value) in members {
+        match file_id {
+            None => encoded.push(FILE_ID_NONE),
+            Some(file_id) => {
+                encoded.push(FILE_ID_SOME);
+                let file_id_len = u32::try_from(file_id.len())
+                    .map_err(|_| head_group_error("file id exceeds u32"))?;
+                encoded.extend_from_slice(&file_id_len.to_be_bytes());
+                encoded.extend_from_slice(file_id.as_bytes());
+            }
+        }
+        let value_len =
+            u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
+        encoded.extend_from_slice(&value_len.to_be_bytes());
+        encoded.extend_from_slice(value);
+    }
+    debug_assert_eq!(encoded.len(), capacity);
+    Ok(encoded)
+}
+
+fn decode_head_group_members(bytes: &[u8]) -> Result<Vec<HeadGroupMemberBytes>, LixError> {
+    if bytes.len() < HEAD_GROUP_HEADER_BYTES {
+        return Err(head_group_error("value is shorter than the fixed header"));
+    }
+    if bytes[0] != HEAD_GROUP_VALUE_VERSION {
+        return Err(head_group_error(&format!(
+            "unsupported group format version {}",
+            bytes[0]
+        )));
+    }
+    let member_count = usize::try_from(read_u32(&bytes[1..5], "group member count")?)
+        .map_err(|_| head_group_error("member count exceeds usize"))?;
+    let mut offset = HEAD_GROUP_HEADER_BYTES;
+    let mut prior_file_id = None::<Option<String>>;
+    let mut members = Vec::with_capacity(member_count);
+    for _ in 0..member_count {
+        let tag = *bytes
+            .get(offset)
+            .ok_or_else(|| head_group_error("is truncated before member file id"))?;
+        offset += 1;
+        let file_id = match tag {
+            FILE_ID_NONE => None,
+            FILE_ID_SOME => {
+                let file_id_len = read_group_u32(bytes, &mut offset, "member file-id length")?;
+                let file_id_end = offset
+                    .checked_add(file_id_len)
+                    .ok_or_else(|| head_group_error("member file-id length overflow"))?;
+                let file_id = bytes
+                    .get(offset..file_id_end)
+                    .ok_or_else(|| head_group_error("is truncated in member file id"))?;
+                offset = file_id_end;
+                Some(
+                    std::str::from_utf8(file_id)
+                        .map_err(|error| {
+                            head_group_error(&format!("member file id is not UTF-8: {error}"))
+                        })?
+                        .to_string(),
+                )
+            }
+            _ => return Err(head_group_error("has an invalid member file-id tag")),
+        };
+        if prior_file_id
+            .as_ref()
+            .is_some_and(|prior| prior >= &file_id)
+        {
+            return Err(head_group_error(
+                "members are not strictly ordered by file id",
+            ));
+        }
+        let value_len = read_group_u32(bytes, &mut offset, "member value length")?;
+        let value_end = offset
+            .checked_add(value_len)
+            .ok_or_else(|| head_group_error("member value length overflow"))?;
+        let value = bytes
+            .get(offset..value_end)
+            .ok_or_else(|| head_group_error("is truncated in member value"))?;
+        decode_head_value(value)?;
+        offset = value_end;
+        prior_file_id = Some(file_id.clone());
+        members.push(HeadGroupMemberBytes {
+            file_id,
+            value: Bytes::copy_from_slice(value),
+        });
+    }
+    if offset != bytes.len() {
+        return Err(head_group_error("has trailing bytes"));
+    }
+    Ok(members)
+}
+
+fn decode_head_group_member_map(
+    bytes: &[u8],
+) -> Result<BTreeMap<Option<String>, Vec<u8>>, LixError> {
+    Ok(decode_head_group_members(bytes)?
+        .into_iter()
+        .map(|member| (member.file_id, member.value.to_vec()))
+        .collect())
+}
+
+fn read_group_u32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize, LixError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or_else(|| head_group_error(&format!("{field} offset overflow")))?;
+    let value = read_u32(
+        bytes
+            .get(*offset..end)
+            .ok_or_else(|| head_group_error(&format!("is truncated before {field}")))?,
+        field,
+    )?;
+    *offset = end;
+    usize::try_from(value).map_err(|_| head_group_error(&format!("{field} exceeds usize")))
+}
+
+fn head_group_error(message: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("invalid tracked-head v5 group: {message}"),
+    )
 }
 
 /// v3 head values are intentionally a small, fixed-header wire record rather
@@ -1114,42 +1535,6 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
         ));
     };
     Ok(bytes)
-}
-
-/// Decodes only the invariant needed by a serial point update. The writer
-/// preserves a row's first `created_at`, but does not need to allocate or
-/// validate its JSON payloads just to do that.
-fn decode_head_created_at(bytes: &[u8]) -> Result<LixTimestamp, LixError> {
-    if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v3 fixed header"));
-    }
-    if bytes[0] != HEAD_VALUE_VERSION {
-        return Err(head_value_error(&format!(
-            "unsupported row format version {}",
-            bytes[0]
-        )));
-    }
-    let flags = bytes[1];
-    if flags & !HEAD_VALUE_ALLOWED_FLAGS != 0 {
-        return Err(head_value_error("row has unknown v3 flag bits"));
-    }
-    let snapshot_len = usize::try_from(read_u32(&bytes[50..54], "snapshot length")?)
-        .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
-    let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
-        .map_err(|_| head_value_error("metadata length exceeds usize"))?;
-    let payload_len = snapshot_len
-        .checked_add(metadata_len)
-        .ok_or_else(|| head_value_error("row payload length overflow"))?;
-    let expected_len = HEAD_VALUE_HEADER_BYTES
-        .checked_add(payload_len)
-        .ok_or_else(|| head_value_error("row payload length overflow"))?;
-    if expected_len != bytes.len() {
-        return Err(head_value_error(
-            "row payload lengths do not match the buffer",
-        ));
-    }
-    LixTimestamp::from_packed(read_u64(&bytes[34..42], "created_at")?)
-        .map_err(|error| head_value_error(&format!("invalid created_at: {error}")))
 }
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
@@ -1463,6 +1848,47 @@ mod tests {
         assert_eq!(decoded.metadata, HeadSlotView::Ref(snapshot_ref));
     }
 
+    #[test]
+    fn v5_group_codec_roundtrips_sorted_members_and_rejects_corruption() {
+        let mut members = BTreeMap::new();
+        members.insert(
+            None,
+            encode_head_value(&head_value("none", CommitId::for_test_label("head")).as_ref())
+                .expect("encode none member"),
+        );
+        members.insert(
+            Some("file-a".to_string()),
+            encode_head_value(&head_value("file-a", CommitId::for_test_label("head")).as_ref())
+                .expect("encode file-a member"),
+        );
+        members.insert(
+            Some("file-b".to_string()),
+            encode_head_value(&head_value("file-b", CommitId::for_test_label("head")).as_ref())
+                .expect("encode file-b member"),
+        );
+
+        let encoded = encode_head_group_members(&members).expect("encode group");
+        let decoded = decode_head_group_members(&encoded).expect("decode group");
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded[0].file_id, None);
+        assert_eq!(decoded[1].file_id.as_deref(), Some("file-a"));
+        assert_eq!(decoded[2].file_id.as_deref(), Some("file-b"));
+        assert_eq!(
+            decode_head_value(&decoded[2].value)
+                .expect("member should preserve v3 payload")
+                .change_id,
+            ChangeId::for_test_label("file-b")
+        );
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(decode_head_group_members(&trailing).is_err());
+
+        let mut bad_version = encoded;
+        bad_version[0] = HEAD_GROUP_VALUE_VERSION + 1;
+        assert!(decode_head_group_members(&bad_version).is_err());
+    }
+
     #[tokio::test]
     async fn direct_live_materializer_honors_projection_and_batches_out_of_band_refs() {
         let storage = StorageAdapter::new(Memory::new());
@@ -1574,11 +2000,196 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn explicit_file_id_reads_use_single_member_projection() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let head = CommitId::for_test_label("head");
+        let entity_pk = EntityPk::single("row");
+        let deltas = [
+            TrackedHeadDeltaRef {
+                schema_key: "schema",
+                file_id: None,
+                entity_pk: &entity_pk,
+                change_id: ChangeId::for_test_label("none"),
+                commit_id: head,
+                deleted: false,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                snapshot: JsonSlotRef::Inline("{\"value\":\"none\"}"),
+                metadata: JsonSlotRef::None,
+            },
+            TrackedHeadDeltaRef {
+                schema_key: "schema",
+                file_id: Some("file-a"),
+                entity_pk: &entity_pk,
+                change_id: ChangeId::for_test_label("file-a"),
+                commit_id: head,
+                deleted: false,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                snapshot: JsonSlotRef::Inline("{\"value\":\"a\"}"),
+                metadata: JsonSlotRef::None,
+            },
+            TrackedHeadDeltaRef {
+                schema_key: "schema",
+                file_id: Some("file-b"),
+                entity_pk: &entity_pk,
+                change_id: ChangeId::for_test_label("file-b"),
+                commit_id: head,
+                deleted: false,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                snapshot: JsonSlotRef::Inline("{\"value\":\"b\"}"),
+                metadata: JsonSlotRef::None,
+            },
+        ];
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open write read");
+        let mut writes = StorageWriteSet::new();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(branch_id, None, head, &deltas, &BTreeSet::new(), None)
+            .await
+            .expect("stage grouped head");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit grouped head");
+
+        let group = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation: head,
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+        };
+        let explicit_member = HeadIdentity {
+            branch_id: branch_id.to_string(),
+            generation: head,
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+            file_id: Some("file-b".to_string()),
+        };
+        let member_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open member verification read");
+        let member = PointReadPlan::new(
+            TRACKED_HEAD_MEMBER_SPACE,
+            &[StorageKey(Bytes::from(encode_member_key(&explicit_member)))],
+        )
+        .materialize(&member_read, StorageGetOptions::default())
+        .await
+        .expect("member projection should load")
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+        assert!(
+            member.is_some(),
+            "explicit file member needs a point record"
+        );
+        drop(member_read);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open logical PK read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        entity_pks: vec![entity_pk.clone()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("logical PK read should execute")
+            .expect("marker should match");
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.file_id.as_deref())
+                .collect::<Vec<_>>(),
+            vec![None, Some("file-a"), Some("file-b")]
+        );
+
+        // Remove only the group to prove the exact-file read never needs to
+        // fetch/parse sibling members. This is intentionally an impossible
+        // committed state in production; it validates the physical route.
+        let mut writes = StorageWriteSet::new();
+        writes.delete(
+            TRACKED_HEAD_GROUP_SPACE,
+            StorageKey(Bytes::from(encode_group_key(&group))),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("remove group for route proof");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open filtered file scan");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        entity_pks: vec![entity_pk.clone()],
+                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("filtered file scan should execute")
+            .expect("marker should match");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id.as_deref(), Some("file-b"));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open explicit file read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .load_projected_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &[TrackedStateKey {
+                    schema_key: "schema".to_string(),
+                    entity_pk,
+                    file_id: Some("file-b".to_string()),
+                }],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("exact file read should execute")
+            .expect("marker should match");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0].as_ref().expect("explicit member should resolve");
+        assert_eq!(row.file_id.as_deref(), Some("file-b"));
+        assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
+    }
+
     #[test]
-    fn row_key_roundtrips_and_preserves_logical_order() {
+    fn group_and_member_keys_roundtrip_and_preserve_logical_order() {
         let generation = CommitId::for_test_label("generation");
         let strings = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
-        let mut identities = Vec::new();
+        let mut groups = Vec::new();
         for schema_key in strings {
             for entity_first in strings {
                 for entity_pk in [
@@ -1586,39 +2197,40 @@ mod tests {
                     EntityPk::from_parts(vec![entity_first.to_string(), "tail".to_string()])
                         .expect("tuple entity key should be valid"),
                 ] {
-                    for file_id in [None, Some(""), Some("a"), Some("a\0")] {
-                        identities.push(HeadIdentity {
-                            branch_id: "branch\0name".to_string(),
-                            generation,
-                            schema_key: schema_key.to_string(),
-                            entity_pk: entity_pk.clone(),
-                            file_id: file_id.map(str::to_string),
-                        });
-                    }
+                    groups.push(HeadGroupIdentity {
+                        branch_id: "branch\0name".to_string(),
+                        generation,
+                        schema_key: schema_key.to_string(),
+                        entity_pk: entity_pk.clone(),
+                    });
                 }
             }
         }
-        identities.sort();
-        identities.dedup();
+        groups.sort();
+        groups.dedup();
 
-        for identity in &identities {
-            let encoded = encode_row_key(identity);
+        for identity in &groups {
+            let encoded = encode_group_key(identity);
             assert_eq!(
-                decode_row_key(&encoded).expect("row key should decode"),
+                decode_group_key(&encoded).expect("group key should decode"),
                 *identity
             );
             let scope = encode_scope_prefix(&identity.branch_id, identity.generation);
             assert_eq!(
-                decode_row_key_in_scope(&encoded, &scope)
+                decode_group_key_in_scope(&encoded, &scope)
                     .expect("scope-decoded row key should decode"),
-                identity.clone().into_row_identity()
+                HeadRowIdentity {
+                    schema_key: identity.schema_key.clone(),
+                    entity_pk: identity.entity_pk.clone(),
+                    file_id: None,
+                }
             );
         }
 
-        let mut by_encoded = identities
+        let mut by_encoded = groups
             .iter()
             .cloned()
-            .map(|identity| (encode_row_key(&identity), identity))
+            .map(|identity| (encode_group_key(&identity), identity))
             .collect::<Vec<_>>();
         by_encoded.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(
@@ -1626,7 +2238,7 @@ mod tests {
                 .iter()
                 .map(|(_, identity)| identity)
                 .collect::<Vec<_>>(),
-            identities.iter().collect::<Vec<_>>()
+            groups.iter().collect::<Vec<_>>()
         );
         for (index, (encoded, _)) in by_encoded.iter().enumerate() {
             for (other_index, (other, _)) in by_encoded.iter().enumerate() {
@@ -1638,6 +2250,18 @@ mod tests {
                 }
             }
         }
+
+        let member = HeadIdentity {
+            branch_id: "branch\0name".to_string(),
+            generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("entity"),
+            file_id: Some("file\0id".to_string()),
+        };
+        assert_eq!(
+            decode_member_key(&encode_member_key(&member)).expect("member key should decode"),
+            member
+        );
     }
 
     #[tokio::test]

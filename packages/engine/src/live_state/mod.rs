@@ -21,7 +21,8 @@ pub(crate) use reader::LiveStateReader;
 pub(crate) use reader::load_exact_rows_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_ROW_SPACE, TrackedHeadContext, TrackedHeadDeltaRef,
+    TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
+    TrackedHeadContext, TrackedHeadDeltaRef,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

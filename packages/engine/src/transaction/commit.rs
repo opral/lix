@@ -1697,7 +1697,7 @@ mod tests {
                     .sidecar_marker_get_many_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
-            if space == crate::live_state::TRACKED_HEAD_ROW_SPACE.id {
+            if space == crate::live_state::TRACKED_HEAD_GROUP_SPACE.id {
                 self.counts
                     .row_get_many_calls
                     .fetch_add(1, Ordering::Relaxed);
@@ -1721,7 +1721,7 @@ mod tests {
             range: KeyRange,
             opts: ScanOptions,
         ) -> Result<ScanChunk, StorageError> {
-            if space == crate::live_state::TRACKED_HEAD_ROW_SPACE.id {
+            if space == crate::live_state::TRACKED_HEAD_GROUP_SPACE.id {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
             }
             if space == crate::live_state::LIVE_STATE_INDEX_ROW_SPACE.id {
