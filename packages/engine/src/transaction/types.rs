@@ -424,6 +424,9 @@ impl From<&PreparedStateRow> for MaterializedLiveStateRow {
 pub(crate) struct StagedCommitChangeRefs {
     pub(crate) commit_id: CommitId,
     pub(crate) commit_change_id: ChangeId,
+    /// Every normal branch-head publication has a distinct public
+    /// `lixcol_change_id`, even though v6 stores the moving ref directly
+    /// rather than as a flat current row.
     pub(crate) branch_ref_change_id: ChangeId,
     pub(crate) created_at: LixTimestamp,
     /// Normal prepared rows are already the authoritative commit-membership

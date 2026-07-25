@@ -2,7 +2,10 @@
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
+use crate::branch::{
+    BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY, BranchHeadControl,
+    stage_branch_head_control,
+};
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
     CommitId, CommitRecord,
@@ -35,14 +38,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The v5 tracked-head group and local-sidecar markers change the meaning of
-/// absent physical keys. Those proofs are only sound for repositories
-/// initialized with this protocol, so opening an older store must fail closed
-/// rather than mixing an old head layout with current visibility rules.
+/// The v6 direct branch-control plane changes the authority for current
+/// branch heads. Those proofs are only sound for repositories initialized
+/// with this protocol, so opening an older store must fail closed rather than
+/// mixing a legacy `lix_branch_ref` row with current visibility rules.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-head-group.v5";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v6";
 
 pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
     writes.put(
@@ -71,18 +74,20 @@ pub(crate) async fn assert_repository_protocol(
     }
     Err(LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
-        "repository uses an unsupported tracked-head storage protocol; recreate the repository",
+        "repository uses an unsupported tracked direct-plane storage protocol; recreate the repository",
     ))
 }
 
 /// Pure seed plan for initializing an engine repository.
 ///
-/// Tracked bootstrap facts go to the changelog. Moving refs such as
-/// `lix_branch_ref` are seeded as untracked local state so repository heads
-/// can advance without becoming commit members.
+/// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
+/// the v6 direct control plane and retain a standalone immutable branch-ref
+/// ledger change; only ordinary untracked data enters the flat live-state
+/// sidecar.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
+    branch_controls: Vec<InitBranchHeadControl>,
     untracked_rows: Vec<InitSeedLiveRow>,
     pub(crate) receipt: InitReceipt,
 }
@@ -117,6 +122,17 @@ struct InitSeedLiveRow {
     branch_id: String,
 }
 
+/// Initial direct branch controls are planned with the seed so their public
+/// metadata is deterministic and independent of the flat live-state lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InitBranchHeadControl {
+    branch_id: String,
+    control: BranchHeadControl,
+    /// Public `lix_change` fact for the control's initial branch-ref
+    /// publication. This deliberately has no flat current-state row.
+    branch_ref_change: InitSeedLiveRow,
+}
+
 /// Values generated while planning the initial repository seed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitReceipt {
@@ -128,8 +144,9 @@ pub struct InitReceipt {
 
 /// Builds the canonical bootstrap changes for a new engine repository.
 ///
-/// The initial commit tracks durable content rows. Branch refs are moving
-/// pointers and therefore live in untracked local state instead of the commit.
+/// The initial commit tracks durable content rows. Branch heads are moving
+/// pointers and therefore live in direct control records instead of the
+/// changelog or flat current state.
 pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSeedPlan, LixError> {
     let main_branch_id = functions.call_uuid_v7().to_string();
     let lix_id = functions.call_uuid_v7().to_string();
@@ -184,20 +201,43 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         author_account_ids: Vec::new(),
         created_at: timestamp,
     };
-    let global_branch_ref_row = untracked_row(
+    // Keep one distinct public ref change id per initial branch, matching the
+    // old `lix_branch_ref` current rows without writing those rows into the
+    // normal sidecar plane.
+    let global_branch_ref_change = branch_ref_ledger_change(
         functions.call_uuid_v7(),
-        EntityPk::single(GLOBAL_BRANCH_ID),
-        BRANCH_REF_SCHEMA_KEY,
-        branch_ref_snapshot(GLOBAL_BRANCH_ID, &initial_commit_id)?,
+        GLOBAL_BRANCH_ID,
+        initial_commit_id,
         timestamp,
-    );
-    let main_branch_ref_row = untracked_row(
+    )?;
+    let global_branch_control = InitBranchHeadControl {
+        branch_id: GLOBAL_BRANCH_ID.to_string(),
+        control: BranchHeadControl {
+            head_commit_id: initial_commit_id,
+            generation: initial_commit_id,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: global_branch_ref_change.id,
+        },
+        branch_ref_change: global_branch_ref_change,
+    };
+    let main_branch_ref_change = branch_ref_ledger_change(
         functions.call_uuid_v7(),
-        EntityPk::single(&main_branch_id),
-        BRANCH_REF_SCHEMA_KEY,
-        branch_ref_snapshot(&main_branch_id, &initial_commit_id)?,
+        &main_branch_id,
+        initial_commit_id,
         timestamp,
-    );
+    )?;
+    let main_branch_control = InitBranchHeadControl {
+        branch_id: main_branch_id.clone(),
+        control: BranchHeadControl {
+            head_commit_id: initial_commit_id,
+            generation: initial_commit_id,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: main_branch_ref_change.id,
+        },
+        branch_ref_change: main_branch_ref_change,
+    };
     let workspace_branch_row = untracked_row(
         functions.call_uuid_v7(),
         EntityPk::single(WORKSPACE_BRANCH_KEY),
@@ -217,11 +257,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
                 initial_checkpoint_change,
             ])
             .collect(),
-        untracked_rows: vec![
-            global_branch_ref_row,
-            main_branch_ref_row,
-            workspace_branch_row,
-        ],
+        branch_controls: vec![global_branch_control, main_branch_control],
+        untracked_rows: vec![workspace_branch_row],
         receipt: InitReceipt {
             lix_id,
             global_branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -265,6 +302,11 @@ where
         .iter()
         .map(seed_untracked_change_to_change_record)
         .collect::<Vec<_>>();
+    let branch_ref_ledger_changes = plan
+        .branch_controls
+        .iter()
+        .map(|branch| seed_untracked_change_to_change_record(&branch.branch_ref_change))
+        .collect::<Vec<_>>();
 
     stage_init_json_payloads(&mut writes, &plan)?;
     stage_init_changelog_commit(
@@ -274,6 +316,7 @@ where
         authored_changes
             .iter()
             .chain(&untracked_changes)
+            .chain(&branch_ref_ledger_changes)
             .cloned()
             .collect(),
     )
@@ -319,11 +362,11 @@ where
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
         let absence_guards = std::collections::BTreeSet::default();
-        for branch_id in [GLOBAL_BRANCH_ID, receipt.main_branch_id.as_str()] {
+        for branch in &plan.branch_controls {
             tracked_head
                 .writer(&read, &mut writes)
                 .stage_commit(
-                    branch_id,
+                    &branch.branch_id,
                     None,
                     plan.commit.id,
                     &head_deltas,
@@ -331,6 +374,7 @@ where
                     None,
                 )
                 .await?;
+            stage_branch_head_control(&mut writes, &branch.branch_id, branch.control)?;
         }
 
         let mut index_writer = live_index.writer(&read, &mut writes);
@@ -410,6 +454,11 @@ fn stage_init_json_payloads(
                     .iter()
                     .map(|row| row.snapshot_content.as_str()),
             )
+            .chain(
+                plan.branch_controls
+                    .iter()
+                    .map(|branch| branch.branch_ref_change.snapshot_content.as_str()),
+            )
             .filter(|snapshot| snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES)
             .map(NormalizedJsonRef::new),
     )?;
@@ -464,6 +513,27 @@ fn untracked_row(
     }
 }
 
+/// The direct control owns a branch ref's current visibility, while this
+/// standalone fact preserves the public immutable `lix_change` ledger row.
+/// It intentionally does not enter `LiveStateIndex`.
+fn branch_ref_ledger_change(
+    id: uuid::Uuid,
+    branch_id: &str,
+    commit_id: CommitId,
+    timestamp: LixTimestamp,
+) -> Result<InitSeedLiveRow, LixError> {
+    Ok(InitSeedLiveRow {
+        id: ChangeId::from(id),
+        entity_pk: EntityPk::single(branch_id),
+        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+        snapshot_content: branch_ref_snapshot(branch_id, commit_id)?,
+        created_at: timestamp,
+        updated_at: timestamp,
+        global: branch_id == GLOBAL_BRANCH_ID,
+        branch_id: branch_id.to_string(),
+    })
+}
+
 fn canonical_change(
     id: uuid::Uuid,
     entity_pk: EntityPk,
@@ -488,6 +558,13 @@ fn branch_descriptor_snapshot(id: &str, name: &str, hidden: bool) -> Result<Stri
     }))
 }
 
+fn branch_ref_snapshot(branch_id: &str, commit_id: CommitId) -> Result<String, LixError> {
+    encode_snapshot(json!({
+        "id": branch_id,
+        "commit_id": commit_id.to_string(),
+    }))
+}
+
 fn key_value_snapshot(key: &str, value: &str) -> Result<String, LixError> {
     encode_snapshot(json!({
         "key": key,
@@ -504,13 +581,6 @@ fn checkpoint_marker_snapshot(branch_id: &str) -> Result<String, LixError> {
 fn registered_schema_snapshot(schema: &serde_json::Value) -> Result<String, LixError> {
     encode_snapshot(json!({
         "value": schema,
-    }))
-}
-
-fn branch_ref_snapshot(id: &str, commit_id: &CommitId) -> Result<String, LixError> {
-    encode_snapshot(json!({
-        "id": id,
-        "commit_id": commit_id.to_string(),
     }))
 }
 
@@ -539,7 +609,7 @@ mod tests {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
 
         assert_eq!(plan.changes.len(), seed_schema_definitions().len() + 4);
-        assert_eq!(plan.untracked_rows.len(), 3);
+        assert_eq!(plan.untracked_rows.len(), 1);
         assert_eq!(plan.receipt.global_branch_id, GLOBAL_BRANCH_ID);
         assert_eq!(plan.receipt.main_branch_id, test_uuid(1));
         assert_eq!(plan.receipt.lix_id, test_uuid(2));
@@ -611,24 +681,28 @@ mod tests {
     }
 
     #[test]
-    fn plan_init_seed_branch_refs_point_to_initial_commit() {
+    fn plan_init_seed_keeps_branch_heads_out_of_untracked_state() {
         let plan = plan_init_seed(test_functions()).expect("init seed should plan");
-        let branch_refs = plan
-            .untracked_rows
-            .iter()
-            .filter(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-            .collect::<Vec<_>>();
-
-        assert_eq!(branch_refs.len(), 2);
+        assert_eq!(plan.untracked_rows.len(), 1);
+        assert!(
+            plan.untracked_rows
+                .iter()
+                .all(|row| row.schema_key != "lix_branch_ref")
+        );
         assert!(
             plan.changes
                 .iter()
-                .all(|change| change.schema_key != BRANCH_REF_SCHEMA_KEY)
+                .all(|change| change.schema_key != "lix_branch_ref")
         );
-        for row in branch_refs {
-            assert_eq!(row.schema_key, BRANCH_REF_SCHEMA_KEY);
-            assert_eq!(row.branch_id, GLOBAL_BRANCH_ID);
-            let snapshot = untracked_snapshot(row);
+        assert_eq!(plan.branch_controls.len(), 2);
+        for branch in &plan.branch_controls {
+            assert_eq!(branch.branch_ref_change.schema_key, BRANCH_REF_SCHEMA_KEY);
+            assert_eq!(branch.control.ref_change_id, branch.branch_ref_change.id);
+            let snapshot = untracked_snapshot(&branch.branch_ref_change);
+            assert_eq!(
+                snapshot.get("id").and_then(JsonValue::as_str),
+                Some(branch.branch_id.as_str())
+            );
             assert_eq!(
                 snapshot.get("commit_id").and_then(JsonValue::as_str),
                 Some(plan.receipt.initial_commit_id.as_str())

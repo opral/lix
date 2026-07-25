@@ -1,21 +1,12 @@
-use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
-use crate::branch::BRANCH_REF_SCHEMA_KEY;
-use crate::branch::{BranchHead, BranchRefReader};
+use crate::branch::{BranchHead, BranchHeadControlContext, BranchRefReader};
 use crate::changelog::CommitId;
-use crate::entity_pk::EntityPk;
-use crate::live_state::{
-    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest, MaterializedLiveStateIndexRow,
-};
 use crate::storage_adapter::StorageAdapterRead;
 
-/// Typed access to moving branch heads stored in live state.
+/// Typed access to moving branch heads stored in the v6 control plane.
 ///
-/// Branch refs are one of the inputs used by live_state visibility, so this
-/// context deliberately bypasses live_state and reads the canonical current
-/// rows directly. That keeps the dependency acyclic:
-/// live_index -> branch_ref -> live_state.
+/// The control record is deliberately below live-state visibility, keeping
+/// the dependency acyclic: `branch-control -> tracked-head -> live-state`.
 pub(super) struct BranchRefContext {}
 
 impl BranchRefContext {
@@ -29,7 +20,9 @@ impl BranchRefContext {
     where
         S: StorageAdapterRead,
     {
-        BranchRefStoreReader { store }
+        BranchRefStoreReader {
+            controls: BranchHeadControlContext::new().reader(store),
+        }
     }
 }
 
@@ -38,7 +31,7 @@ pub(super) struct BranchRefStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    store: S,
+    controls: crate::branch::BranchHeadControlReader<S>,
 }
 
 impl<S> BranchRefStoreReader<S>
@@ -46,20 +39,14 @@ where
     S: StorageAdapterRead,
 {
     pub(crate) async fn load_head(&self, branch_id: &str) -> Result<Option<BranchHead>, LixError> {
-        let Some(row) = LiveStateIndexContext::new()
-            .reader(&self.store)
-            .load_row(&LiveStateIndexRowRequest {
-                schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(branch_id),
-                file_id: None,
-            })
+        Ok(self
+            .controls
+            .load(branch_id)
             .await?
-        else {
-            return Ok(None);
-        };
-
-        decode_branch_head(branch_id, &row)
+            .map(|control| BranchHead {
+                branch_id: branch_id.to_string(),
+                commit_id: control.head_commit_id,
+            }))
     }
 
     pub(crate) async fn load_head_commit_id(
@@ -70,30 +57,16 @@ where
     }
 
     pub(crate) async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-        let rows = LiveStateIndexContext::new()
-            .reader(&self.store)
-            .scan_rows(&LiveStateIndexScanRequest {
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                filter: LiveStateIndexFilter {
-                    schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                    ..LiveStateIndexFilter::default()
-                },
-                projection: Vec::new(),
-                limit: None,
-            })
-            .await?;
-        let mut heads = rows
-            .iter()
-            .map(|row| {
-                let branch_id = row.entity_pk.as_single_string_owned()?;
-                decode_branch_head(&branch_id, row)
-            })
-            .collect::<Result<Vec<_>, _>>()?
+        Ok(self
+            .controls
+            .scan()
+            .await?
             .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        heads.sort_by(|left, right| left.branch_id.cmp(&right.branch_id));
-        Ok(heads)
+            .map(|(branch_id, control)| BranchHead {
+                branch_id,
+                commit_id: control.head_commit_id,
+            })
+            .collect())
     }
 }
 
@@ -115,41 +88,11 @@ where
     }
 }
 
-fn decode_branch_head(
-    requested_branch_id: &str,
-    row: &MaterializedLiveStateIndexRow,
-) -> Result<Option<BranchHead>, LixError> {
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-        return Ok(None);
-    };
-    let snapshot =
-        serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("engine branch-ref snapshot parse failed: {error}"),
-            )
-        })?;
-    let commit_id = snapshot
-        .get("commit_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("branch ref for branch '{requested_branch_id}' is missing commit_id"),
-            )
-        })?;
-    Ok(Some(BranchHead {
-        branch_id: requested_branch_id.to_string(),
-        commit_id: CommitId::parse_lix(commit_id, "branch ref commit_id")?,
-    }))
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::changelog::{
-        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
-    };
-    use crate::live_state::{LiveStateIndexDeltaRef, LiveStateIndexRowRequest};
+    use crate::branch::{BranchHeadControl, stage_branch_head_control};
+    use crate::changelog::{ChangeId, CommitId};
+    use crate::common::LixTimestamp;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
 
@@ -174,11 +117,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn advance_head_writes_global_current_ref() {
+    async fn advance_head_writes_direct_control() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_ref = BranchRefContext::new();
 
-        stage_branch_head(&storage, "branch-a", "commit-a", "2026-01-01T00:00:00Z")
+        stage_branch_head(&storage, "branch-a", "commit-a")
             .await
             .expect("branch head should advance");
 
@@ -194,24 +137,6 @@ mod tests {
             .expect("branch head should exist");
         assert_eq!(head.branch_id, "branch-a");
         assert_eq!(head.commit_id, "commit-a");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
-        let row = LiveStateIndexContext::new()
-            .reader(read)
-            .load_row(&LiveStateIndexRowRequest {
-                schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single("branch-a"),
-                file_id: None,
-            })
-            .await
-            .expect("branch-ref row should load")
-            .expect("branch-ref row should exist");
-        assert_eq!(row.created_at, "2026-01-01T00:00:00.000Z");
-        assert_eq!(row.updated_at, "2026-01-01T00:00:00.000Z");
     }
 
     #[tokio::test]
@@ -219,10 +144,10 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let branch_ref = test_branch_ref();
 
-        stage_branch_head(&storage, "branch-b", "commit-b", "2026-01-01T00:00:00Z")
+        stage_branch_head(&storage, "branch-b", "commit-b")
             .await
             .expect("branch-b should advance");
-        stage_branch_head(&storage, "branch-a", "commit-a", "2026-01-01T00:00:00Z")
+        stage_branch_head(&storage, "branch-a", "commit-a")
             .await
             .expect("branch-a should advance");
 
@@ -259,55 +184,26 @@ mod tests {
         storage: &StorageAdapter,
         branch_id: &str,
         commit_id: &str,
-        timestamp: &str,
     ) -> Result<(), LixError> {
         let commit_id = CommitId::parse_lix(commit_id, "test branch head commit_id")?;
-        let timestamp = crate::common::LixTimestamp::expect_parse("timestamp", timestamp);
-        let entity_pk = EntityPk::single(branch_id);
-        let snapshot = serde_json::json!({
-            "id": branch_id,
-            "commit_id": commit_id,
-        })
-        .to_string();
-        let change_id = ChangeId::for_test_label(&format!("branch-ref-{branch_id}"));
-        let read = storage.begin_read(StorageReadOptions::default()).await?;
         let mut writes = storage.new_write_set();
-        {
-            let mut changelog_read = &read;
-            ChangelogContext::new()
-                .writer(&mut changelog_read, &mut writes)
-                .stage_append(ChangelogAppend {
-                    changes: vec![ChangeRecord {
-                        format_version: 2,
-                        change_id,
-                        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-                        entity_pk: entity_pk.clone(),
-                        file_id: None,
-                        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
-                        metadata: crate::json_store::JsonSlot::None,
-                        created_at: timestamp,
-                        origin_key: None,
-                    }],
-                    ..ChangelogAppend::default()
-                })
-                .await?;
-        }
-        LiveStateIndexContext::new()
-            .writer(&read, &mut writes)
-            .stage_branch_rows(
-                GLOBAL_BRANCH_ID,
-                [LiveStateIndexDeltaRef {
-                    schema_key: BRANCH_REF_SCHEMA_KEY,
-                    file_id: None,
-                    entity_pk: &entity_pk,
-                    change_id,
-                    commit_id: None,
-                    deleted: false,
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                }],
-            )
-            .await?;
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id: commit_id,
+                generation: commit_id,
+                created_at: LixTimestamp::expect_parse(
+                    "test branch ref created_at",
+                    "2026-01-01T00:00:00Z",
+                ),
+                updated_at: LixTimestamp::expect_parse(
+                    "test branch ref updated_at",
+                    "2026-01-01T00:00:00Z",
+                ),
+                ref_change_id: ChangeId::for_test_label("test-branch-ref-change"),
+            },
+        )?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await?;

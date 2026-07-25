@@ -14,6 +14,7 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
+use crate::branch::BranchHeadControl;
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -264,15 +265,50 @@ impl<S> TrackedHeadStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// v6 control-plane variant of [`Self::scan_live_rows_if_current`].
+    ///
+    /// The direct branch control and the v5 marker are published in one
+    /// storage commit. Requiring both the head and generation to agree makes
+    /// a partially rebuilt or stale group projection a clean historical
+    /// fallback rather than visible current state.
+    pub(crate) async fn scan_live_rows_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        self.scan_live_rows_for_marker(
+            branch_id,
+            self.marker_if_control_current(branch_id, control).await?,
+            request,
+        )
+        .await
+    }
+
     /// Returns `None` when this branch has no projection for the canonical
     /// branch ref. That is a cache miss, not empty tracked state.
+    #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        let Some(marker) = self.marker_if_current(branch_id, expected_head).await? else {
+        self.scan_live_rows_for_marker(
+            branch_id,
+            self.marker_if_current(branch_id, expected_head).await?,
+            request,
+        )
+        .await
+    }
+
+    async fn scan_live_rows_for_marker(
+        &self,
+        branch_id: &str,
+        marker: Option<TrackedHeadMarker>,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        let Some(marker) = marker else {
             return Ok(None);
         };
         let entries = scan_entries(
@@ -297,6 +333,7 @@ where
 
     /// Like the immutable-root point batch, preserves input cardinality and
     /// returns tombstones for the visibility layer to resolve.
+    #[cfg(test)]
     pub(crate) async fn load_projected_live_rows_if_current(
         &self,
         branch_id: &str,
@@ -304,10 +341,26 @@ where
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
     ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
+        self.load_projected_live_rows_for_marker(
+            branch_id,
+            self.marker_if_current(branch_id, expected_head).await?,
+            keys,
+            projection,
+        )
+        .await
+    }
+
+    async fn load_projected_live_rows_for_marker(
+        &self,
+        branch_id: &str,
+        marker: Option<TrackedHeadMarker>,
+        keys: &[TrackedStateKey],
+        projection: &ChangeRecordProjection,
+    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
         if keys.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let Some(marker) = self.marker_if_current(branch_id, expected_head).await? else {
+        let Some(marker) = marker else {
             return Ok(None);
         };
 
@@ -386,9 +439,28 @@ where
         Ok(Some(output))
     }
 
+    /// v6 control-plane variant of
+    /// [`Self::load_projected_live_rows_if_current`].
+    pub(crate) async fn load_projected_live_rows_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        keys: &[TrackedStateKey],
+        projection: &ChangeRecordProjection,
+    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
+        self.load_projected_live_rows_for_marker(
+            branch_id,
+            self.marker_if_control_current(branch_id, control).await?,
+            keys,
+            projection,
+        )
+        .await
+    }
+
     /// Returns the durable serving generation exactly when the marker is
     /// bound to `expected_head`. Commit staging passes this value directly to
     /// the writer so a serial child needs one marker point read, not two.
+    #[cfg(test)]
     pub(crate) async fn generation_if_current(
         &self,
         branch_id: &str,
@@ -400,6 +472,20 @@ where
             .map(|marker| marker.generation))
     }
 
+    /// Returns the durable v5 generation only when it is atomically bound to
+    /// the observed v6 branch control.
+    pub(crate) async fn generation_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+    ) -> Result<Option<CommitId>, LixError> {
+        Ok(self
+            .marker_if_control_current(branch_id, control)
+            .await?
+            .map(|marker| marker.generation))
+    }
+
+    #[cfg(test)]
     async fn marker_if_current(
         &self,
         branch_id: &str,
@@ -408,6 +494,18 @@ where
         let expected_head = CommitId::parse_lix(expected_head, "tracked-head expected commit")?;
         let marker = load_marker(&self.store, branch_id).await?;
         Ok(marker.filter(|marker| marker.head_commit_id == expected_head))
+    }
+
+    async fn marker_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+    ) -> Result<Option<TrackedHeadMarker>, LixError> {
+        let marker = load_marker(&self.store, branch_id).await?;
+        Ok(marker.filter(|marker| {
+            marker.head_commit_id == control.head_commit_id
+                && marker.generation == control.generation
+        }))
     }
 }
 
@@ -433,7 +531,7 @@ where
         deltas: &[TrackedHeadDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-    ) -> Result<(), LixError> {
+    ) -> Result<CommitId, LixError> {
         let matches_parent = parent_generation.is_some();
         let generation = parent_generation.unwrap_or(new_head);
 
@@ -573,7 +671,7 @@ where
                 generation,
             },
         )?;
-        Ok(())
+        Ok(generation)
     }
 }
 
@@ -1880,6 +1978,7 @@ fn materialize_live_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::branch::{BranchHeadControl, stage_branch_head_control};
     use crate::json_store::{JsonWritePlacementRef, NormalizedJsonRef};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
@@ -2097,6 +2196,13 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let head = CommitId::for_test_label("head");
+        let control = BranchHeadControl {
+            head_commit_id: head,
+            generation: head,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: ChangeId::for_test_label("branch-ref"),
+        };
         let entity_pk = EntityPk::single("row");
         let second_entity_pk = EntityPk::single("row-2");
         let deltas = [
@@ -2159,6 +2265,8 @@ mod tests {
             .stage_commit(branch_id, None, head, &deltas, &BTreeSet::new(), None)
             .await
             .expect("stage grouped head");
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("stage matching v6 control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2311,6 +2419,36 @@ mod tests {
                 .all(|row| row.file_id.as_deref() == Some("file-b"))
         );
 
+        // The v6 control plane only validates the generation marker. Exact
+        // file identity and schema-scoped file-id reads must still route to
+        // the v5 member projection even when every backing group is absent.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open v6 file-id scan");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_control_current(
+                branch_id,
+                control,
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("v6 file-id scan should execute")
+            .expect("matching v6 control and marker");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .all(|row| row.file_id.as_deref() == Some("file-b"))
+        );
+
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -2332,6 +2470,32 @@ mod tests {
             .expect("marker should match");
         assert_eq!(rows.len(), 1);
         let row = rows[0].as_ref().expect("explicit member should resolve");
+        assert_eq!(row.file_id.as_deref(), Some("file-b"));
+        assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open v6 exact file read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .load_projected_live_rows_if_control_current(
+                branch_id,
+                control,
+                &[TrackedStateKey {
+                    schema_key: "schema".to_string(),
+                    entity_pk: EntityPk::single("row"),
+                    file_id: Some("file-b".to_string()),
+                }],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("v6 exact file read should execute")
+            .expect("matching v6 control and marker");
+        assert_eq!(rows.len(), 1);
+        let row = rows[0]
+            .as_ref()
+            .expect("v6 explicit member should resolve without its group");
         assert_eq!(row.file_id.as_deref(), Some("file-b"));
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
     }
