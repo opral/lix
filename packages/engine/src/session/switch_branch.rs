@@ -109,7 +109,6 @@ fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, Li
         metadata: None,
         origin: None,
         created_at: None,
-        created_at_from_visible_row: false,
         updated_at: None,
         global: true,
         change_id: None,

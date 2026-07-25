@@ -996,7 +996,6 @@ fn tracked_head_delta_from_state_row(
         commit_id,
         deleted: row.snapshot.is_none(),
         created_at: row.created_at,
-        created_at_from_visible_row: row.created_at_from_visible_row,
         updated_at: row.updated_at,
         snapshot: row.snapshot.as_ref().map_or(
             crate::json_store::JsonSlotRef::None,
@@ -2693,121 +2692,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trusted_singleton_head_delta_reuses_visible_created_at_without_row_read() {
-        let memory = Memory::new();
-        let storage = StorageAdapter::new(memory.clone());
-        let binary_cas = BinaryCasContext::new();
-        let branch_ctx = BranchContext::new();
-        let first_created_at = ts("2026-01-01T00:00:00Z");
-
-        let mut first = tracked_branch_row("branch-a", "first-visible-change");
-        first.commit_id = Some(commit_id("first-visible-commit"));
-        first.created_at = first_created_at;
-        first.updated_at = first_created_at;
-        let mut first_read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("first commit read should open");
-        let (writes, _) = commit_prepared_writes(
-            &binary_cas,
-            &branch_ctx,
-            &LiveStateIndexContext::new(),
-            None,
-            &mut first_read,
-            PreparedWriteSet {
-                insert_identities: BTreeMap::new(),
-                state_rows: vec![first],
-                commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
-                    change_refs_with(
-                        ["first-visible-change"],
-                        "first-visible-commit",
-                        "first-visible-commit-change",
-                        "first-visible-branch-ref-change",
-                    ),
-                )]),
-                first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_publications: Vec::new(),
-                extra_commit_parents_by_branch: BTreeMap::new(),
-                file_data_writes: Vec::new(),
-            },
-        )
-        .await
-        .expect("first local commit should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("first local commit should persist");
-
-        let counts = Arc::new(TrackedHeadReadCounts::default());
-        let mut second_read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
-            inner: memory
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("trusted replacement read should open"),
-            counts: Arc::clone(&counts),
-        });
-        let mut second = tracked_branch_row("branch-a", "second-visible-change");
-        second.commit_id = Some(commit_id("second-visible-commit"));
-        second.created_at = first_created_at;
-        second.created_at_from_visible_row = true;
-        second.updated_at = ts("2026-01-02T00:00:00Z");
-        let (writes, _) = commit_prepared_writes(
-            &binary_cas,
-            &branch_ctx,
-            &LiveStateIndexContext::new(),
-            None,
-            &mut second_read,
-            PreparedWriteSet {
-                insert_identities: BTreeMap::new(),
-                state_rows: vec![second],
-                commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
-                    change_refs_with(
-                        ["second-visible-change"],
-                        "second-visible-commit",
-                        "second-visible-commit-change",
-                        "second-visible-branch-ref-change",
-                    ),
-                )]),
-                first_commit_parent_override_by_branch: BTreeMap::new(),
-                checkpoint_publications: Vec::new(),
-                extra_commit_parents_by_branch: BTreeMap::new(),
-                file_data_writes: Vec::new(),
-            },
-        )
-        .await
-        .expect("trusted replacement should stage");
-        assert_eq!(
-            counts.row_get_many_calls.load(Ordering::Relaxed),
-            0,
-            "a trusted singleton replacement must not re-read its tracked-head row"
-        );
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("trusted replacement should persist");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read after trusted replacement should open");
-        let row = live_state_context()
-            .reader(read)
-            .load_row(&LiveStateRowRequest {
-                schema_key: "test_schema".to_string(),
-                branch_id: "branch-a".to_string(),
-                entity_pk: EntityPk::single("entity-1"),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await
-            .expect("trusted replacement should remain readable")
-            .expect("trusted replacement should preserve a current row");
-        assert_eq!(row.created_at, first_created_at);
-        assert_eq!(row.updated_at, ts("2026-01-02T00:00:00Z"));
-    }
-
-    #[tokio::test]
     async fn normal_head_projections_preserve_global_fallback_branch_override_and_tombstones() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
@@ -3830,7 +3714,6 @@ mod tests {
             origin: None,
             origin_key: None,
             created_at: ts("2026-01-01T00:00:00Z"),
-            created_at_from_visible_row: false,
             updated_at: ts("2026-01-01T00:00:00Z"),
             global: branch_id == GLOBAL_BRANCH_ID,
             change_id: Some(ChangeId::for_test_label(change_id)),
