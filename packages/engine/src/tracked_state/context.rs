@@ -140,6 +140,7 @@ struct DiffCommitRootValidationCache {
 struct PointReplayCommit {
     parent_commit_id: Option<CommitId>,
     root_id: Option<TrackedStateRootId>,
+    rootless: bool,
 }
 
 impl DiffCommitRootValidationCache {
@@ -901,6 +902,21 @@ where
                 .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
                 .await;
         }
+        if let Some(entries) = self
+            .diff_tree_entries_from_first_parent_interval(left_commit_id, right_commit_id, request)
+            .await?
+        {
+            return Ok(entries);
+        }
+        if let Some(mut entries) = self
+            .diff_tree_entries_from_first_parent_interval(right_commit_id, left_commit_id, request)
+            .await?
+        {
+            for entry in &mut entries {
+                std::mem::swap(&mut entry.before, &mut entry.after);
+            }
+            return Ok(entries);
+        }
         let left = self.replay_index_entries_at_commit(left_commit_id).await?;
         let right = if left_commit_id == right_commit_id {
             left.clone()
@@ -926,6 +942,98 @@ where
                 )
             })
             .collect())
+    }
+
+    /// Diffs an ancestor/descendant pair from immutable per-commit deltas.
+    ///
+    /// Merge always compares its merge base with each head. Walking only that
+    /// first-parent interval makes the common branch case proportional to the
+    /// commits and identities changed since the base, rather than every entity
+    /// inherited by both commits.
+    async fn diff_tree_entries_from_first_parent_interval(
+        &mut self,
+        ancestor_commit_id: &str,
+        descendant_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Option<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>>, LixError> {
+        let Some(interval) = self
+            .first_parent_interval_between(ancestor_commit_id, descendant_commit_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut keys = BTreeSet::new();
+        for commit_id in interval {
+            for (key, _) in
+                storage::scan_commit_delta_values(&self.store, commit_id, &request.schema_keys)
+                    .await?
+            {
+                if request.matches_key(&key) {
+                    keys.insert(key);
+                }
+            }
+        }
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let before = self
+            .replay_index_values_for_keys_at_commit(ancestor_commit_id, &keys)
+            .await?;
+        let after = self
+            .replay_index_values_for_keys_at_commit(descendant_commit_id, &keys)
+            .await?;
+        Ok(Some(
+            keys.into_iter()
+                .zip(before)
+                .zip(after)
+                .filter_map(|((key, before), after)| {
+                    (before != after).then_some(
+                        crate::tracked_state::types::TrackedStateTreeDiffEntry {
+                            before: before.map(|value| (key.clone(), value)),
+                            after: after.map(|value| (key, value)),
+                        },
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    async fn first_parent_interval_between(
+        &mut self,
+        ancestor_commit_id: &str,
+        descendant_commit_id: &str,
+    ) -> Result<Option<Vec<CommitId>>, LixError> {
+        let ancestor =
+            CommitId::parse_lix(ancestor_commit_id, "tracked-state diff ancestor commit_id")?;
+        let mut current = CommitId::parse_lix(
+            descendant_commit_id,
+            "tracked-state diff descendant commit_id",
+        )?;
+        let mut interval = Vec::new();
+        let mut seen = HashSet::new();
+        loop {
+            if current == ancestor {
+                return Ok(Some(interval));
+            }
+            if !seen.insert(current) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot diff tracked_state commits: first-parent cycle includes '{current}'"
+                    ),
+                ));
+            }
+            interval.push(current);
+            let replay_commit = self.load_point_replay_commit(current).await?;
+            if !replay_commit.rootless {
+                return Ok(None);
+            }
+            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+                return Ok(None);
+            };
+            current = parent_commit_id;
+        }
     }
 
     async fn diff_tree_entries_from_roots(
@@ -1188,15 +1296,6 @@ where
                 }
             }
         };
-        if record.tracked_state_rootless && record.parent_commit_ids.len() > 1 {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "rootless tracked-state commit '{commit_id}' has {} parents",
-                    record.parent_commit_ids.len()
-                ),
-            ));
-        }
         let root_id = if record.tracked_state_rootless {
             None
         } else {
@@ -1207,6 +1306,7 @@ where
         let replay_commit = PointReplayCommit {
             parent_commit_id: record.parent_commit_ids.first().copied(),
             root_id,
+            rootless: record.tracked_state_rootless,
         };
         self.point_replay_commits
             .insert(commit_id, replay_commit.clone());
