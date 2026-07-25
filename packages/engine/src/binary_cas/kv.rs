@@ -12,19 +12,22 @@ use crate::binary_cas::codec::{
 use crate::binary_cas::compression::{decode_zstd_chunk, encode_chunk_payload};
 use crate::binary_cas::{
     BinaryCasChunking, BlobBytesBatch, BlobHash, BlobLayout, BlobMetadata, BlobMetadataBatch,
-    BlobWriteReceipt, InlineBlob,
+    BlobSameLengthSplice, BlobWriteReceipt, InlineBlob,
 };
+#[cfg(test)]
+use crate::storage_adapter::StoragePrefix;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageSpace, StorageWriteSet,
 };
 use crate::storage_adapter::{
-    StorageCoreProjection, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
+    StorageCoreProjection, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
     StorageScanOptions, StorageSpaceId, StorageValue,
 };
 use bytes::Bytes;
 use futures_util::{StreamExt, stream};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ops::Bound;
 use web_time::Instant;
 
 // Keep independent manifest scans bounded so large blob batches do not create
@@ -102,6 +105,7 @@ pub(crate) fn stage_manifest(
     );
 }
 
+#[cfg(test)]
 pub(crate) async fn scan_manifest_chunks(
     store: &impl StorageAdapterRead,
     blob_hash: BlobHash,
@@ -121,6 +125,42 @@ pub(crate) async fn scan_manifest_chunks(
         })
     })
     .collect()
+}
+
+/// Loads exactly the manifest rows declared by a chunked blob's metadata.
+///
+/// Blob roots are content-addressed by their complete bytes, while chunk rows
+/// are a mutable physical representation. A later valid writer may select a
+/// different layout for the same content hash. Restricting reads to the
+/// declared ordinal range keeps stale suffix rows harmless; the caller still
+/// rejects missing declared rows by comparing the resulting count.
+async fn load_declared_manifest_chunks(
+    store: &impl StorageAdapterRead,
+    blob_hash: BlobHash,
+    chunk_count: u32,
+) -> Result<Vec<KvBlobManifestChunk>, LixError> {
+    if chunk_count == 0 {
+        return Ok(Vec::new());
+    }
+    let range = StorageKeyRange {
+        lower: Bound::Included(StorageKey(Bytes::from(manifest_chunk_key(blob_hash, 0)))),
+        upper: Bound::Excluded(StorageKey(Bytes::from(manifest_chunk_key(
+            blob_hash,
+            u64::from(chunk_count),
+        )))),
+    };
+    let plan = ScanPlan::range(BINARY_CAS_MANIFEST_CHUNK_SPACE, range);
+    scan_all_values_for_plan(store, &plan)
+        .await?
+        .into_iter()
+        .map(|value| {
+            let (chunk_hash, chunk_size) = decode_binary_cas_manifest_chunk(&value)?;
+            Ok(KvBlobManifestChunk {
+                chunk_hash,
+                chunk_size,
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn stage_manifest_chunk(
@@ -213,6 +253,7 @@ async fn get_one(
         .map(|bytes| bytes.to_vec()))
 }
 
+#[cfg(test)]
 async fn scan_all_values(
     store: &impl StorageAdapterRead,
     space: StorageSpace,
@@ -224,6 +265,13 @@ async fn scan_all_values(
             bytes: Bytes::from(prefix),
         },
     );
+    scan_all_values_for_plan(store, &plan).await
+}
+
+async fn scan_all_values_for_plan(
+    store: &impl StorageAdapterRead,
+    plan: &ScanPlan,
+) -> Result<Vec<Vec<u8>>, LixError> {
     let mut values = Vec::new();
     let mut resume_after = None;
     loop {
@@ -313,7 +361,8 @@ pub(crate) async fn load_bytes_many(
     let mut scans = stream::iter(chunked_blobs.into_iter().enumerate())
         .map(|(order, (blob_hash, chunk_count))| async move {
             let result = async {
-                let manifest_chunks = scan_manifest_chunks(store, blob_hash).await?;
+                let manifest_chunks =
+                    load_declared_manifest_chunks(store, blob_hash, chunk_count).await?;
                 if manifest_chunks.len() != chunk_count as usize {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -710,6 +759,132 @@ where
     Ok(receipt)
 }
 
+/// Attempts to stage a full replacement by retaining the base manifest's
+/// unchanged chunk references around one host-verified fixed-width splice.
+///
+/// This is deliberately opportunistic. The caller still owns complete
+/// replacement bytes and falls back to [`stage_blob_write_skipping_existing_chunks`]
+/// for every missing, malformed, non-chunked, length-changing, or otherwise
+/// ineligible base. A manifest is an ordered content-addressed chunk list;
+/// readers do not require its boundaries to have been freshly produced by
+/// FastCDC, so keeping valid existing boundaries is format-compatible.
+pub(in crate::binary_cas) async fn try_stage_blob_write_reusing_same_length_splice<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    blob_hashes: &mut HashSet<[u8; 32]>,
+    chunk_keys: &mut HashSet<Vec<u8>>,
+    bytes: &[u8],
+    precomputed_hash: Option<BlobHash>,
+    splice: BlobSameLengthSplice,
+) -> Result<bool, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let Some(blob_hash) = precomputed_hash else {
+        return Ok(false);
+    };
+    let Some(splice_end) = splice.end() else {
+        return Ok(false);
+    };
+    if splice.length == 0 || splice_end > bytes.len() {
+        return Ok(false);
+    }
+    if blob_hashes.contains(&blob_hash.into_bytes()) {
+        return Ok(true);
+    }
+
+    let metadata = match load_metadata_many(&store, &[splice.base_blob_hash]).await {
+        Ok(metadata) => metadata.into_vec().pop().flatten(),
+        Err(_) => return Ok(false),
+    };
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    let BlobLayout::Chunked { chunk_count } = &metadata.layout else {
+        return Ok(false);
+    };
+    let chunk_count = *chunk_count;
+    if metadata.size_bytes != bytes.len() as u64 {
+        return Ok(false);
+    }
+
+    let Ok(base_chunks) =
+        load_declared_manifest_chunks(&store, splice.base_blob_hash, chunk_count).await
+    else {
+        return Ok(false);
+    };
+    if base_chunks.len() != chunk_count as usize {
+        return Ok(false);
+    }
+
+    let mut cursor = 0usize;
+    let mut chunks = Vec::with_capacity(base_chunks.len());
+    let mut changed_chunks = Vec::new();
+    for base_chunk in base_chunks {
+        let Ok(chunk_len) = usize::try_from(base_chunk.chunk_size) else {
+            return Ok(false);
+        };
+        if chunk_len == 0 || chunk_len > MAX_BINARY_CAS_CHUNK_BYTES {
+            return Ok(false);
+        }
+        let Some(end) = cursor.checked_add(chunk_len) else {
+            return Ok(false);
+        };
+        if end > bytes.len() {
+            return Ok(false);
+        }
+        let changed = cursor < splice_end && splice.offset < end;
+        let chunk = PreparedChunk {
+            start: cursor,
+            end,
+            hash: if changed {
+                BlobHash::from_content(&bytes[cursor..end])
+            } else {
+                BlobHash::from_bytes(base_chunk.chunk_hash)
+            },
+        };
+        if changed {
+            changed_chunks.push(chunk);
+        }
+        chunks.push((chunk, changed));
+        cursor = end;
+    }
+    if cursor != bytes.len() || changed_chunks.is_empty() {
+        return Ok(false);
+    }
+
+    let mut chunk_hashes_to_stage =
+        missing_chunk_hashes_for_chunks(store, chunk_keys, &changed_chunks).await?;
+    if !blob_hashes.insert(blob_hash.into_bytes()) {
+        return Ok(true);
+    }
+
+    stage_manifest(
+        writes,
+        blob_hash,
+        &BinaryCasManifest::Chunked {
+            size_bytes: bytes.len() as u64,
+            chunk_count,
+        },
+    );
+    for (chunk_index, (chunk, changed)) in chunks.into_iter().enumerate() {
+        let chunk_data = &bytes[chunk.start..chunk.end];
+        if changed && chunk_hashes_to_stage.remove(&chunk.hash) {
+            stage_content_chunk(writes, chunk.hash, chunk_data)?;
+        }
+        stage_manifest_chunk(
+            writes,
+            blob_hash,
+            chunk_index as u64,
+            &KvBlobManifestChunk {
+                chunk_hash: *chunk.hash.as_bytes(),
+                chunk_size: chunk_data.len() as u64,
+            },
+        );
+    }
+    Ok(true)
+}
+
 fn prepare_blob_write(
     chunking: BinaryCasChunking,
     bytes: &[u8],
@@ -892,6 +1067,30 @@ async fn missing_chunk_hashes(
         .collect())
 }
 
+async fn missing_chunk_hashes_for_chunks(
+    store: &(impl StorageAdapterRead + ?Sized),
+    transaction_chunk_keys: &mut HashSet<Vec<u8>>,
+    chunks: &[PreparedChunk],
+) -> Result<HashSet<BlobHash>, LixError> {
+    let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
+    for chunk in chunks {
+        collect_chunk_lookup_candidate(chunk.hash, transaction_chunk_keys, &mut candidates);
+    }
+    if candidates.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let keys = candidates
+        .iter()
+        .map(|(_, key)| key.clone())
+        .collect::<Vec<_>>();
+    let existing = chunk_keys_exist(store, keys).await?;
+    Ok(candidates
+        .into_iter()
+        .zip(existing)
+        .filter_map(|((chunk_hash, _), exists)| (!exists).then_some(chunk_hash))
+        .collect())
+}
+
 fn collect_chunk_lookup_candidate(
     chunk_hash: BlobHash,
     transaction_chunk_keys: &mut HashSet<Vec<u8>>,
@@ -989,6 +1188,7 @@ fn manifest_key(blob_hash: BlobHash) -> Vec<u8> {
     blob_hash.as_bytes().to_vec()
 }
 
+#[cfg(test)]
 fn manifest_chunk_prefix(blob_hash: BlobHash) -> Vec<u8> {
     blob_hash.as_bytes().to_vec()
 }
@@ -1246,6 +1446,23 @@ mod tests {
             .expect("test blob write should stage")
     }
 
+    async fn stage_test_file_payload(
+        storage: &StorageAdapter<Memory>,
+        writes: &mut StorageWriteSet,
+        payload: &BlobPayload,
+        same_length_splice: Option<BlobSameLengthSplice>,
+    ) {
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("test blob read should open");
+        BinaryCasContext::new()
+            .writer_skipping_existing_chunks(&store, writes)
+            .stage_file_payload(payload, same_length_splice)
+            .await
+            .expect("test file payload should stage");
+    }
+
     async fn stage_test_bytes(
         storage: &StorageAdapter<Memory>,
         writes: &mut StorageWriteSet,
@@ -1326,6 +1543,49 @@ mod tests {
                     chunk_size: 6,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn declared_manifest_reads_ignore_stale_suffix_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let (blob_hash, expected) = {
+            let mut writes = storage.new_write_set();
+            let fixture = stage_two_chunk_blob(&mut writes, 0);
+            stage_manifest_chunk(
+                &mut writes,
+                fixture.0,
+                2,
+                &KvBlobManifestChunk {
+                    chunk_hash: BlobHash::from_content(b"stale manifest suffix").into_bytes(),
+                    chunk_size: 1,
+                },
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("manifest fixture should commit");
+            fixture
+        };
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        assert_eq!(
+            scan_manifest_chunks(&store, blob_hash)
+                .await
+                .expect("raw manifest rows should scan")
+                .len(),
+            3,
+            "the physical suffix is intentionally present",
+        );
+        assert_eq!(
+            load_bytes_many(&store, &[blob_hash])
+                .await
+                .expect("declared manifest rows should load")
+                .into_vec(),
+            vec![Some(expected)],
         );
     }
 
@@ -1891,6 +2151,156 @@ mod tests {
                 .expect("blob should load")
                 .into_vec(),
             vec![Some(data)]
+        );
+    }
+
+    #[tokio::test]
+    async fn same_length_splice_writer_reuses_unchanged_manifest_chunks_and_roundtrips() {
+        let storage = StorageAdapter::new(Memory::new());
+        let before = definitely_multi_chunk_blob_bytes();
+        let base_blob_hash = BlobHash::from_content(&before);
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &before).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("base blob should commit");
+        }
+
+        let base_chunks = {
+            let store = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("base manifest read should open");
+            scan_manifest_chunks(&store, base_blob_hash)
+                .await
+                .expect("base manifest should scan")
+        };
+        assert!(base_chunks.len() > 1, "fixture must be chunked");
+        let changed_chunk_index = base_chunks.len() / 2;
+        let changed_chunk_start = base_chunks
+            .iter()
+            .take(changed_chunk_index)
+            .map(|chunk| usize::try_from(chunk.chunk_size).expect("chunk size should fit"))
+            .sum::<usize>();
+        let changed_chunk_len =
+            usize::try_from(base_chunks[changed_chunk_index].chunk_size).expect("chunk fits");
+        let edit_offset = changed_chunk_start + changed_chunk_len / 2;
+        let mut after = before.clone();
+        after[edit_offset] ^= 0xff;
+        let after_blob_hash = BlobHash::from_content(&after);
+        let after_payload = BlobPayload::from_bytes(after.clone());
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_file_payload(
+                &storage,
+                &mut writes,
+                &after_payload,
+                Some(BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1)),
+            )
+            .await;
+            assert_eq!(
+                writes.stats().staged_puts,
+                u64::try_from(base_chunks.len() + 3).expect("write count should fit"),
+                "one changed chunk needs one presence marker and one payload; all other chunks are manifest references",
+            );
+            writes
+                .validate()
+                .expect("reused manifest writes should be canonical");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("same-length replacement should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("result read should open");
+        let after_chunks = scan_manifest_chunks(&store, after_blob_hash)
+            .await
+            .expect("replacement manifest should scan");
+        assert_eq!(after_chunks.len(), base_chunks.len());
+        let changed_chunk_count = after_chunks
+            .iter()
+            .zip(&base_chunks)
+            .filter(|(after_chunk, base_chunk)| after_chunk.chunk_hash != base_chunk.chunk_hash)
+            .count();
+        assert_eq!(
+            changed_chunk_count, 1,
+            "only the overlapping chunk may change"
+        );
+        assert_eq!(
+            load_bytes_many(&store, &[after_blob_hash])
+                .await
+                .expect("replacement bytes should load")
+                .into_vec(),
+            vec![Some(after)],
+        );
+    }
+
+    #[tokio::test]
+    async fn same_length_splice_writer_falls_back_when_result_length_changes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let before = definitely_multi_chunk_blob_bytes();
+        let base_blob_hash = BlobHash::from_content(&before);
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_bytes(&storage, &mut writes, &before).await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("base blob should commit");
+        }
+
+        let edit_offset = before.len() / 2;
+        let mut after = before.clone();
+        after.insert(edit_offset, b'!');
+        let after_blob_hash = BlobHash::from_content(&after);
+        let after_payload = BlobPayload::from_bytes(after.clone());
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_file_payload(
+                &storage,
+                &mut writes,
+                &after_payload,
+                Some(BlobSameLengthSplice::new(base_blob_hash, edit_offset, 1)),
+            )
+            .await;
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("length-changing replacement should fall back and commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("result read should open");
+        let expected_hashes = crate::binary_cas::chunking::fastcdc_chunk_ranges(&after)
+            .into_iter()
+            .map(|(start, end)| BlobHash::from_content(&after[start..end]).into_bytes())
+            .collect::<Vec<_>>();
+        let actual_hashes = scan_manifest_chunks(&store, after_blob_hash)
+            .await
+            .expect("fallback manifest should scan")
+            .into_iter()
+            .map(|chunk| chunk.chunk_hash)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_hashes, expected_hashes,
+            "fallback must retain FastCDC layout"
+        );
+        assert_eq!(
+            load_bytes_many(&store, &[after_blob_hash])
+                .await
+                .expect("fallback bytes should load")
+                .into_vec(),
+            vec![Some(after)],
         );
     }
 

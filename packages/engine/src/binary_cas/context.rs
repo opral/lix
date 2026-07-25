@@ -2,7 +2,9 @@ use async_trait::async_trait;
 
 use crate::LixError;
 use crate::binary_cas::BinaryCasChunking;
-use crate::binary_cas::{BlobBytesBatch, BlobHash, BlobPayload, BlobWriteReceipt};
+use crate::binary_cas::{
+    BlobBytesBatch, BlobHash, BlobPayload, BlobSameLengthSplice, BlobWriteReceipt,
+};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use std::collections::HashSet;
 
@@ -123,5 +125,32 @@ where
             payload.hash(),
         )
         .await
+    }
+
+    /// Stages a normal file payload, opportunistically retaining unchanged
+    /// manifest chunks for one host-verified same-length splice. Any
+    /// ineligible or unavailable base falls through to the canonical full
+    /// rechunking path.
+    pub(crate) async fn stage_file_payload(
+        &mut self,
+        payload: &BlobPayload,
+        same_length_splice: Option<BlobSameLengthSplice>,
+    ) -> Result<(), LixError> {
+        if let Some(splice) = same_length_splice
+            && crate::binary_cas::kv::try_stage_blob_write_reusing_same_length_splice(
+                self.store,
+                self.writes,
+                &mut self.blob_hashes,
+                &mut self.chunk_keys,
+                payload.bytes(),
+                payload.hash(),
+                splice,
+            )
+            .await?
+        {
+            return Ok(());
+        }
+        self.stage_payload(payload).await?;
+        Ok(())
     }
 }
