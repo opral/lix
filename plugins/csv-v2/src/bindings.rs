@@ -250,13 +250,23 @@ impl Guest for CsvGuest {
         budget: &TransitionBudget,
         input: OpenEntitiesInput,
     ) -> Result<EntityTransition, PluginError> {
+        let accepted = input
+            .accepted
+            .as_ref()
+            .map(|source| read_source(source, budget))
+            .transpose()?;
         let mut builder = EntityImportBuilder::new();
         drain_entities_into_builder(&input.entities, budget, &mut builder)?;
-        let (document, edit) = builder.finish().map_err(plugin_error)?;
-        let edits = if edit.insert.is_empty() {
-            Vec::new()
-        } else {
-            vec![edit]
+        let (document, mut edit) = builder.finish().map_err(plugin_error)?;
+        let edits = match accepted {
+            Some(accepted) if edit.insert.as_ref() == &accepted => Vec::new(),
+            Some(accepted) => {
+                edit.delete_len = u64::try_from(accepted.len())
+                    .map_err(|_| plugin_error("accepted CSV is too large"))?;
+                vec![edit]
+            }
+            None if edit.insert.is_empty() => Vec::new(),
+            None => vec![edit],
         };
         Ok(entity_transition(document, edits))
     }

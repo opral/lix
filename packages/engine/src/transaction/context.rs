@@ -947,6 +947,7 @@ where
                 WasmOpenEntitiesInput {
                     descriptor,
                     entities: Box::new(source),
+                    accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
                 },
             )
             .await
@@ -960,7 +961,7 @@ where
         let validated = match drain_entity_transition_edits(
             actor.as_mut(),
             transition,
-            &[],
+            materialized_bytes.as_ref(),
             Some(materialized_bytes.clone()),
             None,
             limits,
@@ -2503,21 +2504,24 @@ where
             let submitted_bytes = write.payload().shared_bytes();
 
             let (changes, publication, materialized_bytes) = if same_plugin_owner {
-                let observation = self
-                    .acknowledged_session_plugin_observation(
-                        &view.session_key,
-                        selected,
-                        current_owner_change_id
-                            .as_deref()
-                            .expect("same-owner v2 file should have an owner incarnation"),
-                    )
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                            "warm v2 file writes require an exact acknowledged file read",
+                let observation = match self.acknowledged_session_plugin_observation(
+                    &view.session_key,
+                    selected,
+                    current_owner_change_id
+                        .as_deref()
+                        .expect("same-owner v2 file should have an owner incarnation"),
+                ) {
+                    Some(observation) => observation,
+                    None => {
+                        self.cold_open_v2_semantic_actor(
+                            &actor_key,
+                            selected,
+                            descriptor.clone(),
+                            Arc::clone(&factory),
                         )
-                        .with_hint("read the exact file bytes again before retrying the edit")
-                    })?;
+                        .await?
+                    }
+                };
                 if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
                     return Err(LixError::new(
                         LixError::CODE_PLUGIN_OBSERVATION_STALE,
@@ -5134,6 +5138,7 @@ async fn preflight_rendered_v2_file(
             WasmOpenEntitiesInput {
                 descriptor,
                 entities: Box::new(source),
+                accepted: None,
             },
         )
         .await?;

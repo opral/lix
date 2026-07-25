@@ -1735,7 +1735,10 @@ impl Document {
         ))
     }
 
-    pub fn open_entities(records: Vec<EntityRecord>) -> Result<(Self, Vec<ByteEdit>), PluginError> {
+    pub fn open_entities(
+        records: Vec<EntityRecord>,
+        accepted: Option<Vec<u8>>,
+    ) -> Result<(Self, Vec<ByteEdit>), PluginError> {
         let state = records
             .into_iter()
             .map(|record| {
@@ -1755,9 +1758,13 @@ impl Document {
             .collect::<Result<Vec<_>, _>>()?;
         let projection = Projection::from_entity_state(state.iter().cloned())?;
         let root = projection.to_tree()?;
-        let bytes = render_tree_with_lexical_fallback(&root)?;
+        let restored = accepted.is_some();
+        let bytes = match accepted {
+            Some(bytes) => bytes,
+            None => render_tree_with_lexical_fallback(&root)?,
+        };
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
-        let edits = if bytes.is_empty() {
+        let edits = if restored || bytes.is_empty() {
             Vec::new()
         } else {
             vec![ByteEdit {

@@ -296,14 +296,15 @@ interface api {
     ids: id-namespace,
   }
 
-  /// Cold restart/eviction: durable entities exist and plugin-backed bytes do
-  /// not. The returned `entity-transition.edits` use the empty byte string as
-  /// their
-  /// accepted base: an empty result has no edits, while a non-empty complete
-  /// file is one coalesced splice at offset 0 with delete length 0.
+  /// Cold restart/eviction from durable entities. When `accepted` is present,
+  /// it is the host-verified materialized file for the same semantic root.
+  /// Plugins may reuse it as a restore checkpoint instead of rendering the
+  /// complete file. Returned edits use `accepted` as their base, or the empty
+  /// byte string when it is absent.
   record open-entities-input {
     descriptor: file-descriptor,
     entities: own<packet-source>,
+    accepted: option<own<byte-source>>,
   }
 
   /// The budget starts once before the top-level call and remains active while
@@ -311,7 +312,7 @@ interface api {
   /// to a nested call is invalid; no resource call extends the deadline.
   open-file: func(budget: borrow<transition-budget>, input: open-file-input)
     -> result<file-transition, plugin-error>;
-  /// `entity-transition.edits` obey the empty-base rule documented on
+  /// `entity-transition.edits` obey the accepted-base rule documented on
   /// `open-entities-input`.
   open-entities: func(budget: borrow<transition-budget>, input: open-entities-input)
     -> result<entity-transition, plugin-error>;

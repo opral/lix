@@ -2415,6 +2415,7 @@ mod tests {
                         next_row: 0,
                         emitted_table: false,
                     }),
+                    accepted: None,
                 },
             )
             .await
@@ -2812,9 +2813,15 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let budget = self.transition_budget(transition)?;
         let entities =
             self.push_packet_source(PacketSourceValue::Entities(input.entities), &budget)?;
+        let accepted_len = input.accepted.as_ref().map_or(0, |source| source.len());
+        let accepted = input
+            .accepted
+            .map(|source| self.push_byte_source(source, &budget))
+            .transpose()?;
         let binding_input = bindings::exports::lix::plugin::api::OpenEntitiesInput {
             descriptor: descriptor_to_binding(&input.descriptor),
             entities,
+            accepted,
         };
         let guest = self.guest.clone();
         let budget_rep = match self.prepare_nested_call(transition) {
@@ -2838,7 +2845,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             }
             Err(error) => return Err(self.retire_with_error("v2 open-entities trapped", error)),
         };
-        self.register_entity_transition(transition, 0, value)
+        self.register_entity_transition(transition, accepted_len, value)
     }
 
     async fn file_changed(

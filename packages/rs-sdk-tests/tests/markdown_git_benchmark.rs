@@ -47,6 +47,14 @@ struct ColdLixDurations {
 }
 
 #[derive(Debug)]
+struct ColdLixEditDurations {
+    total: Vec<Duration>,
+    storage_open: Vec<Duration>,
+    engine_open: Vec<Duration>,
+    write: Vec<Duration>,
+}
+
+#[derive(Debug)]
 struct GitFixture {
     root: tempfile::TempDir,
 }
@@ -220,6 +228,13 @@ async fn markdown_git_semantic_entities_benchmark() {
         &byte_state,
     );
     byte_lix.close().await.expect("close byte-path Lix");
+    let lix_cold_edits = cold_lix_byte_edits(
+        byte_root.path(),
+        &mut byte_state,
+        &corpus.edit_offsets,
+        cold_samples,
+    )
+    .await;
 
     let mut git = GitFixture::new();
     let git_fixed = git.repo_sizes();
@@ -306,6 +321,18 @@ async fn markdown_git_semantic_entities_benchmark() {
     print_duration_metric("sparse_edit_commit", "lix-byte", &lix_byte_edits);
     print_duration_metric("sparse_edit_commit", "lix-semantic", &lix_semantic_edits);
     print_duration_metric("sparse_edit_commit", "git", &git_edits);
+    print_duration_metric("cold_sparse_edit_total", "lix-byte", &lix_cold_edits.total);
+    print_duration_metric(
+        "cold_sparse_edit_storage_open",
+        "lix-byte",
+        &lix_cold_edits.storage_open,
+    );
+    print_duration_metric(
+        "cold_sparse_edit_engine_open",
+        "lix-byte",
+        &lix_cold_edits.engine_open,
+    );
+    print_duration_metric("cold_sparse_edit_write", "lix-byte", &lix_cold_edits.write);
     print_duration_metric("unrelated_entity_merge", "lix-semantic", &lix_merges);
     print_duration_metric("unrelated_entity_merge", "git", &git_merges);
     print_duration_metric("cold_open_read", "lix-semantic", &lix_cold.total);
@@ -430,6 +457,44 @@ impl GitFixture {
             assert_same_bytes("Git cold object read", &output.stdout, expected);
         }
         durations
+    }
+}
+
+async fn cold_lix_byte_edits(
+    root: &Path,
+    bytes: &mut [u8],
+    edit_offsets: &[usize],
+    samples: usize,
+) -> ColdLixEditDurations {
+    let mut total = Vec::with_capacity(samples);
+    let mut storage_open = Vec::with_capacity(samples);
+    let mut engine_open = Vec::with_capacity(samples);
+    let mut write = Vec::with_capacity(samples);
+    for sample in 0..samples {
+        let index = spread_index(sample, samples, edit_offsets.len() / 2);
+        bytes[edit_offsets[index]] = edit_replacement(bytes[edit_offsets[index]], 500 + sample);
+        let started = Instant::now();
+        let storage_started = Instant::now();
+        let storage = LocalFilesystem::open(root)
+            .await
+            .expect("open cold byte-edit Lix filesystem");
+        storage_open.push(storage_started.elapsed());
+        let engine_started = Instant::now();
+        let lix = open_lix_with_storage(storage)
+            .await
+            .expect("open cold byte-edit Lix workspace");
+        engine_open.push(engine_started.elapsed());
+        let write_started = Instant::now();
+        write_file(&lix, "/benchmark.md", bytes.to_vec()).await;
+        write.push(write_started.elapsed());
+        total.push(started.elapsed());
+        lix.close().await.expect("close cold byte-edit sample");
+    }
+    ColdLixEditDurations {
+        total,
+        storage_open,
+        engine_open,
+        write,
     }
 }
 
