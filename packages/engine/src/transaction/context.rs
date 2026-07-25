@@ -417,11 +417,27 @@ where
         let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
             || !prepared_writes.commit_change_refs_by_branch.is_empty()
             || !prepared_writes.extra_commit_parents_by_branch.is_empty();
+        let has_untracked_state_writes = prepared_writes.state_rows.iter().any(|row| row.untracked);
+        // Untracked rows are a mutable sidecar, but their validation can read
+        // tracked schemas, parents, uniqueness owners, or filesystem state.
+        // Fence that snapshot without rotating the tracked revision: normal
+        // tracked transactions remain independent of sidecar-only commits.
+        let requires_tracked_snapshot_fence = tracked_state_changed || has_untracked_state_writes;
         let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
+        // Validate and materialize from one coherent storage snapshot. The
+        // final write's preconditions then fence every fact validation and
+        // sidecar decision was based on, just like a conventional optimistic
+        // database transaction.
+        let commit_read_storage = transaction.storage.clone();
+        let mut read = SharedStorageAdapterRead::new(
+            commit_read_storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
         transaction
-            .validate_prepared_writes_by_branch(&prepared_writes)
+            .validate_prepared_writes_by_branch(&read, &prepared_writes)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_validation"
@@ -447,12 +463,6 @@ where
                 .map(MaterializedLiveStateRow::from)
                 .collect::<Vec<_>>()
         };
-        let mut read = SharedStorageAdapterRead::new(
-            transaction
-                .storage
-                .begin_read(StorageReadOptions::default())
-                .await?,
-        );
         let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
             None
         } else {
@@ -485,7 +495,7 @@ where
         write_options
             .preconditions
             .extend(materialization_preconditions);
-        if tracked_state_changed {
+        if requires_tracked_snapshot_fence {
             write_options.preconditions.push(
                 StorageAdapter::<StorageImpl>::tracked_mutation_revision_precondition(
                     transaction.opening_tracked_mutation_revision.clone(),
@@ -1654,6 +1664,7 @@ where
 
     async fn validate_prepared_writes_by_branch(
         &mut self,
+        read: &(impl StorageAdapterRead + ?Sized),
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
@@ -1669,12 +1680,7 @@ where
             ) {
                 continue;
             }
-            let read = SharedStorageAdapterRead::new(
-                self.storage
-                    .begin_read(StorageReadOptions::default())
-                    .await?,
-            );
-            let live_state = self.live_state.reader(&read);
+            let live_state = self.live_state.reader(read);
             let schema_catalog = self
                 .schema_resolver
                 .catalog_for_validation(&live_state, scope)

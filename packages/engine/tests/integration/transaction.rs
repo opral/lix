@@ -3,14 +3,53 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use lix_engine::Engine;
 use lix_engine::storage::{
     CommitResult, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
     PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
     StorageWrite, WriteOptions,
 };
+use lix_engine::{CreateBranchOptions, Engine};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
+// Mirrors the private `live_state.local_sidecar_branch.v1` storage space. The
+// integration test deliberately observes this storage-level synchronization
+// point without making it part of the engine's public API.
+const LOCAL_SIDECAR_BRANCH_SPACE: SpaceId = SpaceId(0x0004_000f);
+const SIDECAR_RACE_BRANCH_ID: &str = "sidecar-race";
+
+async fn setup_sidecar_race_branch<StorageImpl>(engine: &Engine<StorageImpl>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let setup = engine
+        .open_workspace_session()
+        .await
+        .expect("setup session should open");
+    setup
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+               VALUES (lix_json('{"x-lix-key":"sidecar_race_parent","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"}},"required":["id"],"additionalProperties":false}'), false, false)"#,
+            &[],
+        )
+        .await
+        .expect("parent schema should register");
+    setup
+        .execute(
+            r#"INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked)
+               VALUES (lix_json('{"x-lix-key":"sidecar_race_child","x-lix-primary-key":["/id"],"x-lix-foreign-keys":[{"properties":["/parent_id"],"references":{"schemaKey":"sidecar_race_parent","properties":["/id"]}}],"type":"object","properties":{"id":{"type":"string"},"parent_id":{"type":"string"}},"required":["id","parent_id"],"additionalProperties":false}'), false, false)"#,
+            &[],
+        )
+        .await
+        .expect("child schema should register");
+    setup
+        .create_branch(CreateBranchOptions {
+            id: Some(SIDECAR_RACE_BRANCH_ID.to_string()),
+            name: "Sidecar race".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("test branch should be created");
+}
 
 #[tokio::test]
 async fn stale_transaction_cannot_publish_over_newer_commit() {
@@ -128,6 +167,175 @@ async fn untracked_sidecar_write_does_not_invalidate_tracked_transaction() {
         .await
         .expect("both durability lanes should remain readable");
     assert_eq!(result.rows().len(), 2);
+}
+
+/// A tracked commit must validate and materialize against one storage snapshot.
+///
+/// The gate stops the tracked delete when it probes the local-sidecar revision.
+/// A second engine then commits an untracked child row. The delete must not
+/// publish using the now-stale validation result, and a fresh retry must see
+/// the child foreign key rather than leaving a dangling reference behind.
+#[tokio::test]
+async fn tracked_commit_retries_when_local_sidecar_changes_after_validation() {
+    let storage = BlockingSidecarReadStorage::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+
+    let setup_engine = Engine::new(storage.clone())
+        .await
+        .expect("initialized storage should create a setup engine");
+    setup_sidecar_race_branch(&setup_engine).await;
+
+    // Separate engine values are deliberate: each engine serializes its own
+    // sessions, while this regression needs to exercise the storage boundary.
+    let tracked_engine = Engine::new(storage.clone())
+        .await
+        .expect("tracked engine should open");
+    let sidecar_engine = Engine::new(storage.clone())
+        .await
+        .expect("sidecar engine should open");
+    let tracked_session = tracked_engine
+        .open_session(SIDECAR_RACE_BRANCH_ID)
+        .await
+        .expect("tracked session should open");
+    let sidecar_session = sidecar_engine
+        .open_session(SIDECAR_RACE_BRANCH_ID)
+        .await
+        .expect("sidecar session should open");
+
+    tracked_session
+        .execute(
+            "INSERT INTO sidecar_race_parent (id) VALUES ('parent-1')",
+            &[],
+        )
+        .await
+        .expect("tracked parent should seed");
+
+    let mut tracked_delete = tracked_session
+        .begin_transaction()
+        .await
+        .expect("tracked delete transaction should begin");
+    tracked_delete
+        .execute("DELETE FROM sidecar_race_parent WHERE id = 'parent-1'", &[])
+        .await
+        .expect("tracked delete should stage");
+
+    let gate = storage.gate();
+    let before_commit = storage.stats();
+    gate.block_next_sidecar_get();
+    let tracked_commit = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { tracked_delete.commit().await })
+    });
+    gate.wait_until_blocked();
+
+    let while_blocked = storage.stats().delta_since(&before_commit);
+    assert_eq!(
+        while_blocked.read_opened, 1,
+        "validation and materialization must share the one commit snapshot"
+    );
+
+    let sidecar_result = sidecar_session
+        .execute(
+            "INSERT INTO sidecar_race_child (id, parent_id, lixcol_untracked) VALUES ('child-1', 'parent-1', true)",
+            &[],
+        )
+        .await;
+    gate.release();
+    sidecar_result.expect("untracked child should commit while tracked delete is blocked");
+
+    let error = join_thread(tracked_commit, "blocked tracked delete")
+        .expect_err("stale tracked validation must not publish after sidecar mutation");
+    assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
+
+    let retry_error = tracked_session
+        .execute("DELETE FROM sidecar_race_parent WHERE id = 'parent-1'", &[])
+        .await
+        .expect_err("fresh delete must observe the committed child foreign key");
+    assert_eq!(retry_error.code, "LIX_ERROR_FOREIGN_KEY");
+}
+
+/// An untracked write may validate a foreign key against tracked state. It must
+/// therefore retry when that tracked state changes before its storage commit.
+#[tokio::test]
+async fn untracked_commit_retries_when_tracked_fk_target_changes_after_validation() {
+    let storage = BlockingCommitStorage::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+
+    let setup_engine = Engine::new(storage.clone())
+        .await
+        .expect("initialized storage should create a setup engine");
+    setup_sidecar_race_branch(&setup_engine).await;
+
+    // Separate engines avoid the per-engine collaboration gate so this test
+    // exercises exactly the storage-level optimistic-concurrency boundary.
+    let tracked_engine = Engine::new(storage.clone())
+        .await
+        .expect("tracked engine should open");
+    let sidecar_engine = Engine::new(storage.clone())
+        .await
+        .expect("sidecar engine should open");
+    let tracked_session = tracked_engine
+        .open_session(SIDECAR_RACE_BRANCH_ID)
+        .await
+        .expect("tracked session should open");
+    let sidecar_session = sidecar_engine
+        .open_session(SIDECAR_RACE_BRANCH_ID)
+        .await
+        .expect("sidecar session should open");
+
+    tracked_session
+        .execute(
+            "INSERT INTO sidecar_race_parent (id) VALUES ('parent-1')",
+            &[],
+        )
+        .await
+        .expect("tracked parent should seed");
+
+    let mut untracked_insert = sidecar_session
+        .begin_transaction()
+        .await
+        .expect("untracked transaction should begin");
+    untracked_insert
+        .execute(
+            "INSERT INTO sidecar_race_child (id, parent_id, lixcol_untracked) VALUES ('child-1', 'parent-1', true)",
+            &[],
+        )
+        .await
+        .expect("untracked child should stage");
+
+    let gate = storage.gate();
+    gate.block_next_write();
+    let untracked_commit = thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        runtime.block_on(async move { untracked_insert.commit().await })
+    });
+    gate.wait_until_blocked();
+
+    let tracked_delete_result = tracked_session
+        .execute("DELETE FROM sidecar_race_parent WHERE id = 'parent-1'", &[])
+        .await;
+    gate.release();
+    tracked_delete_result.expect("tracked delete should commit while untracked write is blocked");
+    let error = join_thread(untracked_commit, "blocked untracked foreign-key insert")
+        .expect_err("untracked write validated against stale tracked state must retry");
+    assert_eq!(error.code, "LIX_TRANSACTION_CONFLICT");
+
+    let retry_error = sidecar_session
+        .execute(
+            "INSERT INTO sidecar_race_child (id, parent_id, lixcol_untracked) VALUES ('child-1', 'parent-1', true)",
+            &[],
+        )
+        .await
+        .expect_err("fresh untracked insert must observe that its tracked FK target was deleted");
+    assert_eq!(retry_error.code, "LIX_ERROR_FOREIGN_KEY");
 }
 
 fn wait_until(description: &str, mut condition: impl FnMut() -> bool) {
@@ -863,6 +1071,12 @@ struct BlockingCommitStorage {
     gate: BlockingBeginWriteGate,
 }
 
+#[derive(Clone)]
+struct BlockingSidecarReadStorage {
+    inner: RecordingStorage,
+    gate: BlockingSidecarReadGate,
+}
+
 impl BlockingBeginWriteStorage {
     fn new() -> Self {
         Self {
@@ -902,6 +1116,23 @@ impl BlockingCommitStorage {
     }
 
     fn gate(&self) -> BlockingBeginWriteGate {
+        self.gate.clone()
+    }
+
+    fn stats(&self) -> TransactionStatsSnapshot {
+        self.inner.stats()
+    }
+}
+
+impl BlockingSidecarReadStorage {
+    fn new() -> Self {
+        Self {
+            inner: RecordingStorage::new(),
+            gate: BlockingSidecarReadGate::new(),
+        }
+    }
+
+    fn gate(&self) -> BlockingSidecarReadGate {
         self.gate.clone()
     }
 
@@ -972,9 +1203,60 @@ impl Storage for BlockingCommitStorage {
     }
 }
 
+impl Storage for BlockingSidecarReadStorage {
+    type Read<'a>
+        = BlockingSidecarRead
+    where
+        Self: 'a;
+
+    type Write<'a>
+        = RecordingWrite
+    where
+        Self: 'a;
+
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        Ok(BlockingSidecarRead {
+            inner: self.inner.begin_read(opts).await?,
+            gate: self.gate.clone(),
+        })
+    }
+
+    async fn begin_write(&self, opts: WriteOptions) -> Result<Self::Write<'_>, StorageError> {
+        self.inner.begin_write(opts).await
+    }
+}
+
 struct BlockingCommitWrite {
     inner: RecordingWrite,
     gate: BlockingBeginWriteGate,
+}
+
+struct BlockingSidecarRead {
+    inner: RecordingRead,
+    gate: BlockingSidecarReadGate,
+}
+
+impl StorageRead for BlockingSidecarRead {
+    async fn get_many(
+        &self,
+        space: SpaceId,
+        keys: &[Key],
+        opts: GetOptions,
+    ) -> Result<GetManyResult, StorageError> {
+        if space == LOCAL_SIDECAR_BRANCH_SPACE {
+            self.gate.maybe_block();
+        }
+        self.inner.get_many(space, keys, opts).await
+    }
+
+    async fn scan(
+        &self,
+        space: SpaceId,
+        range: KeyRange,
+        opts: ScanOptions,
+    ) -> Result<ScanChunk, StorageError> {
+        self.inner.scan(space, range, opts).await
+    }
 }
 
 impl StorageWrite for BlockingCommitWrite {
@@ -1078,6 +1360,100 @@ impl BlockingBeginWriteGate {
 
 #[derive(Default)]
 struct BlockingBeginWriteState {
+    block_next: bool,
+    blocked: bool,
+    released: bool,
+}
+
+#[derive(Clone)]
+struct BlockingSidecarReadGate {
+    state: Arc<(Mutex<BlockingSidecarReadState>, Condvar)>,
+}
+
+impl BlockingSidecarReadGate {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(BlockingSidecarReadState::default()),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn block_next_sidecar_get(&self) {
+        let (lock, _) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("sidecar read gate lock should be available");
+        state.block_next = true;
+        state.blocked = false;
+        state.released = false;
+    }
+
+    fn maybe_block(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("sidecar read gate lock should be available");
+        if !state.block_next {
+            return;
+        }
+        state.block_next = false;
+        state.blocked = true;
+        condvar.notify_all();
+        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+        while !state.released {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for sidecar read gate release"
+            );
+            let (next_state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .expect("sidecar read gate lock should be available after wait");
+            state = next_state;
+            assert!(
+                !wait_result.timed_out() || state.released,
+                "timed out waiting for sidecar read gate release"
+            );
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("sidecar read gate lock should be available");
+        let deadline = Instant::now() + TEST_WAIT_TIMEOUT;
+        while !state.blocked {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for sidecar read gate"
+            );
+            let (next_state, wait_result) = condvar
+                .wait_timeout(state, remaining)
+                .expect("sidecar read gate lock should be available after wait");
+            state = next_state;
+            assert!(
+                !wait_result.timed_out() || state.blocked,
+                "timed out waiting for sidecar read gate"
+            );
+        }
+    }
+
+    fn release(&self) {
+        let (lock, condvar) = &*self.state;
+        let mut state = lock
+            .lock()
+            .expect("sidecar read gate lock should be available");
+        state.released = true;
+        condvar.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct BlockingSidecarReadState {
     block_next: bool,
     blocked: bool,
     released: bool,

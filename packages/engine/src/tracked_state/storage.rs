@@ -567,8 +567,12 @@ mod tests {
         CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId,
     };
     use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
+    use crate::init::REPOSITORY_PROTOCOL_SPACE;
     use crate::json_store::store::JSON_SPACE;
-    use crate::live_state::LIVE_STATE_INDEX_ROW_SPACE;
+    use crate::live_state::{
+        LIVE_STATE_INDEX_ROW_SPACE, LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+        TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_ROW_SPACE,
+    };
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
     };
@@ -582,7 +586,11 @@ mod tests {
     #[test]
     fn native_storage_space_ids_are_unique_across_owner_layouts() {
         let spaces = [
+            REPOSITORY_PROTOCOL_SPACE,
             LIVE_STATE_INDEX_ROW_SPACE,
+            LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+            TRACKED_HEAD_ROW_SPACE,
+            TRACKED_HEAD_MARKER_SPACE,
             JSON_SPACE,
             TRACKED_STATE_TREE_CHUNK_SPACE,
             TRACKED_STATE_COMMIT_ROOT_SPACE,

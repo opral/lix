@@ -269,6 +269,7 @@ where
 {
     let read =
         SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
+    let protocol_read = read.clone();
     let reader = live_state.reader(read);
     let initialized = reader
         .load_row(&LiveStateRowRequest {
@@ -281,7 +282,7 @@ where
         .is_some();
 
     if initialized {
-        return Ok(());
+        return crate::init::assert_repository_protocol(&protocol_read).await;
     }
 
     Err(LixError::new(
@@ -408,5 +409,28 @@ mod tests {
             value,
             Some(StorageProjectedValue::FullValue(predecessor_value))
         );
+    }
+
+    #[tokio::test]
+    async fn initialized_repository_without_protocol_gate_is_rejected() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.delete(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("protocol marker deletion should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("initialized pre-protocol storage must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
 }

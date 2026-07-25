@@ -309,15 +309,18 @@ where
         Ok(Some(output))
     }
 
-    pub(crate) async fn is_current(
+    /// Returns the durable serving generation exactly when the marker is
+    /// bound to `expected_head`. Commit staging passes this value directly to
+    /// the writer so a serial child needs one marker point read, not two.
+    pub(crate) async fn generation_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
-    ) -> Result<bool, LixError> {
+    ) -> Result<Option<CommitId>, LixError> {
         Ok(self
             .marker_if_current(branch_id, expected_head)
             .await?
-            .is_some())
+            .map(|marker| marker.generation))
     }
 
     async fn marker_if_current(
@@ -348,24 +351,40 @@ where
     pub(crate) async fn stage_commit(
         &mut self,
         branch_id: &str,
-        parent_head: Option<CommitId>,
+        parent_generation: Option<CommitId>,
         new_head: CommitId,
         deltas: &[TrackedHeadDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<(), LixError> {
-        let marker = load_marker(self.store, branch_id).await?;
-        let matches_parent = marker.as_ref().is_some_and(|marker| {
-            parent_head.is_some_and(|parent| marker.head_commit_id == parent)
-        });
-        let generation = if matches_parent {
-            marker
-                .as_ref()
-                .expect("matching tracked-head marker exists")
-                .generation
-        } else {
-            new_head
-        };
+        let matches_parent = parent_generation.is_some();
+        let generation = parent_generation.unwrap_or(new_head);
+
+        if matches_parent
+            && absence_guards.is_empty()
+            && let [delta] = deltas
+        {
+            let identity = delta.identity(branch_id, generation);
+            let prior_created_at = load_entry_bytes(self.store, std::slice::from_ref(&identity))
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .map(|value| decode_head_created_at(&value))
+                .transpose()?
+                .unwrap_or(delta.created_at);
+            stage_put_ref(self.writes, &identity, &delta.value_ref(prior_created_at))?;
+            stage_marker(
+                self.writes,
+                branch_id,
+                &TrackedHeadMarker {
+                    head_commit_id: new_head,
+                    generation,
+                },
+            )?;
+            return Ok(());
+        }
+
         let delta_identities = deltas
             .iter()
             .map(|delta| delta.identity(branch_id, generation))
@@ -1095,6 +1114,42 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
         ));
     };
     Ok(bytes)
+}
+
+/// Decodes only the invariant needed by a serial point update. The writer
+/// preserves a row's first `created_at`, but does not need to allocate or
+/// validate its JSON payloads just to do that.
+fn decode_head_created_at(bytes: &[u8]) -> Result<LixTimestamp, LixError> {
+    if bytes.len() < HEAD_VALUE_HEADER_BYTES {
+        return Err(head_value_error("row is shorter than the v3 fixed header"));
+    }
+    if bytes[0] != HEAD_VALUE_VERSION {
+        return Err(head_value_error(&format!(
+            "unsupported row format version {}",
+            bytes[0]
+        )));
+    }
+    let flags = bytes[1];
+    if flags & !HEAD_VALUE_ALLOWED_FLAGS != 0 {
+        return Err(head_value_error("row has unknown v3 flag bits"));
+    }
+    let snapshot_len = usize::try_from(read_u32(&bytes[50..54], "snapshot length")?)
+        .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
+    let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
+        .map_err(|_| head_value_error("metadata length exceeds usize"))?;
+    let payload_len = snapshot_len
+        .checked_add(metadata_len)
+        .ok_or_else(|| head_value_error("row payload length overflow"))?;
+    let expected_len = HEAD_VALUE_HEADER_BYTES
+        .checked_add(payload_len)
+        .ok_or_else(|| head_value_error("row payload length overflow"))?;
+    if expected_len != bytes.len() {
+        return Err(head_value_error(
+            "row payload lengths do not match the buffer",
+        ));
+    }
+    LixTimestamp::from_packed(read_u64(&bytes[34..42], "created_at")?)
+        .map_err(|error| head_value_error(&format!("invalid created_at: {error}")))
 }
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
@@ -1834,6 +1889,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_singleton_insert_rejects_existing_live_row() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("first-head");
+        let second_head = CommitId::for_test_label("second-head");
+        let entity_pk = EntityPk::single("row");
+        let identity = identity(branch_id, generation, "row");
+
+        let mut writes = StorageWriteSet::new();
+        stage_put(
+            &mut writes,
+            &identity,
+            &head_value("first-change", generation),
+        )
+        .expect("stage existing live row");
+        stage_marker(
+            &mut writes,
+            branch_id,
+            &TrackedHeadMarker {
+                head_commit_id: generation,
+                generation,
+            },
+        )
+        .expect("stage existing head marker");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit existing head");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open singleton insert read");
+        let mut writes = StorageWriteSet::new();
+        let absence_guards = BTreeSet::from([TrackedStateKey {
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+            file_id: None,
+        }]);
+        let error = TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(generation),
+                second_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("second-change"),
+                    commit_id: second_head,
+                    deleted: false,
+                    created_at: ts("2026-01-02T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &absence_guards,
+                None,
+            )
+            .await
+            .expect_err("singleton INSERT must reject an existing live row");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
     async fn bootstrap_overlays_parent_identity_without_duplicate_write() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
@@ -1861,7 +1982,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_commit(
                 branch_id,
-                Some(parent_head),
+                None,
                 child_head,
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",

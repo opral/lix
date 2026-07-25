@@ -16,16 +16,63 @@ use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
-use crate::storage_adapter::SharedStorageAdapterRead;
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
+use crate::storage_adapter::{PointReadPlan, SharedStorageAdapterRead, StorageAdapterRead};
+use crate::storage_adapter::{
+    StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
+    StorageSpaceId, StorageWriteSet,
+};
 use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
+use bytes::Bytes;
 use serde_json::json;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ID_KEY: &str = "lix_id";
 const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+
+/// Repository-wide compatibility gate for physical storage protocols.
+///
+/// The local-sidecar marker changes the meaning of an absent key: it is proof
+/// that a branch has never used the local lane. That proof is only sound for
+/// repositories initialized with this protocol, so opening an earlier store
+/// must fail closed rather than silently shadow tracked state with old flat
+/// rows.
+pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
+    StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
+pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"local-sidecar.v1";
+
+pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
+    writes.put(
+        REPOSITORY_PROTOCOL_SPACE,
+        REPOSITORY_PROTOCOL_KEY,
+        REPOSITORY_PROTOCOL_VALUE,
+    );
+}
+
+pub(crate) async fn assert_repository_protocol(
+    read: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(), LixError> {
+    let values = PointReadPlan::new(
+        REPOSITORY_PROTOCOL_SPACE,
+        &[StorageKey(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))],
+    )
+    .materialize(read, StorageGetOptions::default())
+    .await?;
+    let supported = matches!(
+        values.value.into_iter().next().flatten(),
+        Some(StorageProjectedValue::FullValue(value))
+            if value.as_ref() == REPOSITORY_PROTOCOL_VALUE
+    );
+    if supported {
+        return Ok(());
+    }
+    Err(LixError::new(
+        "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
+        "repository uses an unsupported local-sidecar storage protocol; recreate the repository",
+    ))
+}
 
 /// Pure seed plan for initializing an engine repository.
 ///
@@ -270,6 +317,7 @@ where
             .await?;
     }
     crate::catalog::stage_catalog_revision(&mut writes);
+    stage_repository_protocol(&mut writes);
 
     storage
         .commit_write_set(
@@ -333,7 +381,7 @@ fn stage_init_json_payloads(
 }
 
 async fn stage_init_changelog_commit(
-    read: &mut impl crate::storage_adapter::StorageAdapterRead,
+    read: &mut impl StorageAdapterRead,
     writes: &mut StorageWriteSet,
     plan: &InitSeedPlan,
     changes: Vec<ChangeRecord>,
