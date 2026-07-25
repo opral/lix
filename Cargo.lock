@@ -3387,6 +3387,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
  "wasmtime",
  "wasmtime-wasi",
  "zip",

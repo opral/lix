@@ -69,6 +69,15 @@ struct GitFixture {
 #[tokio::test]
 #[ignore = "manual steady-state Markdown byte-write profile target"]
 async fn markdown_lix_byte_hotpath_profile() {
+    if std::env::var_os("LIX_MARKDOWN_GIT_TRACE").is_some() {
+        tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_test_writer()
+            .try_init()
+            .expect("initialize one benchmark tracing subscriber");
+    }
+
     let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
     let samples = env_usize("LIX_MARKDOWN_GIT_PROFILE_SAMPLES", DEFAULT_PROFILE_SAMPLES);
     assert!(samples > 0);
