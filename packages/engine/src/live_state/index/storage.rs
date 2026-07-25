@@ -17,6 +17,21 @@ pub(crate) const LIVE_STATE_INDEX_ROW_NAMESPACE: &str = "live_state.flat_row.v1"
 pub(crate) const LIVE_STATE_INDEX_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0006), LIVE_STATE_INDEX_ROW_NAMESPACE);
 
+/// A revision token for branch-local mutable sidecars.
+///
+/// Normal tracked branches have an independent durable serving projection. A
+/// token lets their hot commit path prove both that no branch-local sidecar
+/// exists and that one did not change after validation, without opening a
+/// flat-row prefix iterator. Once a branch has used the untracked lane, its
+/// rare tracked promotion path is no longer the normal fast path, even after
+/// its flat rows are later cleaned up or the branch id is reused.
+pub(crate) const LIVE_STATE_LOCAL_SIDECAR_BRANCH_NAMESPACE: &str =
+    "live_state.local_sidecar_branch.v1";
+pub(crate) const LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_000f),
+    LIVE_STATE_LOCAL_SIDECAR_BRANCH_NAMESPACE,
+);
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(super) struct FlatIdentity {
@@ -48,6 +63,12 @@ pub(super) struct FlatValue {
 #[derive(musli::Encode)]
 #[musli(packed)]
 struct BranchPrefixRef<'a> {
+    branch_id: &'a str,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct SidecarBranchRef<'a> {
     branch_id: &'a str,
 }
 
@@ -308,6 +329,10 @@ fn encode_key(identity: &FlatIdentity) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("flat live-state key", &identity.as_ref())
 }
 
+fn sidecar_branch_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode("local-sidecar branch key", &SidecarBranchRef { branch_id })
+}
+
 pub(crate) fn branch_empty_precondition(branch_id: &str) -> Result<StoragePrecondition, LixError> {
     let prefix = storage_codec::encode(
         "flat live-state branch prefix",
@@ -319,6 +344,74 @@ pub(crate) fn branch_empty_precondition(branch_id: &str) -> Result<StoragePrecon
             bytes: Bytes::from(prefix),
         }
         .to_range()?,
+    })
+}
+
+/// Rotates the revision token for a non-global mutable sidecar write.
+///
+/// The token is independently generated, rather than reusing an input change
+/// id, so caller-supplied idempotency keys cannot cause an ABA-style false
+/// match. Repeated writes in one transaction use one token per branch, while
+/// a later local transaction necessarily changes the durable value observed by
+/// a concurrent tracked transaction.
+pub(crate) fn stage_local_sidecar_branch_marker(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+) -> Result<(), LixError> {
+    writes.put(
+        LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+        StorageKey(Bytes::from(sidecar_branch_key(branch_id)?)),
+        StorageValue {
+            bytes: Bytes::copy_from_slice(uuid::Uuid::now_v7().as_bytes()),
+        },
+    );
+    Ok(())
+}
+
+/// Returns the branch-local sidecar revision token, when one exists.
+///
+/// This is an exact-key probe, deliberately replacing the historical
+/// branch-wide flat-row scan on normal tracked commits. A present token sends
+/// the rare mixed branch through the existing promotion path and becomes a
+/// compare-and-swap guard for the tracked commit.
+pub(crate) async fn load_local_sidecar_branch_token(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<Option<Bytes>, LixError> {
+    let result = PointReadPlan::new(
+        LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+        &[StorageKey(Bytes::from(sidecar_branch_key(branch_id)?))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    match result.value.into_iter().next().flatten() {
+        None => Ok(None),
+        Some(StorageProjectedValue::FullValue(value)) => Ok(Some(value)),
+        Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "local-sidecar token read unexpectedly omitted its value",
+        )),
+    }
+}
+
+/// Atomically proves the local-sidecar state observed during tracked commit
+/// staging. This exact-key CAS replaces an empty-prefix scan on every normal
+/// tracked commit and rejects a local write that lands after validation.
+pub(crate) fn local_sidecar_branch_precondition(
+    branch_id: &str,
+    expected: Option<Bytes>,
+) -> Result<StoragePrecondition, LixError> {
+    let key = StorageKey(Bytes::from(sidecar_branch_key(branch_id)?));
+    Ok(match expected {
+        None => StoragePrecondition::KeyAbsent {
+            space: LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE.id,
+            key,
+        },
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE.id,
+            key,
+            expected,
+        },
     })
 }
 

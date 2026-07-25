@@ -4,6 +4,8 @@
     clippy::unnecessary_wraps
 )]
 
+use bytes::Bytes;
+
 use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader};
@@ -21,7 +23,8 @@ use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonR
 use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, TrackedHeadContext, TrackedHeadDeltaRef, branch_empty_precondition,
-    row_absent_precondition,
+    load_local_sidecar_branch_token, local_sidecar_branch_precondition, row_absent_precondition,
+    stage_local_sidecar_branch_marker,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
@@ -556,16 +559,25 @@ async fn stage_flat_current_rows(
     preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<Vec<ChangeId>, LixError> {
     let index_reader = current.reader(read);
+    let mut branch_ref_sidecar_tokens = BTreeMap::<String, Option<Bytes>>::new();
     for row in state_rows
         .iter()
         .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
-            if load_current_branch_ref_commit_id(&index_reader, &branch_id)
-                .await?
-                .is_some()
-                && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
+            let existing_commit_id =
+                load_current_branch_ref_commit_id(&index_reader, &branch_id).await?;
+            if existing_commit_id.is_some()
+                && (has_pending_local_sidecar_rows(state_rows, &branch_id)
+                    || guarded_branch_ref_has_local_untracked_rows(
+                        &index_reader,
+                        read,
+                        &branch_id,
+                        &mut branch_ref_sidecar_tokens,
+                        preconditions,
+                    )
+                    .await?)
             {
                 return Err(branch_ref_with_untracked_rows_error(&branch_id, true));
             }
@@ -586,11 +598,31 @@ async fn stage_flat_current_rows(
             continue;
         }
         if existing_commit_id.is_some()
-            && branch_has_local_untracked_rows(&index_reader, &branch_id).await?
+            && (has_pending_local_sidecar_rows(state_rows, &branch_id)
+                || guarded_branch_ref_has_local_untracked_rows(
+                    &index_reader,
+                    read,
+                    &branch_id,
+                    &mut branch_ref_sidecar_tokens,
+                    preconditions,
+                )
+                .await?)
         {
             return Err(branch_ref_with_untracked_rows_error(&branch_id, false));
         }
         ensure_branch_ref_target_exists(read, commit_id).await?;
+    }
+
+    let local_sidecar_branch_ids = state_rows
+        .iter()
+        .filter(|row| row.untracked && row.branch_id != crate::GLOBAL_BRANCH_ID)
+        .map(|row| row.branch_id.as_str())
+        .collect::<BTreeSet<_>>();
+    for branch_id in &local_sidecar_branch_ids {
+        // The token is rotated by every local mutation. A concurrent tracked
+        // write compares the exact value it observed, so it retries rather
+        // than publishing validation against stale sidecar state.
+        stage_local_sidecar_branch_marker(writes, branch_id)?;
     }
 
     let branch_ids = state_rows
@@ -636,10 +668,25 @@ async fn stage_flat_current_rows(
         }
 
         // Tracked rows are served from the durable tracked-head projection.
-        // On the normal path the branch has no untracked sidecar rows, so a
-        // single range-empty precondition proves there is no durability
-        // collision. Do not construct one mutable-index delta per tracked row
-        // only for the writer to discard it.
+        // A branch-local mutable sidecar is explicitly marked when it is
+        // first used. Normal tracked commits therefore need one exact-key
+        // precondition, rather than opening a flat-index prefix iterator on
+        // every write. Global state intentionally keeps the legacy promotion
+        // lane: global untracked rows include engine configuration alongside
+        // tracked state and are not a branch-local sidecar.
+        if *branch_id != crate::GLOBAL_BRANCH_ID {
+            let sidecar_token = load_local_sidecar_branch_token(read, branch_id).await?;
+            let sidecar_is_absent = sidecar_token.is_none();
+            preconditions.push(local_sidecar_branch_precondition(branch_id, sidecar_token)?);
+            if sidecar_is_absent {
+                if !new_deltas.is_empty() {
+                    compactable_change_ids
+                        .extend(writer.stage_branch_rows(branch_id, new_deltas).await?);
+                }
+                continue;
+            }
+        }
+
         if !branch_has_local_untracked_rows(&index_reader, branch_id).await? {
             if has_tracked_insert {
                 preconditions.push(branch_empty_precondition(branch_id)?);
@@ -781,6 +828,39 @@ where
         })
         .await?
         .is_empty())
+}
+
+/// Branch-ref deletion and repointing inspect the sidecar before its pending
+/// rows are staged. Reject a same-transaction collision explicitly rather
+/// than allowing the later flat-index write to invalidate that safety check.
+fn has_pending_local_sidecar_rows(state_rows: &[PreparedStateRow], branch_id: &str) -> bool {
+    branch_id != crate::GLOBAL_BRANCH_ID
+        && state_rows
+            .iter()
+            .any(|row| row.untracked && row.branch_id == branch_id)
+}
+
+/// Reads the branch-local sidecar under the same snapshot as a branch-ref
+/// safety scan and carries its exact revision into the final write. A ref
+/// delete or repoint must retry if a local row appears after that scan.
+async fn guarded_branch_ref_has_local_untracked_rows<S, R>(
+    reader: &crate::live_state::LiveStateIndexStoreReader<S>,
+    read: &R,
+    branch_id: &str,
+    observed_tokens: &mut BTreeMap<String, Option<Bytes>>,
+    preconditions: &mut Vec<StoragePrecondition>,
+) -> Result<bool, LixError>
+where
+    S: StorageAdapterRead,
+    R: StorageAdapterRead + ?Sized,
+{
+    let has_local_rows = branch_has_local_untracked_rows(reader, branch_id).await?;
+    if branch_id != crate::GLOBAL_BRANCH_ID && !observed_tokens.contains_key(branch_id) {
+        let token = load_local_sidecar_branch_token(read, branch_id).await?;
+        preconditions.push(local_sidecar_branch_precondition(branch_id, token.clone())?);
+        observed_tokens.insert(branch_id.to_string(), token);
+    }
+    Ok(has_local_rows)
 }
 
 fn branch_ref_with_untracked_rows_error(branch_id: &str, deletion: bool) -> LixError {
@@ -1009,15 +1089,16 @@ async fn stage_tracked_head(
         // The v4 marker is the durable authority for current state. It is
         // intentionally bound only to the first-parent commit: serial normal
         // commits can append deltas without materializing an immutable root.
-        let parent_is_current = match root.parent_commit_id {
+        let parent_generation = match root.parent_commit_id {
             Some(parent_commit_id) => {
                 tracked_head
                     .reader(read)
-                    .is_current(&root.branch_id, &parent_commit_id.to_string())
+                    .generation_if_current(&root.branch_id, &parent_commit_id.to_string())
                     .await?
             }
-            None => false,
+            None => None,
         };
+        let parent_is_current = parent_generation.is_some();
         let parent_rows = if parent_is_current || root.parent_commit_id.is_none() {
             None
         } else if let Some(parent_commit_id) = root.parent_commit_id {
@@ -1053,7 +1134,7 @@ async fn stage_tracked_head(
         writer
             .stage_commit(
                 &root.branch_id,
-                root.parent_commit_id,
+                parent_generation,
                 root.commit_id,
                 &deltas,
                 &absence_guards,
@@ -1499,8 +1580,10 @@ mod tests {
     #[derive(Default)]
     struct TrackedHeadReadCounts {
         marker_get_many_calls: AtomicUsize,
+        sidecar_marker_get_many_calls: AtomicUsize,
         row_get_many_calls: AtomicUsize,
         row_scan_calls: AtomicUsize,
+        flat_index_scan_calls: AtomicUsize,
         tree_chunk_get_many_calls: AtomicUsize,
         tree_chunk_scan_calls: AtomicUsize,
         commit_root_get_many_calls: AtomicUsize,
@@ -1522,6 +1605,11 @@ mod tests {
             if space == crate::live_state::TRACKED_HEAD_MARKER_SPACE.id {
                 self.counts
                     .marker_get_many_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if space == crate::live_state::LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE.id {
+                self.counts
+                    .sidecar_marker_get_many_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
             if space == crate::live_state::TRACKED_HEAD_ROW_SPACE.id {
@@ -1550,6 +1638,11 @@ mod tests {
         ) -> Result<ScanChunk, StorageError> {
             if space == crate::live_state::TRACKED_HEAD_ROW_SPACE.id {
                 self.counts.row_scan_calls.fetch_add(1, Ordering::Relaxed);
+            }
+            if space == crate::live_state::LIVE_STATE_INDEX_ROW_SPACE.id {
+                self.counts
+                    .flat_index_scan_calls
+                    .fetch_add(1, Ordering::Relaxed);
             }
             if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                 self.counts
@@ -2172,6 +2265,348 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_tracked_commit_uses_sidecar_marker_not_flat_index_scan() {
+        let memory = Memory::new();
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let counts = Arc::new(TrackedHeadReadCounts::default());
+        let mut read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            inner: memory
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("counted commit read should open"),
+            counts: Arc::clone(&counts),
+        });
+
+        let mut row = tracked_branch_row("branch-a", "local-tracked-change");
+        row.commit_id = Some(commit_id("local-tracked-commit"));
+        let (_writes, preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![row],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["local-tracked-change"],
+                        "local-tracked-commit",
+                        "local-tracked-commit-change",
+                        "local-tracked-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("local tracked commit should stage");
+
+        assert_eq!(
+            counts.flat_index_scan_calls.load(Ordering::Relaxed),
+            0,
+            "normal local tracked staging must not open a flat-sidecar prefix iterator"
+        );
+        assert_eq!(
+            counts.sidecar_marker_get_many_calls.load(Ordering::Relaxed),
+            1,
+            "normal local tracked staging should probe only the sidecar marker"
+        );
+        assert!(preconditions.iter().any(|precondition| {
+            matches!(
+                precondition,
+                StoragePrecondition::KeyAbsent { space, .. }
+                    if *space == crate::live_state::LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE.id
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn local_sidecar_write_remains_compatible_with_tracked_head_promotion() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+
+        let mut first_tracked = tracked_branch_row("branch-a", "tracked-first-change");
+        first_tracked.commit_id = Some(commit_id("tracked-first-commit"));
+        let mut first_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("first tracked read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut first_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![first_tracked],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["tracked-first-change"],
+                        "tracked-first-commit",
+                        "tracked-first-commit-change",
+                        "tracked-first-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("first tracked commit should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("first tracked commit should persist");
+
+        let mut sidecar = tracked_branch_row("branch-a", "sidecar-change");
+        sidecar.untracked = true;
+        sidecar.commit_id = None;
+        let mut sidecar_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut sidecar_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![sidecar],
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("local sidecar write should stage after a tracked head");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("local sidecar write should persist after a tracked head");
+        let sidecar_marker_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("sidecar marker read should open");
+        assert!(
+            load_local_sidecar_branch_token(&sidecar_marker_read, "branch-a")
+                .await
+                .expect("sidecar marker should load")
+                .is_some(),
+            "a local sidecar write must durably mark its branch"
+        );
+
+        let counts = Arc::new(TrackedHeadReadCounts::default());
+        let mut second_read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            inner: memory
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("second tracked read should open"),
+            counts: Arc::clone(&counts),
+        });
+        let mut second_tracked = tracked_branch_row("branch-a", "tracked-second-change");
+        second_tracked.commit_id = Some(commit_id("tracked-second-commit"));
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut second_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![second_tracked],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["tracked-second-change"],
+                        "tracked-second-commit",
+                        "tracked-second-commit-change",
+                        "tracked-second-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("tracked promotion should stage after a sidecar write");
+        assert!(
+            counts.flat_index_scan_calls.load(Ordering::Relaxed) > 0,
+            "a marked sidecar branch must use the existing promotion path"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("tracked promotion should persist after a sidecar write");
+
+        let visible = live_state_context()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("visible read should open"),
+            )
+            .load_row(&LiveStateRowRequest {
+                schema_key: "test_schema".to_string(),
+                branch_id: "branch-a".to_string(),
+                entity_pk: EntityPk::single("entity-1"),
+                file_id: NullableKeyFilter::Null,
+            })
+            .await
+            .expect("tracked promotion should be readable")
+            .expect("tracked row should be visible");
+        assert!(!visible.untracked);
+        assert_eq!(visible.change_id, Some(change_id("tracked-second-change")));
+    }
+
+    #[tokio::test]
+    async fn branch_ref_delete_rejects_pending_local_sidecar_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "branch-head").await;
+
+        let mut branch_ref_delete = untracked_global_row("delete-branch-ref");
+        branch_ref_delete.entity_pk = EntityPk::single("branch-a");
+        branch_ref_delete.schema_key = BRANCH_REF_SCHEMA_KEY.to_string();
+        branch_ref_delete.snapshot = None;
+
+        let mut pending_local_sidecar = tracked_branch_row("branch-a", "pending-sidecar-row");
+        pending_local_sidecar.untracked = true;
+        pending_local_sidecar.commit_id = None;
+        pending_local_sidecar.global = false;
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-ref delete read should open");
+        let error = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![branch_ref_delete, pending_local_sidecar],
+                commit_change_refs_by_branch: BTreeMap::new(),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect_err("branch-ref delete must reject a pending local sidecar row");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+    }
+
+    #[tokio::test]
+    async fn serial_local_commit_reads_tracked_head_marker_once() {
+        let memory = Memory::new();
+        let storage = StorageAdapter::new(memory.clone());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+
+        let mut first = tracked_branch_row("branch-a", "first-local-change");
+        first.commit_id = Some(commit_id("first-local-commit"));
+        let mut first_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("first commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut first_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![first],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["first-local-change"],
+                        "first-local-commit",
+                        "first-local-commit-change",
+                        "first-local-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("first local commit should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("first local commit should persist");
+
+        let counts = Arc::new(TrackedHeadReadCounts::default());
+        let mut second_read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
+            inner: memory
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("second counted read should open"),
+            counts: Arc::clone(&counts),
+        });
+        let mut second = tracked_branch_row("branch-a", "second-local-change");
+        second.commit_id = Some(commit_id("second-local-commit"));
+        let (_writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut second_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![second],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["second-local-change"],
+                        "second-local-commit",
+                        "second-local-commit-change",
+                        "second-local-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("second local commit should stage");
+
+        assert_eq!(
+            counts.marker_get_many_calls.load(Ordering::Relaxed),
+            1,
+            "serial tracked-head staging must reuse the generation it already read"
+        );
+    }
+
+    #[tokio::test]
     async fn normal_head_projections_preserve_global_fallback_branch_override_and_tombstones() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
@@ -2263,17 +2698,19 @@ mod tests {
         assert!(
             tracked_head
                 .reader(&marker_read)
-                .is_current(GLOBAL_BRANCH_ID, &commit_id_text("global-head"))
+                .generation_if_current(GLOBAL_BRANCH_ID, &commit_id_text("global-head"))
                 .await
-                .expect("global head marker should load"),
+                .expect("global head marker should load")
+                .is_some(),
             "the global marker must bind its current branch ref"
         );
         assert!(
             tracked_head
                 .reader(&marker_read)
-                .is_current("branch-a", &commit_id_text("branch-head"))
+                .generation_if_current("branch-a", &commit_id_text("branch-head"))
                 .await
-                .expect("branch head marker should load"),
+                .expect("branch head marker should load")
+                .is_some(),
             "the branch marker must bind its current branch ref"
         );
 
