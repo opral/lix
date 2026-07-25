@@ -1281,6 +1281,10 @@ where
                     prepared_semantic_rows,
                 } = self
                     .plugin_write_reconciliation(&rows, &mut file_data)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_reconciliation"
+                    ))
                     .await?;
                 mark_plugin_reconciliation_rows(&mut plugin_rows);
                 for (file_key, version) in &materialization_versions {
@@ -2152,6 +2156,11 @@ where
 
         let mut selected_plugins = BTreeMap::<PluginFileWriteKey, PluginRegistryEntry>::new();
         let mut full_content_classification_bytes = BTreeMap::<PluginFileWriteKey, u64>::new();
+        let selection_span = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_selection"
+        );
+        let selection_guard = selection_span.enter();
         for write in file_data.iter() {
             let Some(path) = write.path.as_deref() else {
                 continue;
@@ -2219,6 +2228,7 @@ where
             };
             selected_plugins.insert(file_key, plugin.clone());
         }
+        drop(selection_guard);
 
         let mut state_groups = BTreeMap::<PluginStateGroupKey, PluginStateGroup>::new();
         for (key, owner) in &owners {
@@ -2591,13 +2601,19 @@ where
                 lease.require_accepted_semantic_root(&visible_root)?;
                 let observation_is_current = observation.semantic_root() == visible_root;
                 let observed_bytes = lease.observed_bytes();
-                let built_splices = build_file_update_splices(
-                    &observed_bytes,
-                    lease.observed_bytes_sha256(),
-                    write.data(),
-                    write.splice_provenance(),
-                    limits,
-                )?;
+                let built_splices = tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_splice_discovery"
+                )
+                .in_scope(|| {
+                    build_file_update_splices(
+                        &observed_bytes,
+                        lease.observed_bytes_sha256(),
+                        write.data(),
+                        write.splice_provenance(),
+                        limits,
+                    )
+                })?;
                 let submitted_bytes_sha256 = built_splices.after_sha256;
                 let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
                 let observed_source = ArcByteSource::new(observed_bytes.clone());
@@ -2623,6 +2639,10 @@ where
                             ids,
                         },
                     )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_file_changed"
+                    ))
                     .await
                 {
                     Ok(transition) => transition,
@@ -2634,6 +2654,10 @@ where
                     &schemas,
                     limits,
                 )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_drain_changes"
+                ))
                 .await
                 {
                     Ok(transition) => transition,
@@ -2647,6 +2671,10 @@ where
                 let mut counters = detected_transition.counters;
                 let changes = match self
                     .suppress_v2_format_only_noops(detected_transition.changes, &file_key)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_suppress_noops"
+                    ))
                     .await
                 {
                     Ok(changes) => changes,
@@ -2810,6 +2838,10 @@ where
                     &file_key,
                     existing_id_namespace_reservation.as_ref(),
                 )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_id_namespace_rows"
+                ))
                 .await;
             let namespace_rows = match namespace_rows {
                 Ok(rows) => rows,

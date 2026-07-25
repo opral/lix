@@ -3,9 +3,10 @@
 //! Git is reported both before and after explicit GC; Lix is measured after a
 //! clean close with its normal automatic storage maintenance.
 
+use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
-    CreateBranchOptions, Lix, LocalFilesystem, MergeBranchOptions, MergeBranchPreviewOptions,
-    Storage, SwitchBranchOptions, Value, open_lix_with_storage,
+    CreateBranchOptions, Lix, MergeBranchOptions, Storage, SwitchBranchOptions, Value,
+    open_lix_with_storage,
 };
 use std::fs;
 use std::io::{Cursor, Write};
@@ -17,6 +18,7 @@ const DEFAULT_TARGET_BYTES: usize = 7 * 1024 * 1024 / 2;
 const DEFAULT_EDIT_SAMPLES: usize = 20;
 const DEFAULT_MERGE_SAMPLES: usize = 7;
 const DEFAULT_COLD_SAMPLES: usize = 5;
+const DEFAULT_PROFILE_SAMPLES: usize = 200;
 const PARAGRAPH_BODY_BYTES: usize = 496;
 
 #[derive(Debug)]
@@ -59,32 +61,85 @@ struct GitFixture {
     root: tempfile::TempDir,
 }
 
+/// CPU-profile target for the ordinary public SQL byte-write path.
+///
+/// This deliberately excludes Git, semantic writes, cold opens, and merges so
+/// a sampled profile is dominated by repeated steady-state Lix edits rather
+/// than fixture construction. The comparison benchmark below remains the
+/// source of user-visible Git versus Lix numbers.
+#[tokio::test]
+#[ignore = "manual steady-state Markdown byte-write profile target"]
+async fn markdown_lix_byte_hotpath_profile() {
+    init_perf_tracing();
+
+    let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let samples = env_usize("LIX_MARKDOWN_GIT_PROFILE_SAMPLES", DEFAULT_PROFILE_SAMPLES);
+    assert!(samples > 0);
+
+    let corpus = markdown_corpus(target_bytes);
+    let archive = build_markdown_v2_plugin_archive();
+    let root = tempfile::tempdir().expect("create Markdown profile directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_plugin(&lix, "plugin_markdown_incremental_v2", &archive).await;
+    write_file(&lix, "/profile.md", corpus.bytes.clone()).await;
+
+    let mut bytes = corpus.bytes;
+    lix.reset_plugin_v2_transition_counters();
+    let started = Instant::now();
+    for sample in 0..samples {
+        let index = spread_index(sample, samples, corpus.edit_offsets.len() / 2);
+        let offset = corpus.edit_offsets[index];
+        bytes[offset] = edit_replacement(bytes[offset], sample);
+        write_file(&lix, "/profile.md", bytes.clone()).await;
+    }
+    let elapsed = started.elapsed();
+    let counters = lix.plugin_v2_transition_counters();
+    eprintln!(
+        "markdown_lix_hot_profile bytes={} samples={} total_ms={:.3} mean_ms={:.3} counters={counters:?}",
+        bytes.len(),
+        samples,
+        elapsed.as_secs_f64() * 1_000.0,
+        elapsed.as_secs_f64() * 1_000.0 / samples as f64,
+    );
+
+    assert_same_bytes(
+        "profile target must preserve exact Markdown bytes",
+        &read_file(&lix, "/profile.md").await,
+        &bytes,
+    );
+    lix.close().await.expect("close Markdown profile Lix");
+}
+
 #[tokio::test]
 #[ignore = "manual Git versus Lix Markdown benchmark"]
 async fn markdown_git_semantic_entities_benchmark() {
+    init_perf_tracing();
+
     let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
     let edit_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_EDIT_SAMPLES", DEFAULT_EDIT_SAMPLES);
+    let semantic_edit_samples =
+        env_usize("LIX_MARKDOWN_GIT_BENCH_SEMANTIC_EDIT_SAMPLES", edit_samples);
     let merge_samples = env_usize(
         "LIX_MARKDOWN_GIT_BENCH_MERGE_SAMPLES",
         DEFAULT_MERGE_SAMPLES,
     );
     let cold_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_COLD_SAMPLES", DEFAULT_COLD_SAMPLES);
-    assert!(edit_samples > 0 && merge_samples > 0 && cold_samples > 0);
+    assert!(edit_samples > 0 && semantic_edit_samples > 0 && merge_samples > 0 && cold_samples > 0);
 
     let corpus = markdown_corpus(target_bytes);
     assert!(
-        corpus.texts.len() > edit_samples + merge_samples * 4,
+        corpus.texts.len() > edit_samples.max(semantic_edit_samples) + merge_samples * 4,
         "benchmark corpus must contain enough unrelated paragraphs"
     );
     let archive = build_markdown_v2_plugin_archive();
 
     let lix_root = tempfile::tempdir().expect("create semantic Lix benchmark directory");
-    let baseline_lix = open_lix_with_filesystem(lix_root.path()).await;
+    let baseline_lix = open_lix_with_rocksdb(lix_root.path()).await;
     install_plugin(&baseline_lix, "plugin_markdown_incremental_v2", &archive).await;
     baseline_lix.close().await.expect("close baseline Lix");
     let lix_fixed = lix_repo_sizes(lix_root.path());
 
-    let lix = open_lix_with_filesystem(lix_root.path()).await;
+    let lix = open_lix_with_rocksdb(lix_root.path()).await;
     let lix_import_started = Instant::now();
     write_file(&lix, "/benchmark.md", corpus.bytes.clone()).await;
     let lix_import = lix_import_started.elapsed();
@@ -92,10 +147,10 @@ async fn markdown_git_semantic_entities_benchmark() {
     let initial_nodes = markdown_nodes_by_kind(&lix, &file_id, "paragraph").await;
     assert_eq!(initial_nodes.len(), corpus.texts.len());
 
-    let mut lix_semantic_edits = Vec::with_capacity(edit_samples);
+    let mut lix_semantic_edits = Vec::with_capacity(semantic_edit_samples);
     let mut lix_main_state = corpus.bytes.clone();
-    for sample in 0..edit_samples {
-        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+    for sample in 0..semantic_edit_samples {
+        let index = spread_index(sample, semantic_edit_samples, corpus.texts.len() / 2);
         let replacement = edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
         let payload = payload_with_replacement(
             &initial_nodes[index].payload_json,
@@ -116,7 +171,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     lix.close().await.expect("close Lix history fixture");
     let lix_history = lix_repo_sizes(lix_root.path());
 
-    let lix = open_lix_with_filesystem(lix_root.path()).await;
+    let lix = open_lix_with_rocksdb(lix_root.path()).await;
     let mut lix_merges = Vec::with_capacity(merge_samples);
     let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
     for sample in 0..merge_samples {
@@ -176,17 +231,6 @@ async fn markdown_git_semantic_entities_benchmark() {
         .await
         .expect("switch to Lix merge target");
 
-        let preview = lix
-            .merge_branch_preview(MergeBranchPreviewOptions {
-                source_branch_id: source.id.clone(),
-            })
-            .await
-            .expect("preview unrelated Lix Markdown entity merge");
-        assert!(
-            preview.conflicts.is_empty(),
-            "derived materialized blobs must not conflict: {:?}",
-            preview.conflicts
-        );
         let started = Instant::now();
         lix.merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
@@ -199,6 +243,30 @@ async fn markdown_git_semantic_entities_benchmark() {
             200 + sample,
         );
     }
+    let final_nodes = markdown_nodes_by_kind(&lix, &file_id, "paragraph")
+        .await
+        .into_iter()
+        .map(|node| (node.id, node.payload_json))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for sample in 0..merge_samples {
+        for (side, index, replacement_sample) in [
+            ("target", corpus.texts.len() / 2 + sample * 2, 100 + sample),
+            ("source", corpus.texts.len() - 1 - sample * 2, 200 + sample),
+        ] {
+            let replacement =
+                edit_replacement(corpus.bytes[corpus.edit_offsets[index]], replacement_sample);
+            let expected = payload_with_replacement(
+                &initial_nodes[index].payload_json,
+                &corpus.texts[index],
+                replacement,
+            );
+            let actual = &final_nodes[&initial_nodes[index].id];
+            assert_eq!(
+                actual, &expected,
+                "semantic {side} entity from merge sample {sample} must remain visible"
+            );
+        }
+    }
     let lix_final = read_file(&lix, "/benchmark.md").await;
     assert_same_bytes(
         "semantic merge must materialize both unrelated edits",
@@ -209,7 +277,7 @@ async fn markdown_git_semantic_entities_benchmark() {
     let lix_live = lix_repo_sizes(lix_root.path());
 
     let byte_root = tempfile::tempdir().expect("create byte-path Lix benchmark directory");
-    let byte_lix = open_lix_with_filesystem(byte_root.path()).await;
+    let byte_lix = open_lix_with_rocksdb(byte_root.path()).await;
     install_plugin(&byte_lix, "plugin_markdown_incremental_v2", &archive).await;
     write_file(&byte_lix, "/benchmark.md", corpus.bytes.clone()).await;
     let mut byte_state = corpus.bytes.clone();
@@ -236,6 +304,24 @@ async fn markdown_git_semantic_entities_benchmark() {
     )
     .await;
 
+    // Keep the raw Git timing cohort independent from the semantic-history
+    // cohort. This lets hot-byte measurements use a statistically useful
+    // sample count even when semantic edit timings are intentionally bounded.
+    let mut git_timing = GitFixture::new();
+    git_timing.write_worktree(&corpus.bytes);
+    git_timing.commit_all("initial Markdown corpus");
+    let mut git_timing_state = corpus.bytes.clone();
+    let mut git_edits = Vec::with_capacity(edit_samples);
+    for sample in 0..edit_samples {
+        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+        git_timing_state[corpus.edit_offsets[index]] =
+            edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
+        let started = Instant::now();
+        git_timing.write_worktree(&git_timing_state);
+        git_timing.commit_all(&format!("timed edit paragraph {index}"));
+        git_edits.push(started.elapsed());
+    }
+
     let mut git = GitFixture::new();
     let git_fixed = git.repo_sizes();
     let git_import_started = Instant::now();
@@ -244,15 +330,12 @@ async fn markdown_git_semantic_entities_benchmark() {
     let git_import = git_import_started.elapsed();
 
     let mut git_state = corpus.bytes.clone();
-    let mut git_edits = Vec::with_capacity(edit_samples);
-    for sample in 0..edit_samples {
-        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+    for sample in 0..semantic_edit_samples {
+        let index = spread_index(sample, semantic_edit_samples, corpus.texts.len() / 2);
         git_state[corpus.edit_offsets[index]] =
             edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
-        let started = Instant::now();
         git.write_worktree(&git_state);
         git.commit_all(&format!("edit paragraph {index}"));
-        git_edits.push(started.elapsed());
     }
     assert_same_bytes(
         "Git and Lix must match after the identical pre-merge edit trace",
@@ -361,13 +444,14 @@ async fn markdown_git_semantic_entities_benchmark() {
          system=git clean_merges=0 conflicts=1 preserved_edits=0"
     );
     eprintln!(
-        "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} merge_samples={} \
+        "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} semantic_edit_samples={} merge_samples={} \
          lix_incremental_total_bytes={} lix_incremental_metadata_bytes={} \
          git_live_incremental_total_bytes={} git_live_incremental_metadata_bytes={} \
          git_packed_incremental_total_bytes={} git_packed_incremental_metadata_bytes={}",
         corpus.bytes.len(),
         corpus.texts.len(),
         edit_samples,
+        semantic_edit_samples,
         merge_samples,
         lix_history
             .total_bytes
@@ -475,9 +559,8 @@ async fn cold_lix_byte_edits(
         bytes[edit_offsets[index]] = edit_replacement(bytes[edit_offsets[index]], 500 + sample);
         let started = Instant::now();
         let storage_started = Instant::now();
-        let storage = LocalFilesystem::open(root)
-            .await
-            .expect("open cold byte-edit Lix filesystem");
+        let storage =
+            RocksDB::open(root.join(".lix")).expect("open cold byte-edit Lix RocksDB storage");
         storage_open.push(storage_started.elapsed());
         let engine_started = Instant::now();
         let lix = open_lix_with_storage(storage)
@@ -506,9 +589,7 @@ async fn cold_lix_reads(root: &Path, expected: &[u8], samples: usize) -> ColdLix
     for _ in 0..samples {
         let started = Instant::now();
         let storage_started = Instant::now();
-        let storage = LocalFilesystem::open(root)
-            .await
-            .expect("open cold Lix filesystem");
+        let storage = RocksDB::open(root.join(".lix")).expect("open cold Lix RocksDB storage");
         storage_open.push(storage_started.elapsed());
         let engine_started = Instant::now();
         let lix = open_lix_with_storage(storage)
@@ -534,7 +615,7 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
     const TABLE: &[u8] = b"| left | right |\n| --- | --- |\n| alpha | beta |\n";
 
     let root = tempfile::tempdir().expect("create Lix semantic quality directory");
-    let lix = open_lix_with_filesystem(root.path()).await;
+    let lix = open_lix_with_rocksdb(root.path()).await;
     install_plugin(&lix, "plugin_markdown_incremental_v2", archive).await;
     write_file(&lix, "/quality.md", TABLE.to_vec()).await;
     let file_id = file_id_at_path(&lix, "/quality.md").await;
@@ -787,25 +868,44 @@ async fn update_markdown_node<StorageImpl>(
 ) where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let result = lix
-        .execute(
-            "UPDATE markdown_node_v2 SET payload_json = $1 \
-             WHERE id = $2 AND lixcol_file_id = $3",
-            &[
-                Value::Text(payload_json),
-                Value::Text(id.to_owned()),
-                Value::Text(file_id.to_owned()),
-            ],
-        )
-        .await
-        .expect("update Markdown semantic entity");
-    assert_eq!(result.rows_affected(), 1);
+    for attempt in 0..5 {
+        match lix
+            .execute(
+                "UPDATE markdown_node_v2 SET payload_json = $1 \
+                 WHERE id = $2 AND lixcol_file_id = $3",
+                &[
+                    Value::Text(payload_json.clone()),
+                    Value::Text(id.to_owned()),
+                    Value::Text(file_id.to_owned()),
+                ],
+            )
+            .await
+        {
+            Ok(result) => {
+                assert_eq!(result.rows_affected(), 1);
+                return;
+            }
+            Err(error) if error.code == "LIX_TRANSACTION_CONFLICT" && attempt < 4 => {
+                tokio::task::yield_now().await;
+            }
+            Err(error) => panic!("update Markdown semantic entity: {error:?}"),
+        }
+    }
+    unreachable!("bounded Markdown entity update retry loop returns or panics");
 }
 
-async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
-    let storage = LocalFilesystem::open(path)
-        .await
-        .expect("open Lix filesystem");
+fn init_perf_tracing() {
+    if std::env::var_os("LIX_MARKDOWN_GIT_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_test_writer()
+            .try_init();
+    }
+}
+
+async fn open_lix_with_rocksdb(path: &Path) -> Lix<RocksDB> {
+    let storage = RocksDB::open(path.join(".lix")).expect("open Lix RocksDB storage");
     open_lix_with_storage(storage)
         .await
         .expect("open Lix workspace")
