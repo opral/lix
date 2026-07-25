@@ -583,9 +583,11 @@ async fn slatedb_direct_versus_remote_reads() {
                     // open and times only the write-to-next-event path. That
                     // is necessarily a warm-runtime workload.
                     if matches!(cache_state, CacheState::WarmMemory) {
-                        let (direct, remote) =
-                            measure_observe_state_update_distribution(&seed, warm_memory_samples)
-                                .await;
+                        let (direct, remote) = Box::pin(measure_observe_state_update_distribution(
+                            &seed,
+                            warm_memory_samples,
+                        ))
+                        .await;
                         report_and_assert(delay_ms, cache_state, operation, &direct, &remote);
                     }
                     continue;
@@ -983,7 +985,7 @@ async fn update_state_row(lix: &Lix<SlateDB>, revision: u64) {
             Value::Json(json!({
                 "ordinal": 5_000,
                 "revision": revision,
-                "active": revision % 2 == 0,
+                "active": revision.is_multiple_of(2),
             })),
             Value::Text(STATE_UPDATE_KEY.to_string()),
         ],
@@ -1323,7 +1325,7 @@ fn state_update_wire_params(revision: u64) -> JsonValue {
             "value": {
                 "ordinal": 5_000,
                 "revision": revision,
-                "active": revision % 2 == 0,
+                "active": revision.is_multiple_of(2),
             },
         },
         {"kind": "text", "value": STATE_UPDATE_KEY},
