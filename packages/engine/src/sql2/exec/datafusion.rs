@@ -90,6 +90,14 @@ pub(crate) async fn execute_read_statement_from_parsed<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
+    // The route below recognizes only a small, fully understood subset; every
+    // other read continues through the normal DataFusion path unchanged.
+    if let Some(result) =
+        super::bound_public_read::try_execute_bound_public_read(ctx, sql, &statement, params)
+            .await?
+    {
+        return Ok(result);
+    }
     let session = prepare_read_session(ctx, std::slice::from_ref(&statement)).await?;
     execute_read_statement_in_session_from_parsed(&session, sql, statement, params).await
 }
@@ -158,6 +166,12 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
+    if let Some(result) =
+        super::bound_public_read::try_execute_bound_public_read(read_ctx, sql, &statement, params)
+            .await?
+    {
+        return Ok(result);
+    }
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
     let plan =
@@ -3129,6 +3143,59 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn native_entity_primary_key_read_materializes_public_result() {
+        let sql = "SELECT id, value FROM test_state_schema \
+                   WHERE id IN ('entity-b', 'entity-a') ORDER BY id";
+        let ctx = DummySqlExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader: Arc::new(DummyBlobReader),
+            live_state: Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    live_test_state_row("entity-b", "branch-a", "B", false),
+                    live_test_state_row("entity-a", "branch-a", "A", false),
+                ],
+            }),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "value"],
+                "additionalProperties": false
+            })],
+        };
+        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
+
+        let result = super::super::bound_public_read::try_execute_bound_public_read(
+            &ctx,
+            sql,
+            &statement,
+            &[],
+        )
+        .await
+        .expect("native route should execute")
+        .expect("exact public primary-key read should use native route");
+
+        assert_eq!(result.columns, vec!["id", "value"]);
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Text("entity-a".to_string()),
+                    Value::Text("A".to_string())
+                ],
+                vec![
+                    Value::Text("entity-b".to_string()),
+                    Value::Text("B".to_string())
+                ],
+            ]
+        );
     }
 
     #[tokio::test]
