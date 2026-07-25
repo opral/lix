@@ -1027,12 +1027,28 @@ where
 
         let active_branch_id = match initial_active_branch_id {
             Some(active_branch_id) => active_branch_id,
-            None => self.inner.root.active_branch_id().await?,
+            None => match self.inner.root.active_branch_id().await {
+                Ok(active_branch_id) => active_branch_id,
+                Err(error) => {
+                    if let Some(notifier) = &durable_terminal_storage_notifier {
+                        notifier.signal_if_terminal(&error);
+                    }
+                    return Err(error.into());
+                }
+            },
         };
         // Validate and open the pinned child before evicting any idle session.
         // A stale client branch preference therefore cannot consume capacity or
         // evict another client.
-        let child = self.inner.root.open_session(active_branch_id).await?;
+        let child = match self.inner.root.open_session(active_branch_id).await {
+            Ok(child) => child,
+            Err(error) => {
+                if let Some(notifier) = &durable_terminal_storage_notifier {
+                    notifier.signal_if_terminal(&error);
+                }
+                return Err(error.into());
+            }
+        };
 
         let mut registry = self.inner.registry.lock().await;
         if let Err(error) = ensure_server_open(registry.lifecycle) {
@@ -3284,6 +3300,74 @@ mod tests {
                 .await
                 .expect("fenced handshake should wake the request observer"),
             "the resumed handshake should preserve its terminal storage result"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_new_handshake_reports_terminal_storage_signal() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let router = handler(LixProtocolServer::new(root));
+
+        storage.fence_reads();
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1")
+                    .extension(notifier)
+                    .body(Body::empty())
+                    .expect("new handshake request"),
+            )
+            .await
+            .expect("new handshake response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+                .await
+                .expect("fenced handshake should wake the request observer"),
+            "the new handshake should preserve its terminal storage result"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_new_handshake_with_explicit_branch_reports_terminal_storage_signal() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let active_branch_id = root
+            .active_branch_id()
+            .await
+            .expect("read initial active branch");
+        let router = handler(LixProtocolServer::new(root));
+
+        storage.fence_reads();
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/lix/v1?activeBranchId={active_branch_id}"))
+                    .extension(notifier)
+                    .body(Body::empty())
+                    .expect("new handshake request"),
+            )
+            .await
+            .expect("new handshake response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+                .await
+                .expect("fenced handshake should wake the request observer"),
+            "the explicit-branch handshake should preserve its terminal storage result"
         );
     }
 
