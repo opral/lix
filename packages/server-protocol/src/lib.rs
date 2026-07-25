@@ -5150,6 +5150,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_rejects_non_finite_results_before_committing() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            Some(json!({
+                "statements": [
+                    {
+                        "sql": "INSERT INTO lix_key_value (key, value) VALUES ('nonfinite-batch', 'written')",
+                        "params": []
+                    },
+                    { "sql": "SELECT 0e0 / 0e0 AS value", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error_code(response).await, LixError::CODE_TYPE_MISMATCH);
+
+        let persisted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT key FROM lix_key_value WHERE key = 'nonfinite-batch'"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(response_json(persisted).await["rows"], json!([]));
+    }
+
+    #[tokio::test]
     async fn execute_reconstructs_cached_blob_splices_and_caches_each_result() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
