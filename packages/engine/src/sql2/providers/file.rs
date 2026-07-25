@@ -44,6 +44,8 @@ use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
     LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
 };
+#[cfg(test)]
+use crate::plugin::host_entity_with_lazy_snapshot;
 use crate::plugin::{
     CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorKey, PluginFileOwner,
     PluginRegistry, PluginRegistryEntry, PluginRuntimeHost, is_plugin_storage_path,
@@ -64,8 +66,6 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SessionFileViewKey, SessionFileViews, SessionPluginFileView};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-#[cfg(test)]
-use crate::plugin::host_entity_with_lazy_snapshot;
 #[cfg(test)]
 use crate::wasm::{WasmHostEntity, WasmTransitionLimits};
 use crate::{
