@@ -2133,9 +2133,9 @@ fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Resul
             Err(_) => Ok(Value::Text(value.to_string())),
         },
         ScalarValue::UInt64(None) => Ok(Value::Null),
-        ScalarValue::Float32(Some(value)) => Ok(Value::Real(f64::from(value))),
+        ScalarValue::Float32(Some(value)) => finite_query_float(f64::from(value)),
         ScalarValue::Float32(None) => Ok(Value::Null),
-        ScalarValue::Float64(Some(value)) => Ok(Value::Real(value)),
+        ScalarValue::Float64(Some(value)) => finite_query_float(value),
         ScalarValue::Float64(None) => Ok(Value::Null),
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
@@ -2149,6 +2149,16 @@ fn scalar_value_to_lix_value(value: ScalarValue, field: Option<&Field>) -> Resul
         ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Ok(Value::Null),
         other => Ok(Value::Text(other.to_string())),
     }
+}
+
+fn finite_query_float(value: f64) -> Result<Value, LixError> {
+    if !value.is_finite() {
+        return Err(LixError::new(
+            LixError::CODE_TYPE_MISMATCH,
+            "SQL query produced a non-finite number",
+        ));
+    }
+    Ok(Value::Real(value))
 }
 
 fn string_scalar_to_lix_value(value: String, field: Option<&Field>) -> Result<Value, LixError> {
