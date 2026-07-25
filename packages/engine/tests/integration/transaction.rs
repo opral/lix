@@ -114,6 +114,77 @@ async fn stale_transaction_cannot_publish_over_newer_commit() {
 }
 
 #[tokio::test]
+async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
+    let storage = Memory::new();
+    Engine::initialize(storage.clone())
+        .await
+        .expect("storage should initialize");
+
+    let setup_engine = Engine::new(storage.clone())
+        .await
+        .expect("initialized storage should create setup engine");
+    let setup_session = setup_engine
+        .open_workspace_session()
+        .await
+        .expect("setup workspace session should open");
+    setup_session
+        .create_branch(CreateBranchOptions {
+            id: Some("deferred-branch".to_string()),
+            name: "Deferred branch".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("local branch should be created");
+
+    // Separate engines share storage but not a collaboration gate, so the
+    // branch can disappear after the transaction opens and before it commits.
+    let branch_engine = Engine::new(storage.clone())
+        .await
+        .expect("branch engine should open");
+    let delete_engine = Engine::new(storage)
+        .await
+        .expect("delete engine should open");
+    let branch_session = branch_engine
+        .open_session("deferred-branch")
+        .await
+        .expect("local branch session should open");
+    let delete_session = delete_engine
+        .open_workspace_session()
+        .await
+        .expect("delete workspace session should open");
+
+    let mut transaction = branch_session
+        .begin_transaction()
+        .await
+        .expect("local transaction should begin");
+    delete_session
+        .execute("DELETE FROM lix_branch WHERE id = 'deferred-branch'", &[])
+        .await
+        .expect("branch delete should commit");
+
+    transaction
+        .execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('deferred-branch-key', 'value')",
+            &[],
+        )
+        .await
+        .expect("normal active-branch write should stage without a branch-head probe");
+    let error = transaction
+        .commit()
+        .await
+        .expect_err("commit must reject a branch deleted after transaction open");
+    assert_eq!(error.code, "LIX_BRANCH_NOT_FOUND");
+    assert_eq!(
+        delete_engine
+            .load_branch_head_commit_id("deferred-branch")
+            .await
+            .expect("branch head lookup should succeed"),
+        None,
+        "the failed transaction must not resurrect the deleted branch"
+    );
+}
+
+#[tokio::test]
 async fn untracked_sidecar_write_does_not_invalidate_tracked_transaction() {
     let storage = Memory::new();
     Engine::initialize(storage.clone())

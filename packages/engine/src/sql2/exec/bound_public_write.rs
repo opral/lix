@@ -171,7 +171,15 @@ async fn execute_entity_write(
 
     let spec = entity_spec(ctx, schema_key)?;
     validate_bound_write_supported(plan, &spec)?;
-    let active_branch_commit_id = load_active_branch_commit_id(ctx).await?;
+    // Only `lix_active_branch_commit_id()` needs the current branch head.
+    // Normal entity mutations already stage against the transaction's active
+    // branch, so eagerly opening another read here makes the common write
+    // path pay for a value it never observes.
+    let active_branch_commit_id = if plan_references_active_branch_commit_id(plan) {
+        Some(load_active_branch_commit_id(ctx).await?)
+    } else {
+        None
+    };
     let no_op = matches!(plan.bound.branch_scope, BranchScope::Empty)
         || matches!(plan.filters.rows, FilterSet::None);
     match plan.bound.op {
@@ -207,13 +215,180 @@ async fn execute_entity_write(
     }
 }
 
+fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {
+    let input_references_head = match &plan.bound.input {
+        BoundWriteInput::Values(values) => values
+            .rows
+            .iter()
+            .flatten()
+            .any(bound_expr_references_active_branch_commit_id),
+        // Query input does not use this executor today. Keep the old eager
+        // behavior if a future supported shape reaches it without a complete
+        // expression traversal for `BoundRead`.
+        BoundWriteInput::Query { .. } => true,
+        BoundWriteInput::None => false,
+    };
+    input_references_head
+        || bound_predicate_references_active_branch_commit_id(&plan.bound.predicate)
+        || plan
+            .bound
+            .assignments
+            .iter()
+            .any(|assignment| bound_expr_references_active_branch_commit_id(&assignment.value))
+        || plan.bound.conflict.as_ref().is_some_and(|conflict| {
+            conflict
+                .action
+                .assignments()
+                .iter()
+                .any(|assignment| bound_expr_references_active_branch_commit_id(&assignment.value))
+        })
+        || plan.bound.returning.as_ref().is_some_and(|returning| {
+            returning
+                .items
+                .iter()
+                .any(|item| bound_expr_references_active_branch_commit_id(&item.expr))
+        })
+}
+
+fn bound_predicate_references_active_branch_commit_id(predicate: &BoundPredicate) -> bool {
+    match predicate {
+        BoundPredicate::True | BoundPredicate::False => false,
+        BoundPredicate::And(predicates) | BoundPredicate::Or(predicates) => predicates
+            .iter()
+            .any(bound_predicate_references_active_branch_commit_id),
+        BoundPredicate::Eq(left, right) => {
+            bound_expr_references_active_branch_commit_id(left)
+                || bound_expr_references_active_branch_commit_id(right)
+        }
+        BoundPredicate::Like { expr, pattern, .. } => {
+            bound_expr_references_active_branch_commit_id(expr)
+                || bound_expr_references_active_branch_commit_id(pattern)
+        }
+        BoundPredicate::IsNull(expr) | BoundPredicate::IsNotNull(expr) => {
+            bound_expr_references_active_branch_commit_id(expr)
+        }
+        BoundPredicate::In { expr, values } => {
+            bound_expr_references_active_branch_commit_id(expr)
+                || values
+                    .iter()
+                    .any(bound_expr_references_active_branch_commit_id)
+        }
+    }
+}
+
+fn bound_expr_references_active_branch_commit_id(expr: &BoundExpr) -> bool {
+    match expr {
+        BoundExpr::Function { name, args } => {
+            (name == "lix_active_branch_commit_id" && args.is_empty())
+                || args
+                    .iter()
+                    .any(bound_expr_references_active_branch_commit_id)
+        }
+        BoundExpr::Cast { expr, .. } => bound_expr_references_active_branch_commit_id(expr),
+        BoundExpr::Column(_)
+        | BoundExpr::ExcludedColumn(_)
+        | BoundExpr::Param(_)
+        | BoundExpr::Literal(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod active_branch_commit_id_reference_tests {
+    use super::*;
+    use crate::sql2::bind::expr::BoundColumnRef;
+    use crate::sql2::bind::write::{
+        BoundParamMap, BoundWrite, BoundWriteInput, BoundWriteOp, BoundWriteTarget,
+        EntityWriteSurface,
+    };
+    use crate::sql2::plan::branch_scope::BranchScope;
+    use crate::sql2::plan::write::PlannedWriteFilters;
+
+    #[test]
+    fn detects_active_branch_commit_id_in_nested_write_expressions() {
+        let plan = update_plan(
+            BoundPredicate::True,
+            BoundExpr::Function {
+                name: "lix_json".to_string(),
+                args: vec![active_branch_commit_id()],
+            },
+        );
+
+        assert!(plan_references_active_branch_commit_id(&plan));
+    }
+
+    #[test]
+    fn detects_active_branch_commit_id_in_predicates_but_ignores_other_functions() {
+        let plan = update_plan(
+            BoundPredicate::Eq(
+                BoundExpr::Column(BoundColumnRef {
+                    table: "json_pointer".to_string(),
+                    column_id: 0,
+                    name: "value".to_string(),
+                }),
+                active_branch_commit_id(),
+            ),
+            BoundExpr::Function {
+                name: "lix_timestamp".to_string(),
+                args: Vec::new(),
+            },
+        );
+
+        assert!(plan_references_active_branch_commit_id(&plan));
+
+        let no_head_plan = update_plan(
+            BoundPredicate::True,
+            BoundExpr::Function {
+                name: "lix_timestamp".to_string(),
+                args: Vec::new(),
+            },
+        );
+        assert!(!plan_references_active_branch_commit_id(&no_head_plan));
+    }
+
+    fn active_branch_commit_id() -> BoundExpr {
+        BoundExpr::Function {
+            name: "lix_active_branch_commit_id".to_string(),
+            args: Vec::new(),
+        }
+    }
+
+    fn update_plan(predicate: BoundPredicate, assignment_value: BoundExpr) -> LogicalWritePlan {
+        LogicalWritePlan {
+            bound: BoundWrite {
+                target: BoundWriteTarget::Entity(EntityWriteSurface::Base {
+                    schema_key: "json_pointer".to_string(),
+                }),
+                op: BoundWriteOp::Update,
+                input: BoundWriteInput::None,
+                predicate,
+                assignments: vec![BoundAssignment {
+                    column: BoundColumnRef {
+                        table: "json_pointer".to_string(),
+                        column_id: 1,
+                        name: "value".to_string(),
+                    },
+                    value: assignment_value,
+                }],
+                conflict: None,
+                returning: None,
+                params: BoundParamMap::default(),
+                branch_scope: BranchScope::Active {
+                    branch_id: "main".to_string(),
+                },
+            },
+            filters: PlannedWriteFilters {
+                rows: FilterSet::All,
+            },
+        }
+    }
+}
+
 async fn load_active_branch_commit_id(
     ctx: &mut dyn SqlWriteExecutionContext,
-) -> Result<Option<CommitId>, LixError> {
+) -> Result<CommitId, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
         .await?
-        .map(Some)
         .ok_or_else(|| {
             LixError::branch_not_found(
                 active_branch_id,

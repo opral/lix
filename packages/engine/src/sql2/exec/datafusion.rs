@@ -3758,7 +3758,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_insert_into_active_entity_rejects_missing_active_head() {
+    async fn execute_sql_insert_into_active_entity_does_not_probe_active_head_during_lowering() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -3776,25 +3776,29 @@ mod tests {
             })],
         };
 
-        let error = execute_write_sql(
+        let result = execute_write_sql(
             &mut ctx,
             "INSERT INTO test_state_schema (lixcol_entity_pk, value) \
              VALUES (lix_json('[\"entity-c\"]'), 'C')",
             &[],
         )
         .await
-        .expect_err("missing active head should fail before staging");
+        .expect("lowering should not probe the active head before commit");
 
-        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
-        assert!(
-            error
-                .message
-                .contains("branch 'missing-branch' was not found")
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(
+            ctx.staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .len(),
+            1,
+            "the transaction commit boundary owns active-branch validation"
         );
     }
 
     #[tokio::test]
-    async fn execute_sql_noop_active_entity_write_rejects_missing_active_head() {
+    async fn execute_sql_noop_active_entity_write_does_not_probe_active_head() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
@@ -3816,19 +3820,20 @@ mod tests {
             "UPDATE test_state_schema SET value = 'D' WHERE false",
             "DELETE FROM test_state_schema WHERE false",
         ] {
-            let error = execute_write_sql(&mut ctx, sql, &[])
+            let result = execute_write_sql(&mut ctx, sql, &[])
                 .await
-                .expect_err("missing active head should fail even for no-op writes");
+                .expect("no-op lowering should not probe the active head");
 
-            assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND, "{sql}");
-            assert!(
-                error
-                    .message
-                    .contains("branch 'missing-branch' was not found"),
-                "{sql}: {}",
-                error.message
-            );
+            assert_eq!(result.rows, vec![vec![Value::Integer(0)]], "{sql}");
         }
+        assert!(
+            ctx.staged_writes
+                .lock()
+                .expect("staged writes lock")
+                .deltas
+                .is_empty(),
+            "no-op writes must not create a staged commit"
+        );
     }
 
     #[tokio::test]

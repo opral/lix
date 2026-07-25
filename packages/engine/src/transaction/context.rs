@@ -52,7 +52,7 @@ use crate::plugin::{
     is_plugin_storage_path, plugin_install_plan_from_archive_path, plugin_key_from_archive_file_id,
     plugin_state_live_state_projection, retain_plugin_state_rows_for_schema_keys,
 };
-use crate::session::{SessionMode, WORKSPACE_BRANCH_KEY};
+use crate::session::{SessionMode, load_workspace_branch_id_from_index};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViewKey, SessionFileViewMutation,
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
@@ -445,15 +445,27 @@ where
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
         check_commit_boundary(commit_boundary.as_ref())?;
         // Validate and materialize from one coherent storage snapshot. The
-        // final write's preconditions then fence every fact validation and
-        // sidecar decision was based on, just like a conventional optimistic
-        // database transaction.
+        // final write's tracked-state precondition then fences the tracked
+        // validation decisions this commit was based on, just like a
+        // conventional optimistic database transaction. Branch-reference
+        // movement retains its existing materialization semantics.
         let commit_read_storage = transaction.storage.clone();
         let mut read = SharedStorageAdapterRead::new(
             commit_read_storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
+        // Stage-time branch/snapshot probes are redundant: this coherent
+        // commit read is the only snapshot that can publish, and the durable
+        // revision precondition below fences it. Resolve branch heads here so
+        // validation, parent selection, and persistence agree on one view.
+        let commit_parent_heads = commit::resolve_prepared_commit_parent_heads(
+            transaction.branch_ctx.as_ref(),
+            &read,
+            &prepared_writes,
+            true,
+        )
+        .await?;
         transaction
             .validate_prepared_writes_by_branch(&read, &prepared_writes)
             .instrument(tracing::debug_span!(
@@ -486,23 +498,24 @@ where
         } else {
             load_path_index_revision(&read).await.ok().flatten()
         };
-        let (mut writes, materialization_preconditions) = match commit::commit_prepared_writes(
-            &transaction.binary_cas,
-            transaction.branch_ctx.as_ref(),
-            transaction.live_state.index(),
-            Some(runtime_functions),
-            &mut read,
-            prepared_writes,
-        )
-        .instrument(tracing::debug_span!(
-            target: "lix_perf",
-            "lix.perf.transaction_materialization"
-        ))
-        .await
-        {
-            Ok(writes) => writes,
-            Err(error) => return Err(error),
-        };
+        let (mut writes, materialization_preconditions) =
+            match commit::commit_prepared_writes_with_parent_heads(
+                &transaction.binary_cas,
+                transaction.live_state.index(),
+                Some(runtime_functions),
+                &commit_parent_heads,
+                &mut read,
+                prepared_writes,
+            )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_materialization"
+            ))
+            .await
+            {
+                Ok(writes) => writes,
+                Err(error) => return Err(error),
+            };
         if catalog_revision_changed {
             stage_catalog_revision(&mut writes);
         }
@@ -578,8 +591,20 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
-        self.ensure_opening_snapshot_is_current().await?;
+        // Staging is transaction-local. Commit validates and materializes from
+        // one coherent snapshot, then fences that snapshot in the durable
+        // write. Re-checking it for every staged batch only repeats point
+        // reads; it cannot make a stale write publish successfully.
         require_valid_transaction_write_storage_scopes(&write)?;
+        // A normal write targets the branch this transaction already opened
+        // against, so its existence is checked together with the coherent
+        // commit snapshot. Preserve the useful early error for the uncommon
+        // programmatic cross-branch write: normalization cannot meaningfully
+        // resolve a schema from a branch that does not exist.
+        if transaction_write_targets_non_active_branch(&write, &self.active_branch_id) {
+            self.require_existing_transaction_write_branch_ids(&write)
+                .await?;
+        }
         #[cfg(feature = "storage-benches")]
         {
             crate::storage_bench::record_transaction_rows_staged(transaction_write_row_count(
@@ -589,8 +614,6 @@ where
                 transaction_write_untracked_row_count(&write),
             );
         }
-        self.require_existing_transaction_write_branch_ids(&write)
-            .await?;
         let (write, file_view_mutations) = self.reconcile_plugin_write(write).await?;
         require_valid_transaction_write_storage_scopes(&write)?;
         let write = self.prepare_transaction_write(write).await?;
@@ -1732,14 +1755,13 @@ where
         &mut self,
         write: &TransactionWrite,
     ) -> Result<(), LixError> {
-        let branch_ids = transaction_write_branch_ids(write);
         let read = SharedStorageAdapterRead::new(
             self.storage
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
         let reader = self.branch_ctx.ref_reader(read);
-        for branch_id in branch_ids {
+        for branch_id in transaction_write_branch_ids(write) {
             if branch_id == GLOBAL_BRANCH_ID {
                 continue;
             }
@@ -2813,14 +2835,40 @@ fn plugin_transaction_json(raw: &str, context: &str) -> Result<TransactionJson, 
     TransactionJson::from_value(value, context)
 }
 
-fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
+fn transaction_write_targets_non_active_branch(
+    write: &TransactionWrite,
+    active_branch_id: &str,
+) -> bool {
+    let is_non_active_local = |branch_id: &str, global: bool| {
+        !global && branch_id != GLOBAL_BRANCH_ID && branch_id != active_branch_id
+    };
     match write {
-        TransactionWrite::Rows { rows, .. } => transaction_write_row_branch_ids(rows),
+        TransactionWrite::Rows { rows, .. } => rows
+            .iter()
+            .any(|row| is_non_active_local(&row.branch_id, row.global)),
         TransactionWrite::RowsWithFileData {
             rows, file_data, ..
-        } => transaction_write_row_branch_ids(rows)
-            .into_iter()
-            .chain(stage_file_data_branch_ids(file_data))
+        } => {
+            rows.iter()
+                .any(|row| is_non_active_local(&row.branch_id, row.global))
+                || file_data
+                    .iter()
+                    .any(|write| is_non_active_local(&write.branch_id, write.global))
+        }
+    }
+}
+
+fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
+    match write {
+        TransactionWrite::Rows { rows, .. } => {
+            rows.iter().map(|row| row.branch_id.clone()).collect()
+        }
+        TransactionWrite::RowsWithFileData {
+            rows, file_data, ..
+        } => rows
+            .iter()
+            .map(|row| row.branch_id.clone())
+            .chain(file_data.iter().map(|write| write.branch_id.clone()))
             .collect(),
     }
 }
@@ -2875,17 +2923,6 @@ fn require_valid_storage_scope(branch_id: &str, global: bool) -> Result<(), LixE
     Ok(())
 }
 
-fn transaction_write_row_branch_ids(rows: &[TransactionWriteRow]) -> BTreeSet<String> {
-    rows.iter().map(|row| row.branch_id.clone()).collect()
-}
-
-fn stage_file_data_branch_ids(file_data: &[TransactionFileData]) -> BTreeSet<String> {
-    file_data
-        .iter()
-        .map(|write| write.branch_id.clone())
-        .collect()
-}
-
 async fn resolve_active_branch_id(
     mode: &SessionMode,
     live_state: &LiveStateContext,
@@ -2894,67 +2931,10 @@ async fn resolve_active_branch_id(
 ) -> Result<String, LixError> {
     match mode {
         SessionMode::Pinned { branch_id } => Ok(branch_id.clone()),
-        SessionMode::Workspace => load_workspace_branch_id(live_state, branch_ctx, read).await,
+        SessionMode::Workspace => {
+            load_workspace_branch_id_from_index(live_state, branch_ctx, read).await
+        }
     }
-}
-
-async fn load_workspace_branch_id(
-    live_state: &LiveStateContext,
-    branch_ctx: &BranchContext,
-    read: &(impl StorageAdapterRead + ?Sized),
-) -> Result<String, LixError> {
-    let row = live_state
-        .reader(read)
-        .load_row(&LiveStateRowRequest {
-            schema_key: "lix_key_value".to_string(),
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
-            file_id: NullableKeyFilter::Null,
-        })
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
-            )
-        })?;
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "workspace branch selector is missing snapshot_content",
-        )
-    })?;
-    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("workspace branch selector snapshot is invalid JSON: {error}"),
-        )
-    })?;
-    let branch_id = snapshot
-        .get("value")
-        .and_then(JsonValue::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "workspace branch selector value must be a non-empty string",
-            )
-        })?
-        .to_string();
-
-    let head = branch_ctx
-        .ref_reader(read)
-        .load_head_commit_id(&branch_id)
-        .await?;
-    if head.is_none() {
-        return Err(LixError::branch_not_found(
-            branch_id,
-            "load_workspace_branch_id",
-            "workspace_selector",
-        ));
-    }
-
-    Ok(branch_id)
 }
 
 #[cfg(test)]
@@ -2999,6 +2979,47 @@ mod tests {
         ] {
             assert!(plugin_owner_needs_write(Some(&current), &desired));
         }
+    }
+
+    #[test]
+    fn active_branch_write_gate_ignores_global_companion_rows_and_files() {
+        let mut active_row = key_value_stage_row("active-row", "value", false);
+        active_row.branch_id = "branch-a".to_string();
+        active_row.global = false;
+        let mut global_row = key_value_stage_row("global-row", "value", false);
+        global_row.branch_id = GLOBAL_BRANCH_ID.to_string();
+        global_row.global = true;
+        let global_file = TransactionFileData::new(
+            "global-file".to_string(),
+            None,
+            None,
+            GLOBAL_BRANCH_ID.to_string(),
+            true,
+            false,
+            Vec::new(),
+        );
+
+        assert!(
+            !transaction_write_targets_non_active_branch(
+                &TransactionWrite::RowsWithFileData {
+                    mode: TransactionWriteMode::Replace,
+                    rows: vec![active_row.clone(), global_row],
+                    file_data: vec![global_file],
+                    count: 1,
+                },
+                "branch-a",
+            ),
+            "normal local writes commonly carry global bookkeeping rows"
+        );
+
+        active_row.branch_id = "branch-b".to_string();
+        assert!(transaction_write_targets_non_active_branch(
+            &TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![active_row],
+            },
+            "branch-a",
+        ));
     }
 
     #[tokio::test]

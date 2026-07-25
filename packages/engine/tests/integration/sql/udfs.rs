@@ -123,3 +123,51 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    lix_active_branch_commit_id_is_available_to_bound_writes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('active-head-write-seed', 'one')",
+                &[],
+            )
+            .await
+            .expect("tracked write should establish an active head");
+        let expected = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head should load")
+            .expect("head should exist");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('active-head-write', lix_active_branch_commit_id())",
+                &[],
+            )
+            .await
+            .expect("bound write should evaluate active head UDF");
+
+        let stored = session
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = 'active-head-write'",
+                &[],
+            )
+            .await
+            .expect("stored active head should read");
+        assert_eq!(
+            stored.rows()[0].value("value").unwrap(),
+            &Value::Json(json!(expected.clone()))
+        );
+    }
+);
