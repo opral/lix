@@ -2450,6 +2450,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
             StatusCode::CONFLICT
         }
+        LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN => StatusCode::SERVICE_UNAVAILABLE,
         LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
@@ -2913,9 +2914,9 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix_sdk::{
-        Blob, Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions,
-        RequestBlobSpliceProvenance, StorageError, TracingTelemetrySink, WriteOptions, open_lix,
-        open_lix_with_telemetry,
+        Blob, CommitResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite, OpenLixOptions,
+        PutBatch, ReadOptions, RequestBlobSpliceProvenance, SpaceId, StorageError, StorageWrite,
+        TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
     };
     use serde_json::{Value as JsonValue, json};
     use std::{
@@ -2939,6 +2940,18 @@ mod tests {
             assert_eq!(response.status(), StatusCode::CONFLICT);
             assert!(is_terminal_storage_response(&response));
         }
+    }
+
+    #[test]
+    fn unknown_commit_outcome_is_non_retryable_but_does_not_retire_the_runtime() {
+        let response = ApiError::from(LixError::new(
+            LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+            "the storage commit outcome is unknown",
+        ))
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_terminal_storage_response(&response));
     }
 
     #[derive(Clone, Debug)]
@@ -3200,6 +3213,91 @@ mod tests {
                 return Err(StorageError::Fenced);
             }
             self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct PostCommitUnknownStorage {
+        inner: Memory,
+        fail_next_commit: Arc<AtomicBool>,
+    }
+
+    impl PostCommitUnknownStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                fail_next_commit: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit.store(true, Ordering::Release);
+        }
+    }
+
+    struct PostCommitUnknownWrite {
+        inner: MemoryWrite,
+        fail_after_commit: bool,
+    }
+
+    impl Storage for PostCommitUnknownStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = PostCommitUnknownWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            Ok(PostCommitUnknownWrite {
+                inner: self.inner.begin_write(options).await?,
+                fail_after_commit: self.fail_next_commit.swap(false, Ordering::AcqRel),
+            })
+        }
+    }
+
+    impl StorageWrite for PostCommitUnknownWrite {
+        async fn put_many(
+            &mut self,
+            space: SpaceId,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.put_many(space, entries).await
+        }
+
+        async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+            self.inner.delete_many(space, keys).await
+        }
+
+        async fn delete_range(
+            &mut self,
+            space: SpaceId,
+            range: KeyRange,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_range(space, range).await
+        }
+
+        async fn commit(self) -> Result<CommitResult, StorageError> {
+            let result = self.inner.commit().await?;
+            if self.fail_after_commit {
+                return Err(StorageError::CommitOutcomeUnknown(
+                    "injected post-commit failure".to_string(),
+                ));
+            }
+            Ok(result)
+        }
+
+        async fn rollback(self) -> Result<(), StorageError> {
+            self.inner.rollback().await
         }
     }
 
@@ -3872,6 +3970,55 @@ mod tests {
         let server = LixProtocolServer::with_options(lix, options).expect("protocol server");
         let router = handler(server.clone());
         TestApp { server, router }
+    }
+
+    #[tokio::test]
+    async fn applied_write_with_unknown_commit_outcome_is_not_safe_to_retry() {
+        let storage = PostCommitUnknownStorage::new();
+        let lix = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(lix);
+        let router = handler(server);
+        let (session_id, _) = new_session(&router).await;
+
+        storage.fail_next_commit();
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('unknown-commit', 'written')"
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let error = response_json(response).await;
+        assert_eq!(
+            error["error"]["code"],
+            LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+        );
+        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(error["error"]["details"]["outcome"], "unknown");
+
+        let persisted = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'unknown-commit'"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(persisted).await["rows"][0][0],
+            json!({ "kind": "int", "value": 1 })
+        );
     }
 
     async fn app_with_tracing_telemetry() -> TestApp {

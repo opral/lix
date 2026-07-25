@@ -91,6 +91,11 @@ impl LixError {
     /// longer serve requests.
     pub const CODE_STORAGE_CLOSED: &'static str = "LIX_STORAGE_CLOSED";
 
+    /// A storage commit may have been applied, but its caller did not receive
+    /// a definitive result.
+    pub const CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN: &'static str =
+        "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN";
+
     /// Optimistic transaction publication lost a race with a newer commit.
     pub const CODE_TRANSACTION_CONFLICT: &'static str = "LIX_TRANSACTION_CONFLICT";
 
@@ -340,6 +345,17 @@ impl From<crate::storage_adapter::StorageError> for LixError {
                 "retryable": false,
                 "outcome": "unknown",
             })),
+            crate::storage_adapter::StorageError::CommitOutcomeUnknown(message) => Self::new(
+                Self::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+                format!("the storage commit outcome is unknown: {message}"),
+            )
+            .with_hint(
+                "Do not automatically retry this request; a mutation may still have completed.",
+            )
+            .with_details(json!({
+                "retryable": false,
+                "outcome": "unknown",
+            })),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }
     }
@@ -417,6 +433,26 @@ mod tests {
                 "retryable": false,
                 "outcome": "unknown",
             }))
+        );
+    }
+
+    #[test]
+    fn unknown_commit_outcome_is_not_retryable() {
+        let error = LixError::from(crate::storage::StorageError::CommitOutcomeUnknown(
+            "storage reply was lost after commit".to_string(),
+        ));
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "retryable": false,
+                "outcome": "unknown",
+            }))
+        );
+        assert_eq!(
+            error.hint(),
+            Some("Do not automatically retry this request; a mutation may still have completed.")
         );
     }
 

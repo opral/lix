@@ -548,6 +548,7 @@ impl StorageWrite for SlateDBWrite {
                     })
                 })
                 .await
+                .map_err(commit_outcome_unknown)
         }
     }
 
@@ -1122,6 +1123,18 @@ fn slatedb_error(error: slatedb::Error) -> StorageError {
     }
 }
 
+/// Errors from an accepted SlateDB write cannot prove the batch was not
+/// applied: SlateDB can fail after its atomic WAL/memtable publication and
+/// before returning the durability watcher. Preserve the known terminal
+/// states, but make every other attempted commit outcome explicit so callers
+/// do not blindly replay it.
+fn commit_outcome_unknown(error: StorageError) -> StorageError {
+    match error {
+        StorageError::Fenced | StorageError::Closed(_) => error,
+        error => StorageError::CommitOutcomeUnknown(error.to_string()),
+    }
+}
+
 fn object_store_error(error: object_store::Error) -> StorageError {
     StorageError::Io(format!("slatedb object store: {error}"))
 }
@@ -1506,7 +1519,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_reports_wal_durability_failure() {
+    fn commit_failure_is_not_advertised_as_a_definite_abort() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let storage = SlateDB::open_object_store_with_options(
             "test-failed-commit",
@@ -1550,8 +1563,8 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .expect("failed commit should finish after its WAL upload");
         assert!(
-            matches!(commit_error, Err(StorageError::Io(message)) if message.contains("injected write failure")),
-            "commit should preserve the SlateDB WAL error"
+            matches!(commit_error, Err(StorageError::CommitOutcomeUnknown(message)) if message.contains("injected write failure")),
+            "an attempted SlateDB commit failure must not claim that the write aborted"
         );
         committer.join().expect("join failed committer");
     }
