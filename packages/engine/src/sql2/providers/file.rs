@@ -5940,13 +5940,13 @@ mod tests {
             snapshot_content: Some(snapshot.clone()),
             metadata: None,
             deleted: false,
-            created_at: String::new(),
-            updated_at: String::new(),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             global: false,
             change_id: None,
             commit_id: None,
             untracked: false,
-            branch_id: "main".to_string(),
+            branch_id: "main".into(),
         }];
 
         let entities = super::v2_read_host_entities(rows, limits)

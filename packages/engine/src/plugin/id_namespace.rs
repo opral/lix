@@ -11,6 +11,8 @@ use serde_json::{Value as JsonValue, json};
 
 use crate::LixError;
 use crate::binary_cas::BlobHash;
+#[cfg(test)]
+use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
@@ -191,7 +193,7 @@ pub(crate) fn require_existing_id_authorities(
                 && row.schema_key == key.schema_key
                 && row.entity_pk.clone().into_parts() == key.entity_pk
                 && row.file_id.as_deref() == Some(file_id)
-                && row.branch_id == branch_id
+                && row.branch_id.as_ref() == branch_id
                 && !row.global
                 && !row.untracked
         });
@@ -410,7 +412,7 @@ fn validate_reservation_identity(
     if row.schema_key != KEY_VALUE_SCHEMA_KEY
         || row.entity_pk.as_single_string().ok() != Some(key)
         || row.file_id.as_deref() != Some(file_id)
-        || row.branch_id != branch_id
+        || row.branch_id.as_ref() != branch_id
         || row.global
         || row.untracked
         || row.deleted
@@ -523,13 +525,13 @@ mod tests {
                 .map(|snapshot| snapshot.normalized().to_string()),
             metadata: None,
             deleted: false,
-            created_at: "1".to_string(),
-            updated_at: "1".to_string(),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
             global: false,
             change_id: None,
             commit_id: None,
             untracked: false,
-            branch_id: "main".to_string(),
+            branch_id: "main".into(),
         }
     }
 

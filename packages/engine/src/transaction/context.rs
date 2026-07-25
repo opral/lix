@@ -932,7 +932,7 @@ where
         let rows = rows
             .into_iter()
             .filter(|row| {
-                row.branch_id == file_key.branch_id
+                row.branch_id.as_ref() == file_key.branch_id
                     && row.file_id.as_deref() == Some(file_key.file_id.as_str())
                     && !row.global
                     && !row.untracked
@@ -2100,7 +2100,7 @@ where
                         let live = entry.live_row();
                         entry.kind == FilesystemPathKind::File
                             && entry.id() == file_key.file_id
-                            && live.branch_id == file_key.branch_id
+                            && live.branch_id.as_ref() == file_key.branch_id
                             && !live.global
                             && !live.untracked
                     })
@@ -4745,7 +4745,7 @@ async fn preflight_owned_v2_generation_upgrades(
             continue;
         };
         let Some(index) = upgrade_indexes
-            .get(&(branch_id, owner.plugin_key().to_string()))
+            .get(&(branch_id.to_string(), owner.plugin_key().to_string()))
             .copied()
         else {
             continue;
@@ -4835,7 +4835,10 @@ async fn preflight_owned_v2_generation_upgrades(
             )
         })?;
         if registered_schema_definitions
-            .insert((row.branch_id, schema_key.to_string()), definition)
+            .insert(
+                (row.branch_id.to_string(), schema_key.to_string()),
+                definition,
+            )
             .is_some()
         {
             return Err(LixError::new(
@@ -4921,7 +4924,7 @@ async fn preflight_owned_v2_generation_upgrades(
             let Some(file_id) = row.file_id.clone() else {
                 continue;
             };
-            if row.branch_id == upgrade.branch_id
+            if row.branch_id.as_ref() == upgrade.branch_id
                 && !row.global
                 && !row.untracked
                 && row.snapshot_content.is_some()
@@ -4958,7 +4961,7 @@ async fn preflight_owned_v2_generation_upgrades(
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;
             };
-            if row.branch_id != upgrade.branch_id || row.global || row.untracked {
+            if row.branch_id.as_ref() != upgrade.branch_id || row.global || row.untracked {
                 continue;
             }
             let Some(snapshot) = row.snapshot_content.as_deref() else {
@@ -5065,7 +5068,7 @@ async fn preflight_owned_v2_generation_upgrades(
                     let row = entry.live_row();
                     entry.kind == FilesystemPathKind::File
                         && entry.id() == owner.file_id()
-                        && row.branch_id == upgrade.branch_id
+                        && row.branch_id.as_ref() == upgrade.branch_id
                         && !row.global
                         && !row.untracked
                 })
@@ -5509,13 +5512,13 @@ mod tests {
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
-            created_at: String::new(),
-            updated_at: String::new(),
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
             global: false,
             change_id: None,
             commit_id: None,
             untracked: false,
-            branch_id: "branch-a".to_string(),
+            branch_id: "branch-a".into(),
         };
         let upsert = |id: &str, snapshot: &[u8], effect| WasmEntityChange::Upsert {
             entity: WasmEntity {
