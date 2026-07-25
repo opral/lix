@@ -5,6 +5,7 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
+#[cfg(test)]
 use crate::live_state::LiveStateReader;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::StorageWriteSet;
@@ -37,13 +38,15 @@ impl FunctionContext {
     /// If deterministic mode is absent or disabled, the context uses system
     /// functions. If enabled, it starts from the persisted sequence + 1.
     #[expect(trivial_casts)]
-    pub(crate) async fn prepare(live_state: &dyn LiveStateReader) -> Result<Self, LixError> {
-        let mode = state::load_mode(live_state).await?;
+    pub(crate) async fn prepare(
+        read: &(impl StorageAdapterRead + ?Sized),
+    ) -> Result<Self, LixError> {
+        let mode = state::load_mode(read).await?;
         if !mode.enabled {
             return Ok(Self::system_for_function_free_read());
         }
 
-        let sequence = state::load_sequence(live_state).await?;
+        let sequence = state::load_sequence(read).await?;
         // Deterministic mode must produce byte-identical state across runs;
         // bookkeeping rows (sequence persistence) take a timestamp derived
         // from the persisted sequence instead of the system clock, without
@@ -138,15 +141,12 @@ mod tests {
     #[tokio::test]
     async fn prepare_uses_system_functions_when_mode_missing() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
 
-        let context = FunctionContext::prepare(&reader)
+        let context = FunctionContext::prepare(&read)
             .await
             .expect("runtime context should prepare");
 
@@ -161,7 +161,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_starts_deterministic_functions_at_sequence_zero() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
@@ -172,13 +171,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let context = FunctionContext::prepare(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let context = FunctionContext::prepare(&read)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -202,7 +199,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_continues_from_persisted_sequence() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
         crate::test_support::seed_global_branch_head(storage.clone()).await;
         write_key_value(
             storage.clone(),
@@ -219,13 +215,11 @@ mod tests {
         )
         .await;
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let context = FunctionContext::prepare(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let context = FunctionContext::prepare(&read)
             .await
             .expect("runtime context should prepare");
         let functions = context.provider();
@@ -257,13 +251,11 @@ mod tests {
         .await;
 
         let context = {
-            let reader = live_state.reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("read should open"),
-            );
-            FunctionContext::prepare(&reader)
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("read should open");
+            FunctionContext::prepare(&read)
                 .await
                 .expect("runtime context should prepare")
         };
@@ -283,20 +275,18 @@ mod tests {
             .await
             .expect("sequence should commit");
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let sequence = load_sequence(&reader).await.expect("sequence should load");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let sequence = load_sequence(&read).await.expect("sequence should load");
         assert_eq!(sequence, DeterministicSequence { highest_seen: 0 });
 
         // Deterministic mode must stamp the bookkeeping row from the
         // persisted sequence, never from the system clock; the persisted
         // sequence was empty, so next_sequence is 0 -> epoch.
         let row = LiveStateReader::load_row(
-            &reader,
+            &live_state.reader(&read),
             &crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -318,14 +308,11 @@ mod tests {
     #[tokio::test]
     async fn persist_if_needed_is_noop_for_system_functions() {
         let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let context = FunctionContext::prepare(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let context = FunctionContext::prepare(&read)
             .await
             .expect("runtime context should prepare");
 
@@ -340,13 +327,11 @@ mod tests {
             .expect("persist should no-op");
         assert!(writes.is_empty());
 
-        let reader = live_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let sequence = load_sequence(&reader)
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let sequence = load_sequence(&read)
             .await
             .expect("missing sequence should load");
         assert_eq!(sequence, DeterministicSequence::uninitialized());

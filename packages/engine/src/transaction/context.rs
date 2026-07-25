@@ -323,10 +323,7 @@ where
             let active_branch_id =
                 resolve_active_branch_id(mode, live_state.as_ref(), branch_ctx.as_ref(), &read)
                     .await?;
-            let runtime_functions = {
-                let runtime_live_state = live_state.reader(&read);
-                FunctionContext::prepare(&runtime_live_state).await?
-            };
+            let runtime_functions = FunctionContext::prepare(&read).await?;
             let functions = runtime_functions.provider();
             let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
