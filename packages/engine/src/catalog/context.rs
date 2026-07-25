@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -199,11 +201,12 @@ impl CatalogContext {
         Ok(snapshot)
     }
 
-    /// Loads schema definitions for SQL surface planning at `branch_id`.
+    /// Projects schema definitions for SQL surface-planning cache tests.
     ///
     /// SQL surfaces are a read-planning projection over the active untracked
     /// schema catalog. Validation must use `schema_facts_for_domain` instead so
     /// schema durability remains explicit.
+    #[cfg(test)]
     pub(crate) async fn schema_jsons_for_sql_read_planning<R>(
         &self,
         live_state: &R,
@@ -212,7 +215,6 @@ impl CatalogContext {
     where
         R: LiveStateReader + ?Sized,
     {
-        #[cfg(test)]
         self.sql_read_schema_loads.fetch_add(1, Ordering::Relaxed);
         let facts = self
             .schema_facts_for_domain(live_state, &Domain::schema_catalog(branch_id, true))
@@ -241,7 +243,8 @@ impl CatalogContext {
         self.sql_read_schema_loads.load(Ordering::Relaxed)
     }
 
-    /// Loads schema facts reachable from a row domain.
+    /// Loads schema facts reachable from a row domain for catalog tests.
+    #[cfg(test)]
     pub(crate) async fn schema_facts_for_domain<R>(
         &self,
         live_state: &R,

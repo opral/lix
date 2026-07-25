@@ -59,7 +59,7 @@ pub(crate) struct ChangelogQuerySource<S> {
 /// the transaction capability instead of flowing through committed read
 /// sources.
 #[async_trait]
-pub(crate) trait SqlExecutionContext {
+pub(crate) trait SqlExecutionContext: Sync {
     type ReadStore: StorageAdapterRead + Clone + Send + Sync + 'static;
 
     fn active_branch_id(&self) -> &str;
@@ -79,6 +79,17 @@ pub(crate) trait SqlExecutionContext {
     /// Loads runtime-defined SQL entity metadata when provider selection could
     /// not be satisfied entirely by compile-time system surfaces.
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError>;
+
+    /// Loads reusable public-surface metadata for this read snapshot.
+    ///
+    /// The default keeps lightweight test/read contexts simple. Session
+    /// contexts override it with their revision-keyed catalog cache; providers
+    /// themselves remain scoped to the current storage snapshot.
+    async fn public_catalog(&self) -> Result<Arc<PublicCatalog>, LixError> {
+        Ok(Arc::new(PublicCatalog::from_visible_schemas(
+            &self.load_visible_schemas().await?,
+        )?))
+    }
 
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))

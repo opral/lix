@@ -14,8 +14,9 @@ use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
 };
-use crate::catalog::{CatalogContext, CatalogFingerprint};
+use crate::catalog::{CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision};
 use crate::commit_graph::{CommitGraphContext, CommitGraphReader};
+use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
@@ -616,9 +617,27 @@ pub(super) struct SessionSqlExecutionContext<'a, R: crate::storage_adapter::Stor
     pub(super) binary_cas: Arc<BinaryCasContext>,
     pub(super) branch_ctx: Arc<BranchContext>,
     pub(super) catalog_context: Arc<CatalogContext>,
+    pub(super) sql_planning_cache: Arc<SqlPlanningCache<CatalogFingerprint>>,
     pub(super) functions: FunctionProviderHandle,
     pub(super) plugin_host: PluginRuntimeHost,
     pub(super) file_views: Option<SessionFileViews>,
+}
+
+impl<R> SessionSqlExecutionContext<'_, R>
+where
+    R: crate::storage_adapter::StorageRead + 'static,
+{
+    async fn compiled_sql_catalog(&self) -> Result<Arc<CatalogSnapshot>, LixError> {
+        let revision = load_catalog_revision(&self.read_store).await?;
+        let live_state = self.live_state();
+        self.catalog_context
+            .compiled_catalog_for_transaction_open(
+                live_state.as_ref(),
+                &Domain::schema_catalog(self.active_branch_id.to_string(), true),
+                revision.as_ref(),
+            )
+            .await
+    }
 }
 
 #[async_trait]
@@ -679,10 +698,13 @@ where
     }
 
     async fn load_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-        let live_state = self.live_state();
-        self.catalog_context
-            .schema_jsons_for_sql_read_planning(live_state.as_ref(), self.active_branch_id)
-            .await
+        Ok(self.compiled_sql_catalog().await?.schema_jsons())
+    }
+
+    async fn public_catalog(&self) -> Result<Arc<crate::sql2::PublicCatalog>, LixError> {
+        let catalog = self.compiled_sql_catalog().await?;
+        self.sql_planning_cache
+            .public_catalog(catalog.fingerprint(), || Ok(catalog.schema_jsons()))
     }
 
     fn plugin_host(&self) -> PluginRuntimeHost {

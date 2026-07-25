@@ -947,6 +947,7 @@ where
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
+                    sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
@@ -1096,6 +1097,7 @@ where
                     binary_cas: Arc::clone(&self.binary_cas),
                     branch_ctx: Arc::clone(&self.branch_ctx),
                     catalog_context: Arc::clone(&self.catalog_context),
+                    sql_planning_cache: Arc::clone(&self.sql_planning_cache),
                     functions: FunctionProviderHandle::system(),
                     plugin_host: self.plugin_host.clone(),
                     file_views: file_view_collector.clone(),
@@ -1323,6 +1325,7 @@ where
             binary_cas: Arc::clone(&self.binary_cas),
             branch_ctx: Arc::clone(&self.branch_ctx),
             catalog_context: Arc::clone(&self.catalog_context),
+            sql_planning_cache: Arc::clone(&self.sql_planning_cache),
             functions: functions.clone(),
             plugin_host: self.plugin_host.clone(),
             file_views: file_view_collector.clone(),
@@ -3062,7 +3065,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_provider_selection_loads_storage_catalog_only_for_dynamic_visibility() {
+    async fn read_provider_selection_reuses_compiled_catalog_for_dynamic_visibility() {
         let session = open_session().await;
         let schema_loads = || {
             session
@@ -3120,8 +3123,8 @@ mod tests {
             .expect("information schema should execute");
         assert_eq!(
             schema_loads(),
-            before + 1,
-            "catalog-wide visibility must load dynamic schemas"
+            before,
+            "catalog-wide visibility must use the revision-keyed catalog instead of rescanning schemas"
         );
 
         let custom_schema = serde_json::json!({
@@ -3148,8 +3151,8 @@ mod tests {
             .expect("custom entity should execute");
         assert_eq!(
             schema_loads(),
-            before_custom_read + 1,
-            "custom entity metadata must load the visible catalog"
+            before_custom_read,
+            "custom entity metadata must use the compiled catalog instead of rescanning schemas"
         );
 
         let before_mixed_join = schema_loads();
@@ -3163,8 +3166,31 @@ mod tests {
             .expect("mixed fixed/custom join should execute");
         assert_eq!(
             schema_loads(),
-            before_mixed_join + 1,
-            "one custom table makes the whole session use the visible catalog"
+            before_mixed_join,
+            "one custom table must keep using the compiled catalog without rescanning schemas"
+        );
+
+        let mut next_schema = custom_schema.clone();
+        next_schema["x-lix-key"] = serde_json::json!("custom_catalog_probe_after_mutation");
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(next_schema.to_string())],
+            )
+            .await
+            .expect("second custom schema should register");
+        let before_changed_catalog_read = schema_loads();
+        session
+            .execute(
+                "SELECT COUNT(*) AS rows FROM custom_catalog_probe_after_mutation",
+                &[],
+            )
+            .await
+            .expect("schema revision must invalidate the cached SQL catalog");
+        assert_eq!(
+            schema_loads(),
+            before_changed_catalog_read,
+            "the next catalog generation must still avoid the uncached schema projection"
         );
     }
 

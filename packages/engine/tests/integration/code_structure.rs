@@ -2785,7 +2785,7 @@ fn sql2_read_session_does_not_register_write_surfaces() {
         relative,
         read_registration,
         &[
-            "PublicCatalog::from_visible_schemas",
+            "ctx.public_catalog()",
             "catalog.surfaces()",
             "PublicSurfaceKind::Branch",
             "PublicSurfaceKind::Change",
