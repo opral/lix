@@ -81,14 +81,23 @@ fn wire_snapshots_are_number_free_even_when_markdown_model_has_numeric_fields() 
 }
 
 #[test]
-fn cold_entity_open_roundtrips_the_complete_gfm_document() {
+fn cold_entity_open_roundtrips_marker_free_complete_gfm_document() {
     let source = b"---\ntitle: Test\n---\n\n| A | B |\n| --- | --- |\n| *x* | `y` |\n".to_vec();
-    let (_, changes) =
-        Document::open_file(source, Some("table.md"), IdNamespace::from_halves(9, 10)).unwrap();
+    assert!(
+        !source.windows(2).any(|window| window == b"]:"),
+        "fixture must exercise the parser's marker-free definition fast path",
+    );
+    let (_, changes) = Document::open_file(
+        source.clone(),
+        Some("table.md"),
+        IdNamespace::from_halves(9, 10),
+    )
+    .unwrap();
     let (document, edits) = Document::open_entities(records(&changes), None).unwrap();
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].offset, 0);
     assert_eq!(edits[0].delete_len, 0);
+    assert_eq!(document.accepted_bytes(), source);
     assert_eq!(document.accepted_bytes(), edits[0].insert.as_slice());
 }
 

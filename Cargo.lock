@@ -3577,8 +3577,6 @@ dependencies = [
 [[package]]
 name = "markdown-syntax"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cb3dad9640aa950d085c143ad2f43f16889daf7443035a3df1ad3cc66108c45"
 
 [[package]]
 name = "matchers"
