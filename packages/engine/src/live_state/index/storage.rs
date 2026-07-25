@@ -158,6 +158,40 @@ pub(super) async fn load_values(
         .collect()
 }
 
+/// Loads the exact persisted bytes for flat live-state rows.
+///
+/// The bytes are intentionally opaque: callers use them only as optimistic
+/// compare-and-swap tokens. Re-encoding `FlatValue` would couple the guard to
+/// the current codec and could accidentally accept a differently encoded
+/// value that represents the same logical row.
+pub(super) async fn load_raw_tokens(
+    store: &(impl StorageAdapterRead + ?Sized),
+    identities: &[FlatIdentity],
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = identities
+        .iter()
+        .map(|identity| encode_key(identity).map(|key| StorageKey(Bytes::from(key))))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = PointReadPlan::new(LIVE_STATE_INDEX_ROW_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    result
+        .value
+        .into_iter()
+        .map(|value| match value {
+            None => Ok(None),
+            Some(StorageProjectedValue::FullValue(value)) => Ok(Some(value)),
+            Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "flat live-state token read unexpectedly omitted its value",
+            )),
+        })
+        .collect()
+}
+
 pub(super) async fn scan_values(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
@@ -423,6 +457,29 @@ pub(crate) fn row_absent_precondition(
         key: StorageKey(Bytes::from(encode_key(&FlatIdentity::from_request(
             request,
         ))?)),
+    })
+}
+
+/// Returns an exact-byte precondition for a flat live-state row observed by a
+/// caller. A missing row is guarded with `KeyAbsent`, so a concurrent create
+/// is also detected.
+pub(crate) fn row_raw_token_precondition(
+    request: &LiveStateIndexRowRequest,
+    expected: Option<Bytes>,
+) -> Result<StoragePrecondition, LixError> {
+    let key = StorageKey(Bytes::from(encode_key(&FlatIdentity::from_request(
+        request,
+    ))?));
+    Ok(match expected {
+        None => StoragePrecondition::KeyAbsent {
+            space: LIVE_STATE_INDEX_ROW_SPACE.id,
+            key,
+        },
+        Some(expected) => StoragePrecondition::KeyValueEquals {
+            space: LIVE_STATE_INDEX_ROW_SPACE.id,
+            key,
+            expected,
+        },
     })
 }
 

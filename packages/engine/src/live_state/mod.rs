@@ -13,7 +13,8 @@ pub(crate) use index::{
     LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, LiveStateIndexStoreReader, LiveStateIndexWriter,
     MaterializedLiveStateIndexRow, branch_empty_precondition, load_local_sidecar_branch_token,
-    local_sidecar_branch_precondition, row_absent_precondition, stage_local_sidecar_branch_marker,
+    local_sidecar_branch_precondition, row_absent_precondition, row_raw_token_precondition,
+    stage_local_sidecar_branch_marker,
 };
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;

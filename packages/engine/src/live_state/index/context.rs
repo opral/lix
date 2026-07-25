@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
+
 use crate::LixError;
 use crate::changelog::{ChangeId, ChangeRecordProjection, materialize_change_payloads};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
@@ -7,8 +9,8 @@ use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 #[cfg(test)]
 use super::storage::load_value;
 use super::storage::{
-    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_values, scan_all_values, scan_values,
-    stage_delete, stage_put,
+    FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_raw_tokens, load_values,
+    scan_all_values, scan_values, stage_delete, stage_put,
 };
 use super::{
     LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
@@ -174,6 +176,21 @@ where
             .zip(values)
             .map(|(identity, value)| value.map(|value| index_row(identity, value)))
             .collect())
+    }
+
+    /// Loads opaque, exact-byte tokens for current flat rows.
+    ///
+    /// This is deliberately narrower than `load_index_rows`: transaction
+    /// publication only needs a durable CAS token, not decoded row metadata.
+    pub(crate) async fn load_raw_row_tokens(
+        &self,
+        requests: &[LiveStateIndexRowRequest],
+    ) -> Result<Vec<Option<Bytes>>, LixError> {
+        let identities = requests
+            .iter()
+            .map(FlatIdentity::from_request)
+            .collect::<Vec<_>>();
+        load_raw_tokens(&self.store, &identities).await
     }
 }
 

@@ -24,7 +24,7 @@ use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, TrackedHeadContext, TrackedHeadDeltaRef, branch_empty_precondition,
     load_local_sidecar_branch_token, local_sidecar_branch_precondition, row_absent_precondition,
-    stage_local_sidecar_branch_marker,
+    row_raw_token_precondition, stage_local_sidecar_branch_marker,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
@@ -572,6 +572,24 @@ fn deterministic_sequence_current_row(
     })
 }
 
+fn branch_ref_index_request_from_state_row(row: &PreparedStateRow) -> LiveStateIndexRowRequest {
+    LiveStateIndexRowRequest {
+        branch_id: row.branch_id.clone(),
+        schema_key: row.schema_key.clone(),
+        entity_pk: row.entity_pk.clone(),
+        file_id: row.file_id.clone(),
+    }
+}
+
+fn branch_ref_index_request_from_engine_row(row: &EngineCurrentRow) -> LiveStateIndexRowRequest {
+    LiveStateIndexRowRequest {
+        branch_id: row.branch_id.clone(),
+        schema_key: row.change.schema_key.clone(),
+        entity_pk: row.change.entity_pk.clone(),
+        file_id: row.change.file_id.clone(),
+    }
+}
+
 async fn stage_flat_current_rows(
     current: &LiveStateIndexContext,
     read: &(impl StorageAdapterRead + ?Sized),
@@ -582,6 +600,37 @@ async fn stage_flat_current_rows(
     preconditions: &mut Vec<StoragePrecondition>,
 ) -> Result<Vec<ChangeId>, LixError> {
     let index_reader = current.reader(read);
+
+    // Branch refs are mutable, untracked rows. They intentionally do not
+    // rotate the tracked mutation revision, so that revision cannot fence two
+    // concurrent ref moves. Guard every directly staged and engine-generated
+    // ref identity with the exact persisted flat-row bytes seen by this
+    // coherent commit read. The bounded point batch also covers an absent ref
+    // with a KeyAbsent precondition, preventing a stale first publication.
+    let branch_ref_requests = state_rows
+        .iter()
+        .filter(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        .map(branch_ref_index_request_from_state_row)
+        .chain(
+            engine_rows
+                .iter()
+                .filter(|row| row.change.schema_key == BRANCH_REF_SCHEMA_KEY)
+                .map(branch_ref_index_request_from_engine_row),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let branch_ref_tokens = index_reader
+        .load_raw_row_tokens(&branch_ref_requests)
+        .await?;
+    preconditions.extend(
+        branch_ref_requests
+            .iter()
+            .zip(branch_ref_tokens)
+            .map(|(request, token)| row_raw_token_precondition(request, token))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+
     let mut branch_ref_sidecar_tokens = BTreeMap::<String, Option<Bytes>>::new();
     for row in state_rows
         .iter()
@@ -1928,6 +1977,218 @@ mod tests {
             .await
             .expect("branch ref load should succeed");
         assert_eq!(loaded_head, Some(record.commit_id));
+    }
+
+    #[tokio::test]
+    async fn direct_branch_ref_update_rejects_a_stale_flat_token() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let branch_id = "branch-ref-race";
+        crate::test_support::seed_branch_head(
+            storage.clone(),
+            branch_id,
+            "branch-ref-initial-head",
+        )
+        .await;
+        seed_empty_commit(&storage, "stale-branch-ref-target").await;
+        seed_empty_commit(&storage, "winner-branch-ref-target").await;
+
+        let mut stale_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale branch-ref read should open");
+        let (stale_writes, stale_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut stale_read,
+            prepared_direct_branch_ref_update(
+                branch_id,
+                "stale-branch-ref-target",
+                "stale-direct-branch-ref-change",
+            ),
+        )
+        .await
+        .expect("stale direct branch-ref update should stage");
+        assert!(stale_preconditions.iter().any(|precondition| {
+            matches!(
+                precondition,
+                StoragePrecondition::KeyValueEquals { space, .. }
+                    if *space == crate::live_state::LIVE_STATE_INDEX_ROW_SPACE.id
+            )
+        }));
+
+        let mut winner_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("winner branch-ref read should open");
+        let (winner_writes, winner_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut winner_read,
+            prepared_direct_branch_ref_update(
+                branch_id,
+                "winner-branch-ref-target",
+                "winner-direct-branch-ref-change",
+            ),
+        )
+        .await
+        .expect("winner direct branch-ref update should stage");
+        storage
+            .commit_write_set(
+                winner_writes,
+                StorageWriteOptions {
+                    preconditions: winner_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("winner direct branch-ref update should commit");
+
+        let error = storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale direct branch-ref update must not overwrite the winner");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch-ref verification read should open");
+        let row = LiveStateIndexContext::new()
+            .reader(read)
+            .load_index_row(&branch_ref_index_request(branch_id))
+            .await
+            .expect("winner branch-ref row should load")
+            .expect("winner branch-ref row should remain present");
+        assert_eq!(
+            row.change_id,
+            change_id("winner-direct-branch-ref-change"),
+            "the stale write must not replace the winner's current ref row"
+        );
+        let head = branch_ctx
+            .ref_reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("branch-ref head verification read should open"),
+            )
+            .load_head_commit_id(branch_id)
+            .await
+            .expect("winner branch-ref head should load");
+        assert_eq!(head, Some(commit_id("winner-branch-ref-target")));
+    }
+
+    #[tokio::test]
+    async fn normal_commit_rejects_stale_engine_branch_ref_publication() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+
+        let mut stale_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("stale normal-commit read should open");
+        let (stale_writes, stale_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut stale_read,
+            prepared_normal_global_commit(
+                "stale-normal-change",
+                "stale-normal-commit",
+                "stale-normal-commit-change",
+                "stale-normal-branch-ref-change",
+            ),
+        )
+        .await
+        .expect("stale normal commit should stage");
+        assert!(stale_preconditions.iter().any(|precondition| {
+            matches!(
+                precondition,
+                StoragePrecondition::KeyAbsent { space, .. }
+                    if *space == crate::live_state::LIVE_STATE_INDEX_ROW_SPACE.id
+            )
+        }));
+
+        let mut winner_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("winner normal-commit read should open");
+        let (winner_writes, winner_preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut winner_read,
+            prepared_normal_global_commit(
+                "winner-normal-change",
+                "winner-normal-commit",
+                "winner-normal-commit-change",
+                "winner-normal-branch-ref-change",
+            ),
+        )
+        .await
+        .expect("winner normal commit should stage");
+        storage
+            .commit_write_set(
+                winner_writes,
+                StorageWriteOptions {
+                    preconditions: winner_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("winner normal commit should commit");
+
+        let error = storage
+            .commit_write_set(
+                stale_writes,
+                StorageWriteOptions {
+                    preconditions: stale_preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect_err("stale normal commit must not publish a stale branch ref");
+        assert!(matches!(
+            error,
+            crate::storage_adapter::StorageWriteSetError::Storage(
+                StorageError::PreconditionFailed(_)
+            )
+        ));
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("normal branch-ref verification read should open");
+        let row = LiveStateIndexContext::new()
+            .reader(read)
+            .load_index_row(&branch_ref_index_request(GLOBAL_BRANCH_ID))
+            .await
+            .expect("winner engine branch-ref row should load")
+            .expect("winner engine branch-ref row should remain present");
+        assert_eq!(
+            row.change_id,
+            change_id("winner-normal-branch-ref-change"),
+            "the stale commit must not replace the winner's current ref row"
+        );
     }
 
     #[tokio::test]
@@ -3656,6 +3917,66 @@ mod tests {
         assert_eq!(heads.get(GLOBAL_BRANCH_ID), Some(&None));
     }
 
+    fn prepared_direct_branch_ref_update(
+        branch_id: &str,
+        target_commit_label: &str,
+        branch_ref_change_label: &str,
+    ) -> PreparedWriteSet {
+        PreparedWriteSet {
+            insert_identities: BTreeMap::new(),
+            state_rows: vec![direct_branch_ref_row(
+                branch_id,
+                target_commit_label,
+                branch_ref_change_label,
+            )],
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            file_data_writes: Vec::new(),
+        }
+    }
+
+    async fn seed_empty_commit(storage: &StorageAdapter, label: &str) {
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("empty commit seed read should open");
+        let mut writes = StorageWriteSet::new();
+        crate::test_support::stage_empty_changelog_commit(&mut read, &mut writes, label, None)
+            .await
+            .expect("empty commit target should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("empty commit target should persist");
+    }
+
+    fn prepared_normal_global_commit(
+        row_change_label: &str,
+        commit_label: &str,
+        commit_change_label: &str,
+        branch_ref_change_label: &str,
+    ) -> PreparedWriteSet {
+        PreparedWriteSet {
+            insert_identities: BTreeMap::new(),
+            state_rows: vec![tracked_global_row(row_change_label)],
+            commit_change_refs_by_branch: BTreeMap::from([(
+                GLOBAL_BRANCH_ID.to_string(),
+                change_refs_with(
+                    [row_change_label],
+                    commit_label,
+                    commit_change_label,
+                    branch_ref_change_label,
+                ),
+            )]),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            file_data_writes: Vec::new(),
+        }
+    }
+
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {
         change_refs_with(change_ids, "test-uuid-1", "test-uuid-2", "test-uuid-3")
     }
@@ -3751,6 +4072,38 @@ mod tests {
             commit_id: None,
             untracked: true,
             ..row
+        }
+    }
+
+    fn direct_branch_ref_row(
+        branch_id: &str,
+        target_commit_label: &str,
+        change_id: &str,
+    ) -> PreparedStateRow {
+        let mut row = untracked_global_row(change_id);
+        row.entity_pk = EntityPk::single(branch_id);
+        row.schema_key = BRANCH_REF_SCHEMA_KEY.to_string();
+        row.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({
+                        "id": branch_id,
+                        "commit_id": commit_id(target_commit_label).to_string(),
+                    }),
+                ),
+                "test direct branch-ref snapshot",
+            )
+            .expect("branch-ref snapshot should stage"),
+        );
+        row
+    }
+
+    fn branch_ref_index_request(branch_id: &str) -> LiveStateIndexRowRequest {
+        LiveStateIndexRowRequest {
+            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            entity_pk: EntityPk::single(branch_id),
+            file_id: None,
         }
     }
 
