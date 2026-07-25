@@ -1086,7 +1086,7 @@ where
             self.point_value_cache
                 .insert((commit_id.to_string(), key.clone()), value.clone());
             for index in &missing[&key] {
-                output[*index] = value.clone();
+                output[*index].clone_from(&value);
             }
         }
         Ok(output)
