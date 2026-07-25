@@ -1,6 +1,19 @@
 #![doc = include_str!("../README.md")]
 #![no_std]
 #![deny(missing_docs)]
+// `markdown-syntax` 0.2.0 is vendored so its private parser-equivalence tests
+// run in this workspace. These are existing upstream style lints under this
+// repository's newer nightly Clippy; keep the allowlist narrow instead of
+// rewriting unrelated third-party parser and serializer code.
+#![allow(
+    clippy::collapsible_if,
+    clippy::derivable_impls,
+    clippy::manual_pattern_char_comparison,
+    clippy::manual_strip,
+    clippy::question_mark,
+    clippy::sliced_string_as_bytes,
+    clippy::while_let_loop
+)]
 
 extern crate alloc;
 
