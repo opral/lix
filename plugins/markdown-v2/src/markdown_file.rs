@@ -18,6 +18,10 @@ use uuid::Uuid;
 pub(crate) struct ParsedMarkdown {
     pub(crate) root: NodeTree,
     pub(crate) top_level_ranges: Vec<Range<usize>>,
+    /// The stable canonical bytes already rendered while parsing. Callers that
+    /// need to compare source layout can consume this instead of rendering the
+    /// reconstructed tree a second time.
+    pub(crate) canonical_render: Option<Vec<u8>>,
 }
 
 pub(crate) fn parse_file(file: &File) -> Result<ParsedMarkdown, PluginError> {
@@ -42,6 +46,7 @@ pub(crate) fn parse_markdown_source(source: &str) -> Result<ParsedMarkdown, Plug
     for _ in 0..8 {
         let rendered = render_tree(&parsed.root)?;
         if rendered == canonical.as_bytes() {
+            parsed.canonical_render = Some(rendered);
             return Ok(parsed);
         }
         canonical = String::from_utf8(rendered).map_err(|error| {
@@ -111,6 +116,7 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
     Ok(ParsedMarkdown {
         root,
         top_level_ranges,
+        canonical_render: None,
     })
 }
 
