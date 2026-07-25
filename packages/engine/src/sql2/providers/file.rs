@@ -3805,12 +3805,12 @@ impl LixFileRecordBatchColumns {
         self.file_ids.push(row.file_id);
         self.globals.push(Some(row.global));
         self.change_ids.push(row.change_id);
-        self.created_ats.push(Some(row.created_at.to_string()));
-        self.updated_ats.push(Some(row.updated_at.to_string()));
+        self.created_ats.push(Some(row.created_at));
+        self.updated_ats.push(Some(row.updated_at));
         self.commit_ids.push(row.commit_id);
         self.untracked_values.push(Some(row.untracked));
         self.metadata_values.push(row.metadata);
-        self.branch_ids.push(Some(row.branch_id.to_string()));
+        self.branch_ids.push(Some(row.branch_id));
     }
 
     fn into_record_batch(self, schema: &SchemaRef) -> Result<RecordBatch, LixError> {
@@ -7656,7 +7656,7 @@ mod tests {
                     branch_ids: request
                         .rows
                         .iter()
-                        .map(|row| row.branch_id.to_string())
+                        .map(|row| row.branch_id.clone())
                         .collect(),
                     schema_keys: request
                         .rows
