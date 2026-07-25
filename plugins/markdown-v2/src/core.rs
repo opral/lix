@@ -1447,9 +1447,231 @@ pub struct ByteEdit {
 
 #[derive(Clone, Debug)]
 pub struct Document {
-    bytes: Arc<Vec<u8>>,
-    root: Arc<NodeTree>,
+    bytes: PersistentBytes,
+    tree: PersistentTree,
     top_level_ranges: Arc<Vec<Range<usize>>>,
+}
+
+/// Persistent top-level Markdown tree. The common paragraph-edit path changes
+/// one top-level node, so retaining the parsed base avoids cloning thousands
+/// of unrelated `NodeSnapshot` JSON values on every keystroke.
+#[derive(Clone, Debug)]
+struct PersistentTree {
+    base: Arc<NodeTree>,
+    top_level_overrides: Arc<BTreeMap<usize, NodeSnapshot>>,
+}
+
+impl PersistentTree {
+    fn new(root: NodeTree) -> Self {
+        Self {
+            base: Arc::new(root),
+            top_level_overrides: Arc::new(BTreeMap::new()),
+        }
+    }
+
+    fn root_node(&self) -> &NodeSnapshot {
+        &self.base.node
+    }
+
+    fn top_level_node(&self, index: usize) -> Option<&NodeSnapshot> {
+        self.top_level_overrides
+            .get(&index)
+            .or_else(|| self.base.children.get(index).map(|child| &child.node))
+    }
+
+    fn replace_top_level(&self, index: usize, node: NodeSnapshot) -> Self {
+        let mut overrides = self.top_level_overrides.as_ref().clone();
+        overrides.insert(index, node);
+        Self {
+            base: Arc::clone(&self.base),
+            top_level_overrides: Arc::new(overrides),
+        }
+    }
+
+    fn materialize(&self) -> NodeTree {
+        let mut root = self.base.as_ref().clone();
+        for (&index, node) in self.top_level_overrides.iter() {
+            root.children[index].node.clone_from(node);
+        }
+        root
+    }
+}
+
+/// Immutable piece table for accepted Markdown bytes. Sparse successors share
+/// all unchanged allocations and own only their inserted bytes.
+#[derive(Clone, Debug)]
+struct PersistentBytes {
+    pieces: Arc<Vec<BytePiece>>,
+    len: usize,
+}
+
+#[derive(Clone, Debug)]
+struct BytePiece {
+    bytes: Arc<Vec<u8>>,
+    start: usize,
+    len: usize,
+}
+
+impl PersistentBytes {
+    fn from_vec(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        let pieces = if bytes.is_empty() {
+            Vec::new()
+        } else {
+            vec![BytePiece {
+                bytes: Arc::new(bytes),
+                start: 0,
+                len,
+            }]
+        };
+        Self {
+            pieces: Arc::new(pieces),
+            len,
+        }
+    }
+
+    fn materialize(&self) -> Vec<u8> {
+        self.range(0..self.len)
+            .expect("complete Markdown byte range is valid")
+    }
+
+    fn byte(&self, offset: usize) -> Option<u8> {
+        if offset >= self.len {
+            return None;
+        }
+        let mut logical_start = 0usize;
+        for piece in self.pieces.iter() {
+            let logical_end = logical_start + piece.len;
+            if offset < logical_end {
+                return Some(piece.bytes[piece.start + offset - logical_start]);
+            }
+            logical_start = logical_end;
+        }
+        None
+    }
+
+    fn range(&self, range: Range<usize>) -> Result<Vec<u8>, PluginError> {
+        if range.start > range.end || range.end > self.len {
+            return Err(PluginError::InvalidInput(
+                "Markdown byte range is out of bounds".to_owned(),
+            ));
+        }
+        let mut output = Vec::with_capacity(range.end - range.start);
+        let mut logical_start = 0usize;
+        for piece in self.pieces.iter() {
+            let logical_end = logical_start + piece.len;
+            let selected_start = range.start.max(logical_start);
+            let selected_end = range.end.min(logical_end);
+            if selected_start < selected_end {
+                let piece_start = piece.start + selected_start - logical_start;
+                let piece_end = piece.start + selected_end - logical_start;
+                output.extend_from_slice(&piece.bytes[piece_start..piece_end]);
+            }
+            if logical_end >= range.end {
+                break;
+            }
+            logical_start = logical_end;
+        }
+        Ok(output)
+    }
+
+    fn append_piece_range(
+        &self,
+        range: Range<usize>,
+        output: &mut Vec<BytePiece>,
+    ) -> Result<(), PluginError> {
+        if range.start > range.end || range.end > self.len {
+            return Err(PluginError::InvalidInput(
+                "Markdown byte range is out of bounds".to_owned(),
+            ));
+        }
+        let mut logical_start = 0usize;
+        for piece in self.pieces.iter() {
+            let logical_end = logical_start + piece.len;
+            let selected_start = range.start.max(logical_start);
+            let selected_end = range.end.min(logical_end);
+            if selected_start < selected_end {
+                push_byte_piece(
+                    output,
+                    BytePiece {
+                        bytes: Arc::clone(&piece.bytes),
+                        start: piece.start + selected_start - logical_start,
+                        len: selected_end - selected_start,
+                    },
+                );
+            }
+            if logical_end >= range.end {
+                break;
+            }
+            logical_start = logical_end;
+        }
+        Ok(())
+    }
+
+    fn splice(&self, splices: &[InputSplice<'_>]) -> Result<Self, PluginError> {
+        let mut pieces = Vec::with_capacity(self.pieces.len() + splices.len() * 2);
+        let mut cursor = 0usize;
+        let mut result_len = self.len;
+        let mut previous_offset = None;
+        for splice in splices {
+            let offset = usize::try_from(splice.offset).map_err(|_| {
+                PluginError::InvalidInput("Markdown splice offset is too large".into())
+            })?;
+            let delete_len = usize::try_from(splice.delete_len).map_err(|_| {
+                PluginError::InvalidInput("Markdown splice delete length is too large".into())
+            })?;
+            let end = offset.checked_add(delete_len).ok_or_else(|| {
+                PluginError::InvalidInput("Markdown splice range overflow".to_owned())
+            })?;
+            if previous_offset.is_some_and(|previous| offset <= previous)
+                || offset < cursor
+                || end > self.len
+            {
+                return Err(PluginError::InvalidInput(
+                    "Markdown splice starts must be strictly increasing, non-overlapping, and within the base"
+                        .to_owned(),
+                ));
+            }
+            self.append_piece_range(cursor..offset, &mut pieces)?;
+            if !splice.insert.is_empty() {
+                push_byte_piece(
+                    &mut pieces,
+                    BytePiece {
+                        bytes: Arc::new(splice.insert.to_vec()),
+                        start: 0,
+                        len: splice.insert.len(),
+                    },
+                );
+            }
+            result_len = result_len
+                .checked_sub(delete_len)
+                .and_then(|len| len.checked_add(splice.insert.len()))
+                .ok_or_else(|| {
+                    PluginError::InvalidInput("Markdown splice size overflow".to_owned())
+                })?;
+            cursor = end;
+            previous_offset = Some(offset);
+        }
+        self.append_piece_range(cursor..self.len, &mut pieces)?;
+        Ok(Self {
+            pieces: Arc::new(pieces),
+            len: result_len,
+        })
+    }
+}
+
+fn push_byte_piece(output: &mut Vec<BytePiece>, piece: BytePiece) {
+    if piece.len == 0 {
+        return;
+    }
+    if let Some(previous) = output.last_mut()
+        && Arc::ptr_eq(&previous.bytes, &piece.bytes)
+        && previous.start + previous.len == piece.start
+    {
+        previous.len += piece.len;
+        return;
+    }
+    output.push(piece);
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1596,37 +1818,6 @@ fn entity_change_to_detected(change: EntityChange) -> Result<DetectedChange, Plu
     })
 }
 
-fn apply_input_splices(base: &[u8], splices: &[InputSplice<'_>]) -> Result<Vec<u8>, PluginError> {
-    let mut output = Vec::new();
-    let mut cursor = 0usize;
-    let mut previous_offset = None;
-    for splice in splices {
-        let offset = usize::try_from(splice.offset)
-            .map_err(|_| PluginError::InvalidInput("Markdown splice offset is too large".into()))?;
-        let delete_len = usize::try_from(splice.delete_len).map_err(|_| {
-            PluginError::InvalidInput("Markdown splice delete length is too large".into())
-        })?;
-        let end = offset.checked_add(delete_len).ok_or_else(|| {
-            PluginError::InvalidInput("Markdown splice range overflow".to_owned())
-        })?;
-        if previous_offset.is_some_and(|previous| offset <= previous)
-            || offset < cursor
-            || end > base.len()
-        {
-            return Err(PluginError::InvalidInput(
-                "Markdown splice starts must be strictly increasing, non-overlapping, and within the base"
-                    .to_owned(),
-            ));
-        }
-        output.extend_from_slice(&base[cursor..offset]);
-        output.extend_from_slice(splice.insert);
-        cursor = end;
-        previous_offset = Some(offset);
-    }
-    output.extend_from_slice(&base[cursor..]);
-    Ok(output)
-}
-
 fn minimal_byte_edit(before: &[u8], after: Vec<u8>) -> Vec<ByteEdit> {
     if before == after {
         return Vec::new();
@@ -1727,8 +1918,8 @@ impl Document {
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
-                bytes: Arc::new(bytes),
-                root: Arc::new(root),
+                bytes: PersistentBytes::from_vec(bytes),
+                tree: PersistentTree::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             changes,
@@ -1775,8 +1966,8 @@ impl Document {
         };
         Ok((
             Self {
-                bytes: Arc::new(bytes),
-                root: Arc::new(root),
+                bytes: PersistentBytes::from_vec(bytes),
+                tree: PersistentTree::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
@@ -1792,25 +1983,27 @@ impl Document {
         splices: &[InputSplice<'_>],
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
-        let bytes = apply_input_splices(&self.bytes, splices)?;
-        let (detected, top_level_ranges, root) = if let Some(incremental) =
-            self.try_paragraph_replacement(splices, &bytes, namespace)?
+        let successor_bytes = self.bytes.splice(splices)?;
+        let (detected, top_level_ranges, tree) = if let Some(incremental) =
+            self.try_paragraph_replacement(splices, &successor_bytes, namespace)?
         {
             incremental
         } else {
+            let bytes = successor_bytes.materialize();
             let file = File {
                 filename: None,
                 data: bytes.clone(),
             };
+            let current_root = self.tree.materialize();
             let before = Projection {
-                nodes_by_id: flatten_tree(&self.root),
+                nodes_by_id: flatten_tree(&current_root),
             };
             let mut parsed = parse_file(&file)?;
             retain_noncanonical_source(&mut parsed, &file.data)?;
-            let top_level_ranges = parsed.top_level_ranges.clone();
+            let top_level_ranges = Arc::new(parsed.top_level_ranges.clone());
             let detected = detect_changes_for_markdown(&before, parsed, namespace)?;
-            let root = projection_after_detected_changes(&self.root, &detected)?.to_tree()?;
-            (detected, top_level_ranges, root)
+            let root = projection_after_detected_changes(&current_root, &detected)?.to_tree()?;
+            (detected, top_level_ranges, PersistentTree::new(root))
         };
         let changes = detected
             .into_iter()
@@ -1818,9 +2011,9 @@ impl Document {
             .collect::<Result<Vec<_>, _>>()?;
         Ok((
             Self {
-                bytes: Arc::new(bytes),
-                root: Arc::new(root),
-                top_level_ranges: Arc::new(top_level_ranges),
+                bytes: successor_bytes,
+                tree,
+                top_level_ranges,
             },
             changes,
         ))
@@ -1839,22 +2032,24 @@ impl Document {
         {
             return Ok((
                 Self {
-                    bytes: Arc::new(bytes),
-                    root: Arc::new(root),
+                    bytes,
+                    tree: PersistentTree::new(root),
                     top_level_ranges: Arc::new(top_level_ranges),
                 },
                 edits,
             ));
         }
-        let projection = projection_after_detected_changes(&self.root, &detected)?;
+        let current_root = self.tree.materialize();
+        let projection = projection_after_detected_changes(&current_root, &detected)?;
         let root = projection.to_tree()?;
         let bytes = render_tree_with_lexical_fallback(&root)?;
         let top_level_ranges = simple_top_level_ranges(&root, &bytes);
-        let edits = minimal_byte_edit(&self.bytes, bytes.clone());
+        let before = self.bytes.materialize();
+        let edits = minimal_byte_edit(&before, bytes.clone());
         Ok((
             Self {
-                bytes: Arc::new(bytes),
-                root: Arc::new(root),
+                bytes: PersistentBytes::from_vec(bytes),
+                tree: PersistentTree::new(root),
                 top_level_ranges: Arc::new(top_level_ranges),
             },
             edits,
@@ -1864,14 +2059,16 @@ impl Document {
     fn try_paragraph_entity_change(
         &self,
         changes: &[DetectedChange],
-    ) -> Result<Option<(Vec<u8>, Vec<Range<usize>>, Vec<ByteEdit>, NodeTree)>, PluginError> {
+    ) -> Result<Option<(PersistentBytes, Vec<Range<usize>>, Vec<ByteEdit>, NodeTree)>, PluginError>
+    {
         let [change] = changes else {
             return Ok(None);
         };
         let Some(snapshot_content) = &change.snapshot_content else {
             return Ok(None);
         };
-        let root = self.root.as_ref();
+        let root = self.tree.materialize();
+        let root = &root;
         if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
             return Ok(None);
         }
@@ -1912,11 +2109,11 @@ impl Document {
                 children: Vec::new(),
             }],
         })?;
-        let mut bytes =
-            Vec::with_capacity(self.bytes.len() - (range.end - range.start) + fragment.len());
-        bytes.extend_from_slice(&self.bytes[..range.start]);
-        bytes.extend_from_slice(&fragment);
-        bytes.extend_from_slice(&self.bytes[range.end..]);
+        let bytes = self.bytes.splice(&[InputSplice {
+            offset: u64::try_from(range.start).expect("usize fits u64"),
+            delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
+            insert: &fragment,
+        }])?;
 
         let delta = isize::try_from(fragment.len()).expect("usize fits isize")
             - isize::try_from(range.end - range.start).expect("usize fits isize");
@@ -1945,9 +2142,10 @@ impl Document {
     fn try_paragraph_replacement(
         &self,
         splices: &[InputSplice<'_>],
-        bytes: &[u8],
+        bytes: &PersistentBytes,
         namespace: IdNamespace,
-    ) -> Result<Option<(Vec<DetectedChange>, Vec<Range<usize>>, NodeTree)>, PluginError> {
+    ) -> Result<Option<(Vec<DetectedChange>, Arc<Vec<Range<usize>>>, PersistentTree)>, PluginError>
+    {
         let [splice] = splices else {
             return Ok(None);
         };
@@ -1961,8 +2159,8 @@ impl Document {
             .map_err(|_| PluginError::InvalidInput("Markdown splice offset is too large".into()))?;
         if !self
             .bytes
-            .get(offset)
-            .is_some_and(u8::is_ascii_alphanumeric)
+            .byte(offset)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
         {
             return Ok(None);
         }
@@ -1975,21 +2173,22 @@ impl Document {
             return Ok(None);
         };
 
-        let before_root = self.root.as_ref();
-        if before_root
-            .node
+        if self
+            .tree
+            .root_node()
             .format
             .get(LEXICAL_FALLBACK_FIELD)
             .is_some()
-            || before_root
-                .children
-                .get(block_index)
-                .is_none_or(|child| child.node.kind != NodeKind::Paragraph)
+            || self
+                .tree
+                .top_level_node(block_index)
+                .is_none_or(|node| node.kind != NodeKind::Paragraph)
         {
             return Ok(None);
         }
 
-        let fragment = std::str::from_utf8(&bytes[range.clone()]).map_err(|error| {
+        let fragment_bytes = bytes.range(range.clone())?;
+        let fragment = std::str::from_utf8(&fragment_bytes).map_err(|error| {
             PluginError::InvalidInput(format!(
                 "file.data must be valid UTF-8 for an incremental Markdown edit: {error}"
             ))
@@ -2002,14 +2201,19 @@ impl Document {
             return Ok(None);
         }
 
-        let old = &before_root.children[block_index];
+        let mut old = self.tree.base.children[block_index].clone();
+        old.node.clone_from(
+            self.tree
+                .top_level_node(block_index)
+                .expect("validated top-level paragraph exists"),
+        );
         let mut new = replacement.root.children.remove(0);
         let generated_ids = collect_generated_ids(&new);
         let generated_node_id = new.node.id.clone();
         new.node.id.clone_from(&old.node.id);
         new.node.parent_id.clone_from(&old.node.parent_id);
         new.node.order_key.clone_from(&old.node.order_key);
-        reconcile_inline_payload(old, &mut new)?;
+        reconcile_inline_payload(&old, &mut new)?;
 
         let mut replacements = BTreeMap::from([(generated_node_id, new.node.id.clone())]);
         let mut allocator = IdAllocator::new(namespace);
@@ -2031,17 +2235,16 @@ impl Document {
                 metadata: change_metadata(Some(&old.node), &new.node),
             }]
         };
-        let mut successor_root = before_root.clone();
-        successor_root.children[block_index] = new;
+        let successor_tree = self.tree.replace_top_level(block_index, new.node.clone());
         Ok(Some((
             detected,
-            self.top_level_ranges.as_ref().clone(),
-            successor_root,
+            Arc::clone(&self.top_level_ranges),
+            successor_tree,
         )))
     }
 
     #[cfg(test)]
-    pub(crate) fn accepted_bytes(&self) -> &[u8] {
-        &self.bytes
+    pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
+        self.bytes.materialize()
     }
 }
