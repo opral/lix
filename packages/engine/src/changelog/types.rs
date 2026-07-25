@@ -412,6 +412,54 @@ pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) origin_key: Option<&'a str>,
 }
 
+/// Borrowed, already-prepared change record for the terminal transaction
+/// append lane.
+///
+/// Unlike [`ChangeRecord`], this form never owns a second copy of row JSON,
+/// primary-key parts, or schema strings. Transaction materialization has
+/// already assigned identities and validated the facts, so the changelog can
+/// encode these references directly into the final write set.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransactionChangeRecordRef<'a> {
+    pub(crate) change_id: ChangeId,
+    pub(crate) format_version: u32,
+    pub(crate) schema_key: &'a str,
+    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) origin_key: Option<&'a str>,
+}
+
+impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
+    fn from(record: &'a ChangeRecord) -> Self {
+        Self {
+            change_id: record.change_id,
+            format_version: record.format_version,
+            schema_key: &record.schema_key,
+            entity_pk: &record.entity_pk,
+            file_id: record.file_id.as_deref(),
+            snapshot: record.snapshot.as_ref_slot(),
+            metadata: record.metadata.as_ref_slot(),
+            created_at: record.created_at,
+            origin_key: record.origin_key.as_deref(),
+        }
+    }
+}
+
+/// Trusted changelog facts assembled at the transaction commit boundary.
+///
+/// This is deliberately separate from [`ChangelogAppend`]: the generic
+/// writer supports validation and read-your-writes overlays, while this lane
+/// is terminal and encodes prepared transaction facts directly into storage.
+#[derive(Debug)]
+pub(crate) struct TransactionChangelogAppend<'a> {
+    pub(crate) commits: Vec<CommitRecord>,
+    pub(crate) changes: Vec<TransactionChangeRecordRef<'a>>,
+    pub(crate) commit_change_refs: Vec<CommitChangeRefSet>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct ChangeRecordView<'a> {

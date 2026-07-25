@@ -42,9 +42,9 @@ use crate::transaction::normalization::reject_reserved_schema_namespace;
 use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::staging::duplicate_insert_identity_message;
 use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
-#[cfg(test)]
-use crate::transaction::types::PreparedStateRow;
-use crate::transaction::types::{TransactionWriteOperation, TransactionWriteOrigin};
+use crate::transaction::types::{
+    PreparedStateRow, TransactionWriteOperation, TransactionWriteOrigin,
+};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -337,6 +337,30 @@ fn row_local_certificates_cover_validation(staged_rows: &[PreparedValidationRow<
                 && row.file_id().is_none()
                 && !matches!(
                     row.schema_key(),
+                    REGISTERED_SCHEMA_KEY
+                        | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                        | FILE_DESCRIPTOR_SCHEMA_KEY
+                        | BRANCH_REF_SCHEMA_KEY
+                )
+        })
+}
+
+/// Returns whether every prepared row carries the same tracked, row-local
+/// validation certificate that the per-schema validation path recognizes.
+///
+/// Normal tracked entity writes reach commit with this certificate. Checking
+/// it before constructing the validation index avoids allocating one wrapper
+/// and BTreeMap entry per row only to discover every schema scope can skip
+/// validation independently.
+pub(crate) fn prepared_tracked_rows_have_row_local_certificates(rows: &[PreparedStateRow]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| {
+            row.facts.row_content_validated
+                && !row.facts.requires_transaction_validation
+                && !row.untracked
+                && row.file_id.is_none()
+                && !matches!(
+                    row.schema_key.as_str(),
                     REGISTERED_SCHEMA_KEY
                         | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
                         | FILE_DESCRIPTOR_SCHEMA_KEY
@@ -6808,5 +6832,40 @@ mod tests {
             untracked: false,
             branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
         }
+    }
+
+    #[test]
+    fn prepared_tracked_row_certificates_match_the_commit_skip_contract() {
+        let mut row = staged_row("normal_schema", Some(r#"{"id":"row"}"#.to_string()));
+        row.facts.row_content_validated = true;
+        assert!(prepared_tracked_rows_have_row_local_certificates(
+            std::slice::from_ref(&row)
+        ));
+
+        let mut requires_cross_row_validation = row.clone();
+        requires_cross_row_validation
+            .facts
+            .requires_transaction_validation = true;
+        assert!(!prepared_tracked_rows_have_row_local_certificates(&[
+            requires_cross_row_validation
+        ]));
+
+        let mut untracked = row.clone();
+        untracked.untracked = true;
+        assert!(!prepared_tracked_rows_have_row_local_certificates(&[
+            untracked
+        ]));
+
+        let mut file_scoped = row.clone();
+        file_scoped.file_id = Some("file-a".to_string());
+        assert!(!prepared_tracked_rows_have_row_local_certificates(&[
+            file_scoped
+        ]));
+
+        let mut reserved = row;
+        reserved.schema_key = REGISTERED_SCHEMA_KEY.to_string();
+        assert!(!prepared_tracked_rows_have_row_local_certificates(&[
+            reserved
+        ]));
     }
 }

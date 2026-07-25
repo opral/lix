@@ -317,10 +317,6 @@ impl StageJson {
             crate::json_store::JsonSlotRef::Ref(&self.json_ref)
         }
     }
-
-    pub(crate) fn slot(&self) -> crate::json_store::JsonSlot {
-        self.slot_ref().to_owned_slot()
-    }
 }
 
 #[expect(clippy::unnecessary_wraps)]

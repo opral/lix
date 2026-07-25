@@ -31,7 +31,8 @@ use crate::tracked_state::types::{
     TrackedStateKeyRef, TrackedStateMutation, TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateRootMutationRef,
+    TrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
@@ -1182,6 +1183,121 @@ where
             primary_chunk_puts: result.chunk_count,
         })
     }
+
+    /// Attempts the dense, ordered parent-root merge used by normal bulk
+    /// tracked commits. Sparse and unordered callers stay on the generic
+    /// mutation path, which preserves its latest-write-wins behavior.
+    pub(crate) async fn try_stage_bulk_parent_root_from_ordered_mutations<'a, I>(
+        &mut self,
+        commit_id: &str,
+        parent_commit_id: Option<&str>,
+        mutation_count: usize,
+        first_mutation_key: &[u8],
+        mutations: I,
+    ) -> Result<Option<TrackedStateWriteReport>, LixError>
+    where
+        I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
+    {
+        let Some(parent_commit_id) = parent_commit_id else {
+            return Ok(None);
+        };
+        let typed_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state commit root commit_id")?;
+        let typed_parent_commit_id =
+            CommitId::parse_lix(parent_commit_id, "tracked-state parent commit_id")?;
+        let parent_metadata = match self.staged_roots.get(parent_commit_id) {
+            Some(metadata) => metadata.clone(),
+            None => storage::load_commit_root(self.store, parent_commit_id)
+                .await?
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "tracked-state parent root for commit '{parent_commit_id}' is missing"
+                        ),
+                    )
+                })?,
+        };
+        let mutation_count_u64 = u64::try_from(mutation_count).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_root changed key count exceeds u64",
+            )
+        })?;
+        // Match the existing full-rebuild threshold, but make the decision
+        // before allocating parent values/mutations. A dense batch is where a
+        // single parent traversal wins decisively over point lookups and patch
+        // construction.
+        if mutation_count < 2 || mutation_count_u64 <= parent_metadata.row_count_estimate / 2 {
+            return Ok(None);
+        }
+        if self
+            .tree
+            .first_key_is_after_root_right_edge(
+                self.store,
+                &self.chunk_overlay,
+                &parent_metadata.root_id,
+                first_mutation_key,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let result = self
+            .tree
+            .merge_and_stage_ordered_parent_mutations(
+                self.store,
+                self.writes,
+                &mut self.chunk_overlay,
+                &parent_metadata.root_id,
+                mutations,
+                Some(commit_id),
+            )
+            .await?;
+        let metadata = TrackedStateCommitRoot {
+            commit_id: typed_commit_id,
+            root_id: result.root_id.clone(),
+            parent_roots: vec![TrackedStateCommitRootParent {
+                commit_id: typed_parent_commit_id,
+                root_id: parent_metadata.root_id,
+            }],
+            changed_key_count: mutation_count_u64,
+            row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root row count exceeds u64",
+                )
+            })?,
+            tree_height: u32::try_from(result.tree_height).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root tree height exceeds u32",
+                )
+            })?,
+            primary_chunk_count: u64::try_from(result.chunk_count).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root chunk count exceeds u64",
+                )
+            })?,
+            primary_chunk_bytes: u64::try_from(result.chunk_bytes).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root chunk bytes exceeds u64",
+                )
+            })?,
+        };
+        storage::stage_commit_root(self.writes, &metadata)?;
+        self.staged_roots.insert(commit_id.to_string(), metadata);
+
+        Ok(Some(TrackedStateWriteReport {
+            commit_id: typed_commit_id,
+            root_id: result.root_id,
+            changed_rows: mutation_count,
+            primary_chunk_puts: result.chunk_count,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1397,6 +1513,318 @@ mod tests {
         assert!(metadata.tree_height >= 1);
         assert!(metadata.primary_chunk_count >= 1);
         assert!(metadata.primary_chunk_bytes > 0);
+    }
+
+    #[tokio::test]
+    async fn dense_ordered_parent_merge_is_canonical_and_reads_staged_parent_chunks() {
+        let bulk_storage = StorageAdapter::new(Memory::new());
+        let generic_storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("dense-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("dense-child").to_string();
+
+        let parent_rows = (0..192)
+            .map(|index| {
+                row(
+                    &format!("entity-{index:03}"),
+                    &format!("change-parent-{index:03}"),
+                    "dense-parent",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut child_rows = (0..96)
+            .map(|index| {
+                row(
+                    &format!("entity-{index:03}"),
+                    &format!("change-child-{index:03}"),
+                    "dense-child",
+                )
+            })
+            .chain((0..96).map(|index| {
+                row(
+                    &format!("entity-{index:03}-new"),
+                    &format!("change-child-new-{index:03}"),
+                    "dense-child",
+                )
+            }))
+            .collect::<Vec<_>>();
+        child_rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+        for row in &mut child_rows {
+            row.created_at = "2026-02-01T00:00:00Z".to_string();
+            row.updated_at = "2026-03-01T00:00:00Z".to_string();
+        }
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let report = {
+            let read = bulk_storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("bulk read should open");
+            let mut writes = bulk_storage.new_write_set();
+            let mut writer = tracked_state.writer(&read, &mut writes);
+            writer
+                .stage_commit_root(
+                    &parent_commit_id,
+                    None,
+                    parent_rows.iter().map(delta_from_materialized_row),
+                )
+                .await
+                .expect("parent root should stage");
+            let report = writer
+                .try_stage_bulk_parent_root_from_ordered_mutations(
+                    &child_commit_id,
+                    Some(&parent_commit_id),
+                    child_rows.len(),
+                    &first_child_key,
+                    child_rows.iter().map(|row| {
+                        Ok(TrackedStateRootMutationRef {
+                            delta: delta_from_materialized_row(row),
+                            require_absence: false,
+                        })
+                    }),
+                )
+                .await
+                .expect("bulk child root should stage")
+                .expect("dense changed rows should take the dense merge");
+            drop(writer);
+            bulk_storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("bulk roots should commit");
+            report
+        };
+        assert_eq!(report.changed_rows, child_rows.len());
+
+        {
+            let read = generic_storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("generic parent read should open");
+            let mut writes = generic_storage.new_write_set();
+            tracked_state
+                .writer(&read, &mut writes)
+                .stage_commit_root(
+                    &parent_commit_id,
+                    None,
+                    parent_rows.iter().map(delta_from_materialized_row),
+                )
+                .await
+                .expect("generic parent root should stage");
+            generic_storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("generic parent root should commit");
+        }
+        {
+            let read = generic_storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("generic child read should open");
+            let mut writes = generic_storage.new_write_set();
+            tracked_state
+                .writer(&read, &mut writes)
+                .stage_commit_root(
+                    &child_commit_id,
+                    Some(&parent_commit_id),
+                    child_rows.iter().map(delta_from_materialized_row),
+                )
+                .await
+                .expect("generic child root should stage");
+            generic_storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("generic child root should commit");
+        }
+
+        let bulk_read = bulk_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("bulk result read should open");
+        let bulk_root = storage::load_root(&bulk_read, &child_commit_id)
+            .await
+            .expect("bulk root should load")
+            .expect("bulk child root should exist");
+        let generic_read = generic_storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("generic result read should open");
+        let generic_root = storage::load_root(&generic_read, &child_commit_id)
+            .await
+            .expect("generic root should load")
+            .expect("generic child root should exist");
+        assert_eq!(bulk_root, generic_root, "dense merge must be canonical");
+
+        let entry = TrackedStateTree::new()
+            .get(
+                &bulk_read,
+                &bulk_root,
+                &TrackedStateKey {
+                    schema_key: "test_schema".to_string(),
+                    file_id: None,
+                    entity_pk: EntityPk::single("entity-000"),
+                },
+            )
+            .await
+            .expect("bulk row should load")
+            .expect("bulk row should exist");
+        assert_eq!(
+            entry.created_at(),
+            crate::common::LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            entry.updated_at(),
+            crate::common::LixTimestamp::expect_parse("updated_at", "2026-03-01T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_ordered_parent_merge_preserves_live_insert_absence_guards() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("dense-guard-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("dense-guard-child").to_string();
+        let parent_rows = [
+            row("entity-a", "change-parent-a", "dense-guard-parent"),
+            row("entity-b", "change-parent-b", "dense-guard-parent"),
+        ];
+        let child_rows = [
+            row("entity-a", "change-child-a", "dense-guard-child"),
+            row("entity-b", "change-child-b", "dense-guard-child"),
+        ];
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        writer
+            .stage_commit_root(
+                &parent_commit_id,
+                None,
+                parent_rows.iter().map(delta_from_materialized_row),
+            )
+            .await
+            .expect("parent root should stage");
+        let error = writer
+            .try_stage_bulk_parent_root_from_ordered_mutations(
+                &child_commit_id,
+                Some(&parent_commit_id),
+                child_rows.len(),
+                &first_child_key,
+                child_rows.iter().map(|row| {
+                    Ok(TrackedStateRootMutationRef {
+                        delta: delta_from_materialized_row(row),
+                        require_absence: true,
+                    })
+                }),
+            )
+            .await
+            .expect_err("live parent row must reject INSERT");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
+    async fn dense_ordered_parent_merge_allows_tombstone_reinsertion() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("dense-tombstone-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("dense-tombstone-child").to_string();
+        let parent_rows = [
+            tombstone("entity-a", "change-parent-a", "dense-tombstone-parent"),
+            row("entity-b", "change-parent-b", "dense-tombstone-parent"),
+        ];
+        let child_rows = [
+            row("entity-a", "change-child-a", "dense-tombstone-child"),
+            row("entity-b", "change-child-b", "dense-tombstone-child"),
+        ];
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        writer
+            .stage_commit_root(
+                &parent_commit_id,
+                None,
+                parent_rows.iter().map(delta_from_materialized_row),
+            )
+            .await
+            .expect("parent root should stage");
+        assert!(
+            writer
+                .try_stage_bulk_parent_root_from_ordered_mutations(
+                    &child_commit_id,
+                    Some(&parent_commit_id),
+                    child_rows.len(),
+                    &first_child_key,
+                    child_rows.iter().enumerate().map(|(index, row)| {
+                        Ok(TrackedStateRootMutationRef {
+                            delta: delta_from_materialized_row(row),
+                            require_absence: index == 0,
+                        })
+                    }),
+                )
+                .await
+                .expect("tombstone reinsertion should stage")
+                .is_some(),
+            "tombstoned parent rows permit INSERT"
+        );
+    }
+
+    #[tokio::test]
+    async fn dense_ordered_parent_merge_leaves_append_only_batches_to_the_patcher() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let parent_commit_id = CommitId::for_test_label("dense-append-parent").to_string();
+        let child_commit_id = CommitId::for_test_label("dense-append-child").to_string();
+        let parent_rows = [
+            row("entity-a", "change-parent-a", "dense-append-parent"),
+            row("entity-b", "change-parent-b", "dense-append-parent"),
+        ];
+        let child_rows = [
+            row("entity-c", "change-child-c", "dense-append-child"),
+            row("entity-d", "change-child-d", "dense-append-child"),
+        ];
+        let first_child_key = encoded_key_from_materialized_row(&child_rows[0]);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut writes = storage.new_write_set();
+        let mut writer = tracked_state.writer(&read, &mut writes);
+        writer
+            .stage_commit_root(
+                &parent_commit_id,
+                None,
+                parent_rows.iter().map(delta_from_materialized_row),
+            )
+            .await
+            .expect("parent root should stage");
+        assert!(
+            writer
+                .try_stage_bulk_parent_root_from_ordered_mutations(
+                    &child_commit_id,
+                    Some(&parent_commit_id),
+                    child_rows.len(),
+                    &first_child_key,
+                    child_rows.iter().map(|row| {
+                        Ok(TrackedStateRootMutationRef {
+                            delta: delta_from_materialized_row(row),
+                            require_absence: false,
+                        })
+                    }),
+                )
+                .await
+                .expect("append-only route check should succeed")
+                .is_none(),
+            "append-only batches keep the existing chunk-reuse path"
+        );
     }
 
     #[tokio::test]
@@ -3204,5 +3632,26 @@ mod tests {
             change_id: ChangeId::for_test_label(change_id),
             commit_id: CommitId::for_test_label(commit_id),
         }
+    }
+
+    fn delta_from_materialized_row(row: &MaterializedTrackedStateRow) -> TrackedStateDeltaRef<'_> {
+        TrackedStateDeltaRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+            change_id: row.change_id,
+            commit_id: row.commit_id,
+            deleted: row.snapshot_content.is_none(),
+            created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
+            updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
+        }
+    }
+
+    fn encoded_key_from_materialized_row(row: &MaterializedTrackedStateRow) -> Vec<u8> {
+        encode_key_ref(TrackedStateKeyRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+        })
     }
 }

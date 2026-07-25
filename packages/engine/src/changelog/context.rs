@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use super::codec::{
     decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
-    encode_commit_change_ref_chunk, encode_commit_record,
+    encode_commit_change_ref_chunk, encode_commit_record, encode_transaction_change_record,
 };
 use super::store::{
     CHANGE_SPACE, COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE, COMMIT_CHANGE_ID_SPACE,
@@ -29,7 +29,7 @@ use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRefChunk, CommitChangeRefSet,
     CommitId, CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitScanBatch, CommitScanRequest,
+    CommitScanBatch, CommitScanRequest, TransactionChangelogAppend,
 };
 use crate::changelog::{GcPlan, GcRoot};
 use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
@@ -370,18 +370,64 @@ impl<S> ChangelogStoreWriter<'_, S>
 where
     S: ChangelogStorageRead + Send + ?Sized,
 {
-    /// Stages an append assembled from already-prepared transaction rows.
+    /// Stages a terminal append assembled from already-prepared transaction rows.
     ///
     /// The transaction owns ID generation, parent selection, and change-ref
-    /// construction. Re-reading all generated UUID keys and rebuilding the
-    /// same relationship indexes here would only revalidate trusted engine
-    /// output. Direct changelog callers continue to use `stage_append`.
+    /// construction. This path has no read-your-writes overlay: its writer is
+    /// dropped immediately after the append, so retaining a second owned copy
+    /// of every row would only add allocation and drop work. Direct changelog
+    /// callers continue to use `stage_append`.
     pub(crate) fn stage_transaction_append(
         &mut self,
-        append: ChangelogAppend,
+        append: TransactionChangelogAppend<'_>,
     ) -> Result<(), LixError> {
         self.ensure_changelog_mutation_is_allowed()?;
-        self.stage_append_records(append, false)
+        let TransactionChangelogAppend {
+            commits,
+            changes,
+            commit_change_refs,
+        } = append;
+        self.writes.reserve_space(CHANGE_SPACE, changes.len(), 0);
+        self.writes.reserve_space(COMMIT_SPACE, commits.len(), 0);
+        self.writes
+            .reserve_space(COMMIT_CHANGE_ID_SPACE, commits.len(), 0);
+
+        for change in changes {
+            self.writes.put(
+                CHANGE_SPACE,
+                change_key(change.change_id),
+                encode_transaction_change_record(&change)?,
+            );
+        }
+
+        let chunks = chunk_commit_change_refs(commit_change_refs);
+        self.writes.reserve_space(
+            COMMIT_CHANGE_REF_CHUNK_SPACE,
+            chunks.values().map(Vec::len).sum(),
+            0,
+        );
+        for commit in commits {
+            self.writes.put(
+                COMMIT_SPACE,
+                commit_key(commit.commit_id),
+                encode_commit_record(&commit)?,
+            );
+            self.writes.put(
+                COMMIT_CHANGE_ID_SPACE,
+                commit_change_id_key(commit.change_id),
+                commit_change_id_value(commit.commit_id),
+            );
+        }
+        for (commit_id, commit_chunks) in chunks {
+            for (chunk_no, chunk) in commit_chunks.iter().enumerate() {
+                self.writes.put(
+                    COMMIT_CHANGE_REF_CHUNK_SPACE,
+                    commit_change_ref_chunk_key(commit_id, chunk_no as u32),
+                    encode_commit_change_ref_chunk(chunk)?,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn stage_append_records(

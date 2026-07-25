@@ -14,7 +14,7 @@ mod types;
 
 pub(crate) use codec::{
     decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
-    encode_commit_change_ref_chunk, encode_commit_record,
+    encode_commit_change_ref_chunk, encode_commit_record, encode_transaction_change_record,
 };
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 pub(crate) use materialization::{
@@ -31,6 +31,7 @@ pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
     ChangeScanRequest, ChangelogAppend, CommitChangeRefChunk, CommitChangeRefSet, CommitId,
     CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
-    CommitScanBatch, CommitScanRequest, commit_row_snapshot_json,
+    CommitScanBatch, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
+    commit_row_snapshot_json,
 };
 pub(crate) use types::{GcLiveSet, GcPlan, GcRepairSet, GcRoot, GcSweepSet};

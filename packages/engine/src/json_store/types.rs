@@ -240,16 +240,6 @@ pub(crate) enum JsonSlotRef<'a> {
     Inline(&'a str),
 }
 
-impl JsonSlotRef<'_> {
-    pub(crate) fn to_owned_slot(self) -> JsonSlot {
-        match self {
-            Self::None => JsonSlot::None,
-            Self::Ref(json_ref) => JsonSlot::Ref(*json_ref),
-            Self::Inline(json) => JsonSlot::Inline(json.into()),
-        }
-    }
-}
-
 /// Musli codec for [`JsonSlot`]: tag byte 0/1/2, then the payload.
 pub(crate) mod json_slot_storage {
     use musli::Context;

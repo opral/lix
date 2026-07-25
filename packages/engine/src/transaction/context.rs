@@ -79,7 +79,10 @@ use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
 };
-use crate::transaction::validation::{TransactionValidationInput, validate_prepared_writes};
+use crate::transaction::validation::{
+    TransactionValidationInput, prepared_tracked_rows_have_row_local_certificates,
+    validate_prepared_writes,
+};
 use crate::wasm::{WasmComponentInstance, WasmPluginFile};
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -1653,6 +1656,9 @@ where
         &mut self,
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
+        if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
+            return Ok(());
+        }
         let validation_index = prepared_writes.validation_index();
         for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
