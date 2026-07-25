@@ -195,3 +195,120 @@ test("observe blob deltas fail closed without an exact non-overlapping base", ()
 		"observe event requires exactly one of result or delta",
 	);
 });
+
+test("observe row deltas splice replacement insertion and deletion", () => {
+	const full = {
+		sequence: 0,
+		mutationSequence: 0,
+		result: {
+			columns: ["value"],
+			rows: [
+				[{ kind: "text", value: "a" }],
+				[{ kind: "text", value: "b" }],
+				[{ kind: "text", value: "c" }],
+			],
+			rowsAffected: 0,
+			notices: [],
+		},
+	};
+	const base = decodeObserveEvent(full);
+	const replacement = decodeObserveEvent(
+		{
+			sequence: 1,
+			mutationSequence: 1,
+			delta: {
+				kind: "row-splice",
+				baseSequence: 0,
+				prefixRows: 1,
+				deleteRows: 1,
+				insertRows: [[{ kind: "text", value: "x" }]],
+			},
+		},
+		base,
+	);
+	expect(replacement.rows.rows.map((row) => row[0]?.value)).toEqual([
+		"a",
+		"x",
+		"c",
+	]);
+	const inserted = decodeObserveEvent(
+		{
+			sequence: 2,
+			mutationSequence: 2,
+			delta: {
+				kind: "row-splice",
+				baseSequence: 1,
+				prefixRows: 2,
+				deleteRows: 0,
+				insertRows: [[{ kind: "text", value: "y" }]],
+			},
+		},
+		replacement,
+	);
+	expect(inserted.rows.rows.map((row) => row[0]?.value)).toEqual([
+		"a",
+		"x",
+		"y",
+		"c",
+	]);
+	const deleted = decodeObserveEvent(
+		{
+			sequence: 3,
+			mutationSequence: 3,
+			delta: {
+				kind: "row-splice",
+				baseSequence: 2,
+				prefixRows: 1,
+				deleteRows: 2,
+				insertRows: [],
+			},
+		},
+		inserted,
+	);
+	expect(deleted.rows.rows.map((row) => row[0]?.value)).toEqual(["a", "c"]);
+});
+
+test("observe row deltas reject invalid bases ranges and row shapes", () => {
+	const base = decodeObserveEvent({
+		sequence: 0,
+		mutationSequence: 0,
+		result: {
+			columns: ["value"],
+			rows: [[{ kind: "text", value: "a" }]],
+			rowsAffected: 0,
+			notices: [],
+		},
+	});
+	const delta = {
+		sequence: 1,
+		mutationSequence: 1,
+		delta: {
+			kind: "row-splice",
+			baseSequence: 0,
+			prefixRows: 0,
+			deleteRows: 1,
+			insertRows: [[{ kind: "text", value: "x" }]],
+		},
+	};
+	expect(() => decodeObserveEvent(delta)).toThrow(
+		"observe row delta does not match its transport base",
+	);
+	expect(() =>
+		decodeObserveEvent(
+			{
+				...delta,
+				delta: { ...delta.delta, prefixRows: 2 },
+			},
+			base,
+		),
+	).toThrow("observe row delta splice range is outside its transport base");
+	expect(() =>
+		decodeObserveEvent(
+			{
+				...delta,
+				delta: { ...delta.delta, insertRows: [[], []] },
+			},
+			base,
+		),
+	).toThrow("observe row delta insert row 0 has 0 values for 1 columns");
+});

@@ -84,10 +84,20 @@ export type RemoteObserveBlobDelta = {
 	insertBase64: string;
 };
 
+type RemoteObserveRowSplice = {
+	kind: "row-splice";
+	baseSequence: number;
+	prefixRows: number;
+	deleteRows: number;
+	insertRows: WireValue[][];
+};
+
+type RemoteObserveDelta = RemoteObserveBlobDelta | RemoteObserveRowSplice;
+
 export type RemoteObserveEvent = RemoteObserveEventBase &
 	(
 		| { result: RemoteExecuteResponse; delta?: never }
-		| { result?: never; delta: RemoteObserveBlobDelta }
+		| { result?: never; delta: RemoteObserveDelta }
 	);
 
 export type RemoteMultiplexObserveEvent = RemoteObserveEvent & {
@@ -263,19 +273,31 @@ export function decodeObserveEvent(
 		mutationSequence: event.mutationSequence,
 		rows: hasResult
 			? decodeExecuteResult(event.result)
-			: applyObserveBlobDelta(event.delta, sequence, base),
+			: applyObserveDelta(event.delta, sequence, base),
 	};
 }
 
-function applyObserveBlobDelta(
+function applyObserveDelta(
 	value: unknown,
 	sequence: number,
 	base: BindingObserveEvent | undefined,
 ): BindingExecuteResult {
 	const delta = record(value, "observe event delta");
-	if (delta.kind !== "single-blob-splice") {
-		throw protocolError(`unknown observe delta kind: ${String(delta.kind)}`);
+	switch (delta.kind) {
+		case "single-blob-splice":
+			return applyObserveBlobDelta(delta, sequence, base);
+		case "row-splice":
+			return applyObserveRowSplice(delta, sequence, base);
+		default:
+			throw protocolError(`unknown observe delta kind: ${String(delta.kind)}`);
 	}
+}
+
+function applyObserveBlobDelta(
+	delta: Record<string, unknown>,
+	sequence: number,
+	base: BindingObserveEvent | undefined,
+): BindingExecuteResult {
 	const baseSequence = nonNegativeSafeInteger(
 		delta.baseSequence,
 		"observe delta baseSequence",
@@ -334,7 +356,82 @@ function applyObserveBlobDelta(
 		columns: ["data"],
 		rows: [[{ kind: "blob", value: null, blob }]],
 		rowsAffected: 0,
-		notices: [],
+			notices: [],
+	};
+}
+
+function applyObserveRowSplice(
+	delta: Record<string, unknown>,
+	sequence: number,
+	base: BindingObserveEvent | undefined,
+): BindingExecuteResult {
+	const baseSequence = nonNegativeSafeInteger(
+		delta.baseSequence,
+		"observe row delta baseSequence",
+	);
+	const prefixRows = nonNegativeSafeInteger(
+		delta.prefixRows,
+		"observe row delta prefixRows",
+	);
+	const deleteRows = nonNegativeSafeInteger(
+		delta.deleteRows,
+		"observe row delta deleteRows",
+	);
+	if (
+		base === undefined ||
+		base.sequence !== baseSequence ||
+		sequence !== baseSequence + 1
+	) {
+		throw protocolError("observe row delta does not match its transport base");
+	}
+	if (!Array.isArray(delta.insertRows)) {
+		throw protocolError("observe row delta insertRows must be an array");
+	}
+	if (
+		prefixRows > base.rows.rows.length ||
+		deleteRows > base.rows.rows.length - prefixRows
+	) {
+		throw protocolError("observe row delta splice range is outside its transport base");
+	}
+	const suffixStart = prefixRows + deleteRows;
+	const nextRowCount =
+		prefixRows + delta.insertRows.length + (base.rows.rows.length - suffixStart);
+	if (
+		!Number.isSafeInteger(nextRowCount) ||
+		nextRowCount > 0xffff_ffff
+	) {
+		throw protocolError("observe row delta result is too large");
+	}
+	let rows: NativeLixValue[][];
+	try {
+		rows = new Array(nextRowCount);
+	} catch {
+		throw protocolError("observe row delta result is too large");
+	}
+	let destination = 0;
+	for (let index = 0; index < prefixRows; index += 1) {
+		rows[destination++] = base.rows.rows[index] as NativeLixValue[];
+	}
+	for (let rowIndex = 0; rowIndex < delta.insertRows.length; rowIndex += 1) {
+		const row = delta.insertRows[rowIndex];
+		if (!Array.isArray(row)) {
+			throw protocolError(`observe row delta insert row ${rowIndex} must be an array`);
+		}
+		if (row.length !== base.rows.columns.length) {
+			throw protocolError(
+				`observe row delta insert row ${rowIndex} has ${row.length} values for ${base.rows.columns.length} columns`,
+			);
+		}
+		rows[destination++] = row.map((entry) => decodeWireValue(entry));
+	}
+	for (let index = suffixStart; index < base.rows.rows.length; index += 1) {
+		rows[destination++] = base.rows.rows[index] as NativeLixValue[];
+	}
+	return {
+		columns: [...base.rows.columns],
+		rows,
+		rowsAffected: base.rows.rowsAffected,
+		notices: base.rows.notices.map((notice) => ({ ...notice })),
 	};
 }
 

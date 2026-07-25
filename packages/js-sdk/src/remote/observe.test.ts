@@ -115,6 +115,78 @@ test("remote observe applies every blob delta before coalescing delivery", async
 	await lix.close();
 });
 
+test("remote observe applies sequential row deltas before coalescing delivery", async () => {
+	const body = [
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 0,
+			mutationSequence: 10,
+			result: {
+				columns: ["value"],
+				rows: [
+					[{ kind: "text", value: "a" }],
+					[{ kind: "text", value: "b" }],
+					[{ kind: "text", value: "c" }],
+				],
+				rowsAffected: 0,
+				notices: [],
+			},
+		}),
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 1,
+			mutationSequence: 11,
+			delta: {
+				kind: "row-splice",
+				baseSequence: 0,
+				prefixRows: 1,
+				deleteRows: 1,
+				insertRows: [[{ kind: "text", value: "x" }]],
+			},
+		}),
+		sseFrame("next", {
+			subscriptionId: "observe-1",
+			sequence: 2,
+			mutationSequence: 12,
+			delta: {
+				kind: "row-splice",
+				baseSequence: 1,
+				prefixRows: 2,
+				deleteRows: 0,
+				insertRows: [[{ kind: "text", value: "y" }]],
+			},
+		}),
+	].join("");
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/@acme/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				if (request.method === "DELETE") return closedSession();
+				return new URL(request.url).pathname.endsWith("/lix/v1/")
+					? handshake()
+					: sseResponse(body);
+			},
+		},
+	});
+
+	const events = lix.observe("SELECT value FROM state ORDER BY value");
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	const latest = await events.next();
+	expect(latest?.sequence).toBe(2);
+	expect(latest?.mutationSequence).toBe(12);
+	expect(latest?.result.rows.map((row) => row.get("value"))).toEqual([
+		"a",
+		"x",
+		"y",
+		"c",
+	]);
+
+	events.close();
+	await lix.close();
+});
+
 test("remote observe multiplexes more than six subscriptions without blocking execute", async () => {
 	const observeRequests: Request[] = [];
 	let headerResolutions = 0;

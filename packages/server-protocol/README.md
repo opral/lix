@@ -82,6 +82,12 @@ authentication, health checks, and compare-and-swap filesystem mutations stay
 outside it. Session identifiers are opaque capabilities: hosts should not log
 or persist them.
 
+Multiplex observation sends an initial full snapshot for each subscription.
+Contiguous later snapshots may instead carry a sequence-based blob or row
+splice against the immediately preceding transport snapshot. A client that
+does not have that exact base must reconnect and begin again with a full
+snapshot; it must never apply a splice to an arbitrary cached result.
+
 ## Binary file upsert
 
 Clients that explicitly want file **upsert** semantics can check for
