@@ -1109,7 +1109,14 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
 }
 
 fn slatedb_error(error: slatedb::Error) -> StorageError {
-    StorageError::Io(format!("slatedb storage: {error}"))
+    match error.kind() {
+        slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => StorageError::Fenced,
+        // SlateDB's public contract requires a new instance after *any*
+        // Closed reason. Keep fencing distinct for callers, while making
+        // background-task failures and future close reasons terminal too.
+        slatedb::ErrorKind::Closed(_) => StorageError::Closed(format!("slatedb storage: {error}")),
+        _ => StorageError::Io(format!("slatedb storage: {error}")),
+    }
 }
 
 fn object_store_error(error: object_store::Error) -> StorageError {
@@ -1363,6 +1370,91 @@ mod tests {
             block_on(read.get_many(space, &[key], GetOptions::default())).expect("read row");
 
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
+    }
+
+    #[test]
+    fn fenced_writer_reports_a_terminal_error_after_slatedb_closes_it() {
+        let object_store = Arc::new(InMemory::new());
+        let db_path = "test-fenced-writer";
+        let first = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open first SlateDB writer");
+        let space = SpaceId(10);
+
+        let mut seed =
+            block_on(first.begin_write(WriteOptions::default())).expect("begin seed write");
+        block_on(seed.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(Bytes::from_static(b"before-fence")),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"value"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage seed write");
+        block_on(seed.commit()).expect("commit seed write");
+        block_on(first.flush()).expect("durably flush seed write");
+
+        let _second = SlateDB::open_object_store_with_options(
+            db_path,
+            object_store,
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open newer SlateDB writer");
+
+        // `await_durable: false` intentionally returns after SlateDB accepts
+        // a write into its local pipeline. The newer writer's completed open
+        // fences this one, but its asynchronous manifest poll is what makes
+        // the terminal state observable here. Do not assert that the very
+        // next non-durable commit fails: SlateDB is allowed to acknowledge it
+        // before that poll observes the fence.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match block_on(first.begin_read(ReadOptions::default())) {
+                Err(StorageError::Fenced) => break,
+                Ok(read) => drop(read),
+                Err(error) => panic!("old writer returned the wrong error after fencing: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "SlateDB did not close the fenced writer within the test deadline"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut fenced =
+            block_on(first.begin_write(WriteOptions::default())).expect("begin fenced write");
+        block_on(fenced.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(Bytes::from_static(b"after-fence")),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"value"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage fenced write");
+        let error = block_on(fenced.commit()).expect_err("fenced writer must reject commits");
+
+        assert_eq!(error, StorageError::Fenced);
+    }
+
+    #[test]
+    fn closed_slatedb_panic_is_a_distinct_terminal_storage_error() {
+        let error = slatedb::Error::closed(
+            "background worker panicked".to_string(),
+            slatedb::CloseReason::Panic,
+        );
+
+        assert!(matches!(slatedb_error(error), StorageError::Closed(_)));
     }
 
     #[test]

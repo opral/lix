@@ -13,6 +13,10 @@ pub enum StorageError {
     WriteConflict,
     PreconditionFailed(Vec<PreconditionFailure>),
     Durability,
+    /// The storage writer was superseded by a newer client and cannot be reused.
+    Fenced,
+    /// The storage instance has stopped and cannot be reused.
+    Closed(String),
     Corruption(String),
     Io(String),
 }
@@ -90,6 +94,8 @@ impl fmt::Display for StorageError {
                 write!(f, "precondition failed: {failures:?}")
             }
             Self::Durability => f.write_str("durability failure"),
+            Self::Fenced => f.write_str("storage writer was fenced by a newer client"),
+            Self::Closed(message) => write!(f, "storage instance is closed: {message}"),
             Self::Corruption(message) => write!(f, "storage corruption: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
         }

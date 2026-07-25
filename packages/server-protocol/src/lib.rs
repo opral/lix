@@ -1454,43 +1454,51 @@ where
 async fn observe<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Json(request): Json<ObserveRequest>,
-) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError>
+) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let sql = required_non_empty(request.sql, "sql")?;
     let params = decode_params(request.params)?;
     let events = lease.observe(&sql, &params).await?;
+    let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
     let stream = async_stream::stream! {
         let _lease = lease;
+        let terminal_sender = terminal_sender;
         loop {
             match events.next().await {
                 Ok(Some(event)) => match ObserveEventResponse::try_from(event) {
-                    Ok(payload) => yield Ok(sse_json_event("next", &payload)),
+                    Ok(payload) => yield Ok::<Event, Infallible>(sse_json_event("next", &payload)),
                     Err(error) => {
-                        yield Ok(sse_json_event("error", &ErrorEnvelope::from_lix_error(&error)));
+                        terminal_sender.signal_if_terminal(&error);
+                        yield Ok::<Event, Infallible>(sse_json_event("error", &ErrorEnvelope::from_lix_error(&error)));
                         break;
                     }
                 },
                 Ok(None) => break,
                 Err(error) => {
-                    yield Ok(sse_json_event("error", &ErrorEnvelope::from_lix_error(&error)));
+                    terminal_sender.signal_if_terminal(&error);
+                    yield Ok::<Event, Infallible>(sse_json_event("error", &ErrorEnvelope::from_lix_error(&error)));
                     break;
                 }
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    response.extensions_mut().insert(terminal_signal);
+    Ok(response)
 }
 
 async fn observe_multiplex<S>(
     Extension(lease): Extension<SessionLease<S>>,
     Json(request): Json<MultiplexObserveRequest>,
-) -> Result<Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>>, ApiError>
+) -> Result<Response, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
@@ -1503,62 +1511,81 @@ where
         )));
     }
     let (sender, mut receiver) = mpsc::channel::<MultiplexObserveMessage>(64);
-    let mut tasks = Vec::with_capacity(request.subscriptions.len());
+    let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
+    // Own every task before validating the next subscription. Dropping a bare
+    // JoinHandle detaches it, which could otherwise leave an abandoned
+    // observation (and its terminal-storage sender) alive if validation fails
+    // or the response body is never polled.
+    let mut task_guard = Some(ObserveTaskGuard(Vec::with_capacity(
+        request.subscriptions.len(),
+    )));
     for subscription in request.subscriptions {
         let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
         let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
         let params = decode_params(subscription.params)?;
         let events = lease.observe(&sql, &params).await?;
         let sender = sender.clone();
+        let terminal_sender = terminal_sender.clone();
         let parent = tracing::Span::current();
-        tasks.push(tokio::spawn(
-            async move {
-                let mut blob_base = None;
-                loop {
-                    let message = match events.next().await {
-                        Ok(Some(event)) => {
-                            match multiplex_observe_payload(event, blob_base.as_ref()) {
-                                Ok((payload, next_blob_base)) => {
-                                    let message = MultiplexObserveMessage::Next {
-                                        subscription_id: subscription_id.clone(),
-                                        payload,
-                                    };
-                                    if sender.send(message).await.is_err() {
-                                        break;
+        task_guard
+            .as_mut()
+            .expect("multiplex task guard exists before creating the stream")
+            .0
+            .push(tokio::spawn(
+                async move {
+                    let mut blob_base = None;
+                    loop {
+                        let message = match events.next().await {
+                            Ok(Some(event)) => {
+                                match multiplex_observe_payload(event, blob_base.as_ref()) {
+                                    Ok((payload, next_blob_base)) => {
+                                        let message = MultiplexObserveMessage::Next {
+                                            subscription_id: subscription_id.clone(),
+                                            payload,
+                                        };
+                                        if sender.send(message).await.is_err() {
+                                            break;
+                                        }
+                                        blob_base = next_blob_base;
+                                        continue;
                                     }
-                                    blob_base = next_blob_base;
-                                    continue;
+                                    Err(error) => {
+                                        terminal_sender.signal_if_terminal(&error);
+                                        MultiplexObserveMessage::Error {
+                                            subscription_id: subscription_id.clone(),
+                                            error: ErrorEnvelope::from_lix_error(&error),
+                                        }
+                                    }
                                 }
-                                Err(error) => MultiplexObserveMessage::Error {
+                            }
+                            Ok(None) => break,
+                            Err(error) => {
+                                terminal_sender.signal_if_terminal(&error);
+                                MultiplexObserveMessage::Error {
                                     subscription_id: subscription_id.clone(),
                                     error: ErrorEnvelope::from_lix_error(&error),
-                                },
+                                }
                             }
+                        };
+                        let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
+                        if sender.send(message).await.is_err() || terminal {
+                            break;
                         }
-                        Ok(None) => break,
-                        Err(error) => MultiplexObserveMessage::Error {
-                            subscription_id: subscription_id.clone(),
-                            error: ErrorEnvelope::from_lix_error(&error),
-                        },
-                    };
-                    let terminal = matches!(message, MultiplexObserveMessage::Error { .. });
-                    if sender.send(message).await.is_err() || terminal {
-                        break;
                     }
                 }
-            }
-            .instrument(parent)
-            .with_current_subscriber(),
-        ));
+                .instrument(parent)
+                .with_current_subscriber(),
+            ));
     }
     drop(sender);
     let stream = async_stream::stream! {
         let _lease = lease;
-        let _task_guard = ObserveTaskGuard(tasks);
+        let _terminal_sender = terminal_sender;
+        let mut task_guard = task_guard;
         while let Some(message) = receiver.recv().await {
             match message {
                 MultiplexObserveMessage::Next { subscription_id, payload } => {
-                    yield Ok(sse_json_event("next", &MultiplexObserveEventResponse {
+                    yield Ok::<Event, Infallible>(sse_json_event("next", &MultiplexObserveEventResponse {
                         subscription_id,
                         sequence: payload.sequence,
                         mutation_sequence: payload.mutation_sequence,
@@ -1567,19 +1594,34 @@ where
                     }));
                 }
                 MultiplexObserveMessage::Error { subscription_id, error } => {
-                    yield Ok(sse_json_event("error", &MultiplexObserveErrorResponse {
+                    let terminal_storage = error.is_terminal_storage_error();
+                    // Abort live siblings before yielding. A yield suspends
+                    // this stream until the client asks for another frame;
+                    // waiting until after it would retain sibling reads when
+                    // a client stops after the terminal error.
+                    if terminal_storage {
+                        drop(task_guard.take());
+                    }
+                    yield Ok::<Event, Infallible>(sse_json_event("error", &MultiplexObserveErrorResponse {
                         subscription_id,
                         error,
                     }));
+                    if terminal_storage {
+                        break;
+                    }
                 }
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    ))
+    let mut response = Sse::new(stream)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response();
+    response.extensions_mut().insert(terminal_signal);
+    Ok(response)
 }
 
 fn sse_json_event<T: Serialize>(event: &'static str, payload: &T) -> Event {
@@ -1971,8 +2013,81 @@ impl From<LixError> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let terminal_storage = self.body.is_terminal_storage_error();
+        let mut response = (self.status, Json(self.body)).into_response();
+        if terminal_storage {
+            response.extensions_mut().insert(TerminalStorageResponse);
+        }
+        response
     }
+}
+
+/// Returns whether a protocol response reports a storage instance that cannot
+/// serve another request and must be replaced.
+///
+/// This is in-process metadata rather than a wire header. It lets an outer
+/// server retire only the terminal runtime without parsing a serialized error
+/// body or treating transient storage failures as terminal.
+pub fn is_terminal_storage_response(response: &Response) -> bool {
+    response
+        .extensions()
+        .get::<TerminalStorageResponse>()
+        .is_some()
+}
+
+#[derive(Clone, Debug)]
+struct TerminalStorageResponse;
+
+/// A one-way in-process signal for an SSE response that reports a terminal
+/// storage error after its HTTP headers have already been sent.
+///
+/// The signal resolves to `true` only for terminal storage errors; it resolves
+/// to `false` when the observation ends normally or its response body is
+/// dropped. This deliberately avoids coupling an outer server to SSE framing.
+#[derive(Clone, Debug)]
+pub struct TerminalStorageStreamSignal {
+    receiver: watch::Receiver<bool>,
+}
+
+#[derive(Clone, Debug)]
+struct TerminalStorageStreamSender {
+    sender: watch::Sender<bool>,
+}
+
+impl TerminalStorageStreamSignal {
+    fn new() -> (TerminalStorageStreamSender, Self) {
+        let (sender, receiver) = watch::channel(false);
+        (TerminalStorageStreamSender { sender }, Self { receiver })
+    }
+
+    /// Waits for either a terminal-storage error or normal stream completion.
+    pub async fn wait_for_terminal_storage(mut self) -> bool {
+        loop {
+            if *self.receiver.borrow() {
+                return true;
+            }
+            if self.receiver.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+}
+
+impl TerminalStorageStreamSender {
+    fn signal_if_terminal(&self, error: &LixError) {
+        if is_terminal_storage_error_code(&error.code) {
+            self.sender.send_replace(true);
+        }
+    }
+}
+
+/// Returns the terminal-storage signal attached to a successful observation
+/// response, if the response streams errors after sending HTTP headers.
+pub fn terminal_storage_stream_signal(response: &Response) -> Option<TerminalStorageStreamSignal> {
+    response
+        .extensions()
+        .get::<TerminalStorageStreamSignal>()
+        .cloned()
 }
 
 #[derive(Debug, Serialize)]
@@ -2015,6 +2130,17 @@ impl ErrorEnvelope {
             },
         }
     }
+
+    fn is_terminal_storage_error(&self) -> bool {
+        is_terminal_storage_error_code(&self.error.code)
+    }
+}
+
+fn is_terminal_storage_error_code(code: &str) -> bool {
+    matches!(
+        code,
+        LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED
+    )
 }
 
 fn status_for_lix_error(error: &LixError) -> StatusCode {
@@ -2023,7 +2149,9 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         | LixError::CODE_COMMIT_NOT_FOUND
         | LixError::CODE_TABLE_NOT_FOUND
         | LixError::CODE_COLUMN_NOT_FOUND => StatusCode::NOT_FOUND,
-        LixError::CODE_CLOSED => StatusCode::CONFLICT,
+        LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
+            StatusCode::CONFLICT
+        }
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -2492,7 +2620,7 @@ mod tests {
     use serde_json::{Value as JsonValue, json};
     use std::{
         io::{Read as _, Write as _},
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicBool},
     };
     use tower::ServiceExt as _;
     use tracing::Subscriber;
@@ -2501,6 +2629,17 @@ mod tests {
         prelude::*,
         registry::LookupSpan,
     };
+
+    #[test]
+    fn terminal_storage_responses_are_non_retryable_conflicts_and_mark_runtime_recovery() {
+        for code in [LixError::CODE_STORAGE_FENCED, LixError::CODE_STORAGE_CLOSED] {
+            let response =
+                ApiError::from(LixError::new(code, "the storage instance stopped")).into_response();
+
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(is_terminal_storage_response(&response));
+        }
+    }
 
     #[derive(Clone, Debug)]
     struct CapturedSpan {
@@ -2676,6 +2815,347 @@ mod tests {
         ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
         }
+    }
+
+    #[derive(Clone)]
+    struct FencedReadStorage {
+        inner: Memory,
+        fenced: Arc<AtomicBool>,
+    }
+
+    impl FencedReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                fenced: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fence_reads(&self) {
+            self.fenced.store(true, Ordering::Release);
+        }
+    }
+
+    impl Storage for FencedReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.fenced.load(Ordering::Acquire) {
+                return Err(StorageError::Fenced);
+            }
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailOneBlockedReadStorage {
+        inner: Memory,
+        gate: Arc<FailOneBlockedReadGate>,
+    }
+
+    struct FailOneBlockedReadGate {
+        remaining: AtomicUsize,
+        failing_entered: Notify,
+        failing_release: Notify,
+        sibling_entered: Notify,
+        sibling_release: Notify,
+        sibling_stopped: Arc<Notify>,
+    }
+
+    struct NotifyOnDrop(Arc<Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    impl FailOneBlockedReadStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                gate: Arc::new(FailOneBlockedReadGate {
+                    remaining: AtomicUsize::new(0),
+                    failing_entered: Notify::new(),
+                    failing_release: Notify::new(),
+                    sibling_entered: Notify::new(),
+                    sibling_release: Notify::new(),
+                    sibling_stopped: Arc::new(Notify::new()),
+                }),
+            }
+        }
+
+        fn fail_one_and_block_a_sibling(&self) {
+            assert_eq!(
+                self.gate.remaining.swap(2, Ordering::AcqRel),
+                0,
+                "test read gate must be idle before arming"
+            );
+        }
+
+        async fn wait_for_failing_read(&self) {
+            self.gate.failing_entered.notified().await;
+        }
+
+        async fn wait_for_blocked_sibling(&self) {
+            self.gate.sibling_entered.notified().await;
+        }
+
+        async fn wait_for_stopped_sibling(&self) {
+            self.gate.sibling_stopped.notified().await;
+        }
+
+        fn release_failing_read(&self) {
+            self.gate.failing_release.notify_one();
+        }
+
+        fn release_blocked_sibling(&self) {
+            self.gate.sibling_release.notify_one();
+        }
+    }
+
+    impl Storage for FailOneBlockedReadStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            let role = self
+                .gate
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .ok();
+            match role {
+                Some(2) => {
+                    self.gate.failing_entered.notify_one();
+                    self.gate.failing_release.notified().await;
+                    Err(StorageError::Fenced)
+                }
+                Some(1) => {
+                    self.gate.sibling_entered.notify_one();
+                    let _stopped = NotifyOnDrop(Arc::clone(&self.gate.sibling_stopped));
+                    self.gate.sibling_release.notified().await;
+                    self.inner.begin_read(options).await
+                }
+                Some(_) | None => self.inner.begin_read(options).await,
+            }
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[tokio::test]
+    async fn fenced_observe_after_headers_signals_and_ends_stream() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server);
+        let (session_id, _) = new_session(&router).await;
+
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/observe",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT 1", "params": [] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal_signal = terminal_storage_stream_signal(&response)
+            .expect("successful observe response must expose its fence signal");
+
+        // The router has already returned 200 headers. Fencing now can only
+        // reach callers through the SSE body, not an ordinary ApiError.
+        storage.fence_reads();
+        let body = tokio::time::timeout(Duration::from_secs(1), response.into_body().collect())
+            .await
+            .expect("fenced observe stream should finish")
+            .expect("fenced observe body");
+        let body = body.to_bytes();
+        let body = std::str::from_utf8(&body).expect("SSE body is UTF-8");
+        assert!(
+            body.contains("event: error"),
+            "expected SSE error, got {body}"
+        );
+        assert!(
+            body.contains("\"code\":\"LIX_STORAGE_FENCED\""),
+            "expected fenced storage error, got {body}"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                terminal_signal.wait_for_terminal_storage(),
+            )
+            .await
+            .expect("fence signal should resolve"),
+            "SSE fence signal should report the terminal storage error"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_multiplex_observe_aborts_live_sibling_before_next_body_poll() {
+        let storage = FailOneBlockedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server);
+        let (session_id, _) = new_session(&router).await;
+
+        storage.fail_one_and_block_a_sibling();
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/observe/multiplex",
+            Some(&session_id),
+            Some(json!({
+                "subscriptions": [
+                    { "id": "fenced", "sql": "SELECT 1", "params": [] },
+                    { "id": "live", "sql": "SELECT 2", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal_signal = terminal_storage_stream_signal(&response)
+            .expect("successful multiplex response must expose its fence signal");
+
+        // Both observation tasks are live behind already-sent headers. Leave
+        // one blocked after returning the other a terminal fence error. The
+        // sibling must be aborted before yielding that error, because a client
+        // can stop polling after its terminal frame.
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_failing_read())
+            .await
+            .expect("one observation should reach the failing read");
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_sibling())
+            .await
+            .expect("the sibling observation should remain live");
+        storage.release_failing_read();
+
+        let mut body = response.into_body();
+        let frame = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("fenced multiplex stream should produce its terminal frame")
+            .expect("fenced multiplex body should contain a frame")
+            .expect("fenced multiplex body frame");
+        let frame = frame
+            .into_data()
+            .expect("fenced multiplex frame should contain data");
+        let frame = std::str::from_utf8(&frame).expect("SSE body is UTF-8");
+        assert!(
+            frame.contains("event: error"),
+            "expected SSE error, got {frame}"
+        );
+        assert!(
+            frame.contains("\"code\":\"LIX_STORAGE_FENCED\""),
+            "expected fenced storage error, got {frame}"
+        );
+        let sibling_stopped =
+            tokio::time::timeout(Duration::from_secs(1), storage.wait_for_stopped_sibling()).await;
+        // Keep a failing regression self-cleaning: the old implementation
+        // leaves this task blocked until explicitly released.
+        storage.release_blocked_sibling();
+        sibling_stopped.expect("fenced multiplex stream should abort its live sibling");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), body.frame())
+                .await
+                .expect("fenced multiplex stream should finish")
+                .is_none(),
+            "fenced multiplex stream should reach EOF"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                terminal_signal.wait_for_terminal_storage(),
+            )
+            .await
+            .expect("fence signal should resolve"),
+            "multiplex fence signal should report the terminal storage error"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_multiplex_response_aborts_unpolled_workers() {
+        let storage = FailOneBlockedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server);
+        let (session_id, _) = new_session(&router).await;
+
+        storage.fail_one_and_block_a_sibling();
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/observe/multiplex",
+            Some(&session_id),
+            Some(json!({
+                "subscriptions": [
+                    { "id": "first", "sql": "SELECT 1", "params": [] },
+                    { "id": "second", "sql": "SELECT 2", "params": [] }
+                ]
+            })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal_signal = terminal_storage_stream_signal(&response)
+            .expect("successful multiplex response must expose its fence signal");
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_failing_read())
+            .await
+            .expect("one observation should reach the failing read");
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_sibling())
+            .await
+            .expect("the sibling observation should remain live");
+
+        drop(response);
+        let signalled = tokio::time::timeout(
+            Duration::from_secs(1),
+            terminal_signal.wait_for_terminal_storage(),
+        )
+        .await;
+        // Keep the failure mode self-cleaning: detached workers from the old
+        // implementation are still blocked until these permits are released.
+        storage.release_failing_read();
+        storage.release_blocked_sibling();
+        assert!(
+            !signalled.expect("dropping an unpolled response should release its signal"),
+            "an unpolled response must not retain a terminal-storage sender"
+        );
     }
 
     async fn app() -> TestApp {
