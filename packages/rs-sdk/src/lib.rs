@@ -24,26 +24,27 @@ pub use lix_engine::telemetry::{
     TelemetrySpanEnd, TelemetrySpanHandle, TelemetrySpanKind, TelemetrySpanStart,
     TelemetrySpanStatus, TelemetryValue, TracingTelemetrySink,
 };
-pub use lix_engine::wasm::{
-    WasmComponentInstance, WasmLimits, WasmPluginDetectedChange, WasmPluginEntityState,
-    WasmPluginFile, WasmRuntime,
-};
+/// Host-side contract for supplying a custom Component API v2 runtime through
+/// [`OpenLixOptions::with_wasm_runtime`]. This is the engine/embedding boundary,
+/// not a plugin-authoring SDK.
+pub use lix_engine::wasm::v2::*;
+pub use lix_engine::wasm::{WasmLimits, WasmRuntime};
 pub use lix_engine::{
     Blob, CommitResult, CoreProjection, CreateBranchOptions, CreateBranchReceipt,
     CreateBranchReceipt as CreateBranchResult, CreateCheckpointReceipt,
     CreateCheckpointReceipt as CreateCheckpointResult, ExecuteBatchStatement, ExecuteOptions,
-    ExecuteResult, ExecutionDisposition, GetManyResult, GetOptions, Key, KeyRange, LixError,
-    LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, MergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeBranchReceipt as MergeBranchResult, MergeChangeStats, MergeConflict,
-    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, ObserveEvent, ObserveEvents,
-    ProjectedValue, PutBatch, ReadEntry, ReadOptions, Row, ScanChunk, ScanOptions, SpaceId,
-    SqlQueryResult, SqlScriptPlan, SqlScriptStatement, Storage, StorageConformanceReport,
-    StorageConformanceResult, StorageConformanceStatus, StorageConformanceTest, StorageError,
-    StorageFactory, StorageFixture, StorageRead, StorageTestConfig, StorageWrite, StoredValue,
-    SwitchBranchOptions, SwitchBranchReceipt, SwitchBranchReceipt as SwitchBranchResult,
-    TryFromValue, Value, WireValue, WriteOptions, WriteStats, parse_sql_script,
-    run_storage_conformance,
+    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, GetManyResult, GetOptions, Key,
+    KeyRange, LixError, LixNotice, MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite,
+    MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, MergeBranchReceipt as MergeBranchResult, MergeChangeStats, MergeConflict,
+    MergeConflictChangeKind, MergeConflictKind, MergeConflictSide, MutationIdentity, ObserveEvent,
+    ObserveEvents, ProjectedValue, PutBatch, ReadEntry, ReadOptions, RequestBlobSpliceProvenance,
+    Row, ScanChunk, ScanOptions, SpaceId, SqlQueryResult, SqlScriptPlan, SqlScriptStatement,
+    Storage, StorageConformanceReport, StorageConformanceResult, StorageConformanceStatus,
+    StorageConformanceTest, StorageError, StorageFactory, StorageFixture, StorageRead,
+    StorageTestConfig, StorageWrite, StoredValue, SwitchBranchOptions, SwitchBranchReceipt,
+    SwitchBranchReceipt as SwitchBranchResult, TryFromValue, Value, VerifiedRequestBlob, WireValue,
+    WriteOptions, WriteStats, parse_sql_script, run_storage_conformance,
 };
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SQLITE_FORMAT_VERSION, SQLite, SQLiteFactory, SQLiteFixture, SQLiteOptions};

@@ -1,0 +1,63 @@
+{
+  "x-lix-key": "markdown_node_v2",
+  "x-lix-primary-key": ["/id"],
+  "x-lix-id-allocation": "host-allocated",
+  "x-lix-foreign-keys": [
+    {
+      "properties": ["/parent_id"],
+      "references": {
+        "schemaKey": "markdown_node_v2",
+        "properties": ["/id"]
+      }
+    }
+  ],
+  "description": "A durable node in the authoritative GitHub Flavored Markdown syntax graph. Structural children are linked by parent_id and order_key; text-bearing leaves embed their inline AST.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Stable node primary key allocated deterministically from the transition namespace."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "document",
+        "frontmatter",
+        "paragraph",
+        "heading",
+        "thematic_break",
+        "block_quote",
+        "list",
+        "list_item",
+        "code_block",
+        "html_block",
+        "definition",
+        "footnote_definition",
+        "table",
+        "table_column",
+        "table_row",
+        "table_cell"
+      ]
+    },
+    "parent_id": {
+      "type": ["string", "null"],
+      "minLength": 1
+    },
+    "order_key": {
+      "type": ["string", "null"],
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "Sibling position. Equal keys are legal and are deterministically ordered by id."
+    },
+    "payload_json": {
+      "type": "string",
+      "description": "Canonical JSON text for kind-specific semantic content. It is string-wrapped because packet-v1's production durable profile does not yet admit JSON number nodes."
+    },
+    "format_json": {
+      "type": "string",
+      "description": "Canonical JSON text for render-effective Markdown spelling choices. A document node may also carry a validated base64 lexical fallback for accepted noncanonical source bytes."
+    }
+  },
+  "required": ["id", "kind", "parent_id", "order_key", "payload_json", "format_json"],
+  "additionalProperties": false
+}

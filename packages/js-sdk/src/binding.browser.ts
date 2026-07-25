@@ -1,7 +1,6 @@
 import type {
 	LixStorageConfig,
 	LixBinding,
-	PluginRuntimeDispatch,
 	TelemetryDispatch,
 } from "./binding-types.js";
 
@@ -17,7 +16,6 @@ function initializeWasm(): Promise<unknown> {
 
 export async function openLixBinding(
 	storage: LixStorageConfig,
-	dispatch: PluginRuntimeDispatch,
 	telemetry?: TelemetryDispatch,
 ): Promise<LixBinding> {
 	if (storage.kind !== "memory") {
@@ -27,7 +25,6 @@ export async function openLixBinding(
 	}
 	await initializeWasm();
 	return openMemoryFromSnapshot(
-		dispatch,
 		telemetry,
 		storage.snapshot,
 	) as Promise<LixBinding>;

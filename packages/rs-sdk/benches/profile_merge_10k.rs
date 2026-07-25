@@ -6,11 +6,10 @@
 //! merge inside `profile_merge_phase` so samply samples can be filtered to that
 //! frame. The post-merge sqlite file is left on disk for inspection.
 //!
-//! Differences from the merge_10k criterion bench (benches/e2e.rs): the bench's
-//! measured region includes `lix.close()`, which this marker frame excludes, and
-//! the merge here runs in a fresh process against a reopened file, so cold-load
-//! frames appear that the bench's in-process setup absorbs. Profile shapes are
-//! comparable; absolute times are not.
+//! The merge runs in a fresh process against a reopened file, so cold-load
+//! frames appear even though component compilation and a warm-up transition are
+//! deliberately outside `profile_merge_phase`. Use this harness for profile
+//! shape, not as a replacement for the explicit large-file acceptance gates.
 
 use lix_sdk::{OpenLixOptions, SQLite, Value, open_lix};
 use std::io::{Cursor, Write as _};
@@ -49,13 +48,13 @@ fn main() {
 
     match mode {
         "setup" => runtime.block_on(async {
-            let plugin = build_csv_plugin();
+            let plugin = build_csv_v2_plugin();
             let lix = open_lix(OpenLixOptions::new(
                 SQLite::open(&lix_path).expect("open sqlite storage"),
             ))
             .await
             .unwrap();
-            install_plugin(&lix, "plugin_csv", &plugin).await;
+            install_plugin(&lix, "plugin_csv_v2", &plugin).await;
             let initial_csv = csv_bytes_from_rows(&initial_rows);
             let start = Instant::now();
             write_file(&lix, CSV_PATH, initial_csv).await;
@@ -190,33 +189,33 @@ fn csv_bytes_from_rows(rows: &[String]) -> Vec<u8> {
     csv.into_bytes()
 }
 
-fn build_csv_plugin() -> Vec<u8> {
+fn build_csv_v2_plugin() -> Vec<u8> {
     // option_env: the bindep artifact env var is absent in some CI target
     // contexts; this harness is only ever run manually, so resolve at
     // runtime and fail with instructions instead of failing the compile.
-    let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_plugin_csv") else {
+    let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
         eprintln!(
-            "CSV plugin wasm path unavailable; build via `cargo build --bench \
+            "CSV v2 plugin wasm path unavailable; build via `cargo build --bench \
              profile_merge_10k --features sqlite` so cargo provides the bindep artifact"
         );
         std::process::exit(2);
     };
-    let wasm = std::fs::read(Path::new(wasm_path)).expect("read bindep-built CSV plugin wasm");
+    let wasm = std::fs::read(Path::new(wasm_path)).expect("read bindep-built CSV v2 plugin wasm");
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options =
         zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     for (path, bytes) in [
         (
             "manifest.json",
-            include_str!("../../../plugins/csv/manifest.json").as_bytes(),
+            include_str!("../../../plugins/csv-v2/manifest.json").as_bytes(),
         ),
         (
-            "schema/csv_table.json",
-            include_str!("../../../plugins/csv/schema/csv_table.json").as_bytes(),
+            "schema/csv_v2_table.json",
+            include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json").as_bytes(),
         ),
         (
-            "schema/csv_row.json",
-            include_str!("../../../plugins/csv/schema/csv_row.json").as_bytes(),
+            "schema/csv_v2_row.json",
+            include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
         ),
         ("plugin.wasm", wasm.as_slice()),
     ] {

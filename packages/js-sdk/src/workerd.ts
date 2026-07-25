@@ -62,9 +62,6 @@ export async function openMemoryLix(
 	}
 	initializeWasm();
 	return openMemoryFromSnapshot(
-		async () => {
-			throw new Error("Lix plugin execution is unavailable in Workerd");
-		},
 		undefined,
 		options.snapshot,
 	);

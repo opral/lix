@@ -99,16 +99,6 @@ try {
 		/^lix_js_sdk_bg-.*\.wasm$/,
 		"engine WASM",
 	);
-	const jcoCoreWasm = findBuiltAsset(
-		builtAssets,
-		/^js-component-bindgen-component\.core-.*\.wasm$/,
-		"JCO core WASM",
-	);
-	const jcoCore2Wasm = findBuiltAsset(
-		builtAssets,
-		/^js-component-bindgen-component\.core2-.*\.wasm$/,
-		"JCO core2 WASM",
-	);
 	const workerSource = await readFile(join(assetsDir, browserWorker), "utf8");
 	const browserJavaScriptSources = await Promise.all(
 		builtAssets
@@ -122,14 +112,6 @@ try {
 	assert.ok(
 		workerSource.includes(engineWasm),
 		"The browser worker does not reference the emitted engine WASM",
-	);
-	assert.ok(
-		workerSource.includes(jcoCoreWasm),
-		"The browser worker does not reference the emitted JCO core WASM",
-	);
-	assert.ok(
-		workerSource.includes(jcoCore2Wasm),
-		"The browser worker does not reference the emitted JCO core2 WASM",
 	);
 	assert.ok(
 		builtAssets.every((file) => !file.startsWith("entry.node-")),
@@ -212,18 +194,10 @@ async function runBrowserSmoke(browser, port, cspMode) {
 
 		assert.deepEqual(result, {
 			message: "production",
-			csv: {
-				cells: [
-					["name", "age"],
-					["Ada", "36"],
-					["Grace", "37"],
-				],
-				rendered: "name,age\nAda,36\nGrace,37\n",
-			},
-			markdown: {
-				kinds: ["document", "heading", "paragraph"],
-				rendered: "# Heading\n\nParagraph with **bold** text.\n",
-			},
+			bundledPluginKeys: [
+				"plugin_csv_v2",
+				"plugin_markdown_incremental_v2",
+			],
 		});
 		assert.deepEqual(browserErrors, []);
 	} finally {
@@ -315,7 +289,7 @@ function contentSecurityPolicy(pathWithinRoot, mode) {
 	if (mode === "global" || isBrowserWorker) {
 		return (
 			"default-src 'none'; " +
-			"script-src 'self' data: 'wasm-unsafe-eval'; " +
+			"script-src 'self' 'wasm-unsafe-eval'; " +
 			"worker-src 'self'; connect-src 'self'"
 		);
 	}

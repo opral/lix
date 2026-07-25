@@ -6,6 +6,7 @@ registerMemoryStorageContract({
 	name: "browser WASM",
 	loadSdk: async () => await import("@lix-js/sdk"),
 	operationTimeoutMs: 30_000,
+	supportsPluginExecution: false,
 });
 
 test("forwards opt-in SQL telemetry from browser WASM", async () => {
