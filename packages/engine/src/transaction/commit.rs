@@ -289,6 +289,12 @@ async fn stage_changelog_commits(
             .get(&commit_row.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
+        validate_selected_change_refs(
+            commit_row.commit_id,
+            state_rows,
+            state_row_indices,
+            &commit_row.selected_change_refs,
+        )?;
         let mut refs = Vec::with_capacity(state_row_indices.len());
         for &row_index in state_row_indices {
             let row = &state_rows[row_index];
@@ -337,6 +343,65 @@ async fn stage_changelog_commits(
         .await?;
     writer.stage_transaction_append(append)?;
     Ok(staged)
+}
+
+/// The terminal transaction append deliberately skips the changelog writer's
+/// read-heavy validation because ordinary prepared rows are freshly generated
+/// and already canonical. Selected historical refs are the one irregular
+/// lane: validate their combined commit membership locally before appending.
+fn validate_selected_change_refs(
+    commit_id: CommitId,
+    state_rows: &[PreparedStateRow],
+    state_row_indices: &[RowIndex],
+    selected_change_refs: &[StagedCommitChangeRef],
+) -> Result<(), LixError> {
+    if selected_change_refs.is_empty() {
+        return Ok(());
+    }
+
+    let mut change_ids = BTreeSet::new();
+    let mut identities = BTreeSet::new();
+    for &row_index in state_row_indices {
+        let row = &state_rows[row_index];
+        let change_id = row.change_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked staged row is missing change_id before changelog append",
+            )
+        })?;
+        if !change_ids.insert(change_id) {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' has duplicate change ref '{change_id}'"
+            )));
+        }
+        if !identities.insert((
+            row.schema_key.as_str(),
+            row.file_id.as_deref(),
+            &row.entity_pk,
+        )) {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' has duplicate change ref key"
+            )));
+        }
+    }
+    for change_ref in selected_change_refs {
+        if !change_ids.insert(change_ref.change_id) {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' has duplicate change ref '{}'",
+                change_ref.change_id
+            )));
+        }
+        if !identities.insert((
+            change_ref.schema_key.as_str(),
+            change_ref.file_id.as_deref(),
+            &change_ref.entity_pk,
+        )) {
+            return Err(LixError::unknown(format!(
+                "commit '{commit_id}' has duplicate change ref key"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn transaction_change_record_from_state_row(
@@ -1173,6 +1238,29 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
         assert!(error.message.contains("branch id is too long"));
+    }
+
+    #[test]
+    fn selected_change_refs_reject_overlap_with_normal_rows() {
+        let row = tracked_global_row("normal-change");
+        let error = validate_selected_change_refs(
+            commit_id("test-uuid-1"),
+            &[row],
+            &[0],
+            &[selected_change_ref("selected-change", "entity-1")],
+        )
+        .expect_err("selected ref must not duplicate a normal row identity");
+        assert!(error.message.contains("duplicate change ref key"));
+
+        let row = tracked_global_row("normal-change");
+        let error = validate_selected_change_refs(
+            commit_id("test-uuid-1"),
+            &[row],
+            &[0],
+            &[selected_change_ref("normal-change", "other-entity")],
+        )
+        .expect_err("selected ref must not duplicate a normal row change id");
+        assert!(error.message.contains("duplicate change ref '"));
     }
 
     #[tokio::test]
@@ -2017,6 +2105,18 @@ mod tests {
             change_refs.add_change_id(self::change_id(change_id));
         }
         change_refs
+    }
+
+    fn selected_change_ref(change_id: &str, entity_pk: &str) -> StagedCommitChangeRef {
+        StagedCommitChangeRef {
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single(entity_pk),
+            change_id: self::change_id(change_id),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        }
     }
 
     fn tracked_global_row(change_id: &str) -> PreparedStateRow {
