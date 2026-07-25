@@ -106,6 +106,12 @@ fn apply_edits(before: &[u8], edits: &[ByteEdit]) -> Vec<u8> {
     after
 }
 
+fn assert_source_spans_match_entities(document: &Document) {
+    document
+        .source_spans_match_entities()
+        .expect("every source span must point at its accepted source bytes");
+}
+
 fn has_number(value: &Value) -> bool {
     match value {
         Value::Number(_) => true,
@@ -146,6 +152,7 @@ fn exact_pretty_json_roundtrip_and_number_free_entities() {
     let bytes = fixture();
     let document = open(&bytes);
     assert_eq!(document.bytes(), bytes);
+    assert_source_spans_match_entities(&document);
     let records = records(&document);
     assert_eq!(records.len(), 4);
     assert_eq!(
@@ -164,6 +171,34 @@ fn exact_pretty_json_roundtrip_and_number_free_entities() {
     assert_eq!(edit.delete_len, 0);
     assert_eq!(edit.insert.as_slice(), bytes);
     assert_eq!(reopened.bytes(), bytes);
+}
+
+#[test]
+fn parsed_source_retains_spans_after_a_layout_shifting_file_change() {
+    let before = fixture();
+    let document = open(&before);
+    let version = offset_of(&before, b"\"version\": 2") + b"\"version\": ".len();
+    let (after, changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(version).unwrap(),
+                delete_len: 1,
+                insert: b"200",
+            }],
+            namespace(),
+        )
+        .expect("layout-shifting source edit");
+
+    let mut expected = before;
+    expected.splice(version..=version, b"200".iter().copied());
+    assert_eq!(after.bytes(), expected);
+    assert_source_spans_match_entities(&after);
+    assert_eq!(
+        changes.len(),
+        1,
+        "only the scene template changed: {changes:#?}"
+    );
+    assert_eq!(changes[0].schema_key, SCENE_SCHEMA_KEY);
 }
 
 #[test]
