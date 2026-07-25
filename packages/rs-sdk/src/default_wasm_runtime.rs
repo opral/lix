@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
@@ -11,7 +14,9 @@ use lix_engine::LixError;
 use lix_engine::wasm::{WasmLimits, WasmRuntime};
 use lru::LruCache;
 use wasmtime::component::{Component, Linker};
-use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{
+    Cache, CacheConfig, Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder,
+};
 use wasmtime_wasi::{
     ResourceTable, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView, p2::add_to_linker_sync,
 };
@@ -24,6 +29,7 @@ const MAX_PLUGIN_INSTANCES: usize = 64;
 const MAX_PLUGIN_MEMORIES: usize = 1;
 const MAX_PLUGIN_TABLES: usize = 8;
 const MAX_PLUGIN_TABLE_ELEMENTS: usize = 1_000_000;
+const LIX_WASMTIME_CACHE_DIR_ENV: &str = "LIX_WASMTIME_CACHE_DIR";
 
 pub(crate) fn runtime() -> Result<Arc<dyn WasmRuntime>, LixError> {
     Ok(Arc::new(WasmtimePluginRuntime::new()?))
@@ -34,7 +40,53 @@ fn create_engine(consume_fuel: bool, epoch_interruption: bool) -> wasmtime::Resu
     config.wasm_component_model(true);
     config.consume_fuel(consume_fuel);
     config.epoch_interruption(epoch_interruption);
+    configure_component_cache(&mut config)?;
     Engine::new(&config)
+}
+
+/// Enables Wasmtime's host-local AOT cache for sandboxed plugin components.
+///
+/// This cache is deliberately outside the workspace and its storage adapter:
+/// native compiled artifacts are tied to the host architecture, Wasmtime
+/// version, and engine settings. Wasmtime keys and validates those artifacts
+/// itself, while the optional override makes isolated deployments and tests
+/// deterministic.
+fn configure_component_cache(config: &mut Config) -> wasmtime::Result<()> {
+    let mut cache_config = CacheConfig::new();
+    let directory = lix_wasmtime_cache_dir()?;
+    let explicitly_configured = directory.is_some();
+    if let Some(directory) = directory {
+        cache_config.with_directory(directory);
+    }
+    match Cache::new(cache_config) {
+        Ok(cache) => {
+            config.cache(Some(cache));
+        }
+        // The stock cache location is an opportunistic latency optimization.
+        // A read-only or home-less deployment must retain the pre-cache
+        // behavior rather than fail to initialize every sandboxed plugin.
+        Err(_) if !explicitly_configured => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+fn lix_wasmtime_cache_dir() -> wasmtime::Result<Option<PathBuf>> {
+    lix_wasmtime_cache_dir_from(env::var_os(LIX_WASMTIME_CACHE_DIR_ENV))
+}
+
+fn lix_wasmtime_cache_dir_from(directory: Option<OsString>) -> wasmtime::Result<Option<PathBuf>> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(directory);
+    if !directory.is_absolute() {
+        return Err(wasmtime::Error::msg(format!(
+            "{LIX_WASMTIME_CACHE_DIR_ENV} must be an absolute path, got '{}'",
+            directory.display()
+        )));
+    }
+    Ok(Some(directory))
 }
 
 struct WasmtimePluginRuntime {
@@ -502,6 +554,7 @@ fn wasm_runtime_error(context: impl Into<String>, error: impl fmt::Display) -> L
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicUsize;
 
@@ -518,6 +571,56 @@ mod tests {
         let first = WasmtimePluginRuntime::new().expect("first runtime should initialize");
         let second = WasmtimePluginRuntime::new().expect("second runtime should initialize");
         assert!(Arc::ptr_eq(&first.shared, &second.shared));
+    }
+
+    #[test]
+    fn wasmtime_component_cache_persists_between_engines() {
+        let directory = tempfile::tempdir().expect("cache directory should initialize");
+        let component_bytes = wasm_encoder::Component::new().finish();
+
+        let first_cache = test_component_cache(directory.path());
+        let first_engine = test_engine_with_component_cache(first_cache.clone());
+        Component::new(&first_engine, &component_bytes)
+            .expect("first engine should compile the component");
+        assert!(
+            first_cache.cache_misses() > 0,
+            "the first engine must populate the persistent cache"
+        );
+
+        // A separate Cache and Engine model a fresh Lix process. The in-process
+        // component LRU cannot satisfy this compile, so a hit proves the
+        // host-local Wasmtime cache is active.
+        let second_cache = test_component_cache(directory.path());
+        let second_engine = test_engine_with_component_cache(second_cache.clone());
+        Component::new(&second_engine, &component_bytes)
+            .expect("second engine should load the cached component");
+        assert!(
+            second_cache.cache_hits() > 0,
+            "the second engine must reuse the persistent component cache"
+        );
+    }
+
+    #[test]
+    fn wasmtime_cache_override_requires_an_absolute_path() {
+        assert_eq!(
+            lix_wasmtime_cache_dir_from(None).expect("an absent override should be valid"),
+            None
+        );
+
+        let absolute = env::temp_dir().join("lix-wasmtime-cache");
+        assert_eq!(
+            lix_wasmtime_cache_dir_from(Some(absolute.clone().into_os_string()))
+                .expect("an absolute override should be valid"),
+            Some(absolute)
+        );
+
+        let error = lix_wasmtime_cache_dir_from(Some(OsString::from("relative-cache")))
+            .expect_err("a relative override must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("LIX_WASMTIME_CACHE_DIR must be an absolute path")
+        );
     }
 
     #[test]
@@ -886,6 +989,19 @@ mod tests {
         let engine = create_engine(false, false).expect("test engine should initialize");
         Component::new(&engine, wasm_encoder::Component::new().finish())
             .expect("empty component should compile")
+    }
+
+    fn test_component_cache(directory: &Path) -> Cache {
+        let mut config = CacheConfig::new();
+        config.with_directory(directory);
+        Cache::new(config).expect("test cache should initialize")
+    }
+
+    fn test_engine_with_component_cache(cache: Cache) -> Engine {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.cache(Some(cache));
+        Engine::new(&config).expect("test engine should initialize")
     }
 
     fn component_with_initial_memory(pages: u64) -> Vec<u8> {
