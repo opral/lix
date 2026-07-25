@@ -94,12 +94,35 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
                 profile_raw_sqlite_operation(rows, operation, sample_count, output);
             }
         }
+        Ok("raw_sqlite_literal") => {
+            assert!(
+                matches!(operation, TransactionBenchOp::UpdateAll),
+                "raw_sqlite_literal only supports update_all"
+            );
+            if let Some(repeats) = hot_repeats {
+                profile_hot_raw_sqlite_literal_updates(rows, repeats);
+            } else {
+                profile_raw_sqlite_literal_updates(rows, sample_count);
+            }
+        }
         Ok("sql_session") => {
             let profile = profile_sql_session_storage();
             if let Some(repeats) = hot_repeats {
                 profile_hot_sql_session_operations(runtime, rows, operation, repeats, profile);
             } else {
                 profile_sql_session_operation(runtime, rows, operation, sample_count, profile);
+            }
+        }
+        Ok("sql_session_bound") => {
+            assert!(
+                matches!(operation, TransactionBenchOp::UpdateAll),
+                "sql_session_bound only supports update_all"
+            );
+            let profile = profile_sql_session_storage();
+            if let Some(repeats) = hot_repeats {
+                profile_hot_sql_session_bound_updates(runtime, rows, repeats, profile);
+            } else {
+                profile_sql_session_bound_updates(runtime, rows, sample_count, profile);
             }
         }
         Ok("transaction") | Err(_) => {
@@ -110,7 +133,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             }
         }
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, kv_layout, or raw_sqlite"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, sql_session_bound, kv_layout, raw_sqlite, or raw_sqlite_literal"
         ),
     }
 }
@@ -219,6 +242,29 @@ fn profile_hot_sql_session_operations(
     black_box(row_count);
 }
 
+fn profile_hot_sql_session_bound_updates(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    repeats: usize,
+    profile: StorageProfile,
+) {
+    let repeats_u32 =
+        u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let fixture = runtime.block_on(sql_session::seeded_fixture(profile, rows));
+    let start = Instant::now();
+    let mut row_count = 0;
+    for _ in 0..repeats {
+        row_count += runtime.block_on(fixture.update_all_bound());
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "tracked_state_crud hot profile: sql_session_bound/{}/update_all/{repeats} repeats: total={elapsed:?} per_operation={:?}",
+        profile.name(),
+        elapsed / repeats_u32,
+    );
+    black_box(row_count);
+}
+
 fn profile_hot_raw_sqlite_operations(
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
@@ -240,6 +286,23 @@ fn profile_hot_raw_sqlite_operations(
         output.layer(),
         profile_operation_name(operation),
         repeats,
+        elapsed / repeats_u32,
+    );
+    black_box(row_count);
+}
+
+fn profile_hot_raw_sqlite_literal_updates(rows: &[WorkloadRow], repeats: usize) {
+    let repeats_u32 =
+        u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let mut fixture = raw_sqlite::seeded_fixture(rows);
+    let start = Instant::now();
+    let mut row_count = 0;
+    for _ in 0..repeats {
+        row_count += fixture.update_all_literal();
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "tracked_state_crud hot profile: raw_sqlite/literal/update_all/{repeats} repeats: total={elapsed:?} per_operation={:?}",
         elapsed / repeats_u32,
     );
     black_box(row_count);
@@ -330,6 +393,18 @@ fn profile_raw_sqlite_operation(
     print_profile_samples(output.layer(), operation, samples);
 }
 
+fn profile_raw_sqlite_literal_updates(rows: &[WorkloadRow], sample_count: usize) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let mut fixture = raw_sqlite::seeded_fixture(rows);
+        let start = Instant::now();
+        let result = fixture.update_all_literal();
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples("raw_sqlite/literal", TransactionBenchOp::UpdateAll, samples);
+}
+
 fn profile_sql_session_operation(
     runtime: &tokio::runtime::Runtime,
     rows: &[WorkloadRow],
@@ -352,6 +427,27 @@ fn profile_sql_session_operation(
     print_profile_samples(
         &format!("sql_session/{}", profile.name()),
         operation,
+        samples,
+    );
+}
+
+fn profile_sql_session_bound_updates(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    sample_count: usize,
+    profile: StorageProfile,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let fixture = runtime.block_on(sql_session::seeded_fixture(profile, rows));
+        let start = Instant::now();
+        let result = runtime.block_on(fixture.update_all_bound());
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples(
+        &format!("sql_session_bound/{}", profile.name()),
+        TransactionBenchOp::UpdateAll,
         samples,
     );
 }

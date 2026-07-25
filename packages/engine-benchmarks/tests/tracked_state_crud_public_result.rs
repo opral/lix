@@ -41,8 +41,8 @@ async fn standalone_sqlite_public_results_match_lix_sql_results() {
             updated_value_json: r#""updated""#.to_string(),
         },
     ];
-    let raw = raw_sqlite::seeded_fixture(&rows);
-    let lix = sql_session::seeded_fixture(StorageProfile::SQLite, &rows).await;
+    let mut raw = raw_sqlite::seeded_fixture(&rows);
+    let lix = sql_session::seeded_fixture(StorageProfile::RocksDB, &rows).await;
 
     assert_eq!(raw.read_all_public_result(), lix.read_all_result().await);
     assert_eq!(
@@ -53,4 +53,8 @@ async fn standalone_sqlite_public_results_match_lix_sql_results() {
         raw.read_many_by_pk_public_result(READ_MANY_PK_COUNT),
         lix.read_many_by_pk_result().await
     );
+
+    assert_eq!(raw.update_all_literal(), rows.len());
+    assert_eq!(lix.update_all_bound().await, rows.len());
+    assert_eq!(raw.read_all_public_result(), lix.read_all_result().await);
 }
