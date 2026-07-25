@@ -35,7 +35,8 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Tracked rows are resolved from the branch head's immutable commit root.
+/// Tracked rows are resolved from the branch head's durable head projection;
+/// sparse immutable roots and changelog replay are historical fallbacks.
 /// Untracked and engine-owned current rows are resolved through a flat mutable
 /// identity-to-change index, then both sources are combined for serving.
 pub(crate) struct LiveStateContext {
@@ -302,33 +303,18 @@ where
                             })
                             .collect::<Vec<_>>();
                         let source = tracked_source_from_branch_id(&branch_id);
-                        let rows = if let Some(root_id) =
-                            crate::tracked_state::load_root(&self.store, &commit_id).await?
+                        let rows = if let Some(rows) = self
+                            .tracked_head
+                            .reader(&self.store)
+                            .load_projected_live_rows_if_current(
+                                &branch_id,
+                                &commit_id,
+                                &keys,
+                                &projection,
+                            )
+                            .await?
                         {
-                            if let Some(rows) = self
-                                .tracked_head
-                                .reader(&self.store)
-                                .load_projected_live_rows_if_current(
-                                    &branch_id,
-                                    &commit_id,
-                                    &root_id,
-                                    &keys,
-                                    &projection,
-                                )
-                                .await?
-                            {
-                                rows
-                            } else {
-                                self.tracked_state
-                                    .reader(&self.store)
-                                    .load_projected_rows_at_commit(&commit_id, &keys, &projection)
-                                    .await?
-                                    .into_iter()
-                                    .map(|row| {
-                                        row.map(|row| project_tracked_row(row, &branch_id, source))
-                                    })
-                                    .collect()
-                            }
+                            rows
                         } else {
                             self.tracked_state
                                 .reader(&self.store)
@@ -481,39 +467,13 @@ where
             .map(|(branch_id, commit_id)| {
                 let tracked_request = tracked_request.clone();
                 async move {
-                    let (rows, ordered_unique) = if let Some(root_id) =
-                        crate::tracked_state::load_root(store, &commit_id).await?
+                    let (rows, ordered_unique) = if let Some(rows) = self
+                        .tracked_head
+                        .reader(store)
+                        .scan_live_rows_if_current(&branch_id, &commit_id, &tracked_request)
+                        .await?
                     {
-                        if let Some(rows) = self
-                            .tracked_head
-                            .reader(store)
-                            .scan_live_rows_if_current(
-                                &branch_id,
-                                &commit_id,
-                                &root_id,
-                                &tracked_request,
-                            )
-                            .await?
-                        {
-                            (rows, true)
-                        } else {
-                            (
-                                self.tracked_state
-                                    .reader(store)
-                                    .scan_rows_at_commit(&commit_id, &tracked_request)
-                                    .await?
-                                    .into_iter()
-                                    .map(|row| {
-                                        project_tracked_row(
-                                            row,
-                                            &branch_id,
-                                            tracked_source_from_branch_id(&branch_id),
-                                        )
-                                    })
-                                    .collect(),
-                                false,
-                            )
-                        }
+                        (rows, true)
                     } else {
                         (
                             self.tracked_state

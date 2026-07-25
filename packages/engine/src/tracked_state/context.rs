@@ -140,16 +140,8 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? else {
-            return Err(missing_commit_root_error(commit_id));
-        };
         let rows = self
-            .tree
-            .scan(
-                &self.store,
-                &root_id,
-                &tree_scan_request_from_tracked(request),
-            )
+            .index_entries_at_commit(commit_id, &tree_scan_request_from_tracked(request))
             .await?;
         let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut rows =
@@ -221,6 +213,13 @@ where
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
         diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    /// True only for the sparse immutable checkpoints. A false result does
+    /// not mean the commit is unreadable: ordinary v4 commits replay their
+    /// first-parent changelog interval on the cold historical path.
+    pub(crate) async fn has_durable_commit_root(&self, commit_id: &str) -> Result<bool, LixError> {
+        Ok(self.tree.load_root(&self.store, commit_id).await?.is_some())
     }
 
     pub(crate) async fn validate_diff_rows_for_commits_against_changelog(
@@ -868,6 +867,50 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
+        let left_root = self.tree.load_root(&self.store, left_commit_id).await?;
+        let right_root = if left_commit_id == right_commit_id {
+            left_root.clone()
+        } else {
+            self.tree.load_root(&self.store, right_commit_id).await?
+        };
+        if let (Some(_), Some(_)) = (&left_root, &right_root) {
+            return self
+                .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
+                .await;
+        }
+        let left = self.replay_index_entries_at_commit(left_commit_id).await?;
+        let right = if left_commit_id == right_commit_id {
+            left.clone()
+        } else {
+            self.replay_index_entries_at_commit(right_commit_id).await?
+        };
+        let keys = left
+            .keys()
+            .chain(right.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        Ok(keys
+            .into_iter()
+            .filter(|key| request.matches_key(key))
+            .filter_map(|key| {
+                let before = left.get(&key).cloned();
+                let after = right.get(&key).cloned();
+                (before != after).then_some(
+                    crate::tracked_state::types::TrackedStateTreeDiffEntry {
+                        before: before.map(|value| (key.clone(), value)),
+                        after: after.map(|value| (key, value)),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn diff_tree_entries_from_roots(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
         let mut cache = DiffCommitRootValidationCache::new();
         let left_root = self
             .load_validated_diff_root(left_commit_id, &mut cache)
@@ -896,11 +939,83 @@ where
         Ok(metadata.root_id)
     }
 
-    async fn load_ensured_root(&mut self, commit_id: &str) -> Result<TrackedStateRootId, LixError> {
-        self.tree
-            .load_root(&self.store, commit_id)
-            .await?
-            .ok_or_else(|| missing_commit_root_error(commit_id))
+    async fn index_entries_at_commit(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        if let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? {
+            return self.tree.scan(&self.store, &root_id, request).await;
+        }
+        let rows = self.replay_index_entries_at_commit(commit_id).await?;
+        Ok(rows
+            .into_iter()
+            .filter(|(key, value)| request.matches(key, value))
+            .collect())
+    }
+
+    /// Replays a rootless first-parent interval into an ordered logical index.
+    ///
+    /// This is deliberately a cold-path implementation: current serving reads
+    /// use `live_state.tracked_head.v4`, while sparse historical roots avoid
+    /// replay for checkpoints and topology operations. The canonical
+    /// changelog already holds every mutation, so no extra history format is
+    /// needed merely to omit per-commit copy-on-write roots.
+    async fn replay_index_entries_at_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<BTreeMap<TrackedStateKey, TrackedStateIndexValue>, LixError> {
+        let plans = crate::tracked_state::commit_root_rebuild::load_first_parent_replay_plans(
+            &self.store,
+            commit_id,
+        )
+        .await?;
+        let baseline_root = if plans.is_empty() {
+            self.tree.load_root(&self.store, commit_id).await?
+        } else if let Some(parent_commit_id) = plans.last().and_then(|plan| plan.parent_commit_id) {
+            self.tree
+                .load_root(&self.store, &parent_commit_id.to_string())
+                .await?
+        } else {
+            None
+        };
+        let all_rows = TrackedStateTreeScanRequest {
+            include_tombstones: true,
+            ..TrackedStateTreeScanRequest::default()
+        };
+        let mut entries = if let Some(root_id) = baseline_root {
+            self.tree
+                .scan(&self.store, &root_id, &all_rows)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        for plan in plans.iter().rev() {
+            for delta in &plan.deltas {
+                let key = TrackedStateKey {
+                    schema_key: delta.schema_key.clone(),
+                    file_id: delta.file_id.clone(),
+                    entity_pk: delta.entity_pk.clone(),
+                };
+                let created_at = entries
+                    .get(&key)
+                    .map(TrackedStateIndexValue::created_at)
+                    .unwrap_or(delta.created_at);
+                entries.insert(
+                    key,
+                    TrackedStateIndexValue {
+                        change_id: delta.change_id,
+                        commit_id: delta.commit_id,
+                        deleted: delta.snapshot.is_none(),
+                        created_at,
+                        updated_at: delta.updated_at,
+                    },
+                );
+            }
+        }
+        Ok(entries)
     }
 
     async fn commit_root_values_for_keys(
@@ -908,8 +1023,11 @@ where
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-        let root_id = self.load_ensured_root(commit_id).await?;
-        self.tree.get_many(&self.store, &root_id, keys).await
+        if let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? {
+            return self.tree.get_many(&self.store, &root_id, keys).await;
+        }
+        let entries = self.replay_index_entries_at_commit(commit_id).await?;
+        Ok(keys.iter().map(|key| entries.get(key).cloned()).collect())
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -968,6 +1086,18 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    pub(crate) async fn stage_missing_commit_root_chain(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        crate::tracked_state::commit_root_rebuild::stage_missing_commit_root_chain(self, commit_id)
+            .await
+    }
+
+    pub(super) fn store(&self) -> &S {
+        self.store
+    }
+
     pub(crate) async fn validate_staged_commit_root_against_changelog(
         &self,
         commit_id: &str,
@@ -1073,7 +1203,16 @@ where
                     entity_pk: delta.entity_pk.clone(),
                 })
                 .collect::<Vec<_>>();
-            self.tree.get_many(self.store, base_root, &keys).await?
+            // A root fence can reconstruct several skipped ordinary commits
+            // into this same write set. Read through both staged root metadata
+            // and the chunk overlay so a child can preserve `created_at` from
+            // an ancestor whose chunks have not reached storage yet.
+            let staged_read = storage::TrackedStateStagedRead::new(
+                self.store,
+                self.staged_roots.values(),
+                &self.chunk_overlay,
+            )?;
+            self.tree.get_many(&staged_read, base_root, &keys).await?
         } else {
             vec![None; deltas.len()]
         };
