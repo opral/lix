@@ -82,43 +82,47 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
         Ok("kv_layout") => {
             assert!(
                 hot_repeats.is_none(),
-                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS is only available for transaction reads"
+                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS is unavailable for the kv_layout layer"
             );
             profile_kv_layout_operation(runtime, rows, operation, sample_count);
         }
         Ok("raw_sqlite") => {
-            assert!(
-                hot_repeats.is_none(),
-                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS is only available for transaction reads"
-            );
-            profile_raw_sqlite_operation(rows, operation, sample_count);
+            if let Some(repeats) = hot_repeats {
+                profile_hot_raw_sqlite_operations(rows, operation, repeats);
+            } else {
+                profile_raw_sqlite_operation(rows, operation, sample_count);
+            }
+        }
+        Ok("sql_session") => {
+            if let Some(repeats) = hot_repeats {
+                profile_hot_sql_session_operations(runtime, rows, operation, repeats);
+            } else {
+                profile_sql_session_operation(runtime, rows, operation, sample_count);
+            }
         }
         Ok("transaction") | Err(_) => {
             if let Some(repeats) = hot_repeats {
-                profile_hot_transaction_reads(runtime, rows, operation, repeats);
+                profile_hot_transaction_operations(runtime, rows, operation, repeats);
             } else {
                 profile_transaction_operation(runtime, rows, operation, sample_count);
             }
         }
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, kv_layout, or raw_sqlite"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, sql_session, kv_layout, or raw_sqlite"
         ),
     }
 }
 
-/// Keeps one seeded fixture alive for a repeatable, read-only profiling
-/// window. This deliberately trades representative cache behavior for a
-/// trace dominated by the operation itself rather than fixture construction.
-fn profile_hot_transaction_reads(
+/// Keeps one seeded fixture alive for a repeatable profiling window. This
+/// deliberately trades representative cache behavior for a trace dominated
+/// by the operation itself rather than fixture construction.
+fn profile_hot_transaction_operations(
     runtime: &tokio::runtime::Runtime,
     rows: &[WorkloadRow],
     operation: TransactionBenchOp,
     repeats: usize,
 ) {
-    assert!(
-        operation.is_read(),
-        "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS only supports read_all, read_one, or read_many"
-    );
+    operation.assert_supports_hot_repeats();
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
     let mut fixture = runtime.block_on(transaction_api::seeded_fixture(
@@ -133,6 +137,55 @@ fn profile_hot_transaction_reads(
     let elapsed = start.elapsed();
     println!(
         "tracked_state_crud hot profile: transaction/lix_rocksdb/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        profile_operation_name(operation),
+        repeats,
+        elapsed / repeats_u32,
+    );
+    black_box(row_count);
+}
+
+fn profile_hot_sql_session_operations(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    repeats: usize,
+) {
+    operation.assert_supports_hot_repeats();
+    let repeats_u32 =
+        u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let fixture = runtime.block_on(sql_session::seeded_fixture(StorageProfile::RocksDB, rows));
+    let start = Instant::now();
+    let mut row_count = 0;
+    for _ in 0..repeats {
+        row_count += runtime.block_on(run_sql_session_operation(operation, &fixture));
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "tracked_state_crud hot profile: sql_session/lix_rocksdb/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        profile_operation_name(operation),
+        repeats,
+        elapsed / repeats_u32,
+    );
+    black_box(row_count);
+}
+
+fn profile_hot_raw_sqlite_operations(
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    repeats: usize,
+) {
+    operation.assert_supports_hot_repeats();
+    let repeats_u32 =
+        u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let mut fixture = raw_sqlite::seeded_fixture(rows);
+    let start = Instant::now();
+    let mut row_count = 0;
+    for _ in 0..repeats {
+        row_count += run_raw_sqlite_operation(operation, &mut fixture);
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "tracked_state_crud hot profile: raw_sqlite/{}/{} repeats: total={elapsed:?} per_operation={:?}",
         profile_operation_name(operation),
         repeats,
         elapsed / repeats_u32,
@@ -217,20 +270,64 @@ fn profile_raw_sqlite_operation(
             raw_sqlite::empty_fixture(rows)
         };
         let start = Instant::now();
-        let result = match operation {
-            TransactionBenchOp::InsertAll => fixture.insert_all(),
-            TransactionBenchOp::ReadAll => fixture.read_all(),
-            TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk(),
-            TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT),
-            TransactionBenchOp::UpdateAll => fixture.update_all(),
-            TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk(),
-            TransactionBenchOp::DeleteAll => fixture.delete_all(),
-            TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk(),
-        };
+        let result = run_raw_sqlite_operation(operation, &mut fixture);
         samples.push(start.elapsed());
         black_box(result);
     }
     print_profile_samples("raw_sqlite", operation, samples);
+}
+
+fn profile_sql_session_operation(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    sample_count: usize,
+) {
+    let mut samples = Vec::with_capacity(sample_count);
+    for _ in 0..sample_count {
+        let fixture = if operation.needs_seed() {
+            runtime.block_on(sql_session::seeded_fixture(StorageProfile::RocksDB, rows))
+        } else {
+            runtime.block_on(sql_session::empty_fixture(StorageProfile::RocksDB, rows))
+        };
+        let start = Instant::now();
+        let result = runtime.block_on(run_sql_session_operation(operation, &fixture));
+        samples.push(start.elapsed());
+        black_box(result);
+    }
+    print_profile_samples("sql_session/lix_rocksdb", operation, samples);
+}
+
+async fn run_sql_session_operation(
+    operation: TransactionBenchOp,
+    fixture: &sql_session::SqlFixture,
+) -> usize {
+    match operation {
+        TransactionBenchOp::InsertAll => fixture.insert_all().await,
+        TransactionBenchOp::ReadAll => fixture.read_all().await,
+        TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk().await,
+        TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk().await,
+        TransactionBenchOp::UpdateAll => fixture.update_all().await,
+        TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk().await,
+        TransactionBenchOp::DeleteAll => fixture.delete_all().await,
+        TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk().await,
+    }
+}
+
+fn run_raw_sqlite_operation(
+    operation: TransactionBenchOp,
+    fixture: &mut raw_sqlite::RawSqliteFixture,
+) -> usize {
+    match operation {
+        TransactionBenchOp::InsertAll => fixture.insert_all(),
+        TransactionBenchOp::ReadAll => fixture.read_all(),
+        TransactionBenchOp::ReadOneByPk => fixture.read_one_by_pk(),
+        TransactionBenchOp::ReadManyByPk => fixture.read_many_by_pk(READ_MANY_PK_COUNT),
+        TransactionBenchOp::UpdateAll => fixture.update_all(),
+        TransactionBenchOp::UpdateOneByPk => fixture.update_one_by_pk(),
+        TransactionBenchOp::DeleteAll => fixture.delete_all(),
+        TransactionBenchOp::DeleteOneByPk => fixture.delete_one_by_pk(),
+    }
 }
 
 fn print_profile_samples(layer: &str, operation: TransactionBenchOp, mut samples: Vec<Duration>) {
@@ -436,8 +533,18 @@ impl TransactionBenchOp {
         !matches!(self, Self::InsertAll)
     }
 
-    fn is_read(self) -> bool {
-        matches!(self, Self::ReadAll | Self::ReadOneByPk | Self::ReadManyByPk)
+    fn assert_supports_hot_repeats(self) {
+        assert!(
+            matches!(
+                self,
+                Self::ReadAll
+                    | Self::ReadOneByPk
+                    | Self::ReadManyByPk
+                    | Self::UpdateAll
+                    | Self::UpdateOneByPk
+            ),
+            "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS only supports read_all, read_one, read_many, update_all, or update_one"
+        );
     }
 
     async fn run(self, fixture: &mut transaction_api::TransactionFixture) -> usize {

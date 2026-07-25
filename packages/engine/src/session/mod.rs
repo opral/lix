@@ -22,7 +22,7 @@ mod transaction;
 
 pub use checkpoint::CreateCheckpointReceipt;
 pub use context::SessionContext;
-pub(crate) use context::{SessionMode, WORKSPACE_BRANCH_KEY};
+pub(crate) use context::{SessionMode, load_workspace_branch_id_from_index};
 pub use create_branch::{CreateBranchOptions, CreateBranchReceipt};
 pub use execute::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition,

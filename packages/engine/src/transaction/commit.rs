@@ -48,11 +48,35 @@ type RowIndex = usize;
 /// stages a canonical changelog fact. Tracked rows additionally become commit
 /// members and update immutable history roots; untracked rows update only the
 /// mutable flat live-state index.
+#[cfg(test)]
 pub(crate) async fn commit_prepared_writes(
     binary_cas: &BinaryCasContext,
     branch_ctx: &BranchContext,
     live_index: &LiveStateIndexContext,
     runtime_functions: Option<&FunctionContext>,
+    read: &mut impl StorageAdapterRead,
+    prepared_writes: PreparedWriteSet,
+) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    let commit_parent_heads =
+        resolve_prepared_commit_parent_heads(branch_ctx, &*read, &prepared_writes, false).await?;
+    commit_prepared_writes_with_parent_heads(
+        binary_cas,
+        live_index,
+        runtime_functions,
+        &commit_parent_heads,
+        read,
+        prepared_writes,
+    )
+    .await
+}
+
+/// Materializes a prepared commit with branch heads already resolved from the
+/// caller's coherent commit snapshot.
+pub(crate) async fn commit_prepared_writes_with_parent_heads(
+    binary_cas: &BinaryCasContext,
+    live_index: &LiveStateIndexContext,
+    runtime_functions: Option<&FunctionContext>,
+    commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
@@ -95,8 +119,7 @@ pub(crate) async fn commit_prepared_writes(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
-        branch_ctx,
-        &*read,
+        commit_parent_heads,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -1448,8 +1471,7 @@ async fn finalize_commit_rows(
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
-    branch_ctx: &BranchContext,
-    read: &(impl StorageAdapterRead + ?Sized),
+    commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut branch_heads = Vec::new();
@@ -1469,10 +1491,16 @@ async fn finalize_commit_rows(
             if let Some(parent) = first_commit_parent_override_by_branch.get(&branch_id) {
                 vec![*parent]
             } else {
-                branch_ctx
-                    .ref_reader(read)
-                    .load_head_commit_id(&branch_id)
-                    .await?
+                commit_parent_heads
+                    .get(&branch_id)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("commit parent head was not resolved for branch '{branch_id}'"),
+                        )
+                    })?
+                    .as_ref()
+                    .copied()
                     .into_iter()
                     .collect::<Vec<_>>()
             };
@@ -1512,6 +1540,63 @@ async fn finalize_commit_rows(
         branch_heads,
         tracked_roots,
     })
+}
+
+/// Resolves every branch touched by a prepared commit from the same coherent
+/// read that validation and materialization use. Production callers require
+/// non-global targets to exist; low-level materialization may opt out to
+/// preserve its root-construction primitive.
+pub(crate) async fn resolve_prepared_commit_parent_heads(
+    branch_ctx: &BranchContext,
+    read: &(impl StorageAdapterRead + ?Sized),
+    prepared_writes: &PreparedWriteSet,
+    require_existing_non_global_targets: bool,
+) -> Result<BTreeMap<String, Option<CommitId>>, LixError> {
+    let commit_parent_branch_ids = prepared_writes
+        .commit_change_refs_by_branch
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut required_branch_ids = prepared_writes
+        .state_rows
+        .iter()
+        .map(|row| row.branch_id.clone())
+        .chain(
+            prepared_writes
+                .file_data_writes
+                .iter()
+                .map(|write| write.branch_id.clone()),
+        )
+        .chain(
+            prepared_writes
+                .first_commit_parent_override_by_branch
+                .keys()
+                .cloned(),
+        )
+        .chain(
+            prepared_writes
+                .extra_commit_parents_by_branch
+                .keys()
+                .cloned(),
+        )
+        .collect::<BTreeSet<_>>();
+    required_branch_ids.extend(commit_parent_branch_ids.iter().cloned());
+
+    let branch_ref = branch_ctx.ref_reader(read);
+    let mut parent_heads = BTreeMap::new();
+    for branch_id in required_branch_ids {
+        let head = branch_ref.load_head_commit_id(&branch_id).await?;
+        if require_existing_non_global_targets
+            && branch_id != crate::GLOBAL_BRANCH_ID
+            && head.is_none()
+        {
+            return Err(LixError::branch_not_found(branch_id, "commit", "target"));
+        }
+        if commit_parent_branch_ids.contains(&branch_id) {
+            parent_heads.insert(branch_id, head);
+        }
+    }
+    Ok(parent_heads)
 }
 
 fn merge_parent_commit_ids(mut base: Vec<CommitId>, extra: Vec<CommitId>) -> Vec<CommitId> {
@@ -3415,15 +3500,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_parents_global_commit_to_existing_branch_ref() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_ctx = BranchContext::new();
-        crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "initial-commit")
-            .await;
-
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
@@ -3431,8 +3507,10 @@ mod tests {
             )]),
             BTreeMap::new(),
             BTreeMap::new(),
-            &branch_ctx,
-            &mut read,
+            &BTreeMap::from([(
+                GLOBAL_BRANCH_ID.to_string(),
+                Some(CommitId::for_test_label("initial-commit")),
+            )]),
         )
         .await
         .expect("global commit row should finalize");
@@ -3455,12 +3533,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_skips_empty_members() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_ctx = BranchContext::new();
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
@@ -3468,8 +3540,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             BTreeMap::new(),
-            &branch_ctx,
-            &mut read,
+            &BTreeMap::new(),
         )
         .await
         .expect("empty change_refs should be ignored");
@@ -3480,22 +3551,14 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_branch_ref_as_parent() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_ctx = BranchContext::new();
-        crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
-            .await;
-        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "previous-commit").await;
-
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
             BTreeMap::new(),
             BTreeMap::new(),
-            &branch_ctx,
-            &mut read,
+            &BTreeMap::from([(
+                "branch-a".to_string(),
+                Some(CommitId::for_test_label("previous-commit")),
+            )]),
         )
         .await
         .expect("active-branch commit finalization should resolve parent");
@@ -3509,14 +3572,6 @@ mod tests {
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
-        let storage = StorageAdapter::new(Memory::new());
-        let branch_ctx = BranchContext::new();
-        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "target-head").await;
-
-        let mut read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("read should open");
         let rows = finalize_commit_rows(
             BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
             BTreeMap::new(),
@@ -3524,8 +3579,10 @@ mod tests {
                 "branch-a".to_string(),
                 vec![CommitId::for_test_label("source-head")],
             )]),
-            &branch_ctx,
-            &mut read,
+            &BTreeMap::from([(
+                "branch-a".to_string(),
+                Some(CommitId::for_test_label("target-head")),
+            )]),
         )
         .await
         .expect("merge commit finalization should resolve parents");
@@ -3537,6 +3594,68 @@ mod tests {
                 CommitId::for_test_label("source-head")
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_commit_rejects_missing_non_global_branch_before_materialization() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_ctx = BranchContext::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = resolve_prepared_commit_parent_heads(
+            &branch_ctx,
+            &read,
+            &PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![tracked_branch_row("missing-branch", "missing-change")],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "missing-branch".to_string(),
+                    change_refs(["missing-change"]),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+            true,
+        )
+        .await
+        .expect_err("non-global target must exist when commit materializes");
+
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn prepared_commit_allows_missing_global_root_before_materialization() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_ctx = BranchContext::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let heads = resolve_prepared_commit_parent_heads(
+            &branch_ctx,
+            &read,
+            &PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: Vec::new(),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs(["first-global-change"]),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+            true,
+        )
+        .await
+        .expect("the root global commit may have no parent branch ref");
+
+        assert_eq!(heads.get(GLOBAL_BRANCH_ID), Some(&None));
     }
 
     fn change_refs<const N: usize>(change_ids: [&str; N]) -> StagedCommitChangeRefs {

@@ -9,6 +9,7 @@ use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
+use crate::LixError;
 use crate::binary_cas::{BinaryCasContext, BlobDataReader};
 use crate::branch::{
     BranchContext, BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole,
@@ -19,7 +20,7 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
-use crate::live_state::{LiveStateContext, LiveStateReader, LiveStateRowRequest};
+use crate::live_state::{LiveStateContext, LiveStateIndexRowRequest, LiveStateReader};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{PluginComponentHost, PluginRuntimeHost};
@@ -33,11 +34,77 @@ use crate::storage_adapter::{SharedStorageAdapterRead, StorageAdapter, StorageAd
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
 use crate::transaction::{Transaction, open_transaction};
-use crate::{LixError, NullableKeyFilter};
 
 use super::transaction::{SessionOperationGuard, SessionTransactionManager, SessionWriteLease};
 
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
+
+/// Loads the workspace selector from its canonical untracked global index
+/// entry, then verifies that the selected branch still exists in the same
+/// storage snapshot.
+///
+/// The selector is engine-owned mutable state. Routing it through generic
+/// live-state visibility would also probe the immutable tracked head even
+/// though a tracked fallback is not a valid selector representation.
+pub(crate) async fn load_workspace_branch_id_from_index(
+    live_state: &LiveStateContext,
+    branch_ctx: &BranchContext,
+    reader: &(impl StorageAdapterRead + ?Sized),
+) -> Result<String, LixError> {
+    let mut rows = live_state
+        .index()
+        .reader(reader)
+        .load_rows(
+            &[LiveStateIndexRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+                entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
+                file_id: None,
+            }],
+            &["snapshot_content".to_string()],
+        )
+        .await?;
+    let row = rows.pop().flatten().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
+        )
+    })?;
+    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "workspace branch selector is missing snapshot_content",
+        )
+    })?;
+    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("workspace branch selector snapshot is invalid JSON: {error}"),
+        )
+    })?;
+    let branch_id = snapshot
+        .get("value")
+        .and_then(JsonValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace branch selector value must be a non-empty string",
+            )
+        })?
+        .to_string();
+
+    let branch_ref = branch_ctx.ref_reader(reader);
+    BranchLifecycle::new(&branch_ref)
+        .require_existing_ref(
+            &branch_id,
+            BranchOperation::LoadWorkspaceSelector,
+            BranchReferenceRole::WorkspaceSelector,
+        )
+        .await?;
+
+    Ok(branch_id)
+}
 
 #[derive(Clone)]
 pub(crate) enum SessionMode {
@@ -397,56 +464,12 @@ where
     where
         S: StorageAdapterRead + ?Sized,
     {
-        let row = self
-            .live_state
-            .reader(reader)
-            .load_row(&LiveStateRowRequest {
-                schema_key: "lix_key_value".to_string(),
-                branch_id: GLOBAL_BRANCH_ID.to_string(),
-                entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
-                file_id: NullableKeyFilter::Null,
-            })
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
-                )
-            })?;
-        let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "workspace branch selector is missing snapshot_content",
-            )
-        })?;
-        let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("workspace branch selector snapshot is invalid JSON: {error}"),
-            )
-        })?;
-        let branch_id = snapshot
-            .get("value")
-            .and_then(JsonValue::as_str)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "workspace branch selector value must be a non-empty string",
-                )
-            })?
-            .to_string();
-
-        let branch_ref = self.branch_ctx.ref_reader(reader);
-        BranchLifecycle::new(&branch_ref)
-            .require_existing_ref(
-                &branch_id,
-                BranchOperation::LoadWorkspaceSelector,
-                BranchReferenceRole::WorkspaceSelector,
-            )
-            .await?;
-
-        Ok(branch_id)
+        load_workspace_branch_id_from_index(
+            self.live_state.as_ref(),
+            self.branch_ctx.as_ref(),
+            reader,
+        )
+        .await
     }
 
     pub(crate) async fn with_write_transaction<T, F>(&self, f: F) -> Result<T, LixError>
@@ -471,11 +494,13 @@ where
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
         let planner_validation_is_serialized = write_access.serializes_collaboration_writes();
-        let _deterministic_runtime_guard = if self.deterministic_mode_enabled().await? {
-            Some(self.lock_deterministic_runtime().await)
-        } else {
-            None
-        };
+        // Automatic writes already hold the collaboration gate, so taking the
+        // runtime gate unconditionally cannot reduce their concurrency. It
+        // avoids opening a separate read solely to decide whether
+        // `Transaction::open` should be allowed to prepare deterministic
+        // functions; that coherent opening snapshot remains the source of
+        // truth for the mode.
+        let _deterministic_runtime_guard = self.lock_deterministic_runtime().await;
         let opened = open_transaction(
             &self.mode,
             self.storage.clone(),
@@ -921,6 +946,29 @@ mod tests {
             .await
             .expect("commit should resume after collaboration gate release")
             .expect("explicit transaction commit should succeed");
+    }
+
+    #[tokio::test]
+    async fn automatic_writes_take_the_deterministic_runtime_gate_without_a_mode_precheck() {
+        let session = open_session().await;
+        let deterministic_guard = std::sync::Arc::clone(&session.deterministic_runtime_gate)
+            .lock_owned()
+            .await;
+        let mut write = Box::pin(session.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('automatic-runtime-gate', 'value')",
+            &[],
+        ));
+        let mut cx = Context::from_waker(noop_waker_ref());
+        assert!(
+            matches!(write.as_mut().poll(&mut cx), Poll::Pending),
+            "automatic write should wait for the deterministic runtime gate"
+        );
+
+        drop(deterministic_guard);
+        tokio::time::timeout(TEST_WAIT_TIMEOUT, write)
+            .await
+            .expect("automatic write should resume after runtime gate release")
+            .expect("automatic write should succeed after runtime gate release");
     }
 
     #[tokio::test]
