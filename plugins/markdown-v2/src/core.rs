@@ -2027,14 +2027,14 @@ impl Document {
             .into_iter()
             .map(entity_change_to_detected)
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some((bytes, top_level_ranges, edits, root)) =
+        if let Some((bytes, top_level_ranges, edits, tree)) =
             self.try_paragraph_entity_change(&detected)?
         {
             return Ok((
                 Self {
                     bytes,
-                    tree: PersistentTree::new(root),
-                    top_level_ranges: Arc::new(top_level_ranges),
+                    tree,
+                    top_level_ranges,
                 },
                 edits,
             ));
@@ -2059,27 +2059,43 @@ impl Document {
     fn try_paragraph_entity_change(
         &self,
         changes: &[DetectedChange],
-    ) -> Result<Option<(PersistentBytes, Vec<Range<usize>>, Vec<ByteEdit>, NodeTree)>, PluginError>
-    {
+    ) -> Result<
+        Option<(
+            PersistentBytes,
+            Arc<Vec<Range<usize>>>,
+            Vec<ByteEdit>,
+            PersistentTree,
+        )>,
+        PluginError,
+    > {
         let [change] = changes else {
             return Ok(None);
         };
         let Some(snapshot_content) = &change.snapshot_content else {
             return Ok(None);
         };
-        let root = self.tree.materialize();
-        let root = &root;
-        if root.node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
+        if self
+            .tree
+            .root_node()
+            .format
+            .get(LEXICAL_FALLBACK_FIELD)
+            .is_some()
+        {
             return Ok(None);
         }
-        let Some((block_index, old)) = root
+        let Some(block_index) = self
+            .tree
+            .base
             .children
             .iter()
-            .enumerate()
-            .find(|(_, child)| change.entity_pk == [child.node.id.clone()])
+            .position(|child| change.entity_pk == [child.node.id.clone()])
         else {
             return Ok(None);
         };
+        let old = self
+            .tree
+            .top_level_node(block_index)
+            .expect("base top-level Markdown node exists");
         let Some(range) = self.top_level_ranges.get(block_index) else {
             return Ok(None);
         };
@@ -2088,16 +2104,16 @@ impl Document {
                 "invalid Markdown paragraph snapshot for incremental rendering: {error}"
             ))
         })?;
-        if old.node.kind != NodeKind::Paragraph
+        if old.kind != NodeKind::Paragraph
             || new.kind != NodeKind::Paragraph
-            || new.id != old.node.id
-            || new.parent_id != old.node.parent_id
-            || new.order_key != old.node.order_key
+            || new.id != old.id
+            || new.parent_id != old.parent_id
+            || new.order_key != old.order_key
         {
             return Ok(None);
         }
 
-        let mut fragment_root = root.node.clone();
+        let mut fragment_root = self.tree.root_node().clone();
         let format = fragment_root.format.as_object_mut().ok_or_else(|| {
             PluginError::Internal("Markdown document format must be an object".into())
         })?;
@@ -2134,9 +2150,13 @@ impl Document {
             delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
             insert: Arc::new(fragment),
         }];
-        let mut successor_root = root.clone();
-        successor_root.children[block_index].node = new;
-        Ok(Some((bytes, top_level_ranges, edits, successor_root)))
+        let successor_tree = self.tree.replace_top_level(block_index, new);
+        Ok(Some((
+            bytes,
+            Arc::new(top_level_ranges),
+            edits,
+            successor_tree,
+        )))
     }
 
     fn try_paragraph_replacement(
