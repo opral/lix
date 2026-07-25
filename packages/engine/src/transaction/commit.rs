@@ -8,7 +8,11 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
-use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader};
+use crate::branch::{
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControl, BranchHeadControlContext,
+    BranchHeadControlObservation, BranchRefReader, branch_head_control_precondition,
+    stage_branch_head_control, stage_delete_branch_head_control,
+};
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, ChangelogWriter, CommitChangeRefSet,
     CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
@@ -127,13 +131,22 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     ))
     .await?;
     let commit_rows = finalized.commit_rows;
-    let branch_heads = finalized.branch_heads;
     let tracked_roots = finalized.tracked_roots;
-    let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
-    let mut engine_rows = branch_heads
+    // V6 removes the automatic flat current row for a normal branch-head
+    // advance, but `lix_change` remains an unscoped public ledger. Retain one
+    // tiny direct change fact per published control.
+    let branch_head_changes = tracked_roots
         .iter()
-        .map(branch_ref_current_row)
+        .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
+    let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
+    // v6 publishes automatic tracked heads through one direct control record.
+    // Do not also synthesize a mutable `lix_branch_ref` current row for every
+    // normal commit: `branch_head_changes` above preserves the immutable
+    // public `lix_change` ledger fact. Explicit branch-management writes
+    // retain their legacy row lowering below while control records are the
+    // sole authority readers consult.
+    let mut engine_rows = Vec::new();
     if let Some((highest_seen, timestamp, change_id)) =
         runtime_functions.and_then(FunctionContext::deterministic_sequence_checkpoint)
     {
@@ -148,7 +161,6 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
 
     if state_rows.is_empty()
         && commit_rows.is_empty()
-        && branch_heads.is_empty()
         && engine_rows.is_empty()
         && writes.is_empty()
     {
@@ -174,6 +186,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         read,
         &mut writes,
         &state_rows,
+        &branch_head_changes,
         &engine_rows,
         &compactable_change_ids,
         &row_index.tracked_row_indices_by_commit,
@@ -196,6 +209,9 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
 
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
 
+    let branch_control_observations =
+        observe_branch_head_controls(read, &tracked_roots, &state_rows).await?;
+
     stage_tracked_roots(
         read,
         &mut writes,
@@ -211,7 +227,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_roots"
     ))
     .await?;
-    stage_tracked_head(
+    let normal_branch_controls = stage_tracked_head(
         read,
         &mut writes,
         &state_rows,
@@ -219,11 +235,20 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_identities,
+        &branch_control_observations,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
         "lix.perf.materialization.tracked_head"
     ))
+    .await?;
+    stage_branch_head_control_publications(
+        &mut writes,
+        &normal_branch_controls,
+        &state_rows,
+        &mut preconditions,
+        &branch_control_observations,
+    )
     .await?;
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
@@ -320,6 +345,7 @@ async fn stage_changelog_commits(
     read: &mut impl StorageAdapterRead,
     writes: &mut StorageWriteSet,
     state_rows: &[PreparedStateRow],
+    branch_head_changes: &[ChangeRecord],
     branch_ref_rows: &[EngineCurrentRow],
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
@@ -331,6 +357,11 @@ async fn stage_changelog_commits(
         .iter()
         .filter(|row| !(row.untracked && row.snapshot.is_none()))
         .map(transaction_change_record_from_state_row)
+        .chain(
+            branch_head_changes
+                .iter()
+                .map(|change| Ok(TransactionChangeRecordRef::from(change))),
+        )
         .chain(
             branch_ref_rows
                 .iter()
@@ -499,15 +530,18 @@ struct EngineCurrentRow {
     updated_at: LixTimestamp,
 }
 
-fn branch_ref_current_row(head: &PendingBranchHead) -> Result<EngineCurrentRow, LixError> {
+/// Builds the standalone public ledger fact for an automatic branch-head
+/// advance. The v6 control owns current visibility; this fact keeps the
+/// existing `lix_change` contract without reintroducing a flat current row.
+fn branch_ref_change_record(root: &PendingTrackedRoot) -> Result<ChangeRecord, LixError> {
     let snapshot = serde_json::to_string(&serde_json::json!({
-        "id": head.branch_id,
-        "commit_id": head.commit_id.to_string(),
+        "id": root.branch_id,
+        "commit_id": root.commit_id.to_string(),
     }))
     .map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("failed to serialize branch-ref current change: {error}"),
+            format!("failed to serialize direct branch-ref change: {error}"),
         )
     })?;
     if snapshot.len() > crate::json_store::JSON_INLINE_MAX_BYTES {
@@ -520,21 +554,16 @@ fn branch_ref_current_row(head: &PendingBranchHead) -> Result<EngineCurrentRow, 
             ),
         ));
     }
-    Ok(EngineCurrentRow {
-        branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-        change: ChangeRecord {
-            format_version: 2,
-            change_id: head.change_id,
-            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-            entity_pk: EntityPk::single(&head.branch_id),
-            file_id: None,
-            snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
-            metadata: crate::json_store::JsonSlot::None,
-            created_at: head.timestamp,
-            origin_key: None,
-        },
-        created_at: head.timestamp,
-        updated_at: head.timestamp,
+    Ok(ChangeRecord {
+        format_version: 2,
+        change_id: root.ref_change_id,
+        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+        entity_pk: EntityPk::single(&root.branch_id),
+        file_id: None,
+        snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
+        metadata: crate::json_store::JsonSlot::None,
+        created_at: root.ref_updated_at,
+        origin_key: None,
     })
 }
 
@@ -638,8 +667,7 @@ async fn stage_flat_current_rows(
     {
         let branch_id = row.entity_pk.as_single_string_owned()?;
         let Some(snapshot) = row.snapshot.as_ref() else {
-            let existing_commit_id =
-                load_current_branch_ref_commit_id(&index_reader, &branch_id).await?;
+            let existing_commit_id = load_current_branch_ref_commit_id(read, &branch_id).await?;
             if existing_commit_id.is_some()
                 && (has_pending_local_sidecar_rows(state_rows, &branch_id)
                     || guarded_branch_ref_has_local_untracked_rows(
@@ -662,8 +690,7 @@ async fn stage_flat_current_rows(
         else {
             continue;
         };
-        let existing_commit_id =
-            load_current_branch_ref_commit_id(&index_reader, &branch_id).await?;
+        let existing_commit_id = load_current_branch_ref_commit_id(read, &branch_id).await?;
         if existing_commit_id.as_deref() == Some(commit_id) {
             // Updating descriptor fields or assigning the current head again
             // must not disturb branch-local live state.
@@ -851,37 +878,15 @@ async fn ensure_branch_ref_target_exists(
     ))
 }
 
-async fn load_current_branch_ref_commit_id<S>(
-    reader: &crate::live_state::LiveStateIndexStoreReader<S>,
+async fn load_current_branch_ref_commit_id(
+    read: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
-) -> Result<Option<String>, LixError>
-where
-    S: StorageAdapterRead,
-{
-    let Some(row) = reader
-        .load_row(&LiveStateIndexRowRequest {
-            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
-            schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-            entity_pk: EntityPk::single(branch_id),
-            file_id: None,
-        })
+) -> Result<Option<String>, LixError> {
+    Ok(BranchHeadControlContext::new()
+        .reader(read)
+        .load(branch_id)
         .await?
-    else {
-        return Ok(None);
-    };
-    let Some(snapshot) = row.snapshot_content.as_deref() else {
-        return Ok(None);
-    };
-    let value = serde_json::from_str::<serde_json::Value>(snapshot).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("invalid current branch ref for '{branch_id}': {error}"),
-        )
-    })?;
-    Ok(value
-        .get("commit_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+        .map(|control| control.head_commit_id.to_string()))
 }
 
 async fn branch_has_local_untracked_rows<S>(
@@ -1122,9 +1127,11 @@ async fn stage_tracked_head(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
-) -> Result<(), LixError> {
+    observations: &BTreeMap<String, BranchHeadControlObservation>,
+) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let tracked_head = TrackedHeadContext::new();
     let mut writer = tracked_head.writer(read, writes);
+    let mut controls = BTreeMap::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
@@ -1135,7 +1142,24 @@ async fn stage_tracked_head(
                 ),
             )
         })?;
+        let parent_control = observations
+            .get(&root.branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "missing v6 branch-control observation for normal publication branch '{}'",
+                        root.branch_id
+                    ),
+                )
+            })?
+            .control;
         if !staged.selected_change_refs.is_empty() {
+            insert_direct_branch_control(
+                &mut controls,
+                &root.branch_id,
+                normal_branch_head_control(root, parent_control, root.commit_id),
+            )?;
             continue;
         }
         let state_row_indices = tracked_row_indices_by_commit
@@ -1161,14 +1185,16 @@ async fn stage_tracked_head(
         // The v4 marker is the durable authority for current state. It is
         // intentionally bound only to the first-parent commit: serial normal
         // commits can append deltas without materializing an immutable root.
-        let parent_generation = match root.parent_commit_id {
-            Some(parent_commit_id) => {
+        let parent_generation = match (root.parent_commit_id, parent_control) {
+            (Some(parent_commit_id), Some(control))
+                if control.head_commit_id == parent_commit_id =>
+            {
                 tracked_head
                     .reader(read)
-                    .generation_if_current(&root.branch_id, &parent_commit_id.to_string())
+                    .generation_if_control_current(&root.branch_id, control)
                     .await?
             }
-            None => None,
+            _ => None,
         };
         let parent_is_current = parent_generation.is_some();
         let parent_rows = if parent_is_current || root.parent_commit_id.is_none() {
@@ -1182,6 +1208,11 @@ async fn stage_tracked_head(
                 .iter()
                 .any(|candidate| candidate.commit_id == parent_commit_id)
             {
+                insert_direct_branch_control(
+                    &mut controls,
+                    &root.branch_id,
+                    normal_branch_head_control(root, parent_control, root.commit_id),
+                )?;
                 continue;
             }
             Some(
@@ -1203,7 +1234,7 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        writer
+        let generation = writer
             .stage_commit(
                 &root.branch_id,
                 parent_generation,
@@ -1213,8 +1244,218 @@ async fn stage_tracked_head(
                 parent_rows,
             )
             .await?;
+        insert_direct_branch_control(
+            &mut controls,
+            &root.branch_id,
+            normal_branch_head_control(root, parent_control, generation),
+        )?;
+    }
+    Ok(controls)
+}
+
+fn normal_branch_head_control(
+    root: &PendingTrackedRoot,
+    previous: Option<BranchHeadControl>,
+    generation: CommitId,
+) -> BranchHeadControl {
+    BranchHeadControl {
+        head_commit_id: root.commit_id,
+        generation,
+        created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
+        updated_at: root.ref_updated_at,
+        ref_change_id: root.ref_change_id,
+    }
+}
+
+fn insert_direct_branch_control(
+    controls: &mut BTreeMap<String, BranchHeadControl>,
+    branch_id: &str,
+    control: BranchHeadControl,
+) -> Result<(), LixError> {
+    if controls.insert(branch_id.to_string(), control).is_some() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked direct plane received multiple normal publications for branch '{branch_id}' in one commit"
+            ),
+        ));
     }
     Ok(())
+}
+
+/// Publishes every v6 branch-head control under an exact-byte CAS token.
+///
+/// Normal tracked commits arrive as `normal_controls`, built from the same
+/// parent/generation decision that wrote the v5 group marker. Explicit branch
+/// management still enters the prepared-row pipeline for validation and
+/// changelog compatibility, but its authoritative moving head is lowered
+/// here as well. This deliberately keeps the rare lifecycle lane compatible
+/// while removing automatic `lix_branch_ref` materialization from normal
+/// CRUD commits.
+async fn stage_branch_head_control_publications(
+    writes: &mut StorageWriteSet,
+    normal_controls: &BTreeMap<String, BranchHeadControl>,
+    state_rows: &[PreparedStateRow],
+    preconditions: &mut Vec<StoragePrecondition>,
+    observations: &BTreeMap<String, BranchHeadControlObservation>,
+) -> Result<(), LixError> {
+    let explicit_targets = explicit_branch_head_targets(state_rows)?;
+    let mut publications = normal_controls
+        .iter()
+        .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
+        .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
+
+    for (branch_id, target) in explicit_targets {
+        if publications.contains_key(&branch_id) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "cannot publish an explicit branch ref and a normal tracked commit for branch '{branch_id}' in one transaction"
+                ),
+            ));
+        }
+        let existing = observations
+            .get(&branch_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "missing v6 branch-control observation for explicit publication branch '{branch_id}'"
+                    ),
+                )
+            })?
+            .control;
+        let desired = target
+            .head_commit_id
+            .map(|head_commit_id| BranchHeadControl {
+                head_commit_id,
+                // Repointing to the same head must not invalidate a complete v5
+                // serving generation merely because public ref metadata changed.
+                generation: existing
+                    .filter(|control| control.head_commit_id == head_commit_id)
+                    .map_or(head_commit_id, |control| control.generation),
+                // The flat v5 branch-ref projection preserved creation time on
+                // replacement. The control record owns that same public fact.
+                created_at: existing.map_or(target.created_at, |control| control.created_at),
+                updated_at: target.updated_at,
+                ref_change_id: target.ref_change_id,
+            });
+        publications.insert(branch_id, desired);
+    }
+
+    if publications.is_empty() {
+        return Ok(());
+    }
+    for (branch_id, desired) in &mut publications {
+        let observation = observations.get(branch_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "missing v6 branch-control observation for publication branch '{branch_id}'"
+                ),
+            )
+        })?;
+        preconditions.push(branch_head_control_precondition(
+            branch_id,
+            observation.raw_token.clone(),
+        )?);
+        match desired {
+            Some(control) => stage_branch_head_control(writes, branch_id, *control)?,
+            None => stage_delete_branch_head_control(writes, branch_id)?,
+        }
+    }
+    Ok(())
+}
+
+/// Returns explicit public branch-ref targets. `None` is a deletion; `Some`
+/// is a validated commit id. The v6 control record remains the authority, but
+/// retaining these rows in the generic lifecycle lowering means its existing
+/// sidecar and target-existence checks remain in force.
+struct ExplicitBranchHeadTarget {
+    head_commit_id: Option<CommitId>,
+    ref_change_id: ChangeId,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+}
+
+fn explicit_branch_head_targets(
+    state_rows: &[PreparedStateRow],
+) -> Result<BTreeMap<String, ExplicitBranchHeadTarget>, LixError> {
+    let mut targets = BTreeMap::new();
+    for row in state_rows {
+        if row.schema_key != BRANCH_REF_SCHEMA_KEY || !row.untracked {
+            continue;
+        }
+        let branch_id = row.entity_pk.as_single_string_owned()?;
+        let head_commit_id = row
+            .snapshot
+            .as_ref()
+            .map(|snapshot| {
+                let commit_id = snapshot
+                    .value
+                    .get("commit_id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PARAM,
+                            format!(
+                                "branch ref for branch '{branch_id}' is missing commit_id before v6 publication"
+                            ),
+                        )
+                    })?;
+                CommitId::parse_lix(commit_id, "v6 branch-head control target")
+            })
+            .transpose()?;
+        let ref_change_id = row.change_id.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "explicit branch ref for branch '{branch_id}' is missing its public change id"
+                ),
+            )
+        })?;
+        let target = ExplicitBranchHeadTarget {
+            head_commit_id,
+            ref_change_id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        };
+        if targets.insert(branch_id.clone(), target).is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "transaction contains multiple explicit branch-ref publications for branch '{branch_id}'"
+                ),
+            ));
+        }
+    }
+    Ok(targets)
+}
+
+/// Takes one coherent raw point batch for every control this materialization
+/// can publish. The result is threaded through v5 generation selection and
+/// final CAS staging, so the control plane adds exactly one control batch to
+/// a commit rather than a head lookup plus a second token lookup.
+async fn observe_branch_head_controls(
+    read: &(impl StorageAdapterRead + ?Sized),
+    tracked_roots: &[PendingTrackedRoot],
+    state_rows: &[PreparedStateRow],
+) -> Result<BTreeMap<String, BranchHeadControlObservation>, LixError> {
+    let mut branch_ids = tracked_roots
+        .iter()
+        .map(|root| root.branch_id.clone())
+        .collect::<BTreeSet<_>>();
+    for row in state_rows {
+        if row.schema_key == BRANCH_REF_SCHEMA_KEY && row.untracked {
+            branch_ids.insert(row.entity_pk.as_single_string_owned()?);
+        }
+    }
+    let branch_ids = branch_ids.into_iter().collect::<Vec<_>>();
+    let observations = BranchHeadControlContext::new()
+        .reader(read)
+        .load_observed(&branch_ids)
+        .await?;
+    Ok(branch_ids.into_iter().zip(observations).collect())
 }
 
 async fn stage_tracked_roots(
@@ -1486,11 +1727,11 @@ fn visit_tracked_root_parent_first<'a>(
 /// `commit_rows` are canonical changelog commit facts. tracked_state roots store
 /// serving commit roots keyed by the corresponding commit id.
 ///
-/// `branch_heads` are moving refs. Their changes enter the canonical ledger
-/// without becoming members of the commits they point at.
+/// Moving heads publish through the v6 direct branch-control plane after the
+/// immutable commit facts are staged. They are not synthetic changelog
+/// changes and do not become members of the commits they point at.
 struct FinalizedCommitRows {
     commit_rows: Vec<FinalizedCommitRow>,
-    branch_heads: Vec<PendingBranchHead>,
     tracked_roots: Vec<PendingTrackedRoot>,
 }
 
@@ -1502,17 +1743,13 @@ struct FinalizedCommitRow {
     selected_change_refs: Vec<StagedCommitChangeRef>,
 }
 
-struct PendingBranchHead {
-    branch_id: String,
-    commit_id: CommitId,
-    change_id: ChangeId,
-    timestamp: LixTimestamp,
-}
-
 struct PendingTrackedRoot {
     branch_id: String,
     commit_id: CommitId,
     parent_commit_id: Option<CommitId>,
+    /// Metadata for the public synthesized `lix_branch_ref` row.
+    ref_change_id: ChangeId,
+    ref_updated_at: LixTimestamp,
     requires_root: bool,
 }
 
@@ -1523,7 +1760,6 @@ async fn finalize_commit_rows(
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
-    let mut branch_heads = Vec::new();
     let mut tracked_roots = Vec::new();
 
     for (branch_id, change_refs) in commit_change_refs_by_branch {
@@ -1570,23 +1806,18 @@ async fn finalize_commit_rows(
             change_id: commit_change_id,
             selected_change_refs,
         });
-        branch_heads.push(PendingBranchHead {
-            branch_id: branch_id.clone(),
-            commit_id,
-            change_id: branch_ref_change_id,
-            timestamp,
-        });
         tracked_roots.push(PendingTrackedRoot {
             branch_id,
             commit_id,
             parent_commit_id,
+            ref_change_id: branch_ref_change_id,
+            ref_updated_at: timestamp,
             requires_root,
         });
     }
 
     Ok(FinalizedCommitRows {
         commit_rows,
-        branch_heads,
         tracked_roots,
     })
 }
@@ -1790,20 +2021,6 @@ mod tests {
             }
             self.inner.scan(space, range, opts).await
         }
-    }
-
-    #[test]
-    fn branch_ref_current_row_rejects_snapshot_that_cannot_be_inlined() {
-        let error = branch_ref_current_row(&PendingBranchHead {
-            branch_id: "b".repeat(crate::json_store::JSON_INLINE_MAX_BYTES),
-            commit_id: CommitId::for_test_label("long-branch-head"),
-            change_id: ChangeId::for_test_label("long-branch-ref-change"),
-            timestamp: ts("2026-01-01T00:00:00Z"),
-        })
-        .expect_err("oversized engine-authored branch ref should fail clearly");
-
-        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
-        assert!(error.message.contains("branch id is too long"));
     }
 
     #[test]
@@ -2123,7 +2340,7 @@ mod tests {
             matches!(
                 precondition,
                 StoragePrecondition::KeyAbsent { space, .. }
-                    if *space == crate::live_state::LIVE_STATE_INDEX_ROW_SPACE.id
+                    if *space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id
             )
         }));
 
@@ -2178,16 +2395,16 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("normal branch-ref verification read should open");
-        let row = LiveStateIndexContext::new()
+        let control = BranchHeadControlContext::new()
             .reader(read)
-            .load_index_row(&branch_ref_index_request(GLOBAL_BRANCH_ID))
+            .load(GLOBAL_BRANCH_ID)
             .await
-            .expect("winner engine branch-ref row should load")
-            .expect("winner engine branch-ref row should remain present");
+            .expect("winner direct branch control should load")
+            .expect("winner direct branch control should remain present");
         assert_eq!(
-            row.change_id,
+            control.ref_change_id,
             change_id("winner-normal-branch-ref-change"),
-            "the stale commit must not replace the winner's current ref row"
+            "the stale commit must not replace the winner's public branch-ref metadata"
         );
     }
 
@@ -3239,6 +3456,7 @@ mod tests {
             &[parent_row, child_row],
             &[],
             &[],
+            &[],
             &BTreeMap::from([
                 (CommitId::for_test_label("parent-commit"), vec![0]),
                 (CommitId::for_test_label("child-commit"), vec![1]),
@@ -3775,7 +3993,7 @@ mod tests {
         .expect("global commit row should finalize");
 
         assert_eq!(rows.commit_rows.len(), 1);
-        assert_eq!(rows.branch_heads.len(), 1);
+        assert_eq!(rows.tracked_roots.len(), 1);
         let row = &rows.commit_rows[0];
         assert_eq!(row.commit_id, commit_id("test-uuid-1"));
         assert_eq!(row.change_id, change_id("test-uuid-2"));
@@ -3785,9 +4003,9 @@ mod tests {
             vec![CommitId::for_test_label("initial-commit")]
         );
 
-        let branch_head = &rows.branch_heads[0];
-        assert_eq!(branch_head.branch_id, GLOBAL_BRANCH_ID);
-        assert_eq!(branch_head.commit_id, commit_id("test-uuid-1"));
+        let root = &rows.tracked_roots[0];
+        assert_eq!(root.branch_id, GLOBAL_BRANCH_ID);
+        assert_eq!(root.commit_id, commit_id("test-uuid-1"));
     }
 
     #[tokio::test]
@@ -3805,7 +4023,7 @@ mod tests {
         .expect("empty change_refs should be ignored");
 
         assert!(rows.commit_rows.is_empty());
-        assert!(rows.branch_heads.is_empty());
+        assert!(rows.tracked_roots.is_empty());
     }
 
     #[tokio::test]
@@ -3826,7 +4044,7 @@ mod tests {
             rows.commit_rows[0].parent_commit_ids,
             vec![CommitId::for_test_label("previous-commit")]
         );
-        assert_eq!(rows.branch_heads[0].branch_id, "branch-a");
+        assert_eq!(rows.tracked_roots[0].branch_id, "branch-a");
     }
 
     #[tokio::test]

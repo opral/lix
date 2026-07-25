@@ -69,6 +69,88 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_branch_ref_control_preserves_public_row_metadata,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let branch_id = sim.main_branch_id();
+        let before = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
+                     FROM lix_branch_ref WHERE id = '{branch_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("initial ref metadata should be readable");
+        assert_eq!(before.len(), 1);
+        let initial_created_at = before.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("created timestamp should be text");
+        let initial_updated_at = before.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("updated timestamp should be text");
+        let initial_change_id = before.rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("change id should be text");
+
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('branch-ref-public-metadata', 'next-head')",
+                &[],
+            )
+            .await
+            .expect("tracked write should advance the workspace head");
+
+        let after = session
+            .execute(
+                &format!(
+                    "SELECT lixcol_created_at, lixcol_updated_at, lixcol_change_id \
+                     FROM lix_branch_ref WHERE id = '{branch_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("advanced ref metadata should be readable");
+        assert_eq!(after.len(), 1);
+        let advanced_created_at = after.rows()[0]
+            .get::<String>("lixcol_created_at")
+            .expect("advanced created timestamp should be text");
+        let advanced_updated_at = after.rows()[0]
+            .get::<String>("lixcol_updated_at")
+            .expect("advanced updated timestamp should be text");
+        let advanced_change_id = after.rows()[0]
+            .get::<String>("lixcol_change_id")
+            .expect("advanced change id should be text");
+
+        assert_eq!(advanced_created_at, initial_created_at);
+        assert_ne!(advanced_updated_at, initial_updated_at);
+        assert_ne!(advanced_change_id, initial_change_id);
+        assert_eq!(
+            count_rows(
+                &session,
+                &format!(
+                    "SELECT COUNT(*) FROM lix_change \
+                     WHERE id = '{advanced_change_id}' \
+                     AND schema_key = 'lix_branch_ref'"
+                ),
+            )
+            .await,
+            1,
+            "the synthesized current ref must retain its immutable public lix_change ledger fact"
+        );
+    }
+);
+
+simulation_test!(
     lix_branch_insert_creates_descriptor_and_ref,
     |sim| async move {
         let engine = sim.boot_engine().await;

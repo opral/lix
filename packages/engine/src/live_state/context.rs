@@ -3,7 +3,7 @@
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::branch::BRANCH_REF_SCHEMA_KEY;
+use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchHeadControl, BranchHeadControlContext};
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
-type BranchCommitIds = std::collections::BTreeMap<String, String>;
+type BranchHeads = std::collections::BTreeMap<String, BranchHeadControl>;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
@@ -125,7 +125,7 @@ where
             } else {
                 Vec::new()
             };
-        let untracked_rows = if request.filter.untracked != Some(false)
+        let mut untracked_rows = if request.filter.untracked != Some(false)
             && !is_commit_derived_only_request(request)
         {
             let branch_rows = stream::iter(scope.storage_branch_ids.clone())
@@ -136,6 +136,7 @@ where
                         .scan_rows(&index_scan_request_from_live(request, &branch_id))
                         .await?
                         .into_iter()
+                        .filter(|row| row.schema_key != BRANCH_REF_SCHEMA_KEY)
                         .map(MaterializedLiveStateRow::from)
                         .collect();
                     Ok::<_, LixError>(rows)
@@ -147,6 +148,9 @@ where
         } else {
             Vec::new()
         };
+        if request.filter.untracked != Some(false) {
+            untracked_rows.extend(scan_direct_branch_ref_rows(store, request, &scope).await?);
+        }
         if commit_derived_rows.is_empty()
             && untracked_rows.is_empty()
             && let Some(index) =
@@ -214,7 +218,7 @@ where
         if request.rows.iter().any(|row| {
             matches!(
                 row.schema_key.as_str(),
-                COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY
+                COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
             )
         }) {
             let mut rows = Vec::with_capacity(request.rows.len());
@@ -280,7 +284,7 @@ where
         if request.untracked != Some(true) {
             let mut identities_by_branch = std::collections::BTreeMap::<String, Vec<_>>::new();
             for identity in &storage_identities {
-                if scope.branch_commit_ids.contains_key(&identity.branch_id) {
+                if scope.branch_heads.contains_key(&identity.branch_id) {
                     identities_by_branch
                         .entry(identity.branch_id.clone())
                         .or_default()
@@ -291,7 +295,8 @@ where
                 crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
             let tracked_batches = stream::iter(identities_by_branch)
                 .map(|(branch_id, identities)| {
-                    let commit_id = scope.branch_commit_ids[&branch_id].clone();
+                    let control = scope.branch_heads[&branch_id];
+                    let commit_id = control.head_commit_id.to_string();
                     let projection = projection.clone();
                     async move {
                         let keys = identities
@@ -306,9 +311,9 @@ where
                         let rows = if let Some(rows) = self
                             .tracked_head
                             .reader(&self.store)
-                            .load_projected_live_rows_if_current(
+                            .load_projected_live_rows_if_control_current(
                                 &branch_id,
-                                &commit_id,
+                                control,
                                 &keys,
                                 &projection,
                             )
@@ -458,19 +463,19 @@ where
             .iter()
             .filter_map(|branch_id| {
                 scope
-                    .branch_commit_ids
+                    .branch_heads
                     .get(branch_id)
-                    .map(|commit_id| (branch_id.clone(), commit_id.clone()))
+                    .map(|control| (branch_id.clone(), *control))
             })
             .collect::<Vec<_>>();
         let branch_rows = stream::iter(branches)
-            .map(|(branch_id, commit_id)| {
+            .map(|(branch_id, control)| {
                 let tracked_request = tracked_request.clone();
                 async move {
                     let (rows, ordered_unique) = if let Some(rows) = self
                         .tracked_head
                         .reader(store)
-                        .scan_live_rows_if_current(&branch_id, &commit_id, &tracked_request)
+                        .scan_live_rows_if_control_current(&branch_id, control, &tracked_request)
                         .await?
                     {
                         (rows, true)
@@ -478,7 +483,10 @@ where
                         (
                             self.tracked_state
                                 .reader(store)
-                                .scan_rows_at_commit(&commit_id, &tracked_request)
+                                .scan_rows_at_commit(
+                                    &control.head_commit_id.to_string(),
+                                    &tracked_request,
+                                )
                                 .await?
                                 .into_iter()
                                 .map(|row| {
@@ -611,6 +619,94 @@ async fn scan_commit_derived_rows(
                     .any(|branch_id| branch_id == row.branch_id.as_ref()))
     });
     Ok(rows)
+}
+
+/// Synthesizes the public `lix_branch_ref` metadata entity from authoritative
+/// v6 controls. The old physical flat row is intentionally filtered out at
+/// the caller so SQL/entity consumers keep seeing exactly one current ref per
+/// branch even while a rare lifecycle write retains its legacy projection for
+/// validation and changelog compatibility.
+async fn scan_direct_branch_ref_rows(
+    store: &(impl StorageAdapterRead + ?Sized),
+    request: &LiveStateScanRequest,
+    scope: &LiveStateScanScope,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    if !schema_filter_allows(&request.filter.schema_keys, BRANCH_REF_SCHEMA_KEY)
+        || !file_filter_allows_null(&request.filter.file_ids)
+        || !scope
+            .storage_branch_ids
+            .iter()
+            .any(|branch_id| branch_id == GLOBAL_BRANCH_ID)
+    {
+        return Ok(Vec::new());
+    }
+
+    let requested_branch_ids = if request.filter.entity_pks.is_empty() {
+        Vec::new()
+    } else {
+        request
+            .filter
+            .entity_pks
+            .iter()
+            .filter_map(|entity_pk| entity_pk.as_single_string_owned().ok())
+            .collect::<Vec<_>>()
+    };
+    if !request.filter.entity_pks.is_empty()
+        && requested_branch_ids.len() != request.filter.entity_pks.len()
+    {
+        return Ok(Vec::new());
+    }
+    let controls = BranchHeadControlContext::new().reader(store);
+    let entries = if requested_branch_ids.is_empty() {
+        controls.scan().await?
+    } else {
+        controls
+            .load_many(&requested_branch_ids)
+            .await?
+            .into_iter()
+            .zip(requested_branch_ids)
+            .filter_map(|(control, branch_id)| control.map(|control| (branch_id, control)))
+            .collect()
+    };
+    entries
+        .into_iter()
+        .map(|(branch_id, control)| direct_branch_ref_row(&branch_id, control))
+        .collect()
+}
+
+fn direct_branch_ref_row(
+    branch_id: &str,
+    control: BranchHeadControl,
+) -> Result<MaterializedLiveStateRow, LixError> {
+    let snapshot_content = serde_json::to_string(&serde_json::json!({
+        "id": branch_id,
+        "commit_id": control.head_commit_id.to_string(),
+    }))
+    .map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("failed to encode v6 direct branch-ref snapshot: {error}"),
+        )
+    })?;
+    Ok(MaterializedLiveStateRow {
+        entity_pk: EntityPk::single(branch_id),
+        schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
+        file_id: None,
+        snapshot_content: Some(snapshot_content),
+        metadata: None,
+        deleted: false,
+        // These read-only columns are part of every public entity surface.
+        // Preserve the same replacement semantics the old flat current row
+        // had: creation time is stable, while each ref publication gets an
+        // updated timestamp and distinct change id.
+        created_at: control.created_at,
+        updated_at: control.updated_at,
+        global: true,
+        change_id: Some(control.ref_change_id),
+        commit_id: None,
+        untracked: true,
+        branch_id: GLOBAL_BRANCH_ID.into(),
+    })
 }
 
 fn request_may_include_commit_derived(request: &LiveStateScanRequest) -> bool {
@@ -750,7 +846,7 @@ fn index_scan_request_from_live(
 struct LiveStateScanScope {
     storage_branch_ids: Vec<String>,
     projection_branch_ids: Vec<String>,
-    branch_commit_ids: BranchCommitIds,
+    branch_heads: BranchHeads,
 }
 
 /// Rows read from one durable tracked branch source.
@@ -809,46 +905,45 @@ fn finalize_ordered_unique_rows(
 
 async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
-    live_index: &LiveStateIndexContext,
+    _live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
     resolve_branch_heads: bool,
 ) -> Result<LiveStateScanScope, LixError> {
     if request.filter.branch_ids.is_empty() {
         if resolve_branch_heads {
-            let branch_commit_ids = load_branch_ref_commit_ids(store, live_index, &[]).await?;
+            let branch_heads = load_branch_head_controls(store, &[]).await?;
             return Ok(LiveStateScanScope {
-                storage_branch_ids: branch_commit_ids.keys().cloned().collect(),
+                storage_branch_ids: branch_heads.keys().cloned().collect(),
                 projection_branch_ids: Vec::new(),
-                branch_commit_ids,
+                branch_heads,
             });
         }
         return Ok(LiveStateScanScope {
-            storage_branch_ids: all_branch_ref_ids(store, live_index).await?,
+            storage_branch_ids: all_branch_head_control_ids(store).await?,
             projection_branch_ids: Vec::new(),
-            branch_commit_ids: BranchCommitIds::new(),
+            branch_heads: BranchHeads::new(),
         });
     }
 
     if resolve_branch_heads {
         let candidate_branch_ids = expanded_branch_ids(&request.filter.branch_ids);
-        let branch_commit_ids =
-            load_branch_ref_commit_ids(store, live_index, &candidate_branch_ids).await?;
+        let branch_heads = load_branch_head_controls(store, &candidate_branch_ids).await?;
         let projection_branch_ids = request
             .filter
             .branch_ids
             .iter()
-            .filter(|branch_id| branch_commit_ids.contains_key(*branch_id))
+            .filter(|branch_id| branch_heads.contains_key(*branch_id))
             .cloned()
             .collect::<Vec<_>>();
         let storage_branch_ids = expanded_branch_ids(&projection_branch_ids);
         return Ok(LiveStateScanScope {
             storage_branch_ids,
             projection_branch_ids,
-            branch_commit_ids,
+            branch_heads,
         });
     }
 
-    let existing_branch_ids = load_branch_ref_ids(store, live_index, &request.filter.branch_ids)
+    let existing_branch_ids = load_branch_head_control_ids(store, &request.filter.branch_ids)
         .await?
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -864,83 +959,59 @@ async fn scan_scope(
     Ok(LiveStateScanScope {
         storage_branch_ids,
         projection_branch_ids,
-        branch_commit_ids: BranchCommitIds::new(),
+        branch_heads: BranchHeads::new(),
     })
 }
 
-async fn load_branch_ref_commit_ids(
+/// Loads v6 controls without touching the mutable live-state index. A
+/// nonempty request is point-read; the empty request is the explicit
+/// all-branches scan used only by broad scans.
+async fn load_branch_head_controls(
     store: &(impl StorageAdapterRead + ?Sized),
-    live_index: &LiveStateIndexContext,
     branch_ids: &[String],
-) -> Result<BranchCommitIds, LixError> {
-    let rows = live_index
-        .reader(store)
-        .scan_rows(&LiveStateIndexScanRequest {
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            filter: LiveStateIndexFilter {
-                schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                entity_pks: branch_ids.iter().map(EntityPk::single).collect(),
-                file_ids: vec![NullableKeyFilter::Null],
-            },
-            projection: vec!["snapshot_content".to_string()],
-            limit: None,
-        })
-        .await?;
-    let mut branch_commit_ids = BranchCommitIds::new();
-    for row in rows {
-        let branch_id = row.entity_pk.as_single_string_owned()?;
-        if let Some(commit_id) = parse_branch_ref_commit_id(row.snapshot_content.as_deref())? {
-            branch_commit_ids.insert(branch_id, commit_id);
-        }
+) -> Result<BranchHeads, LixError> {
+    let reader = BranchHeadControlContext::new().reader(store);
+    if branch_ids.is_empty() {
+        return Ok(reader.scan().await?.into_iter().collect());
     }
-    Ok(branch_commit_ids)
+    let controls = reader.load_many(branch_ids).await?;
+    Ok(branch_ids
+        .iter()
+        .cloned()
+        .zip(controls)
+        .filter_map(|(branch_id, control)| control.map(|control| (branch_id, control)))
+        .collect())
 }
 
-async fn all_branch_ref_ids(
+async fn all_branch_head_control_ids(
     store: &(impl StorageAdapterRead + ?Sized),
-    live_index: &LiveStateIndexContext,
 ) -> Result<Vec<String>, LixError> {
-    load_branch_ref_ids(store, live_index, &[]).await
+    Ok(BranchHeadControlContext::new()
+        .reader(store)
+        .scan()
+        .await?
+        .into_iter()
+        .map(|(branch_id, _)| branch_id)
+        .collect())
 }
 
-async fn load_branch_ref_ids(
+async fn load_branch_head_control_ids(
     store: &(impl StorageAdapterRead + ?Sized),
-    live_index: &LiveStateIndexContext,
     branch_ids: &[String],
 ) -> Result<Vec<String>, LixError> {
-    let rows = live_index
+    if branch_ids.is_empty() {
+        return all_branch_head_control_ids(store).await;
+    }
+    let controls = BranchHeadControlContext::new()
         .reader(store)
-        .scan_index_rows(&LiveStateIndexScanRequest {
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            filter: LiveStateIndexFilter {
-                schema_keys: vec![BRANCH_REF_SCHEMA_KEY.to_string()],
-                entity_pks: branch_ids.iter().map(EntityPk::single).collect(),
-                file_ids: vec![NullableKeyFilter::Null],
-            },
-            projection: Vec::new(),
-            limit: None,
-        })
+        .load_many(branch_ids)
         .await?;
-    rows.into_iter()
-        .map(|row| row.entity_pk.as_single_string_owned())
-        .collect()
-}
-
-fn parse_branch_ref_commit_id(snapshot_content: Option<&str>) -> Result<Option<String>, LixError> {
-    let Some(snapshot_content) = snapshot_content else {
-        return Ok(None);
-    };
-    let snapshot =
-        serde_json::from_str::<serde_json::Value>(snapshot_content).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("live_state branch-ref snapshot parse failed: {error}"),
-            )
-        })?;
-    Ok(snapshot
-        .get("commit_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string))
+    Ok(branch_ids
+        .iter()
+        .cloned()
+        .zip(controls)
+        .filter_map(|(branch_id, control)| control.map(|_| branch_id))
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1153,6 +1224,44 @@ mod tests {
         .await
         .expect("untracked changes should write");
         drop(changelog_writer);
+
+        // Unit fixtures historically modeled branch heads as flat
+        // `lix_branch_ref` rows. V6 deliberately rejects that physical
+        // authority, so keep the fixture's public row while seeding the
+        // matching direct control used by every production reader.
+        for (row, change) in &changes {
+            if row.schema_key != BRANCH_REF_SCHEMA_KEY || row.deleted {
+                continue;
+            }
+            let branch_id = row
+                .entity_pk
+                .as_single_string_owned()
+                .expect("test branch ref must have one branch id key");
+            let snapshot = row
+                .snapshot_content
+                .as_deref()
+                .expect("test branch ref must have a snapshot");
+            let commit_id = serde_json::from_str::<serde_json::Value>(snapshot)
+                .expect("test branch-ref snapshot should be JSON")
+                .get("commit_id")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| CommitId::parse_lix(value, "test branch-ref commit"))
+                .transpose()
+                .expect("test branch-ref commit should parse")
+                .expect("test branch-ref snapshot should name a commit");
+            crate::branch::stage_branch_head_control(
+                &mut writes,
+                &branch_id,
+                BranchHeadControl {
+                    head_commit_id: commit_id,
+                    generation: commit_id,
+                    created_at: ts(&row.created_at),
+                    updated_at: ts(&row.updated_at),
+                    ref_change_id: change.change_id,
+                },
+            )
+            .expect("test branch-head control should stage");
+        }
 
         let mut rows_by_branch = std::collections::BTreeMap::<&str, Vec<_>>::new();
         for (row, change) in &changes {

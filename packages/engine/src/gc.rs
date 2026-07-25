@@ -10,10 +10,8 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use crate::changelog::{
-    ChangeRecordProjection, ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot,
-    materialize_change_payloads,
-};
+use crate::branch::BranchHeadControlContext;
+use crate::changelog::{ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot};
 use crate::live_state::LiveStateIndexContext;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
@@ -377,43 +375,24 @@ where
         .reader(store.clone())
         .scan_all_index_rows()
         .await?;
-    let branch_ref_change_ids = flat_rows
-        .iter()
-        .filter(|row| row.schema_key == "lix_branch_ref")
-        .map(|row| row.change_id);
-    let flat_payloads = materialize_change_payloads(
-        &store,
-        branch_ref_change_ids,
-        ChangeRecordProjection::from_columns(&["snapshot_content".to_string()]),
-        "garbage-collection flat live-state root",
-    )
-    .await?;
-
     let mut roots = flat_rows
         .iter()
         .map(|row| GcRoot::StandaloneChange(row.change_id))
         .collect::<Vec<_>>();
-    for row in &flat_rows {
-        if row.schema_key != "lix_branch_ref" {
-            continue;
-        }
-        let payload = flat_payloads.get(&row.change_id).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "garbage collection could not materialize branch-ref change '{}'",
-                    row.change_id
-                ),
-            )
-        })?;
-        let snapshot = parse_snapshot(
-            payload.snapshot_content.as_deref(),
-            "branch ref",
-            row.change_id,
-        )?;
-        let commit_id = required_snapshot_text(&snapshot, "commit_id", "branch ref")?;
-        let commit_id = CommitId::parse_lix(commit_id, "garbage-collection branch head")?;
-        roots.push(GcRoot::BranchHead(commit_id));
+    // v6 branch controls, not their public `lix_branch_ref` projection rows,
+    // are the authoritative GC roots. Explicit lifecycle rows may remain in
+    // flat state for SQL compatibility, but a stale projection must never
+    // keep a superseded commit alive.
+    for (_branch_id, control) in BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
+        .await?
+    {
+        roots.push(GcRoot::BranchHead(control.head_commit_id));
+        // The synthesized public `lix_branch_ref` row exposes this standalone
+        // immutable change id. Keep its currently published ledger fact live
+        // without making the mutable control a flat live-state row again.
+        roots.push(GcRoot::StandaloneChange(control.ref_change_id));
     }
     for recovery in load_recovery_refs(&store).await? {
         roots.push(GcRoot::BranchHead(recovery.recovered_head_commit_id));
@@ -461,46 +440,15 @@ fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
-fn parse_snapshot(
-    snapshot: Option<&str>,
-    kind: &str,
-    change_id: crate::changelog::ChangeId,
-) -> Result<serde_json::Value, LixError> {
-    let snapshot = snapshot.ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("live {kind} change '{change_id}' has no snapshot"),
-        )
-    })?;
-    serde_json::from_str(snapshot).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("live {kind} change '{change_id}' has invalid JSON: {error}"),
-        )
-    })
-}
-
-fn required_snapshot_text<'a>(
-    snapshot: &'a serde_json::Value,
-    field: &str,
-    kind: &str,
-) -> Result<&'a str, LixError> {
-    snapshot
-        .get(field)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!("{kind} snapshot is missing non-empty text field '{field}'"),
-            )
-        })
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::branch::BranchHeadControlContext;
     use crate::changelog::CommitId;
-    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+    use crate::live_state::LiveStateIndexContext;
+    use crate::storage_adapter::{
+        Memory, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
+    };
+    use crate::tracked_state::TrackedStateContext;
 
     use super::{
         CheckpointGcState, CheckpointRecoveryRef, load_checkpoint_gc_state, load_recovery_ref,
@@ -576,6 +524,62 @@ mod tests {
                 .expect("checkpoint GC state should load"),
             expected
         );
+    }
+
+    #[tokio::test]
+    async fn repository_gc_keeps_heads_rooted_only_by_v6_controls() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let live_index = LiveStateIndexContext::new();
+        let receipt = crate::init::initialize(storage.clone(), &tracked_state, &live_index)
+            .await
+            .expect("repository should initialize");
+
+        let read = SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("GC read should open"),
+        );
+        let mut writes = storage.new_write_set();
+        let plan = super::stage_repository_gc(read, &mut writes)
+            .await
+            .expect("GC should plan from direct branch controls");
+        let initial_commit = CommitId::parse_lix(&receipt.initial_commit_id, "initial commit")
+            .expect("initial receipt should contain a commit id");
+        assert!(
+            !plan.changelog.sweep.commits.contains(&initial_commit),
+            "the initial commit must stay live even though init writes no flat lix_branch_ref row"
+        );
+        let controls = BranchHeadControlContext::new()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("control read should open"),
+            )
+            .scan()
+            .await
+            .expect("v6 controls should scan");
+        assert_eq!(
+            controls.len(),
+            2,
+            "init should publish both direct controls"
+        );
+        for (_branch_id, control) in controls {
+            assert!(
+                plan.changelog.live.changes.contains(&control.ref_change_id),
+                "the control's current public branch-ref ledger change must stay live"
+            );
+            assert!(
+                !plan
+                    .changelog
+                    .sweep
+                    .changes
+                    .contains(&control.ref_change_id),
+                "GC must not sweep a direct control's current public branch-ref ledger change"
+            );
+        }
     }
 
     fn recovery(branch_id: &str, recovered_head: &str, checkpoint: &str) -> CheckpointRecoveryRef {

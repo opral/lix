@@ -18,6 +18,8 @@ fn prepare_json_ref(value: &str) -> JsonRef {
 }
 #[cfg(test)]
 use crate::GLOBAL_BRANCH_ID;
+#[cfg(test)]
+use crate::branch::{BranchHeadControl, stage_branch_head_control};
 
 #[cfg(test)]
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000001";
@@ -78,6 +80,18 @@ pub(crate) async fn seed_branch_head_with_rows(
     .expect("tracked root should write");
 
     let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
+    stage_branch_head_control(
+        &mut writes,
+        branch_id,
+        BranchHeadControl {
+            head_commit_id: commit_id,
+            generation: commit_id,
+            created_at: test_timestamp(),
+            updated_at: test_timestamp(),
+            ref_change_id: branch_ref_change_id,
+        },
+    )
+    .expect("direct branch-head control should stage");
     let branch_ref_entity_pk = crate::entity_pk::EntityPk::single(branch_id);
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
