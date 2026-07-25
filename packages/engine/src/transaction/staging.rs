@@ -549,7 +549,7 @@ impl TransactionWriteBuffer {
             StagedPreparedRows::AppendOnly { rows, .. } => rows,
             StagedPreparedRows::Indexed { rows, .. } => rows.into_iter().flatten().collect(),
         };
-        let result = Ok(PreparedWriteSet {
+        Ok(PreparedWriteSet {
             state_rows,
             insert_identities: std::mem::take(&mut *insert_identities_guard),
             commit_change_refs_by_branch: std::mem::take(&mut *commit_change_refs_guard),
@@ -559,8 +559,7 @@ impl TransactionWriteBuffer {
             checkpoint_publications: std::mem::take(&mut *checkpoint_publications_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
-        });
-        result
+        })
     }
 
     pub(crate) fn add_checkpoint_publication(
