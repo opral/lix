@@ -1,9 +1,10 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BinaryCasContext;
-use crate::branch::BranchContext;
+use crate::branch::{BranchContext, BranchHeadControl, stage_branch_head_control};
 use crate::catalog::CatalogContext;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
@@ -12,7 +13,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
-    LiveStateScanRequest,
+    LiveStateScanRequest, TrackedHeadContext,
 };
 use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::session::SessionMode;
@@ -526,6 +527,26 @@ async fn seed_visible_schema_rows<StorageImpl>(
         })
         .await
         .expect("schema fixture branch-ref changes should stage");
+    // Match repository initialization: the immutable schema root and each
+    // visible branch control get a complete v5 serving generation before the
+    // timed fixture begins. Without these markers, the first timed tracked
+    // write bootstraps from history instead of exercising the normal path.
+    let tracked_head = TrackedHeadContext::new();
+    let absence_guards = BTreeSet::new();
+    for (branch_id, _, _, _) in &branch_refs {
+        tracked_head
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                None,
+                commit_id,
+                &[],
+                &absence_guards,
+                Some(rows.clone()),
+            )
+            .await
+            .expect("schema fixture tracked head should stage");
+    }
     let live_index = LiveStateIndexContext::new();
     let mut current = live_index.writer(&read, &mut writes);
     current
@@ -546,6 +567,23 @@ async fn seed_visible_schema_rows<StorageImpl>(
         )
         .await
         .expect("global current fixture should stage");
+    // Branch controls are the authoritative v6 publication fence. The
+    // branch-ref rows above remain part of the public fixture, but do not
+    // make a tracked root visible to transaction opening on their own.
+    for (branch_id, _, _, change_id) in &branch_refs {
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id: commit_id,
+                generation: commit_id,
+                created_at: timestamp,
+                updated_at: timestamp,
+                ref_change_id: *change_id,
+            },
+        )
+        .expect("schema fixture branch control should stage");
+    }
     // A branch ref can change the registered-schema catalog reachable from a
     // branch, so it rotates the same cache revision in production commits.
     crate::catalog::stage_catalog_revision(&mut writes);
