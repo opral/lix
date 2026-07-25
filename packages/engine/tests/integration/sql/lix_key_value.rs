@@ -31,6 +31,74 @@ simulation_test!(lix_key_value_roundtrips_arbitrary_json, |sim| async move {
     );
 });
 
+simulation_test!(
+    lix_key_value_persisted_tracked_entity_scan_preserves_canonical_json_through_global_branch_merge,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let global_session = sim.wrap_session(
+            engine
+                .open_session("global")
+                .await
+                .expect("global session should open"),
+            &engine,
+        );
+
+        // Both writes auto-commit before the read. That forces normal tracked
+        // TransactionJson bytes through the persisted global and active heads,
+        // then through the active branch's global-fallback merge.
+        global_session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) \
+                 VALUES ('kv-canonical-persisted-global', \
+                         lix_json('{ \"z\": { \"b\": 2, \"a\": 1 }, \"a\": [3, 2] }'), true)",
+                &[],
+            )
+            .await
+            .expect("tracked global insert should succeed");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('kv-canonical-persisted-active', \
+                         lix_json('{ \"z\": { \"d\": 4, \"c\": 3 }, \"a\": [5, 4] }'))",
+                &[],
+            )
+            .await
+            .expect("tracked active insert should succeed");
+
+        let result = session
+            // LIKE deliberately routes through the broad EntitySpec scan rather
+            // than the exact-primary-key native executor.
+            .execute(
+                "SELECT key, CONCAT(value, '') AS value_text FROM lix_key_value \
+                 WHERE key LIKE 'kv-canonical-persisted-%' ORDER BY key",
+                &[],
+            )
+            .await
+            .expect("broad tracked entity scan should succeed");
+        assert_eq!(
+            result.rows().iter().map(|row| row.values()).collect::<Vec<_>>(),
+            vec![
+                &[
+                    Value::Text("kv-canonical-persisted-active".to_string()),
+                    Value::Text(r#"{"a":[5,4],"z":{"c":3,"d":4}}"#.to_string()),
+                ],
+                &[
+                    Value::Text("kv-canonical-persisted-global".to_string()),
+                    Value::Text(r#"{"a":[3,2],"z":{"a":1,"b":2}}"#.to_string()),
+                ],
+            ],
+            "persisted tracked JSON stays canonical through global/branch visibility merge"
+        );
+    }
+);
+
 simulation_test!(lix_key_value_duplicate_insert_rejects, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
