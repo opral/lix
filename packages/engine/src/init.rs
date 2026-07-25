@@ -318,6 +318,7 @@ where
             })
             .collect::<Vec<_>>();
         let tracked_head = TrackedHeadContext::new();
+        let absence_guards = std::collections::BTreeSet::default();
         for branch_id in [GLOBAL_BRANCH_ID, receipt.main_branch_id.as_str()] {
             tracked_head
                 .writer(&read, &mut writes)
@@ -326,7 +327,7 @@ where
                     None,
                     plan.commit.id,
                     &head_deltas,
-                    &Default::default(),
+                    &absence_guards,
                     None,
                 )
                 .await?;

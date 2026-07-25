@@ -42,11 +42,14 @@ pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.tracked_head_
 pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v5";
 pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0012), TRACKED_HEAD_GROUP_NAMESPACE);
-/// Exact projection for explicit file-backed identities.
+/// File-id projection for explicit file-backed identities.
 ///
 /// The group value remains authoritative for normal logical-PK reads. This
-/// narrow projection avoids turning `file_id = ?` point reads into an
-/// unbounded group-value fetch when a logical PK has many file members.
+/// narrow projection avoids turning `file_id = ?` reads into an unbounded
+/// group-value fetch when a logical PK has many file members. Its physical
+/// order is `(branch, generation, schema, file_id, entity_pk)`, so both an
+/// exact full identity and a schema-scoped file-id scan avoid unpacking
+/// unrelated entity groups.
 pub(crate) const TRACKED_HEAD_MEMBER_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0013), TRACKED_HEAD_MEMBER_NAMESPACE);
 pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
@@ -670,6 +673,18 @@ async fn scan_entries(
             .take(limit.unwrap_or(usize::MAX))
             .collect());
     }
+    if let Some(prefixes) = explicit_member_scan_prefixes(branch_id, generation, filter) {
+        let mut rows = scan_explicit_member_entries(store, prefixes, filter).await?;
+        // Member projection keys are ordered by `file_id` before `entity_pk`.
+        // Restore the public logical order when callers request multiple file
+        // ids; the group route below is already ordered that way.
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        rows.dedup_by(|(left, _), (right, _)| left == right);
+        if let Some(limit) = limit {
+            rows.truncate(limit);
+        }
+        return Ok(rows);
+    }
     if let Some(groups) = exact_group_identities(branch_id, generation, filter) {
         let values = load_group_bytes(store, &groups).await?;
         let mut rows = Vec::new();
@@ -801,6 +816,84 @@ fn exact_explicit_member_identities(
     identities.sort();
     identities.dedup();
     Some(identities)
+}
+
+/// A schema-scoped `file_id = ?` lookup cannot use the grouped primary
+/// serving record without decoding every logical PK in that schema. Explicit
+/// member rows use a file-id-first suffix solely for this access pattern.
+///
+/// Exact `(schema, entity_pk, file_id)` requests take the point-read route
+/// above. If the schema is unknown, no useful member-space prefix exists and
+/// we correctly retain the general group scan fallback.
+fn explicit_member_scan_prefixes(
+    branch_id: &str,
+    generation: CommitId,
+    filter: &TrackedStateFilter,
+) -> Option<Vec<Vec<u8>>> {
+    if filter.schema_keys.is_empty()
+        || filter.file_ids.is_empty()
+        || !filter.entity_pks.is_empty()
+        || filter
+            .file_ids
+            .iter()
+            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
+    {
+        return None;
+    }
+    let mut prefixes = Vec::with_capacity(filter.schema_keys.len() * filter.file_ids.len());
+    for schema_key in &filter.schema_keys {
+        for file_id in &filter.file_ids {
+            let NullableKeyFilter::Value(file_id) = file_id else {
+                unreachable!("explicit member scan filter checked above");
+            };
+            let mut prefix = encode_scope_prefix(branch_id, generation);
+            write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
+            write_file_id(&mut prefix, Some(file_id));
+            prefixes.push(prefix);
+        }
+    }
+    prefixes.sort();
+    prefixes.dedup();
+    Some(prefixes)
+}
+
+async fn scan_explicit_member_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    prefixes: Vec<Vec<u8>>,
+    filter: &TrackedStateFilter,
+) -> Result<Vec<(HeadRowIdentity, Bytes)>, LixError> {
+    let mut rows = Vec::new();
+    for prefix in prefixes {
+        let plan = ScanPlan::prefix(
+            TRACKED_HEAD_MEMBER_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(prefix),
+            },
+        );
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    store,
+                    StorageScanOptions {
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?;
+            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                let identity = decode_member_key(entry.key.0.as_ref())?.into_row_identity();
+                if matches_filter(&identity, filter) {
+                    rows.push((identity, full_value_bytes(entry.value)?));
+                }
+            }
+            if !page.value.has_more || resume_after.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(rows)
 }
 
 fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
@@ -959,8 +1052,10 @@ fn encode_group_key(identity: &HeadGroupIdentity) -> Vec<u8> {
 
 fn encode_member_key(identity: &HeadIdentity) -> Vec<u8> {
     debug_assert!(identity.file_id.is_some());
-    let mut out = encode_group_key(&identity.group_identity());
+    let mut out = encode_scope_prefix(&identity.branch_id, identity.generation);
+    write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
     write_file_id(&mut out, identity.file_id.as_deref());
+    write_entity_pk(&mut out, &identity.entity_pk);
     out
 }
 
@@ -988,7 +1083,6 @@ fn decode_group_key(bytes: &[u8]) -> Result<HeadGroupIdentity, LixError> {
     })
 }
 
-#[cfg(test)]
 fn decode_member_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     let mut offset = 0usize;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -1000,11 +1094,11 @@ fn decode_member_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     if schema_terminator != KEY_PART_FINAL {
         return Err(key_codec_error("schema key has an invalid terminator"));
     }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
     let file_id = read_file_id(bytes, &mut offset)?;
     if file_id.is_none() {
         return Err(key_codec_error("member key must contain a file id"));
     }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("member key has trailing bytes"));
     }
@@ -1102,7 +1196,6 @@ fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
     out.extend_from_slice(&[KEY_PART_FINAL, terminator]);
 }
 
-#[cfg(test)]
 fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixError> {
     let end = offset
         .checked_add(GENERATION_BYTES)
@@ -1136,7 +1229,6 @@ fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError
     })
 }
 
-#[cfg(test)]
 fn read_file_id(bytes: &[u8], offset: &mut usize) -> Result<Option<String>, LixError> {
     let tag = *bytes
         .get(*offset)
@@ -2006,6 +2098,7 @@ mod tests {
         let branch_id = "branch";
         let head = CommitId::for_test_label("head");
         let entity_pk = EntityPk::single("row");
+        let second_entity_pk = EntityPk::single("row-2");
         let deltas = [
             TrackedHeadDeltaRef {
                 schema_key: "schema",
@@ -2043,6 +2136,18 @@ mod tests {
                 snapshot: JsonSlotRef::Inline("{\"value\":\"b\"}"),
                 metadata: JsonSlotRef::None,
             },
+            TrackedHeadDeltaRef {
+                schema_key: "schema",
+                file_id: Some("file-b"),
+                entity_pk: &second_entity_pk,
+                change_id: ChangeId::for_test_label("second-file-b"),
+                commit_id: head,
+                deleted: false,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                snapshot: JsonSlotRef::Inline("{\"value\":\"second-b\"}"),
+                metadata: JsonSlotRef::None,
+            },
         ];
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -2065,6 +2170,12 @@ mod tests {
             generation: head,
             schema_key: "schema".to_string(),
             entity_pk: entity_pk.clone(),
+        };
+        let second_group = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation: head,
+            schema_key: "schema".to_string(),
+            entity_pk: second_entity_pk.clone(),
         };
         let explicit_member = HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -2130,6 +2241,10 @@ mod tests {
             TRACKED_HEAD_GROUP_SPACE,
             StorageKey(Bytes::from(encode_group_key(&group))),
         );
+        writes.delete(
+            TRACKED_HEAD_GROUP_SPACE,
+            StorageKey(Bytes::from(encode_group_key(&second_group))),
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -2159,6 +2274,42 @@ mod tests {
             .expect("marker should match");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id.as_deref(), Some("file-b"));
+
+        // A schema-scoped `file_id = ?` query also stays on the member
+        // projection. This is the access pattern used by filesystem-backed
+        // entity scans, where the entity PK is not known before the query.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open file-id scan");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("file-id scan should execute")
+            .expect("marker should match");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.entity_pk.as_single_string().expect("single key"))
+                .collect::<Vec<_>>(),
+            vec!["row", "row-2"]
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.file_id.as_deref() == Some("file-b"))
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
