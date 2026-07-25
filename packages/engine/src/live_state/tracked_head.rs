@@ -19,6 +19,7 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
 };
+use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
@@ -30,12 +31,16 @@ use crate::tracked_state::{
     TrackedStateScanRequest,
 };
 
-pub(crate) const TRACKED_HEAD_ROW_NAMESPACE: &str = "live_state.tracked_head_row.v2";
-pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v2";
+// v3 intentionally changes both spaces. A v2 marker can never authorize a
+// v3 reader over v2 row bytes, so mixed-version repositories safely take the
+// immutable-root fallback until the next normal tracked commit publishes a
+// complete v3 generation.
+pub(crate) const TRACKED_HEAD_ROW_NAMESPACE: &str = "live_state.tracked_head_row.v3";
+pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v3";
 pub(crate) const TRACKED_HEAD_ROW_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0009), TRACKED_HEAD_ROW_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_000b), TRACKED_HEAD_ROW_NAMESPACE);
 pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_000a), TRACKED_HEAD_MARKER_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_000c), TRACKED_HEAD_MARKER_NAMESPACE);
 
 /// Immutable manifest for the currently readable generation of a branch.
 ///
@@ -61,17 +66,19 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, musli::Decode)]
-#[musli(packed)]
+/// Write-side representation of a v3 head row.
+///
+/// This exists only while a transaction is being staged. Read-side code uses
+/// [`HeadValueView`], which parses the fixed header directly from RocksDB's
+/// returned bytes and never builds this allocation-heavy representation.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadValue {
     change_id: ChangeId,
     commit_id: CommitId,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    #[musli(with = crate::json_store::json_slot_storage)]
     snapshot: JsonSlot,
-    #[musli(with = crate::json_store::json_slot_storage)]
     metadata: JsonSlot,
 }
 
@@ -89,17 +96,14 @@ impl HeadValue {
     }
 }
 
-#[derive(Debug, Clone, Copy, musli::Encode)]
-#[musli(packed)]
+#[derive(Debug, Clone, Copy)]
 struct HeadValueRef<'a> {
     change_id: ChangeId,
     commit_id: CommitId,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
-    #[musli(with = crate::json_store::json_slot_storage_ref)]
     snapshot: JsonSlotRef<'a>,
-    #[musli(with = crate::json_store::json_slot_storage_ref)]
     metadata: JsonSlotRef<'a>,
 }
 
@@ -197,20 +201,20 @@ where
 {
     /// Returns `None` when this branch has no projection for the canonical
     /// branch ref/root pair. That is a cache miss, not empty tracked state.
-    pub(crate) async fn scan_rows_if_current(
+    pub(crate) async fn scan_live_rows_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
         expected_root: &TrackedStateRootId,
         request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedTrackedStateRow>>, LixError> {
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
         let Some(marker) = self
             .marker_if_current(branch_id, expected_head, expected_root)
             .await?
         else {
             return Ok(None);
         };
-        let entries = scan_values(
+        let entries = scan_entries(
             &self.store,
             branch_id,
             marker.generation,
@@ -219,7 +223,8 @@ where
         )
         .await?;
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-        let mut rows = materialize_entries(&self.store, entries, projection).await?;
+        let mut rows =
+            materialize_live_entries(&self.store, entries, projection, branch_id).await?;
         if !request.filter.include_tombstones {
             rows.retain(|row| !row.deleted);
         }
@@ -231,14 +236,14 @@ where
 
     /// Like the immutable-root point batch, preserves input cardinality and
     /// returns tombstones for the visibility layer to resolve.
-    pub(crate) async fn load_projected_rows_if_current(
+    pub(crate) async fn load_projected_live_rows_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
         expected_root: &TrackedStateRootId,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
-    ) -> Result<Option<Vec<Option<MaterializedTrackedStateRow>>>, LixError> {
+    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
         if keys.is_empty() {
             return Ok(Some(Vec::new()));
         }
@@ -263,13 +268,13 @@ where
                 .push(index);
         }
         let identities = output_indices.keys().cloned().collect::<Vec<_>>();
-        let values = load_values(&self.store, &identities).await?;
+        let values = load_entry_bytes(&self.store, &identities).await?;
         let entries = identities
             .into_iter()
             .zip(values)
             .filter_map(|(identity, value)| value.map(|value| (identity, value)))
             .collect();
-        let rows = materialize_entries(&self.store, entries, *projection).await?;
+        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
         let mut output = vec![None; keys.len()];
         for row in rows {
             let identity = HeadIdentity {
@@ -356,16 +361,16 @@ where
             .map(|delta| delta.identity(branch_id, generation))
             .collect::<BTreeSet<_>>();
 
-        let mut prior = BTreeMap::<HeadIdentity, HeadValue>::new();
+        let mut prior_created_at = BTreeMap::<HeadIdentity, LixTimestamp>::new();
         if matches_parent {
             let identities = deltas
                 .iter()
                 .map(|delta| delta.identity(branch_id, generation))
                 .collect::<Vec<_>>();
-            let values = load_values(self.store, &identities).await?;
+            let values = load_entry_bytes(self.store, &identities).await?;
             for (identity, value) in identities.into_iter().zip(values) {
                 if let Some(value) = value {
-                    prior.insert(identity, value);
+                    prior_created_at.insert(identity, decode_head_value(&value)?.created_at);
                 }
             }
         } else if let Some(rows) = parent_rows {
@@ -407,7 +412,7 @@ where
                 if !delta_identities.contains(&identity) {
                     stage_put(self.writes, &identity, &value)?;
                 }
-                prior.insert(identity, value);
+                prior_created_at.insert(identity, value.created_at);
             }
         } else {
             self.writes
@@ -416,9 +421,10 @@ where
 
         for delta in deltas {
             let identity = delta.identity(branch_id, generation);
-            let created_at = prior
+            let created_at = prior_created_at
                 .get(&identity)
-                .map_or(delta.created_at, |previous| previous.created_at);
+                .copied()
+                .unwrap_or(delta.created_at);
             stage_put_ref(self.writes, &identity, &delta.value_ref(created_at))?;
         }
         stage_marker(
@@ -451,10 +457,13 @@ async fn load_marker(
         .transpose()
 }
 
-async fn load_values(
+/// Loads the physical v3 values without decoding them. This keeps the owning
+/// `Bytes` allocation alive until the direct materializer has copied only the
+/// selected output fields into the final serving row.
+async fn load_entry_bytes(
     store: &(impl StorageAdapterRead + ?Sized),
     identities: &[HeadIdentity],
-) -> Result<Vec<Option<HeadValue>>, LixError> {
+) -> Result<Vec<Option<Bytes>>, LixError> {
     if identities.is_empty() {
         return Ok(Vec::new());
     }
@@ -468,19 +477,19 @@ async fn load_values(
     result
         .value
         .into_iter()
-        .map(|value| value.map(decode_head_value).transpose())
+        .map(|value| value.map(full_value_bytes).transpose())
         .collect()
 }
 
-async fn scan_values(
+async fn scan_entries(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
     filter: &TrackedStateFilter,
     limit: Option<usize>,
-) -> Result<Vec<(HeadIdentity, HeadValue)>, LixError> {
+) -> Result<Vec<(HeadIdentity, Bytes)>, LixError> {
     if let Some(identities) = exact_filter_identities(branch_id, generation, filter) {
-        let values = load_values(store, &identities).await?;
+        let values = load_entry_bytes(store, &identities).await?;
         return Ok(identities
             .into_iter()
             .zip(values)
@@ -523,7 +532,7 @@ async fn scan_values(
                 if !matches_filter(&identity, filter) {
                     continue;
                 }
-                rows.push((identity, decode_head_value(entry.value)?));
+                rows.push((identity, full_value_bytes(entry.value)?));
                 if limit.is_some_and(|limit| rows.len() >= limit) {
                     return Ok(rows);
                 }
@@ -664,7 +673,7 @@ fn stage_put_ref(
         TRACKED_HEAD_ROW_SPACE,
         StorageKey(Bytes::from(encode_row_key(identity))),
         StorageValue {
-            bytes: Bytes::from(storage_codec::encode("tracked-head row", value)?),
+            bytes: Bytes::from(encode_head_value(value)?),
         },
     );
     Ok(())
@@ -863,160 +872,383 @@ fn decode_marker_value(value: StorageProjectedValue) -> Result<TrackedHeadMarker
     storage_codec::decode("tracked-head marker", &bytes)
 }
 
-fn decode_head_value(value: StorageProjectedValue) -> Result<HeadValue, LixError> {
+/// v3 head values are intentionally a small, fixed-header wire record rather
+/// than a general Musli struct. The normal read path needs only these fields,
+/// and decoding a Musli `JsonSlot` first allocated an intermediate value for
+/// every row before it was copied into a live-state row.
+///
+/// ```text
+///  0      format version (3)
+///  1      deleted + snapshot/metadata kinds
+///  2..18  change UUID
+/// 18..34  commit UUID
+/// 34..42  created_at packed timestamp (big endian)
+/// 42..50  updated_at packed timestamp (big endian)
+/// 50..54  snapshot payload byte length (big endian u32)
+/// 54..58  metadata payload byte length (big endian u32)
+/// 58..    snapshot payload, then metadata payload
+/// ```
+///
+/// Slot payloads are either inline UTF-8 JSON or a fixed 32-byte `JsonRef`.
+/// This makes parsing bounded and lets the scan path build the final
+/// `MaterializedLiveStateRow` in one pass.
+const HEAD_VALUE_VERSION: u8 = 3;
+const HEAD_VALUE_HEADER_BYTES: usize = 58;
+const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
+const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
+const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
+const HEAD_VALUE_SLOT_MASK: u8 = 0b11;
+const HEAD_VALUE_ALLOWED_FLAGS: u8 = HEAD_VALUE_DELETED
+    | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_SNAPSHOT_SHIFT)
+    | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_METADATA_SHIFT);
+const HEAD_SLOT_NONE: u8 = 0;
+const HEAD_SLOT_REF: u8 = 1;
+const HEAD_SLOT_INLINE: u8 = 2;
+const UUID_BYTES: usize = 16;
+const JSON_REF_BYTES: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadSlotView<'a> {
+    None,
+    Ref(JsonRef),
+    Inline(&'a str),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadValueView<'a> {
+    change_id: ChangeId,
+    commit_id: CommitId,
+    deleted: bool,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    snapshot: HeadSlotView<'a>,
+    metadata: HeadSlotView<'a>,
+}
+
+fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
+    let snapshot_kind = encoded_slot_kind(value.snapshot);
+    let metadata_kind = encoded_slot_kind(value.metadata);
+    if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
+        return Err(head_value_error(
+            "deleted tracked-head rows must not carry JSON payloads",
+        ));
+    }
+    let snapshot_len = encoded_slot_len(value.snapshot);
+    let metadata_len = encoded_slot_len(value.metadata);
+    let capacity = HEAD_VALUE_HEADER_BYTES
+        .checked_add(snapshot_len)
+        .and_then(|bytes| bytes.checked_add(metadata_len))
+        .ok_or_else(|| head_value_error("encoded row length overflow"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    bytes.push(HEAD_VALUE_VERSION);
+    let mut flags = if value.deleted { HEAD_VALUE_DELETED } else { 0 };
+    flags |= snapshot_kind << HEAD_VALUE_SNAPSHOT_SHIFT;
+    flags |= metadata_kind << HEAD_VALUE_METADATA_SHIFT;
+    bytes.push(flags);
+    bytes.extend_from_slice(value.change_id.as_uuid().as_bytes());
+    bytes.extend_from_slice(value.commit_id.as_uuid().as_bytes());
+    bytes.extend_from_slice(&value.created_at.packed().to_be_bytes());
+    bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
+    bytes.extend_from_slice(
+        &u32::try_from(snapshot_len)
+            .map_err(|_| head_value_error("snapshot payload exceeds v3 u32 limit"))?
+            .to_be_bytes(),
+    );
+    bytes.extend_from_slice(
+        &u32::try_from(metadata_len)
+            .map_err(|_| head_value_error("metadata payload exceeds v3 u32 limit"))?
+            .to_be_bytes(),
+    );
+    append_slot_payload(&mut bytes, value.snapshot);
+    append_slot_payload(&mut bytes, value.metadata);
+    debug_assert_eq!(bytes.len(), capacity);
+    Ok(bytes)
+}
+
+fn encoded_slot_kind(slot: JsonSlotRef<'_>) -> u8 {
+    match slot {
+        JsonSlotRef::None => HEAD_SLOT_NONE,
+        JsonSlotRef::Ref(_) => HEAD_SLOT_REF,
+        JsonSlotRef::Inline(_) => HEAD_SLOT_INLINE,
+    }
+}
+
+fn encoded_slot_len(slot: JsonSlotRef<'_>) -> usize {
+    match slot {
+        JsonSlotRef::None => 0,
+        JsonSlotRef::Ref(_) => JSON_REF_BYTES,
+        JsonSlotRef::Inline(json) => json.len(),
+    }
+}
+
+fn append_slot_payload(bytes: &mut Vec<u8>, slot: JsonSlotRef<'_>) {
+    match slot {
+        JsonSlotRef::None => {}
+        JsonSlotRef::Ref(json_ref) => bytes.extend_from_slice(json_ref.as_hash_bytes()),
+        JsonSlotRef::Inline(json) => bytes.extend_from_slice(json.as_bytes()),
+    }
+}
+
+fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
     let StorageProjectedValue::FullValue(bytes) = value else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
+        return Err(head_value_error(
             "tracked-head row read unexpectedly omitted its value",
         ));
     };
-    storage_codec::decode("tracked-head row", &bytes)
+    Ok(bytes)
 }
 
-enum MaterializedSlot {
-    None,
-    Inline(Box<str>),
-    Loaded(usize),
-}
-
-async fn materialize_entries(
-    store: &(impl StorageAdapterRead + ?Sized),
-    entries: Vec<(HeadIdentity, HeadValue)>,
-    projection: ChangeRecordProjection,
-) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-    let mut json_refs = Vec::new();
-    let mut plans = Vec::with_capacity(entries.len());
-    for (identity, value) in entries {
-        let HeadValue {
-            change_id,
-            commit_id,
-            deleted,
-            created_at,
-            updated_at,
-            snapshot,
-            metadata,
-        } = value;
-        let snapshot = materialized_slot(
-            !deleted && projection.snapshot_content,
-            snapshot,
-            &mut json_refs,
-        );
-        let metadata = materialized_slot(!deleted && projection.metadata, metadata, &mut json_refs);
-        plans.push((
-            identity, change_id, commit_id, deleted, created_at, updated_at, snapshot, metadata,
+fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
+    if bytes.len() < HEAD_VALUE_HEADER_BYTES {
+        return Err(head_value_error("row is shorter than the v3 fixed header"));
+    }
+    if bytes[0] != HEAD_VALUE_VERSION {
+        return Err(head_value_error(&format!(
+            "unsupported row format version {}",
+            bytes[0]
+        )));
+    }
+    let flags = bytes[1];
+    if flags & !HEAD_VALUE_ALLOWED_FLAGS != 0 {
+        return Err(head_value_error("row has unknown v3 flag bits"));
+    }
+    let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
+    let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
+    let change_id = ChangeId::new(uuid_from_head_bytes(&bytes[2..18], "change id")?);
+    let commit_id = CommitId::new(uuid_from_head_bytes(&bytes[18..34], "commit id")?);
+    let created_at = LixTimestamp::from_packed(read_u64(&bytes[34..42], "created_at")?)
+        .map_err(|error| head_value_error(&format!("invalid created_at: {error}")))?;
+    let updated_at = LixTimestamp::from_packed(read_u64(&bytes[42..50], "updated_at")?)
+        .map_err(|error| head_value_error(&format!("invalid updated_at: {error}")))?;
+    let snapshot_len = usize::try_from(read_u32(&bytes[50..54], "snapshot length")?)
+        .map_err(|_| head_value_error("snapshot length exceeds usize"))?;
+    let metadata_len = usize::try_from(read_u32(&bytes[54..58], "metadata length")?)
+        .map_err(|_| head_value_error("metadata length exceeds usize"))?;
+    let snapshot_end = HEAD_VALUE_HEADER_BYTES
+        .checked_add(snapshot_len)
+        .ok_or_else(|| head_value_error("snapshot payload length overflow"))?;
+    let metadata_end = snapshot_end
+        .checked_add(metadata_len)
+        .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
+    if metadata_end != bytes.len() {
+        return Err(head_value_error(
+            "row payload lengths do not match the buffer",
         ));
     }
-    let mut json_values = if json_refs.is_empty() {
-        Vec::new()
-    } else {
-        JsonStoreContext::new()
-            .load_bytes_many(
-                store,
-                JsonLoadRequestRef {
-                    refs: &json_refs,
-                    scope: JsonReadScopeRef::OutOfBand,
-                },
-            )
-            .await?
-            .into_values()
-    };
-    plans
-        .into_iter()
-        .map(
-            |(
-                identity,
-                change_id,
-                commit_id,
-                deleted,
-                created_at,
-                updated_at,
-                snapshot,
-                metadata,
-            )| {
-                Ok(MaterializedTrackedStateRow {
-                    entity_pk: identity.entity_pk,
-                    schema_key: identity.schema_key,
-                    file_id: identity.file_id,
-                    snapshot_content: materialize_slot(snapshot, &json_refs, &mut json_values)?,
-                    metadata: materialize_slot(metadata, &json_refs, &mut json_values)?,
-                    deleted,
-                    created_at: created_at.to_string(),
-                    updated_at: updated_at.to_string(),
-                    change_id,
-                    commit_id,
-                })
+    let snapshot = decode_slot(
+        snapshot_kind,
+        &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
+        "snapshot",
+    )?;
+    let metadata = decode_slot(
+        metadata_kind,
+        &bytes[snapshot_end..metadata_end],
+        "metadata",
+    )?;
+    let deleted = flags & HEAD_VALUE_DELETED != 0;
+    if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
+        return Err(head_value_error(
+            "deleted tracked-head rows must not carry JSON payloads",
+        ));
+    }
+    Ok(HeadValueView {
+        change_id,
+        commit_id,
+        deleted,
+        created_at,
+        updated_at,
+        snapshot,
+        metadata,
+    })
+}
+
+fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
+    let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
+        head_value_error(&format!(
+            "{field} must have {UUID_BYTES} bytes in the v3 header"
+        ))
+    })?;
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
+fn read_u64(bytes: &[u8], field: &str) -> Result<u64, LixError> {
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| head_value_error(&format!("{field} has an invalid fixed-header width")))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn read_u32(bytes: &[u8], field: &str) -> Result<u32, LixError> {
+    let bytes: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| head_value_error(&format!("{field} has an invalid fixed-header width")))?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotView<'a>, LixError> {
+    match kind {
+        HEAD_SLOT_NONE if bytes.is_empty() => Ok(HeadSlotView::None),
+        HEAD_SLOT_NONE => Err(head_value_error(&format!(
+            "{field} none slot must have an empty payload"
+        ))),
+        HEAD_SLOT_REF if bytes.len() == JSON_REF_BYTES => {
+            let hash: [u8; JSON_REF_BYTES] = bytes.try_into().map_err(|_| {
+                head_value_error(&format!(
+                    "{field} ref payload must have {JSON_REF_BYTES} bytes"
+                ))
+            })?;
+            Ok(HeadSlotView::Ref(JsonRef::from_hash_bytes(hash)))
+        }
+        HEAD_SLOT_REF => Err(head_value_error(&format!(
+            "{field} ref payload must have {JSON_REF_BYTES} bytes"
+        ))),
+        HEAD_SLOT_INLINE => std::str::from_utf8(bytes)
+            .map(HeadSlotView::Inline)
+            .map_err(|error| {
+                head_value_error(&format!("{field} inline payload is not UTF-8: {error}"))
+            }),
+        _ => Err(head_value_error(&format!(
+            "{field} has an unknown slot kind {kind}"
+        ))),
+    }
+}
+
+fn head_value_error(message: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("invalid tracked-head v3 row: {message}"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum DeferredJsonField {
+    Snapshot,
+    Metadata,
+}
+
+struct DeferredJson {
+    row_index: usize,
+    field: DeferredJsonField,
+    json_ref: JsonRef,
+}
+
+/// Builds serving rows directly from a v3 wire value. The only allocations
+/// here are the final `String` fields and identities which the public row type
+/// requires; there is no `HeadValue`/`MaterializedTrackedStateRow` staging
+/// layer to drop after each scan.
+async fn materialize_live_entries(
+    store: &(impl StorageAdapterRead + ?Sized),
+    entries: Vec<(HeadIdentity, Bytes)>,
+    projection: ChangeRecordProjection,
+    branch_id: &str,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
+    let mut json_refs = Vec::new();
+    let mut deferred = Vec::new();
+    let mut rows = Vec::with_capacity(entries.len());
+    for (identity, bytes) in entries {
+        let value = decode_head_value(&bytes)?;
+        let row_index = rows.len();
+        let snapshot_content = materialize_live_slot(
+            !value.deleted && projection.snapshot_content,
+            value.snapshot,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Snapshot,
+        );
+        let metadata = materialize_live_slot(
+            !value.deleted && projection.metadata,
+            value.metadata,
+            &mut json_refs,
+            &mut deferred,
+            row_index,
+            DeferredJsonField::Metadata,
+        );
+        rows.push(MaterializedLiveStateRow {
+            entity_pk: identity.entity_pk,
+            schema_key: identity.schema_key,
+            file_id: identity.file_id,
+            snapshot_content,
+            metadata,
+            deleted: value.deleted,
+            created_at: value.created_at.to_string(),
+            updated_at: value.updated_at.to_string(),
+            global,
+            change_id: Some(value.change_id),
+            commit_id: Some(value.commit_id),
+            untracked: false,
+            branch_id: branch_id.to_string(),
+        });
+    }
+    if json_refs.is_empty() {
+        return Ok(rows);
+    }
+    let mut json_values = JsonStoreContext::new()
+        .load_bytes_many(
+            store,
+            JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: JsonReadScopeRef::OutOfBand,
             },
         )
-        .collect()
-}
-
-fn materialized_slot(
-    include: bool,
-    slot: JsonSlot,
-    json_refs: &mut Vec<JsonRef>,
-) -> MaterializedSlot {
-    if !include {
-        return MaterializedSlot::None;
-    }
-    match slot {
-        JsonSlot::None => MaterializedSlot::None,
-        JsonSlot::Inline(json) => MaterializedSlot::Inline(json),
-        JsonSlot::Ref(json_ref) => {
-            let index = json_refs.len();
-            json_refs.push(json_ref);
-            MaterializedSlot::Loaded(index)
+        .await?
+        .into_values();
+    for (index, deferred) in deferred.into_iter().enumerate() {
+        let bytes = json_values
+            .get_mut(index)
+            .ok_or_else(|| head_value_error("lost an out-of-band JSON value index"))?
+            .take()
+            .ok_or_else(|| {
+                head_value_error(&format!(
+                    "row is missing JSON payload '{}'",
+                    deferred.json_ref.to_hex()
+                ))
+            })?;
+        let json = String::from_utf8(bytes).map_err(|error| {
+            head_value_error(&format!("out-of-band JSON payload is not UTF-8: {error}"))
+        })?;
+        let row = rows
+            .get_mut(deferred.row_index)
+            .ok_or_else(|| head_value_error("lost an out-of-band JSON row index"))?;
+        match deferred.field {
+            DeferredJsonField::Snapshot => row.snapshot_content = Some(json),
+            DeferredJsonField::Metadata => row.metadata = Some(json),
         }
     }
+    Ok(rows)
 }
 
-fn materialize_slot(
-    slot: MaterializedSlot,
-    json_refs: &[JsonRef],
-    json_values: &mut [Option<Vec<u8>>],
-) -> Result<Option<String>, LixError> {
-    let index = match slot {
-        MaterializedSlot::None => return Ok(None),
-        MaterializedSlot::Inline(json) => return Ok(Some(json.into_string())),
-        MaterializedSlot::Loaded(index) => index,
-    };
-    let json_ref = json_refs.get(index).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-head materialization lost JSON ref index",
-        )
-    })?;
-    let bytes = json_values
-        .get_mut(index)
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-head materialization lost JSON value index",
-            )
-        })?
-        .take()
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked-head row is missing JSON payload '{}'",
-                    json_ref.to_hex()
-                ),
-            )
-        })?;
-    String::from_utf8(bytes).map(Some).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked-head JSON payload is not UTF-8: {}",
-                error.utf8_error()
-            ),
-        )
-    })
+fn materialize_live_slot(
+    include: bool,
+    slot: HeadSlotView<'_>,
+    json_refs: &mut Vec<JsonRef>,
+    deferred: &mut Vec<DeferredJson>,
+    row_index: usize,
+    field: DeferredJsonField,
+) -> Option<String> {
+    if !include {
+        return None;
+    }
+    match slot {
+        HeadSlotView::None => None,
+        HeadSlotView::Inline(json) => Some(json.to_string()),
+        HeadSlotView::Ref(json_ref) => {
+            json_refs.push(json_ref);
+            deferred.push(DeferredJson {
+                row_index,
+                field,
+                json_ref,
+            });
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json_store::{JsonWritePlacementRef, NormalizedJsonRef};
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
 
     fn ts(value: &str) -> LixTimestamp {
@@ -1046,6 +1278,152 @@ mod tests {
             updated_at: ts("2026-01-01T00:00:00Z"),
             snapshot: JsonSlot::from_json("{\"value\":true}"),
             metadata: JsonSlot::None,
+        }
+    }
+
+    #[test]
+    fn v3_value_codec_roundtrips_fixed_header_inline_and_ref_slots() {
+        let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
+        let value = HeadValueRef {
+            change_id: ChangeId::for_test_label("change"),
+            commit_id: CommitId::for_test_label("commit"),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
+            metadata: JsonSlotRef::Ref(&snapshot_ref),
+        };
+
+        let bytes = encode_head_value(&value).expect("encode v3 row");
+        assert_eq!(bytes[0], HEAD_VALUE_VERSION);
+        assert_eq!(
+            bytes.len(),
+            HEAD_VALUE_HEADER_BYTES + "{\"snapshot\":true}".len() + JSON_REF_BYTES
+        );
+        let decoded = decode_head_value(&bytes).expect("decode v3 row");
+        assert_eq!(decoded.change_id, value.change_id);
+        assert_eq!(decoded.commit_id, value.commit_id);
+        assert_eq!(decoded.created_at, value.created_at);
+        assert_eq!(decoded.updated_at, value.updated_at);
+        assert_eq!(
+            decoded.snapshot,
+            HeadSlotView::Inline("{\"snapshot\":true}")
+        );
+        assert_eq!(decoded.metadata, HeadSlotView::Ref(snapshot_ref));
+    }
+
+    #[tokio::test]
+    async fn direct_live_materializer_honors_projection_and_batches_out_of_band_refs() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("generation");
+        let head = CommitId::for_test_label("head");
+        let root = root("head");
+        let long_metadata = format!("\"{}\"", "x".repeat(300));
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        let refs = json_writer
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::OutOfBand,
+                [NormalizedJsonRef::new(&long_metadata)],
+            )
+            .expect("stage out-of-band metadata");
+        let metadata_ref = refs[0];
+        let row_identity = identity(branch_id, generation, "row");
+        stage_put(
+            &mut writes,
+            &row_identity,
+            &HeadValue {
+                change_id: ChangeId::for_test_label("change"),
+                commit_id: head,
+                deleted: false,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-02T00:00:00Z"),
+                snapshot: JsonSlot::from_json("{\"snapshot\":true}"),
+                metadata: JsonSlot::Ref(metadata_ref),
+            },
+        )
+        .expect("stage v3 row");
+        stage_marker(
+            &mut writes,
+            branch_id,
+            &TrackedHeadMarker {
+                head_commit_id: head,
+                root_id: root.clone(),
+                generation,
+            },
+        )
+        .expect("stage v3 marker");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit v3 head");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open projection read");
+        let metadata_only = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &root,
+                &TrackedStateScanRequest {
+                    read_columns: crate::tracked_state::TrackedStateReadColumns {
+                        columns: vec!["metadata".to_string()],
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("scan v3 head")
+            .expect("matching marker");
+        assert_eq!(metadata_only.len(), 1);
+        assert_eq!(metadata_only[0].snapshot_content, None);
+        assert_eq!(
+            metadata_only[0].metadata.as_deref(),
+            Some(long_metadata.as_str())
+        );
+        assert_eq!(metadata_only[0].branch_id, branch_id);
+        assert!(!metadata_only[0].global);
+        assert!(!metadata_only[0].untracked);
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open point read");
+        let keys = vec![
+            TrackedStateKey {
+                schema_key: "schema".to_string(),
+                entity_pk: EntityPk::single("row"),
+                file_id: None,
+            },
+            TrackedStateKey {
+                schema_key: "schema".to_string(),
+                entity_pk: EntityPk::single("row"),
+                file_id: None,
+            },
+        ];
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .load_projected_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &root,
+                &keys,
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("point read v3 head")
+            .expect("matching marker");
+        assert_eq!(rows.len(), 2);
+        for row in rows.into_iter().flatten() {
+            assert_eq!(row.snapshot_content.as_deref(), Some("{\"snapshot\":true}"));
+            assert_eq!(row.metadata.as_deref(), Some(long_metadata.as_str()));
+            assert_eq!(row.change_id, Some(ChangeId::for_test_label("change")));
+            assert_eq!(row.commit_id, Some(head));
         }
     }
 
@@ -1171,7 +1549,7 @@ mod tests {
             .expect("open read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_rows_if_current(
+            .scan_live_rows_if_current(
                 "branch",
                 &head.to_string(),
                 &root,
@@ -1230,7 +1608,7 @@ mod tests {
             .expect("open read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_rows_if_current(
+            .scan_live_rows_if_current(
                 "branch",
                 &head.to_string(),
                 &root,
@@ -1252,7 +1630,7 @@ mod tests {
         assert!(
             TrackedHeadContext::new()
                 .reader(read)
-                .scan_rows_if_current(
+                .scan_live_rows_if_current(
                     "branch",
                     &CommitId::for_test_label("other").to_string(),
                     &root,
@@ -1350,7 +1728,7 @@ mod tests {
             .expect("open verify read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_rows_if_current(
+            .scan_live_rows_if_current(
                 branch_id,
                 &second_head.to_string(),
                 &second_root,
@@ -1427,7 +1805,7 @@ mod tests {
             .expect("open verify read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_rows_if_current(
+            .scan_live_rows_if_current(
                 branch_id,
                 &child_head.to_string(),
                 &child_root,
@@ -1437,7 +1815,10 @@ mod tests {
             .expect("scan child head")
             .expect("matching marker");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].change_id, ChangeId::for_test_label("child-change"));
+        assert_eq!(
+            rows[0].change_id,
+            Some(ChangeId::for_test_label("child-change"))
+        );
         assert_eq!(rows[0].created_at, "2026-01-01T00:00:00.000Z");
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("{\"value\":2}"));
     }

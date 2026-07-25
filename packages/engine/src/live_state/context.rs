@@ -301,13 +301,14 @@ where
                                 file_id: identity.file_id.clone(),
                             })
                             .collect::<Vec<_>>();
+                        let source = tracked_source_from_branch_id(&branch_id);
                         let rows = if let Some(root_id) =
                             crate::tracked_state::load_root(&self.store, &commit_id).await?
                         {
                             if let Some(rows) = self
                                 .tracked_head
                                 .reader(&self.store)
-                                .load_projected_rows_if_current(
+                                .load_projected_live_rows_if_current(
                                     &branch_id,
                                     &commit_id,
                                     &root_id,
@@ -322,12 +323,22 @@ where
                                     .reader(&self.store)
                                     .load_projected_rows_at_commit(&commit_id, &keys, &projection)
                                     .await?
+                                    .into_iter()
+                                    .map(|row| {
+                                        row.map(|row| project_tracked_row(row, &branch_id, source))
+                                    })
+                                    .collect()
                             }
                         } else {
                             self.tracked_state
                                 .reader(&self.store)
                                 .load_projected_rows_at_commit(&commit_id, &keys, &projection)
                                 .await?
+                                .into_iter()
+                                .map(|row| {
+                                    row.map(|row| project_tracked_row(row, &branch_id, source))
+                                })
+                                .collect()
                         };
                         Ok::<_, LixError>((branch_id, identities, rows))
                     }
@@ -335,11 +346,10 @@ where
                 .buffered(BRANCH_READ_CONCURRENCY)
                 .try_collect::<Vec<_>>()
                 .await?;
-            for (branch_id, identities, rows) in tracked_batches {
-                let source = tracked_source_from_branch_id(&branch_id);
+            for (_branch_id, identities, rows) in tracked_batches {
                 for (identity, row) in identities.into_iter().zip(rows) {
                     if let Some(row) = row {
-                        candidates.insert(identity, project_tracked_row(row, &branch_id, source));
+                        candidates.insert(identity, row);
                     }
                 }
             }
@@ -469,14 +479,13 @@ where
             .map(|(branch_id, commit_id)| {
                 let tracked_request = tracked_request.clone();
                 async move {
-                    let source = tracked_source_from_branch_id(&branch_id);
                     let (rows, ordered_unique) = if let Some(root_id) =
                         crate::tracked_state::load_root(store, &commit_id).await?
                     {
                         if let Some(rows) = self
                             .tracked_head
                             .reader(store)
-                            .scan_rows_if_current(
+                            .scan_live_rows_if_current(
                                 &branch_id,
                                 &commit_id,
                                 &root_id,
@@ -490,7 +499,16 @@ where
                                 self.tracked_state
                                     .reader(store)
                                     .scan_rows_at_commit(&commit_id, &tracked_request)
-                                    .await?,
+                                    .await?
+                                    .into_iter()
+                                    .map(|row| {
+                                        project_tracked_row(
+                                            row,
+                                            &branch_id,
+                                            tracked_source_from_branch_id(&branch_id),
+                                        )
+                                    })
+                                    .collect(),
                                 false,
                             )
                         }
@@ -499,16 +517,22 @@ where
                             self.tracked_state
                                 .reader(store)
                                 .scan_rows_at_commit(&commit_id, &tracked_request)
-                                .await?,
+                                .await?
+                                .into_iter()
+                                .map(|row| {
+                                    project_tracked_row(
+                                        row,
+                                        &branch_id,
+                                        tracked_source_from_branch_id(&branch_id),
+                                    )
+                                })
+                                .collect(),
                             false,
                         )
                     };
                     Ok::<_, LixError>(TrackedBranchRows {
                         branch_id: branch_id.clone(),
-                        rows: rows
-                            .into_iter()
-                            .map(|row| project_tracked_row(row, &branch_id, source))
-                            .collect(),
+                        rows,
                         ordered_unique,
                     })
                 }
