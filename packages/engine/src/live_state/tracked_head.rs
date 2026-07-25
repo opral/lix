@@ -1,11 +1,10 @@
 //! Materialized serving state for one tracked branch head.
 //!
-//! Commit roots remain the immutable authority for versioned state. This
-//! table is a generation-keyed projection of one branch head which lets the
-//! normal live-state path range scan rows and hydrate JSON directly, without
-//! replaying every row through the changelog. A manifest binds a generation to
-//! both the branch ref's commit and its immutable root. Any mismatch is a
-//! cache miss and callers fall back to the commit root.
+//! Commit roots are sparse historical checkpoints. This table is the durable,
+//! generation-keyed serving state for one branch head, letting the normal
+//! live-state path range scan rows and hydrate JSON directly without replaying
+//! changelog history. A marker binds a generation to the branch ref's commit.
+//! Any mismatch is a cache miss and callers take the historical fallback.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,20 +28,20 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateKey, TrackedStateRootId,
-    TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateKey, TrackedStateScanRequest,
 };
 
-// v3 intentionally changes both spaces. A v2 marker can never authorize a
-// v3 reader over v2 row bytes, so mixed-version repositories safely take the
-// immutable-root fallback until the next normal tracked commit publishes a
-// complete v3 generation.
-pub(crate) const TRACKED_HEAD_ROW_NAMESPACE: &str = "live_state.tracked_head_row.v3";
-pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v3";
+// v4 makes the durable tracked head authoritative for normal current reads.
+// It uses new physical spaces as well as a new marker shape: a v3 marker
+// carried a root id and cannot authorize v4 row bytes. Mixed repositories
+// safely use the historical fallback until their next ordinary tracked commit
+// publishes a complete v4 generation.
+pub(crate) const TRACKED_HEAD_ROW_NAMESPACE: &str = "live_state.tracked_head_row.v4";
+pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v4";
 pub(crate) const TRACKED_HEAD_ROW_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_000b), TRACKED_HEAD_ROW_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_000d), TRACKED_HEAD_ROW_NAMESPACE);
 pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_000c), TRACKED_HEAD_MARKER_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_000e), TRACKED_HEAD_MARKER_NAMESPACE);
 
 /// Immutable manifest for the currently readable generation of a branch.
 ///
@@ -53,7 +52,6 @@ pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
 #[musli(packed)]
 struct TrackedHeadMarker {
     head_commit_id: CommitId,
-    root_id: TrackedStateRootId,
     generation: CommitId,
 }
 
@@ -224,18 +222,14 @@ where
     S: StorageAdapterRead,
 {
     /// Returns `None` when this branch has no projection for the canonical
-    /// branch ref/root pair. That is a cache miss, not empty tracked state.
+    /// branch ref. That is a cache miss, not empty tracked state.
     pub(crate) async fn scan_live_rows_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
-        expected_root: &TrackedStateRootId,
         request: &TrackedStateScanRequest,
     ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        let Some(marker) = self
-            .marker_if_current(branch_id, expected_head, expected_root)
-            .await?
-        else {
+        let Some(marker) = self.marker_if_current(branch_id, expected_head).await? else {
             return Ok(None);
         };
         let entries = scan_entries(
@@ -264,17 +258,13 @@ where
         &self,
         branch_id: &str,
         expected_head: &str,
-        expected_root: &TrackedStateRootId,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
     ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
         if keys.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let Some(marker) = self
-            .marker_if_current(branch_id, expected_head, expected_root)
-            .await?
-        else {
+        let Some(marker) = self.marker_if_current(branch_id, expected_head).await? else {
             return Ok(None);
         };
 
@@ -323,10 +313,9 @@ where
         &self,
         branch_id: &str,
         expected_head: &str,
-        expected_root: &TrackedStateRootId,
     ) -> Result<bool, LixError> {
         Ok(self
-            .marker_if_current(branch_id, expected_head, expected_root)
+            .marker_if_current(branch_id, expected_head)
             .await?
             .is_some())
     }
@@ -335,13 +324,10 @@ where
         &self,
         branch_id: &str,
         expected_head: &str,
-        expected_root: &TrackedStateRootId,
     ) -> Result<Option<TrackedHeadMarker>, LixError> {
         let expected_head = CommitId::parse_lix(expected_head, "tracked-head expected commit")?;
         let marker = load_marker(&self.store, branch_id).await?;
-        Ok(marker.filter(|marker| {
-            marker.head_commit_id == expected_head && marker.root_id == *expected_root
-        }))
+        Ok(marker.filter(|marker| marker.head_commit_id == expected_head))
     }
 }
 
@@ -363,16 +349,14 @@ where
         &mut self,
         branch_id: &str,
         parent_head: Option<CommitId>,
-        parent_root: Option<&TrackedStateRootId>,
         new_head: CommitId,
-        new_root: TrackedStateRootId,
         deltas: &[TrackedHeadDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<(), LixError> {
         let marker = load_marker(self.store, branch_id).await?;
         let matches_parent = marker.as_ref().is_some_and(|marker| {
             parent_head.is_some_and(|parent| marker.head_commit_id == parent)
-                && parent_root.is_some_and(|root| marker.root_id == *root)
         });
         let generation = if matches_parent {
             marker
@@ -396,13 +380,30 @@ where
             let values = load_entry_bytes(self.store, &identities).await?;
             for (identity, value) in identities.into_iter().zip(values) {
                 if let Some(value) = value {
-                    prior_created_at.insert(identity, decode_head_value(&value)?.created_at);
+                    let value = decode_head_value(&value)?;
+                    let key = TrackedStateKey {
+                        schema_key: identity.schema_key.clone(),
+                        entity_pk: identity.entity_pk.clone(),
+                        file_id: identity.file_id.clone(),
+                    };
+                    if absence_guards.contains(&key) && !value.deleted {
+                        return Err(tracked_head_duplicate_insert_error(&key));
+                    }
+                    prior_created_at.insert(identity, value.created_at);
                 }
             }
         } else if let Some(rows) = parent_rows {
             self.writes
                 .reserve_space(TRACKED_HEAD_ROW_SPACE, rows.len() + deltas.len(), 0);
             for row in rows {
+                let key = TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                    file_id: row.file_id.clone(),
+                };
+                if absence_guards.contains(&key) && !row.deleted {
+                    return Err(tracked_head_duplicate_insert_error(&key));
+                }
                 let identity = HeadIdentity {
                     branch_id: branch_id.to_string(),
                     generation,
@@ -458,12 +459,25 @@ where
             branch_id,
             &TrackedHeadMarker {
                 head_commit_id: new_head,
-                root_id: new_root,
                 generation,
             },
         )?;
         Ok(())
     }
+}
+
+fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
+    let entity_pk = key
+        .entity_pk
+        .as_json_array_text()
+        .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
+            key.schema_key
+        ),
+    )
 }
 
 async fn load_marker(
@@ -1341,10 +1355,6 @@ mod tests {
         LixTimestamp::expect_parse("test timestamp", value)
     }
 
-    fn root(label: &str) -> TrackedStateRootId {
-        TrackedStateRootId::new(*blake3::hash(label.as_bytes()).as_bytes())
-    }
-
     fn identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {
         HeadIdentity {
             branch_id: branch_id.to_string(),
@@ -1404,7 +1414,6 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("generation");
         let head = CommitId::for_test_label("head");
-        let root = root("head");
         let long_metadata = format!("\"{}\"", "x".repeat(300));
         let mut writes = StorageWriteSet::new();
         let mut json_writer = JsonStoreContext::new().writer();
@@ -1436,7 +1445,6 @@ mod tests {
             branch_id,
             &TrackedHeadMarker {
                 head_commit_id: head,
-                root_id: root.clone(),
                 generation,
             },
         )
@@ -1455,7 +1463,6 @@ mod tests {
             .scan_live_rows_if_current(
                 branch_id,
                 &head.to_string(),
-                &root,
                 &TrackedStateScanRequest {
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
                         columns: vec!["metadata".to_string()],
@@ -1497,7 +1504,6 @@ mod tests {
             .load_projected_live_rows_if_current(
                 branch_id,
                 &head.to_string(),
-                &root,
                 &keys,
                 &ChangeRecordProjection::full(),
             )
@@ -1584,7 +1590,6 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let generation = CommitId::for_test_label("generation");
         let head = CommitId::for_test_label("head");
-        let root = root("head");
         let identities = vec![
             HeadIdentity {
                 branch_id: "branch".to_string(),
@@ -1625,7 +1630,6 @@ mod tests {
             "branch",
             &TrackedHeadMarker {
                 head_commit_id: head,
-                root_id: root.clone(),
                 generation,
             },
         )
@@ -1644,7 +1648,6 @@ mod tests {
             .scan_live_rows_if_current(
                 "branch",
                 &head.to_string(),
-                &root,
                 &TrackedStateScanRequest::default(),
             )
             .await
@@ -1681,7 +1684,6 @@ mod tests {
             snapshot: JsonSlot::from_json("{\"id\":\"row\"}"),
             metadata: JsonSlot::None,
         };
-        let root = root("head");
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &value).expect("stage row");
         stage_marker(
@@ -1689,7 +1691,6 @@ mod tests {
             "branch",
             &TrackedHeadMarker {
                 head_commit_id: head,
-                root_id: root.clone(),
                 generation,
             },
         )
@@ -1707,7 +1708,6 @@ mod tests {
             .scan_live_rows_if_current(
                 "branch",
                 &head.to_string(),
-                &root,
                 &TrackedStateScanRequest::default(),
             )
             .await
@@ -1729,7 +1729,6 @@ mod tests {
                 .scan_live_rows_if_current(
                     "branch",
                     &CommitId::for_test_label("other").to_string(),
-                    &root,
                     &TrackedStateScanRequest::default(),
                 )
                 .await
@@ -1745,8 +1744,6 @@ mod tests {
         let entity_pk = EntityPk::single("row");
         let first_head = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
-        let first_root = root("first-root");
-        let second_root = root("second-root");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -1758,9 +1755,7 @@ mod tests {
             .stage_commit(
                 branch_id,
                 None,
-                None,
                 first_head,
-                first_root.clone(),
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
@@ -1773,6 +1768,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":1}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 None,
             )
             .await
@@ -1793,9 +1789,7 @@ mod tests {
             .stage_commit(
                 branch_id,
                 Some(first_head),
-                Some(&first_root),
                 second_head,
-                second_root.clone(),
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
@@ -1808,6 +1802,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 None,
             )
             .await
@@ -1827,7 +1822,6 @@ mod tests {
             .scan_live_rows_if_current(
                 branch_id,
                 &second_head.to_string(),
-                &second_root,
                 &TrackedStateScanRequest::default(),
             )
             .await
@@ -1846,8 +1840,6 @@ mod tests {
         let entity_pk = EntityPk::single("row");
         let parent_head = CommitId::for_test_label("parent-head");
         let child_head = CommitId::for_test_label("child-head");
-        let parent_root = root("parent-root");
-        let child_root = root("child-root");
         let parent_rows = vec![MaterializedTrackedStateRow {
             entity_pk: entity_pk.clone(),
             schema_key: "schema".to_string(),
@@ -1870,9 +1862,7 @@ mod tests {
             .stage_commit(
                 branch_id,
                 Some(parent_head),
-                Some(&parent_root),
                 child_head,
-                child_root.clone(),
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
                     file_id: None,
@@ -1885,6 +1875,7 @@ mod tests {
                     snapshot: JsonSlotRef::Inline("{\"value\":2}"),
                     metadata: JsonSlotRef::None,
                 }],
+                &BTreeSet::new(),
                 Some(parent_rows),
             )
             .await
@@ -1904,7 +1895,6 @@ mod tests {
             .scan_live_rows_if_current(
                 branch_id,
                 &child_head.to_string(),
-                &child_root,
                 &TrackedStateScanRequest::default(),
             )
             .await

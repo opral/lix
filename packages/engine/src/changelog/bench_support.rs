@@ -681,6 +681,7 @@ fn direct_append_with_shape(
             format_version: 1,
             commit_id: typed_commit_id,
             parent_commit_ids: Vec::new(),
+            tracked_state_rootless: false,
             change_id: ChangeId::for_test_label(&commit_change_id),
             author_account_ids: Vec::new(),
             created_at: crate::common::LixTimestamp::expect_parse(

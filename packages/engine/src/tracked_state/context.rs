@@ -67,6 +67,10 @@ impl TrackedStateContext {
         TrackedStateStoreReader {
             store,
             tree: self.tree.clone(),
+            point_replay_intervals: HashMap::new(),
+            point_value_cache: HashMap::new(),
+            commit_delta_value_cache: HashMap::new(),
+            point_replay_commits: HashMap::new(),
         }
     }
 
@@ -109,6 +113,19 @@ impl TrackedStateContext {
 pub(crate) struct TrackedStateStoreReader<S> {
     store: S,
     tree: TrackedStateTree,
+    /// Reused by one reader's repeated historical point probes. SQL history
+    /// providers often resolve a descriptor, its ancestors, and plugin state
+    /// at the same observed commit.
+    point_replay_intervals: HashMap<String, (Vec<CommitId>, Option<TrackedStateRootId>)>,
+    point_value_cache: HashMap<(String, TrackedStateKey), Option<TrackedStateIndexValue>>,
+    /// Reuses direct delta lookups when several observed commits share a
+    /// rootless first-parent interval. This stays identity-routed: a cache
+    /// miss always issues a point read, never an unbounded schema scan.
+    commit_delta_value_cache: HashMap<(CommitId, TrackedStateKey), Option<TrackedStateIndexValue>>,
+    /// Commit topology and sparse-root probes are shared by all point reads
+    /// in one snapshot, so resolving neighbouring observed revisions never
+    /// reloads the same changelog records.
+    point_replay_commits: HashMap<CommitId, PointReplayCommit>,
 }
 
 struct DiffCommitRootValidationCache {
@@ -117,6 +134,12 @@ struct DiffCommitRootValidationCache {
     commit_roots: HashMap<String, TrackedStateRootId>,
     tree_values: HashMap<(TrackedStateRootId, TrackedStateKey), Option<TrackedStateIndexValue>>,
     changelog_first_parents: HashMap<String, Option<CommitId>>,
+}
+
+#[derive(Clone)]
+struct PointReplayCommit {
+    parent_commit_id: Option<CommitId>,
+    root_id: Option<TrackedStateRootId>,
 }
 
 impl DiffCommitRootValidationCache {
@@ -140,16 +163,8 @@ where
         commit_id: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? else {
-            return Err(missing_commit_root_error(commit_id));
-        };
         let rows = self
-            .tree
-            .scan(
-                &self.store,
-                &root_id,
-                &tree_scan_request_from_tracked(request),
-            )
+            .index_entries_at_commit(commit_id, &tree_scan_request_from_tracked(request))
             .await?;
         let materialization = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut rows =
@@ -221,6 +236,13 @@ where
         request: &TrackedStateDiffRequest,
     ) -> Result<TrackedStateDiff, LixError> {
         diff_commits(self, left_commit_id, right_commit_id, request).await
+    }
+
+    /// True only for the sparse immutable checkpoints. A false result does
+    /// not mean the commit is unreadable: ordinary v4 commits replay their
+    /// first-parent changelog interval on the cold historical path.
+    pub(crate) async fn has_durable_commit_root(&self, commit_id: &str) -> Result<bool, LixError> {
+        Ok(self.tree.load_root(&self.store, commit_id).await?.is_some())
     }
 
     pub(crate) async fn validate_diff_rows_for_commits_against_changelog(
@@ -868,6 +890,50 @@ where
         right_commit_id: &str,
         request: &TrackedStateTreeScanRequest,
     ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
+        let left_root = self.tree.load_root(&self.store, left_commit_id).await?;
+        let right_root = if left_commit_id == right_commit_id {
+            left_root.clone()
+        } else {
+            self.tree.load_root(&self.store, right_commit_id).await?
+        };
+        if let (Some(_), Some(_)) = (&left_root, &right_root) {
+            return self
+                .diff_tree_entries_from_roots(left_commit_id, right_commit_id, request)
+                .await;
+        }
+        let left = self.replay_index_entries_at_commit(left_commit_id).await?;
+        let right = if left_commit_id == right_commit_id {
+            left.clone()
+        } else {
+            self.replay_index_entries_at_commit(right_commit_id).await?
+        };
+        let keys = left
+            .keys()
+            .chain(right.keys())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        Ok(keys
+            .into_iter()
+            .filter(|key| request.matches_key(key))
+            .filter_map(|key| {
+                let before = left.get(&key).cloned();
+                let after = right.get(&key).cloned();
+                (before != after).then_some(
+                    crate::tracked_state::types::TrackedStateTreeDiffEntry {
+                        before: before.map(|value| (key.clone(), value)),
+                        after: after.map(|value| (key, value)),
+                    },
+                )
+            })
+            .collect())
+    }
+
+    async fn diff_tree_entries_from_roots(
+        &mut self,
+        left_commit_id: &str,
+        right_commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<crate::tracked_state::types::TrackedStateTreeDiffEntry>, LixError> {
         let mut cache = DiffCommitRootValidationCache::new();
         let left_root = self
             .load_validated_diff_root(left_commit_id, &mut cache)
@@ -896,11 +962,373 @@ where
         Ok(metadata.root_id)
     }
 
-    async fn load_ensured_root(&mut self, commit_id: &str) -> Result<TrackedStateRootId, LixError> {
-        self.tree
-            .load_root(&self.store, commit_id)
-            .await?
-            .ok_or_else(|| missing_commit_root_error(commit_id))
+    async fn index_entries_at_commit(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        if let Some(keys) = exact_keys_for_request(request) {
+            let values = self
+                .replay_index_values_for_keys_at_commit(commit_id, &keys)
+                .await?;
+            let mut entries = keys
+                .into_iter()
+                .zip(values)
+                .filter_map(|(key, value)| value.map(|value| (key, value)))
+                .filter(|(key, value)| request.matches(key, value))
+                .collect::<Vec<_>>();
+            if let Some(limit) = request.limit {
+                entries.truncate(limit);
+            }
+            return Ok(entries);
+        }
+        if let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? {
+            return self.tree.scan(&self.store, &root_id, request).await;
+        }
+        self.replay_index_entries_for_request_at_commit(commit_id, request)
+            .await
+    }
+
+    /// Replays a rootless first-parent interval into an ordered logical index.
+    ///
+    /// This is deliberately a cold-path implementation: current serving reads
+    /// use `live_state.tracked_head.v4`, while sparse historical roots avoid
+    /// replay for checkpoints and topology operations. The canonical
+    /// changelog already holds every mutation, so no extra history format is
+    /// needed merely to omit per-commit copy-on-write roots.
+    async fn replay_index_entries_at_commit(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<BTreeMap<TrackedStateKey, TrackedStateIndexValue>, LixError> {
+        let plans = crate::tracked_state::commit_root_rebuild::load_first_parent_replay_plans(
+            &self.store,
+            commit_id,
+        )
+        .await?;
+        let baseline_root = if plans.is_empty() {
+            self.tree.load_root(&self.store, commit_id).await?
+        } else if let Some(parent_commit_id) = plans.last().and_then(|plan| plan.parent_commit_id) {
+            self.tree
+                .load_root(&self.store, &parent_commit_id.to_string())
+                .await?
+        } else {
+            None
+        };
+        let all_rows = TrackedStateTreeScanRequest {
+            include_tombstones: true,
+            ..TrackedStateTreeScanRequest::default()
+        };
+        let mut entries = if let Some(root_id) = baseline_root {
+            self.tree
+                .scan(&self.store, &root_id, &all_rows)
+                .await?
+                .into_iter()
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        for plan in plans.iter().rev() {
+            for delta in &plan.deltas {
+                let key = TrackedStateKey {
+                    schema_key: delta.schema_key.clone(),
+                    file_id: delta.file_id.clone(),
+                    entity_pk: delta.entity_pk.clone(),
+                };
+                let created_at = entries
+                    .get(&key)
+                    .map(TrackedStateIndexValue::created_at)
+                    .unwrap_or(delta.created_at);
+                entries.insert(
+                    key,
+                    TrackedStateIndexValue {
+                        change_id: delta.change_id,
+                        commit_id: delta.commit_id,
+                        deleted: delta.snapshot.is_none(),
+                        created_at,
+                        updated_at: delta.updated_at,
+                    },
+                );
+            }
+        }
+        Ok(entries)
+    }
+
+    /// Resolves only the requested identities across rootless first-parent
+    /// history. Commit-delta values are absolute index states, including their
+    /// original `created_at`, so the first delta seen while walking backward is
+    /// final for that identity. This stops as soon as all requested keys are
+    /// resolved instead of reconstructing the full interval.
+    async fn replay_index_values_for_keys_at_commit(
+        &mut self,
+        commit_id: &str,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let mut output = vec![None; keys.len()];
+        let mut missing = BTreeMap::<TrackedStateKey, Vec<usize>>::new();
+        for (index, key) in keys.iter().cloned().enumerate() {
+            if let Some(value) = self
+                .point_value_cache
+                .get(&(commit_id.to_string(), key.clone()))
+            {
+                output[index] = value.clone();
+            } else {
+                missing.entry(key).or_default().push(index);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(output);
+        }
+        let missing_keys = missing.keys().cloned().collect::<Vec<_>>();
+        let values = self
+            .resolve_rootless_index_values_at_commit(commit_id, &missing_keys)
+            .await?;
+        for (key, value) in missing_keys.into_iter().zip(values) {
+            self.point_value_cache
+                .insert((commit_id.to_string(), key.clone()), value.clone());
+            for index in &missing[&key] {
+                output[*index].clone_from(&value);
+            }
+        }
+        Ok(output)
+    }
+
+    async fn resolve_rootless_index_values_at_commit(
+        &mut self,
+        commit_id: &str,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let mut values = vec![None; keys.len()];
+        let mut unresolved = (0..keys.len()).collect::<Vec<_>>();
+        let mut current_commit_id =
+            CommitId::parse_lix(commit_id, "tracked-state point replay commit_id")?;
+        let mut seen_commit_ids = HashSet::new();
+
+        loop {
+            if !seen_commit_ids.insert(current_commit_id) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot point-replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+            let replay_commit = self.load_point_replay_commit(current_commit_id).await?;
+            if let Some(root_id) = replay_commit.root_id {
+                let unresolved_keys = unresolved
+                    .iter()
+                    .map(|&index| keys[index].clone())
+                    .collect::<Vec<_>>();
+                let baseline = self
+                    .tree
+                    .get_many(&self.store, &root_id, &unresolved_keys)
+                    .await?;
+                for (index, value) in unresolved.into_iter().zip(baseline) {
+                    values[index] = value;
+                }
+                break;
+            }
+
+            let unresolved_keys = unresolved
+                .iter()
+                .map(|&index| keys[index].clone())
+                .collect::<Vec<_>>();
+            let deltas = self
+                .load_replayed_commit_delta_values(current_commit_id, &unresolved_keys)
+                .await?;
+            let mut next_unresolved = Vec::new();
+            for (index, delta) in unresolved.into_iter().zip(deltas) {
+                if let Some(delta) = delta {
+                    values[index] = Some(delta);
+                } else {
+                    next_unresolved.push(index);
+                }
+            }
+            if next_unresolved.is_empty() {
+                break;
+            }
+            unresolved = next_unresolved;
+            let Some(parent_commit_id) = replay_commit.parent_commit_id else {
+                break;
+            };
+            current_commit_id = parent_commit_id;
+        }
+        Ok(values)
+    }
+
+    async fn load_point_replay_commit(
+        &mut self,
+        commit_id: CommitId,
+    ) -> Result<PointReplayCommit, LixError> {
+        if let Some(cached) = self.point_replay_commits.get(&commit_id) {
+            return Ok(cached.clone());
+        }
+        let record = {
+            let mut reader = ChangelogContext::new().reader(&self.store);
+            let batch = reader
+                .load_commits(CommitLoadRequest {
+                    commit_ids: &[commit_id],
+                    projection: CommitProjection::Record,
+                })
+                .await?;
+            match batch.entries.into_iter().next().flatten() {
+                Some(CommitLoadEntry::Record(record)) => record,
+                Some(CommitLoadEntry::Full { .. }) => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "changelog returned a full commit load for tracked-state point replay",
+                    ));
+                }
+                None => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "cannot point-replay tracked_state for unknown commit '{commit_id}'"
+                        ),
+                    ));
+                }
+            }
+        };
+        if record.tracked_state_rootless && record.parent_commit_ids.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rootless tracked-state commit '{commit_id}' has {} parents",
+                    record.parent_commit_ids.len()
+                ),
+            ));
+        }
+        let root_id = if record.tracked_state_rootless {
+            None
+        } else {
+            self.tree
+                .load_root(&self.store, &commit_id.to_string())
+                .await?
+        };
+        let replay_commit = PointReplayCommit {
+            parent_commit_id: record.parent_commit_ids.first().copied(),
+            root_id,
+        };
+        self.point_replay_commits
+            .insert(commit_id, replay_commit.clone());
+        Ok(replay_commit)
+    }
+
+    /// Loads a commit's deltas for point history replay. The cache is keyed by
+    /// the physical commit and identity, so overlapping observed revisions
+    /// share exact storage reads without widening them into a schema scan.
+    async fn load_replayed_commit_delta_values(
+        &mut self,
+        commit_id: CommitId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let mut output = vec![None; keys.len()];
+        let mut missing = Vec::new();
+        for (index, key) in keys.iter().enumerate() {
+            if let Some(value) = self.commit_delta_value_cache.get(&(commit_id, key.clone())) {
+                output[index] = value.clone();
+            } else {
+                missing.push((index, key.clone()));
+            }
+        }
+        if missing.is_empty() {
+            return Ok(output);
+        }
+        let missing_keys = missing
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let values =
+            storage::load_commit_delta_values(&self.store, commit_id, &missing_keys).await?;
+        for ((index, key), value) in missing.into_iter().zip(values) {
+            self.commit_delta_value_cache
+                .insert((commit_id, key), value.clone());
+            output[index] = value;
+        }
+        Ok(output)
+    }
+
+    /// Replays a partially constrained rootless scan without first
+    /// reconstructing every tracked identity. The schema prefix is enough to
+    /// discard unrelated commit deltas at storage-read time; entity and file
+    /// filters are applied before they enter the logical overlay.
+    async fn replay_index_entries_for_request_at_commit(
+        &mut self,
+        commit_id: &str,
+        request: &TrackedStateTreeScanRequest,
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        let (commits, baseline_root) = self.point_replay_interval(commit_id).await?;
+
+        let baseline_request = TrackedStateTreeScanRequest {
+            include_tombstones: true,
+            limit: None,
+            ..request.clone()
+        };
+        let mut entries = if let Some(root_id) = baseline_root {
+            self.tree
+                .scan(&self.store, &root_id, &baseline_request)
+                .await?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>()
+        } else {
+            BTreeMap::new()
+        };
+        for commit_id in commits.iter().rev() {
+            for (key, delta) in
+                storage::scan_commit_delta_values(&self.store, *commit_id, &request.schema_keys)
+                    .await?
+            {
+                if !request.matches_key(&key) {
+                    continue;
+                }
+                let created_at = entries
+                    .get(&key)
+                    .map(TrackedStateIndexValue::created_at)
+                    .unwrap_or(delta.created_at);
+                entries.insert(
+                    key,
+                    TrackedStateIndexValue {
+                        change_id: delta.change_id,
+                        commit_id: delta.commit_id,
+                        deleted: delta.deleted,
+                        created_at,
+                        updated_at: delta.updated_at,
+                    },
+                );
+            }
+        }
+        let mut entries = entries
+            .into_iter()
+            .filter(|(key, value)| request.matches(key, value))
+            .collect::<Vec<_>>();
+        if let Some(limit) = request.limit {
+            entries.truncate(limit);
+        }
+        Ok(entries)
+    }
+
+    async fn point_replay_interval(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<(Vec<CommitId>, Option<TrackedStateRootId>), LixError> {
+        if let Some(interval) = self.point_replay_intervals.get(commit_id) {
+            return Ok(interval.clone());
+        }
+        let interval =
+            crate::tracked_state::commit_root_rebuild::load_first_parent_point_replay_interval(
+                &self.store,
+                commit_id,
+                &self.point_replay_intervals,
+            )
+            .await?;
+        for index in 0..interval.0.len() {
+            self.point_replay_intervals
+                .entry(interval.0[index].to_string())
+                .or_insert_with(|| (interval.0[index..].to_vec(), interval.1.clone()));
+        }
+        self.point_replay_intervals
+            .entry(commit_id.to_string())
+            .or_insert_with(|| interval.clone());
+        Ok(interval)
     }
 
     async fn commit_root_values_for_keys(
@@ -908,8 +1336,11 @@ where
         commit_id: &str,
         keys: &[TrackedStateKey],
     ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-        let root_id = self.load_ensured_root(commit_id).await?;
-        self.tree.get_many(&self.store, &root_id, keys).await
+        if let Some(root_id) = self.tree.load_root(&self.store, commit_id).await? {
+            return self.tree.get_many(&self.store, &root_id, keys).await;
+        }
+        self.replay_index_values_for_keys_at_commit(commit_id, keys)
+            .await
     }
 
     /// Plans a three-way merge by diffing both heads against the same base.
@@ -968,6 +1399,18 @@ impl<S> TrackedStateWriter<'_, S>
 where
     S: StorageAdapterRead + ?Sized,
 {
+    pub(crate) async fn stage_missing_commit_root_chain(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        crate::tracked_state::commit_root_rebuild::stage_missing_commit_root_chain(self, commit_id)
+            .await
+    }
+
+    pub(super) fn store(&self) -> &S {
+        self.store
+    }
+
     pub(crate) async fn validate_staged_commit_root_against_changelog(
         &self,
         commit_id: &str,
@@ -1073,7 +1516,16 @@ where
                     entity_pk: delta.entity_pk.clone(),
                 })
                 .collect::<Vec<_>>();
-            self.tree.get_many(self.store, base_root, &keys).await?
+            // A root fence can reconstruct several skipped ordinary commits
+            // into this same write set. Read through both staged root metadata
+            // and the chunk overlay so a child can preserve `created_at` from
+            // an ancestor whose chunks have not reached storage yet.
+            let staged_read = storage::TrackedStateStagedRead::new(
+                self.store,
+                self.staged_roots.values(),
+                &self.chunk_overlay,
+            )?;
+            self.tree.get_many(&staged_read, base_root, &keys).await?
         } else {
             vec![None; deltas.len()]
         };
@@ -1330,6 +1782,43 @@ fn tree_scan_request_from_tracked(
         // hidden, returning too few live rows.
         limit: None,
     }
+}
+
+/// Materializes an exact point set only when every identity component is
+/// specified. An unconstrained file id could match arbitrary file-local rows,
+/// so it deliberately retains the cold full-replay scan path.
+fn exact_keys_for_request(request: &TrackedStateTreeScanRequest) -> Option<Vec<TrackedStateKey>> {
+    if request.schema_keys.is_empty()
+        || request.entity_pks.is_empty()
+        || request.file_ids.is_empty()
+        || request
+            .file_ids
+            .iter()
+            .any(|filter| matches!(filter, NullableKeyFilter::Any))
+    {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(
+        request.schema_keys.len() * request.entity_pks.len() * request.file_ids.len(),
+    );
+    for schema_key in &request.schema_keys {
+        for entity_pk in &request.entity_pks {
+            for file_id in &request.file_ids {
+                keys.push(TrackedStateKey {
+                    schema_key: schema_key.clone(),
+                    entity_pk: entity_pk.clone(),
+                    file_id: match file_id {
+                        NullableKeyFilter::Null => None,
+                        NullableKeyFilter::Value(file_id) => Some(file_id.clone()),
+                        NullableKeyFilter::Any => unreachable!("Any was rejected above"),
+                    },
+                });
+            }
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    Some(keys)
 }
 
 fn validate_diff_row_against_changelog(
@@ -2123,7 +2612,7 @@ mod tests {
                 .expect("child commit_root delete should commit");
         }
 
-        tracked_state
+        let rootless_diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -2132,7 +2621,12 @@ mod tests {
             )
             .diff_commits("base", "child", &test_schema_diff_request())
             .await
-            .expect_err("diff should require durable roots before repair");
+            .expect("rootless history should remain diffable before repair");
+        assert_eq!(rootless_diff.entries.len(), 1);
+        assert_eq!(
+            rootless_diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Modified
+        );
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -2401,6 +2895,7 @@ mod tests {
                     format_version: 1,
                     commit_id: commit_a,
                     parent_commit_ids: vec![commit_b],
+                    tracked_state_rootless: false,
                     change_id: ChangeId::for_test_label("commit-a:commit"),
                     author_account_ids: Vec::new(),
                     created_at: crate::common::LixTimestamp::expect_parse(

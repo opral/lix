@@ -432,6 +432,7 @@ mod tests {
             format_version: 1,
             commit_id: id,
             parent_commit_ids: parent.into_iter().collect(),
+            tracked_state_rootless: false,
             change_id: ChangeId::for_test_label(&format!("{id}-change")),
             author_account_ids: Vec::new(),
             created_at: timestamp(),

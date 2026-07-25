@@ -6,21 +6,27 @@
 
 use std::collections::HashMap;
 
-use crate::changelog::CommitId;
+use crate::changelog::{ChangeId, CommitId};
+use crate::common::LixTimestamp;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageError,
+    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix,
+    StorageProjectedValue, StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId,
+    StorageValue, StorageWriteSet,
 };
-use crate::tracked_state::codec::PendingChunkWrite;
+use crate::tracked_state::codec::{
+    PendingChunkWrite, decode_key, encode_key_ref, encode_schema_key_prefix,
+};
 use crate::tracked_state::types::{
-    TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateRootId,
+    TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
 pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_NAMESPACE: &str = "tracked_state.commit_delta.v1";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -29,12 +35,31 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
     StorageSpaceId(0x0004_0004),
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
+/// Identity-addressable mutation records for each tracked commit.
+///
+/// Immutable roots are sparse checkpoints. This compact delta table keeps
+/// historical point reads bounded across rootless first-parent intervals:
+/// callers can probe only the requested identities instead of hydrating every
+/// changelog change merely to discover its key.
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0010),
+    TRACKED_STATE_COMMIT_DELTA_NAMESPACE,
+);
 
 // Version the root metadata independently of storage backends. Version 3 is a
 // hard cut for derived commit rows, prefix-friendly keys, and compact tree
 // nodes. Reject older roots before their differently ordered state can be
 // inherited or traversed.
 const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR3";
+
+#[derive(Debug, Clone, Copy, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct CommitDeltaValue {
+    change_id: ChangeId,
+    deleted: bool,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+}
 
 async fn get_one(
     store: &(impl StorageAdapterRead + ?Sized),
@@ -65,6 +90,16 @@ pub(crate) async fn load_root(
 /// UUIDv7 order matches the former hyphenated-text key order.
 fn commit_root_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
+}
+
+fn commit_delta_prefix(commit_id: CommitId) -> Vec<u8> {
+    commit_id.as_uuid().as_bytes().to_vec()
+}
+
+fn commit_delta_key(commit_id: CommitId, key: TrackedStateKeyRef<'_>) -> Vec<u8> {
+    let mut encoded = commit_delta_prefix(commit_id);
+    encoded.extend_from_slice(&encode_key_ref(key));
+    encoded
 }
 
 pub(crate) async fn load_commit_root(
@@ -113,6 +148,205 @@ pub(crate) fn stage_delete_commit_root(writes: &mut StorageWriteSet, commit_id: 
         TRACKED_STATE_COMMIT_ROOT_SPACE,
         key(commit_root_key(commit_id)),
     );
+}
+
+/// Removes every identity delta for a collected commit. Unlike immutable tree
+/// chunks, these keys are commit-addressed and therefore cannot be reclaimed
+/// by content-addressed storage maintenance.
+pub(crate) async fn stage_delete_commit_deltas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: CommitId,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        TRACKED_STATE_COMMIT_DELTA_SPACE,
+        StoragePrefix {
+            bytes: Bytes::from(commit_delta_prefix(commit_id)),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            writes.delete(TRACKED_STATE_COMMIT_DELTA_SPACE, entry.key);
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stage_commit_delta(
+    writes: &mut StorageWriteSet,
+    delta: TrackedStateDeltaRef<'_>,
+) -> Result<(), LixError> {
+    let key = commit_delta_key(
+        delta.commit_id,
+        TrackedStateKeyRef {
+            schema_key: delta.schema_key,
+            file_id: delta.file_id,
+            entity_pk: delta.entity_pk,
+        },
+    );
+    let value = CommitDeltaValue {
+        change_id: delta.change_id,
+        deleted: delta.deleted,
+        created_at: delta.created_at,
+        updated_at: delta.updated_at,
+    };
+    writes.put(
+        TRACKED_STATE_COMMIT_DELTA_SPACE,
+        self::key(key),
+        self::value(storage_codec::encode("tracked_state commit_delta", &value)?),
+    );
+    Ok(())
+}
+
+pub(crate) async fn load_commit_delta_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    keys: &[TrackedStateKey],
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let storage_keys = keys
+        .iter()
+        .map(|key| {
+            StorageKey(Bytes::from(commit_delta_key(
+                commit_id,
+                TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                },
+            )))
+        })
+        .collect::<Vec<_>>();
+    let result = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
+    result
+        .value
+        .into_iter()
+        .map(|value| {
+            let Some(value) = value else {
+                return Ok(None);
+            };
+            let bytes = full_value(value).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta point read returned key-only value",
+                )
+            })?;
+            let value =
+                storage_codec::decode::<CommitDeltaValue>("tracked_state commit_delta", &bytes)?;
+            Ok(Some(TrackedStateIndexValue {
+                change_id: value.change_id,
+                commit_id,
+                deleted: value.deleted,
+                created_at: value.created_at,
+                updated_at: value.updated_at,
+            }))
+        })
+        .collect()
+}
+
+/// Scans only the mutations in one commit that belong to one of the requested
+/// schemas. This is the partial-key counterpart to
+/// [`load_commit_delta_values`]: it avoids hydrating unrelated changelog
+/// changes when a history provider knows the schema but not every identity.
+pub(crate) async fn scan_commit_delta_values(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    schema_keys: &[String],
+) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+    let commit_prefix = commit_delta_prefix(commit_id);
+    let mut prefixes = if schema_keys.is_empty() {
+        vec![commit_prefix.clone()]
+    } else {
+        schema_keys
+            .iter()
+            .map(|schema_key| {
+                let mut prefix = commit_prefix.clone();
+                prefix.extend_from_slice(&encode_schema_key_prefix(schema_key));
+                prefix
+            })
+            .collect::<Vec<_>>()
+    };
+    prefixes.sort();
+    prefixes.dedup();
+
+    let mut entries = Vec::new();
+    for prefix in prefixes {
+        let plan = ScanPlan::prefix(
+            TRACKED_STATE_COMMIT_DELTA_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(prefix.clone()),
+            },
+        );
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    store,
+                    StorageScanOptions {
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?;
+            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                let encoded_key = entry
+                    .key
+                    .0
+                    .strip_prefix(commit_prefix.as_slice())
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "tracked_state commit_delta scan escaped its commit prefix",
+                        )
+                    })?;
+                let key = decode_key(encoded_key)?;
+                let bytes = full_value(entry.value).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "tracked_state commit_delta scan returned key-only value",
+                    )
+                })?;
+                let value = storage_codec::decode::<CommitDeltaValue>(
+                    "tracked_state commit_delta",
+                    &bytes,
+                )?;
+                entries.push((
+                    key,
+                    TrackedStateIndexValue {
+                        change_id: value.change_id,
+                        commit_id,
+                        deleted: value.deleted,
+                        created_at: value.created_at,
+                        updated_at: value.updated_at,
+                    },
+                ));
+            }
+            if !page.value.has_more || resume_after.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(entries)
 }
 
 pub(crate) async fn read_chunk(
@@ -340,8 +574,9 @@ mod tests {
     };
 
     use super::{
-        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root, encode_commit_root,
+        TRACKED_STATE_COMMIT_DELTA_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
+        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root,
+        encode_commit_root,
     };
 
     #[test]
@@ -351,6 +586,7 @@ mod tests {
             JSON_SPACE,
             TRACKED_STATE_TREE_CHUNK_SPACE,
             TRACKED_STATE_COMMIT_ROOT_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,

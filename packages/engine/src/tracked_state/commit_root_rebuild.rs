@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -63,7 +63,26 @@ where
     Ok(report)
 }
 
-async fn load_rebuild_plans_to_nearest_available_root<S>(
+/// Stages every missing first-parent root from the nearest durable checkpoint
+/// through `commit_id` into one caller-owned root writer. Normal commits no
+/// longer materialize roots, so merge/checkpoint fences use this cold helper
+/// to recover their first-parent base without exposing an intermediate write.
+pub(crate) async fn stage_missing_commit_root_chain<S>(
+    writer: &mut TrackedStateWriter<'_, S>,
+    commit_id: &str,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let plans =
+        load_rebuild_plans_to_nearest_available_root(writer.store(), commit_id, false).await?;
+    for plan in plans.iter().rev() {
+        stage_rebuild_plan_with_writer(writer, plan).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn load_rebuild_plans_to_nearest_available_root<S>(
     store: &S,
     commit_id: &str,
     force_head: bool,
@@ -101,6 +120,123 @@ where
         force_current = false;
     }
     Ok(plans)
+}
+
+/// Loads the first-parent interval required for a read-only historical
+/// replay. Unlike root repair, this deliberately trusts the presence of a
+/// durable checkpoint and never recursively validates/rebuilds it; that keeps
+/// the returned future `Send` for DataFusion's asynchronous providers.
+pub(crate) async fn load_first_parent_replay_plans<S>(
+    store: &S,
+    commit_id: &str,
+) -> Result<Vec<CommitRootRebuildPlan>, LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut plans = Vec::new();
+    let mut current_commit_id = commit_id.to_string();
+    let mut seen_commit_ids = HashSet::new();
+    loop {
+        if !seen_commit_ids.insert(current_commit_id.clone()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
+        }
+        if storage::load_root(store, &current_commit_id)
+            .await?
+            .is_some()
+        {
+            return Ok(plans);
+        }
+        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
+        let parent_commit_id = plan.parent_commit_id;
+        plans.push(plan);
+        let Some(parent_commit_id) = parent_commit_id else {
+            return Ok(plans);
+        };
+        current_commit_id = parent_commit_id.to_string();
+    }
+}
+
+/// Locates a rootless first-parent interval for an identity-routed read.
+///
+/// Unlike [`load_first_parent_replay_plans`], this reads commit records only:
+/// the caller consults the commit-delta index for the requested identities, so
+/// it must not hydrate every change ref just to discover unrelated keys.
+pub(crate) async fn load_first_parent_point_replay_interval<S>(
+    store: &S,
+    commit_id: &str,
+    cached_intervals: &HashMap<String, (Vec<CommitId>, Option<TrackedStateRootId>)>,
+) -> Result<(Vec<CommitId>, Option<TrackedStateRootId>), LixError>
+where
+    S: StorageAdapterRead + ?Sized,
+{
+    let mut commits = Vec::new();
+    let mut current_commit_id =
+        CommitId::parse_lix(commit_id, "tracked-state point replay commit_id")?;
+    let mut seen_commit_ids = HashSet::new();
+    let mut reader = ChangelogContext::new().reader(store);
+    loop {
+        if !seen_commit_ids.insert(current_commit_id) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "cannot point-replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
+                ),
+            ));
+        }
+        let batch = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[current_commit_id],
+                projection: CommitProjection::Record,
+            })
+            .await?;
+        let record = match batch.entries.into_iter().next().flatten() {
+            Some(CommitLoadEntry::Record(record)) => record,
+            Some(CommitLoadEntry::Full { .. }) => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "changelog returned a full commit load for tracked-state point replay",
+                ));
+            }
+            None => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "cannot point-replay tracked_state for unknown commit '{current_commit_id}'"
+                    ),
+                ));
+            }
+        };
+        if record.tracked_state_rootless && record.parent_commit_ids.len() > 1 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "rootless tracked-state commit '{current_commit_id}' has {} parents",
+                    record.parent_commit_ids.len()
+                ),
+            ));
+        }
+        if !record.tracked_state_rootless
+            && let Some(root_id) = storage::load_root(store, &current_commit_id.to_string()).await?
+        {
+            return Ok((commits, Some(root_id)));
+        }
+        commits.push(current_commit_id);
+        let Some(parent_commit_id) = first_parent_commit_id(&record) else {
+            return Ok((commits, None));
+        };
+        if let Some((tail_commits, baseline_root)) =
+            cached_intervals.get(&parent_commit_id.to_string())
+        {
+            commits.extend(tail_commits.iter().copied());
+            return Ok((commits, baseline_root.clone()));
+        }
+        current_commit_id = parent_commit_id;
+    }
 }
 
 fn load_available_root<'a, S>(
@@ -184,10 +320,10 @@ where
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommitRootRebuildPlan {
-    commit_id: CommitId,
-    parent_commit_id: Option<CommitId>,
-    deltas: Vec<CommitRootRebuildDelta>,
+pub(crate) struct CommitRootRebuildPlan {
+    pub(crate) commit_id: CommitId,
+    pub(crate) parent_commit_id: Option<CommitId>,
+    pub(crate) deltas: Vec<CommitRootRebuildDelta>,
 }
 
 async fn load_commit_root_rebuild_plan<S>(
@@ -262,7 +398,7 @@ where
     })
 }
 
-async fn stage_rebuild_plan_with_writer<S>(
+pub(crate) async fn stage_rebuild_plan_with_writer<S>(
     writer: &mut TrackedStateWriter<'_, S>,
     plan: &CommitRootRebuildPlan,
 ) -> Result<TrackedStateWriteReport, LixError>

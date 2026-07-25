@@ -1530,6 +1530,7 @@ mod tests {
                 format_version: 1,
                 commit_id,
                 parent_commit_ids: Vec::new(),
+                tracked_state_rootless: false,
                 change_id: ChangeId::for_test_label(&format!("{label}-commit-change-{index}")),
                 author_account_ids: Vec::new(),
                 created_at: ts("2026-05-20T00:00:00Z"),

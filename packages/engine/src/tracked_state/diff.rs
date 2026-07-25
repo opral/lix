@@ -90,6 +90,8 @@ where
     S: crate::storage_adapter::StorageAdapterRead,
 {
     let scan_request = scan_request_for_diff(request);
+    let roots_are_available = reader.has_durable_commit_root(left_commit_id).await?
+        && reader.has_durable_commit_root(right_commit_id).await?;
     let tree_entries = reader
         .diff_tree_entries_at_commits(left_commit_id, right_commit_id, &scan_request)
         .await?;
@@ -116,9 +118,21 @@ where
             rows_to_validate.push(after);
         }
     }
-    let payloads = reader
-        .validate_diff_rows_and_load_payloads(&rows_to_validate)
-        .await?;
+    let payloads = if roots_are_available {
+        reader
+            .validate_diff_rows_and_load_payloads(&rows_to_validate)
+            .await?
+    } else {
+        // Rootless rows were reconstructed directly from the canonical
+        // changelog interval. There is no independently stored tree to audit;
+        // loading the same payloads supplies diff's cross-change comparison
+        // without forcing a cold historical read to materialize roots.
+        let change_ids = rows_to_validate
+            .iter()
+            .map(|row| row.change_id)
+            .collect::<Vec<_>>();
+        reader.load_change_payloads(&change_ids).await?
+    };
 
     // Rows are identity-only; payload equality needs the change records when
     // a live/live pair carries different change ids (cross-branch writes can

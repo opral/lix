@@ -8,8 +8,10 @@ use crate::LixError;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader};
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
-    CommitRecord, TransactionChangeRecordRef, TransactionChangelogAppend,
+    ChangeId, ChangeRecord, ChangelogContext, ChangelogReader, ChangelogWriter, CommitChangeRefSet,
+    CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
+    CommitProjection as ChangelogCommitProjection, CommitRecord, TransactionChangeRecordRef,
+    TransactionChangelogAppend,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -23,9 +25,9 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, encode_key_ref,
+    TRACKED_STATE_COMMIT_DELTA_SPACE, TrackedStateContext, TrackedStateDeltaRef,
+    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
+    TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref, stage_commit_delta,
 };
 use crate::transaction::staging::{
     PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
@@ -101,6 +103,7 @@ pub(crate) async fn commit_prepared_writes(
     let commit_rows = finalized.commit_rows;
     let branch_heads = finalized.branch_heads;
     let tracked_roots = finalized.tracked_roots;
+    let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
     let mut engine_rows = branch_heads
         .iter()
         .map(branch_ref_current_row)
@@ -149,6 +152,7 @@ pub(crate) async fn commit_prepared_writes(
         &compactable_change_ids,
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
+        has_checkpoint_publication,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -156,9 +160,17 @@ pub(crate) async fn commit_prepared_writes(
     ))
     .await?;
 
+    stage_tracked_commit_delta_index(
+        &mut writes,
+        &state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &tracked_roots,
+        &staged_commits,
+    )?;
+
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
 
-    let tracked_root_ids = stage_tracked_roots(
+    stage_tracked_roots(
         read,
         &mut writes,
         &state_rows,
@@ -166,6 +178,7 @@ pub(crate) async fn commit_prepared_writes(
         &tracked_roots,
         &staged_commits,
         &insert_identities,
+        has_checkpoint_publication,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -179,7 +192,7 @@ pub(crate) async fn commit_prepared_writes(
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
         &staged_commits,
-        &tracked_root_ids,
+        &insert_identities,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -285,6 +298,7 @@ async fn stage_changelog_commits(
     compact_change_ids: &[ChangeId],
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     commit_rows: &[FinalizedCommitRow],
+    force_root_fence: bool,
 ) -> Result<BTreeMap<CommitId, StagedChangelogCommit>, LixError> {
     let mut commits = Vec::with_capacity(commit_rows.len());
     let changes = state_rows
@@ -329,6 +343,9 @@ async fn stage_changelog_commits(
             format_version: 1,
             commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
+            tracked_state_rootless: !force_root_fence
+                && commit_row.parent_commit_ids.len() <= 1
+                && commit_row.selected_change_refs.is_empty(),
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
@@ -573,14 +590,7 @@ async fn stage_flat_current_rows(
         {
             return Err(branch_ref_with_untracked_rows_error(&branch_id, false));
         }
-        crate::tracked_state::load_root(read, commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!("branch ref targets commit '{commit_id}' without a tracked root"),
-                )
-            })?;
+        ensure_branch_ref_target_exists(read, commit_id).await?;
     }
 
     let branch_ids = state_rows
@@ -625,7 +635,7 @@ async fn stage_flat_current_rows(
             continue;
         }
 
-        // Tracked rows are served exclusively from immutable commit roots.
+        // Tracked rows are served from the durable tracked-head projection.
         // On the normal path the branch has no untracked sidecar rows, so a
         // single range-empty precondition proves there is no durability
         // collision. Do not construct one mutable-index delta per tracked row
@@ -696,6 +706,30 @@ async fn stage_flat_current_rows(
         .collect::<BTreeSet<_>>();
     compactable_change_ids.retain(|change_id| !new_ids.contains(change_id));
     Ok(compactable_change_ids.into_iter().collect())
+}
+
+/// A branch ref targets changelog history, not an implementation detail of
+/// its sparse immutable-root checkpoints. Ordinary v4 commits intentionally
+/// have no root, so validate the canonical commit record instead.
+async fn ensure_branch_ref_target_exists(
+    read: &(impl StorageAdapterRead + ?Sized),
+    commit_id: &str,
+) -> Result<(), LixError> {
+    let typed_commit_id = CommitId::parse_lix(commit_id, "branch ref target commit")?;
+    let commits = ChangelogContext::new()
+        .reader(read)
+        .load_commits(ChangelogCommitLoadRequest {
+            commit_ids: &[typed_commit_id],
+            projection: ChangelogCommitProjection::Record,
+        })
+        .await?;
+    if commits.entries.into_iter().next().flatten().is_some() {
+        return Ok(());
+    }
+    Err(LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("branch ref targets unknown commit '{commit_id}'"),
+    ))
 }
 
 async fn load_current_branch_ref_commit_id<S>(
@@ -871,6 +905,59 @@ fn tracked_head_delta_from_state_row(
     })
 }
 
+/// Stages a compact, identity-addressable change record for every tracked
+/// commit. Sparse immutable roots remain the scan/checkpoint structure; this
+/// index is the missing point-read structure for rootless first-parent
+/// history.
+fn stage_tracked_commit_delta_index(
+    writes: &mut StorageWriteSet,
+    state_rows: &[PreparedStateRow],
+    tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
+    tracked_roots: &[PendingTrackedRoot],
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+) -> Result<(), LixError> {
+    let delta_count = tracked_roots
+        .iter()
+        .map(|root| {
+            tracked_row_indices_by_commit
+                .get(&root.commit_id)
+                .map_or(0, Vec::len)
+                + staged_commits
+                    .get(&root.commit_id)
+                    .map_or(0, |staged| staged.selected_change_refs.len())
+        })
+        .sum::<usize>();
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SPACE, delta_count, 0);
+    for root in tracked_roots {
+        for &row_index in tracked_row_indices_by_commit
+            .get(&root.commit_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+        {
+            stage_commit_delta(
+                writes,
+                tracked_delta_from_state_row(&state_rows[row_index])?,
+            )?;
+        }
+        let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked commit '{}' has no changelog facts for commit-delta staging",
+                    root.commit_id
+                ),
+            )
+        })?;
+        for change_ref in &staged.selected_change_refs {
+            stage_commit_delta(
+                writes,
+                tracked_delta_from_selected_change_ref(change_ref, root.commit_id)?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Stages the generation-keyed head projection only for normal prepared
 /// rows. Merge/checkpoint selected references stay on the immutable-root
 /// fallback until their next ordinary child commit bootstraps a generation.
@@ -882,20 +969,11 @@ async fn stage_tracked_head(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    tracked_root_ids: &BTreeMap<CommitId, crate::tracked_state::TrackedStateRootId>,
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
 ) -> Result<(), LixError> {
     let tracked_head = TrackedHeadContext::new();
     let mut writer = tracked_head.writer(read, writes);
     for root in tracked_roots_parent_first(tracked_roots)? {
-        let Some(new_root) = tracked_root_ids.get(&root.commit_id).cloned() else {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked head for commit '{}' has no staged immutable root",
-                    root.commit_id
-                ),
-            ));
-        };
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -916,32 +994,41 @@ async fn stage_tracked_head(
             .iter()
             .map(|&row_index| tracked_head_delta_from_state_row(&state_rows[row_index]))
             .collect::<Result<Vec<_>, _>>()?;
+        let absence_guards = state_row_indices
+            .iter()
+            .filter_map(|&row_index| {
+                let row = &state_rows[row_index];
+                tracked_row_requires_absence(row, insert_identities).then(|| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+            })
+            .collect::<BTreeSet<_>>();
 
-        let parent_root = match root.parent_commit_id {
+        // The v4 marker is the durable authority for current state. It is
+        // intentionally bound only to the first-parent commit: serial normal
+        // commits can append deltas without materializing an immutable root.
+        let parent_is_current = match root.parent_commit_id {
             Some(parent_commit_id) => {
-                crate::tracked_state::load_root(read, &parent_commit_id.to_string()).await?
-            }
-            None => None,
-        };
-        // A marker must be bound to both the first parent commit and the
-        // immutable root. A ref move or explicit root rebuild therefore
-        // creates a fresh generation rather than mutating stale state.
-        let parent_is_current = match (root.parent_commit_id, parent_root.as_ref()) {
-            (Some(parent_commit_id), Some(parent_root)) => {
                 tracked_head
                     .reader(read)
-                    .is_current(&root.branch_id, &parent_commit_id.to_string(), parent_root)
+                    .is_current(&root.branch_id, &parent_commit_id.to_string())
                     .await?
             }
-            _ => false,
+            None => false,
         };
         let parent_rows = if parent_is_current || root.parent_commit_id.is_none() {
             None
         } else if let Some(parent_commit_id) = root.parent_commit_id {
             // A parent staged earlier in this same write set is not visible
-            // through `read`; leave this rare nested path on the root
-            // fallback instead of publishing a partial generation.
-            if parent_root.is_none() {
+            // through `read`; publish no partial generation. Once committed,
+            // current reads safely take the changelog-replay fallback until a
+            // following ordinary child bootstraps a complete v4 head.
+            if tracked_roots
+                .iter()
+                .any(|candidate| candidate.commit_id == parent_commit_id)
+            {
                 continue;
             }
             Some(
@@ -967,10 +1054,9 @@ async fn stage_tracked_head(
             .stage_commit(
                 &root.branch_id,
                 root.parent_commit_id,
-                parent_root.as_ref(),
                 root.commit_id,
-                new_root,
                 &deltas,
+                &absence_guards,
                 parent_rows,
             )
             .await?;
@@ -986,11 +1072,31 @@ async fn stage_tracked_roots(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
-) -> Result<BTreeMap<CommitId, crate::tracked_state::TrackedStateRootId>, LixError> {
+    force_root_fence: bool,
+) -> Result<(), LixError> {
+    let root_fence_ids = tracked_root_fence_ids(tracked_roots, force_root_fence);
+    if root_fence_ids.is_empty() {
+        return Ok(());
+    }
     let tracked_state = TrackedStateContext::new();
     let mut tracked_writer = tracked_state.writer(read, writes);
-    let mut root_ids = BTreeMap::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
+        if !root_fence_ids.contains(&root.commit_id) {
+            continue;
+        }
+        if let Some(parent_commit_id) = root.parent_commit_id
+            && !root_fence_ids.contains(&parent_commit_id)
+        {
+            // Ordinary commits deliberately omit immutable roots. A
+            // merge/checkpoint fence still needs a canonical first-parent
+            // root, so reconstruct the cold chain in this same root writer
+            // before staging the fence. Keeping one overlay makes the newly
+            // staged ancestors visible to the fence without a second storage
+            // transaction.
+            tracked_writer
+                .stage_missing_commit_root_chain(&parent_commit_id.to_string())
+                .await?;
+        }
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1031,7 +1137,7 @@ async fn stage_tracked_roots(
                 file_id: first_row.file_id.as_deref(),
                 entity_pk: &first_row.entity_pk,
             });
-            if let Some(report) = tracked_writer
+            if tracked_writer
                 .try_stage_bulk_parent_root_from_ordered_mutations(
                     &commit_id_text,
                     parent_commit_id_text.as_deref(),
@@ -1046,8 +1152,8 @@ async fn stage_tracked_roots(
                     }),
                 )
                 .await?
+                .is_some()
             {
-                root_ids.insert(root.commit_id, report.root_id);
                 continue;
             }
         }
@@ -1081,7 +1187,7 @@ async fn stage_tracked_roots(
         // also preserves the one-mutation path for ordinary singleton writes.
         let commit_id_text = root.commit_id.to_string();
         let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
-        let report = tracked_writer
+        tracked_writer
             .stage_commit_root_with_absence_guards(
                 &commit_id_text,
                 parent_commit_id_text.as_deref(),
@@ -1089,58 +1195,42 @@ async fn stage_tracked_roots(
                 &absence_guards,
             )
             .await?;
-        root_ids.insert(root.commit_id, report.root_id);
     }
-    let rooted_commit_ids = tracked_roots
+    Ok(())
+}
+
+/// Immutable roots are a cold-path history structure. Keep them at topology
+/// and checkpoint fences, plus any staged first-parent ancestors necessary to
+/// build that fence in one atomic write set. Ordinary serial commits are
+/// represented only by the changelog and the v4 durable head projection.
+fn tracked_root_fence_ids(
+    tracked_roots: &[PendingTrackedRoot],
+    force_all: bool,
+) -> BTreeSet<CommitId> {
+    if force_all {
+        return tracked_roots.iter().map(|root| root.commit_id).collect();
+    }
+    let roots_by_id = tracked_roots
         .iter()
+        .map(|root| (root.commit_id, root))
+        .collect::<BTreeMap<_, _>>();
+    let mut required = tracked_roots
+        .iter()
+        .filter(|root| root.requires_root)
         .map(|root| root.commit_id)
         .collect::<BTreeSet<_>>();
-    let extra_tracked = tracked_row_indices_by_commit
-        .keys()
-        .filter(|commit_id| !rooted_commit_ids.contains(commit_id))
-        .copied()
-        .collect::<BTreeSet<_>>();
-    if !extra_tracked.is_empty() {
-        let mut commit_ids = tracked_row_indices_by_commit
-            .keys()
-            .copied()
+    loop {
+        let ancestors = required
+            .iter()
+            .filter_map(|commit_id| roots_by_id[commit_id].parent_commit_id)
+            .filter(|parent_id| roots_by_id.contains_key(parent_id))
             .collect::<Vec<_>>();
-        commit_ids.sort();
-        commit_ids.dedup();
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "tracked live_state rows have no finalized root metadata for commit ids: {}",
-                commit_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
-    }
-    if !staged_commits.is_empty() {
-        let commit_ids = staged_commits
-            .keys()
-            .filter(|commit_id| !rooted_commit_ids.contains(commit_id))
-            .copied()
-            .collect::<Vec<_>>();
-        if commit_ids.is_empty() {
-            return Ok(root_ids);
+        let before = required.len();
+        required.extend(ancestors);
+        if required.len() == before {
+            return required;
         }
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "changelog staged commits without tracked root metadata: {}",
-                commit_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        ));
     }
-    Ok(root_ids)
 }
 
 fn tracked_state_rows_are_strictly_sorted(
@@ -1270,6 +1360,7 @@ struct PendingTrackedRoot {
     branch_id: String,
     commit_id: CommitId,
     parent_commit_id: Option<CommitId>,
+    requires_root: bool,
 }
 
 async fn finalize_commit_rows(
@@ -1312,6 +1403,7 @@ async fn finalize_commit_rows(
                 .unwrap_or_default(),
         );
         let parent_commit_id = parent_commit_ids.first().copied();
+        let requires_root = parent_commit_ids.len() > 1 || !selected_change_refs.is_empty();
 
         commit_rows.push(FinalizedCommitRow {
             commit_id,
@@ -1330,6 +1422,7 @@ async fn finalize_commit_rows(
             branch_id,
             commit_id,
             parent_commit_id,
+            requires_root,
         });
     }
 
@@ -1361,15 +1454,17 @@ mod tests {
     use crate::branch::BranchContext;
     use crate::catalog::SchemaPlanId;
     use crate::changelog::ChangelogReader;
-    use crate::live_state::{LiveStateContext, LiveStateRowRequest};
-    use crate::live_state::{LiveStateIndexContext, LiveStateIndexRowRequest};
+    use crate::live_state::{
+        LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+        LiveStateIndexContext, LiveStateIndexRowRequest, LiveStateProjection, LiveStateRowRequest,
+    };
     use crate::storage::{
         CommitResult, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ScanChunk, ScanOptions,
         SpaceId, Storage, StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
-        StorageReadOptions, StorageWriteOptions,
+        StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
     use crate::transaction::types::PreparedRowFacts;
     use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
@@ -1383,6 +1478,15 @@ mod tests {
     // `tracked_state::storage` intentionally keeps this internal; this test
     // observes the durable space rather than reaching through that module.
     const TRACKED_STATE_TREE_CHUNK_SPACE_ID: SpaceId = SpaceId(0x0004_0001);
+    const TRACKED_STATE_COMMIT_ROOT_SPACE_ID: SpaceId = SpaceId(0x0004_0004);
+    const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
+        TRACKED_STATE_TREE_CHUNK_SPACE_ID,
+        "tracked_state.tree_chunk",
+    );
+    const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::new(
+        TRACKED_STATE_COMMIT_ROOT_SPACE_ID,
+        "tracked_state.commit_root",
+    );
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(
@@ -1399,6 +1503,8 @@ mod tests {
         row_scan_calls: AtomicUsize,
         tree_chunk_get_many_calls: AtomicUsize,
         tree_chunk_scan_calls: AtomicUsize,
+        commit_root_get_many_calls: AtomicUsize,
+        commit_root_scan_calls: AtomicUsize,
     }
 
     struct CountingTrackedHeadRead {
@@ -1428,6 +1534,11 @@ mod tests {
                     .tree_chunk_get_many_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
+            if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                self.counts
+                    .commit_root_get_many_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.inner.get_many(space, keys, opts).await
         }
 
@@ -1443,6 +1554,11 @@ mod tests {
             if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
                 self.counts
                     .tree_chunk_scan_calls
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                self.counts
+                    .commit_root_scan_calls
                     .fetch_add(1, Ordering::Relaxed);
             }
             self.inner.scan(space, range, opts).await
@@ -1487,7 +1603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_staged_writes_appends_changelog_and_updates_commit_root() {
+    async fn ordinary_tracked_commit_appends_changelog_without_materializing_root() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -1518,6 +1634,14 @@ mod tests {
         )
         .await
         .expect("commit should flush staged rows");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must not write immutable tree chunks"
+        );
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must not write commit-root metadata"
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1586,7 +1710,7 @@ mod tests {
                 },
             )
             .await
-            .expect("commit root should scan");
+            .expect("rootless commit history should replay");
         assert!(
             commit_rows.is_empty(),
             "commit rows are derived from changelog.commit, not stored in tracked roots"
@@ -1629,6 +1753,265 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rootless_serial_history_replays_scan_and_diff() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+
+        let mut first = tracked_global_row("rootless-first-change");
+        first.commit_id = Some(commit_id("rootless-first-commit"));
+        first.created_at = ts("2026-01-01T00:00:00Z");
+        first.updated_at = first.created_at;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("first commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![first],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs_with(
+                        ["rootless-first-change"],
+                        "rootless-first-commit",
+                        "rootless-first-commit-change",
+                        "rootless-first-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("first rootless commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "first ordinary commit must remain rootless"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("first rootless commit should persist");
+
+        let mut second = tracked_global_row("rootless-second-change");
+        second.commit_id = Some(commit_id("rootless-second-commit"));
+        second.created_at = ts("2026-01-02T00:00:00Z");
+        second.updated_at = second.created_at;
+        second.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({ "value": 2 }),
+                ),
+                "second rootless tracked row snapshot",
+            )
+            .expect("second snapshot should stage"),
+        );
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![second],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs_with(
+                        ["rootless-second-change"],
+                        "rootless-second-commit",
+                        "rootless-second-commit-change",
+                        "rootless-second-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("second rootless commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must remain rootless"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("second rootless commit should persist");
+
+        let mut reader = TrackedStateContext::new().reader(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("historical read should open"),
+        );
+        let request = TrackedStateScanRequest::default();
+        let first_rows = reader
+            .scan_rows_at_commit(&commit_id_text("rootless-first-commit"), &request)
+            .await
+            .expect("first rootless commit should replay");
+        assert!(matches!(
+            first_rows.as_slice(),
+            [row] if row.change_id == change_id("rootless-first-change")
+                && row.snapshot_content.as_deref() == Some("{\"value\":1}")
+        ));
+        let second_rows = reader
+            .scan_rows_at_commit(&commit_id_text("rootless-second-commit"), &request)
+            .await
+            .expect("second rootless commit should replay");
+        assert!(matches!(
+            second_rows.as_slice(),
+            [row] if row.change_id == change_id("rootless-second-change")
+                && row.created_at == "2026-01-01T00:00:00.000Z"
+                && row.snapshot_content.as_deref() == Some("{\"value\":2}")
+        ));
+        let diff = reader
+            .diff_commits(
+                &commit_id_text("rootless-first-commit"),
+                &commit_id_text("rootless-second-commit"),
+                &crate::tracked_state::TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("rootless commits should diff from replayed state");
+        assert!(matches!(
+            diff.entries.as_slice(),
+            [entry] if entry.kind == crate::tracked_state::TrackedStateDiffKind::Modified
+        ));
+    }
+
+    #[tokio::test]
+    async fn root_fence_materializes_a_rootless_first_parent_chain() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+
+        let mut normal = tracked_global_row("fence-normal-change");
+        normal.commit_id = Some(commit_id("fence-normal-commit"));
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("normal commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![normal],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs_with(
+                        ["fence-normal-change"],
+                        "fence-normal-commit",
+                        "fence-normal-commit-change",
+                        "fence-normal-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("normal rootless commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "ordinary parent must not materialize a root"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("normal rootless commit should persist");
+
+        let mut fence_refs = change_refs_with(
+            [],
+            "fence-commit",
+            "fence-commit-change",
+            "fence-branch-ref-change",
+        );
+        fence_refs.add_selected_change_ref(StagedCommitChangeRef {
+            schema_key: "test_schema".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("entity-1"),
+            change_id: change_id("fence-normal-change"),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+        });
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fence commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: Vec::new(),
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    fence_refs,
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("fence should rebuild its rootless first-parent chain");
+        assert!(
+            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "selected-reference fence must materialize history roots"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("fence should persist atomically");
+
+        let rows = TrackedStateContext::new()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("fence read should open"),
+            )
+            .scan_rows_at_commit(
+                &commit_id_text("fence-commit"),
+                &TrackedStateScanRequest::default(),
+            )
+            .await
+            .expect("fence root should serve history");
+        assert!(matches!(
+            rows.as_slice(),
+            [row] if row.change_id == change_id("fence-normal-change")
+        ));
+    }
+
+    #[tokio::test]
     async fn normal_tracked_commit_live_reads_select_head_projection() {
         let memory = Memory::new();
         let storage = StorageAdapter::new(memory.clone());
@@ -1659,6 +2042,14 @@ mod tests {
         )
         .await
         .expect("normal tracked commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE),
+            "an ordinary tracked commit must not write immutable tree chunks"
+        );
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "an ordinary tracked commit must not write commit-root metadata"
+        );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1704,6 +2095,16 @@ mod tests {
             0,
             "a current head projection must avoid immutable-tree chunk scans"
         );
+        assert_eq!(
+            counts.commit_root_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "a current head projection must not first look up root metadata"
+        );
+        assert_eq!(
+            counts.commit_root_scan_calls.load(Ordering::Relaxed),
+            0,
+            "a current head projection must not scan root metadata"
+        );
 
         let loaded = live_state_context()
             .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
@@ -1722,6 +2123,32 @@ mod tests {
             counts.row_get_many_calls.load(Ordering::Relaxed) > 0,
             "the exact tracked lookup must point-read the head projection"
         );
+
+        let exact_rows = live_state_context()
+            .reader(StorageAdapterReadScope::new(CountingTrackedHeadRead {
+                inner: memory
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("counted exact batch read should open"),
+                counts: Arc::clone(&counts),
+            }))
+            .load_exact_rows(&LiveStateExactBatchRequest {
+                rows: vec![LiveStateExactRowRequest {
+                    schema_key: "test_schema".to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    entity_pk: EntityPk::single("entity-1"),
+                    file_id: None,
+                }],
+                projection: LiveStateProjection::default(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await
+            .expect("exact tracked batch should succeed");
+        assert!(matches!(
+            exact_rows.as_slice(),
+            [Some(row)] if row.change_id == Some(change_id("tracked-head-change"))
+        ));
         assert_eq!(
             counts.tree_chunk_get_many_calls.load(Ordering::Relaxed),
             0,
@@ -1731,6 +2158,16 @@ mod tests {
             counts.tree_chunk_scan_calls.load(Ordering::Relaxed),
             0,
             "neither serving read may scan immutable-tree chunks"
+        );
+        assert_eq!(
+            counts.commit_root_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "neither serving read may look up root metadata"
+        );
+        assert_eq!(
+            counts.commit_root_scan_calls.load(Ordering::Relaxed),
+            0,
+            "neither serving read may scan root metadata"
         );
     }
 
@@ -1822,36 +2259,22 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("marker read should open");
-        let global_root =
-            crate::tracked_state::load_root(&marker_read, &commit_id_text("global-head"))
-                .await
-                .expect("global root should load")
-                .expect("global root should exist");
-        let branch_root =
-            crate::tracked_state::load_root(&marker_read, &commit_id_text("branch-head"))
-                .await
-                .expect("branch root should load")
-                .expect("branch root should exist");
         let tracked_head = TrackedHeadContext::new();
         assert!(
             tracked_head
                 .reader(&marker_read)
-                .is_current(
-                    GLOBAL_BRANCH_ID,
-                    &commit_id_text("global-head"),
-                    &global_root
-                )
+                .is_current(GLOBAL_BRANCH_ID, &commit_id_text("global-head"))
                 .await
                 .expect("global head marker should load"),
-            "the global marker must bind its current branch ref and root"
+            "the global marker must bind its current branch ref"
         );
         assert!(
             tracked_head
                 .reader(&marker_read)
-                .is_current("branch-a", &commit_id_text("branch-head"), &branch_root)
+                .is_current("branch-a", &commit_id_text("branch-head"))
                 .await
                 .expect("branch head marker should load"),
-            "the branch marker must bind its current branch ref and root"
+            "the branch marker must bind its current branch ref"
         );
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
@@ -1986,6 +2409,16 @@ mod tests {
             0,
             "current global and branch projections must avoid immutable-tree scans"
         );
+        assert_eq!(
+            counts.commit_root_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "current global and branch projections must not look up root metadata"
+        );
+        assert_eq!(
+            counts.commit_root_scan_calls.load(Ordering::Relaxed),
+            0,
+            "current global and branch projections must not scan root metadata"
+        );
     }
 
     #[tokio::test]
@@ -2028,6 +2461,7 @@ mod tests {
                 (CommitId::for_test_label("child-commit"), vec![1]),
             ]),
             &commits,
+            false,
         )
         .await
         .expect("child-before-parent input should still stage parent first");

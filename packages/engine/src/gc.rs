@@ -432,13 +432,14 @@ where
     // deleted directly without inventorying every retained root.
     let sweep_tracked_commit_roots = changelog_plan.sweep.commits.clone();
 
-    // Checkpoint GC is deliberately logical-only. Removing a dead changelog
-    // commit also invalidates its derived tracked-state root metadata; the
-    // immutable tree/CAS payloads are reclaimed by a future offline storage
-    // maintenance path, never by an interactive checkpoint flow.
+    // Removing a dead changelog commit invalidates its derived root metadata
+    // and its commit-addressed delta index. Immutable tree/CAS payloads remain
+    // content-addressed maintenance work, but delta rows have no shared
+    // ownership and must be reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
     for commit_id in &sweep_tracked_commit_roots {
         crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
+        crate::tracked_state::stage_delete_commit_deltas(&store, writes, *commit_id).await?;
     }
     let tracked_root_stage_us = elapsed_micros(phase_started);
 

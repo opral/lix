@@ -176,6 +176,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::json_store::store::JSON_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
+        crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,

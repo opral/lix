@@ -407,6 +407,7 @@ async fn stage_test_changelog_commit(
         format_version: 1,
         commit_id: typed_commit_id,
         parent_commit_ids: typed_parent_ids,
+        tracked_state_rootless: false,
         change_id: typed_commit_change_id,
         author_account_ids: Vec::new(),
         created_at,

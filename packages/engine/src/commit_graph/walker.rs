@@ -830,6 +830,7 @@ mod tests {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id),
                 parent_commit_ids: change.parent_commit_ids.iter().copied().collect(),
+                tracked_state_rootless: false,
                 change_id: change.change.id,
                 author_account_ids: Vec::new(),
                 created_at: change.change.created_at,
