@@ -724,6 +724,7 @@ where
             .layer(
                 CompressionLayer::new()
                     .gzip(true)
+                    .zstd(true)
                     .quality(CompressionLevel::Precise(2))
                     .compress_when(
                         DefaultPredicate::new().and(SizeAbove::new(MIN_COMPRESSION_BODY_BYTES)),
@@ -2813,6 +2814,21 @@ mod tests {
         serde_json::from_slice(&decoded).expect("compressed json")
     }
 
+    async fn zstd_response_json(response: Response) -> JsonValue {
+        assert_eq!(
+            response.headers().get(axum::http::header::CONTENT_ENCODING),
+            Some(&axum::http::HeaderValue::from_static("zstd"))
+        );
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("compressed body")
+            .to_bytes();
+        let decoded = zstd::stream::decode_all(bytes.as_ref()).expect("decode zstd");
+        serde_json::from_slice(&decoded).expect("compressed json")
+    }
+
     async fn error_code(response: Response) -> String {
         response_json(response).await["error"]["code"]
             .as_str()
@@ -4289,7 +4305,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_finite_json_responses_use_gzip_but_sse_does_not() {
+    async fn large_finite_responses_negotiate_compression_but_sse_does_not() {
         let app = app().await;
         let (session_id, _) = new_session(&app.router).await;
         let request_body = json!({
@@ -4315,6 +4331,27 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             gzip_response_json(response).await["rows"][0][0]["value"],
+            "x".repeat(64 * 1024)
+        );
+
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/lix/v1/execute")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .header(axum::http::header::ACCEPT_ENCODING, "zstd")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request_body.to_string()))
+                    .expect("zstd response request"),
+            )
+            .await
+            .expect("zstd response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            zstd_response_json(response).await["rows"][0][0]["value"],
             "x".repeat(64 * 1024)
         );
 
