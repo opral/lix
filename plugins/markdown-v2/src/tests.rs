@@ -225,6 +225,60 @@ fn incremental_paragraph_edit_preserves_unrelated_entities_after_cold_reopen() {
 }
 
 #[test]
+fn repeated_sparse_edits_share_history_without_losing_prior_successors() {
+    let source = b"Alpha paragraph\n\nBravo paragraph\n\nCharlie paragraph\n".to_vec();
+    let (document, _) = Document::open_file(
+        source.clone(),
+        Some("successors.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .unwrap();
+    let original = document.fork();
+
+    let alpha_offset = source
+        .windows(b"Alpha".len())
+        .position(|window| window == b"Alpha")
+        .unwrap();
+    let (after_alpha, alpha_changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(alpha_offset).unwrap(),
+                delete_len: 1,
+                insert: b"O",
+            }],
+            IdNamespace::from_halves(3, 4),
+        )
+        .unwrap();
+    assert_eq!(alpha_changes.len(), 1);
+
+    let charlie_offset = source
+        .windows(b"Charlie".len())
+        .position(|window| window == b"Charlie")
+        .unwrap();
+    let (after_charlie, charlie_changes) = after_alpha
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(charlie_offset).unwrap(),
+                delete_len: 1,
+                insert: b"K",
+            }],
+            IdNamespace::from_halves(5, 6),
+        )
+        .unwrap();
+
+    assert_eq!(charlie_changes.len(), 1);
+    assert_eq!(
+        after_charlie.accepted_bytes(),
+        b"Olpha paragraph\n\nBravo paragraph\n\nKharlie paragraph\n"
+    );
+    assert_eq!(
+        after_alpha.accepted_bytes(),
+        b"Olpha paragraph\n\nBravo paragraph\n\nCharlie paragraph\n"
+    );
+    assert_eq!(original.accepted_bytes(), source);
+}
+
+#[test]
 fn entity_edit_returns_a_minimal_file_splice_and_preserves_old_fork() {
     let source = b"Before\n\nUntouched\n".to_vec();
     let (document, initial) =
