@@ -327,42 +327,49 @@ test("remote observe can continue after a semantic SSE error", async () => {
 });
 
 test("remote observe treats unmarked semantic errors as terminal", async () => {
-	let observeRequests = 0;
-	const lix = await openLix({
-		server: {
-			mode: "remote",
-			url: "https://lixray.test/@acme/workspace",
-			fetch: async (input, init) => {
-				const request = new Request(input, init);
-				if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
-					return handshake();
-				}
-				if (request.method === "DELETE") return closedSession();
-				observeRequests += 1;
-				return sseResponse(
-					sseFrame("error", {
-						subscriptionId: "observe-1",
-						error: {
-							code: "LIX_INVALID_SQL",
-							message: "invalid observed query",
-						},
-					}),
-				);
+	vi.useFakeTimers();
+	try {
+		let observeRequests = 0;
+		const lix = await openLix({
+			server: {
+				mode: "remote",
+				url: "https://lixray.test/@acme/workspace",
+				fetch: async (input, init) => {
+					const request = new Request(input, init);
+					if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+						return handshake();
+					}
+					if (request.method === "DELETE") return closedSession();
+					observeRequests += 1;
+					return sseResponse(
+						sseFrame("error", {
+							subscriptionId: "observe-1",
+							error: {
+								code: "LIX_INVALID_SQL",
+								message: "invalid observed query",
+							},
+						}),
+					);
+				},
 			},
-		},
-	});
+		});
 
-	const events = lix.observe("INVALID");
-	await expect(events.next()).rejects.toMatchObject({
-		code: "LIX_INVALID_SQL",
-	});
-	await expect(events.next()).rejects.toMatchObject({
-		code: "LIX_INVALID_SQL",
-	});
-	expect(observeRequests).toBe(1);
+		const events = lix.observe("INVALID");
+		await expect(events.next()).rejects.toMatchObject({
+			code: "LIX_INVALID_SQL",
+		});
+		await expect(events.next()).rejects.toMatchObject({
+			code: "LIX_INVALID_SQL",
+		});
+		expect(observeRequests).toBe(1);
+		await vi.advanceTimersByTimeAsync(100);
+		expect(observeRequests).toBe(1);
 
-	events.close();
-	await lix.close();
+		events.close();
+		await lix.close();
+	} finally {
+		vi.useRealTimers();
+	}
 });
 
 test("a successful branch switch restarts observations on the pinned session", async () => {

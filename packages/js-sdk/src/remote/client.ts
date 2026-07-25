@@ -973,8 +973,14 @@ class RemoteObservationHub {
 							);
 						}
 						const error = errorFromResponseBody(payload);
-						if (payload.subscriptionId !== undefined) {
-							const observation = this.#observation(payload.subscriptionId);
+						const subscriptionId = payload.subscriptionId;
+						if (subscriptionId !== undefined) {
+							if (typeof subscriptionId !== "string") {
+								throw protocolError(
+									"remote observe event requires subscriptionId",
+								);
+							}
+							const observation = this.#observation(subscriptionId);
 							if (payload.retryable === true) {
 								observation.recover(error);
 								reconnect = true;
@@ -982,6 +988,7 @@ class RemoteObservationHub {
 								return;
 							}
 							observation.fail(error);
+							this.#observations.delete(subscriptionId);
 							continue;
 						}
 						if (payload.retryable === true) {
