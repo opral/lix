@@ -3377,6 +3377,7 @@ version = "0.8.4"
 dependencies = [
  "async-trait",
  "codspeed-criterion-compat",
+ "lix_rocksdb_storage",
  "lix_sdk",
  "plugin_csv_v2",
  "plugin_excalidraw_v2",

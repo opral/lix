@@ -1078,6 +1078,126 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
     lix.close().await.expect("JSON benchmark should close");
 }
 
+#[tokio::test]
+#[ignore = "10 MiB JSON unrelated-entity merge benchmark"]
+async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
+    const SAMPLES: usize = 7;
+
+    let archive = build_json_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("workspace should open with the production Wasmtime runtime");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/merge-ten-mib.json";
+    let (bytes, _, _) = json_ten_mib_flat_fixture();
+    write_file(&lix, path, bytes)
+        .await
+        .expect("real JSON v2 Wasm should import the 10 MiB fixture");
+    let file_id = file_id_at_path(&lix, path).await;
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let mut elapsed_ms = Vec::with_capacity(SAMPLES);
+
+    for sample in 0..SAMPLES {
+        let source = lix
+            .create_branch(CreateBranchOptions {
+                id: Some(format!("json-merge-source-{sample}")),
+                name: format!("JSON merge source {sample}"),
+                from_commit_id: None,
+            })
+            .await
+            .unwrap();
+        let target_key = format!("property_{:06}", sample * 2);
+        let source_key = format!("property_{:06}", sample * 2 + 1);
+        let target_value = format!("\"target-{sample}\"");
+        let source_value = format!("\"source-{sample}\"");
+
+        lix.execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Text(target_value.clone()),
+                Value::Text(target_key.clone()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("target JSON property should update");
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: source.id.clone(),
+        })
+        .await
+        .unwrap();
+        lix.execute(
+            "UPDATE json_object_member SET scalar_json = $1 \
+             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Text(source_value.clone()),
+                Value::Text(source_key.clone()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("source JSON property should update");
+        lix.switch_branch(SwitchBranchOptions {
+            branch_id: target_branch_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        lix.merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect("unrelated JSON properties should merge cleanly");
+        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+        let merged = lix
+            .execute(
+                "SELECT key, scalar_json FROM json_object_member \
+                 WHERE parent_id = 'root' AND key IN ($1, $2) AND lixcol_file_id = $3",
+                &[
+                    Value::Text(target_key),
+                    Value::Text(source_key),
+                    Value::Text(file_id.clone()),
+                ],
+            )
+            .await
+            .expect("merged JSON properties should query");
+        let values = merged
+            .rows()
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<String>("key").unwrap(),
+                    row.get::<String>("scalar_json").unwrap(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values.len(), 2);
+        assert!(values.values().any(|value| value == &target_value));
+        assert!(values.values().any(|value| value == &source_value));
+    }
+
+    elapsed_ms.sort_by(f64::total_cmp);
+    let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
+    let p95_index = ((elapsed_ms.len() * 95).div_ceil(100)).saturating_sub(1);
+    let p95_ms = elapsed_ms[p95_index];
+    eprintln!(
+        "v2_json_ten_mib_unrelated_entity_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
+         p50_ms={p50_ms:.3} p95_ms={p95_ms:.3}"
+    );
+
+    lix.close().await.expect("JSON benchmark should close");
+}
+
 #[derive(Debug)]
 struct ColdMaterializedOpenSample {
     elapsed: Duration,
