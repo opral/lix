@@ -83,6 +83,14 @@ impl LixError {
     /// Storage I/O failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
+    /// A newer storage client fenced this writer, so this Lix instance can no
+    /// longer serve requests.
+    pub const CODE_STORAGE_FENCED: &'static str = "LIX_STORAGE_FENCED";
+
+    /// The backing storage instance stopped and this Lix instance can no
+    /// longer serve requests.
+    pub const CODE_STORAGE_CLOSED: &'static str = "LIX_STORAGE_CLOSED";
+
     /// Optimistic transaction publication lost a race with a newer commit.
     pub const CODE_TRANSACTION_CONFLICT: &'static str = "LIX_TRANSACTION_CONFLICT";
 
@@ -301,6 +309,28 @@ impl From<crate::storage_adapter::StorageError> for LixError {
                 "transaction snapshot is stale because tracked state changed before commit",
             )
             .with_hint("Retry the transaction against the latest committed state."),
+            crate::storage_adapter::StorageError::Fenced => Self::new(
+                Self::CODE_STORAGE_FENCED,
+                "the storage writer was fenced by a newer client",
+            )
+            .with_hint(
+                "Do not automatically retry this request; a mutation may still have completed.",
+            )
+            .with_details(json!({
+                "retryable": false,
+                "outcome": "unknown",
+            })),
+            crate::storage_adapter::StorageError::Closed(_) => Self::new(
+                Self::CODE_STORAGE_CLOSED,
+                "the storage instance closed and must be reopened",
+            )
+            .with_hint(
+                "Do not automatically retry this request; a mutation may still have completed.",
+            )
+            .with_details(json!({
+                "retryable": false,
+                "outcome": "unknown",
+            })),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }
     }
@@ -365,5 +395,44 @@ mod tests {
         let err = LixError::unknown("desc");
         assert_eq!(err.code, "LIX_ERROR_UNKNOWN");
         assert_eq!(err.hint, None);
+    }
+
+    #[test]
+    fn fenced_storage_error_is_terminal_and_not_retryable() {
+        let error = LixError::from(crate::storage::StorageError::Fenced);
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_FENCED);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "retryable": false,
+                "outcome": "unknown",
+            }))
+        );
+    }
+
+    #[test]
+    fn fenced_storage_write_set_error_preserves_the_terminal_code() {
+        let error = LixError::from(crate::storage_adapter::StorageWriteSetError::Storage(
+            crate::storage::StorageError::Fenced,
+        ));
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_FENCED);
+    }
+
+    #[test]
+    fn closed_storage_error_is_terminal_and_not_retryable() {
+        let error = LixError::from(crate::storage::StorageError::Closed(
+            "background worker panicked".to_string(),
+        ));
+
+        assert_eq!(error.code, LixError::CODE_STORAGE_CLOSED);
+        assert_eq!(
+            error.details,
+            Some(serde_json::json!({
+                "retryable": false,
+                "outcome": "unknown",
+            }))
+        );
     }
 }
