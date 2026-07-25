@@ -5449,11 +5449,10 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let entity_a = live_entity_row("entity-a", "branch-a", "A");
+        let expected_created_at = entity_a.created_at.to_string();
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![
-                live_entity_row("entity-a", "branch-a", "A"),
-                live_entity_row("entity-b", "branch-a", "B"),
-            ],
+            rows: vec![entity_a, live_entity_row("entity-b", "branch-a", "B")],
         });
         let staged_writes = Arc::new(Mutex::new(CapturingStagedWrites::default()));
         let mut ctx = DummySqlWriteExecutionContext {
@@ -5485,6 +5484,15 @@ mod tests {
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         assert_eq!(staged_writes.deltas.len(), 1);
+        assert_eq!(
+            staged_writes.deltas[0].rows[0].created_at.as_deref(),
+            Some(expected_created_at.as_str()),
+            "a public UPDATE must carry the candidate's first-created timestamp"
+        );
+        assert!(
+            staged_writes.deltas[0].rows[0].created_at_from_visible_row,
+            "only the public candidate lowerer may mark a created timestamp as trusted"
+        );
         let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
             .expect("staged delta should expose pending overlay");

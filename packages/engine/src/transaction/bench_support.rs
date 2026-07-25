@@ -417,6 +417,7 @@ fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionW
         metadata: None,
         origin: None,
         created_at: None,
+        created_at_from_visible_row: false,
         updated_at: None,
         global: false,
         change_id: None,

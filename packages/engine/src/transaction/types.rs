@@ -127,6 +127,11 @@ pub(crate) struct TransactionWriteRow {
     pub(crate) metadata: Option<TransactionJson>,
     pub(crate) origin: Option<TransactionWriteOrigin>,
     pub(crate) created_at: Option<String>,
+    /// `created_at` was copied from a visible row selected by the SQL
+    /// mutation lowerer. This is non-serializable provenance: external
+    /// callers cannot assert it by supplying a timestamp.
+    #[serde(skip)]
+    pub(crate) created_at_from_visible_row: bool,
     pub(crate) updated_at: Option<String>,
     pub(crate) global: bool,
     pub(crate) change_id: Option<String>,
@@ -366,6 +371,7 @@ pub(crate) struct PreparedStateRow {
     pub(crate) origin: Option<TransactionWriteOrigin>,
     pub(crate) origin_key: Option<String>,
     pub(crate) created_at: LixTimestamp,
+    pub(crate) created_at_from_visible_row: bool,
     pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
@@ -509,5 +515,47 @@ impl StagedCommitChangeRefs {
 
     pub(crate) fn allow_empty(&mut self) {
         self.allow_empty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_created_at_provenance_is_not_serializable_or_deserializable() {
+        let row = TransactionWriteRow {
+            entity_pk: Some(EntityPk::single("row")),
+            schema_key: "schema".to_string(),
+            file_id: None,
+            snapshot: None,
+            metadata: None,
+            origin: None,
+            created_at: Some("2026-01-01T00:00:00Z".to_string()),
+            created_at_from_visible_row: true,
+            updated_at: None,
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            branch_id: "branch".to_string(),
+        };
+
+        let mut serialized = serde_json::to_value(row).expect("row should serialize");
+        assert!(serialized.get("created_at_from_visible_row").is_none());
+        serialized
+            .as_object_mut()
+            .expect("serialized row should be an object")
+            .insert(
+                "created_at_from_visible_row".to_string(),
+                serde_json::Value::Bool(true),
+            );
+
+        let decoded: TransactionWriteRow =
+            serde_json::from_value(serialized).expect("row should deserialize");
+        assert!(
+            !decoded.created_at_from_visible_row,
+            "serialized callers must not be able to assert internal provenance"
+        );
     }
 }
