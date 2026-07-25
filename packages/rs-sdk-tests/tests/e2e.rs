@@ -1012,6 +1012,72 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     lix.close().await.expect("workspace should close");
 }
 
+#[tokio::test]
+#[ignore = "10 MiB ordinary public-SQL JSON byte-write benchmark"]
+async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
+    const SAMPLES: usize = 7;
+
+    let root = tempfile::tempdir().expect("create JSON benchmark directory");
+    let archive = build_json_v2_plugin_archive();
+    let lix = open_lix_with_filesystem(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/ordinary-sql-ten-mib.json";
+    let (mut bytes, edit_offset, _) = json_ten_mib_flat_fixture();
+    write_file(&lix, path, bytes.clone())
+        .await
+        .expect("real JSON v2 Wasm should import the 10 MiB fixture");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(bytes.clone()),
+        "the initial read must acknowledge the exact materialized base",
+    );
+
+    let mut elapsed_ms = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        bytes[edit_offset] = alternate_ascii_hex(bytes[edit_offset]);
+        lix.reset_plugin_v2_transition_counters();
+        let started = Instant::now();
+        write_file(&lix, path, bytes.clone())
+            .await
+            .expect("ordinary SQL full-byte JSON edit should succeed");
+        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+        let counters = lix.plugin_v2_transition_counters();
+        assert_eq!(counters.packet_records, 1, "sample {sample}");
+        assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
+        assert_eq!(counters.private_document_cache_hits, 1, "sample {sample}");
+        assert_eq!(counters.full_document_reparses, 0, "sample {sample}");
+        assert_eq!(counters.full_renderer_invocations, 0, "sample {sample}");
+        assert!(
+            counters.host_full_diff_bytes_compared >= JSON_TEN_MIB_BYTES as u64,
+            "sample {sample} must exercise the ordinary full-byte fallback",
+        );
+    }
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(bytes),
+        "ordinary SQL JSON edits must remain byte-exact",
+    );
+
+    elapsed_ms.sort_by(f64::total_cmp);
+    let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
+    let p95_index = ((elapsed_ms.len() * 95).div_ceil(100)).saturating_sub(1);
+    let p95_ms = elapsed_ms[p95_index];
+    eprintln!(
+        "v2_json_ordinary_sql_hot_edit bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
+         p50_ms={p50_ms:.3} p95_ms={p95_ms:.3}"
+    );
+
+    lix.close().await.expect("JSON benchmark should close");
+}
+
 #[derive(Debug)]
 struct ColdMaterializedOpenSample {
     elapsed: Duration,

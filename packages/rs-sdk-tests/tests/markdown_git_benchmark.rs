@@ -17,6 +17,7 @@ const DEFAULT_TARGET_BYTES: usize = 7 * 1024 * 1024 / 2;
 const DEFAULT_EDIT_SAMPLES: usize = 20;
 const DEFAULT_MERGE_SAMPLES: usize = 7;
 const DEFAULT_COLD_SAMPLES: usize = 5;
+const DEFAULT_PROFILE_SAMPLES: usize = 200;
 const PARAGRAPH_BODY_BYTES: usize = 496;
 
 #[derive(Debug)]
@@ -57,6 +58,53 @@ struct ColdLixEditDurations {
 #[derive(Debug)]
 struct GitFixture {
     root: tempfile::TempDir,
+}
+
+/// CPU-profile target for the ordinary public SQL byte-write path.
+///
+/// This deliberately excludes Git, semantic writes, cold opens, and merges so
+/// a sampled profile is dominated by repeated steady-state Lix edits rather
+/// than fixture construction. The comparison benchmark below remains the
+/// source of user-visible Git versus Lix numbers.
+#[tokio::test]
+#[ignore = "manual steady-state Markdown byte-write profile target"]
+async fn markdown_lix_byte_hotpath_profile() {
+    let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let samples = env_usize("LIX_MARKDOWN_GIT_PROFILE_SAMPLES", DEFAULT_PROFILE_SAMPLES);
+    assert!(samples > 0);
+
+    let corpus = markdown_corpus(target_bytes);
+    let archive = build_markdown_v2_plugin_archive();
+    let root = tempfile::tempdir().expect("create Markdown profile directory");
+    let lix = open_lix_with_filesystem(root.path()).await;
+    install_plugin(&lix, "plugin_markdown_incremental_v2", &archive).await;
+    write_file(&lix, "/profile.md", corpus.bytes.clone()).await;
+
+    let mut bytes = corpus.bytes;
+    lix.reset_plugin_v2_transition_counters();
+    let started = Instant::now();
+    for sample in 0..samples {
+        let index = spread_index(sample, samples, corpus.edit_offsets.len() / 2);
+        let offset = corpus.edit_offsets[index];
+        bytes[offset] = edit_replacement(bytes[offset], sample);
+        write_file(&lix, "/profile.md", bytes.clone()).await;
+    }
+    let elapsed = started.elapsed();
+    let counters = lix.plugin_v2_transition_counters();
+    eprintln!(
+        "markdown_lix_hot_profile bytes={} samples={} total_ms={:.3} mean_ms={:.3} counters={counters:?}",
+        bytes.len(),
+        samples,
+        elapsed.as_secs_f64() * 1_000.0,
+        elapsed.as_secs_f64() * 1_000.0 / samples as f64,
+    );
+
+    assert_same_bytes(
+        "profile target must preserve exact Markdown bytes",
+        &read_file(&lix, "/profile.md").await,
+        &bytes,
+    );
+    lix.close().await.expect("close Markdown profile Lix");
 }
 
 #[tokio::test]
