@@ -95,7 +95,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
         for write in &prepared_writes.file_data_writes {
-            blob_writer.stage_payload(write.payload()).await?;
+            blob_writer
+                .stage_payload(write.payload())
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.binary_cas_stage_payload"
+                ))
+                .await?;
             for payload in write.auxiliary_payloads() {
                 blob_writer.stage_payload(payload).await?;
             }

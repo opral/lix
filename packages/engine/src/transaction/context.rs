@@ -2205,10 +2205,9 @@ where
                     None => true,
                     Some(PluginContentType::Text) => {
                         write.splice_provenance().is_some_and(|provenance| {
-                            observation
-                                .bytes_sha256()
-                                .matches_lower_hex(provenance.base_sha256())
-                                && transport_splice_preserves_utf8(write.data(), provenance)
+                            observation.bytes_sha256().is_some_and(|digest| {
+                                digest.matches_lower_hex(provenance.base_sha256())
+                            }) && transport_splice_preserves_utf8(write.data(), provenance)
                         })
                     }
                     Some(PluginContentType::Binary) => false,
@@ -2378,7 +2377,14 @@ where
                 )
             })?;
             let plugin = entry.to_installed_plugin(wasm)?;
-            let factory = self.plugin_host.load_or_compile_v2_factory(&plugin).await?;
+            let factory = self
+                .plugin_host
+                .load_or_compile_v2_factory(&plugin)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_factory_compile"
+                ))
+                .await?;
             component_v2_factories.insert(key, factory);
         }
 
@@ -2791,7 +2797,13 @@ where
                 )
             } else {
                 let store_permit = self.plugin_host.actor_cache().admit_store()?;
-                let mut actor = factory.instantiate_actor().await?;
+                let mut actor = factory
+                    .instantiate_actor()
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_actor_instantiate"
+                    ))
+                    .await?;
                 let source = ArcByteSource::new(submitted_bytes.clone());
                 let transition = actor
                     .open_file(
@@ -2802,9 +2814,17 @@ where
                             ids,
                         },
                     )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_open_file"
+                    ))
                     .await?;
                 let validated =
                     drain_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_open_file_drain"
+                        ))
                         .await?;
                 let changes = validated.changes;
                 let mut counters = validated.counters;
@@ -2854,14 +2874,20 @@ where
                     return Err(error);
                 }
             };
-            let change_rows = plugin_detected_changes_from_v2(&changes).and_then(|detected| {
-                plugin_change_rows(
-                    selected,
-                    detected,
-                    &write.file_id,
-                    &context,
-                    "plugin v2 file transition",
-                )
+            let change_rows = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_change_rows"
+            )
+            .in_scope(|| {
+                plugin_detected_changes_from_v2(&changes).and_then(|detected| {
+                    plugin_change_rows(
+                        selected,
+                        detected,
+                        &write.file_id,
+                        &context,
+                        "plugin v2 file transition",
+                    )
+                })
             });
             let change_rows = match change_rows {
                 Ok(rows) => rows,

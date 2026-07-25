@@ -1,3 +1,4 @@
+use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
     MergeBranchOptions, MergeBranchPreviewOptions, MutationIdentity, RequestBlobSpliceProvenance,
@@ -7,6 +8,7 @@ use lix_sdk::{
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
 use sha2::{Digest as _, Sha256};
+use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
@@ -849,6 +851,7 @@ async fn v2_json_scalar_lww_composes_and_stale_structure_does_not_resurrect_node
 #[tokio::test]
 #[ignore = "10 MiB end-to-end Wasm acceptance gate"]
 async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
+    init_perf_tracing();
     let archive = build_json_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default())
         .await
@@ -1015,11 +1018,12 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
 #[tokio::test]
 #[ignore = "10 MiB ordinary public-SQL JSON byte-write benchmark"]
 async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
+    init_perf_tracing();
     const SAMPLES: usize = 7;
 
     let root = tempfile::tempdir().expect("create JSON benchmark directory");
     let archive = build_json_v2_plugin_archive();
-    let lix = open_lix_with_filesystem(root.path()).await;
+    let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
         "plugin_json_incremental_v2",
@@ -1081,12 +1085,12 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
 #[tokio::test]
 #[ignore = "10 MiB JSON unrelated-entity merge benchmark"]
 async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
+    init_perf_tracing();
     const SAMPLES: usize = 7;
 
+    let root = tempfile::tempdir().expect("create JSON merge benchmark directory");
     let archive = build_json_v2_plugin_archive();
-    let lix = open_lix(OpenLixOptions::default())
-        .await
-        .expect("workspace should open with the production Wasmtime runtime");
+    let lix = open_lix_with_rocksdb(root.path()).await;
     install_reference_plugin_in_blank_registry(
         &lix,
         "plugin_json_incremental_v2",
@@ -1196,6 +1200,107 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     );
 
     lix.close().await.expect("JSON benchmark should close");
+}
+
+#[tokio::test]
+#[ignore = "10 MiB JSON public-SQL read benchmark on RocksDB"]
+async fn v2_json_ten_mib_rocksdb_read_benchmark() {
+    const WARM_SAMPLES: usize = 20;
+    const COLD_SAMPLES: usize = 7;
+
+    let root = tempfile::tempdir().expect("create JSON read benchmark directory");
+    let archive = build_json_v2_plugin_archive();
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &archive,
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/read-ten-mib.json";
+    let (bytes, _, _) = json_ten_mib_flat_fixture();
+    write_file(&lix, path, bytes.clone())
+        .await
+        .expect("real JSON v2 Wasm should import the 10 MiB fixture");
+
+    for _ in 0..3 {
+        let read = read_file(&lix, path)
+            .await
+            .expect("warm materialized JSON should read")
+            .expect("warm materialized JSON should exist");
+        assert_eq!(read.len(), JSON_TEN_MIB_BYTES);
+        black_box(read);
+    }
+
+    let mut warm_ms = Vec::with_capacity(WARM_SAMPLES);
+    for _ in 0..WARM_SAMPLES {
+        let started = Instant::now();
+        let read = read_file(&lix, path)
+            .await
+            .expect("warm materialized JSON should read")
+            .expect("warm materialized JSON should exist");
+        warm_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        assert_eq!(read.len(), JSON_TEN_MIB_BYTES);
+        black_box(read);
+    }
+    lix.close().await.expect("warm JSON benchmark should close");
+
+    let mut cold_total_ms = Vec::with_capacity(COLD_SAMPLES);
+    let mut cold_storage_open_ms = Vec::with_capacity(COLD_SAMPLES);
+    let mut cold_engine_open_ms = Vec::with_capacity(COLD_SAMPLES);
+    let mut cold_read_ms = Vec::with_capacity(COLD_SAMPLES);
+    for _ in 0..COLD_SAMPLES {
+        let total_started = Instant::now();
+        let storage_started = Instant::now();
+        let storage =
+            RocksDB::open(root.path().join(".lix")).expect("reopen JSON benchmark RocksDB");
+        cold_storage_open_ms.push(storage_started.elapsed().as_secs_f64() * 1_000.0);
+
+        let engine_started = Instant::now();
+        let reopened = open_lix_with_storage(storage)
+            .await
+            .expect("reopen JSON benchmark workspace");
+        cold_engine_open_ms.push(engine_started.elapsed().as_secs_f64() * 1_000.0);
+
+        let read_started = Instant::now();
+        let read = read_file(&reopened, path)
+            .await
+            .expect("cold materialized JSON should read")
+            .expect("cold materialized JSON should exist");
+        cold_read_ms.push(read_started.elapsed().as_secs_f64() * 1_000.0);
+        assert_eq!(read, bytes);
+        black_box(&read);
+        reopened
+            .close()
+            .await
+            .expect("cold JSON benchmark should close");
+        cold_total_ms.push(total_started.elapsed().as_secs_f64() * 1_000.0);
+    }
+
+    for samples in [
+        &mut warm_ms,
+        &mut cold_total_ms,
+        &mut cold_storage_open_ms,
+        &mut cold_engine_open_ms,
+        &mut cold_read_ms,
+    ] {
+        samples.sort_by(f64::total_cmp);
+    }
+    eprintln!(
+        "v2_json_ten_mib_rocksdb_read bytes={JSON_TEN_MIB_BYTES} \
+         warm_samples={WARM_SAMPLES} warm_p50_ms={:.3} warm_p95_ms={:.3} \
+         cold_samples={COLD_SAMPLES} cold_total_p50_ms={:.3} \
+         cold_storage_open_p50_ms={:.3} cold_engine_open_p50_ms={:.3} \
+         cold_read_p50_ms={:.3}",
+        p50_ms(&warm_ms),
+        p95_ms(&warm_ms),
+        p50_ms(&cold_total_ms),
+        p50_ms(&cold_storage_open_ms),
+        p50_ms(&cold_engine_open_ms),
+        p50_ms(&cold_read_ms),
+    );
 }
 
 #[derive(Debug)]
@@ -2326,6 +2431,22 @@ async fn open_lix_with_filesystem(path: &Path) -> Lix<LocalFilesystem> {
     open_lix_with_storage(storage).await.unwrap()
 }
 
+async fn open_lix_with_rocksdb(path: &Path) -> Lix<RocksDB> {
+    let storage = RocksDB::open(path.join(".lix")).expect("open Lix RocksDB storage");
+    open_lix_with_storage(storage)
+        .await
+        .expect("open Lix workspace")
+}
+
+fn p50_ms(sorted: &[f64]) -> f64 {
+    sorted[sorted.len() / 2]
+}
+
+fn p95_ms(sorted: &[f64]) -> f64 {
+    let index = ((sorted.len() * 95).div_ceil(100)).saturating_sub(1);
+    sorted[index]
+}
+
 async fn install_plugin<StorageImpl>(
     lix: &Lix<StorageImpl>,
     key: &str,
@@ -2578,6 +2699,16 @@ fn build_json_v2_plugin_archive() -> Vec<u8> {
         writer.write_all(bytes).unwrap();
     }
     writer.finish().unwrap().into_inner()
+}
+
+fn init_perf_tracing() {
+    if std::env::var_os("LIX_PLUGIN_V2_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_test_writer()
+            .try_init();
+    }
 }
 
 const JSON_TEN_MIB_BYTES: usize = 10 * 1024 * 1024;
