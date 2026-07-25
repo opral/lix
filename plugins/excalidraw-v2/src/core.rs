@@ -368,12 +368,25 @@ impl Document {
         _namespace: IdNamespace,
     ) -> Result<(Self, InitialChanges), String> {
         let parsed = parse_file(&bytes)?;
-        let document = Self::from_entities(parsed.scene, parsed.elements, parsed.files)?;
-        if document.0.bytes.as_slice() != bytes {
-            return Err("Excalidraw source layout did not round-trip exactly".to_owned());
-        }
+        let document = Self::from_parsed_source(bytes, parsed);
         let changes = document.initial_changes();
         Ok((document, changes))
+    }
+
+    /// Builds a document directly from source that `parse_file` has already
+    /// structurally and semantically validated. In particular, the parser
+    /// recorded the original value spans for every element and file, so there
+    /// is no need to render the whole document and parse it again merely to
+    /// recover the same bytes and spans.
+    fn from_parsed_source(bytes: Vec<u8>, parsed: ParsedFile) -> Self {
+        Self(Arc::new(DocumentInner {
+            bytes: Arc::new(bytes),
+            scene: parsed.scene,
+            elements: Arc::new(parsed.elements),
+            files: Arc::new(parsed.files),
+            element_spans: Arc::new(parsed.element_spans),
+            file_spans: Arc::new(parsed.file_spans),
+        }))
     }
 
     fn from_entities(
@@ -437,10 +450,7 @@ impl Document {
         let mut parsed = parse_file(&bytes)?;
         reconcile_order_keys(&self.0.elements, &mut parsed.elements)?;
         reconcile_order_keys(&self.0.files, &mut parsed.files)?;
-        let after = Self::from_entities(parsed.scene, parsed.elements, parsed.files)?;
-        if after.0.bytes.as_slice() != bytes {
-            return Err("changed Excalidraw source layout did not round-trip exactly".to_owned());
-        }
+        let after = Self::from_parsed_source(bytes, parsed);
         let changes = diff_records(self.records()?, after.records()?);
         Ok((after, changes))
     }
@@ -710,6 +720,8 @@ struct ParsedFile {
     scene: SceneEntity,
     elements: Vec<ElementEntity>,
     files: Vec<FileEntity>,
+    element_spans: HashMap<String, Span>,
+    file_spans: HashMap<String, Span>,
 }
 
 #[derive(Clone, Debug)]
@@ -717,6 +729,7 @@ struct RawEntry {
     id: Option<String>,
     prefix: String,
     raw: String,
+    span: Span,
 }
 
 #[derive(Debug)]
@@ -766,19 +779,16 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
 
     let element_keys = OrderKey::evenly_between(None, None, elements_raw.entries.len())?;
     let mut element_ids = HashSet::new();
-    let elements = elements_raw
-        .entries
-        .into_iter()
-        .zip(element_keys)
-        .map(|(entry, key)| {
-            let entity =
-                ElementEntity::from_source(key.to_snapshot_string(), entry.prefix, entry.raw)?;
-            if !element_ids.insert(entity.id.clone()) {
-                return Err(format!("duplicate Excalidraw element id {:?}", entity.id));
-            }
-            Ok(entity)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    let mut element_spans = HashMap::with_capacity(elements_raw.entries.len());
+    let mut elements = Vec::with_capacity(elements_raw.entries.len());
+    for (entry, key) in elements_raw.entries.into_iter().zip(element_keys) {
+        let entity = ElementEntity::from_source(key.to_snapshot_string(), entry.prefix, entry.raw)?;
+        if !element_ids.insert(entity.id.clone()) {
+            return Err(format!("duplicate Excalidraw element id {:?}", entity.id));
+        }
+        element_spans.insert(entity.id.clone(), entry.span);
+        elements.push(entity);
+    }
 
     let files_tail_json = files_raw
         .as_ref()
@@ -786,20 +796,24 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
     let file_count = files_raw.as_ref().map_or(0, |files| files.entries.len());
     let file_keys = OrderKey::evenly_between(None, None, file_count)?;
     let mut file_ids = HashSet::new();
-    let files = files_raw
+    let mut file_spans = HashMap::with_capacity(file_count);
+    let mut files = Vec::with_capacity(file_count);
+    for (entry, key) in files_raw
         .map_or_else(Vec::new, |files| files.entries)
         .into_iter()
         .zip(file_keys)
-        .map(|(entry, key)| {
-            let id = entry
-                .id
-                .ok_or_else(|| "files map entry is missing its decoded key".to_owned())?;
-            if !file_ids.insert(id.clone()) {
-                return Err(format!("duplicate Excalidraw file id {id:?}"));
-            }
-            FileEntity::from_source(id, key.to_snapshot_string(), entry.prefix, entry.raw)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+    {
+        let id = entry
+            .id
+            .ok_or_else(|| "files map entry is missing its decoded key".to_owned())?;
+        if !file_ids.insert(id.clone()) {
+            return Err(format!("duplicate Excalidraw file id {id:?}"));
+        }
+        let entity =
+            FileEntity::from_source(id, key.to_snapshot_string(), entry.prefix, entry.raw)?;
+        file_spans.insert(entity.id.clone(), entry.span);
+        files.push(entity);
+    }
 
     let scene = SceneEntity {
         template_json,
@@ -812,6 +826,8 @@ fn parse_file(bytes: &[u8]) -> Result<ParsedFile, String> {
         scene,
         elements,
         files,
+        element_spans,
+        file_spans,
     })
 }
 
@@ -902,6 +918,7 @@ fn scan_array_collection(bytes: &[u8], start: usize, end: usize) -> Result<RawCo
             id: None,
             prefix: bytes_to_string(&bytes[segment_start..value_start])?,
             raw: bytes_to_string(&bytes[value_start..value_end])?,
+            span: span(value_start, value_end)?,
         });
         scanner.skip_whitespace();
         match scanner.peek() {
@@ -965,6 +982,7 @@ fn scan_object_collection(bytes: &[u8], start: usize, end: usize) -> Result<RawC
             id: Some(id),
             prefix: bytes_to_string(&bytes[segment_start..value_start])?,
             raw: bytes_to_string(&bytes[value_start..value_end])?,
+            span: span(value_start, value_end)?,
         });
         scanner.skip_whitespace();
         match scanner.peek() {
@@ -991,6 +1009,16 @@ fn scan_object_collection(bytes: &[u8], start: usize, end: usize) -> Result<RawC
             }
         }
     }
+}
+
+fn span(start: usize, end: usize) -> Result<Span, String> {
+    let length = end
+        .checked_sub(start)
+        .ok_or_else(|| "Excalidraw source span ends before it starts".to_owned())?;
+    Ok(Span {
+        offset: u64::try_from(start).map_err(|_| "Excalidraw source offset exceeds u64")?,
+        length: u64::try_from(length).map_err(|_| "Excalidraw source length exceeds u64")?,
+    })
 }
 
 fn require_collection_end(actual: usize, expected: usize, name: &str) -> Result<(), String> {
