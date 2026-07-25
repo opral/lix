@@ -1082,7 +1082,7 @@ where
         }
     };
     let active_branch_id = lease
-        .run(|lix| async move { lix.active_branch_id().await })
+        .run_cancellable_read(|lix| async move { lix.active_branch_id().await })
         .await?;
     Ok((
         [(CACHE_CONTROL, "no-store")],
@@ -1370,7 +1370,7 @@ where
 {
     let path = required_non_empty(request.path, "path")?;
     let data = lease
-        .run(move |lix| async move { lix.read_file_data(path).await })
+        .run_cancellable_read(move |lix| async move { lix.read_file_data(path).await })
         .await?;
     let (found, body) = data.map_or_else(
         || ("false", Bytes::new()),
@@ -4972,6 +4972,93 @@ mod tests {
         )
         .await;
         assert_eq!(retry.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_resumed_handshake_releases_session_for_close() {
+        let storage = BlockingReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server.clone());
+        let lease = server.create_session(None).await.expect("session lease");
+        let session_id = lease.session_id.clone();
+        drop(lease);
+
+        storage.block_next_read();
+        let read_router = router.clone();
+        let read_session_id = session_id.clone();
+        let operation = tokio::spawn(async move {
+            request(&read_router, "GET", "/lix/v1", Some(&read_session_id), None).await
+        });
+        storage.wait_for_blocked_read().await;
+
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("outer HTTP-equivalent future was cancelled")
+                .is_cancelled()
+        );
+
+        let close =
+            tokio::time::timeout(Duration::from_secs(1), server.delete_session(&session_id)).await;
+        // Keep a failing regression self-cleaning: if cancellation ever stops
+        // reaching storage, release the blocked read before asserting below.
+        storage.release_blocked_read();
+        close
+            .expect("cancelled handshake must release the session read lock")
+            .expect("close cancelled handshake session");
+    }
+
+    #[tokio::test]
+    async fn cancelled_raw_file_read_releases_session_for_close() {
+        let storage = BlockingReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server.clone());
+        let lease = server.create_session(None).await.expect("session lease");
+        let session_id = lease.session_id.clone();
+        drop(lease);
+
+        storage.block_next_read();
+        let read_router = router.clone();
+        let read_session_id = session_id.clone();
+        let operation = tokio::spawn(async move {
+            request(
+                &read_router,
+                "GET",
+                "/lix/v1/file?path=%2Fpayload.bin",
+                Some(&read_session_id),
+                None,
+            )
+            .await
+        });
+        storage.wait_for_blocked_read().await;
+
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("outer HTTP-equivalent future was cancelled")
+                .is_cancelled()
+        );
+
+        let close =
+            tokio::time::timeout(Duration::from_secs(1), server.delete_session(&session_id)).await;
+        // Keep a failing regression self-cleaning: if cancellation ever stops
+        // reaching storage, release the blocked read before asserting below.
+        storage.release_blocked_read();
+        close
+            .expect("cancelled file read must release the session read lock")
+            .expect("close cancelled file read session");
     }
 
     #[tokio::test]
