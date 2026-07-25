@@ -328,16 +328,28 @@ where
                 FunctionContext::prepare(&runtime_live_state).await?
             };
             let functions = runtime_functions.provider();
-            let schema_catalog = {
+            let (sql_schema_catalog, tracked_schema_catalog) = {
                 let catalog_revision = load_catalog_revision(&read).await?;
                 let visible_live_state = live_state.reader(&read);
-                catalog_context
+                let sql_schema_catalog = catalog_context
                     .compiled_catalog_for_transaction_open(
                         &visible_live_state,
                         &Domain::schema_catalog(active_branch_id.clone(), true),
                         catalog_revision.as_ref(),
                     )
-                    .await?
+                    .await?;
+                // SQL planning needs the untracked-visible catalog, while
+                // normal tracked mutations normalize against the tracked
+                // catalog. Pin both under the same revision at open so the
+                // first write never falls back to a catalog scan.
+                let tracked_schema_catalog = catalog_context
+                    .compiled_catalog_for_transaction_open(
+                        &visible_live_state,
+                        &Domain::schema_catalog(active_branch_id.clone(), false),
+                        catalog_revision.as_ref(),
+                    )
+                    .await?;
+                (sql_schema_catalog, tracked_schema_catalog)
             };
             let opening_tracked_mutation_revision =
                 StorageAdapter::<StorageImpl>::load_tracked_mutation_revision_from_read(&read)
@@ -346,7 +358,8 @@ where
                 active_branch_id,
                 runtime_functions,
                 functions,
-                schema_catalog,
+                sql_schema_catalog,
+                tracked_schema_catalog,
                 opening_tracked_mutation_revision,
             ))
         }
@@ -355,7 +368,8 @@ where
             active_branch_id,
             runtime_functions,
             functions,
-            schema_catalog,
+            sql_schema_catalog,
+            tracked_schema_catalog,
             opening_tracked_mutation_revision,
         ) = match setup_result {
             Ok(result) => result,
@@ -367,7 +381,11 @@ where
         let mut schema_resolver = TransactionSchemaResolver::new(Arc::clone(&catalog_context));
         schema_resolver.remember_compiled_catalog(
             &Domain::schema_catalog(active_branch_id.clone(), true),
-            Arc::clone(&schema_catalog),
+            Arc::clone(&sql_schema_catalog),
+        );
+        schema_resolver.remember_compiled_catalog(
+            &Domain::schema_catalog(active_branch_id.clone(), false),
+            tracked_schema_catalog,
         );
         let staged_writes = Arc::new(TransactionWriteBuffer::new(functions.clone()));
         Ok(OpenTransaction {
@@ -379,7 +397,7 @@ where
                 plugin_host,
                 branch_ctx,
                 schema_resolver,
-                sql_schema_snapshot: schema_catalog,
+                sql_schema_snapshot: sql_schema_catalog,
                 sql_planning_cache,
                 staged_writes,
                 filesystem_path_index_cache: Arc::new(FilesystemPathIndexCache::default()),
@@ -3349,6 +3367,24 @@ mod tests {
                 .all(|row| row.entity_pk.as_single_string_owned().as_deref()
                     != Ok("untracked-programmatic")),
             "untracked staged rows should not be written into tracked state"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_open_prewarms_tracked_and_sql_schema_catalogs() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, transaction) =
+            open_test_transaction(&storage).await;
+
+        assert!(
+            transaction
+                .schema_resolver
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, true))
+        );
+        assert!(
+            transaction
+                .schema_resolver
+                .has_cached_catalog_for_test(&Domain::schema_catalog(GLOBAL_BRANCH_ID, false))
         );
     }
 

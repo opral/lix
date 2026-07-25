@@ -481,6 +481,10 @@ async fn seed_visible_schema_rows<StorageImpl>(
     )
     .await
     .expect("schema fixture rows should stage");
+    // Production initialization records this revision with the schema root.
+    // Keep the low-level benchmark fixture on the normal transaction-open
+    // cache path rather than measuring a legacy no-revision fallback.
+    crate::catalog::stage_catalog_revision(&mut writes);
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
         .expect("schema fixture tracked rows should commit");
@@ -542,6 +546,9 @@ async fn seed_visible_schema_rows<StorageImpl>(
         )
         .await
         .expect("global current fixture should stage");
+    // A branch ref can change the registered-schema catalog reachable from a
+    // branch, so it rotates the same cache revision in production commits.
+    crate::catalog::stage_catalog_revision(&mut writes);
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
         .expect("schema fixture flat current rows should commit");
