@@ -121,16 +121,18 @@ async fn markdown_lix_byte_hotpath_profile() {
 async fn markdown_git_semantic_entities_benchmark() {
     let target_bytes = env_usize("LIX_MARKDOWN_GIT_BENCH_BYTES", DEFAULT_TARGET_BYTES);
     let edit_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_EDIT_SAMPLES", DEFAULT_EDIT_SAMPLES);
+    let semantic_edit_samples =
+        env_usize("LIX_MARKDOWN_GIT_BENCH_SEMANTIC_EDIT_SAMPLES", edit_samples);
     let merge_samples = env_usize(
         "LIX_MARKDOWN_GIT_BENCH_MERGE_SAMPLES",
         DEFAULT_MERGE_SAMPLES,
     );
     let cold_samples = env_usize("LIX_MARKDOWN_GIT_BENCH_COLD_SAMPLES", DEFAULT_COLD_SAMPLES);
-    assert!(edit_samples > 0 && merge_samples > 0 && cold_samples > 0);
+    assert!(edit_samples > 0 && semantic_edit_samples > 0 && merge_samples > 0 && cold_samples > 0);
 
     let corpus = markdown_corpus(target_bytes);
     assert!(
-        corpus.texts.len() > edit_samples + merge_samples * 4,
+        corpus.texts.len() > edit_samples.max(semantic_edit_samples) + merge_samples * 4,
         "benchmark corpus must contain enough unrelated paragraphs"
     );
     let archive = build_markdown_v2_plugin_archive();
@@ -149,10 +151,10 @@ async fn markdown_git_semantic_entities_benchmark() {
     let initial_nodes = markdown_nodes_by_kind(&lix, &file_id, "paragraph").await;
     assert_eq!(initial_nodes.len(), corpus.texts.len());
 
-    let mut lix_semantic_edits = Vec::with_capacity(edit_samples);
+    let mut lix_semantic_edits = Vec::with_capacity(semantic_edit_samples);
     let mut lix_main_state = corpus.bytes.clone();
-    for sample in 0..edit_samples {
-        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+    for sample in 0..semantic_edit_samples {
+        let index = spread_index(sample, semantic_edit_samples, corpus.texts.len() / 2);
         let replacement = edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
         let payload = payload_with_replacement(
             &initial_nodes[index].payload_json,
@@ -293,6 +295,24 @@ async fn markdown_git_semantic_entities_benchmark() {
     )
     .await;
 
+    // Keep the raw Git timing cohort independent from the semantic-history
+    // cohort. This lets hot-byte measurements use a statistically useful
+    // sample count even when semantic edit timings are intentionally bounded.
+    let mut git_timing = GitFixture::new();
+    git_timing.write_worktree(&corpus.bytes);
+    git_timing.commit_all("initial Markdown corpus");
+    let mut git_timing_state = corpus.bytes.clone();
+    let mut git_edits = Vec::with_capacity(edit_samples);
+    for sample in 0..edit_samples {
+        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+        git_timing_state[corpus.edit_offsets[index]] =
+            edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
+        let started = Instant::now();
+        git_timing.write_worktree(&git_timing_state);
+        git_timing.commit_all(&format!("timed edit paragraph {index}"));
+        git_edits.push(started.elapsed());
+    }
+
     let mut git = GitFixture::new();
     let git_fixed = git.repo_sizes();
     let git_import_started = Instant::now();
@@ -301,15 +321,12 @@ async fn markdown_git_semantic_entities_benchmark() {
     let git_import = git_import_started.elapsed();
 
     let mut git_state = corpus.bytes.clone();
-    let mut git_edits = Vec::with_capacity(edit_samples);
-    for sample in 0..edit_samples {
-        let index = spread_index(sample, edit_samples, corpus.texts.len() / 2);
+    for sample in 0..semantic_edit_samples {
+        let index = spread_index(sample, semantic_edit_samples, corpus.texts.len() / 2);
         git_state[corpus.edit_offsets[index]] =
             edit_replacement(corpus.bytes[corpus.edit_offsets[index]], sample);
-        let started = Instant::now();
         git.write_worktree(&git_state);
         git.commit_all(&format!("edit paragraph {index}"));
-        git_edits.push(started.elapsed());
     }
     assert_same_bytes(
         "Git and Lix must match after the identical pre-merge edit trace",
@@ -418,13 +435,14 @@ async fn markdown_git_semantic_entities_benchmark() {
          system=git clean_merges=0 conflicts=1 preserved_edits=0"
     );
     eprintln!(
-        "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} merge_samples={} \
+        "markdown_git_bench corpus_bytes={} paragraphs={} edit_samples={} semantic_edit_samples={} merge_samples={} \
          lix_incremental_total_bytes={} lix_incremental_metadata_bytes={} \
          git_live_incremental_total_bytes={} git_live_incremental_metadata_bytes={} \
          git_packed_incremental_total_bytes={} git_packed_incremental_metadata_bytes={}",
         corpus.bytes.len(),
         corpus.texts.len(),
         edit_samples,
+        semantic_edit_samples,
         merge_samples,
         lix_history
             .total_bytes
