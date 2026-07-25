@@ -8,6 +8,7 @@
     clippy::unused_self
 )]
 
+use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -55,9 +56,68 @@ pub(crate) struct TransactionWriteBuffer {
     file_data_writes: Mutex<Vec<TransactionFileData>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum RowSlot {
     State(usize),
+}
+
+/// Narrows exact entity scans over an indexed transaction overlay without
+/// changing the journal's identity/coalescing semantics. A file id, branch,
+/// and durability remain post-filter checks because one logical entity can
+/// legitimately have multiple such physical rows while it is staged.
+#[derive(Default)]
+struct StagedScanCandidateIndex {
+    slots_by_schema_and_entity: HashMap<String, HashMap<EntityPk, Vec<RowSlot>>>,
+}
+
+impl StagedScanCandidateIndex {
+    fn insert(&mut self, row: &PreparedStateRow, slot: RowSlot) {
+        self.slots_by_schema_and_entity
+            .entry(row.schema_key.clone())
+            .or_default()
+            .entry(row.entity_pk.clone())
+            .or_default()
+            .push(slot);
+    }
+
+    /// Returns a strict superset of the staged rows a scan can observe when
+    /// both identity dimensions are constrained. The remaining scan filters
+    /// are deliberately applied by the established matcher afterwards.
+    fn slots_for_filter<'a>(
+        &'a self,
+        filter: &crate::live_state::LiveStateFilter,
+    ) -> Option<Cow<'a, [RowSlot]>> {
+        if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
+            return None;
+        }
+
+        if let ([schema_key], [entity_pk]) =
+            (filter.schema_keys.as_slice(), filter.entity_pks.as_slice())
+        {
+            let slots = self
+                .slots_by_schema_and_entity
+                .get(schema_key)
+                .and_then(|by_entity| by_entity.get(entity_pk))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            return Some(Cow::Borrowed(slots));
+        }
+
+        let mut slots = Vec::new();
+        for schema_key in &filter.schema_keys {
+            let Some(by_entity) = self.slots_by_schema_and_entity.get(schema_key) else {
+                continue;
+            };
+            for entity_pk in &filter.entity_pks {
+                if let Some(candidate_slots) = by_entity.get(entity_pk) {
+                    slots.extend(candidate_slots.iter().copied());
+                }
+            }
+        }
+        slots.sort_unstable();
+        slots.dedup();
+        Some(Cow::Owned(slots))
+    }
 }
 
 /// The normal write path is an ordered journal. It becomes an indexed overlay
@@ -71,6 +131,7 @@ enum StagedPreparedRows {
     Indexed {
         rows: Vec<Option<PreparedStateRow>>,
         by_identity: HashMap<PreparedStateRowIdentity, RowSlot>,
+        by_candidate: StagedScanCandidateIndex,
     },
 }
 
@@ -390,14 +451,21 @@ impl TransactionWriteBuffer {
         let append_only_rows = std::mem::take(rows);
         let mut rows = Vec::with_capacity(append_only_rows.len());
         let mut by_identity = HashMap::with_capacity(append_only_rows.len());
+        let mut by_candidate = StagedScanCandidateIndex::default();
         for row in append_only_rows {
             let identity = PreparedStateRowIdentity::from(&row);
             let index = rows.len();
+            let slot = RowSlot::State(index);
+            by_candidate.insert(&row, slot);
             rows.push(Some(row));
-            let previous = by_identity.insert(identity, RowSlot::State(index));
+            let previous = by_identity.insert(identity, slot);
             debug_assert!(previous.is_none(), "append-only rows must be unique");
         }
-        *guard = StagedPreparedRows::Indexed { rows, by_identity };
+        *guard = StagedPreparedRows::Indexed {
+            rows,
+            by_identity,
+            by_candidate,
+        };
         Ok(())
     }
 
@@ -780,6 +848,7 @@ impl TransactionWriteBuffer {
         let StagedPreparedRows::Indexed {
             rows: staged_rows,
             by_identity,
+            by_candidate,
         } = &mut *guard
         else {
             unreachable!("generic staging must promote the identity index");
@@ -843,8 +912,10 @@ impl TransactionWriteBuffer {
                 }
                 None => {
                     let index = staged_rows.len();
+                    let slot = RowSlot::State(index);
+                    by_candidate.insert(&row, slot);
                     staged_rows.push(Some(row));
-                    RowSlot::State(index)
+                    slot
                 }
             };
             by_identity.insert(identity, slot);
@@ -991,8 +1062,12 @@ impl PreparedStateRowOverlay {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let (staged_rows, by_identity) = match &*rows_guard {
-            StagedPreparedRows::Indexed { rows, by_identity } => (rows, by_identity),
+        let (staged_rows, by_identity, by_candidate) = match &*rows_guard {
+            StagedPreparedRows::Indexed {
+                rows,
+                by_identity,
+                by_candidate,
+            } => (rows, by_identity, by_candidate),
             StagedPreparedRows::AppendOnly { rows, .. } => {
                 debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
                 return Ok(StagedScanParts { rows: Vec::new() });
@@ -1000,18 +1075,15 @@ impl PreparedStateRowOverlay {
         };
 
         let mut rows = Vec::new();
-        for slot in by_identity.values() {
-            match *slot {
-                RowSlot::State(index) => {
-                    let Some(row) = staged_rows.get(index).and_then(Option::as_ref) else {
-                        continue;
-                    };
-                    if !staged_row_identity_matches_scan(row, request) {
-                        continue;
-                    }
-                    rows.push(MaterializedLiveStateRow::from(row));
-                }
-            }
+        if let Some(slots) = by_candidate.slots_for_filter(&request.filter) {
+            append_matching_staged_rows(&mut rows, slots.iter().copied(), staged_rows, request);
+        } else {
+            append_matching_staged_rows(
+                &mut rows,
+                by_identity.values().copied(),
+                staged_rows,
+                request,
+            );
         }
         Ok(StagedScanParts { rows })
     }
@@ -1034,7 +1106,10 @@ impl PreparedStateRowOverlay {
     fn load_state_slot(&self, identity: &PreparedStateRowIdentity) -> Option<PreparedStateRow> {
         self.staged_writes.ensure_identity_index(false).ok()?;
         let rows_guard = self.staged_writes.rows.lock().ok()?;
-        let StagedPreparedRows::Indexed { rows, by_identity } = &*rows_guard else {
+        let StagedPreparedRows::Indexed {
+            rows, by_identity, ..
+        } = &*rows_guard
+        else {
             return None;
         };
         let Some(RowSlot::State(index)) = by_identity.get(identity).copied() else {
@@ -1067,7 +1142,9 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
             )
         })?;
         let (staged_rows, by_identity) = match &*rows_guard {
-            StagedPreparedRows::Indexed { rows, by_identity } => (rows, by_identity),
+            StagedPreparedRows::Indexed {
+                rows, by_identity, ..
+            } => (rows, by_identity),
             StagedPreparedRows::AppendOnly { rows, .. } => {
                 debug_assert!(rows.is_empty(), "nonempty reads must promote the journal");
                 return Ok(vec![None; request.rows.len()]);
@@ -1358,6 +1435,23 @@ fn remove_row_from_commit_change_refs(
     change_refs.remove_change_id(change_id);
     if change_refs.is_empty() {
         change_refs_by_branch.remove(&row.branch_id);
+    }
+}
+
+fn append_matching_staged_rows(
+    output: &mut Vec<MaterializedLiveStateRow>,
+    slots: impl IntoIterator<Item = RowSlot>,
+    staged_rows: &[Option<PreparedStateRow>],
+    request: &LiveStateScanRequest,
+) {
+    for slot in slots {
+        let RowSlot::State(index) = slot;
+        let Some(row) = staged_rows.get(index).and_then(Option::as_ref) else {
+            continue;
+        };
+        if staged_row_identity_matches_scan(row, request) {
+            output.push(MaterializedLiveStateRow::from(row));
+        }
     }
 }
 
@@ -2314,6 +2408,135 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn staging_overlay_keyed_scan_keeps_branch_and_file_candidates_for_final_matching() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    state_row("selected", "global"),
+                    state_row("other", "other-entity"),
+                    state_row("selected", "active").with_branch("branch-a"),
+                    state_row("selected", "other-file").with_file_id("file-a"),
+                    state_row("selected", "other-schema").with_schema("other_schema"),
+                ],
+            })
+            .expect("rows should stage");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let rows = overlay
+            .scan_parts(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    entity_pks: vec![EntityPk::single("selected")],
+                    branch_ids: vec!["branch-a".to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    include_tombstones: true,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .expect("keyed scan should succeed")
+            .rows;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "active and global fallback both remain candidates"
+        );
+        assert!(rows.iter().all(|row| {
+            row.schema_key == "lix_key_value"
+                && row.entity_pk == EntityPk::single("selected")
+                && row.file_id.is_none()
+                && matches!(row.branch_id.as_ref(), "branch-a" | GLOBAL_BRANCH_ID)
+        }));
+    }
+
+    #[test]
+    fn keyed_staged_scan_deduplicates_multi_key_candidates_by_slot_order() {
+        let mut index = StagedScanCandidateIndex::default();
+        index.insert(&state_row("first", "one"), RowSlot::State(4));
+        index.insert(&state_row("second", "two"), RowSlot::State(9));
+
+        let filter = LiveStateFilter {
+            schema_keys: vec!["lix_key_value".to_string(), "lix_key_value".to_string()],
+            entity_pks: vec![
+                EntityPk::single("second"),
+                EntityPk::single("first"),
+                EntityPk::single("first"),
+            ],
+            ..LiveStateFilter::default()
+        };
+        let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
+            panic!("multi-key filter should use the candidate index");
+        };
+
+        assert_eq!(slots, vec![RowSlot::State(4), RowSlot::State(9)]);
+    }
+
+    #[test]
+    fn keyed_staged_scan_keeps_reused_slot_after_promotion_and_tombstone() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("selected", "initial"),
+                    tracked_append_row("other", "other"),
+                ],
+            })
+            .expect("initial append-only rows should stage");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec!["lix_key_value".to_string()],
+                entity_pks: vec![EntityPk::single("selected")],
+                branch_ids: vec!["branch-a".to_string()],
+                file_ids: vec![NullableKeyFilter::Null],
+                include_tombstones: true,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        };
+        overlay
+            .scan_parts(&request)
+            .expect("keyed scan should promote the journal");
+        assert!(staged_writes.uses_identity_index_for_tests());
+
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![
+                    tracked_append_row("selected", "replacement")
+                        .with_change_id("selected-replacement"),
+                ],
+            })
+            .expect("replacement should reuse the indexed slot");
+        let mut tombstone =
+            tracked_append_row("selected", "deleted").with_change_id("selected-tombstone");
+        tombstone.snapshot = None;
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: vec![tombstone],
+            })
+            .expect("tombstone should reuse the indexed slot");
+
+        let rows = overlay
+            .scan_parts(&request)
+            .expect("keyed scan should retain the reused slot")
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].deleted);
+        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
     }
 
     #[tokio::test]
