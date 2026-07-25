@@ -155,7 +155,11 @@ fn retain_noncanonical_source(
     parsed: &mut ParsedMarkdown,
     source: &[u8],
 ) -> Result<(), PluginError> {
-    let canonical = render_tree(&parsed.root)?;
+    let canonical = parsed.canonical_render.take().ok_or_else(|| {
+        PluginError::Internal(
+            "stable Markdown parse is missing its canonical render for lexical fallback".into(),
+        )
+    })?;
     if canonical == source {
         return Ok(());
     }

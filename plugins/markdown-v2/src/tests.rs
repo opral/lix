@@ -1,6 +1,7 @@
 use crate::{
     ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace, InputSplice, NODE_SCHEMA_KEY,
 };
+use base64::Engine as _;
 use serde_json::Value;
 
 fn assert_number_free(value: &Value) {
@@ -23,6 +24,17 @@ fn records(changes: &[EntityChange]) -> Vec<EntityRecord> {
             })
         })
         .collect()
+}
+
+fn document_format(changes: &[EntityChange]) -> Value {
+    let wire = changes
+        .iter()
+        .filter_map(|change| change.snapshot.as_deref())
+        .map(|snapshot| serde_json::from_slice::<Value>(snapshot).expect("valid wire snapshot"))
+        .find(|wire| wire["kind"] == "document")
+        .expect("document snapshot");
+    serde_json::from_str(wire["format_json"].as_str().expect("document format_json"))
+        .expect("valid document format JSON")
 }
 
 fn utf16le(source: &str) -> Vec<u8> {
@@ -121,6 +133,43 @@ fn cold_entity_open_preserves_accepted_noncanonical_source_bytes() {
         assert_eq!(edits[0].delete_len, 0, "{name}");
         assert_eq!(edits[0].insert.as_slice(), source, "{name}");
     }
+}
+
+#[test]
+fn canonical_source_avoids_fallback_and_encoded_source_preserves_it() {
+    let canonical = b"# Heading\n\nBody\n".to_vec();
+    let (_, canonical_changes) = Document::open_file(
+        canonical,
+        Some("canonical.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .expect("canonical Markdown should open");
+    assert!(
+        document_format(&canonical_changes)
+            .get("lexical_fallback_base64")
+            .is_none(),
+        "canonical input must not retain an unnecessary raw fallback",
+    );
+
+    let encoded = b"\xef\xbb\xbf# Heading\n\nBody\n".to_vec();
+    let (_, encoded_changes) = Document::open_file(
+        encoded.clone(),
+        Some("encoded.md"),
+        IdNamespace::from_halves(3, 4),
+    )
+    .expect("encoded Markdown should open");
+    let expected_fallback = base64::engine::general_purpose::STANDARD.encode(&encoded);
+    assert_eq!(
+        document_format(&encoded_changes)
+            .get("lexical_fallback_base64")
+            .and_then(Value::as_str),
+        Some(expected_fallback.as_str()),
+        "noncanonical bytes must remain available for exact lexical restoration",
+    );
+    let (restored, edits) = Document::open_entities(records(&encoded_changes), None)
+        .expect("encoded Markdown should restore from semantic entities");
+    assert_eq!(restored.accepted_bytes(), encoded);
+    assert_eq!(edits.len(), 1);
 }
 
 #[test]
