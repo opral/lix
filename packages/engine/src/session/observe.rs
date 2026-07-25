@@ -6,6 +6,7 @@ use crate::observe_coordinator::{
     ObserveQueryEvaluation, ObserveQueryKey, ObserveQueryState, ObserveSessionScope,
     ObserveSharedContent,
 };
+use crate::observe_invalidation::ObserveInvalidationEvent;
 use crate::storage_adapter::Memory;
 use crate::storage_adapter::Storage;
 use crate::{ExecuteResult, LixError, Value, sql2};
@@ -47,7 +48,7 @@ where
 {
     session: SessionContext<StorageImpl>,
     query: ObserveQuery,
-    receiver: watch::Receiver<u64>,
+    receiver: watch::Receiver<ObserveInvalidationEvent>,
     sequence: u64,
     last_rows: Option<ExecuteResult>,
     last_shared_content: Option<ObserveSharedContent>,
@@ -127,7 +128,18 @@ where
     }
 
     async fn wait_for_invalidation(&mut self) -> Result<bool, LixError> {
-        Ok(self.receiver.changed().await.is_ok())
+        if self.receiver.changed().await.is_err() {
+            return Ok(false);
+        }
+        self.invalidation_generation().map(|_| true)
+    }
+
+    fn invalidation_generation(&mut self) -> Result<u64, LixError> {
+        let event = self.receiver.borrow_and_update().clone();
+        match event {
+            ObserveInvalidationEvent::Generation(generation) => Ok(generation),
+            ObserveInvalidationEvent::TerminalStorageError(error) => Err(error),
+        }
     }
 
     async fn evaluate_stable_snapshot(
@@ -140,7 +152,7 @@ where
                 .observe_invalidation
                 .ensure_external_watcher(self.session.storage.clone())
                 .await?;
-            let before = *self.receiver.borrow_and_update();
+            let before = self.invalidation_generation()?;
             let rows = self.execute_or_share(before).await;
             drop(operation_guard);
             let rows = match rows {
@@ -151,7 +163,7 @@ where
                 }
                 Err(error) => return Err(error),
             };
-            let after = *self.receiver.borrow_and_update();
+            let after = self.invalidation_generation()?;
             if before == after {
                 return Ok(Some((after, rows)));
             }

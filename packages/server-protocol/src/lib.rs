@@ -2821,6 +2821,8 @@ mod tests {
     struct FencedReadStorage {
         inner: Memory,
         fenced: Arc<AtomicBool>,
+        fenced_read_count: Arc<AtomicUsize>,
+        fenced_read: Arc<Notify>,
     }
 
     impl FencedReadStorage {
@@ -2828,11 +2830,23 @@ mod tests {
             Self {
                 inner: Memory::new(),
                 fenced: Arc::new(AtomicBool::new(false)),
+                fenced_read_count: Arc::new(AtomicUsize::new(0)),
+                fenced_read: Arc::new(Notify::new()),
             }
         }
 
         fn fence_reads(&self) {
             self.fenced.store(true, Ordering::Release);
+        }
+
+        async fn wait_for_fenced_read(&self) {
+            loop {
+                let notified = self.fenced_read.notified();
+                if self.fenced_read_count.load(Ordering::Acquire) != 0 {
+                    return;
+                }
+                notified.await;
+            }
         }
     }
 
@@ -2848,6 +2862,8 @@ mod tests {
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
             if self.fenced.load(Ordering::Acquire) {
+                self.fenced_read_count.fetch_add(1, Ordering::AcqRel);
+                self.fenced_read.notify_waiters();
                 return Err(StorageError::Fenced);
             }
             self.inner.begin_read(options).await
@@ -3023,6 +3039,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fenced_external_observe_watcher_signals_and_ends_stream() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server);
+        let (session_id, _) = new_session(&router).await;
+
+        let response = request(
+            &router,
+            "POST",
+            "/lix/v1/observe",
+            Some(&session_id),
+            Some(json!({ "sql": "SELECT 1", "params": [] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let terminal_signal = terminal_storage_stream_signal(&response)
+            .expect("successful observe response must expose its fence signal");
+        let mut body = response.into_body();
+
+        let initial = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("observe stream should produce its initial frame")
+            .expect("observe stream should contain its initial frame")
+            .expect("observe stream initial frame");
+        let initial = initial
+            .into_data()
+            .expect("observe stream initial frame should contain data");
+        let initial = std::str::from_utf8(&initial).expect("SSE body is UTF-8");
+        assert!(
+            initial.contains("event: next"),
+            "expected initial SSE event, got {initial}"
+        );
+
+        // The initial snapshot has already started the external mutation
+        // watcher. Fencing its next poll must wake the active observation with
+        // the terminal error rather than leave it waiting for invalidation.
+        storage.fence_reads();
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_fenced_read())
+            .await
+            .expect("external watcher should observe the fenced storage read");
+
+        let terminal = tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("fenced observe watcher should produce its terminal frame")
+            .expect("fenced observe watcher should contain its terminal frame")
+            .expect("fenced observe watcher terminal frame");
+        let terminal = terminal
+            .into_data()
+            .expect("fenced observe watcher terminal frame should contain data");
+        let terminal = std::str::from_utf8(&terminal).expect("SSE body is UTF-8");
+        assert!(
+            terminal.contains("event: error"),
+            "expected SSE error, got {terminal}"
+        );
+        assert!(
+            terminal.contains("\"code\":\"LIX_STORAGE_FENCED\""),
+            "expected fenced storage error, got {terminal}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), body.frame())
+                .await
+                .expect("fenced observe watcher should finish")
+                .is_none(),
+            "fenced observe watcher should reach EOF"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                terminal_signal.wait_for_terminal_storage(),
+            )
+            .await
+            .expect("fence signal should resolve"),
+            "SSE fence signal should report the terminal storage error"
+        );
+    }
+
+    #[tokio::test]
     async fn fenced_multiplex_observe_aborts_live_sibling_before_next_body_poll() {
         let storage = FailOneBlockedReadStorage::new();
         let root = Arc::new(
@@ -3034,6 +3132,7 @@ mod tests {
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
+        prime_external_observe_watcher(&router, &session_id).await;
         storage.fail_one_and_block_a_sibling();
         let response = request(
             &router,
@@ -3118,6 +3217,7 @@ mod tests {
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
 
+        prime_external_observe_watcher(&router, &session_id).await;
         storage.fail_one_and_block_a_sibling();
         let response = request(
             &router,
@@ -3156,6 +3256,24 @@ mod tests {
             !signalled.expect("dropping an unpolled response should release its signal"),
             "an unpolled response must not retain a terminal-storage sender"
         );
+    }
+
+    async fn prime_external_observe_watcher(router: &Router, session_id: &str) {
+        let response = request(
+            router,
+            "POST",
+            "/lix/v1/observe",
+            Some(session_id),
+            Some(json!({ "sql": "SELECT 0", "params": [] })),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        tokio::time::timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("priming observe should produce an initial frame")
+            .expect("priming observe stream should not end immediately")
+            .expect("priming observe initial frame should be valid");
     }
 
     async fn app() -> TestApp {
