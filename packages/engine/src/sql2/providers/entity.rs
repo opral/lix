@@ -1398,15 +1398,16 @@ fn entity_record_batch_from_raw_projection(
         .fields()
         .iter()
         .map(|field| {
-            if let Some(property_name) = field.name().strip_prefix("lixcol_") {
-                entity_system_column_array(property_name, rows)
-            } else {
-                visible_columns.next().ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "entity projection decoder did not return a visible column".to_string(),
-                    )
-                })
-            }
+            field.name().strip_prefix("lixcol_").map_or_else(
+                || {
+                    visible_columns.next().ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "entity projection decoder did not return a visible column".to_string(),
+                        )
+                    })
+                },
+                |property_name| entity_system_column_array(property_name, rows),
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
