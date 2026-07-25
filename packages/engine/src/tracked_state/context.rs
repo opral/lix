@@ -2262,7 +2262,7 @@ mod tests {
                 .expect("child commit_root delete should commit");
         }
 
-        tracked_state
+        let rootless_diff = tracked_state
             .reader(
                 storage
                     .begin_read(StorageReadOptions::default())
@@ -2271,7 +2271,12 @@ mod tests {
             )
             .diff_commits("base", "child", &test_schema_diff_request())
             .await
-            .expect_err("diff should require durable roots before repair");
+            .expect("rootless history should remain diffable before repair");
+        assert_eq!(rootless_diff.entries.len(), 1);
+        assert_eq!(
+            rootless_diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Modified
+        );
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
