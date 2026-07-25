@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, params, params_from_iter};
 use tempfile::TempDir;
 
 use crate::workload::WorkloadRow;
@@ -6,6 +6,8 @@ use crate::workload::WorkloadRow;
 pub(crate) struct RawSqliteFixture {
     connection: Connection,
     rows: Vec<WorkloadRow>,
+    read_many_by_pk_count: usize,
+    read_many_by_pk_sql: String,
     _dir: TempDir,
 }
 
@@ -28,9 +30,12 @@ pub(crate) fn empty_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
              ) WITHOUT ROWID;",
         )
         .expect("initialize raw sqlite benchmark database");
+    let read_many_by_pk_count = rows.len().min(crate::READ_MANY_PK_COUNT);
     RawSqliteFixture {
         connection,
         rows: rows.to_vec(),
+        read_many_by_pk_count,
+        read_many_by_pk_sql: select_many_by_pk_sql(read_many_by_pk_count),
         _dir: dir,
     }
 }
@@ -123,19 +128,21 @@ impl RawSqliteFixture {
 
     pub(crate) fn read_many_by_pk(&self, count: usize) -> usize {
         let count = count.min(self.rows.len());
+        assert_eq!(
+            count, self.read_many_by_pk_count,
+            "read-many benchmark must use the fixture's setup-excluded query shape"
+        );
         let mut statement = self
             .connection
-            .prepare_cached("SELECT path, value FROM json_pointer WHERE path = ?1")
+            .prepare_cached(&self.read_many_by_pk_sql)
             .expect("prepare raw sqlite multi-point read");
+        let mut query = statement
+            .query(params_from_iter(
+                self.rows[..count].iter().map(|row| row.path.as_str()),
+            ))
+            .expect("query raw sqlite multi-point rows");
         let mut found = 0;
-        for row in &self.rows[..count] {
-            let mut query = statement
-                .query(params![row.path])
-                .expect("query raw sqlite multi-point row");
-            let result = query
-                .next()
-                .expect("read raw sqlite multi-point row")
-                .expect("raw sqlite multi-point row must exist");
+        while let Some(result) = query.next().expect("read next raw sqlite multi-point row") {
             let _: &str = result
                 .get_ref(0)
                 .expect("read raw sqlite multi-point path")
@@ -209,4 +216,13 @@ impl RawSqliteFixture {
         assert_eq!(affected, 1);
         affected
     }
+}
+
+fn select_many_by_pk_sql(count: usize) -> String {
+    assert!(count > 0, "read-many benchmark requires at least one row");
+    let placeholders = (1..=count)
+        .map(|index| format!("?{index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("SELECT path, value FROM json_pointer WHERE path IN ({placeholders}) ORDER BY path")
 }
