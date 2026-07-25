@@ -1747,25 +1747,27 @@ where
                 .extend(lifecycle_schema_rows.into_iter().map(|(_, row)| row));
         }
 
-        let registry_rows = overlay_scan_rows(
+        let registry_rows = overlay_load_exact_rows(
             &base,
             &staged,
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
-                    branch_ids: branch_ids.iter().cloned().collect(),
-                    file_ids: vec![NullableKeyFilter::Null],
-                    untracked: Some(false),
-                    ..Default::default()
-                },
+            &LiveStateExactBatchRequest {
+                rows: branch_ids
+                    .iter()
+                    .map(|branch_id| LiveStateExactRowRequest {
+                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                        branch_id: branch_id.clone(),
+                        entity_pk: EntityPk::single(PLUGIN_REGISTRY_KEY),
+                        file_id: None,
+                    })
+                    .collect(),
                 projection: plugin_registry_live_state_projection(),
-                ..Default::default()
+                untracked: Some(false),
+                include_tombstones: false,
             },
         )
         .await?;
         let mut registry_rows_by_branch = BTreeMap::<String, MaterializedLiveStateRow>::new();
-        for row in registry_rows {
+        for row in registry_rows.into_iter().flatten() {
             if registry_rows_by_branch
                 .insert(row.branch_id.to_string(), row)
                 .is_some()
@@ -1890,12 +1892,7 @@ where
             return Ok(reconciliation);
         }
 
-        let owner_branch_ids = active_branch_ids
-            .iter()
-            .cloned()
-            .chain(deleted_file_keys.keys().map(|key| key.branch_id.clone()))
-            .collect::<BTreeSet<_>>();
-        let mut candidate_file_ids = BTreeSet::<String>::new();
+        let mut candidate_file_keys = BTreeSet::<PluginFileWriteKey>::new();
         for write in file_data.iter() {
             if write.global
                 || write.untracked
@@ -1904,10 +1901,10 @@ where
             {
                 continue;
             }
-            candidate_file_ids.insert(write.file_id.clone());
+            candidate_file_keys.insert(PluginFileWriteKey::from(write));
         }
         for key in deleted_file_keys.keys() {
-            candidate_file_ids.insert(key.file_id.clone());
+            candidate_file_keys.insert(key.clone());
         }
         for row in input_rows {
             if row.global
@@ -1917,36 +1914,42 @@ where
             {
                 continue;
             }
-            candidate_file_ids.extend(row.file_id.iter().cloned());
+            candidate_file_keys.insert(PluginFileWriteKey {
+                branch_id: row.branch_id.clone(),
+                global: false,
+                untracked: false,
+                file_id: row
+                    .file_id
+                    .clone()
+                    .expect("candidate semantic row has a file id"),
+            });
         }
-        if candidate_file_ids.is_empty() {
+        if candidate_file_keys.is_empty() {
             return Ok(reconciliation);
         }
 
-        let owner_rows = overlay_scan_rows(
+        let owner_rows = overlay_load_exact_rows(
             &base,
             &staged,
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
-                    entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
-                    branch_ids: owner_branch_ids.into_iter().collect(),
-                    file_ids: candidate_file_ids
-                        .iter()
-                        .cloned()
-                        .map(NullableKeyFilter::Value)
-                        .collect(),
-                    untracked: Some(false),
-                    ..Default::default()
-                },
+            &LiveStateExactBatchRequest {
+                rows: candidate_file_keys
+                    .iter()
+                    .map(|key| LiveStateExactRowRequest {
+                        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+                        branch_id: key.branch_id.clone(),
+                        entity_pk: EntityPk::single(PLUGIN_OWNER_KEY),
+                        file_id: Some(key.file_id.clone()),
+                    })
+                    .collect(),
                 projection: plugin_registry_live_state_projection(),
-                ..Default::default()
+                untracked: Some(false),
+                include_tombstones: false,
             },
         )
         .await?;
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
         let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
-        for row in owner_rows {
+        for row in owner_rows.into_iter().flatten() {
             let branch_id = row.branch_id.to_string();
             let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
                 continue;
@@ -2225,11 +2228,15 @@ where
         let mut state_groups = BTreeMap::<PluginStateGroupKey, PluginStateGroup>::new();
         for (key, owner) in &owners {
             let selected = selected_plugins.get(key);
+            let semantic = semantic_groups.get(key).map(|group| &group.plugin);
             // A same-owner v2 write is authorized by an exact document
             // observation and must not hydrate the complete durable graph.
             // Lifecycle removal/reselection still needs the old rows so it
             // can tombstone every schema owned by the previous plugin.
-            if selected.is_some_and(|selected| selected.key() == owner.plugin_key()) {
+            if selected
+                .or(semantic)
+                .is_some_and(|selected| selected.key() == owner.plugin_key())
+            {
                 continue;
             }
             let group_key = PluginStateGroupKey {
@@ -2241,7 +2248,7 @@ where
             group
                 .schema_keys
                 .extend(owner.schema_keys().iter().cloned());
-            if let Some(selected) = selected
+            if let Some(selected) = selected.or(semantic)
                 && selected.key() == owner.plugin_key()
             {
                 group
@@ -2895,7 +2902,13 @@ where
                 plugin_key: group.plugin.key().to_string(),
                 plugin_generation: group.plugin.archive_blob_hash().to_string(),
             };
-            let prepared = self.prepare_transaction_rows(group.rows.clone()).await?;
+            let prepared = self
+                .prepare_transaction_rows(group.rows.clone())
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_semantic_prepare_rows"
+                ))
+                .await?;
             if prepared.iter().any(|row| {
                 row.branch_id != file_key.branch_id
                     || row.file_id.as_deref() != Some(file_key.file_id.as_str())
@@ -2976,7 +2989,13 @@ where
                                 ),
                             )
                         })?;
-                    let cold_open = cache.prepare_cold_open(&actor_key, &visible_root).await?;
+                    let cold_open = cache
+                        .prepare_cold_open(&actor_key, &visible_root)
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_semantic_actor_lookup"
+                        ))
+                        .await?;
                     let observation = match cold_open {
                         PluginActorColdOpen::Ready(observation) => observation,
                         PluginActorColdOpen::Build(cold_install) => {
@@ -2987,6 +3006,10 @@ where
                                 descriptor.clone(),
                                 factory,
                             )
+                            .instrument(tracing::debug_span!(
+                                target: "lix_perf",
+                                "lix.perf.plugin_semantic_actor_cold_open"
+                            ))
                             .await?
                         }
                     };
@@ -3000,7 +3023,13 @@ where
                         ));
                     }
                     (
-                        cache.lease_for_transition(&observation).await?,
+                        cache
+                            .lease_for_transition(&observation)
+                            .instrument(tracing::debug_span!(
+                                target: "lix_perf",
+                                "lix.perf.plugin_semantic_actor_lease"
+                            ))
+                            .await?,
                         actor_key,
                         view,
                     )
@@ -3052,6 +3081,10 @@ where
                 &materialization_version,
                 limits,
             )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_semantic_render"
+            ))
             .await;
             let (publication, rendered_bytes, counters) = match transition {
                 Ok(transition) => transition,
