@@ -64,16 +64,80 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&count| count > 0)
         .unwrap_or(15);
+    let hot_repeats = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS")
+        .ok()
+        .map(|value| {
+            let count = value.parse::<usize>().unwrap_or_else(|_| {
+                panic!(
+                    "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must be a positive integer, got '{value}'"
+                )
+            });
+            assert!(
+                count > 0,
+                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must be a positive integer"
+            );
+            count
+        });
     match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_LAYER").as_deref() {
-        Ok("kv_layout") => profile_kv_layout_operation(runtime, rows, operation, sample_count),
-        Ok("raw_sqlite") => profile_raw_sqlite_operation(rows, operation, sample_count),
+        Ok("kv_layout") => {
+            assert!(
+                hot_repeats.is_none(),
+                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS is only available for transaction reads"
+            );
+            profile_kv_layout_operation(runtime, rows, operation, sample_count);
+        }
+        Ok("raw_sqlite") => {
+            assert!(
+                hot_repeats.is_none(),
+                "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS is only available for transaction reads"
+            );
+            profile_raw_sqlite_operation(rows, operation, sample_count);
+        }
         Ok("transaction") | Err(_) => {
-            profile_transaction_operation(runtime, rows, operation, sample_count);
+            if let Some(repeats) = hot_repeats {
+                profile_hot_transaction_reads(runtime, rows, operation, repeats);
+            } else {
+                profile_transaction_operation(runtime, rows, operation, sample_count);
+            }
         }
         Ok(other) => panic!(
             "unknown LIX_TRACKED_STATE_CRUD_PROFILE_LAYER '{other}'; expected transaction, kv_layout, or raw_sqlite"
         ),
     }
+}
+
+/// Keeps one seeded fixture alive for a repeatable, read-only profiling
+/// window. This deliberately trades representative cache behavior for a
+/// trace dominated by the operation itself rather than fixture construction.
+fn profile_hot_transaction_reads(
+    runtime: &tokio::runtime::Runtime,
+    rows: &[WorkloadRow],
+    operation: TransactionBenchOp,
+    repeats: usize,
+) {
+    assert!(
+        operation.is_read(),
+        "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS only supports read_all, read_one, or read_many"
+    );
+    let repeats_u32 =
+        u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let mut fixture = runtime.block_on(transaction_api::seeded_fixture(
+        StorageProfile::RocksDB,
+        rows,
+    ));
+    let start = Instant::now();
+    let mut row_count = 0;
+    for _ in 0..repeats {
+        row_count += runtime.block_on(operation.run(&mut fixture));
+    }
+    let elapsed = start.elapsed();
+    println!(
+        "tracked_state_crud hot profile: transaction/lix_rocksdb/{}/{} repeats: total={elapsed:?} per_operation={:?}",
+        profile_operation_name(operation),
+        repeats,
+        elapsed / repeats_u32,
+    );
+    black_box(row_count);
 }
 
 fn profile_transaction_operation(
@@ -370,6 +434,10 @@ enum TransactionBenchOp {
 impl TransactionBenchOp {
     fn needs_seed(self) -> bool {
         !matches!(self, Self::InsertAll)
+    }
+
+    fn is_read(self) -> bool {
+        matches!(self, Self::ReadAll | Self::ReadOneByPk | Self::ReadManyByPk)
     }
 
     async fn run(self, fixture: &mut transaction_api::TransactionFixture) -> usize {
