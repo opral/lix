@@ -386,7 +386,6 @@ impl TransactionBenchOp {
     }
 }
 
-#[expect(clippy::cast_possible_truncation)]
 fn bench_transaction_op(
     group: &mut BenchmarkGroup<'_, WallTime>,
     runtime: &tokio::runtime::Runtime,
