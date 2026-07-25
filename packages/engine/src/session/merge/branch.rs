@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value as JsonValue, json};
+use tracing::Instrument as _;
 
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
@@ -200,7 +201,7 @@ where
                     return Err(LixError::invalid_self_merge(active_branch_id));
                 }
 
-                let (target_head, source_head) = {
+                let (target_head, source_head) = async {
                     let reader = transaction.branch_ref_reader().await;
                     let lifecycle = BranchLifecycle::new(&reader);
                     let target_head = lifecycle
@@ -217,15 +218,25 @@ where
                             BranchReferenceRole::Source,
                         )
                         .await?;
-                    (target_head, source_head)
-                };
+                    Ok::<_, LixError>((target_head, source_head))
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_branch_refs"
+                ))
+                .await?;
 
-                let merge_base = {
+                let merge_base = async {
                     let mut reader = transaction.commit_graph_reader().await;
-                    reader.merge_base(&target_head, &source_head).await?
-                };
+                    reader.merge_base(&target_head, &source_head).await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_base"
+                ))
+                .await?;
                 let base_commit_id = merge_base.commit_id;
-                let analysis = {
+                let analysis = async {
                     let mut reader = transaction.tracked_state_reader().await;
                     analyze(
                         &mut reader,
@@ -235,12 +246,22 @@ where
                             source_commit_id: source_head,
                         },
                     )
-                    .await?
-                };
-                let derived_blob_files = {
+                    .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_analysis"
+                ))
+                .await?;
+                let derived_blob_files = async {
                     let mut reader = transaction.tracked_state_reader().await;
-                    derived_plugin_blob_conflicts(&mut reader, &analysis).await?
-                };
+                    derived_plugin_blob_conflicts(&mut reader, &analysis).await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_derived_blob_detection"
+                ))
+                .await?;
 
                 if analysis.outcome == MergeOutcome::AlreadyUpToDate {
                     return Ok(MergeBranchReceipt {
@@ -292,7 +313,7 @@ where
                     )?);
                 }
 
-                let semantic_rows = {
+                let semantic_rows = async {
                     let mut reader = transaction.tracked_state_reader().await;
                     materialized_plugin_merge_rows(
                         &mut reader,
@@ -300,27 +321,42 @@ where
                         &derived_blob_files,
                         &active_branch_id,
                     )
-                    .await?
-                };
+                    .await
+                }
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_materialized_rows"
+                ))
+                .await?;
                 if !semantic_rows.is_empty() {
                     transaction
                         .stage_write(TransactionWrite::Rows {
                             mode: TransactionWriteMode::Replace,
                             rows: semantic_rows,
                         })
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.merge_stage_semantic_rows"
+                        ))
                         .await?;
                 }
-                let selected_changes = merge_plan
-                    .picks
-                    .iter()
-                    .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
-                    .map(selected_change_from_merge_pick)
-                    .collect::<Vec<_>>();
-                let created_merge_commit_id = transaction.stage_merge_commit(
-                    active_branch_id.clone(),
-                    analysis.commits.source_commit_id,
-                    selected_changes,
-                )?;
+                let created_merge_commit_id = tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.merge_stage_commit"
+                )
+                .in_scope(|| {
+                    let selected_changes = merge_plan
+                        .picks
+                        .iter()
+                        .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
+                        .map(selected_change_from_merge_pick)
+                        .collect::<Vec<_>>();
+                    transaction.stage_merge_commit(
+                        active_branch_id.clone(),
+                        analysis.commits.source_commit_id,
+                        selected_changes,
+                    )
+                })?;
                 Ok(MergeBranchReceipt {
                     outcome: MergeBranchOutcome::MergeCommitted,
                     target_branch_id: active_branch_id,
@@ -334,6 +370,10 @@ where
                 })
             })
         })
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.merge_branch_total"
+        ))
         .await
     }
 }
