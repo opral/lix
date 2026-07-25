@@ -29,6 +29,9 @@ tokio = { version = "1", features = ["sync", "rt"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd", "decompression-gzip"] }
 tracing = "0.1"
 
+[target.'cfg(all(not(target_os = "windows"), any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"] }
+
 [dev-dependencies]
 async-trait = "0.1"
 flate2 = "1"
