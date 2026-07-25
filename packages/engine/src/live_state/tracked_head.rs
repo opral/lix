@@ -901,7 +901,7 @@ fn read_key_string(
         cursor += 1;
         if terminator != KEY_ESCAPE {
             let value = std::str::from_utf8(&bytes[start..cursor - 2])
-                .map_err(|error| key_codec_error(&format!("{field} is not UTF-8: {}", error)))?;
+                .map_err(|error| key_codec_error(&format!("{field} is not UTF-8: {error}")))?;
             *offset = cursor;
             return Ok((value.to_owned(), terminator));
         }
