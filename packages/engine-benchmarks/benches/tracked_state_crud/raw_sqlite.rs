@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Rows, params, params_from_iter};
 use tempfile::TempDir;
 
-use crate::workload::WorkloadRow;
+use crate::workload::{WorkloadRow, sql_string};
 use lix_engine::{ExecuteResult, Value};
 
 pub(crate) struct RawSqliteFixture {
@@ -9,6 +9,7 @@ pub(crate) struct RawSqliteFixture {
     rows: Vec<WorkloadRow>,
     read_many_by_pk_count: usize,
     read_many_by_pk_sql: String,
+    literal_update_sql: Vec<String>,
     _dir: TempDir,
 }
 
@@ -37,6 +38,7 @@ pub(crate) fn empty_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
         rows: rows.to_vec(),
         read_many_by_pk_count,
         read_many_by_pk_sql: select_many_by_pk_sql(read_many_by_pk_count),
+        literal_update_sql: rows.iter().map(literal_update_sql).collect(),
         _dir: dir,
     }
 }
@@ -231,6 +233,28 @@ impl RawSqliteFixture {
         affected
     }
 
+    /// Runs the same prebuilt literal-statement shape as the public Lix SQL
+    /// session fixture. Unlike [`Self::update_all`], this deliberately does
+    /// not reuse a parameterized SQLite statement, so it isolates parser and
+    /// statement-setup cost from Lix's versioned commit work.
+    pub(crate) fn update_all_literal(&mut self) -> usize {
+        let transaction = self
+            .connection
+            .transaction()
+            .expect("begin literal raw sqlite update transaction");
+        let mut affected = 0;
+        for sql in &self.literal_update_sql {
+            affected += transaction
+                .execute(sql, [])
+                .expect("run literal raw sqlite update row");
+        }
+        transaction
+            .commit()
+            .expect("commit literal raw sqlite update transaction");
+        assert_eq!(affected, self.rows.len());
+        affected
+    }
+
     pub(crate) fn update_one_by_pk(&self) -> usize {
         let row = &self.rows[self.rows.len() / 2];
         let affected = self
@@ -303,4 +327,12 @@ fn select_many_by_pk_sql(count: usize) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("SELECT path, value FROM json_pointer WHERE path IN ({placeholders}) ORDER BY path")
+}
+
+fn literal_update_sql(row: &WorkloadRow) -> String {
+    format!(
+        "UPDATE json_pointer SET value = '{}' WHERE path = '{}'",
+        sql_string(row.updated_value_json.as_str()),
+        sql_string(row.path.as_str())
+    )
 }

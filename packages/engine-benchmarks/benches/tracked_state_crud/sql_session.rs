@@ -7,6 +7,7 @@ use crate::workload::{WorkloadRow, sql_string};
 
 const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
+const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
 
 pub(crate) enum SqlFixture {
     SQLite(GenericSqlFixture<SQLite>),
@@ -22,6 +23,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
     update_all_sql_rows: Vec<String>,
+    bound_update_all_params: Vec<Vec<Value>>,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
     // Keep the storage path alive until after the session/storage is dropped.
@@ -112,6 +114,16 @@ impl SqlFixture {
         }
     }
 
+    /// Executes the tracked bulk-update workload through the public bound
+    /// parameter surface. This is a profiling control for separating repeated
+    /// literal SQL planning from the versioned write path.
+    pub(crate) async fn update_all_bound(&self) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.update_all_bound().await,
+            Self::RocksDB(fixture) => fixture.update_all_bound().await,
+        }
+    }
+
     pub(crate) async fn update_one_by_pk(&self) -> usize {
         match self {
             Self::SQLite(fixture) => fixture.update_one_by_pk().await,
@@ -191,6 +203,29 @@ where
     }
 
     #[expect(clippy::cast_possible_truncation)]
+    async fn update_all_bound(&self) -> usize {
+        let mut transaction = self
+            .session
+            .begin_transaction()
+            .await
+            .expect("begin tracked-state CRUD bound transaction");
+        let mut affected = 0;
+        for params in &self.bound_update_all_params {
+            affected += transaction
+                .execute(BOUND_UPDATE_ALL_SQL, params)
+                .await
+                .expect("execute tracked-state CRUD bound transaction SQL")
+                .rows_affected();
+        }
+        transaction
+            .commit()
+            .await
+            .expect("commit tracked-state CRUD bound transaction");
+        assert_eq!(affected as usize, self.row_count);
+        affected as usize
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
     async fn update_one_by_pk(&self) -> usize {
         let affected = execute(&self.session, &self.update_one_by_pk_sql)
             .await
@@ -236,6 +271,15 @@ where
         select_one_by_pk_sql: select_by_pk_sql(&rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&rows[mid]),
         update_all_sql_rows: rows.iter().map(update_row_sql).collect(),
+        bound_update_all_params: rows
+            .iter()
+            .map(|row| {
+                vec![
+                    Value::Text(row.updated_value_json.clone()),
+                    Value::Text(row.path.clone()),
+                ]
+            })
+            .collect(),
         delete_all_sql: "DELETE FROM json_pointer".to_string(),
         delete_one_by_pk_sql: format!(
             "DELETE FROM json_pointer WHERE path = '{}'",
