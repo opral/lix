@@ -1,10 +1,12 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
+use lix_engine::wasm::v2::WasmTransitionCounters;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
-    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecutionDisposition, LixError, Memory,
-    MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecuteStatementMetadata,
+    ExecutionDisposition, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
+    SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -241,6 +243,19 @@ where
         self.session.read_file_data(path.into()).await
     }
 
+    #[doc(hidden)]
+    pub async fn execute_with_options_and_metadata(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+    ) -> Result<ExecuteResult, LixError> {
+        self.session
+            .execute_with_options_and_metadata(sql, params, options, metadata)
+            .await
+    }
+
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
@@ -268,6 +283,18 @@ where
         statements: &[ExecuteBatchStatement],
     ) -> Result<ExecutionDisposition, LixError> {
         self.session.execute_batch_disposition(statements)
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_batch_with_options_and_metadata(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_batch_with_options_and_metadata(statements, options, statement_metadata)
+            .await
     }
 
     pub fn observe(
@@ -350,6 +377,19 @@ where
 
     pub async fn close(&self) -> Result<(), LixError> {
         self.session.close().await
+    }
+
+    /// Returns engine-local v2 transition counters for profiling and
+    /// production invariant monitoring.
+    #[doc(hidden)]
+    pub fn plugin_v2_transition_counters(&self) -> WasmTransitionCounters {
+        self.engine.plugin_v2_transition_counters()
+    }
+
+    /// Starts a new engine-local v2 transition measurement window.
+    #[doc(hidden)]
+    pub fn reset_plugin_v2_transition_counters(&self) {
+        self.engine.reset_plugin_v2_transition_counters();
     }
 }
 

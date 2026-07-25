@@ -65,7 +65,8 @@ where
             return Ok(None);
         }
         if self.last_rows.is_none() {
-            let Some((mutation_sequence, evaluation)) = self.evaluate_stable_snapshot().await?
+            let Some((mutation_sequence, evaluation)) =
+                Box::pin(self.evaluate_stable_snapshot()).await?
             else {
                 return Ok(None);
             };
@@ -86,7 +87,7 @@ where
                 return Ok(None);
             }
 
-            if !self.wait_for_invalidation().await? {
+            if !Box::pin(self.wait_for_invalidation()).await? {
                 self.closed = true;
                 return Ok(None);
             }
@@ -96,7 +97,8 @@ where
                 return Ok(None);
             }
 
-            let Some((mutation_sequence, evaluation)) = self.evaluate_stable_snapshot().await?
+            let Some((mutation_sequence, evaluation)) =
+                Box::pin(self.evaluate_stable_snapshot()).await?
             else {
                 return Ok(None);
             };
@@ -153,7 +155,7 @@ where
                 .ensure_external_watcher(self.session.storage.clone())
                 .await?;
             let before = self.invalidation_generation()?;
-            let rows = self.execute_or_share(before).await;
+            let rows = Box::pin(self.execute_or_share(before)).await;
             drop(operation_guard);
             let rows = match rows {
                 Ok(rows) => rows,
@@ -172,18 +174,23 @@ where
 
     async fn execute_or_share(&self, generation: u64) -> Result<ObserveQueryEvaluation, LixError> {
         let Some(shared_state) = &self.query.shared_state else {
-            return self
-                .session
-                .execute_for_observe(&self.query.sql, &self.query.params)
-                .await
-                .map(ObserveQueryEvaluation::unshared);
+            return Box::pin(
+                self.session
+                    .execute_for_observe(&self.query.sql, &self.query.params),
+            )
+            .await
+            .map(ObserveQueryEvaluation::unshared);
         };
 
         shared_state
-            .evaluate(generation, Arc::strong_count(shared_state) > 1, || async {
-                self.session
-                    .execute_for_observe(&self.query.sql, &self.query.params)
+            .evaluate(generation, Arc::strong_count(shared_state) > 1, || {
+                Box::pin(async {
+                    Box::pin(
+                        self.session
+                            .execute_for_observe(&self.query.sql, &self.query.params),
+                    )
                     .await
+                })
             })
             .await
     }

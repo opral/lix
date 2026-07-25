@@ -15,10 +15,11 @@ use axum::{
 };
 use lix_sdk::{
     Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
-    ExecutionDisposition, Lix, LixError, ObserveEvent, ObserveEvents, Storage, SwitchBranchOptions,
-    Value, WireValue,
+    ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, ObserveEvent, ObserveEvents,
+    Storage, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -78,8 +79,14 @@ pub const MAX_MULTIPLEX_SUBSCRIPTIONS: usize = 32;
 const MAX_REQUEST_BLOB_CACHE_ENTRIES: usize = 8;
 /// Blobs below this size are cheaper to send whole than to retain and hash.
 const MIN_REQUEST_BLOB_CACHE_BYTES: usize = 32 * 1024;
-/// Maximum aggregate bytes retained by one remote session's request blob cache.
-const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 2 * 1024 * 1024;
+/// Maximum aggregate bytes retained by one remote session's request blob
+/// cache. This holds one exact 10.68 MB production CSV (or 10 MB JSON) base,
+/// while inserting its similarly sized successor evicts the predecessor.
+const MAX_REQUEST_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum request-base bytes retained across every remote session for one
+/// workspace. Once full, additional bases simply use the existing complete-
+/// blob retry path; request correctness never depends on cache admission.
+pub const DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES: usize = 128 * 1024 * 1024;
 const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 
 const SESSION_TOKEN_BYTES: usize = 32;
@@ -100,6 +107,8 @@ pub struct ProtocolServerOptions {
     pub max_sessions: usize,
     pub session_idle_timeout: Duration,
     pub max_request_body_bytes: usize,
+    /// Maximum request-base bytes retained across all sessions.
+    pub max_request_blob_cache_bytes: usize,
 }
 
 impl Default for ProtocolServerOptions {
@@ -108,6 +117,7 @@ impl Default for ProtocolServerOptions {
             max_sessions: DEFAULT_MAX_SESSIONS,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
             max_request_body_bytes: DEFAULT_MAX_REQUEST_BODY_BYTES,
+            max_request_blob_cache_bytes: DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
         }
     }
 }
@@ -143,6 +153,7 @@ where
     root: Arc<Lix<S>>,
     options: ProtocolServerOptions,
     registry: AsyncMutex<SessionRegistry<S>>,
+    request_blob_budget: Arc<RequestBlobCacheBudget>,
     session_open_gate: Arc<SessionOpenGate>,
     close_started: Once,
     close_result: watch::Sender<Option<Result<(), LixError>>>,
@@ -244,60 +255,171 @@ where
     last_used: Mutex<Instant>,
     leases: AtomicUsize,
     request_blobs: Mutex<RequestBlobCache>,
+    max_reconstructed_request_blob_bytes: usize,
 }
 
-#[derive(Default)]
+struct RequestBlobCacheBudget {
+    max_bytes: usize,
+    total_bytes: AtomicUsize,
+}
+
+impl RequestBlobCacheBudget {
+    fn new(max_bytes: usize) -> Self {
+        debug_assert!(max_bytes > 0, "request blob cache budget must be positive");
+        Self {
+            max_bytes,
+            total_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        let mut current = self.total_bytes.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.max_bytes {
+                return false;
+            }
+            match self.total_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.total_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(
+            previous >= bytes,
+            "request blob cache budget accounting underflow"
+        );
+    }
+}
+
 struct RequestBlobCache {
-    entries: HashMap<String, Arc<[u8]>>,
+    entries: HashMap<String, VerifiedRequestBlob>,
     insertion_order: VecDeque<String>,
     total_bytes: usize,
+    budget: Arc<RequestBlobCacheBudget>,
 }
 
 impl RequestBlobCache {
-    fn get(&self, sha256: &str) -> Option<Arc<[u8]>> {
+    fn new(budget: Arc<RequestBlobCacheBudget>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            total_bytes: 0,
+            budget,
+        }
+    }
+
+    fn get(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
         self.entries.get(sha256).cloned()
     }
 
     fn insert(&mut self, candidate: CachedRequestBlob) {
-        if !is_request_blob_cacheable(candidate.bytes.len())
-            || self.entries.contains_key(&candidate.sha256)
+        let candidate_bytes = candidate.blob.blob().len();
+        if !is_request_blob_cacheable(candidate_bytes)
+            || self.entries.contains_key(candidate.blob.sha256())
         {
             return;
         }
-        while self.entries.len() >= MAX_REQUEST_BLOB_CACHE_ENTRIES
-            || self
-                .total_bytes
-                .checked_add(candidate.bytes.len())
+
+        let mut projected_entries = self.entries.len();
+        let mut projected_bytes = self.total_bytes;
+        let mut eviction_count = 0usize;
+        while projected_entries >= MAX_REQUEST_BLOB_CACHE_ENTRIES
+            || projected_bytes
+                .checked_add(candidate_bytes)
                 .is_none_or(|total| total > MAX_REQUEST_BLOB_CACHE_BYTES)
         {
-            let Some(oldest) = self.insertion_order.pop_front() else {
-                break;
-            };
-            if let Some(removed) = self.entries.remove(&oldest) {
-                self.total_bytes = self.total_bytes.saturating_sub(removed.len());
-            }
+            let oldest = self
+                .insertion_order
+                .get(eviction_count)
+                .expect("cache insertion order covers every retained entry");
+            let removed = self
+                .entries
+                .get(oldest)
+                .expect("cache insertion order contains only retained entries");
+            projected_entries -= 1;
+            projected_bytes -= removed.blob().len();
+            eviction_count += 1;
         }
-        self.total_bytes += candidate.bytes.len();
-        self.insertion_order.push_back(candidate.sha256.clone());
-        self.entries.insert(candidate.sha256, candidate.bytes);
+
+        loop {
+            let evicted_bytes = self.total_bytes - projected_bytes;
+            let additional_bytes = candidate_bytes.saturating_sub(evicted_bytes);
+            if self.budget.try_reserve(additional_bytes) {
+                break;
+            }
+            let Some(oldest) = self.insertion_order.get(eviction_count) else {
+                return;
+            };
+            let removed = self
+                .entries
+                .get(oldest)
+                .expect("cache insertion order contains only retained entries");
+            projected_bytes -= removed.blob().len();
+            eviction_count += 1;
+        }
+
+        let evicted_bytes = self.total_bytes - projected_bytes;
+        for _ in 0..eviction_count {
+            let oldest = self
+                .insertion_order
+                .pop_front()
+                .expect("planned cache eviction has an insertion-order entry");
+            let removed = self
+                .entries
+                .remove(&oldest)
+                .expect("planned cache eviction has a retained entry");
+            self.total_bytes -= removed.blob().len();
+        }
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(candidate_bytes)
+            .expect("the per-session cache limit bounds retained bytes");
+        let sha256 = candidate.blob.sha256().to_owned();
+        self.insertion_order.push_back(sha256.clone());
+        self.entries.insert(sha256, candidate.blob);
+        if evicted_bytes > candidate_bytes {
+            self.budget.release(evicted_bytes - candidate_bytes);
+        }
+    }
+}
+
+impl Drop for RequestBlobCache {
+    fn drop(&mut self) {
+        self.budget.release(self.total_bytes);
     }
 }
 
 struct CachedRequestBlob {
-    sha256: String,
-    bytes: Arc<[u8]>,
+    blob: VerifiedRequestBlob,
 }
 
 impl<S> SessionRecord<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(lix: Lix<S>, now: Instant) -> Self {
+    fn new(
+        lix: Lix<S>,
+        now: Instant,
+        max_reconstructed_request_blob_bytes: usize,
+        request_blob_budget: Arc<RequestBlobCacheBudget>,
+    ) -> Self {
         Self {
             lix: Arc::new(AsyncRwLock::new(Arc::new(lix))),
             last_used: Mutex::new(now),
             leases: AtomicUsize::new(0),
-            request_blobs: Mutex::new(RequestBlobCache::default()),
+            request_blobs: Mutex::new(RequestBlobCache::new(request_blob_budget)),
+            max_reconstructed_request_blob_bytes,
         }
     }
 
@@ -333,7 +455,7 @@ where
         self.lease_count() == 0 && now.saturating_duration_since(self.last_used()) >= timeout
     }
 
-    fn request_blob(&self, sha256: &str) -> Option<Arc<[u8]>> {
+    fn request_blob(&self, sha256: &str) -> Option<VerifiedRequestBlob> {
         self.request_blobs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -464,6 +586,7 @@ where
         sql: String,
         params: Vec<Value>,
         options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
     ) -> Result<ExecuteResult, LixError> {
         let disposition = {
             let lix = self.record.lix.read().await;
@@ -472,13 +595,15 @@ where
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
-                    lix.execute_with_options(&sql, &params, options).await
+                    lix.execute_with_options_and_metadata(&sql, &params, options, metadata)
+                        .await
                 })
                 .await
             }
             ExecutionDisposition::Durable => {
                 self.run(move |lix| async move {
-                    lix.execute_with_options(&sql, &params, options).await
+                    lix.execute_with_options_and_metadata(&sql, &params, options, metadata)
+                        .await
                 })
                 .await
             }
@@ -489,6 +614,7 @@ where
         &self,
         statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let disposition = {
             let lix = self.record.lix.read().await;
@@ -497,13 +623,23 @@ where
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
-                    lix.execute_batch_with_options(&statements, options).await
+                    lix.execute_batch_with_options_and_metadata(
+                        &statements,
+                        options,
+                        statement_metadata,
+                    )
+                    .await
                 })
                 .await
             }
             ExecutionDisposition::Durable => {
                 self.run(move |lix| async move {
-                    lix.execute_batch_with_options(&statements, options).await
+                    lix.execute_batch_with_options_and_metadata(
+                        &statements,
+                        options,
+                        statement_metadata,
+                    )
+                    .await
                 })
                 .await
             }
@@ -677,6 +813,12 @@ where
                 "protocol max_request_body_bytes must be greater than zero",
             ));
         }
+        if options.max_request_blob_cache_bytes == 0 {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "protocol max_request_blob_cache_bytes must be greater than zero",
+            ));
+        }
         let (close_result, _) = watch::channel(None);
         Ok(Self {
             inner: Arc::new(ServerInner {
@@ -686,6 +828,9 @@ where
                     lifecycle: ServerLifecycle::Open,
                     sessions: HashMap::new(),
                 }),
+                request_blob_budget: Arc::new(RequestBlobCacheBudget::new(
+                    options.max_request_blob_cache_bytes,
+                )),
                 session_open_gate: Arc::new(SessionOpenGate::default()),
                 close_started: Once::new(),
                 close_result,
@@ -893,7 +1038,12 @@ where
                 removed_sessions.push(record);
             }
         }
-        let record = Arc::new(SessionRecord::new(child, now));
+        let record = Arc::new(SessionRecord::new(
+            child,
+            now,
+            self.inner.options.max_request_body_bytes,
+            Arc::clone(&self.inner.request_blob_budget),
+        ));
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
@@ -1125,13 +1275,15 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let sql = required_non_empty(request.sql, "sql")?;
-    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
     let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
     let mut cache_candidates = Vec::new();
     let decoded = decode_request_params(
         request.params,
         None,
         request.cache_blobs,
+        reconstructed_bytes_limit,
         &mut reconstructed_bytes_remaining,
         &mut cache_candidate_bytes_remaining,
         &mut cache_candidates,
@@ -1139,7 +1291,8 @@ where
     )?;
     let options = request.options.into();
     let params = decoded.values;
-    let result = lease.execute(sql, params, options).await?;
+    let metadata = decoded.metadata;
+    let result = lease.execute(sql, params, options, metadata).await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(ExecuteResponse::try_from(result)?))
 }
@@ -1155,9 +1308,10 @@ where
         return Err(ApiError::bad_request("statements must not be empty"));
     }
     let mut cache_candidates = Vec::new();
-    let mut reconstructed_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+    let reconstructed_bytes_limit = lease.record.max_reconstructed_request_blob_bytes;
+    let mut reconstructed_bytes_remaining = reconstructed_bytes_limit;
     let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
-    let statements = request
+    let decoded_statements = request
         .statements
         .into_iter()
         .enumerate()
@@ -1166,19 +1320,26 @@ where
                 statement.params,
                 Some(index),
                 request.cache_blobs,
+                reconstructed_bytes_limit,
                 &mut reconstructed_bytes_remaining,
                 &mut cache_candidate_bytes_remaining,
                 &mut cache_candidates,
                 |sha256| lease.record.request_blob(sha256),
             )?;
-            Ok(ExecuteBatchStatement {
-                sql: required_non_empty(statement.sql, "statements[].sql")?,
-                params: decoded.values,
-            })
+            Ok((
+                ExecuteBatchStatement {
+                    sql: required_non_empty(statement.sql, "statements[].sql")?,
+                    params: decoded.values,
+                },
+                decoded.metadata,
+            ))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
+    let (statements, statement_metadata): (Vec<_>, Vec<_>) = decoded_statements.into_iter().unzip();
     let options = request.options.into();
-    let results = lease.execute_batch(statements, options).await?;
+    let results = lease
+        .execute_batch(statements, options, statement_metadata)
+        .await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(
         results
@@ -1677,18 +1838,21 @@ fn decode_params_at(
 
 struct DecodedRequestParams {
     values: Vec<Value>,
+    metadata: ExecuteStatementMetadata,
 }
 
 fn decode_request_params(
     params: Vec<RequestWireValue>,
     statement_index: Option<usize>,
     cache_full_blobs: bool,
+    reconstructed_bytes_limit: usize,
     reconstructed_bytes_remaining: &mut usize,
     cache_candidate_bytes_remaining: &mut usize,
     cache_candidates: &mut Vec<CachedRequestBlob>,
-    lookup_blob: impl Fn(&str) -> Option<Arc<[u8]>>,
+    lookup_blob: impl Fn(&str) -> Option<VerifiedRequestBlob>,
 ) -> Result<DecodedRequestParams, ApiError> {
     let mut values = Vec::with_capacity(params.len());
+    let mut parameter_blob_splices = Vec::with_capacity(params.len());
     for (parameter_index, value) in params.into_iter().enumerate() {
         match value {
             RequestWireValue::Value(value) => {
@@ -1706,13 +1870,13 @@ fn decode_request_params(
                     && bytes.len() <= *cache_candidate_bytes_remaining
                 {
                     prepare_cache_candidate(
-                        sha256_hex(bytes),
-                        bytes,
+                        VerifiedRequestBlob::verify(bytes.clone()),
                         cache_candidate_bytes_remaining,
                         cache_candidates,
                     );
                 }
                 values.push(value);
+                parameter_blob_splices.push(None);
             }
             RequestWireValue::BlobSplice(splice) => {
                 let base_sha256 = splice.base_sha256;
@@ -1756,9 +1920,9 @@ fn decode_request_params(
                         "blob splice suffixBytes is too large",
                     )
                 })?;
-                if prefix > base.len()
-                    || suffix > base.len()
-                    || prefix.saturating_add(suffix) > base.len()
+                if prefix > base.blob().len()
+                    || suffix > base.blob().len()
+                    || prefix.saturating_add(suffix) > base.blob().len()
                 {
                     return Err(invalid_parameter_error(
                         parameter_index,
@@ -1799,56 +1963,55 @@ fn decode_request_params(
                         statement_index,
                         LixError::CODE_INVALID_PARAM,
                         format!(
-                            "aggregate reconstructed blobs exceed the {MAX_REQUEST_BLOB_CACHE_BYTES}-byte request limit"
+                            "aggregate reconstructed blobs exceed the {reconstructed_bytes_limit}-byte request limit"
                         ),
                     ));
                 }
                 *reconstructed_bytes_remaining -= reconstructed_len;
-                let mut reconstructed = Vec::with_capacity(reconstructed_len);
-                reconstructed.extend_from_slice(&base[..prefix]);
-                reconstructed.extend_from_slice(&insert);
-                reconstructed.extend_from_slice(&base[base.len() - suffix..]);
-                let actual_sha256 = sha256_hex(&reconstructed);
-                if actual_sha256 != result_sha256 {
-                    return Err(invalid_parameter_error(
-                        parameter_index,
-                        statement_index,
-                        LixError::CODE_INVALID_PARAM,
-                        "blob splice resultSha256 does not match the reconstructed bytes",
-                    ));
-                }
+                let (reconstructed, provenance) = base
+                    .reconstruct_splice(&base_sha256, &result_sha256, prefix, suffix, insert)
+                    .map_err(|error| {
+                        invalid_parameter_error(
+                            parameter_index,
+                            statement_index,
+                            error.code,
+                            error.message,
+                        )
+                    })?;
                 prepare_cache_candidate(
-                    result_sha256,
-                    &reconstructed,
+                    reconstructed.clone(),
                     cache_candidate_bytes_remaining,
                     cache_candidates,
                 );
-                values.push(Value::Blob(reconstructed.into()));
+                values.push(Value::Blob(reconstructed.blob().clone()));
+                parameter_blob_splices.push(Some(provenance));
             }
         }
     }
-    Ok(DecodedRequestParams { values })
+    Ok(DecodedRequestParams {
+        values,
+        metadata: ExecuteStatementMetadata {
+            parameter_blob_splices,
+            ..ExecuteStatementMetadata::default()
+        },
+    })
 }
 
 fn prepare_cache_candidate(
-    sha256: String,
-    bytes: &[u8],
+    blob: VerifiedRequestBlob,
     bytes_remaining: &mut usize,
     candidates: &mut Vec<CachedRequestBlob>,
 ) {
-    if !is_request_blob_cacheable(bytes.len())
-        || bytes.len() > *bytes_remaining
+    if !is_request_blob_cacheable(blob.blob().len())
+        || blob.blob().len() > *bytes_remaining
         || candidates
             .iter()
-            .any(|candidate| candidate.sha256 == sha256)
+            .any(|candidate| candidate.blob.sha256() == blob.sha256())
     {
         return;
     }
-    *bytes_remaining -= bytes.len();
-    candidates.push(CachedRequestBlob {
-        sha256,
-        bytes: Arc::from(bytes.to_vec()),
-    });
+    *bytes_remaining -= blob.blob().len();
+    candidates.push(CachedRequestBlob { blob });
 }
 
 fn invalid_parameter_error(
@@ -1887,6 +2050,7 @@ fn is_request_blob_cacheable(length: usize) -> bool {
     (MIN_REQUEST_BLOB_CACHE_BYTES..=MAX_REQUEST_BLOB_CACHE_BYTES).contains(&length)
 }
 
+#[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut encoded = String::with_capacity(digest.len() * 2);
@@ -2152,6 +2316,7 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
             StatusCode::CONFLICT
         }
+        LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     }
@@ -2614,8 +2779,9 @@ mod tests {
     use flate2::{Compression, read::GzDecoder, write::GzEncoder};
     use http_body_util::BodyExt as _;
     use lix_sdk::{
-        Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions, StorageError,
-        TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
+        Blob, Memory, MemoryRead, MemoryWrite, OpenLixOptions, ReadOptions,
+        RequestBlobSpliceProvenance, StorageError, TracingTelemetrySink, WriteOptions, open_lix,
+        open_lix_with_telemetry,
     };
     use serde_json::{Value as JsonValue, json};
     use std::{
@@ -3387,6 +3553,214 @@ mod tests {
             "suffixBytes": suffix_bytes,
             "insertBase64": insert_base64,
         })
+    }
+
+    #[test]
+    fn request_blob_splice_metadata_stays_aligned_with_its_sql_parameter() {
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let mut result = base.clone();
+        result[8..12].copy_from_slice(b"BETA");
+        let base_sha256 = sha256_hex(&base);
+        let params = vec![
+            json!({ "kind": "text", "value": "file-a" }),
+            blob_splice_json(&base, &result, 8, base.len() - 12, b"BETA"),
+            wire_blob_json(b"full"),
+        ]
+        .into_iter()
+        .map(|value| serde_json::from_value(value).expect("request parameter should decode"))
+        .collect();
+        let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut cache_candidates = Vec::new();
+
+        let decoded = decode_request_params(
+            params,
+            None,
+            false,
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| {
+                (sha256 == base_sha256).then(|| VerifiedRequestBlob::verify(base.clone().into()))
+            },
+        )
+        .expect("splice parameters should decode");
+
+        let Value::Blob(result_blob) = &decoded.values[1] else {
+            panic!("splice should decode to a blob parameter");
+        };
+        assert_eq!(result_blob.as_ref(), result.as_slice());
+        assert_eq!(decoded.metadata.parameter_blob_splices.len(), 3);
+        assert!(decoded.metadata.parameter_blob_splices[0].is_none());
+        let provenance = decoded.metadata.parameter_blob_splices[1]
+            .as_ref()
+            .expect("splice metadata should remain at parameter two");
+        let expected = RequestBlobSpliceProvenance::new_validated(
+            &base,
+            result_blob,
+            &base_sha256,
+            &sha256_hex(&result),
+            8,
+            base.len() - 12,
+            b"BETA".to_vec(),
+        )
+        .expect("expected splice provenance should validate");
+        assert_eq!(provenance, &expected);
+        assert!(decoded.metadata.parameter_blob_splices[2].is_none());
+    }
+
+    #[test]
+    fn request_blob_splice_reconstructs_the_exact_large_csv_fixture() {
+        const EXACT_CSV_BYTES: usize = 10_680_000;
+        const _: () = {
+            assert!(EXACT_CSV_BYTES > 10 * 1024 * 1024);
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
+
+        let base: Blob = vec![b'a'; EXACT_CSV_BYTES].into();
+        let mut result = base.to_vec();
+        let edit_offset = result.len() / 2;
+        result[edit_offset] = b'b';
+        let base_sha256 = sha256_hex(&base);
+        let params = vec![
+            serde_json::from_value(blob_splice_json(
+                &base,
+                &result,
+                edit_offset,
+                base.len() - edit_offset - 1,
+                b"b",
+            ))
+            .expect("large splice request parameter should decode"),
+        ];
+        let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+        let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+        let mut cache_candidates = Vec::new();
+
+        let decoded = decode_request_params(
+            params,
+            None,
+            false,
+            DEFAULT_MAX_REQUEST_BODY_BYTES,
+            &mut reconstructed_bytes_remaining,
+            &mut cache_candidate_bytes_remaining,
+            &mut cache_candidates,
+            |sha256| (sha256 == base_sha256).then(|| VerifiedRequestBlob::verify(base.clone())),
+        )
+        .expect("the exact 10.68 MB CSV splice should reconstruct");
+
+        let Value::Blob(reconstructed) = &decoded.values[0] else {
+            panic!("large splice should decode to a blob parameter");
+        };
+        assert_eq!(reconstructed.as_ref(), result.as_slice());
+        let provenance = decoded.metadata.parameter_blob_splices[0]
+            .as_ref()
+            .expect("large splice provenance should survive decoding");
+        let expected = RequestBlobSpliceProvenance::new_validated(
+            &base,
+            reconstructed,
+            &base_sha256,
+            &sha256_hex(&result),
+            edit_offset,
+            base.len() - edit_offset - 1,
+            b"b".to_vec(),
+        )
+        .expect("expected large splice provenance should validate");
+        assert_eq!(provenance, &expected);
+        assert_eq!(
+            reconstructed_bytes_remaining,
+            DEFAULT_MAX_REQUEST_BODY_BYTES - EXACT_CSV_BYTES
+        );
+        assert_eq!(cache_candidates.len(), 1);
+        assert_eq!(cache_candidates[0].blob.blob().as_ref(), result.as_slice());
+        assert_eq!(
+            cache_candidates[0].blob.blob().as_ptr(),
+            reconstructed.as_ptr(),
+            "SQL, provenance, and the successor cache must share one reconstructed payload"
+        );
+    }
+
+    #[test]
+    fn batch_blob_splice_metadata_stays_aligned_by_statement() {
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
+        let base_sha256 = sha256_hex(&base);
+        let decode = |parameter_index: usize, insert: u8| {
+            let mut result = base.clone();
+            result[parameter_index] = insert;
+            let splice = blob_splice_json(
+                &base,
+                &result,
+                parameter_index,
+                base.len() - parameter_index - 1,
+                &[insert],
+            );
+            let mut wire = vec![json!({ "kind": "text", "value": "unrelated" })];
+            wire.resize_with(parameter_index, || json!({ "kind": "null", "value": null }));
+            wire.push(splice);
+            let params = wire
+                .into_iter()
+                .map(|value| {
+                    serde_json::from_value(value).expect("batch request parameter should decode")
+                })
+                .collect();
+            let mut reconstructed_bytes_remaining = DEFAULT_MAX_REQUEST_BODY_BYTES;
+            let mut cache_candidate_bytes_remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
+            let mut cache_candidates = Vec::new();
+            decode_request_params(
+                params,
+                Some(parameter_index),
+                false,
+                DEFAULT_MAX_REQUEST_BODY_BYTES,
+                &mut reconstructed_bytes_remaining,
+                &mut cache_candidate_bytes_remaining,
+                &mut cache_candidates,
+                |sha256| {
+                    (sha256 == base_sha256)
+                        .then(|| VerifiedRequestBlob::verify(base.clone().into()))
+                },
+            )
+            .expect("batch splice should decode")
+        };
+
+        let first = decode(1, b'1');
+        let second = decode(3, b'2');
+        assert!(first.metadata.parameter_blob_splices[0].is_none());
+        let Value::Blob(first_result) = &first.values[1] else {
+            panic!("first splice should decode to a blob");
+        };
+        let first_expected = RequestBlobSpliceProvenance::new_validated(
+            &base,
+            first_result,
+            &base_sha256,
+            &sha256_hex(first_result),
+            1,
+            base.len() - 2,
+            vec![b'1'],
+        )
+        .expect("first expected provenance should validate");
+        assert_eq!(
+            first.metadata.parameter_blob_splices[1].as_ref(),
+            Some(&first_expected)
+        );
+        assert!(second.metadata.parameter_blob_splices[1].is_none());
+        assert!(second.metadata.parameter_blob_splices[2].is_none());
+        let Value::Blob(second_result) = &second.values[3] else {
+            panic!("second splice should decode to a blob");
+        };
+        let second_expected = RequestBlobSpliceProvenance::new_validated(
+            &base,
+            second_result,
+            &base_sha256,
+            &sha256_hex(second_result),
+            3,
+            base.len() - 4,
+            vec![b'2'],
+        )
+        .expect("second expected provenance should validate");
+        assert_eq!(
+            second.metadata.parameter_blob_splices[3].as_ref(),
+            Some(&second_expected)
+        );
     }
 
     fn gzip(bytes: &[u8]) -> Vec<u8> {
@@ -4520,9 +4894,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_batch_bounds_aggregate_blob_reconstruction_before_mutation() {
-        let app = app().await;
+        const TEST_RECONSTRUCTION_LIMIT: usize = 128 * 1024;
+        let app = app_with_options(ProtocolServerOptions {
+            max_request_body_bytes: TEST_RECONSTRUCTION_LIMIT,
+            ..ProtocolServerOptions::default()
+        })
+        .await;
         let (session_id, _) = new_session(&app.router).await;
-        let base = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
+        let base = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES];
         let cached = request(
             &app.router,
             "POST",
@@ -4543,31 +4922,29 @@ mod tests {
         let mut result = base.clone();
         result.push(b'b');
         let splice = blob_splice_json(&base, &result, base.len(), 0, b"b");
+        let statements = (0..4)
+            .map(|index| {
+                if index == 0 {
+                    json!({
+                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
+                        "params": [
+                            { "kind": "text", "value": "/must-not-execute.bin" },
+                            splice.clone(),
+                        ],
+                    })
+                } else {
+                    json!({ "sql": "SELECT $1", "params": [splice.clone()] })
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(result.len() * statements.len() > TEST_RECONSTRUCTION_LIMIT);
         let response = request(
             &app.router,
             "POST",
             "/lix/v1/execute-batch",
             Some(&session_id),
             Some(json!({
-                "statements": [
-                    {
-                        "sql": "INSERT INTO lix_file (path, data) VALUES ($1, $2)",
-                        "params": [
-                            { "kind": "text", "value": "/must-not-execute.bin" },
-                            splice,
-                        ],
-                    },
-                    {
-                        "sql": "SELECT $1",
-                        "params": [blob_splice_json(
-                            &base,
-                            &result,
-                            base.len(),
-                            0,
-                            b"b",
-                        )],
-                    },
-                ],
+                "statements": statements,
             })),
         )
         .await;
@@ -4694,52 +5071,164 @@ mod tests {
 
     #[test]
     fn request_blob_cache_evicts_by_entry_and_byte_limits() {
-        let mut cache = RequestBlobCache::default();
+        let mut cache = RequestBlobCache::new(Arc::new(RequestBlobCacheBudget::new(
+            DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
+        )));
+        let mut inserted = Vec::new();
         for index in 0..=MAX_REQUEST_BLOB_CACHE_ENTRIES {
-            cache.insert(CachedRequestBlob {
-                sha256: format!("entry-{index}"),
-                bytes: Arc::from(vec![
+            let blob = VerifiedRequestBlob::verify(
+                vec![
                     u8::try_from(index).expect("test index should fit");
                     MIN_REQUEST_BLOB_CACHE_BYTES
-                ]),
-            });
+                ]
+                .into(),
+            );
+            inserted.push(blob.sha256().to_owned());
+            cache.insert(CachedRequestBlob { blob });
         }
         assert_eq!(cache.entries.len(), MAX_REQUEST_BLOB_CACHE_ENTRIES);
-        assert!(cache.get("entry-0").is_none());
+        assert!(cache.get(&inserted[0]).is_none());
         assert!(
             cache
-                .get(&format!("entry-{MAX_REQUEST_BLOB_CACHE_ENTRIES}"))
+                .get(&inserted[MAX_REQUEST_BLOB_CACHE_ENTRIES])
                 .is_some()
         );
 
-        cache.insert(CachedRequestBlob {
-            sha256: "too-large".to_string(),
-            bytes: Arc::from(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1]),
-        });
-        assert!(cache.get("too-large").is_none());
+        let too_large =
+            VerifiedRequestBlob::verify(vec![0_u8; MAX_REQUEST_BLOB_CACHE_BYTES + 1].into());
+        let too_large_sha256 = too_large.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: too_large });
+        assert!(cache.get(&too_large_sha256).is_none());
         assert!(cache.total_bytes <= MAX_REQUEST_BLOB_CACHE_BYTES);
 
-        cache.insert(CachedRequestBlob {
-            sha256: "too-small".to_string(),
-            bytes: Arc::from(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1]),
-        });
-        assert!(cache.get("too-small").is_none());
+        let too_small =
+            VerifiedRequestBlob::verify(vec![0_u8; MIN_REQUEST_BLOB_CACHE_BYTES - 1].into());
+        let too_small_sha256 = too_small.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: too_small });
+        assert!(cache.get(&too_small_sha256).is_none());
     }
 
     #[test]
-    fn request_cache_candidates_share_one_bounded_clone_budget() {
+    fn request_blob_cache_reuses_verified_full_blob_without_payload_clone() {
+        let source: Blob = vec![b'a'; MIN_REQUEST_BLOB_CACHE_BYTES].into();
+        let source_ptr = source.as_ptr();
+        let verified = VerifiedRequestBlob::verify(source);
+        let sha256 = verified.sha256().to_owned();
+        let mut cache = RequestBlobCache::new(Arc::new(RequestBlobCacheBudget::new(
+            DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
+        )));
+
+        cache.insert(CachedRequestBlob { blob: verified });
+
+        let cached = cache.get(&sha256).expect("full blob should be retained");
+        assert_eq!(cached.blob().as_ptr(), source_ptr);
+    }
+
+    #[test]
+    fn request_blob_cache_retains_and_rotates_exact_large_file_bases() {
+        const EXACT_CSV_BYTES: usize = 10_680_000;
+        const _: () = {
+            assert!(EXACT_CSV_BYTES <= MAX_REQUEST_BLOB_CACHE_BYTES);
+            assert!(EXACT_CSV_BYTES * 2 > MAX_REQUEST_BLOB_CACHE_BYTES);
+        };
+        let mut cache = RequestBlobCache::new(Arc::new(RequestBlobCacheBudget::new(
+            DEFAULT_MAX_REQUEST_BLOB_CACHE_BYTES,
+        )));
+
+        let base = VerifiedRequestBlob::verify(vec![b'a'; EXACT_CSV_BYTES].into());
+        let base_sha256 = base.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: base });
+        assert_eq!(
+            cache.get(&base_sha256).map(|blob| blob.blob().len()),
+            Some(EXACT_CSV_BYTES)
+        );
+
+        let successor = VerifiedRequestBlob::verify(vec![b'b'; EXACT_CSV_BYTES].into());
+        let successor_sha256 = successor.sha256().to_owned();
+        cache.insert(CachedRequestBlob { blob: successor });
+        assert!(cache.get(&base_sha256).is_none());
+        assert_eq!(
+            cache.get(&successor_sha256).map(|blob| blob.blob().len()),
+            Some(EXACT_CSV_BYTES)
+        );
+        assert_eq!(cache.total_bytes, EXACT_CSV_BYTES);
+    }
+
+    #[test]
+    fn request_blob_caches_share_one_workspace_byte_budget() {
+        let budget = Arc::new(RequestBlobCacheBudget::new(
+            MIN_REQUEST_BLOB_CACHE_BYTES * 2,
+        ));
+        let mut first = RequestBlobCache::new(Arc::clone(&budget));
+        let mut second = RequestBlobCache::new(Arc::clone(&budget));
+        let mut third = RequestBlobCache::new(Arc::clone(&budget));
+        let blob = |marker| {
+            let mut bytes = vec![b'x'; MIN_REQUEST_BLOB_CACHE_BYTES];
+            bytes[0] = marker;
+            VerifiedRequestBlob::verify(bytes.into())
+        };
+        let first_blob = blob(b'1');
+        let first_sha256 = first_blob.sha256().to_owned();
+        let second_blob = blob(b'2');
+        let second_sha256 = second_blob.sha256().to_owned();
+        let third_blob = blob(b'3');
+        let third_sha256 = third_blob.sha256().to_owned();
+
+        first.insert(CachedRequestBlob { blob: first_blob });
+        second.insert(CachedRequestBlob { blob: second_blob });
+        third.insert(CachedRequestBlob {
+            blob: third_blob.clone(),
+        });
+        assert!(first.get(&first_sha256).is_some());
+        assert!(second.get(&second_sha256).is_some());
+        assert!(
+            third.get(&third_sha256).is_none(),
+            "a full workspace budget must decline another session cache admission"
+        );
+        assert_eq!(
+            budget.total_bytes.load(Ordering::Acquire),
+            MIN_REQUEST_BLOB_CACHE_BYTES * 2
+        );
+
+        let first_successor = blob(b'4');
+        let first_successor_sha256 = first_successor.sha256().to_owned();
+        first.insert(CachedRequestBlob {
+            blob: first_successor,
+        });
+        assert!(first.get(&first_sha256).is_none());
+        assert!(first.get(&first_successor_sha256).is_some());
+        assert_eq!(
+            budget.total_bytes.load(Ordering::Acquire),
+            MIN_REQUEST_BLOB_CACHE_BYTES * 2,
+            "an equal-size local rotation must retain its budget under contention"
+        );
+
+        drop(first);
+        third.insert(CachedRequestBlob { blob: third_blob });
+        assert!(
+            third.get(&third_sha256).is_some(),
+            "dropping a session cache must release its workspace budget"
+        );
+        assert_eq!(
+            budget.total_bytes.load(Ordering::Acquire),
+            MIN_REQUEST_BLOB_CACHE_BYTES * 2
+        );
+    }
+
+    #[test]
+    fn request_cache_candidates_share_one_bounded_payload_budget() {
         let mut remaining = MAX_REQUEST_BLOB_CACHE_BYTES;
         let mut candidates = Vec::new();
         let first = vec![b'a'; MAX_REQUEST_BLOB_CACHE_BYTES / 2];
-        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        let first = VerifiedRequestBlob::verify(first.into());
+        prepare_cache_candidate(first.clone(), &mut remaining, &mut candidates);
         let after_first = remaining;
-        prepare_cache_candidate(sha256_hex(&first), &first, &mut remaining, &mut candidates);
+        prepare_cache_candidate(first, &mut remaining, &mut candidates);
         assert_eq!(remaining, after_first, "duplicate should reuse candidate");
 
         let over_remaining = vec![b'b'; after_first + 1];
         prepare_cache_candidate(
-            sha256_hex(&over_remaining),
-            &over_remaining,
+            VerifiedRequestBlob::verify(over_remaining.into()),
             &mut remaining,
             &mut candidates,
         );
@@ -5876,6 +6365,22 @@ mod tests {
         );
         let Err(error) = result else {
             panic!("zero capacity must be rejected");
+        };
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+
+        let result = LixProtocolServer::with_options(
+            Arc::new(
+                open_lix(OpenLixOptions::<Memory>::default())
+                    .await
+                    .expect("open second lix"),
+            ),
+            ProtocolServerOptions {
+                max_request_blob_cache_bytes: 0,
+                ..ProtocolServerOptions::default()
+            },
+        );
+        let Err(error) = result else {
+            panic!("zero request blob cache capacity must be rejected");
         };
         assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
     }

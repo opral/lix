@@ -1,0 +1,37 @@
+{
+  "x-lix-key": "excalidraw_file",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "description": "One Excalidraw files-map entry keyed by its native map key. Binary data and numeric metadata stay inside file_json as text.",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The decoded key in the scene's files object."
+    },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$",
+      "description": "A stable fractional key preserving the source object's deterministic order."
+    },
+    "prefix_json": {
+      "type": "string",
+      "minLength": 2,
+      "description": "Exact whitespace, encoded map key, and colon immediately preceding file_json; commas are supplied by the renderer."
+    },
+    "file_json": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The complete exact Excalidraw binary-file JSON object encoded as text."
+    }
+  },
+  "required": [
+    "id",
+    "order_key",
+    "prefix_json",
+    "file_json"
+  ],
+  "additionalProperties": false
+}

@@ -8,9 +8,6 @@ const initialized = initWasm();
 async function openMemoryLix(options: { snapshot?: Uint8Array } = {}) {
 	await initialized;
 	return openMemoryFromSnapshot(
-		async () => {
-			throw new Error("plugins are unavailable in this test");
-		},
 		undefined,
 		options.snapshot,
 	);

@@ -1,0 +1,39 @@
+{
+  "x-lix-key": "csv_v2_row",
+  "x-lix-primary-key": ["/id"],
+  "x-lix-id-allocation": "host-allocated",
+  "description": "One decoded CSV record. Row order is controlled by order_key.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "minLength": 1 },
+    "order_key": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$"
+    },
+    "cells": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "layout": {
+      "description": "Sparse lexical exceptions. Omit this object for canonical quoting and the table terminator.",
+      "type": "object",
+      "properties": {
+        "force_quote": {
+          "description": "Minimal unpadded base64url bitset, least-significant bit first, forcing otherwise-unnecessary quotes for selected fields; trailing zero bytes are omitted.",
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]+$"
+        },
+        "terminator": {
+          "description": "An exceptional row ending. The empty string means no final terminator.",
+          "type": "string",
+          "enum": ["", "\n", "\r\n", "\r"]
+        }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    }
+  },
+  "required": ["id", "order_key", "cells"],
+  "additionalProperties": false
+}

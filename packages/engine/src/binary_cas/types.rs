@@ -48,6 +48,10 @@ impl BlobPayload {
         &self.bytes
     }
 
+    pub(crate) fn shared_bytes(&self) -> crate::Blob {
+        self.bytes.clone()
+    }
+
     pub(crate) fn hash(&self) -> Option<BlobHash> {
         self.hash
     }

@@ -1,0 +1,34 @@
+{
+  "x-lix-key": "csv_v2_table",
+  "x-lix-primary-key": ["/id"],
+  "description": "CSV dialect metadata.",
+  "type": "object",
+  "properties": {
+    "id": { "type": "string", "const": "root" },
+    "dialect": {
+      "type": "object",
+      "properties": {
+        "delimiter": {
+          "description": "One safe ASCII byte: tab or printable ASCII.",
+          "type": "string",
+          "pattern": "^(?:\\t|[ -~])$"
+        },
+        "quote": {
+          "anyOf": [
+            {
+              "description": "One printable non-space ASCII byte, distinct from delimiter.",
+              "type": "string",
+              "pattern": "^[!-~]$"
+            },
+            { "type": "null" }
+          ]
+        },
+        "terminator": { "type": "string", "enum": ["\n", "\r\n", "\r"] }
+      },
+      "required": ["delimiter", "quote", "terminator"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["id", "dialect"],
+  "additionalProperties": false
+}
