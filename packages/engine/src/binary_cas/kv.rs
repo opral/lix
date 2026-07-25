@@ -808,11 +808,11 @@ where
         return Ok(false);
     }
 
-    let base_chunks =
-        match load_declared_manifest_chunks(&store, splice.base_blob_hash, chunk_count).await {
-            Ok(chunks) => chunks,
-            Err(_) => return Ok(false),
-        };
+    let Ok(base_chunks) =
+        load_declared_manifest_chunks(&store, splice.base_blob_hash, chunk_count).await
+    else {
+        return Ok(false);
+    };
     if base_chunks.len() != chunk_count as usize {
         return Ok(false);
     }
@@ -1460,7 +1460,7 @@ mod tests {
             .writer_skipping_existing_chunks(&store, writes)
             .stage_file_payload(payload, same_length_splice)
             .await
-            .expect("test file payload should stage")
+            .expect("test file payload should stage");
     }
 
     async fn stage_test_bytes(
