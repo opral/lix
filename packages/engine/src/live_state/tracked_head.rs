@@ -66,6 +66,28 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
+/// The portion of a head-row key that varies within one branch generation.
+///
+/// A full table scan already constrains `branch_id` and `generation` in the
+/// RocksDB prefix. Keeping that immutable scope out of every decoded row
+/// avoids parsing and allocating the same two key parts 10,000 times.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct HeadRowIdentity {
+    schema_key: String,
+    entity_pk: EntityPk,
+    file_id: Option<String>,
+}
+
+impl HeadIdentity {
+    fn into_row_identity(self) -> HeadRowIdentity {
+        HeadRowIdentity {
+            schema_key: self.schema_key,
+            entity_pk: self.entity_pk,
+            file_id: self.file_id,
+        }
+    }
+}
+
 /// Write-side representation of a v3 head row.
 ///
 /// This exists only while a transaction is being staged. Read-side code uses
@@ -272,7 +294,9 @@ where
         let entries = identities
             .into_iter()
             .zip(values)
-            .filter_map(|(identity, value)| value.map(|value| (identity, value)))
+            .filter_map(|(identity, value)| {
+                value.map(|value| (identity.into_row_identity(), value))
+            })
             .collect();
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
         let mut output = vec![None; keys.len()];
@@ -487,18 +511,21 @@ async fn scan_entries(
     generation: CommitId,
     filter: &TrackedStateFilter,
     limit: Option<usize>,
-) -> Result<Vec<(HeadIdentity, Bytes)>, LixError> {
+) -> Result<Vec<(HeadRowIdentity, Bytes)>, LixError> {
     if let Some(identities) = exact_filter_identities(branch_id, generation, filter) {
         let values = load_entry_bytes(store, &identities).await?;
         return Ok(identities
             .into_iter()
             .zip(values)
-            .filter_map(|(identity, value)| value.map(|value| (identity, value)))
+            .filter_map(|(identity, value)| {
+                value.map(|value| (identity.into_row_identity(), value))
+            })
             .take(limit.unwrap_or(usize::MAX))
             .collect());
     }
 
-    let mut prefixes = scan_prefixes(branch_id, generation, filter);
+    let scope = encode_scope_prefix(branch_id, generation);
+    let mut prefixes = scan_prefixes(&scope, filter);
     prefixes.sort();
     prefixes.dedup();
     let mut rows = Vec::new();
@@ -528,7 +555,7 @@ async fn scan_entries(
                 .await?;
             resume_after = page.value.entries.last().map(|entry| entry.key.clone());
             for entry in page.value.entries {
-                let identity = decode_row_key(entry.key.0.as_ref())?;
+                let identity = decode_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
                 if !matches_filter(&identity, filter) {
                     continue;
                 }
@@ -586,18 +613,13 @@ fn exact_filter_identities(
     Some(identities)
 }
 
-fn scan_prefixes(
-    branch_id: &str,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-) -> Vec<Vec<u8>> {
-    let scope = encode_scope_prefix(branch_id, generation);
+fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
     if filter.schema_keys.is_empty() {
-        return vec![scope];
+        return vec![scope.to_vec()];
     }
     let mut prefixes = Vec::new();
     for schema_key in &filter.schema_keys {
-        let mut schema_prefix = scope.clone();
+        let mut schema_prefix = scope.to_vec();
         write_key_string(&mut schema_prefix, schema_key, KEY_PART_FINAL);
         if filter.entity_pks.is_empty() {
             prefixes.push(schema_prefix);
@@ -630,7 +652,7 @@ fn scan_prefixes(
     prefixes
 }
 
-fn matches_filter(identity: &HeadIdentity, filter: &TrackedStateFilter) -> bool {
+fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
         && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&identity.entity_pk))
         && (filter.file_ids.is_empty()
@@ -691,6 +713,7 @@ fn encode_row_key(identity: &HeadIdentity) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
 fn decode_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     let mut offset = 0usize;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -710,6 +733,34 @@ fn decode_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     Ok(HeadIdentity {
         branch_id,
         generation,
+        schema_key,
+        entity_pk,
+        file_id,
+    })
+}
+
+/// Decodes only the mutable suffix of a row key from a prefix-scoped scan.
+///
+/// `ScanPlan::prefix` already constrains the branch and generation. We still
+/// verify the fixed scope before parsing the suffix so a malformed storage key
+/// cannot be interpreted as a row from the wrong generation.
+fn decode_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
+    if !bytes.starts_with(scope) {
+        return Err(key_codec_error(
+            "does not begin with the scanned branch-generation scope",
+        ));
+    }
+    let mut offset = scope.len();
+    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
+    if schema_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("schema key has an invalid terminator"));
+    }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    let file_id = read_file_id(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("has trailing bytes"));
+    }
+    Ok(HeadRowIdentity {
         schema_key,
         entity_pk,
         file_id,
@@ -774,6 +825,7 @@ fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
     out.extend_from_slice(&[KEY_PART_FINAL, terminator]);
 }
 
+#[cfg(test)]
 fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixError> {
     let end = offset
         .checked_add(GENERATION_BYTES)
@@ -830,20 +882,50 @@ fn read_key_string(
     offset: &mut usize,
     field: &str,
 ) -> Result<(String, u8), LixError> {
-    let mut out = Vec::new();
+    let start = *offset;
+    let mut cursor = start;
+    // The normal generated IDs do not contain the escaped NUL byte. Decode
+    // that common case directly from the RocksDB key instead of first growing
+    // a temporary `Vec<u8>` one byte at a time.
     loop {
         let byte = *bytes
-            .get(*offset)
+            .get(cursor)
             .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
-        *offset += 1;
+        cursor += 1;
+        if byte != KEY_PART_FINAL {
+            continue;
+        }
+        let terminator = *bytes
+            .get(cursor)
+            .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
+        cursor += 1;
+        if terminator != KEY_ESCAPE {
+            let value = std::str::from_utf8(&bytes[start..cursor - 2])
+                .map_err(|error| key_codec_error(&format!("{field} is not UTF-8: {}", error)))?;
+            *offset = cursor;
+            return Ok((value.to_owned(), terminator));
+        }
+        break;
+    }
+
+    // Escaped NUL bytes are rare but remain fully supported. Seed the owned
+    // buffer with the prefix before the first escape, then decode the rest.
+    let mut out = Vec::with_capacity(cursor.saturating_sub(start) + 16);
+    out.extend_from_slice(&bytes[start..cursor - 2]);
+    out.push(KEY_PART_FINAL);
+    loop {
+        let byte = *bytes
+            .get(cursor)
+            .ok_or_else(|| key_codec_error(&format!("is truncated in {field}")))?;
+        cursor += 1;
         if byte != KEY_PART_FINAL {
             out.push(byte);
             continue;
         }
         let terminator = *bytes
-            .get(*offset)
+            .get(cursor)
             .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
-        *offset += 1;
+        cursor += 1;
         if terminator == KEY_ESCAPE {
             out.push(KEY_PART_FINAL);
             continue;
@@ -851,6 +933,7 @@ fn read_key_string(
         let value = String::from_utf8(out).map_err(|error| {
             key_codec_error(&format!("{field} is not UTF-8: {}", error.utf8_error()))
         })?;
+        *offset = cursor;
         return Ok((value, terminator));
     }
 }
@@ -1138,7 +1221,7 @@ struct DeferredJson {
 /// layer to drop after each scan.
 async fn materialize_live_entries(
     store: &(impl StorageAdapterRead + ?Sized),
-    entries: Vec<(HeadIdentity, Bytes)>,
+    entries: Vec<(HeadRowIdentity, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
@@ -1459,6 +1542,12 @@ mod tests {
             assert_eq!(
                 decode_row_key(&encoded).expect("row key should decode"),
                 *identity
+            );
+            let scope = encode_scope_prefix(&identity.branch_id, identity.generation);
+            assert_eq!(
+                decode_row_key_in_scope(&encoded, &scope)
+                    .expect("scope-decoded row key should decode"),
+                identity.clone().into_row_identity()
             );
         }
 
