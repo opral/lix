@@ -562,15 +562,17 @@ where
         })?;
         let lix = Arc::clone(&self.record.lix);
         let operation_lease = self.clone();
+        let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
         let (cancel_on_drop, mut cancelled) = tokio::sync::oneshot::channel::<()>();
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let result = tokio::task::spawn_blocking(move || {
             let _operation_lease = operation_lease;
-            tracing::dispatcher::with_default(&dispatch, || {
+            let result = tracing::dispatcher::with_default(&dispatch, || {
                 parent.in_scope(|| {
                     runtime.block_on(async move {
                         tokio::select! {
+                            biased;
                             result = async {
                                 let lix = lix.read().await;
                                 operation(Arc::clone(&lix)).await
@@ -582,7 +584,11 @@ where
                         }
                     })
                 })
-            })
+            });
+            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
+                notifier.signal_if_terminal(error);
+            }
+            result
         })
         .await
         .map_err(|error| {
@@ -701,10 +707,16 @@ where
         })?
     }
 
-    async fn observe(&self, sql: &str, params: &[Value]) -> Result<ServerObserve<S>, LixError> {
+    async fn observe(
+        &self,
+        sql: &str,
+        params: &[Value],
+        terminal_sender: TerminalStorageStreamSender,
+    ) -> Result<ServerObserve<S>, LixError> {
         let lix = self.record.lix.read().await;
         Ok(ServerObserve {
             events: Arc::new(Mutex::new(lix.observe(sql, params)?)),
+            terminal_sender,
         })
     }
 }
@@ -759,6 +771,7 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     events: Arc<Mutex<ObserveEvents<S>>>,
+    terminal_sender: TerminalStorageStreamSender,
 }
 
 impl<S> ServerObserve<S>
@@ -773,11 +786,12 @@ where
             )
         })?;
         let events = Arc::clone(&self.events);
+        let terminal_sender = self.terminal_sender.clone();
         let (cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         let result = tokio::task::spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || {
+            let result = tracing::dispatcher::with_default(&dispatch, || {
                 parent.in_scope(|| {
                     let mut events = events.lock().map_err(|error| {
                         LixError::new(
@@ -787,6 +801,7 @@ where
                     })?;
                     runtime.block_on(async {
                         tokio::select! {
+                            biased;
                             result = events.next() => result,
                             _ = cancel => Err(LixError::new(
                                 LixError::CODE_CLOSED,
@@ -795,7 +810,11 @@ where
                         }
                     })
                 })
-            })
+            });
+            if let Err(error) = &result {
+                terminal_sender.signal_if_terminal(error);
+            }
+            result
         })
         .await
         .map_err(|error| {
@@ -1002,6 +1021,7 @@ where
     async fn create_session(
         &self,
         initial_active_branch_id: Option<String>,
+        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
     ) -> Result<SessionLease<S>, ApiError> {
         let pending_open = self.reserve_session_open()?;
 
@@ -1076,7 +1096,7 @@ where
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
-        let lease = SessionLease::new(session_id, record, None);
+        let lease = SessionLease::new(session_id, record, durable_terminal_storage_notifier);
         drop(registry);
         for record in removed_sessions {
             close_removed_session(record).await;
@@ -1251,10 +1271,12 @@ async fn handshake<S>(
     State(state): State<HandlerState<S>>,
     Query(request): Query<HandshakeRequest>,
     headers: HeaderMap,
+    notifier: Option<Extension<DurableTerminalStorageNotifier>>,
 ) -> Result<impl IntoResponse, ApiError>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    let durable_terminal_storage_notifier = notifier.map(|Extension(notifier)| notifier);
     let lease = match optional_session_id(&headers)? {
         Some(session_id) => {
             if request.active_branch_id.is_some() {
@@ -1262,7 +1284,9 @@ where
                     "activeBranchId is only allowed when creating a session",
                 ));
             }
-            state.lease(&session_id, None).await?
+            state
+                .lease(&session_id, durable_terminal_storage_notifier.clone())
+                .await?
         }
         None => {
             let active_branch_id = match request.active_branch_id {
@@ -1276,7 +1300,10 @@ where
                 }
                 None => None,
             };
-            state.server.create_session(active_branch_id).await?
+            state
+                .server
+                .create_session(active_branch_id, durable_terminal_storage_notifier)
+                .await?
         }
     };
     let active_branch_id = lease
@@ -1664,8 +1691,10 @@ where
 {
     let sql = required_non_empty(request.sql, "sql")?;
     let params = decode_params(request.params)?;
-    let events = lease.observe(&sql, &params).await?;
     let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
+    let events = lease
+        .observe(&sql, &params, terminal_sender.clone())
+        .await?;
     let stream = async_stream::stream! {
         let _lease = lease;
         let terminal_sender = terminal_sender;
@@ -1727,7 +1756,9 @@ where
         let subscription_id = required_non_empty(subscription.id, "subscriptions[].id")?;
         let sql = required_non_empty(subscription.sql, "subscriptions[].sql")?;
         let params = decode_params(subscription.params)?;
-        let events = lease.observe(&sql, &params).await?;
+        let events = lease
+            .observe(&sql, &params, terminal_sender.clone())
+            .await?;
         let sender = sender.clone();
         let terminal_sender = terminal_sender.clone();
         let parent = tracing::Span::current();
@@ -2281,21 +2312,21 @@ impl TerminalStorageStreamSender {
     }
 }
 
-/// Request-scoped sender that preserves a terminal result from durable work
-/// after its HTTP future is cancelled.
+/// Request-scoped sender that preserves a terminal storage result after its
+/// HTTP future is cancelled.
 #[derive(Clone, Debug)]
 pub struct DurableTerminalStorageNotifier {
     sender: watch::Sender<bool>,
 }
 
-/// Receiver for a request's detached durable-operation terminal result.
+/// Receiver for a request's terminal storage result.
 #[derive(Clone, Debug)]
 pub struct DurableTerminalStorageSignal {
     receiver: watch::Receiver<bool>,
 }
 
 /// Creates the request extension and receiver used to observe a terminal
-/// result from durable work that outlives its HTTP request.
+/// storage result after its HTTP request is cancelled.
 pub fn durable_terminal_storage_signal()
 -> (DurableTerminalStorageNotifier, DurableTerminalStorageSignal) {
     let (sender, receiver) = watch::channel(false);
@@ -3214,6 +3245,82 @@ mod tests {
         ) -> Result<Self::Write<'_>, StorageError> {
             self.inner.begin_write(options).await
         }
+    }
+
+    #[tokio::test]
+    async fn fenced_resumed_handshake_reports_terminal_storage_signal() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server.clone());
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
+        let session_id = lease.session_id.clone();
+        drop(lease);
+
+        storage.fence_reads();
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/lix/v1")
+                    .header(SESSION_ID_HEADER, session_id)
+                    .extension(notifier)
+                    .body(Body::empty())
+                    .expect("resumed handshake request"),
+            )
+            .await
+            .expect("resumed handshake response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+                .await
+                .expect("fenced handshake should wake the request observer"),
+            "the resumed handshake should preserve its terminal storage result"
+        );
+    }
+
+    #[tokio::test]
+    async fn fenced_observe_next_reports_terminal_storage_before_returning_error() {
+        let storage = FencedReadStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open Lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
+        let (terminal_sender, terminal_signal) = TerminalStorageStreamSignal::new();
+        let events = lease
+            .observe("SELECT 1", &[], terminal_sender)
+            .await
+            .expect("start observation");
+
+        storage.fence_reads();
+        let error = events
+            .next()
+            .await
+            .expect_err("fenced observation should return a storage error");
+        assert_eq!(error.code, LixError::CODE_STORAGE_FENCED);
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                terminal_signal.wait_for_terminal_storage(),
+            )
+            .await
+            .expect("fenced observation should wake the response observer"),
+            "the observation must record its terminal storage error before the caller can be cancelled"
+        );
     }
 
     #[derive(Clone)]
@@ -6098,7 +6205,7 @@ mod tests {
         .await;
         let first = app
             .server
-            .create_session(None)
+            .create_session(None, None)
             .await
             .expect("open first session");
         let first_session_id = first.session_id.clone();
@@ -6117,7 +6224,8 @@ mod tests {
             .await
             .expect("active branch");
         let server = app.server.clone();
-        let replacement = tokio::spawn(async move { server.create_session(Some(branch_id)).await });
+        let replacement =
+            tokio::spawn(async move { server.create_session(Some(branch_id), None).await });
 
         loop {
             let replaced = {
@@ -6219,7 +6327,7 @@ mod tests {
             let branch_id = branch_id.clone();
             tasks.spawn(async move {
                 server
-                    .create_session(Some(branch_id))
+                    .create_session(Some(branch_id), None)
                     .await
                     .expect("open protocol session")
             });
@@ -6347,7 +6455,10 @@ mod tests {
         )
         .expect("protocol server");
         let router = handler(server.clone());
-        let lease = server.create_session(None).await.expect("session lease");
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
         let session_id = lease.session_id.clone();
         drop(lease);
 
@@ -6405,7 +6516,10 @@ mod tests {
         );
         let server = LixProtocolServer::new(root);
         let router = handler(server.clone());
-        let lease = server.create_session(None).await.expect("session lease");
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
         let session_id = lease.session_id.clone();
         drop(lease);
 
@@ -6445,7 +6559,10 @@ mod tests {
         );
         let server = LixProtocolServer::new(root);
         let router = handler(server.clone());
-        let lease = server.create_session(None).await.expect("session lease");
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
         let session_id = lease.session_id.clone();
         drop(lease);
 
@@ -6500,7 +6617,10 @@ mod tests {
         )
         .expect("protocol server");
         let router = handler(server.clone());
-        let lease = server.create_session(None).await.expect("session lease");
+        let lease = server
+            .create_session(None, None)
+            .await
+            .expect("session lease");
         let session_id = lease.session_id.clone();
         let record = Arc::clone(&lease.record);
         drop(lease);
