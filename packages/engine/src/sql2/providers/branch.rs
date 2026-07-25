@@ -500,7 +500,14 @@ async fn load_branch_rows_scoped(
                 // descriptors being listed. Preserve point-read semantics in
                 // that case while keeping the one-scan fast path for valid
                 // branch-ref state.
-                Err(error) if error.code != LixError::CODE_STORAGE_ERROR => {
+                Err(error)
+                    if !matches!(
+                        error.code.as_str(),
+                        LixError::CODE_STORAGE_ERROR
+                            | LixError::CODE_STORAGE_FENCED
+                            | LixError::CODE_STORAGE_CLOSED
+                    ) =>
+                {
                     load_branch_rows_with_point_lookups(descriptors, branch_ref).await
                 }
                 Err(error) => Err(error),
@@ -1383,34 +1390,37 @@ mod tests {
 
     #[tokio::test]
     async fn batch_head_read_does_not_amplify_storage_errors() {
-        let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![
-                descriptor_row("branch-a", "Branch A"),
-                descriptor_row("branch-b", "Branch B"),
-                descriptor_row("branch-c", "Branch C"),
-            ],
-        });
-        let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
-            point_reads: AtomicUsize::new(0),
-            scans: AtomicUsize::new(0),
-            scan_error: Some(LixError::new(
-                LixError::CODE_STORAGE_ERROR,
-                "branch-ref scan failed",
-            )),
-            point_error_branch: None,
-        });
+        for code in [
+            LixError::CODE_STORAGE_ERROR,
+            LixError::CODE_STORAGE_FENCED,
+            LixError::CODE_STORAGE_CLOSED,
+        ] {
+            let live_state = Arc::new(RowsLiveStateReader {
+                rows: vec![
+                    descriptor_row("branch-a", "Branch A"),
+                    descriptor_row("branch-b", "Branch B"),
+                    descriptor_row("branch-c", "Branch C"),
+                ],
+            });
+            let branch_ref = Arc::new(CountingBranchRefReader {
+                heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+                point_reads: AtomicUsize::new(0),
+                scans: AtomicUsize::new(0),
+                scan_error: Some(LixError::new(code, "branch-ref scan failed")),
+                point_error_branch: None,
+            });
 
-        let error = load_branch_rows(
-            live_state,
-            branch_ref.clone(),
-            BranchHeadReadStrategy::Batch,
-        )
-        .await
-        .unwrap_err();
+            let error = load_branch_rows(
+                live_state,
+                branch_ref.clone(),
+                BranchHeadReadStrategy::Batch,
+            )
+            .await
+            .unwrap_err();
 
-        assert_eq!(error.code, LixError::CODE_STORAGE_ERROR);
-        assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
-        assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 0);
+            assert_eq!(error.code, code);
+            assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
+            assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 0);
+        }
     }
 }
