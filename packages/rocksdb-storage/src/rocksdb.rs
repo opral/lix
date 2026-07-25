@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
@@ -23,7 +23,6 @@ use rocksdb::{BlockBasedOptions, DB, Direction, IteratorMode, Options, WriteBatc
 use tempfile::TempDir;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-const OWNED_VALUE_MIN_BYTES: usize = 64 * 1024;
 const DEFAULT_BLOB_MIN_SIZE: u64 = 32 * 1024;
 const DEFAULT_BLOB_FILE_SIZE: u64 = 256 * 1024 * 1024;
 const DEFAULT_BLOB_GC_AGE_CUTOFF: f64 = 0.25;
@@ -303,11 +302,10 @@ impl StorageRead for RocksDBRead<'_> {
                 .iterator(IteratorMode::From(&bounds.lower_seek, Direction::Forward))
             {
                 let (encoded_key, value) = item.map_err(rocksdb_error)?;
-                let encoded_key = encoded_key.as_ref();
-                if !bounds.after_lower(encoded_key) {
+                if !bounds.after_lower(encoded_key.as_ref()) {
                     continue;
                 }
-                if !bounds.before_upper(encoded_key) {
+                if !bounds.before_upper(encoded_key.as_ref()) {
                     break;
                 }
                 if entries.len() == opts.page_size() {
@@ -317,7 +315,7 @@ impl StorageRead for RocksDBRead<'_> {
                     });
                 }
                 entries.push(ReadEntry {
-                    key: Key(Bytes::copy_from_slice(&encoded_key[4..])),
+                    key: logical_key_from_physical(encoded_key),
                     value: project_owned_value(value, opts.projection),
                 });
             }
@@ -619,19 +617,70 @@ fn stored_value_bytes(value: StoredValue) -> Bytes {
     value.bytes
 }
 
+/// Reclaims the iterator-owned physical key and removes its four-byte space
+/// prefix without copying its logical-key bytes.
+fn logical_key_from_physical(encoded_key: Box<[u8]>) -> Key {
+    let mut key = Bytes::from(encoded_key);
+    key.advance(4);
+    Key(key)
+}
+
 fn project_owned_value<T>(value: T, projection: CoreProjection) -> ProjectedValue
 where
-    T: AsRef<[u8]>,
     Bytes: From<T>,
 {
     match projection {
         CoreProjection::KeyOnly => ProjectedValue::KeyOnly,
-        CoreProjection::FullValue if value.as_ref().len() >= OWNED_VALUE_MIN_BYTES => {
-            ProjectedValue::FullValue(Bytes::from(value))
-        }
-        CoreProjection::FullValue => {
-            ProjectedValue::FullValue(Bytes::copy_from_slice(value.as_ref()))
-        }
+        // `Snapshot::multi_get` yields Rust-owned `Vec<u8>` values and the
+        // standard iterator yields Rust-owned `Box<[u8]>` values. Retaining
+        // those allocations in `Bytes` avoids a second full value copy.
+        CoreProjection::FullValue => ProjectedValue::FullValue(Bytes::from(value)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoreProjection, ProjectedValue, logical_key_from_physical, project_owned_value};
+
+    #[test]
+    fn logical_key_reuses_the_physical_key_allocation() {
+        let physical_key: Box<[u8]> = Box::from(&b"\0\0\0\x01logical-key"[..]);
+        let logical_ptr = physical_key.as_ptr().wrapping_add(4);
+
+        let key = logical_key_from_physical(physical_key);
+
+        assert_eq!(key.0.as_ptr(), logical_ptr);
+        assert_eq!(&key.0[..], b"logical-key");
+    }
+
+    #[test]
+    fn full_value_reuses_vec_allocation() {
+        let value = b"small value that used to take the copy path".to_vec();
+        let ptr = value.as_ptr();
+
+        let ProjectedValue::FullValue(value) =
+            project_owned_value(value, CoreProjection::FullValue)
+        else {
+            panic!("full-value projection should return bytes");
+        };
+
+        assert_eq!(value.as_ptr(), ptr);
+        assert_eq!(&value[..], b"small value that used to take the copy path");
+    }
+
+    #[test]
+    fn full_value_reuses_boxed_slice_allocation() {
+        let value: Box<[u8]> = Box::from(&b"iterator value"[..]);
+        let ptr = value.as_ptr();
+
+        let ProjectedValue::FullValue(value) =
+            project_owned_value(value, CoreProjection::FullValue)
+        else {
+            panic!("full-value projection should return bytes");
+        };
+
+        assert_eq!(value.as_ptr(), ptr);
+        assert_eq!(&value[..], b"iterator value");
     }
 }
 

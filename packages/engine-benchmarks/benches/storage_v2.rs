@@ -1577,6 +1577,30 @@ where
         }
     }
 
+    for (case_name, rows) in [
+        ("direct_scan_full_q1000_v32", 1_000),
+        ("direct_scan_full_q10000_v32", 10_000),
+    ] {
+        if should_run(case_name) {
+            let scan_storage = storage_family.seed_points(SpaceId(1), rows, 32);
+            let scan_range = physical_point_scan_range(1);
+            group.throughput(Throughput::Bytes(u64::from(rows) * 32));
+            group.bench_function(case_name, |b| {
+                b.iter(|| {
+                    let read = block_on(scan_storage.begin_read(ReadOptions::default()))
+                        .expect("begin direct small-value full scan read");
+                    let chunk =
+                        block_on(materialize_complete_storage_scan(&read, scan_range.clone()))
+                            .expect("direct small-value full scan");
+                    assert_eq!(chunk.entries.len(), rows as usize);
+                    assert!(!chunk.has_more);
+                    drop(read);
+                    black_box(chunk);
+                });
+            });
+        }
+    }
+
     group.finish();
 }
 
@@ -1952,6 +1976,45 @@ where
     R: StorageRead,
 {
     read.scan(space(1).id, range, opts).await
+}
+
+async fn materialize_complete_storage_scan<R>(
+    read: &R,
+    range: KeyRange,
+) -> Result<ScanChunk, StorageError>
+where
+    R: StorageRead,
+{
+    let mut entries = Vec::new();
+    let mut resume_after = None;
+
+    loop {
+        let chunk = read
+            .scan(
+                space(1).id,
+                range.clone(),
+                ScanOptions {
+                    projection: CoreProjection::FullValue,
+                    resume_after,
+                    ..ScanOptions::default()
+                },
+            )
+            .await?;
+        let has_more = chunk.has_more;
+        resume_after = chunk.entries.last().map(|entry| entry.key.clone());
+        entries.extend(chunk.entries);
+
+        if !has_more {
+            return Ok(ScanChunk {
+                entries,
+                has_more: false,
+            });
+        }
+        assert!(
+            resume_after.is_some(),
+            "scan reported more rows without a resume key"
+        );
+    }
 }
 
 fn checked_write_set_from_mutations(mutations: &[WriteMutation]) -> StorageWriteSet {
