@@ -246,9 +246,12 @@ fn require_framed_record_fits(
 pub(crate) struct BuiltInputSplices {
     pub(crate) edits: Vec<WasmInputSplice>,
     pub(crate) used_transport_provenance: bool,
-    /// Exact identity of `after`, either adopted from verified transport
-    /// provenance or computed by the full-diff fallback.
-    pub(crate) after_sha256: FileBytesSha256,
+    /// Exact identity of `after` when verified transport already supplied it.
+    ///
+    /// Ordinary full-byte SQL writes do not need a protocol SHA-256. Keeping
+    /// this optional avoids hashing a large accepted file solely in case a
+    /// later request happens to carry transport splice provenance.
+    pub(crate) after_sha256: Option<FileBytesSha256>,
     /// Bytes examined only by the bounded host full-diff fallback.
     pub(crate) full_diff_bytes_compared: u64,
 }
@@ -259,15 +262,17 @@ pub(crate) struct BuiltInputSplices {
 /// before/after blobs once to find their maximal common prefix/suffix.
 pub(crate) fn build_file_update_splices(
     before: &[u8],
-    before_sha256: FileBytesSha256,
+    before_sha256: impl Into<Option<FileBytesSha256>>,
     after: &[u8],
     provenance: Option<&RequestBlobSpliceProvenance>,
     limits: WasmTransitionLimits,
 ) -> Result<BuiltInputSplices, LixError> {
     limits.validate()?;
+    let before_sha256 = before_sha256.into();
     let verified_transport = provenance.and_then(|provenance| {
         let provenance_base = FileBytesSha256::from_lower_hex(provenance.base_sha256())?;
         let provenance_result = FileBytesSha256::from_lower_hex(provenance.result_sha256())?;
+        let before_sha256 = before_sha256.unwrap_or_else(|| FileBytesSha256::compute(before));
         (provenance_base == before_sha256
             && provenance.matches_result(after)
             && validate_transport_splice(before, after, provenance).is_ok())
@@ -281,11 +286,15 @@ pub(crate) fn build_file_update_splices(
                 provenance.suffix_bytes(),
                 provenance.insert(),
                 true,
-                result_sha256,
+                Some(result_sha256),
                 0,
             )
         } else {
-            let (prefix, prefix_bytes_compared) = common_prefix_len(before, after);
+            let (prefix, prefix_bytes_compared) = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_splice_prefix"
+            )
+            .in_scope(|| common_prefix_len(before, after));
             if prefix == before.len() && prefix == after.len() {
                 return Ok(BuiltInputSplices {
                     edits: Vec::new(),
@@ -298,14 +307,18 @@ pub(crate) fn build_file_update_splices(
                 .len()
                 .saturating_sub(prefix)
                 .min(after.len().saturating_sub(prefix));
-            let (suffix, suffix_bytes_compared) = common_suffix_len(before, after, max_suffix);
+            let (suffix, suffix_bytes_compared) = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_splice_suffix"
+            )
+            .in_scope(|| common_suffix_len(before, after, max_suffix));
             let insert_end = after.len() - suffix;
             (
                 prefix,
                 suffix,
                 &after[prefix..insert_end],
                 false,
-                FileBytesSha256::compute(after),
+                None,
                 prefix_bytes_compared.saturating_add(suffix_bytes_compared),
             )
         };
@@ -1035,7 +1048,7 @@ pub(crate) struct ResolvedOutputSplice {
 pub(crate) struct ValidatedEntityTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) bytes: Blob,
-    pub(crate) bytes_sha256: FileBytesSha256,
+    pub(crate) bytes_sha256: Option<FileBytesSha256>,
     #[cfg(test)]
     pub(crate) edits: Vec<ResolvedOutputSplice>,
     pub(crate) counters: WasmTransitionCounters,
@@ -1221,7 +1234,10 @@ async fn drain_entity_transition_edits_inner(
         }
         bytes
     };
-    let bytes_sha256 = FileBytesSha256::compute(&bytes);
+    // Cold-open validation benefits from caching the accepted protocol
+    // digest. A normal semantic render does not: defer that O(file) SHA-256
+    // until a later request actually presents transport splice provenance.
+    let bytes_sha256 = expected.as_ref().map(|_| FileBytesSha256::compute(&bytes));
     let runtime_counters = actor.finish_transition(transition.transition).await?;
     Ok(ValidatedEntityTransition {
         document: transition.document,
@@ -1789,7 +1805,7 @@ mod tests {
         .unwrap();
         assert!(from_transport.used_transport_provenance);
         assert_eq!(from_transport.full_diff_bytes_compared, 0);
-        assert_eq!(from_transport.after_sha256, after_sha256);
+        assert_eq!(from_transport.after_sha256, Some(after_sha256));
         assert_eq!(
             from_transport.edits,
             vec![WasmInputSplice {
@@ -1798,6 +1814,17 @@ mod tests {
                 insert: WasmInputBytes::Inline(b"XY".to_vec()),
             }]
         );
+
+        let lazily_verified_transport = build_file_update_splices(
+            before,
+            None,
+            &after,
+            Some(&provenance),
+            WasmTransitionLimits::default(),
+        )
+        .unwrap();
+        assert!(lazily_verified_transport.used_transport_provenance);
+        assert_eq!(lazily_verified_transport.after_sha256, Some(after_sha256));
 
         let fallback = build_file_update_splices(
             before,
@@ -1809,7 +1836,7 @@ mod tests {
         .unwrap();
         assert!(!fallback.used_transport_provenance);
         assert_eq!(fallback.full_diff_bytes_compared, 12);
-        assert_eq!(fallback.after_sha256, after_sha256);
+        assert_eq!(fallback.after_sha256, None);
         assert_eq!(fallback.edits, from_transport.edits);
 
         let lazy = build_file_update_splices(
@@ -1858,7 +1885,6 @@ mod tests {
         let proof_base = b"uvwxyz";
         let after: Blob = b"uvXYyz".as_slice().into();
         let before_sha256 = FileBytesSha256::compute(before);
-        let after_sha256 = FileBytesSha256::compute(&after);
         let provenance = RequestBlobSpliceProvenance::new_validated_for_test(
             proof_base,
             &after,
@@ -1876,7 +1902,7 @@ mod tests {
         )
         .expect("cross-file provenance is only an optimization miss");
         assert!(!fallback.used_transport_provenance);
-        assert_eq!(fallback.after_sha256, after_sha256);
+        assert_eq!(fallback.after_sha256, None);
     }
 
     #[test]
@@ -1902,7 +1928,7 @@ mod tests {
         .expect("transplanted provenance must fall back safely");
 
         assert!(!fallback.used_transport_provenance);
-        assert_eq!(fallback.after_sha256, FileBytesSha256::compute(&submitted));
+        assert_eq!(fallback.after_sha256, None);
         assert_eq!(
             fallback.edits,
             vec![WasmInputSplice {

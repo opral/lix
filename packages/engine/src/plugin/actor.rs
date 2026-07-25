@@ -45,7 +45,7 @@ pub(crate) struct PluginObservation {
     actor_nonce: u64,
     revision: u64,
     semantic_root: Arc<str>,
-    bytes_sha256: FileBytesSha256,
+    bytes_sha256: Option<FileBytesSha256>,
 }
 
 impl PluginObservation {
@@ -57,7 +57,7 @@ impl PluginObservation {
         &self.semantic_root
     }
 
-    pub(crate) fn bytes_sha256(&self) -> FileBytesSha256 {
+    pub(crate) fn bytes_sha256(&self) -> Option<FileBytesSha256> {
         self.bytes_sha256
     }
 }
@@ -66,7 +66,7 @@ struct PluginActorAcceptedState {
     store: PluginActorStore,
     document: WasmDocumentHandle,
     bytes: Blob,
-    bytes_sha256: FileBytesSha256,
+    bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
     history: VecDeque<PluginActorHistoricalState>,
 }
@@ -101,7 +101,7 @@ struct PluginActorHistoricalState {
     revision: u64,
     document: WasmDocumentHandle,
     bytes: Blob,
-    bytes_sha256: FileBytesSha256,
+    bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
 }
 
@@ -292,7 +292,7 @@ impl PluginActorCache {
         semantic_root: impl Into<Arc<str>>,
     ) -> PluginObservation {
         let semantic_root = semantic_root.into();
-        let bytes_sha256 = FileBytesSha256::compute(&bytes);
+        let bytes_sha256 = Some(FileBytesSha256::compute(&bytes));
         let mut state = self.lock();
         state.clock = state.clock.wrapping_add(1);
         let last_used = state.clock;
@@ -337,10 +337,11 @@ impl PluginActorCache {
         store: PluginActorStore,
         document: WasmDocumentHandle,
         bytes: Blob,
-        bytes_sha256: FileBytesSha256,
+        bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
     ) -> Result<PluginObservation, LixError> {
         let semantic_root = semantic_root.into();
+        let bytes_sha256 = bytes_sha256.into();
         if cold_install.key != key {
             let mut store = store;
             let _ = store.actor.drop_document(document).await;
@@ -708,7 +709,7 @@ fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
 struct PluginActorSuccessor {
     document: WasmDocumentHandle,
     bytes: Blob,
-    bytes_sha256: FileBytesSha256,
+    bytes_sha256: Option<FileBytesSha256>,
     semantic_root: Arc<str>,
 }
 
@@ -745,7 +746,7 @@ pub(crate) struct PluginActorLease {
     guard: Option<OwnedMutexGuard<PluginActorAcceptedState>>,
     observed_document: WasmDocumentHandle,
     observed_bytes: Blob,
-    observed_bytes_sha256: FileBytesSha256,
+    observed_bytes_sha256: Option<FileBytesSha256>,
     uncertain_guest_call: bool,
     successor: Option<PluginActorSuccessor>,
 }
@@ -776,7 +777,7 @@ impl PluginActorLease {
     }
 
     #[cfg(test)]
-    pub(crate) fn accepted_bytes_sha256(&self) -> FileBytesSha256 {
+    pub(crate) fn accepted_bytes_sha256(&self) -> Option<FileBytesSha256> {
         self.guard
             .as_deref()
             .expect("actor lease guard exists")
@@ -791,7 +792,7 @@ impl PluginActorLease {
         self.observed_bytes.clone()
     }
 
-    pub(crate) fn observed_bytes_sha256(&self) -> FileBytesSha256 {
+    pub(crate) fn observed_bytes_sha256(&self) -> Option<FileBytesSha256> {
         self.observed_bytes_sha256
     }
 
@@ -890,9 +891,10 @@ impl PluginActorLease {
         mut call: PluginActorPendingCall,
         document: WasmDocumentHandle,
         bytes: Blob,
-        bytes_sha256: FileBytesSha256,
+        bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
     ) -> Result<(), LixError> {
+        let bytes_sha256 = bytes_sha256.into();
         if !self.uncertain_guest_call || self.successor.is_some() {
             self.slot.retire();
             return Err(LixError::new(
@@ -965,9 +967,10 @@ impl PluginActorLease {
         &mut self,
         document: WasmDocumentHandle,
         bytes: Blob,
-        bytes_sha256: FileBytesSha256,
+        bytes_sha256: impl Into<Option<FileBytesSha256>>,
         semantic_root: impl Into<Arc<str>>,
     ) -> Result<(), LixError> {
+        let bytes_sha256 = bytes_sha256.into();
         if !self.uncertain_guest_call || self.successor.is_some() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1498,11 +1501,11 @@ mod tests {
         let before_hash = FileBytesSha256::compute(b"before");
         let after_hash = FileBytesSha256::compute(b"after");
         let before = install(&cache, key, 1, b"before", "root-1");
-        assert_eq!(before.bytes_sha256(), before_hash);
+        assert_eq!(before.bytes_sha256(), Some(before_hash));
 
         let mut lease = cache.lease(&before).await.unwrap();
-        assert_eq!(lease.observed_bytes_sha256(), before_hash);
-        assert_eq!(lease.accepted_bytes_sha256(), before_hash);
+        assert_eq!(lease.observed_bytes_sha256(), Some(before_hash));
+        assert_eq!(lease.accepted_bytes_sha256(), Some(before_hash));
         lease.begin_guest_call().unwrap();
         lease
             .complete_guest_call(
@@ -1513,11 +1516,33 @@ mod tests {
             )
             .unwrap();
         let after = lease.commit_successor().await.unwrap();
-        assert_eq!(after.bytes_sha256(), after_hash);
+        assert_eq!(after.bytes_sha256(), Some(after_hash));
 
         let historical = cache.lease_for_transition(&before).await.unwrap();
-        assert_eq!(historical.observed_bytes_sha256(), before_hash);
-        assert_eq!(historical.accepted_bytes_sha256(), after_hash);
+        assert_eq!(historical.observed_bytes_sha256(), Some(before_hash));
+        assert_eq!(historical.accepted_bytes_sha256(), Some(after_hash));
+
+        drop(historical);
+        let mut latest = cache.lease(&after).await.unwrap();
+        latest.begin_guest_call().unwrap();
+        latest
+            .complete_guest_call(
+                WasmDocumentHandle(3),
+                b"later".as_slice().into(),
+                None,
+                Arc::<str>::from("root-3"),
+            )
+            .unwrap();
+        let later = latest.commit_successor().await.unwrap();
+        assert_eq!(later.bytes_sha256(), None);
+        assert_eq!(
+            cache
+                .lease_for_transition(&later)
+                .await
+                .unwrap()
+                .observed_bytes_sha256(),
+            None
+        );
     }
 
     #[tokio::test]
