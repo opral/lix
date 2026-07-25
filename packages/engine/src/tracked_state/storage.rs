@@ -571,7 +571,7 @@ mod tests {
     use crate::json_store::store::JSON_SPACE;
     use crate::live_state::{
         LIVE_STATE_INDEX_ROW_SPACE, LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
-        TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_ROW_SPACE,
+        TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
     };
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
@@ -589,7 +589,8 @@ mod tests {
             REPOSITORY_PROTOCOL_SPACE,
             LIVE_STATE_INDEX_ROW_SPACE,
             LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
-            TRACKED_HEAD_ROW_SPACE,
+            TRACKED_HEAD_GROUP_SPACE,
+            TRACKED_HEAD_MEMBER_SPACE,
             TRACKED_HEAD_MARKER_SPACE,
             JSON_SPACE,
             TRACKED_STATE_TREE_CHUNK_SPACE,

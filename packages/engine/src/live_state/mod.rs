@@ -13,7 +13,8 @@ pub(crate) use index::{
     LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest,
     LiveStateIndexScanRequest, LiveStateIndexStoreReader, LiveStateIndexWriter,
     MaterializedLiveStateIndexRow, branch_empty_precondition, load_local_sidecar_branch_token,
-    local_sidecar_branch_precondition, row_absent_precondition, stage_local_sidecar_branch_marker,
+    local_sidecar_branch_precondition, row_absent_precondition, row_raw_token_precondition,
+    stage_local_sidecar_branch_marker,
 };
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
@@ -21,7 +22,8 @@ pub(crate) use reader::LiveStateReader;
 pub(crate) use reader::load_exact_rows_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_ROW_SPACE, TrackedHeadContext, TrackedHeadDeltaRef,
+    TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
+    TrackedHeadContext, TrackedHeadDeltaRef,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

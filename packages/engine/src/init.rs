@@ -12,7 +12,9 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
+use crate::live_state::{
+    LiveStateIndexContext, LiveStateIndexDeltaRef, TrackedHeadContext, TrackedHeadDeltaRef,
+};
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
 };
@@ -33,15 +35,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The local-sidecar marker changes the meaning of an absent key: it is proof
-/// that a branch has never used the local lane. That proof is only sound for
-/// repositories initialized with this protocol, so opening an earlier store
-/// must fail closed rather than silently shadow tracked state with old flat
-/// rows.
+/// The v5 tracked-head group and local-sidecar markers change the meaning of
+/// absent physical keys. Those proofs are only sound for repositories
+/// initialized with this protocol, so opening an older store must fail closed
+/// rather than mixing an old head layout with current visibility rules.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"local-sidecar.v1";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-head-group.v5";
 
 pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
     writes.put(
@@ -70,7 +71,7 @@ pub(crate) async fn assert_repository_protocol(
     }
     Err(LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
-        "repository uses an unsupported local-sidecar storage protocol; recreate the repository",
+        "repository uses an unsupported tracked-head storage protocol; recreate the repository",
     ))
 }
 
@@ -296,6 +297,41 @@ where
             .writer(&read, &mut writes)
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
+
+        // Seed both visible branches with a complete v5 serving generation.
+        // The initial commit is shared, but the branch-scoped marker and
+        // groups are intentionally independent so normal reads never need a
+        // historical fallback immediately after initialization.
+        let head_deltas = authored_changes
+            .iter()
+            .map(|change| TrackedHeadDeltaRef {
+                schema_key: &change.schema_key,
+                file_id: change.file_id.as_deref(),
+                entity_pk: &change.entity_pk,
+                change_id: change.change_id,
+                commit_id: plan.commit.id,
+                deleted: change.snapshot.is_none(),
+                created_at: change.created_at,
+                updated_at: change.created_at,
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+            })
+            .collect::<Vec<_>>();
+        let tracked_head = TrackedHeadContext::new();
+        let absence_guards = std::collections::BTreeSet::default();
+        for branch_id in [GLOBAL_BRANCH_ID, receipt.main_branch_id.as_str()] {
+            tracked_head
+                .writer(&read, &mut writes)
+                .stage_commit(
+                    branch_id,
+                    None,
+                    plan.commit.id,
+                    &head_deltas,
+                    &absence_guards,
+                    None,
+                )
+                .await?;
+        }
 
         let mut index_writer = live_index.writer(&read, &mut writes);
         index_writer
