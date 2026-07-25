@@ -211,15 +211,6 @@ where
                 ));
             }
         };
-        if record.tracked_state_rootless && record.parent_commit_ids.len() > 1 {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "rootless tracked-state commit '{current_commit_id}' has {} parents",
-                    record.parent_commit_ids.len()
-                ),
-            ));
-        }
         if !record.tracked_state_rootless
             && let Some(root_id) = storage::load_root(store, &current_commit_id.to_string()).await?
         {

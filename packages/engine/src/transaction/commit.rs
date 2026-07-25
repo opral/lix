@@ -369,9 +369,10 @@ async fn stage_changelog_commits(
             format_version: 1,
             commit_id: commit_row.commit_id,
             parent_commit_ids: commit_row.parent_commit_ids.clone(),
-            tracked_state_rootless: !force_root_fence
-                && commit_row.parent_commit_ids.len() <= 1
-                && commit_row.selected_change_refs.is_empty(),
+            // Every commit carries absolute per-identity deltas against its
+            // first parent. Additional ancestry and selected historical refs
+            // therefore do not require eagerly materializing the full root.
+            tracked_state_rootless: !force_root_fence,
             change_id: commit_row.change_id,
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
@@ -1062,9 +1063,8 @@ fn stage_tracked_commit_delta_index(
 }
 
 /// Stages the generation-keyed head projection only for normal prepared
-/// rows. Merge/checkpoint selected references stay on the immutable-root
-/// fallback until their next ordinary child commit bootstraps a generation.
-/// This keeps the hot path direct while never publishing an incomplete head.
+/// rows. Merge selected references use rootless first-parent replay until
+/// their next ordinary child commit bootstraps a generation.
 async fn stage_tracked_head(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -1314,27 +1314,7 @@ fn tracked_root_fence_ids(
     if force_all {
         return tracked_roots.iter().map(|root| root.commit_id).collect();
     }
-    let roots_by_id = tracked_roots
-        .iter()
-        .map(|root| (root.commit_id, root))
-        .collect::<BTreeMap<_, _>>();
-    let mut required = tracked_roots
-        .iter()
-        .filter(|root| root.requires_root)
-        .map(|root| root.commit_id)
-        .collect::<BTreeSet<_>>();
-    loop {
-        let ancestors = required
-            .iter()
-            .filter_map(|commit_id| roots_by_id[commit_id].parent_commit_id)
-            .filter(|parent_id| roots_by_id.contains_key(parent_id))
-            .collect::<Vec<_>>();
-        let before = required.len();
-        required.extend(ancestors);
-        if required.len() == before {
-            return required;
-        }
-    }
+    BTreeSet::new()
 }
 
 fn tracked_state_rows_are_strictly_sorted(
@@ -1464,7 +1444,6 @@ struct PendingTrackedRoot {
     branch_id: String,
     commit_id: CommitId,
     parent_commit_id: Option<CommitId>,
-    requires_root: bool,
 }
 
 async fn finalize_commit_rows(
@@ -1512,8 +1491,6 @@ async fn finalize_commit_rows(
                 .unwrap_or_default(),
         );
         let parent_commit_id = parent_commit_ids.first().copied();
-        let requires_root = parent_commit_ids.len() > 1 || !selected_change_refs.is_empty();
-
         commit_rows.push(FinalizedCommitRow {
             commit_id,
             parent_commit_ids: parent_commit_ids.clone(),
@@ -1531,7 +1508,6 @@ async fn finalize_commit_rows(
             branch_id,
             commit_id,
             parent_commit_id,
-            requires_root,
         });
     }
 
@@ -2074,7 +2050,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_fence_materializes_a_rootless_first_parent_chain() {
+    async fn selected_reference_commit_stays_rootless_and_replays_first_parent() {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
@@ -2159,11 +2135,11 @@ mod tests {
             },
         )
         .await
-        .expect("fence should rebuild its rootless first-parent chain");
+        .expect("selected-reference commit should stage");
         assert!(
-            writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
-                && writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
-            "selected-reference fence must materialize history roots"
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "absolute selected-reference deltas must keep the commit rootless"
         );
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -2182,7 +2158,7 @@ mod tests {
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("fence root should serve history");
+            .expect("rootless selected-reference commit should replay history");
         assert!(matches!(
             rows.as_slice(),
             [row] if row.change_id == change_id("fence-normal-change")
