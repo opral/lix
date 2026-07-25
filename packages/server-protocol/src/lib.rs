@@ -357,15 +357,24 @@ where
 {
     session_id: String,
     record: Arc<SessionRecord<S>>,
+    durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
 }
 
 impl<S> SessionLease<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    fn new(session_id: String, record: Arc<SessionRecord<S>>) -> Self {
+    fn new(
+        session_id: String,
+        record: Arc<SessionRecord<S>>,
+        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    ) -> Self {
         record.acquire(Instant::now());
-        Self { session_id, record }
+        Self {
+            session_id,
+            record,
+            durable_terminal_storage_notifier,
+        }
     }
 
     async fn run<T, F, Fut>(&self, operation: F) -> Result<T, LixError>
@@ -386,18 +395,23 @@ where
         // make an operation look idle and eligible for session eviction while
         // it is still running.
         let operation_lease = self.clone();
+        let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             let _operation_lease = operation_lease;
-            tracing::dispatcher::with_default(&dispatch, || {
+            let result = tracing::dispatcher::with_default(&dispatch, || {
                 parent.in_scope(|| {
                     runtime.block_on(async move {
                         let lix = lix.read().await;
                         operation(Arc::clone(&lix)).await
                     })
                 })
-            })
+            });
+            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
+                notifier.signal_if_terminal(error);
+            }
+            result
         })
         .await
         .map_err(|error| {
@@ -522,11 +536,12 @@ where
         })?;
         let lix = Arc::clone(&self.record.lix);
         let operation_lease = self.clone();
+        let durable_terminal_storage_notifier = self.durable_terminal_storage_notifier.clone();
         let parent = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
         tokio::task::spawn_blocking(move || {
             let _operation_lease = operation_lease;
-            tracing::dispatcher::with_default(&dispatch, || {
+            let result = tracing::dispatcher::with_default(&dispatch, || {
                 parent.in_scope(|| {
                     runtime.block_on(async move {
                         let mut lix = lix.write().await;
@@ -535,7 +550,11 @@ where
                         Ok(receipt)
                     })
                 })
-            })
+            });
+            if let (Some(notifier), Err(error)) = (&durable_terminal_storage_notifier, &result) {
+                notifier.signal_if_terminal(error);
+            }
+            result
         })
         .await
         .map_err(|error| {
@@ -559,7 +578,11 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     fn clone(&self) -> Self {
-        Self::new(self.session_id.clone(), Arc::clone(&self.record))
+        Self::new(
+            self.session_id.clone(),
+            Arc::clone(&self.record),
+            self.durable_terminal_storage_notifier.clone(),
+        )
     }
 }
 
@@ -584,8 +607,14 @@ impl<S> HandlerState<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    async fn lease(&self, session_id: &str) -> Result<SessionLease<S>, ApiError> {
-        self.server.lease(session_id).await
+    async fn lease(
+        &self,
+        session_id: &str,
+        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    ) -> Result<SessionLease<S>, ApiError> {
+        self.server
+            .lease(session_id, durable_terminal_storage_notifier)
+            .await
     }
 }
 
@@ -897,7 +926,7 @@ where
         registry
             .sessions
             .insert(session_id.clone(), Arc::clone(&record));
-        let lease = SessionLease::new(session_id, record);
+        let lease = SessionLease::new(session_id, record, None);
         drop(registry);
         for record in removed_sessions {
             close_removed_session(record).await;
@@ -912,7 +941,11 @@ where
             .reserve(self.inner.options.max_sessions)
     }
 
-    async fn lease(&self, session_id: &str) -> Result<SessionLease<S>, ApiError> {
+    async fn lease(
+        &self,
+        session_id: &str,
+        durable_terminal_storage_notifier: Option<DurableTerminalStorageNotifier>,
+    ) -> Result<SessionLease<S>, ApiError> {
         let mut registry = self.inner.registry.lock().await;
         ensure_server_open(registry.lifecycle)?;
         let Some(record) = registry.sessions.get(session_id).cloned() else {
@@ -926,7 +959,11 @@ where
             }
             return Err(ApiError::session_gone());
         }
-        Ok(SessionLease::new(session_id.to_string(), record))
+        Ok(SessionLease::new(
+            session_id.to_string(),
+            record,
+            durable_terminal_storage_notifier,
+        ))
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<(), ApiError> {
@@ -1037,7 +1074,13 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     let session_id = required_session_id(request.headers())?;
-    let lease = state.lease(&session_id).await?;
+    let durable_terminal_storage_notifier = request
+        .extensions()
+        .get::<DurableTerminalStorageNotifier>()
+        .cloned();
+    let lease = state
+        .lease(&session_id, durable_terminal_storage_notifier)
+        .await?;
     request.extensions_mut().insert(lease);
     Ok(next.run(request).await)
 }
@@ -1069,7 +1112,7 @@ where
                     "activeBranchId is only allowed when creating a session",
                 ));
             }
-            state.lease(&session_id).await?
+            state.lease(&session_id, None).await?
         }
         None => {
             let active_branch_id = match request.active_branch_id {
@@ -2062,14 +2105,7 @@ impl TerminalStorageStreamSignal {
 
     /// Waits for either a terminal-storage error or normal stream completion.
     pub async fn wait_for_terminal_storage(mut self) -> bool {
-        loop {
-            if *self.receiver.borrow() {
-                return true;
-            }
-            if self.receiver.changed().await.is_err() {
-                return false;
-            }
-        }
+        wait_for_terminal_storage(&mut self.receiver).await
     }
 }
 
@@ -2077,6 +2113,57 @@ impl TerminalStorageStreamSender {
     fn signal_if_terminal(&self, error: &LixError) {
         if is_terminal_storage_error_code(&error.code) {
             self.sender.send_replace(true);
+        }
+    }
+}
+
+/// Request-scoped sender that preserves a terminal result from durable work
+/// after its HTTP future is cancelled.
+#[derive(Clone, Debug)]
+pub struct DurableTerminalStorageNotifier {
+    sender: watch::Sender<bool>,
+}
+
+/// Receiver for a request's detached durable-operation terminal result.
+#[derive(Clone, Debug)]
+pub struct DurableTerminalStorageSignal {
+    receiver: watch::Receiver<bool>,
+}
+
+/// Creates the request extension and receiver used to observe a terminal
+/// result from durable work that outlives its HTTP request.
+pub fn durable_terminal_storage_signal()
+-> (DurableTerminalStorageNotifier, DurableTerminalStorageSignal) {
+    let (sender, receiver) = watch::channel(false);
+    (
+        DurableTerminalStorageNotifier { sender },
+        DurableTerminalStorageSignal { receiver },
+    )
+}
+
+impl DurableTerminalStorageSignal {
+    /// Waits for a terminal storage error or for every notifier clone to drop
+    /// without one.
+    pub async fn wait_for_terminal_storage(mut self) -> bool {
+        wait_for_terminal_storage(&mut self.receiver).await
+    }
+}
+
+impl DurableTerminalStorageNotifier {
+    fn signal_if_terminal(&self, error: &LixError) {
+        if is_terminal_storage_error_code(&error.code) {
+            self.sender.send_replace(true);
+        }
+    }
+}
+
+async fn wait_for_terminal_storage(receiver: &mut watch::Receiver<bool>) -> bool {
+    loop {
+        if *receiver.borrow() {
+            return true;
+        }
+        if receiver.changed().await.is_err() {
+            return false;
         }
     }
 }
@@ -2818,6 +2905,92 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct BlockingFencedWriteStorage {
+        inner: Memory,
+        gate: Arc<BlockingFencedWriteGate>,
+    }
+
+    struct BlockingFencedWriteGate {
+        remaining: AtomicUsize,
+        entered: AtomicBool,
+        entered_notify: Notify,
+        release: Notify,
+    }
+
+    impl BlockingFencedWriteStorage {
+        fn new() -> Self {
+            Self {
+                inner: Memory::new(),
+                gate: Arc::new(BlockingFencedWriteGate {
+                    remaining: AtomicUsize::new(0),
+                    entered: AtomicBool::new(false),
+                    entered_notify: Notify::new(),
+                    release: Notify::new(),
+                }),
+            }
+        }
+
+        fn block_next_write(&self) {
+            assert_eq!(
+                self.gate.remaining.swap(1, Ordering::AcqRel),
+                0,
+                "test write gate must be idle before arming"
+            );
+            self.gate.entered.store(false, Ordering::Release);
+        }
+
+        async fn wait_for_blocked_write(&self) {
+            loop {
+                let notified = self.gate.entered_notify.notified();
+                if self.gate.entered.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        }
+
+        fn release_blocked_write(&self) {
+            self.gate.release.notify_waiters();
+        }
+    }
+
+    impl Storage for BlockingFencedWriteStorage {
+        type Read<'a>
+            = MemoryRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = MemoryWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            if self
+                .gate
+                .remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                let release = self.gate.release.notified();
+                self.gate.entered.store(true, Ordering::Release);
+                self.gate.entered_notify.notify_waiters();
+                release.await;
+                return Err(StorageError::Fenced);
+            }
+            self.inner.begin_write(options).await
+        }
+    }
+
+    #[derive(Clone)]
     struct FencedReadStorage {
         inner: Memory,
         fenced: Arc<AtomicBool>,
@@ -2885,6 +3058,10 @@ mod tests {
 
     struct FailOneBlockedReadGate {
         remaining: AtomicUsize,
+        pause_next_read: AtomicBool,
+        paused_read: AtomicBool,
+        paused_entered: Notify,
+        paused_release: Notify,
         failing_entered: Notify,
         failing_release: Notify,
         sibling_entered: Notify,
@@ -2900,12 +3077,26 @@ mod tests {
         }
     }
 
+    struct PausedReadGuard {
+        gate: Arc<FailOneBlockedReadGate>,
+    }
+
+    impl Drop for PausedReadGuard {
+        fn drop(&mut self) {
+            self.gate.paused_release.notify_waiters();
+        }
+    }
+
     impl FailOneBlockedReadStorage {
         fn new() -> Self {
             Self {
                 inner: Memory::new(),
                 gate: Arc::new(FailOneBlockedReadGate {
                     remaining: AtomicUsize::new(0),
+                    pause_next_read: AtomicBool::new(false),
+                    paused_read: AtomicBool::new(false),
+                    paused_entered: Notify::new(),
+                    paused_release: Notify::new(),
                     failing_entered: Notify::new(),
                     failing_release: Notify::new(),
                     sibling_entered: Notify::new(),
@@ -2921,6 +3112,27 @@ mod tests {
                 0,
                 "test read gate must be idle before arming"
             );
+        }
+
+        fn pause_next_read(&self) -> PausedReadGuard {
+            assert!(
+                !self.gate.pause_next_read.swap(true, Ordering::AcqRel),
+                "test read pause must be idle before arming"
+            );
+            self.gate.paused_read.store(false, Ordering::Release);
+            PausedReadGuard {
+                gate: Arc::clone(&self.gate),
+            }
+        }
+
+        async fn wait_for_paused_read(&self) {
+            loop {
+                let notified = self.gate.paused_entered.notified();
+                if self.gate.paused_read.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
         }
 
         async fn wait_for_failing_read(&self) {
@@ -2955,6 +3167,12 @@ mod tests {
             Self: 'a;
 
         async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            if self.gate.pause_next_read.swap(false, Ordering::AcqRel) {
+                let release = self.gate.paused_release.notified();
+                self.gate.paused_read.store(true, Ordering::Release);
+                self.gate.paused_entered.notify_waiters();
+                release.await;
+            }
             let role = self
                 .gate
                 .remaining
@@ -3133,6 +3351,10 @@ mod tests {
         let (session_id, _) = new_session(&router).await;
 
         prime_external_observe_watcher(&router, &session_id).await;
+        let _paused_watcher = storage.pause_next_read();
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_paused_read())
+            .await
+            .expect("external watcher should pause before multiplex fault injection");
         storage.fail_one_and_block_a_sibling();
         let response = request(
             &router,
@@ -3218,6 +3440,10 @@ mod tests {
         let (session_id, _) = new_session(&router).await;
 
         prime_external_observe_watcher(&router, &session_id).await;
+        let _paused_watcher = storage.pause_next_read();
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_paused_read())
+            .await
+            .expect("external watcher should pause before multiplex fault injection");
         storage.fail_one_and_block_a_sibling();
         let response = request(
             &router,
@@ -5768,35 +5994,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancelled_durable_operation_keeps_its_detached_operation_leased() {
-        let app = app_with_options(ProtocolServerOptions {
-            max_sessions: 1,
-            session_idle_timeout: Duration::from_mins(1),
-            ..ProtocolServerOptions::default()
-        })
-        .await;
-        let lease = app
-            .server
-            .create_session(None)
-            .await
-            .expect("session lease");
-        let record = Arc::clone(&lease.record);
-        let (started_sender, started) = tokio::sync::oneshot::channel();
-        let (finish_sender, finish) = tokio::sync::oneshot::channel();
-        let (done_sender, done) = tokio::sync::oneshot::channel();
-        let operation = tokio::spawn(async move {
-            // `run` is the durable path used by writes and durable runtime
-            // functions, so caller cancellation must not interrupt it.
-            lease
-                .run(move |_lix| async move {
-                    started_sender.send(()).expect("signal start");
-                    finish.await.expect("finish operation");
-                    done_sender.send(()).expect("signal completion");
-                    Ok(())
-                })
+    async fn cancelled_durable_operation_reports_terminal_storage_after_caller_cancellation() {
+        let storage = BlockingFencedWriteStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
                 .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::with_options(
+            root,
+            ProtocolServerOptions {
+                max_sessions: 1,
+                session_idle_timeout: Duration::from_mins(1),
+                ..ProtocolServerOptions::default()
+            },
+        )
+        .expect("protocol server");
+        let router = handler(server.clone());
+        let lease = server.create_session(None).await.expect("session lease");
+        let session_id = lease.session_id.clone();
+        let record = Arc::clone(&lease.record);
+        drop(lease);
+        let (notifier, signal) = durable_terminal_storage_signal();
+        storage.block_next_write();
+        let operation_router = router.clone();
+        let operation_session_id = session_id.clone();
+        let operation = tokio::spawn(async move {
+            operation_router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/lix/v1/execute")
+                        .header(SESSION_ID_HEADER, operation_session_id)
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .extension(notifier)
+                        .body(Body::from(
+                            json!({
+                                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('detached-write', 'value')"
+                            })
+                            .to_string(),
+                        ))
+                        .expect("durable execute request"),
+                )
+                .await
+                .expect("protocol router response")
         });
-        started.await.expect("operation started");
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_write())
+            .await
+            .expect("durable operation should begin its write");
 
         operation.abort();
         assert!(
@@ -5805,16 +6050,77 @@ mod tests {
                 .expect_err("outer HTTP-equivalent future was cancelled")
                 .is_cancelled()
         );
-        let at_capacity = request(&app.router, "GET", "/lix/v1", None, None).await;
+        let at_capacity = request(&router, "GET", "/lix/v1", None, None).await;
         assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        finish_sender.send(()).expect("release detached operation");
-        done.await.expect("detached operation completed");
+        storage.release_blocked_write();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+                .await
+                .expect("detached terminal result should wake the request observer"),
+            "the detached durable operation should preserve its terminal storage result"
+        );
         while record.lease_count() != 0 {
             tokio::task::yield_now().await;
         }
-        let replacement = request(&app.router, "GET", "/lix/v1", None, None).await;
+        let replacement = request(&router, "GET", "/lix/v1", None, None).await;
         assert_eq!(replacement.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn cancelled_branch_switch_reports_terminal_storage_after_caller_cancellation() {
+        let storage = BlockingFencedWriteStorage::new();
+        let root = Arc::new(
+            open_lix(OpenLixOptions::new(storage.clone()))
+                .await
+                .expect("open lix"),
+        );
+        let server = LixProtocolServer::new(root);
+        let router = handler(server.clone());
+        let (session_id, _) = new_session(&router).await;
+        let created = request(
+            &router,
+            "POST",
+            "/lix/v1/branch/create",
+            Some(&session_id),
+            Some(json!({ "name": "Detached switch target" })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let branch_id = response_json(created).await["id"]
+            .as_str()
+            .expect("created branch id")
+            .to_string();
+
+        let (notifier, signal) = durable_terminal_storage_signal();
+        let lease = server
+            .lease(&session_id, Some(notifier))
+            .await
+            .expect("session lease");
+        storage.block_next_write();
+        let operation =
+            tokio::spawn(
+                async move { lease.switch_branch(SwitchBranchOptions { branch_id }).await },
+            );
+        tokio::time::timeout(Duration::from_secs(1), storage.wait_for_blocked_write())
+            .await
+            .expect("branch switch should begin its write");
+
+        operation.abort();
+        assert!(
+            operation
+                .await
+                .expect_err("outer HTTP-equivalent future was cancelled")
+                .is_cancelled()
+        );
+
+        storage.release_blocked_write();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), signal.wait_for_terminal_storage(),)
+                .await
+                .expect("detached branch switch terminal result should wake the request observer"),
+            "the detached branch switch should preserve its terminal storage result"
+        );
     }
 
     #[tokio::test]
