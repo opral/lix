@@ -17,6 +17,9 @@ pub enum StorageError {
     Fenced,
     /// The storage instance has stopped and cannot be reused.
     Closed(String),
+    /// A commit may have been applied, but the caller did not receive a
+    /// definitive result.
+    CommitOutcomeUnknown(String),
     Corruption(String),
     Io(String),
 }
@@ -96,6 +99,9 @@ impl fmt::Display for StorageError {
             Self::Durability => f.write_str("durability failure"),
             Self::Fenced => f.write_str("storage writer was fenced by a newer client"),
             Self::Closed(message) => write!(f, "storage instance is closed: {message}"),
+            Self::CommitOutcomeUnknown(message) => {
+                write!(f, "storage commit outcome is unknown: {message}")
+            }
             Self::Corruption(message) => write!(f, "storage corruption: {message}"),
             Self::Io(message) => write!(f, "io error: {message}"),
         }
