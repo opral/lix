@@ -437,6 +437,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transaction_opening_revision_caches_tracked_and_sql_catalogs_separately() {
+        let context = CatalogContext::new();
+        let sql_domain = Domain::schema_catalog("global", true);
+        let tracked_domain = Domain::schema_catalog("global", false);
+        let revision = CatalogRevision::for_test(b"revision-one");
+        let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
+
+        context
+            .compiled_catalog_for_transaction_open(&reader, &sql_domain, Some(&revision))
+            .await
+            .expect("SQL catalog should compile");
+        context
+            .compiled_catalog_for_transaction_open(&reader, &tracked_domain, Some(&revision))
+            .await
+            .expect("tracked catalog should compile");
+        assert_eq!(
+            reader.scan_count(),
+            3,
+            "a cold SQL catalog scans two scopes and a cold tracked catalog scans one"
+        );
+
+        context
+            .compiled_catalog_for_transaction_open(&reader, &sql_domain, Some(&revision))
+            .await
+            .expect("SQL catalog should hit by revision");
+        context
+            .compiled_catalog_for_transaction_open(&reader, &tracked_domain, Some(&revision))
+            .await
+            .expect("tracked catalog should hit by revision");
+        assert_eq!(
+            reader.scan_count(),
+            3,
+            "hot transaction opens must not rescan either schema catalog"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_transaction_opening_revision_conservatively_rescans() {
         let context = CatalogContext::new();
         let domain = Domain::schema_catalog("global", true);
