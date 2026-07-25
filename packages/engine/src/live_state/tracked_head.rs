@@ -6,7 +6,9 @@
 //! changelog history. A marker binds a generation to the branch ref's commit.
 //! Any mismatch is a cache miss and callers take the historical fallback.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 
 use std::sync::Arc;
 
@@ -113,15 +115,6 @@ impl HeadIdentity {
         }
     }
 
-    fn into_group_identity(self) -> HeadGroupIdentity {
-        HeadGroupIdentity {
-            branch_id: self.branch_id,
-            generation: self.generation,
-            schema_key: self.schema_key,
-            entity_pk: self.entity_pk,
-        }
-    }
-
     fn group_identity(&self) -> HeadGroupIdentity {
         HeadGroupIdentity {
             branch_id: self.branch_id.clone(),
@@ -195,16 +188,6 @@ pub(crate) struct TrackedHeadDeltaRef<'a> {
 }
 
 impl<'a> TrackedHeadDeltaRef<'a> {
-    fn identity(&self, branch_id: &str, generation: CommitId) -> HeadIdentity {
-        HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: self.schema_key.to_string(),
-            entity_pk: self.entity_pk.clone(),
-            file_id: self.file_id.map(str::to_string),
-        }
-    }
-
     fn value_ref(&self, created_at: LixTimestamp) -> HeadValueRef<'a> {
         HeadValueRef {
             change_id: self.change_id,
@@ -534,145 +517,394 @@ where
     ) -> Result<CommitId, LixError> {
         let matches_parent = parent_generation.is_some();
         let generation = parent_generation.unwrap_or(new_head);
-
-        let mut seen_delta_identities = BTreeSet::new();
-        for delta in deltas {
-            let identity = delta.identity(branch_id, generation);
-            if !seen_delta_identities.insert(identity.clone()) {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked-head commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
-                        identity.schema_key, identity.entity_pk, identity.file_id
-                    ),
-                ));
-            }
-        }
-
-        let mut groups = if matches_parent {
-            let group_identities = deltas
-                .iter()
-                .map(|delta| delta.identity(branch_id, generation).into_group_identity())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-            let values = load_group_bytes(self.store, &group_identities).await?;
-            let mut groups = BTreeMap::new();
-            for (identity, value) in group_identities.into_iter().zip(values) {
-                let members = value
-                    .as_deref()
-                    .map(decode_head_group_member_map)
-                    .transpose()?
-                    .unwrap_or_default();
-                groups.insert(identity, members);
-            }
-            groups
-        } else {
-            let mut groups =
-                BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, Vec<u8>>>::new();
-            for row in parent_rows.unwrap_or_default() {
-                let key = TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                    file_id: row.file_id.clone(),
-                };
-                if absence_guards.contains(&key) && !row.deleted {
-                    return Err(tracked_head_duplicate_insert_error(&key));
-                }
-                let identity = HeadIdentity {
-                    branch_id: branch_id.to_string(),
-                    generation,
-                    schema_key: row.schema_key,
-                    entity_pk: row.entity_pk,
-                    file_id: row.file_id,
-                };
-                let value = HeadValue {
-                    change_id: row.change_id,
-                    commit_id: row.commit_id,
-                    deleted: row.deleted,
-                    created_at: LixTimestamp::expect_parse(
-                        "tracked-head parent created_at",
-                        &row.created_at,
-                    ),
-                    updated_at: LixTimestamp::expect_parse(
-                        "tracked-head parent updated_at",
-                        &row.updated_at,
-                    ),
-                    snapshot: row
-                        .snapshot_content
-                        .as_deref()
-                        .map_or(JsonSlot::None, JsonSlot::from_json),
-                    metadata: row
-                        .metadata
-                        .as_deref()
-                        .map_or(JsonSlot::None, JsonSlot::from_json),
-                };
-                let members = groups.entry(identity.group_identity()).or_default();
-                if members
-                    .insert(
-                        identity.file_id.clone(),
-                        encode_head_value(&value.as_ref())?,
-                    )
-                    .is_some()
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked-head bootstrap contains duplicate full row identity",
-                    ));
-                }
-            }
-            groups
+        let marker = TrackedHeadMarker {
+            head_commit_id: new_head,
+            generation,
         };
+        // Preflight the only fallible publication bytes before staging an
+        // incremental generation in the caller's write set. A failed writer
+        // must not leave any same-generation group mutation behind.
+        let marker_key = marker_key(branch_id)?;
+        let marker_value = storage_codec::encode("tracked-head marker", &marker)?;
 
-        for delta in deltas {
-            let identity = delta.identity(branch_id, generation);
-            let key = TrackedStateKey {
-                schema_key: identity.schema_key.clone(),
-                entity_pk: identity.entity_pk.clone(),
-                file_id: identity.file_id.clone(),
-            };
-            let members = groups.entry(identity.group_identity()).or_default();
-            let created_at = if let Some(existing) = members.get(&identity.file_id) {
-                let existing = decode_head_value(existing)?;
-                if absence_guards.contains(&key) && !existing.deleted {
-                    return Err(tracked_head_duplicate_insert_error(&key));
-                }
-                existing.created_at
-            } else {
-                delta.created_at
-            };
-            members.insert(
-                identity.file_id,
-                encode_head_value(&delta.value_ref(created_at))?,
-            );
-        }
-
-        self.writes
-            .reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
-        let explicit_member_count = groups
-            .values()
-            .map(|members| members.keys().filter(|file_id| file_id.is_some()).count())
-            .sum();
-        self.writes
-            .reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
-        for (identity, members) in groups {
-            stage_put_group_members(self.writes, &identity, &members)?;
-            for (file_id, value) in &members {
-                if file_id.is_some() {
-                    stage_put_member_bytes(self.writes, &identity, file_id.as_deref(), value)?;
-                }
+        // Sorting borrowed deltas establishes both the exact-mutation
+        // uniqueness check and the group order needed for a streaming merge.
+        // The normal matching-generation path must never reconstruct every
+        // v5 member in an owned BTreeMap just to change one member.
+        let mut sorted_deltas = deltas.iter().collect::<Vec<_>>();
+        sorted_deltas.sort_unstable_by(|left, right| compare_head_deltas(left, right));
+        for pair in sorted_deltas.windows(2) {
+            if compare_head_deltas(pair[0], pair[1]) == Ordering::Equal {
+                return Err(tracked_head_duplicate_delta_error(pair[1]));
             }
         }
-        stage_marker(
-            self.writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: new_head,
+
+        if matches_parent {
+            let groups = group_sorted_head_deltas(branch_id, generation, &sorted_deltas);
+            let previous_groups =
+                load_group_bytes(self.store, groups.iter().map(|group| &group.identity)).await?;
+
+            self.writes
+                .reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
+            self.writes.reserve_space(
+                TRACKED_HEAD_MEMBER_SPACE,
+                sorted_deltas
+                    .iter()
+                    .filter(|delta| delta.file_id.is_some())
+                    .count(),
+                0,
+            );
+            let mut next_groups = Vec::new();
+            next_groups
+                .try_reserve(groups.len())
+                .map_err(|_| head_group_error("cannot reserve staged group outputs"))?;
+            for (group, previous) in groups.iter().zip(previous_groups) {
+                next_groups.push(encode_incremental_group(
+                    previous.as_deref(),
+                    &sorted_deltas[group.deltas.clone()],
+                    absence_guards,
+                )?);
+            }
+            for (group, next) in groups.iter().zip(next_groups) {
+                stage_put_group_bytes(self.writes, &group.identity, next.bytes);
+                for (file_id, value) in next.explicit_member_projections {
+                    stage_put_file_member_bytes(self.writes, &group.identity, file_id, &value);
+                }
+            }
+        } else {
+            stage_bootstrap_groups(
+                self.writes,
+                branch_id,
                 generation,
-            },
-        )?;
+                &sorted_deltas,
+                absence_guards,
+                parent_rows.unwrap_or_default(),
+            )?;
+        }
+        stage_marker_encoded(self.writes, marker_key, marker_value);
         Ok(generation)
     }
+}
+
+/// One contiguous range of sorted mutations for a physical v5 group.
+///
+/// The range borrows the transaction's deltas, while the group identity is
+/// owned once. This is intentionally not a map of decoded members: matching
+/// generation commits merge the encoded old group directly into its next
+/// value.
+struct HeadGroupMutation {
+    identity: HeadGroupIdentity,
+    deltas: Range<usize>,
+}
+
+/// Fully validated replacement bytes for one matching-generation group.
+///
+/// Keeping these short-lived outputs until every group has validated makes
+/// `stage_commit` all-or-nothing for the existing serving generation without
+/// rebuilding decoded member maps.
+struct EncodedHeadGroup<'a> {
+    bytes: Vec<u8>,
+    explicit_member_projections: Vec<(&'a str, Vec<u8>)>,
+}
+
+fn compare_head_deltas(
+    left: &TrackedHeadDeltaRef<'_>,
+    right: &TrackedHeadDeltaRef<'_>,
+) -> Ordering {
+    left.schema_key
+        .cmp(right.schema_key)
+        .then_with(|| left.entity_pk.cmp(right.entity_pk))
+        .then_with(|| left.file_id.cmp(&right.file_id))
+}
+
+fn same_head_group(left: &TrackedHeadDeltaRef<'_>, right: &TrackedHeadDeltaRef<'_>) -> bool {
+    left.schema_key == right.schema_key && left.entity_pk == right.entity_pk
+}
+
+fn tracked_head_duplicate_delta_error(delta: &TrackedHeadDeltaRef<'_>) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!(
+            "tracked-head commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
+            delta.schema_key, delta.entity_pk, delta.file_id
+        ),
+    )
+}
+
+fn group_sorted_head_deltas(
+    branch_id: &str,
+    generation: CommitId,
+    deltas: &[&TrackedHeadDeltaRef<'_>],
+) -> Vec<HeadGroupMutation> {
+    let mut groups = Vec::new();
+    let mut start = 0;
+    while start < deltas.len() {
+        let first = deltas[start];
+        let mut end = start + 1;
+        while end < deltas.len() && same_head_group(first, deltas[end]) {
+            end += 1;
+        }
+        groups.push(HeadGroupMutation {
+            identity: HeadGroupIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: first.schema_key.to_string(),
+                entity_pk: first.entity_pk.clone(),
+            },
+            deltas: start..end,
+        });
+        start = end;
+    }
+    groups
+}
+
+/// Builds a fresh v5 generation after a branch movement.
+///
+/// This path necessarily starts from materialized parent rows, so it retains
+/// the simple owned-map implementation. Ordinary commits keep their parent
+/// generation and use [`encode_incremental_group`] instead.
+fn stage_bootstrap_groups(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    deltas: &[&TrackedHeadDeltaRef<'_>],
+    absence_guards: &BTreeSet<TrackedStateKey>,
+    parent_rows: Vec<MaterializedTrackedStateRow>,
+) -> Result<(), LixError> {
+    let mut groups = BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, Vec<u8>>>::new();
+    for row in parent_rows {
+        let MaterializedTrackedStateRow {
+            entity_pk,
+            schema_key,
+            file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            change_id,
+            commit_id,
+        } = row;
+        let key = TrackedStateKey {
+            schema_key: schema_key.clone(),
+            entity_pk: entity_pk.clone(),
+            file_id: file_id.clone(),
+        };
+        if absence_guards.contains(&key) && !deleted {
+            return Err(tracked_head_duplicate_insert_error(&key));
+        }
+        let identity = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key,
+            entity_pk,
+        };
+        let value = HeadValue {
+            change_id,
+            commit_id,
+            deleted,
+            created_at: LixTimestamp::expect_parse("tracked-head parent created_at", &created_at),
+            updated_at: LixTimestamp::expect_parse("tracked-head parent updated_at", &updated_at),
+            snapshot: snapshot_content
+                .as_deref()
+                .map_or(JsonSlot::None, JsonSlot::from_json),
+            metadata: metadata
+                .as_deref()
+                .map_or(JsonSlot::None, JsonSlot::from_json),
+        };
+        let members = groups.entry(identity).or_default();
+        if members
+            .insert(file_id, encode_head_value(&value.as_ref())?)
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked-head bootstrap contains duplicate full row identity",
+            ));
+        }
+    }
+
+    for delta in deltas {
+        let group = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key: delta.schema_key.to_string(),
+            entity_pk: delta.entity_pk.clone(),
+        };
+        let members = groups.entry(group).or_default();
+        let created_at = match members.get(&delta.file_id.map(str::to_string)) {
+            Some(existing) => {
+                let existing = decode_head_value(existing)?;
+                reject_guarded_live_member(absence_guards, delta, existing)?;
+                existing.created_at
+            }
+            None => delta.created_at,
+        };
+        members.insert(
+            delta.file_id.map(str::to_string),
+            encode_head_value(&delta.value_ref(created_at))?,
+        );
+    }
+
+    writes.reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
+    let explicit_member_count = groups
+        .values()
+        .map(|members| members.keys().filter(|file_id| file_id.is_some()).count())
+        .sum();
+    writes.reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
+    for (identity, members) in groups {
+        stage_put_group_members(writes, &identity, &members)?;
+        for (file_id, value) in &members {
+            if file_id.is_some() {
+                stage_put_member_bytes(writes, &identity, file_id.as_deref(), value)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Merges one existing v5 group and its sorted mutations without decoding the
+/// whole group into owned member values. Every old member is still parsed and
+/// validated before it is copied, so an unrelated malformed sibling cannot be
+/// silently republished.
+fn encode_incremental_group<'a>(
+    previous: Option<&[u8]>,
+    deltas: &[&TrackedHeadDeltaRef<'a>],
+    absence_guards: &BTreeSet<TrackedStateKey>,
+) -> Result<EncodedHeadGroup<'a>, LixError> {
+    debug_assert!(!deltas.is_empty());
+    debug_assert!(
+        deltas
+            .windows(2)
+            .all(|pair| compare_head_deltas(pair[0], pair[1]) == Ordering::Less)
+    );
+
+    let mut cursor = previous.map(HeadGroupMembers::new).transpose()?;
+    let mut current = next_head_group_member(&mut cursor)?;
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve(previous.map_or(HEAD_GROUP_HEADER_BYTES, <[u8]>::len))
+        .map_err(|_| head_group_error("cannot reserve group value bytes"))?;
+    encoded.push(HEAD_GROUP_VALUE_VERSION);
+    encoded.extend_from_slice(&[0; 4]);
+    let mut member_count = 0usize;
+    let mut explicit_member_projections = Vec::new();
+    explicit_member_projections
+        .try_reserve(
+            deltas
+                .iter()
+                .filter(|delta| delta.file_id.is_some())
+                .count(),
+        )
+        .map_err(|_| head_group_error("cannot reserve explicit member projections"))?;
+
+    for delta in deltas {
+        loop {
+            let Some(member) = current else {
+                append_delta_head_group_member(
+                    &mut encoded,
+                    delta,
+                    delta.created_at,
+                    &mut explicit_member_projections,
+                )?;
+                increment_head_group_member_count(&mut member_count)?;
+                break;
+            };
+            match member.file_id.cmp(&delta.file_id) {
+                Ordering::Less => {
+                    append_head_group_member(&mut encoded, member.file_id, member.value)?;
+                    increment_head_group_member_count(&mut member_count)?;
+                    current = next_head_group_member(&mut cursor)?;
+                }
+                Ordering::Equal => {
+                    reject_guarded_live_member(absence_guards, delta, member.head)?;
+                    append_delta_head_group_member(
+                        &mut encoded,
+                        delta,
+                        member.head.created_at,
+                        &mut explicit_member_projections,
+                    )?;
+                    increment_head_group_member_count(&mut member_count)?;
+                    current = next_head_group_member(&mut cursor)?;
+                    break;
+                }
+                Ordering::Greater => {
+                    append_delta_head_group_member(
+                        &mut encoded,
+                        delta,
+                        delta.created_at,
+                        &mut explicit_member_projections,
+                    )?;
+                    increment_head_group_member_count(&mut member_count)?;
+                    break;
+                }
+            }
+        }
+    }
+    while let Some(member) = current {
+        append_head_group_member(&mut encoded, member.file_id, member.value)?;
+        increment_head_group_member_count(&mut member_count)?;
+        current = next_head_group_member(&mut cursor)?;
+    }
+
+    let member_count =
+        u32::try_from(member_count).map_err(|_| head_group_error("member count exceeds u32"))?;
+    encoded[1..HEAD_GROUP_HEADER_BYTES].copy_from_slice(&member_count.to_be_bytes());
+    Ok(EncodedHeadGroup {
+        bytes: encoded,
+        explicit_member_projections,
+    })
+}
+
+fn increment_head_group_member_count(member_count: &mut usize) -> Result<(), LixError> {
+    *member_count = member_count
+        .checked_add(1)
+        .ok_or_else(|| head_group_error("member count overflow"))?;
+    Ok(())
+}
+
+fn next_head_group_member<'a>(
+    cursor: &mut Option<HeadGroupMembers<'a>>,
+) -> Result<Option<HeadGroupMemberView<'a>>, LixError> {
+    cursor
+        .as_mut()
+        .map_or(Ok(None), HeadGroupMembers::next_member)
+}
+
+fn reject_guarded_live_member(
+    absence_guards: &BTreeSet<TrackedStateKey>,
+    delta: &TrackedHeadDeltaRef<'_>,
+    existing: HeadValueView<'_>,
+) -> Result<(), LixError> {
+    if absence_guards.is_empty() || existing.deleted {
+        return Ok(());
+    }
+    let key = TrackedStateKey {
+        schema_key: delta.schema_key.to_string(),
+        entity_pk: delta.entity_pk.clone(),
+        file_id: delta.file_id.map(str::to_string),
+    };
+    if absence_guards.contains(&key) {
+        return Err(tracked_head_duplicate_insert_error(&key));
+    }
+    Ok(())
+}
+
+fn append_delta_head_group_member<'a>(
+    encoded: &mut Vec<u8>,
+    delta: &TrackedHeadDeltaRef<'a>,
+    created_at: LixTimestamp,
+    explicit_member_projections: &mut Vec<(&'a str, Vec<u8>)>,
+) -> Result<(), LixError> {
+    let value = encode_head_value(&delta.value_ref(created_at))?;
+    append_head_group_member(encoded, delta.file_id, &value)?;
+    // The group is authoritative. An unchanged explicit projection already
+    // belongs to this generation, so only rewrite projections whose member
+    // changed in this commit.
+    if let Some(file_id) = delta.file_id {
+        explicit_member_projections.push((file_id, value));
+    }
+    Ok(())
 }
 
 fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
@@ -707,17 +939,17 @@ async fn load_marker(
 }
 
 /// Loads packed v5 groups without materializing their members.
-async fn load_group_bytes(
+async fn load_group_bytes<'a>(
     store: &(impl StorageAdapterRead + ?Sized),
-    identities: &[HeadGroupIdentity],
+    identities: impl IntoIterator<Item = &'a HeadGroupIdentity>,
 ) -> Result<Vec<Option<Bytes>>, LixError> {
-    if identities.is_empty() {
-        return Ok(Vec::new());
-    }
     let keys = identities
-        .iter()
+        .into_iter()
         .map(|identity| StorageKey(Bytes::from(encode_group_key(identity))))
         .collect::<Vec<_>>();
+    if keys.is_empty() {
+        return Ok(Vec::new());
+    }
     let result = PointReadPlan::new(TRACKED_HEAD_GROUP_SPACE, &keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
@@ -1049,19 +1281,28 @@ fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bo
             }))
 }
 
+#[cfg(test)]
 fn stage_marker(
     writes: &mut StorageWriteSet,
     branch_id: &str,
     marker: &TrackedHeadMarker,
 ) -> Result<(), LixError> {
-    writes.put(
-        TRACKED_HEAD_MARKER_SPACE,
-        StorageKey(Bytes::from(marker_key(branch_id)?)),
-        StorageValue {
-            bytes: Bytes::from(storage_codec::encode("tracked-head marker", marker)?),
-        },
+    stage_marker_encoded(
+        writes,
+        marker_key(branch_id)?,
+        storage_codec::encode("tracked-head marker", marker)?,
     );
     Ok(())
+}
+
+fn stage_marker_encoded(writes: &mut StorageWriteSet, key: Vec<u8>, value: Vec<u8>) {
+    writes.put(
+        TRACKED_HEAD_MARKER_SPACE,
+        StorageKey(Bytes::from(key)),
+        StorageValue {
+            bytes: Bytes::from(value),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -1098,14 +1339,22 @@ fn stage_put_group_members(
     identity: &HeadGroupIdentity,
     members: &BTreeMap<Option<String>, Vec<u8>>,
 ) -> Result<(), LixError> {
+    stage_put_group_bytes(writes, identity, encode_head_group_members(members)?);
+    Ok(())
+}
+
+fn stage_put_group_bytes(
+    writes: &mut StorageWriteSet,
+    identity: &HeadGroupIdentity,
+    bytes: Vec<u8>,
+) {
     writes.put(
         TRACKED_HEAD_GROUP_SPACE,
         StorageKey(Bytes::from(encode_group_key(identity))),
         StorageValue {
-            bytes: Bytes::from(encode_head_group_members(members)?),
+            bytes: Bytes::from(bytes),
         },
     );
-    Ok(())
 }
 
 fn stage_put_member_bytes(
@@ -1120,6 +1369,16 @@ fn stage_put_member_bytes(
             "tracked-head explicit member projection requires a file_id",
         ));
     };
+    stage_put_file_member_bytes(writes, group, file_id, value);
+    Ok(())
+}
+
+fn stage_put_file_member_bytes(
+    writes: &mut StorageWriteSet,
+    group: &HeadGroupIdentity,
+    file_id: &str,
+    value: &[u8],
+) {
     let identity = HeadIdentity {
         branch_id: group.branch_id.clone(),
         generation: group.generation,
@@ -1134,7 +1393,6 @@ fn stage_put_member_bytes(
             bytes: Bytes::copy_from_slice(value),
         },
     );
-    Ok(())
 }
 
 fn marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
@@ -1449,6 +1707,156 @@ struct HeadGroupMemberBytes {
     value: Bytes,
 }
 
+/// A validated, borrowed member from a v5 group value.
+///
+/// The incremental writer uses this cursor to copy untouched member bytes
+/// directly into the next group while retaining the old fixed-header value
+/// needed to preserve `created_at` on a changed identity.
+#[derive(Clone, Copy)]
+struct HeadGroupMemberView<'a> {
+    file_id: Option<&'a str>,
+    value: &'a [u8],
+    head: HeadValueView<'a>,
+}
+
+/// Streaming parser for the authoritative v5 group bytes.
+///
+/// Unlike the reader-side decoder, this does not allocate a `String`,
+/// `Bytes`, or map for every member. It still enforces the complete wire
+/// contract while every member is consumed, including untouched siblings.
+struct HeadGroupMembers<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+    remaining: usize,
+    prior_file_id: Option<Option<&'a str>>,
+}
+
+impl<'a> HeadGroupMembers<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
+        if bytes.len() < HEAD_GROUP_HEADER_BYTES {
+            return Err(head_group_error("value is shorter than the fixed header"));
+        }
+        if bytes[0] != HEAD_GROUP_VALUE_VERSION {
+            return Err(head_group_error(&format!(
+                "unsupported group format version {}",
+                bytes[0]
+            )));
+        }
+        let remaining = usize::try_from(read_u32(&bytes[1..5], "group member count")?)
+            .map_err(|_| head_group_error("member count exceeds usize"))?;
+        Ok(Self {
+            bytes,
+            offset: HEAD_GROUP_HEADER_BYTES,
+            remaining,
+            prior_file_id: None,
+        })
+    }
+
+    fn next_member(&mut self) -> Result<Option<HeadGroupMemberView<'a>>, LixError> {
+        if self.remaining == 0 {
+            if self.offset != self.bytes.len() {
+                return Err(head_group_error("has trailing bytes"));
+            }
+            return Ok(None);
+        }
+
+        let tag = *self
+            .bytes
+            .get(self.offset)
+            .ok_or_else(|| head_group_error("is truncated before member file id"))?;
+        self.offset += 1;
+        let file_id = match tag {
+            FILE_ID_NONE => None,
+            FILE_ID_SOME => {
+                let file_id_len =
+                    read_group_u32(self.bytes, &mut self.offset, "member file-id length")?;
+                let file_id_end = self
+                    .offset
+                    .checked_add(file_id_len)
+                    .ok_or_else(|| head_group_error("member file-id length overflow"))?;
+                let file_id = self
+                    .bytes
+                    .get(self.offset..file_id_end)
+                    .ok_or_else(|| head_group_error("is truncated in member file id"))?;
+                self.offset = file_id_end;
+                Some(std::str::from_utf8(file_id).map_err(|error| {
+                    head_group_error(&format!("member file id is not UTF-8: {error}"))
+                })?)
+            }
+            _ => return Err(head_group_error("has an invalid member file-id tag")),
+        };
+        if self.prior_file_id.is_some_and(|prior| prior >= file_id) {
+            return Err(head_group_error(
+                "members are not strictly ordered by file id",
+            ));
+        }
+
+        let value_len = read_group_u32(self.bytes, &mut self.offset, "member value length")?;
+        let value_end = self
+            .offset
+            .checked_add(value_len)
+            .ok_or_else(|| head_group_error("member value length overflow"))?;
+        let value = self
+            .bytes
+            .get(self.offset..value_end)
+            .ok_or_else(|| head_group_error("is truncated in member value"))?;
+        let head = decode_head_value(value)?;
+        self.offset = value_end;
+        self.remaining -= 1;
+        self.prior_file_id = Some(file_id);
+        Ok(Some(HeadGroupMemberView {
+            file_id,
+            value,
+            head,
+        }))
+    }
+}
+
+fn append_head_group_member(
+    encoded: &mut Vec<u8>,
+    file_id: Option<&str>,
+    value: &[u8],
+) -> Result<(), LixError> {
+    let file_id_bytes = match file_id {
+        None => 0,
+        Some(file_id) => {
+            u32::try_from(file_id.len()).map_err(|_| head_group_error("file id exceeds u32"))?;
+            4usize
+                .checked_add(file_id.len())
+                .ok_or_else(|| head_group_error("group value length overflow"))?
+        }
+    };
+    u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
+    let member_len = 1usize
+        .checked_add(file_id_bytes)
+        .and_then(|length| length.checked_add(4))
+        .and_then(|length| length.checked_add(value.len()))
+        .ok_or_else(|| head_group_error("group value length overflow"))?;
+    encoded
+        .len()
+        .checked_add(member_len)
+        .ok_or_else(|| head_group_error("group value length overflow"))?;
+    encoded
+        .try_reserve(member_len)
+        .map_err(|_| head_group_error("cannot reserve group value bytes"))?;
+
+    match file_id {
+        None => encoded.push(FILE_ID_NONE),
+        Some(file_id) => {
+            encoded.push(FILE_ID_SOME);
+            let file_id_len = u32::try_from(file_id.len())
+                .map_err(|_| head_group_error("file id exceeds u32"))?;
+            encoded.extend_from_slice(&file_id_len.to_be_bytes());
+            encoded.extend_from_slice(file_id.as_bytes());
+        }
+    }
+    let value_len =
+        u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
+    encoded.extend_from_slice(&value_len.to_be_bytes());
+    encoded.extend_from_slice(value);
+    Ok(())
+}
+
 fn encode_head_group_members(
     members: &BTreeMap<Option<String>, Vec<u8>>,
 ) -> Result<Vec<u8>, LixError> {
@@ -1569,15 +1977,6 @@ fn decode_head_group_members(bytes: &[u8]) -> Result<Vec<HeadGroupMemberBytes>, 
         return Err(head_group_error("has trailing bytes"));
     }
     Ok(members)
-}
-
-fn decode_head_group_member_map(
-    bytes: &[u8],
-) -> Result<BTreeMap<Option<String>, Vec<u8>>, LixError> {
-    Ok(decode_head_group_members(bytes)?
-        .into_iter()
-        .map(|member| (member.file_id, member.value.to_vec()))
-        .collect())
 }
 
 fn read_group_u32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize, LixError> {
@@ -2828,6 +3227,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_group_merge_preserves_untouched_members_and_file_projections() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("first-head");
+        let second_head = CommitId::for_test_label("second-head");
+        let entity_pk = EntityPk::single("row");
+        let group = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+        };
+
+        let mut members = BTreeMap::new();
+        members.insert(
+            None,
+            encode_head_value(&head_value("none-first", generation).as_ref())
+                .expect("encode none member"),
+        );
+        members.insert(
+            Some("file-a".to_string()),
+            encode_head_value(&head_value("file-a-first", generation).as_ref())
+                .expect("encode file-a member"),
+        );
+        members.insert(
+            Some("file-b".to_string()),
+            encode_head_value(&head_value("file-b-first", generation).as_ref())
+                .expect("encode file-b member"),
+        );
+        let mut writes = StorageWriteSet::new();
+        stage_put_group_members(&mut writes, &group, &members).expect("stage initial group");
+        for (file_id, value) in &members {
+            if file_id.is_some() {
+                stage_put_member_bytes(&mut writes, &group, file_id.as_deref(), value)
+                    .expect("stage initial explicit member");
+            }
+        }
+        stage_marker(
+            &mut writes,
+            branch_id,
+            &TrackedHeadMarker {
+                head_commit_id: generation,
+                generation,
+            },
+        )
+        .expect("stage initial marker");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit initial group");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open incremental read");
+        let mut writes = StorageWriteSet::new();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(generation),
+                second_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: Some("file-a"),
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("file-a-second"),
+                    commit_id: second_head,
+                    deleted: false,
+                    created_at: ts("2026-01-02T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage streamed update");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit streamed update");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open logical verification read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &second_head.to_string(),
+                &TrackedStateScanRequest::default(),
+            )
+            .await
+            .expect("scan streamed group")
+            .expect("matching marker");
+        assert_eq!(rows.len(), 3);
+        let none = rows
+            .iter()
+            .find(|row| row.file_id.is_none())
+            .expect("none member remains");
+        let file_a = rows
+            .iter()
+            .find(|row| row.file_id.as_deref() == Some("file-a"))
+            .expect("changed member remains");
+        let file_b = rows
+            .iter()
+            .find(|row| row.file_id.as_deref() == Some("file-b"))
+            .expect("untouched member remains");
+        assert_eq!(none.change_id, Some(ChangeId::for_test_label("none-first")));
+        assert_eq!(
+            file_a.change_id,
+            Some(ChangeId::for_test_label("file-a-second"))
+        );
+        assert_eq!(
+            file_b.change_id,
+            Some(ChangeId::for_test_label("file-b-first"))
+        );
+        assert_eq!(file_a.created_at, ts("2026-01-01T00:00:00Z"));
+        assert_eq!(file_a.updated_at, ts("2026-01-02T00:00:00Z"));
+
+        let identities = ["file-a", "file-b"].map(|file_id| HeadIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+            file_id: Some(file_id.to_string()),
+        });
+        let keys = identities
+            .iter()
+            .map(|identity| StorageKey(Bytes::from(encode_member_key(identity))))
+            .collect::<Vec<_>>();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open projection verification read");
+        let projections = PointReadPlan::new(TRACKED_HEAD_MEMBER_SPACE, &keys)
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("load explicit member projections")
+            .value;
+        for (identity, projection) in identities.into_iter().zip(projections) {
+            let value = full_value_bytes(projection.expect("projection remains present"))
+                .expect("projection has full bytes");
+            let value = decode_head_value(&value).expect("projection decodes");
+            let expected_change = if identity.file_id.as_deref() == Some("file-a") {
+                ChangeId::for_test_label("file-a-second")
+            } else {
+                ChangeId::for_test_label("file-b-first")
+            };
+            assert_eq!(value.change_id, expected_change);
+        }
+    }
+
+    #[tokio::test]
+    async fn incremental_group_rejects_corrupt_untouched_member_before_staging_publication() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("first-head");
+        let second_head = CommitId::for_test_label("second-head");
+        let entity_pk = EntityPk::single("row");
+        let group = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+        };
+        let mut members = BTreeMap::new();
+        members.insert(
+            None,
+            encode_head_value(&head_value("none", generation).as_ref())
+                .expect("encode none member"),
+        );
+        members.insert(
+            Some("file-a".to_string()),
+            encode_head_value(&head_value("file-a", generation).as_ref())
+                .expect("encode file-a member"),
+        );
+        members.insert(
+            Some("file-b".to_string()),
+            encode_head_value(&head_value("file-b", generation).as_ref())
+                .expect("encode file-b member"),
+        );
+        let mut corrupt = encode_head_group_members(&members).expect("encode corrupt base group");
+        corrupt.push(0);
+        let mut initial_writes = StorageWriteSet::new();
+        initial_writes.put(
+            TRACKED_HEAD_GROUP_SPACE,
+            StorageKey(Bytes::from(encode_group_key(&group))),
+            StorageValue {
+                bytes: Bytes::from(corrupt),
+            },
+        );
+        storage
+            .commit_write_set(initial_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit corrupt group fixture");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open incremental read");
+        let mut writes = StorageWriteSet::new();
+        let error = TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(generation),
+                second_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: Some("file-a"),
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("file-a-second"),
+                    commit_id: second_head,
+                    deleted: false,
+                    created_at: ts("2026-01-02T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect_err("corrupt untouched member must reject the whole group");
+        assert!(error.message.contains("trailing bytes"));
+        assert_eq!(writes.stats().staged_puts, 0);
+        assert_eq!(writes.stats().staged_deletes, 0);
+    }
+
+    #[tokio::test]
     async fn incremental_singleton_insert_rejects_existing_live_row() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
@@ -2891,6 +3525,99 @@ mod tests {
             .await
             .expect_err("singleton INSERT must reject an existing live row");
         assert_eq!(error.code, LixError::CODE_UNIQUE);
+    }
+
+    #[tokio::test]
+    async fn incremental_guarded_insert_resurrects_tombstone_with_first_created_at() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let generation = CommitId::for_test_label("first-head");
+        let second_head = CommitId::for_test_label("second-head");
+        let entity_pk = EntityPk::single("row");
+        let identity = identity(branch_id, generation, "row");
+
+        let mut tombstone = head_value("first-delete", generation);
+        tombstone.deleted = true;
+        tombstone.updated_at = ts("2026-01-02T00:00:00Z");
+        tombstone.snapshot = JsonSlot::None;
+        tombstone.metadata = JsonSlot::None;
+        let mut writes = StorageWriteSet::new();
+        stage_put(&mut writes, &identity, &tombstone).expect("stage existing tombstone");
+        stage_marker(
+            &mut writes,
+            branch_id,
+            &TrackedHeadMarker {
+                head_commit_id: generation,
+                generation,
+            },
+        )
+        .expect("stage existing tombstone marker");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit existing tombstone");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open guarded resurrection read");
+        let mut writes = StorageWriteSet::new();
+        let absence_guards = BTreeSet::from([TrackedStateKey {
+            schema_key: "schema".to_string(),
+            entity_pk: entity_pk.clone(),
+            file_id: None,
+        }]);
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(generation),
+                second_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("second-insert"),
+                    commit_id: second_head,
+                    deleted: false,
+                    created_at: ts("2026-01-03T00:00:00Z"),
+                    updated_at: ts("2026-01-03T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":2}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &absence_guards,
+                None,
+            )
+            .await
+            .expect("guarded INSERT may resurrect a tombstone");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit guarded resurrection");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open resurrection verification read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &second_head.to_string(),
+                &TrackedStateScanRequest::default(),
+            )
+            .await
+            .expect("scan resurrected row")
+            .expect("matching marker");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].created_at, ts("2026-01-01T00:00:00Z"));
+        assert_eq!(rows[0].updated_at, ts("2026-01-03T00:00:00Z"));
+        assert_eq!(
+            rows[0].change_id,
+            Some(ChangeId::for_test_label("second-insert"))
+        );
+        assert_eq!(rows[0].snapshot_content.as_deref(), Some("{\"value\":2}"));
     }
 
     #[tokio::test]
