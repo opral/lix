@@ -327,8 +327,7 @@ where
         // The protocol check must precede the live-state read: tracked-head
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
-        crate::init::RepositoryProtocolStatus::Current
-        | crate::init::RepositoryProtocolStatus::Legacy => {
+        crate::init::RepositoryProtocolStatus::Current => {
             let reader = live_state.reader(read);
             let initialized = reader
                 .load_row(&LiveStateRowRequest {
@@ -573,32 +572,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_v9_protocol_opens_and_uses_generic_entity_reads() {
+    async fn legacy_v9_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
-        {
-            let engine = Engine::new(storage.clone())
-                .await
-                .expect("current repository should open");
-            let session = engine
-                .open_workspace_session()
-                .await
-                .expect("workspace session should open");
-            register_json_pointer_schema(&session).await;
-            assert_eq!(
-                session
-                    .execute(
-                        "INSERT INTO json_pointer (path, value) VALUES ('/legacy', lix_json('{\"version\":9}'))",
-                        &[],
-                    )
-                    .await
-                    .expect("write tracked-only legacy probe row")
-                    .rows_affected(),
-                1
-            );
-        }
         let storage_adapter = StorageAdapter::new(storage.clone());
         let mut writes = storage_adapter.new_write_set();
         writes.put(
@@ -611,42 +589,10 @@ mod tests {
             .await
             .expect("legacy protocol marker should commit");
 
-        let read = storage_adapter
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("legacy protocol read should open");
-        assert_eq!(
-            crate::init::repository_protocol_status(&read)
-                .await
-                .expect("legacy protocol should decode"),
-            crate::init::RepositoryProtocolStatus::Legacy
-        );
-
-        let engine = Engine::new(storage)
-            .await
-            .expect("v9 repository should remain readable through the generic path");
-        let session = engine
-            .open_workspace_session()
-            .await
-            .expect("workspace session should open");
-        let rows = session
-            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
-            .await
-            .expect("generic entity read should execute");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows.rows()[0]
-                .get::<String>("path")
-                .expect("legacy tracked row path"),
-            "/legacy"
-        );
-        assert_eq!(
-            rows.rows()[0]
-                .get::<serde_json::Value>("value")
-                .expect("legacy tracked row value"),
-            json!({"version": 9}),
-            "v9 must preserve a tracked-only entity through the generic path"
-        );
+        let Err(error) = Engine::new(storage).await else {
+            panic!("v9 repository must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
 
     #[tokio::test]

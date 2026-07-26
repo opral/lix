@@ -7,6 +7,9 @@
 - Added SQL script planning to the Rust and Workerd SDKs.
 
   Lix now parses single and multi-statement SQL into one atomic statement plan with request-wide parameter ranges.
+- Enforced the current tracked direct-plane storage format.
+
+  Repositories marked with the predecessor v9 layout now fail closed with `LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT`; recreate them or explicitly export and import their data. The public API is unchanged.
 
 ## 0.8.3 - 2026-07-15
 
