@@ -962,36 +962,37 @@ where
         else {
             return Ok(None);
         };
-        let mut keys = BTreeSet::new();
+        // The interval is ordered descendant -> ancestor. Commit deltas carry
+        // absolute row state, so the first value we see for an identity is
+        // exactly its value at the descendant endpoint. Retain it here rather
+        // than replaying the entire interval a second time to rediscover it.
+        let mut latest_after_by_key = BTreeMap::new();
         for commit_id in interval {
-            for (key, _) in self
+            for (key, value) in self
                 .scan_replayed_commit_delta_values(commit_id, &request.schema_keys)
                 .await?
             {
                 if request.matches_key(&key) {
-                    keys.insert(key);
+                    latest_after_by_key.entry(key).or_insert(value);
                 }
             }
         }
-        let keys = keys.into_iter().collect::<Vec<_>>();
+        let keys = latest_after_by_key.keys().cloned().collect::<Vec<_>>();
         if keys.is_empty() {
             return Ok(Some(Vec::new()));
         }
         let before = self
             .replay_index_values_for_keys_at_commit(ancestor_commit_id, &keys)
             .await?;
-        let after = self
-            .replay_index_values_for_keys_at_commit(descendant_commit_id, &keys)
-            .await?;
         Ok(Some(
-            keys.into_iter()
+            latest_after_by_key
+                .into_iter()
                 .zip(before)
-                .zip(after)
-                .filter_map(|((key, before), after)| {
-                    (before != after).then_some(
+                .filter_map(|((key, after), before)| {
+                    (before.as_ref() != Some(&after)).then_some(
                         crate::tracked_state::types::TrackedStateTreeDiffEntry {
                             before: before.map(|value| (key.clone(), value)),
-                            after: after.map(|value| (key, value)),
+                            after: Some((key, after)),
                         },
                     )
                 })
@@ -1350,9 +1351,10 @@ where
     /// Scans one commit's packed deltas and promotes the decoded values into
     /// the existing identity cache. A diff first discovers its changed keys by
     /// scanning the first-parent interval, then resolves those same keys at
-    /// both endpoints. Keeping the scan's decoded values avoids reopening the
-    /// same packed segment for the endpoint replay while preserving the
-    /// cache's identity-routed semantics.
+    /// the ancestor endpoint. The newest scanned delta is already the
+    /// descendant value, so retaining decoded entries avoids a second full
+    /// descendant replay while preserving the cache's identity-routed
+    /// semantics.
     async fn scan_replayed_commit_delta_values(
         &mut self,
         commit_id: CommitId,

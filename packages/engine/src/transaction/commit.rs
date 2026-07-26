@@ -2574,6 +2574,104 @@ mod tests {
             .await
             .expect("second rootless commit should persist");
 
+        let mut third = tracked_global_row("rootless-third-change");
+        third.commit_id = Some(commit_id("rootless-third-commit"));
+        third.created_at = ts("2026-01-03T00:00:00Z");
+        third.updated_at = third.created_at;
+        third.snapshot = Some(
+            crate::transaction::types::stage_json_from_value(
+                crate::transaction::types::TransactionJson::from_value_for_test(
+                    serde_json::json!({ "value": 3 }),
+                ),
+                "third rootless tracked row snapshot",
+            )
+            .expect("third snapshot should stage"),
+        );
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("third commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![third],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs_with(
+                        ["rootless-third-change"],
+                        "rootless-third-commit",
+                        "rootless-third-commit-change",
+                        "rootless-third-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("third rootless commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial ordinary commit must remain rootless"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("third rootless commit should persist");
+
+        let mut deleted = tracked_global_row("rootless-delete-change");
+        deleted.commit_id = Some(commit_id("rootless-delete-commit"));
+        deleted.created_at = ts("2026-01-04T00:00:00Z");
+        deleted.updated_at = deleted.created_at;
+        deleted.snapshot = None;
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("delete commit read should open");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![deleted],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    GLOBAL_BRANCH_ID.to_string(),
+                    change_refs_with(
+                        ["rootless-delete-change"],
+                        "rootless-delete-commit",
+                        "rootless-delete-commit-change",
+                        "rootless-delete-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("rootless delete commit should stage");
+        assert!(
+            !writes.has_mutations_in_space(TRACKED_STATE_TREE_CHUNK_SPACE)
+                && !writes.has_mutations_in_space(TRACKED_STATE_COMMIT_ROOT_SPACE),
+            "serial delete commit must remain rootless"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("rootless delete commit should persist");
+
         let mut reader = TrackedStateContext::new().reader(
             storage
                 .begin_read(StorageReadOptions::default())
@@ -2600,10 +2698,20 @@ mod tests {
                 && row.created_at == "2026-01-01T00:00:00.000Z"
                 && row.snapshot_content.as_deref() == Some("{\"value\":2}")
         ));
+        let third_rows = reader
+            .scan_rows_at_commit(&commit_id_text("rootless-third-commit"), &request)
+            .await
+            .expect("third rootless commit should replay");
+        assert!(matches!(
+            third_rows.as_slice(),
+            [row] if row.change_id == change_id("rootless-third-change")
+                && row.created_at == "2026-01-01T00:00:00.000Z"
+                && row.snapshot_content.as_deref() == Some("{\"value\":3}")
+        ));
         let diff = reader
             .diff_commits(
                 &commit_id_text("rootless-first-commit"),
-                &commit_id_text("rootless-second-commit"),
+                &commit_id_text("rootless-third-commit"),
                 &crate::tracked_state::TrackedStateDiffRequest::default(),
             )
             .await
@@ -2611,6 +2719,66 @@ mod tests {
         assert!(matches!(
             diff.entries.as_slice(),
             [entry] if entry.kind == crate::tracked_state::TrackedStateDiffKind::Modified
+                && entry.after.as_ref().map(|row| row.change_id)
+                    == Some(change_id("rootless-third-change"))
+        ));
+        let reverse_diff = reader
+            .diff_commits(
+                &commit_id_text("rootless-third-commit"),
+                &commit_id_text("rootless-first-commit"),
+                &crate::tracked_state::TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("reverse rootless commits should diff from replayed state");
+        assert!(matches!(
+            reverse_diff.entries.as_slice(),
+            [entry] if entry.kind == crate::tracked_state::TrackedStateDiffKind::Modified
+                && entry.before.as_ref().map(|row| row.change_id)
+                    == Some(change_id("rootless-third-change"))
+                && entry.after.as_ref().map(|row| row.change_id)
+                    == Some(change_id("rootless-first-change"))
+        ));
+        let deleted_rows = reader
+            .scan_rows_at_commit(&commit_id_text("rootless-delete-commit"), &request)
+            .await
+            .expect("delete rootless commit should replay");
+        assert!(deleted_rows.is_empty());
+        let delete_diff = reader
+            .diff_commits(
+                &commit_id_text("rootless-first-commit"),
+                &commit_id_text("rootless-delete-commit"),
+                &crate::tracked_state::TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("rootless delete commits should diff from replayed state");
+        assert!(
+            matches!(
+                delete_diff.entries.as_slice(),
+                [entry] if entry.kind == crate::tracked_state::TrackedStateDiffKind::Removed
+                    && entry.before.as_ref().map(|row| row.change_id)
+                        == Some(change_id("rootless-first-change"))
+                    && entry.after.as_ref().is_some_and(|row|
+                        row.deleted && row.change_id == change_id("rootless-delete-change")
+                    )
+            ),
+            "unexpected rootless delete diff: {delete_diff:#?}"
+        );
+        let reverse_delete_diff = reader
+            .diff_commits(
+                &commit_id_text("rootless-delete-commit"),
+                &commit_id_text("rootless-first-commit"),
+                &crate::tracked_state::TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("reverse rootless delete commits should diff from replayed state");
+        assert!(matches!(
+            reverse_delete_diff.entries.as_slice(),
+            [entry] if entry.kind == crate::tracked_state::TrackedStateDiffKind::Added
+                && entry.before.as_ref().is_some_and(|row|
+                    row.deleted && row.change_id == change_id("rootless-delete-change")
+                )
+                && entry.after.as_ref().map(|row| row.change_id)
+                    == Some(change_id("rootless-first-change"))
         ));
     }
 
