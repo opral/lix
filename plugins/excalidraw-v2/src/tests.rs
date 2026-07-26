@@ -126,7 +126,7 @@ fn manifest_and_schemas_expose_the_three_semantic_units() {
     let manifest: Value = serde_json::from_str(MANIFEST_JSON).unwrap();
     assert_eq!(manifest["key"], "plugin_excalidraw_v2");
     assert_eq!(manifest["runtime"], "wasm-component-v2");
-    assert_eq!(manifest["api_version"], "2.0.0");
+    assert_eq!(manifest["api_version"], "2.1.0");
     assert_eq!(manifest["match"]["path_glob"], "*.excalidraw");
     assert_eq!(manifest["schemas"].as_array().unwrap().len(), 3);
 

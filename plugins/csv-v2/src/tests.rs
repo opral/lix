@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::{RowConflictResolution, resolve_row_conflict};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
@@ -943,6 +944,48 @@ fn cold_open_rejects_duplicate_noncompact_row_ids() {
     };
     let error = Document::open_entities(vec![table, snapshot("one"), snapshot("two")]).unwrap_err();
     assert!(error.contains("identities must be unique"), "{error}");
+}
+
+#[test]
+fn conflict_resolver_composes_distinct_cell_edits() {
+    let base = br#"{"id":"row","order_key":"01","cells":["before","middle","after"]}"#;
+    let a = br#"{"id":"row","order_key":"01","cells":["A","middle","after"]}"#;
+    let b = br#"{"id":"row","order_key":"01","cells":["before","middle","B"]}"#;
+
+    let RowConflictResolution::Replace(snapshot) =
+        resolve_row_conflict(Some(base), Some(a), Some(b))
+    else {
+        panic!("independent cell changes must compose");
+    };
+    let snapshot = parse_row_snapshot(&snapshot).unwrap();
+    assert_eq!(snapshot.cells, ["A", "middle", "B"]);
+}
+
+#[test]
+fn conflict_resolver_uses_canonical_b_for_same_cell_and_structure() {
+    let base = br#"{"id":"row","order_key":"01","cells":["before","middle"]}"#;
+    let a = br#"{"id":"row","order_key":"01","cells":["a","middle"]}"#;
+    let b = br#"{"id":"row","order_key":"01","cells":["b","middle"]}"#;
+    assert_eq!(
+        resolve_row_conflict(Some(base), Some(a), Some(b)),
+        RowConflictResolution::TakeB
+    );
+
+    let reordered = br#"{"id":"row","order_key":"03","cells":["before","B"]}"#;
+    assert_eq!(
+        resolve_row_conflict(Some(base), Some(a), Some(reordered)),
+        RowConflictResolution::TakeB
+    );
+}
+
+#[test]
+fn conflict_resolver_keeps_deletion_deterministic() {
+    let base = br#"{"id":"row","order_key":"01","cells":["before"]}"#;
+    let a = br#"{"id":"row","order_key":"01","cells":["a"]}"#;
+    assert_eq!(
+        resolve_row_conflict(Some(base), Some(a), None),
+        RowConflictResolution::Delete
+    );
 }
 
 #[test]

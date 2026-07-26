@@ -1,4 +1,4 @@
-package lix:plugin@2.0.0;
+package lix:plugin@2.1.0;
 
 interface host {
   type bytes = list<u8>;
@@ -80,12 +80,12 @@ interface host {
     attachments: option<own<byte-sources>>,
   }
 
-  /// Versioned packed entity or change packets. Upserts contain the complete
-  /// schema entity (including semantic order); deletion is a distinct variant.
-  /// This is a transient ABI arena, not the durable storage layout. `some(page)`
-  /// must contain at least one record and advance; after `none`, all later calls
-  /// return `none`. `max-bytes` must be positive and no larger than the budget's
-  /// page cap. An indivisible oversized record returns `record-too-large`.
+  /// Versioned packed entity, entity-change, or conflict packets. The call
+  /// site fixes the record kind. This is a transient ABI arena, not the
+  /// durable storage layout. `some(page)` must contain at least one record and
+  /// advance; after `none`, all later calls return `none`. `max-bytes` must be
+  /// positive and no larger than the budget's page cap. An indivisible
+  /// oversized record returns `record-too-large`.
   resource packet-source {
     next: func(
       budget: borrow<transition-budget>,
@@ -199,6 +199,18 @@ interface api {
     attachments: option<own<byte-outputs>>,
   }
 
+  /// Guest-output resolution packets. Every record corresponds, in order, to
+  /// exactly one input conflict. A `take` record selects one immutable input
+  /// version without copying its snapshot through guest linear memory; a
+  /// `replace` record contains one newly merged complete snapshot; `delete`
+  /// resolves the entity to a tombstone.
+  record resolution-page {
+    format-version: u16,
+    record-count: u32,
+    payload: bytes,
+    attachments: option<own<byte-outputs>>,
+  }
+
   resource change-cursor {
     /// Packets contain entity changes. Every entity key occurs at most once;
     /// each upsert is a complete schema entity and delete is a distinct tag.
@@ -209,6 +221,17 @@ interface api {
       budget: borrow<transition-budget>,
       max-bytes: u32,
     ) -> result<option<change-page>, plugin-error>;
+  }
+
+  resource resolution-cursor {
+    /// Records are ordered one-for-one with the conflict source consumed by
+    /// `resolve-conflicts`. The host rejects a skipped, duplicated, reordered,
+    /// or excess result. Packet framing, bounded output attachments, progress,
+    /// and permanent EOF follow `change-cursor`.
+    next: func(
+      budget: borrow<transition-budget>,
+      max-bytes: u32,
+    ) -> result<option<resolution-page>, plugin-error>;
   }
 
   record edit-page {
@@ -270,6 +293,20 @@ interface api {
     changes: own<packet-source>,
   }
 
+  record conflict-update {
+    /// The descriptor is taken from a common file incarnation whose complete
+    /// path and descriptor agree at all three merge roots. Plugin selection is
+    /// pinned by the engine before merge analysis; the plugin must never infer
+    /// authority from a mutable target/source branch label.
+    descriptor: file-descriptor,
+    /// One packet record contains a shared entity key plus `base` and its two
+    /// concurrent variants, `a` and `b`. Snapshot values are lazy attachment
+    /// references, so a deterministic fallback can select `b` without
+    /// reading a large JSON value into guest memory. `a`/`b` are canonically
+    /// ordered by durable `(updated_at, change_id)`, not by merge direction.
+    conflicts: own<packet-source>,
+  }
+
   record file-transition {
     document: own<document>,
     changes: own<change-cursor>,
@@ -316,6 +353,13 @@ interface api {
   /// `open-entities-input`.
   open-entities: func(budget: borrow<transition-budget>, input: open-entities-input)
     -> result<entity-transition, plugin-error>;
+  /// Resolves only colliding semantic entities before the existing
+  /// `entities-changed` renderer materializes the file once. The guest must
+  /// return one deterministic resolution for every conflict it consumes.
+  /// There is deliberately no document resource here: resolving one paragraph
+  /// or CSV row must not cold-hydrate an unrelated multi-megabyte file.
+  resolve-conflicts: func(budget: borrow<transition-budget>, input: conflict-update)
+    -> result<own<resolution-cursor>, plugin-error>;
 }
 
 world plugin {

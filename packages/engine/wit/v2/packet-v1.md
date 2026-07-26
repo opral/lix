@@ -1,10 +1,11 @@
 # Lix plugin packet encoding v1
 
-This file is the normative encoding for `packet-page.format-version = 1` and
-`change-page.format-version = 1` in `lix-plugin-v2.wit`. The binary packet is
-an SDK/runtime detail rather than the intended format-authoring surface. There
-is no reusable production v2 SDK yet: each reference plugin keeps its checked
-codec and typed adapter beside its format core. The CSV
+This file is the normative encoding for `packet-page.format-version = 1`,
+`change-page.format-version = 1`, and `resolution-page.format-version = 1` in
+`lix-plugin-v2.wit`. The binary packet is an SDK/runtime detail rather than the
+intended format-authoring surface. There is no reusable production v2 SDK yet:
+each reference plugin keeps its checked codec and typed adapter beside its
+format core. The CSV
 [`packet.rs`](../../../../plugins/csv-v2/src/packet.rs) and
 [`bindings.rs`](../../../../plugins/csv-v2/src/bindings.rs) are the smallest
 current reference, not a frozen general SDK facade. Format logic should use
@@ -29,10 +30,10 @@ out-of-range attachment, or trailing bytes.
 
 An attachment reference addresses an entry in the page's single optional
 attachment table. For a host `packet-page` it names an index in `byte-sources`;
-for a guest `change-page` it names an index in `byte-outputs`. `offset +
-length` must not overflow and must be within the length reported for the named
-index. Snapshot bytes must be valid UTF-8 Snapshot JSON v1 for the entity's
-schema.
+for a guest `change-page` or `resolution-page` it names an index in
+`byte-outputs`. `offset + length` must not overflow and must be within the
+length reported for the named index. Snapshot bytes must be valid UTF-8
+Snapshot JSON v1 for the entity's schema.
 
 ## Snapshot JSON semantic model v1
 
@@ -145,6 +146,8 @@ The call site fixes the record kind:
 - `open-entities.entities` contains `entity-record` values.
 - `entity-update.changes` and guest `change-cursor` pages contain
   `entity-change-record` values.
+- `conflict-update.conflicts` contains `entity-conflict-record` values.
+- Guest `resolution-cursor` pages contain `conflict-resolution-record` values.
 
 A page with the wrong record kind is invalid input. The runtime never guesses
 the kind from bytes.
@@ -179,6 +182,95 @@ rank authority. The host rejects a key repeated anywhere in the complete
 transition and validates each complete upsert against its schema before
 conflict resolution. Conflict resolution is entity-granular; packet format 1
 does not encode cross-entity atomic groups.
+
+## Static conflict-resolution packets
+
+`resolve-conflicts` is a static, file-scoped operation. It deliberately takes
+no `document` resource: resolving one colliding paragraph or CSV row must not
+cold-hydrate an unrelated multi-megabyte file or rebuild a plugin's complete
+index. The engine invokes it once for a compatible file/plugin generation
+group, supplies a lazy paged conflict source, drains one aligned resolution
+cursor, then feeds the resolved semantic changes through the ordinary
+`entities-changed` render path once.
+
+The engine owns merge authority and canonical side ordering. `base` is the
+common ancestor. `a` and `b` are the two divergent versions ordered by
+their durable `(updated_at, change_id)` tuple, never by target/source branch
+direction or packet arrival order. Reversing the branch merge therefore gives
+the plugin the same triple and the same deterministic decision. `b` is the
+higher-ranked fallback candidate; it is not a claim that a client wall clock
+is authoritative. Transport-level arrival-order LWW requires a future
+host-issued write rank.
+
+### Entity-conflict record
+
+```text
+entity-key key
+u32       ordinal              // host-assigned, zero-based in this batch
+
+u8         base_state           // 0 = absent/tombstone, 1 = present
+blob-ref   base_snapshot         // present only when base_state = 1
+u8         a_state              // 0 = absent/tombstone, 1 = present
+blob-ref   a_snapshot            // present only when a_state = 1
+u8         b_state              // 0 = absent/tombstone, 1 = present
+blob-ref   b_snapshot            // present only when b_state = 1
+```
+
+The three snapshot fields are independent lazy `blob-ref` values. A resolver
+that selects a side does not read its bytes. In particular, a deterministic
+canonical fallback emits `take(b)` without copying a large value
+through guest linear memory. A plugin reads only the snapshots needed for a
+format-specific heuristic.
+
+### Conflict-resolution record
+
+Resolution records are positional, not keyed. A resolution cursor must emit
+exactly one record for every input conflict record, in precisely the consumed
+input order, with no skipped, repeated, inserted, or reordered result. It
+echoes the host-assigned `ordinal`, so the host proves that property rather than
+trusting the guest's ordering claim. The host owns entity keys and rejects a
+cursor whose ordinal sequence or total cardinality differs from its source.
+This prevents a plugin from changing merge scope while still allowing its
+result to be streamed in bounded pages.
+
+```text
+u8         resolution_tag       // 0 = take, 1 = replace, 2 = delete
+u32        ordinal              // echoes the matching input record
+
+// Present only for resolution_tag = 0:
+u8         take_side            // 0 = base, 1 = a, 2 = b
+
+// Present only for resolution_tag = 1:
+u8         effect               // 0 = content, 1 = format-only
+blob-ref   complete_snapshot_content
+```
+
+`take` retains the selected immutable input version and therefore has no
+guest-output snapshot. `replace` supplies one complete newly merged snapshot;
+large replacements use the `resolution-page`'s `byte-outputs` attachment table
+under the ordinary attachment rules. `delete` resolves the entity to a
+tombstone. A plugin must always return a deterministic result in this release.
+For an unsupported, overlapping, malformed, or structural edit, the normal
+fallback is `take(b)` (or `delete` when `b` is absent).
+
+### Granularity and heuristic guidance
+
+Conflict resolution is scoped to the plugin's durable entity granularity, not
+to a universal file AST. A CSV plugin can represent a stable row as one entity
+and safely compose changes to different same-index cells when the base, a,
+and b values retain the same row identity, order, field count, and layout.
+Concurrent edits to the same cell, row reordering, field-shape changes, or
+layout changes should deterministically take `b` rather than inventing a
+row-structure CRDT. A Markdown plugin can similarly attempt a bounded
+three-way text heuristic inside one paragraph/block entity and take `b`
+for overlapping or unsupported syntax. Entity IDs remain stable identifiers;
+row positions, array indices, and byte offsets are not identities.
+
+This API intentionally resolves a merge now. It does not persist both sides as
+first-class conflict rows, and plugins must not encode a private durable
+conflict object inside an ordinary entity snapshot. JJ-style persisted conflict
+values, explicit user resolution, and transport of unresolved alternatives are
+deferred to a later data-model and protocol increment.
 
 ## Limits and attachment tables
 

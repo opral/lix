@@ -27,6 +27,60 @@ fn records(changes: &[EntityChange]) -> Vec<EntityRecord> {
         .collect()
 }
 
+fn plain_paragraph_snapshot(text: &str) -> Vec<u8> {
+    let (_, changes) = Document::open_file(
+        format!("{text}\n").into_bytes(),
+        Some("merge.md"),
+        IdNamespace::from_halves(41, 42),
+    )
+    .expect("plain paragraph should parse");
+    changes
+        .into_iter()
+        .find_map(|change| {
+            let snapshot = change.snapshot?;
+            let wire: Value = serde_json::from_slice(&snapshot).ok()?;
+            (wire["kind"] == "paragraph").then_some(snapshot)
+        })
+        .expect("plain paragraph snapshot")
+}
+
+fn snapshot_with_plain_text(snapshot: &[u8], text: &str) -> Vec<u8> {
+    let mut wire: Value = serde_json::from_slice(snapshot).expect("valid wire snapshot");
+    let mut payload: Value = serde_json::from_str(
+        wire["payload_json"]
+            .as_str()
+            .expect("wire payload JSON string"),
+    )
+    .expect("valid payload JSON");
+    let [inline] = payload["inline"]
+        .as_array_mut()
+        .expect("plain paragraph inline array")
+        .as_mut_slice()
+    else {
+        panic!("plain paragraph should contain exactly one inline");
+    };
+    assert_eq!(inline["type"], "text");
+    inline["value"] = Value::String(text.to_owned());
+    wire["payload_json"] = Value::String(serde_json::to_string(&payload).unwrap());
+    serde_json::to_vec(&wire).expect("updated wire snapshot")
+}
+
+fn plain_text_from_snapshot(snapshot: &[u8]) -> String {
+    let wire: Value = serde_json::from_slice(snapshot).expect("valid wire snapshot");
+    let payload: Value = serde_json::from_str(
+        wire["payload_json"]
+            .as_str()
+            .expect("wire payload JSON string"),
+    )
+    .expect("valid payload JSON");
+    payload["inline"]
+        .as_array()
+        .and_then(|inlines| inlines.first())
+        .and_then(|inline| inline["value"].as_str())
+        .expect("plain text inline value")
+        .to_owned()
+}
+
 fn document_format(changes: &[EntityChange]) -> Value {
     let wire = changes
         .iter()
@@ -79,6 +133,48 @@ fn wire_snapshots_are_number_free_even_when_markdown_model_has_numeric_fields() 
         assert!(value["payload_json"].is_string());
         assert!(value["format_json"].is_string());
     }
+}
+
+#[test]
+fn entity_conflict_keeps_disjoint_plain_paragraph_word_inserts() {
+    let base = plain_paragraph_snapshot("word");
+    let a = snapshot_with_plain_text(&base, "beginword");
+    let b = snapshot_with_plain_text(&base, "wordend");
+
+    let resolved = Document::resolve_entity_conflict(Some(base), Some(a), Some(b))
+        .expect("b live entity should produce a resolution");
+
+    assert_eq!(plain_text_from_snapshot(&resolved), "beginwordend");
+}
+
+#[test]
+fn entity_conflict_orders_same_position_inserts_by_canonical_side() {
+    let base = plain_paragraph_snapshot("word");
+    let a = snapshot_with_plain_text(&base, "aword");
+    let b = snapshot_with_plain_text(&base, "bword");
+
+    let resolved = Document::resolve_entity_conflict(Some(base), Some(a), Some(b))
+        .expect("b live entity should produce a resolution");
+
+    assert_eq!(plain_text_from_snapshot(&resolved), "abword");
+}
+
+#[test]
+fn entity_conflict_uses_exact_b_snapshot_for_overlapping_edits_or_deletes() {
+    let base = plain_paragraph_snapshot("word");
+    let a = snapshot_with_plain_text(&base, "a");
+    let b = snapshot_with_plain_text(&base, "b");
+
+    assert_eq!(
+        Document::resolve_entity_conflict(Some(base.clone()), Some(a), Some(b.clone())),
+        Some(b),
+        "overlapping replacements must remain deterministic b-wins",
+    );
+    assert_eq!(
+        Document::resolve_entity_conflict(Some(base), Some(plain_paragraph_snapshot("a")), None),
+        None,
+        "a b delete must win without trying to parse a stale side",
+    );
 }
 
 #[test]

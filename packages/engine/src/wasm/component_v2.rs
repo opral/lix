@@ -14,13 +14,15 @@ use async_trait::async_trait;
 use crate::{LixError, wasm::WasmLimits};
 
 pub const PACKET_FORMAT_V1: u16 = 1;
-pub const WASM_COMPONENT_V2_API_VERSION: &str = "2.0.0";
+pub const WASM_COMPONENT_V2_API_VERSION: &str = "2.1.0";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
 
 const MIB: u64 = 1024 * 1024;
 const MIB_U32: u32 = 1024 * 1024;
+const COLD_FILE_MAX_DEADLINE_NANOSECONDS: u64 = 60_000_000_000;
+const COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB: u64 = 1_000_000_000;
 
 /// Aggregate limits for one top-level v2 transition, including cursor and
 /// attachment draining after the exported guest call returns.
@@ -56,6 +58,25 @@ impl Default for WasmTransitionLimits {
 }
 
 impl WasmTransitionLimits {
+    /// Returns a bounded budget for a first cold parse of one submitted file.
+    ///
+    /// A fresh `open-file` must legitimately examine all input bytes, unlike a
+    /// warm sparse edit or static conflict resolver. Keep the normal five
+    /// second bound for a zero/small file, add one second per started MiB, and
+    /// cap the result at one minute. This is admission policy, not an excuse
+    /// for a plugin to make the hot path proportional to file size.
+    pub fn for_cold_file_bytes(file_bytes: u64) -> Self {
+        let mut limits = Self::default();
+        let extra = file_bytes
+            .div_ceil(MIB)
+            .saturating_mul(COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB);
+        limits.total_deadline_nanoseconds = limits
+            .total_deadline_nanoseconds
+            .saturating_add(extra)
+            .min(COLD_FILE_MAX_DEADLINE_NANOSECONDS);
+        limits
+    }
+
     pub fn validate(self) -> Result<Self, LixError> {
         if self.max_record_bytes == 0
             || self.max_page_bytes == 0
@@ -118,6 +139,15 @@ pub struct WasmTransitionCounters {
     pub full_document_reparses: u64,
     pub full_renderer_invocations: u64,
     pub filesystem_sync_full_renders: u64,
+    /// Static conflict-resolution guest calls. A merge batches all colliding
+    /// entities for one file/plugin generation into one call, so this should
+    /// remain O(files), not O(conflicts).
+    pub conflict_resolution_calls: u64,
+    /// Conflict triples delivered to a plugin resolver.
+    pub conflict_resolution_records: u64,
+    /// Resolutions that selected an immutable input version without returning
+    /// a replacement snapshot through guest linear memory.
+    pub conflict_resolution_takes: u64,
 }
 
 impl WasmTransitionCounters {
@@ -180,6 +210,15 @@ impl WasmTransitionCounters {
         self.filesystem_sync_full_renders = self
             .filesystem_sync_full_renders
             .saturating_add(other.filesystem_sync_full_renders);
+        self.conflict_resolution_calls = self
+            .conflict_resolution_calls
+            .saturating_add(other.conflict_resolution_calls);
+        self.conflict_resolution_records = self
+            .conflict_resolution_records
+            .saturating_add(other.conflict_resolution_records);
+        self.conflict_resolution_takes = self
+            .conflict_resolution_takes
+            .saturating_add(other.conflict_resolution_takes);
     }
 }
 
@@ -394,6 +433,70 @@ pub trait WasmEntityChangeSource: Send {
     fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmHostEntityChanges>, LixError>;
 }
 
+/// One same-identity three-way semantic conflict. `a` and `b` are
+/// canonically ordered by the durable `(updated_at, change_id)` tuple rather
+/// than by the branch into which a merge happens. A missing value represents a
+/// pre-creation or tombstoned entity.
+#[derive(Debug, Clone)]
+pub struct WasmEntityConflict<B> {
+    /// Host-assigned zero-based position in this resolver invocation. The
+    /// guest must echo it in its resolution record, allowing the host to
+    /// prove that an untrusted cursor neither reordered nor duplicated picks.
+    pub ordinal: u32,
+    pub key: WasmEntityKey,
+    pub base: Option<B>,
+    pub a: Option<B>,
+    pub b: Option<B>,
+}
+
+pub type WasmHostEntityConflict = WasmEntityConflict<WasmHostBytes>;
+pub type WasmGuestEntityConflict = WasmEntityConflict<WasmGuestBytes>;
+
+#[derive(Debug, Clone)]
+pub struct WasmEntityConflictPage {
+    pub conflicts: Vec<WasmHostEntityConflict>,
+}
+
+/// Bounded host conflict triples supplied to the static `resolve-conflicts`
+/// hook. Each complete snapshot stays lazy through `WasmHostBytes::Source`.
+pub trait WasmEntityConflictSource: Send {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityConflictPage>, LixError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmConflictTake {
+    Base,
+    A,
+    B,
+}
+
+/// A conflict result is aligned with its input record; it cannot alter the
+/// schema key or entity primary key. `Take` reuses the selected historical
+/// row, avoiding a large round trip through guest linear memory.
+#[derive(Debug, Clone)]
+pub enum WasmConflictResolution<B> {
+    Take(WasmConflictTake),
+    Replace {
+        snapshot_content: B,
+        effect: WasmChangeEffect,
+    },
+    Delete,
+}
+
+pub type WasmHostConflictResolution = WasmConflictResolution<WasmHostBytes>;
+pub type WasmGuestConflictResolution = WasmConflictResolution<WasmGuestBytes>;
+
+#[derive(Debug, Clone)]
+pub struct WasmConflictResolutionPage {
+    pub format_version: u16,
+    /// Host-assigned input ordinal echoed by the guest for every aligned
+    /// resolution. It has the same length and order as `resolutions`.
+    pub ordinals: Vec<u32>,
+    pub resolutions: Vec<WasmGuestConflictResolution>,
+    /// Exactly one page-local table supplies all `Replace` output ranges.
+    pub outputs: Option<WasmByteOutputsHandle>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmIdNamespace {
     pub high: u64,
@@ -557,6 +660,23 @@ pub struct WasmEntityUpdate {
     pub changes: Box<dyn WasmEntityChangeSource>,
 }
 
+/// Input for one stateless, file-scoped conflict-resolution call. It has no
+/// document handle on purpose: a one-row/one-paragraph merge must not force a
+/// cold open of all semantic entities in the file.
+pub struct WasmConflictUpdate {
+    pub descriptor: WasmFileDescriptor,
+    pub conflicts: Box<dyn WasmEntityConflictSource>,
+}
+
+impl fmt::Debug for WasmConflictUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WasmConflictUpdate")
+            .field("descriptor", &self.descriptor)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for WasmEntityUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -577,6 +697,7 @@ macro_rules! handle_type {
 
 handle_type!(WasmDocumentHandle);
 handle_type!(WasmChangeCursorHandle);
+handle_type!(WasmResolutionCursorHandle);
 handle_type!(WasmEditCursorHandle);
 handle_type!(WasmByteOutputsHandle);
 handle_type!(WasmTransitionHandle);
@@ -686,6 +807,87 @@ impl WasmChangeDrainValidator {
         if self.attachment_refs > self.limits.max_attachment_refs {
             return Err(invalid_param(
                 "v2 attachment reference count exceeds its limit",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn accept_eof(&mut self) {
+        self.reached_eof = true;
+    }
+}
+
+/// Cross-page validator for static conflict-resolution output. Input/output
+/// cardinality and selected-side availability are checked by the merge
+/// drainer, which owns the corresponding conflict stream; this validator owns
+/// cursor framing, attachment, page, and EOF invariants.
+#[derive(Debug, Clone, Copy)]
+pub struct WasmConflictResolutionDrainValidator {
+    limits: WasmTransitionLimits,
+    pages: u32,
+    attachment_refs: u32,
+    reached_eof: bool,
+}
+
+impl WasmConflictResolutionDrainValidator {
+    pub fn new(limits: WasmTransitionLimits) -> Result<Self, LixError> {
+        Ok(Self {
+            limits: limits.validate()?,
+            pages: 0,
+            attachment_refs: 0,
+            reached_eof: false,
+        })
+    }
+
+    pub fn accept_page(&mut self, page: &WasmConflictResolutionPage) -> Result<(), LixError> {
+        if self.reached_eof {
+            return Err(invalid_param("a v2 resolution cursor advanced after EOF"));
+        }
+        if page.format_version != PACKET_FORMAT_V1 {
+            return Err(invalid_param(
+                "unsupported v2 resolution packet format version",
+            ));
+        }
+        if page.resolutions.is_empty() {
+            return Err(invalid_param("a v2 resolution page must not be empty"));
+        }
+        if page.ordinals.len() != page.resolutions.len() {
+            return Err(invalid_param(
+                "a v2 resolution page must carry one ordinal per resolution",
+            ));
+        }
+        self.pages = self
+            .pages
+            .checked_add(1)
+            .ok_or_else(|| invalid_param("v2 resolution page count overflowed"))?;
+        if self.pages > self.limits.max_pages {
+            return Err(invalid_param("v2 resolution page count exceeds its limit"));
+        }
+
+        let mut page_refs = 0u32;
+        for resolution in &page.resolutions {
+            if let WasmConflictResolution::Replace {
+                snapshot_content: WasmGuestBytes::Output(range),
+                ..
+            } = resolution
+            {
+                range
+                    .offset
+                    .checked_add(range.length)
+                    .ok_or_else(|| invalid_param("v2 resolution output range overflowed"))?;
+                page_refs = page_refs
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_param("v2 attachment reference count overflowed"))?;
+            }
+        }
+        validate_attachment_table_presence(page_refs, page.outputs.is_some())?;
+        self.attachment_refs = self
+            .attachment_refs
+            .checked_add(page_refs)
+            .ok_or_else(|| invalid_param("v2 attachment reference count overflowed"))?;
+        if self.attachment_refs > self.limits.max_attachment_refs {
+            return Err(invalid_param(
+                "v2 resolution attachment reference count exceeds its limit",
             ));
         }
         Ok(())
@@ -830,6 +1032,15 @@ pub struct WasmEntityTransition {
     pub edits: WasmEditCursorHandle,
 }
 
+/// Static conflict-resolution output has no successor document. The existing
+/// semantic renderer consumes the validated result afterwards and produces
+/// the one materialized file transition for the merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmConflictTransition {
+    pub transition: WasmTransitionHandle,
+    pub resolutions: WasmResolutionCursorHandle,
+}
+
 /// A compiled v2 Component. Implementations share this factory but create one
 /// isolated Store/instance for every branch/file actor.
 #[async_trait]
@@ -873,12 +1084,35 @@ pub trait WasmComponentV2Actor: Send {
         update: WasmEntityUpdate,
     ) -> Result<WasmEntityTransition, LixError>;
 
+    async fn resolve_conflicts(
+        &mut self,
+        limits: WasmTransitionLimits,
+        update: WasmConflictUpdate,
+    ) -> Result<WasmConflictTransition, LixError> {
+        let _ = (limits, update);
+        Err(invalid_param(
+            "this v2 component actor does not implement conflict resolution",
+        ))
+    }
+
     async fn next_change_page(
         &mut self,
         transition: WasmTransitionHandle,
         cursor: WasmChangeCursorHandle,
         max_bytes: u32,
     ) -> Result<Option<WasmChangePage>, LixError>;
+
+    async fn next_resolution_page(
+        &mut self,
+        transition: WasmTransitionHandle,
+        cursor: WasmResolutionCursorHandle,
+        max_bytes: u32,
+    ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
+        let _ = (transition, cursor, max_bytes);
+        Err(invalid_param(
+            "this v2 component actor does not implement conflict resolution",
+        ))
+    }
 
     async fn next_edit_page(
         &mut self,
@@ -1070,6 +1304,22 @@ mod tests {
     }
 
     #[test]
+    fn cold_file_budget_scales_with_input_and_stays_bounded() {
+        assert_eq!(
+            WasmTransitionLimits::for_cold_file_bytes(0).total_deadline_nanoseconds,
+            WasmTransitionLimits::default().total_deadline_nanoseconds
+        );
+        assert_eq!(
+            WasmTransitionLimits::for_cold_file_bytes(10 * MIB).total_deadline_nanoseconds,
+            15_000_000_000
+        );
+        assert_eq!(
+            WasmTransitionLimits::for_cold_file_bytes(128 * MIB).total_deadline_nanoseconds,
+            COLD_FILE_MAX_DEADLINE_NANOSECONDS
+        );
+    }
+
+    #[test]
     fn change_drain_validation_is_transition_wide() {
         let key = WasmEntityKey {
             schema_key: "csv_row".to_owned(),
@@ -1188,9 +1438,10 @@ mod tests {
     #[test]
     fn production_wit_is_versioned() {
         let wit = include_str!("../../wit/v2/lix-plugin-v2.wit");
-        assert!(wit.starts_with("package lix:plugin@2.0.0;"));
+        assert!(wit.starts_with("package lix:plugin@2.1.0;"));
         assert!(wit.contains("resource document"));
         assert!(wit.contains("file-changed:"));
         assert!(wit.contains("entities-changed:"));
+        assert!(wit.contains("resolve-conflicts:"));
     }
 }

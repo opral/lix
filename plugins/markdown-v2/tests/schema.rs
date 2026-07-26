@@ -44,7 +44,7 @@ fn manifest_publishes_only_the_v2_schema() {
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST_JSON).unwrap();
     assert_eq!(manifest["key"], "plugin_markdown_incremental_v2");
     assert_eq!(manifest["runtime"], "wasm-component-v2");
-    assert_eq!(manifest["api_version"], "2.0.0");
+    assert_eq!(manifest["api_version"], "2.1.0");
     assert_eq!(manifest["match"]["path_glob"], "*.{md,markdown}");
     assert_eq!(manifest["schemas"], serde_json::json!([NODE_SCHEMA_PATH]));
 }

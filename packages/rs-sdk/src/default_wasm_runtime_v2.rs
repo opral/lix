@@ -6,13 +6,16 @@ use std::time::Instant;
 use lix_engine::wasm::v2::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmChangeCursorHandle, WasmChangeDrainValidator, WasmChangeEffect, WasmChangePage,
-    WasmComponentV2Actor, WasmComponentV2Factory, WasmDocumentHandle, WasmEditCursorHandle,
+    WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictResolution,
+    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTake,
+    WasmConflictTransition, WasmConflictUpdate, WasmDocumentHandle, WasmEditCursorHandle,
     WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource,
-    WasmEntityChanges, WasmEntityKey, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
-    WasmEntityUpdate, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate, WasmGuestBytes,
-    WasmHostBytes, WasmIdNamespace, WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput,
-    WasmOutputRange, WasmOutputSplice, WasmSourceSlice, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits,
+    WasmEntityChanges, WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityKey,
+    WasmEntityPage, WasmEntitySource, WasmEntityTransition, WasmEntityUpdate, WasmFileDescriptor,
+    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmHostBytes, WasmIdNamespace,
+    WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
+    WasmResolutionCursorHandle, WasmSourceSlice, WasmTransitionCounters, WasmTransitionHandle,
+    WasmTransitionLimits,
 };
 use wasmtime::component::{Resource, ResourceAny};
 
@@ -128,6 +131,7 @@ pub struct ByteSourcesResource {
 enum PacketSourceValue {
     Entities(Box<dyn WasmEntitySource>),
     Changes(Box<dyn WasmEntityChangeSource>),
+    Conflicts(Box<dyn WasmEntityConflictSource>),
 }
 
 pub struct PacketSourceResource {
@@ -135,6 +139,7 @@ pub struct PacketSourceResource {
     budget: Weak<Mutex<TransitionBudgetState>>,
     eof: bool,
     previous_entity_key: Option<WasmEntityKey>,
+    previous_conflict_key: Option<WasmEntityKey>,
     seen_change_keys: BTreeSet<WasmEntityKey>,
 }
 
@@ -171,6 +176,13 @@ struct ChangeCursorState {
     eof: bool,
 }
 
+struct ResolutionCursorState {
+    resource: ResourceAny,
+    transition: u64,
+    validator: WasmConflictResolutionDrainValidator,
+    eof: bool,
+}
+
 struct EditCursorState {
     resource: ResourceAny,
     transition: u64,
@@ -192,6 +204,7 @@ struct WasmtimeV2Actor {
     next_handle: u64,
     documents: HashMap<u64, ResourceAny>,
     change_cursors: HashMap<u64, ChangeCursorState>,
+    resolution_cursors: HashMap<u64, ResolutionCursorState>,
     edit_cursors: HashMap<u64, EditCursorState>,
     outputs: HashMap<u64, OutputState>,
     transitions: HashMap<u64, ActiveTransition>,
@@ -276,6 +289,56 @@ fn encode_change_packet(
         records.push(record);
     }
     frame_records(records, attachments, max_bytes, limits)
+}
+
+fn encode_conflict_packet(
+    page: WasmEntityConflictPage,
+    max_bytes: u32,
+    limits: WasmTransitionLimits,
+    previous_key: &mut Option<WasmEntityKey>,
+) -> Result<EncodedPacketPage, LixError> {
+    if page.conflicts.is_empty() {
+        return Err(v2_invalid_plugin(
+            "v2 conflict source returned an empty page",
+        ));
+    }
+    let mut records = Vec::with_capacity(page.conflicts.len());
+    let mut attachments = Vec::new();
+    for conflict in page.conflicts {
+        if previous_key
+            .as_ref()
+            .is_some_and(|key| key >= &conflict.key)
+        {
+            return Err(v2_invalid_plugin(
+                "v2 conflict source keys are not globally strictly increasing",
+            ));
+        }
+        let mut record = Vec::new();
+        encode_entity_key(&conflict.key, &mut record)?;
+        push_u32(&mut record, conflict.ordinal);
+        encode_conflict_state(conflict.base, &mut record, &mut attachments)?;
+        encode_conflict_state(conflict.a, &mut record, &mut attachments)?;
+        encode_conflict_state(conflict.b, &mut record, &mut attachments)?;
+        validate_record_len(record.len(), limits)?;
+        *previous_key = Some(conflict.key);
+        records.push(record);
+    }
+    frame_records(records, attachments, max_bytes, limits)
+}
+
+fn encode_conflict_state(
+    value: Option<WasmHostBytes>,
+    output: &mut Vec<u8>,
+    attachments: &mut Vec<WasmSourceSlice>,
+) -> Result<(), LixError> {
+    match value {
+        None => output.push(0),
+        Some(value) => {
+            output.push(1);
+            encode_host_blob(value, output, attachments)?;
+        }
+    }
+    Ok(())
 }
 
 fn frame_records(
@@ -364,6 +427,12 @@ struct DecodedChangePacket {
     output_ranges: Vec<WasmOutputRange>,
 }
 
+struct DecodedResolutionPacket {
+    ordinals: Vec<u32>,
+    resolutions: Vec<WasmConflictResolution<WasmGuestBytes>>,
+    output_ranges: Vec<WasmOutputRange>,
+}
+
 fn decode_change_packet(
     record_count: u32,
     payload: &[u8],
@@ -433,6 +502,84 @@ fn decode_change_packet(
     changes.validate()?;
     Ok(DecodedChangePacket {
         changes,
+        output_ranges,
+    })
+}
+
+fn decode_resolution_packet(
+    record_count: u32,
+    payload: &[u8],
+    max_bytes: u32,
+    limits: WasmTransitionLimits,
+) -> Result<DecodedResolutionPacket, LixError> {
+    if record_count == 0 {
+        return Err(v2_invalid_plugin(
+            "v2 guest returned a zero-record resolution page",
+        ));
+    }
+    if max_bytes == 0 || max_bytes > limits.max_page_bytes {
+        return Err(v2_limit(
+            "v2 resolution cursor max-bytes is outside its transition limit",
+        ));
+    }
+    if payload.len() > max_bytes as usize {
+        return Err(v2_limit(
+            "v2 guest resolution payload exceeds the requested max-bytes",
+        ));
+    }
+    let record_count = usize::try_from(record_count)
+        .map_err(|_| v2_invalid_plugin("v2 guest record count exceeds host bounds"))?;
+    if record_count > payload.len() / size_of::<u32>() {
+        return Err(v2_invalid_plugin(
+            "v2 guest resolution record count exceeds its bounded payload framing",
+        ));
+    }
+    let mut framed = PacketReader::new(payload);
+    let mut ordinals = Vec::new();
+    let mut resolutions = Vec::new();
+    let mut output_ranges = Vec::new();
+    for _ in 0..record_count {
+        let record_len = framed.read_u32()? as usize;
+        if record_len > limits.max_record_bytes as usize {
+            return Err(v2_record_too_large(record_len as u64));
+        }
+        let record_bytes = framed.read_exact(record_len)?;
+        let mut record = PacketReader::new(record_bytes);
+        let tag = record.read_u8()?;
+        let ordinal = record.read_u32()?;
+        let resolution = match tag {
+            0 => {
+                let side = match record.read_u8()? {
+                    0 => WasmConflictTake::Base,
+                    1 => WasmConflictTake::A,
+                    2 => WasmConflictTake::B,
+                    _ => return Err(v2_invalid_plugin("unknown v2 conflict take side")),
+                };
+                WasmConflictResolution::Take(side)
+            }
+            1 => {
+                let effect = match record.read_u8()? {
+                    0 => WasmChangeEffect::Content,
+                    1 => WasmChangeEffect::FormatOnly,
+                    _ => return Err(v2_invalid_plugin("unknown v2 resolution effect tag")),
+                };
+                let snapshot_content = decode_guest_blob(&mut record, &mut output_ranges)?;
+                WasmConflictResolution::Replace {
+                    snapshot_content,
+                    effect,
+                }
+            }
+            2 => WasmConflictResolution::Delete,
+            _ => return Err(v2_invalid_plugin("unknown v2 conflict resolution tag")),
+        };
+        record.finish()?;
+        ordinals.push(ordinal);
+        resolutions.push(resolution);
+    }
+    framed.finish()?;
+    Ok(DecodedResolutionPacket {
+        ordinals,
+        resolutions,
         output_ranges,
     })
 }
@@ -856,6 +1003,7 @@ impl WasmComponentV2Factory for WasmtimeV2Factory {
             next_handle: 1,
             documents: HashMap::new(),
             change_cursors: HashMap::new(),
+            resolution_cursors: HashMap::new(),
             edit_cursors: HashMap::new(),
             outputs: HashMap::new(),
             transitions: HashMap::new(),
@@ -1119,6 +1267,17 @@ impl bindings::lix::plugin::host::HostPacketSource for WasiHostState {
                         None => None,
                     }
                 }
+                PacketSourceValue::Conflicts(conflicts) => {
+                    match conflicts.next_page(max_bytes).map_err(lix_source_error)? {
+                        Some(page) => Some(encode_conflict_packet(
+                            page,
+                            max_bytes,
+                            limits,
+                            &mut source.previous_conflict_key,
+                        )),
+                        None => None,
+                    }
+                }
             };
             match page {
                 Some(page) => page.map_err(lix_source_error)?,
@@ -1353,6 +1512,7 @@ impl WasmtimeV2Actor {
                 budget: Arc::downgrade(budget),
                 eof: false,
                 previous_entity_key: None,
+                previous_conflict_key: None,
                 seen_change_keys: BTreeSet::new(),
             })
             .map_err(|error| wasm_runtime_error("failed to allocate v2 packet source", error))
@@ -1388,6 +1548,7 @@ impl WasmtimeV2Actor {
         self.store.take();
         self.documents.clear();
         self.change_cursors.clear();
+        self.resolution_cursors.clear();
         self.edit_cursors.clear();
         self.outputs.clear();
         self.transitions.clear();
@@ -1463,6 +1624,11 @@ impl WasmtimeV2Actor {
             .change_cursors
             .extract_if(|_, cursor| cursor.transition == transition)
             .map(|(_, cursor)| cursor.resource)
+            .chain(
+                self.resolution_cursors
+                    .extract_if(|_, cursor| cursor.transition == transition)
+                    .map(|(_, cursor)| cursor.resource),
+            )
             .chain(
                 self.edit_cursors
                     .extract_if(|_, cursor| cursor.transition == transition)
@@ -1568,6 +1734,32 @@ impl WasmtimeV2Actor {
             transition: WasmTransitionHandle(transition),
             document: WasmDocumentHandle(document),
             edits: WasmEditCursorHandle(cursor),
+        })
+    }
+
+    fn register_conflict_transition(
+        &mut self,
+        transition: u64,
+        cursor_resource: bindings::exports::lix::plugin::api::ResolutionCursor,
+    ) -> Result<WasmConflictTransition, LixError> {
+        let limits = self
+            .transition_budget(transition)?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits;
+        let cursor = self.allocate_handle()?;
+        self.resolution_cursors.insert(
+            cursor,
+            ResolutionCursorState {
+                resource: cursor_resource,
+                transition,
+                validator: WasmConflictResolutionDrainValidator::new(limits)?,
+                eof: false,
+            },
+        );
+        Ok(WasmConflictTransition {
+            transition: WasmTransitionHandle(transition),
+            resolutions: WasmResolutionCursorHandle(cursor),
         })
     }
 }
@@ -2296,6 +2488,29 @@ mod tests {
     }
 
     #[test]
+    fn resolution_decoder_accepts_explicit_canonical_tombstone() {
+        let limits = WasmTransitionLimits::default();
+        let mut record = Vec::new();
+        record.push(2); // delete
+        push_u32(&mut record, 7); // host-assigned conflict ordinal
+        let mut packet = Vec::new();
+        push_u32(
+            &mut packet,
+            u32::try_from(record.len()).expect("test resolution record length fits u32"),
+        );
+        packet.extend_from_slice(&record);
+
+        let decoded = decode_resolution_packet(1, &packet, limits.max_page_bytes, limits)
+            .expect("an explicit delete is a valid resolution packet");
+        assert_eq!(decoded.ordinals, [7]);
+        assert!(matches!(
+            decoded.resolutions.as_slice(),
+            [WasmConflictResolution::Delete]
+        ));
+        assert!(decoded.output_ranges.is_empty());
+    }
+
+    #[test]
     fn fresh_v2_actor_stores_have_isolated_resource_tables() {
         let engine = create_engine(false, true).expect("test engine should initialize");
         let limits = WasmLimits::default();
@@ -2971,6 +3186,46 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         self.register_entity_transition(transition, base_len, value)
     }
 
+    async fn resolve_conflicts(
+        &mut self,
+        limits: WasmTransitionLimits,
+        update: WasmConflictUpdate,
+    ) -> Result<WasmConflictTransition, LixError> {
+        let (transition, _budget_resource) = self.begin_transition(limits, None)?;
+        let budget = self.transition_budget(transition)?;
+        let conflicts =
+            self.push_packet_source(PacketSourceValue::Conflicts(update.conflicts), &budget)?;
+        let binding_update = bindings::exports::lix::plugin::api::ConflictUpdate {
+            descriptor: descriptor_to_binding(&update.descriptor),
+            conflicts,
+        };
+        let guest = self.guest.clone();
+        let budget_rep = match self.prepare_nested_call(transition) {
+            Ok(budget_rep) => budget_rep,
+            Err(error) => {
+                self.retire_now();
+                return Err(error);
+            }
+        };
+        let result = guest.call_resolve_conflicts(
+            self.store_mut()?,
+            Resource::new_borrow(budget_rep),
+            &binding_update,
+        );
+        let cursor = match result {
+            Ok(Ok(cursor)) => cursor,
+            Ok(Err(error)) => {
+                let error = Self::plugin_error("resolve-conflicts", error);
+                self.retire_now();
+                return Err(error);
+            }
+            Err(error) => {
+                return Err(self.retire_with_error("v2 resolve-conflicts trapped", error));
+            }
+        };
+        self.register_conflict_transition(transition, cursor)
+    }
+
     async fn next_change_page(
         &mut self,
         transition: WasmTransitionHandle,
@@ -3073,6 +3328,121 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         };
         if let Err(error) = self
             .change_cursors
+            .get_mut(&cursor.0)
+            .expect("cursor was checked above")
+            .validator
+            .accept_page(&result)
+        {
+            self.retire_now();
+            return Err(error);
+        }
+        Ok(Some(result))
+    }
+
+    async fn next_resolution_page(
+        &mut self,
+        transition: WasmTransitionHandle,
+        cursor: WasmResolutionCursorHandle,
+        max_bytes: u32,
+    ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
+        let (resource, cursor_transition, eof) = self
+            .resolution_cursors
+            .get(&cursor.0)
+            .map(|cursor| (cursor.resource, cursor.transition, cursor.eof))
+            .ok_or_else(|| v2_invalid_plugin("unknown v2 resolution cursor handle"))?;
+        if cursor_transition != transition.0 {
+            return Err(v2_invalid_plugin(
+                "v2 resolution cursor belongs to a different transition",
+            ));
+        }
+        if eof {
+            return Ok(None);
+        }
+        let budget_rep = self.prepare_nested_call(transition.0)?;
+        let guest = self.guest.clone();
+        let result = guest.resolution_cursor().call_next(
+            self.store_mut()?,
+            resource,
+            Resource::new_borrow(budget_rep),
+            max_bytes,
+        );
+        let page = match result {
+            Ok(Ok(Some(page))) => page,
+            Ok(Ok(None)) => {
+                let cursor = self
+                    .resolution_cursors
+                    .get_mut(&cursor.0)
+                    .expect("cursor was checked above");
+                cursor.eof = true;
+                cursor.validator.accept_eof();
+                return Ok(None);
+            }
+            Ok(Err(error)) => {
+                return Err(self.handle_returned_plugin_error(
+                    transition.0,
+                    "resolution-cursor.next",
+                    error,
+                ));
+            }
+            Err(error) => {
+                return Err(self.retire_with_error("v2 resolution-cursor.next trapped", error));
+            }
+        };
+        if page.format_version != PACKET_FORMAT_V1 {
+            self.retire_now();
+            return Err(v2_invalid_plugin("unsupported v2 guest packet version"));
+        }
+        let limits = self
+            .transition_budget(transition.0)?
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits;
+        let decoded =
+            decode_resolution_packet(page.record_count, &page.payload, max_bytes, limits)?;
+        let reference_count = checked_u32(decoded.output_ranges.len(), "output reference count")?;
+        if (reference_count == 0) == page.attachments.is_some() {
+            self.retire_now();
+            return Err(v2_invalid_plugin(
+                "v2 resolution page output table presence does not match its references",
+            ));
+        }
+        let budget = self.transition_budget(transition.0)?;
+        {
+            let mut state = budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.charge_attachment_refs(reference_count)?;
+            state.charge_page(page.payload.len() as u64)?;
+            state.counters.packet_pages = state.counters.packet_pages.saturating_add(1);
+            state.counters.packet_records = state
+                .counters
+                .packet_records
+                .saturating_add(u64::from(page.record_count));
+        }
+        let outputs = if let Some(resource) = page.attachments {
+            let lengths =
+                self.validate_output_ranges(transition.0, resource, &decoded.output_ranges)?;
+            let handle = self.allocate_handle()?;
+            self.outputs.insert(
+                handle,
+                OutputState {
+                    resource,
+                    transition: transition.0,
+                    lengths,
+                },
+            );
+            Some(WasmByteOutputsHandle(handle))
+        } else {
+            None
+        };
+        let result = WasmConflictResolutionPage {
+            format_version: page.format_version,
+            ordinals: decoded.ordinals,
+            resolutions: decoded.resolutions,
+            outputs,
+        };
+        if let Err(error) = self
+            .resolution_cursors
             .get_mut(&cursor.0)
             .expect("cursor was checked above")
             .validator
@@ -3372,6 +3742,10 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .values()
             .any(|cursor| cursor.transition == transition.0 && !cursor.eof)
             || self
+                .resolution_cursors
+                .values()
+                .any(|cursor| cursor.transition == transition.0 && !cursor.eof)
+            || self
                 .edit_cursors
                 .values()
                 .any(|cursor| cursor.transition == transition.0 && !cursor.eof)
@@ -3391,6 +3765,11 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .extract_if(|_, cursor| cursor.transition == transition.0)
             .map(|(_, cursor)| cursor.resource)
             .collect::<Vec<_>>();
+        let resolution_resources = self
+            .resolution_cursors
+            .extract_if(|_, cursor| cursor.transition == transition.0)
+            .map(|(_, cursor)| cursor.resource)
+            .collect::<Vec<_>>();
         let output_resources = self
             .outputs
             .extract_if(|_, output| output.transition == transition.0)
@@ -3398,6 +3777,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .collect::<Vec<_>>();
         for resource in change_resources
             .into_iter()
+            .chain(resolution_resources)
             .chain(edit_resources)
             .chain(output_resources)
         {

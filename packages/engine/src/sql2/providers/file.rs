@@ -7912,7 +7912,7 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let mut manifest = serde_json::json!({
-            "api_version": "2.0.0",
+            "api_version": "2.1.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
@@ -7927,7 +7927,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -7949,7 +7949,7 @@ mod tests {
         wasm: &[u8],
     ) -> PluginRegistryEntry {
         let manifest_json = serde_json::json!({
-            "api_version": "2.0.0",
+            "api_version": "2.1.0",
             "entry": "plugin.wasm",
             "key": key,
             "match": { "path_glob": path_glob },
@@ -7960,7 +7960,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),
@@ -8019,7 +8019,7 @@ mod tests {
             r#"{{
                 "key": "plugin_sentinel",
                 "runtime": "wasm-component-v2",
-                "api_version": "2.0.0",
+                "api_version": "2.1.0",
                 "match": {{ "path_glob": "{path_glob}" }},
                 "entry": "plugin.wasm",
                 "schemas": ["schema/plugin_note.json"]

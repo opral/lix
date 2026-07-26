@@ -16,12 +16,14 @@ use sha2::{Digest as _, Sha256};
 use crate::common::RequestBlobSpliceProvenance;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentV2Actor, WasmDocumentHandle,
-    WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource,
-    WasmEntityChanges, WasmEntityPage, WasmEntitySource, WasmEntityTransition, WasmFileTransition,
-    WasmGuestBytes, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
-    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits,
+    WasmChangeDrainValidator, WasmChangePage, WasmComponentV2Actor, WasmConflictResolution,
+    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
+    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
+    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
+    WasmEntityConflictSource, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
+    WasmFileTransition, WasmGuestBytes, WasmHostBytes, WasmHostConflictResolution, WasmHostEntity,
+    WasmHostEntityChanges, WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmSourceRange,
+    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use crate::{Blob, LixError};
 
@@ -883,6 +885,102 @@ impl WasmEntityChangeSource for VecEntityChangeSource {
     }
 }
 
+/// Vec-backed lazy source for same-identity three-way conflict triples. The
+/// source is deliberately separate from `VecEntityChangeSource`: a conflict
+/// exposes three immutable versions, while an entity update exposes only the
+/// already resolved final state.
+#[derive(Debug)]
+pub(crate) struct VecEntityConflictSource {
+    conflicts: VecDeque<WasmEntityConflict<WasmHostBytes>>,
+    state: VecSourceState,
+}
+
+impl VecEntityConflictSource {
+    pub(crate) fn new(
+        conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
+        limits: WasmTransitionLimits,
+    ) -> Result<Self, LixError> {
+        validate_conflict_order(&conflicts)?;
+        for (expected_ordinal, conflict) in conflicts.iter().enumerate() {
+            if conflict.ordinal
+                != u32::try_from(expected_ordinal).map_err(|_| {
+                    invalid_input("v2 conflict source has more than u32::MAX records")
+                })?
+            {
+                return Err(invalid_input(
+                    "v2 conflict source ordinals must be zero-based and contiguous",
+                ));
+            }
+            for snapshot in [&conflict.base, &conflict.a, &conflict.b]
+                .into_iter()
+                .flatten()
+            {
+                validate_host_entity(&WasmEntity {
+                    key: conflict.key.clone(),
+                    snapshot_content: snapshot.clone(),
+                })?;
+            }
+        }
+        Ok(Self {
+            conflicts: conflicts.into(),
+            state: VecSourceState::new(limits)?,
+        })
+    }
+}
+
+impl WasmEntityConflictSource for VecEntityConflictSource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityConflictPage>, LixError> {
+        if self.state.reached_eof {
+            return Ok(None);
+        }
+        let page_limit = self.state.page_limit(max_bytes)?;
+        if self.conflicts.is_empty() {
+            self.state.reached_eof = true;
+            return Ok(None);
+        }
+
+        let mut page_bytes = 0u64;
+        let mut page_refs = 0u32;
+        let mut conflicts = Vec::new();
+        while let Some(conflict) = self.conflicts.front() {
+            let record_bytes = encoded_entity_conflict_record_bytes(conflict)?;
+            if record_bytes > u64::from(self.state.limits.max_record_bytes) {
+                return Err(invalid_input("v2 conflict record exceeds max_record_bytes"));
+            }
+            let framed_bytes = record_bytes
+                .checked_add(4)
+                .ok_or_else(|| invalid_input("v2 conflict frame length overflowed"))?;
+            if page_bytes
+                .checked_add(framed_bytes)
+                .is_none_or(|size| size > page_limit)
+            {
+                if conflicts.is_empty() {
+                    return Err(invalid_input(
+                        "v2 conflict record does not fit the requested page",
+                    ));
+                }
+                break;
+            }
+            page_bytes += framed_bytes;
+            for snapshot in [&conflict.base, &conflict.a, &conflict.b]
+                .into_iter()
+                .flatten()
+            {
+                page_refs = page_refs
+                    .checked_add(host_bytes_attachment_refs(snapshot))
+                    .ok_or_else(|| invalid_input("v2 conflict attachment count overflowed"))?;
+            }
+            conflicts.push(
+                self.conflicts
+                    .pop_front()
+                    .expect("front conflict was just inspected"),
+            );
+        }
+        self.state.accept_page(page_bytes, page_refs)?;
+        Ok(Some(WasmEntityConflictPage { conflicts }))
+    }
+}
+
 #[derive(Debug)]
 struct VecSourceState {
     limits: WasmTransitionLimits,
@@ -965,6 +1063,26 @@ fn validate_change_order<B>(changes: &[WasmEntityChange<B>]) -> Result<(), LixEr
     Ok(())
 }
 
+fn validate_conflict_order(
+    conflicts: &[WasmEntityConflict<WasmHostBytes>],
+) -> Result<(), LixError> {
+    for conflict in conflicts {
+        if conflict.key.entity_pk.is_empty() {
+            return Err(invalid_input(
+                "v2 conflict entity primary keys must not be empty",
+            ));
+        }
+    }
+    for pair in conflicts.windows(2) {
+        if pair[0].key >= pair[1].key {
+            return Err(invalid_input(
+                "v2 conflict sources must be strictly key-sorted and unique",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_host_entity(entity: &WasmHostEntity) -> Result<(), LixError> {
     if entity.key.entity_pk.is_empty() {
         return Err(invalid_input("v2 entity primary keys must not be empty"));
@@ -994,6 +1112,27 @@ fn encoded_entity_change_record_bytes(
             .checked_add(1)
             .and_then(|size| size.checked_add(snapshot_bytes))
             .ok_or_else(|| invalid_input("v2 change record size overflowed"))?;
+    }
+    Ok(size)
+}
+
+fn encoded_entity_conflict_record_bytes(
+    conflict: &WasmEntityConflict<WasmHostBytes>,
+) -> Result<u64, LixError> {
+    let mut size = encoded_entity_key_bytes(&conflict.key)?
+        .checked_add(4)
+        .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+    for snapshot in [&conflict.base, &conflict.a, &conflict.b] {
+        // One state tag: 0 for an absent/tombstoned value, 1 followed by the
+        // normal lazy blob reference for a live complete snapshot.
+        size = size
+            .checked_add(1)
+            .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+        if let Some(snapshot) = snapshot {
+            size = size
+                .checked_add(encoded_host_bytes_ref_bytes(snapshot)?)
+                .ok_or_else(|| invalid_input("v2 conflict record size overflowed"))?;
+        }
     }
     Ok(size)
 }
@@ -1052,6 +1191,15 @@ fn change_attachment_refs(change: &WasmEntityChange<WasmHostBytes>) -> u32 {
 pub(crate) struct ValidatedFileTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) changes: WasmHostEntityChanges,
+    pub(crate) counters: WasmTransitionCounters,
+}
+
+/// Fully drained static conflict-resolution output. Results remain aligned to
+/// the caller's conflict list; the merge planner owns the entity keys and
+/// historical rows used by a `Take` result.
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedConflictTransition {
+    pub(crate) resolutions: Vec<WasmHostConflictResolution>,
     pub(crate) counters: WasmTransitionCounters,
 }
 
@@ -1169,6 +1317,127 @@ async fn drain_file_transition_changes_inner(
     Ok(ValidatedFileTransition {
         document: transition.document,
         changes: WasmEntityChanges { changes },
+        counters: merge_counter_snapshots(local_counters, runtime_counters),
+    })
+}
+
+/// Drains one static resolver cursor. The resolver cannot invent keys: output
+/// cardinality is exactly the input conflict count and every result remains in
+/// the source's canonical key order. This lets `Take(B)` reuse a durable
+/// historical row without moving its snapshot through guest memory.
+pub(crate) async fn drain_conflict_transition_resolutions(
+    actor: &mut dyn WasmComponentV2Actor,
+    transition: WasmConflictTransition,
+    expected_count: usize,
+    limits: WasmTransitionLimits,
+) -> Result<ValidatedConflictTransition, LixError> {
+    let transition_handle = transition.transition;
+    match drain_conflict_transition_resolutions_inner(actor, transition, expected_count, limits)
+        .await
+    {
+        Ok(validated) => Ok(validated),
+        Err(error) => Err(cleanup_rejected_transition(actor, transition_handle, error).await),
+    }
+}
+
+async fn drain_conflict_transition_resolutions_inner(
+    actor: &mut dyn WasmComponentV2Actor,
+    transition: WasmConflictTransition,
+    expected_count: usize,
+    limits: WasmTransitionLimits,
+) -> Result<ValidatedConflictTransition, LixError> {
+    let mut validator = WasmConflictResolutionDrainValidator::new(limits)?;
+    let mut budget = OutputDrainBudget::new(limits)?;
+    let mut local_counters = WasmTransitionCounters {
+        conflict_resolution_calls: 1,
+        ..WasmTransitionCounters::default()
+    };
+    let mut resolutions = Vec::with_capacity(expected_count);
+
+    loop {
+        let Some(page) = actor
+            .next_resolution_page(
+                transition.transition,
+                transition.resolutions,
+                limits.max_page_bytes,
+            )
+            .await?
+        else {
+            validator.accept_eof();
+            break;
+        };
+        validator.accept_page(&page).map_err(|error| {
+            invalid_guest(format!(
+                "invalid v2 resolution cursor page: {}",
+                error.message
+            ))
+        })?;
+        // Check every replacement's complete byte range before asking the
+        // guest output table for its length or allocating its output buffer.
+        // `Take` and `Delete` are snapshot-free, but an untrusted `Replace`
+        // may otherwise name an arbitrarily large output range.
+        prevalidate_conflict_resolution_page(&page, &mut budget)?;
+        local_counters.packet_pages = local_counters.packet_pages.saturating_add(1);
+        local_counters.packet_records = local_counters
+            .packet_records
+            .saturating_add(page.resolutions.len() as u64);
+
+        let outputs = page.outputs;
+        for (ordinal, resolution) in page.ordinals.into_iter().zip(page.resolutions) {
+            let expected_ordinal = u32::try_from(resolutions.len()).map_err(|_| {
+                invalid_guest("v2 conflict resolver has more than u32::MAX results")
+            })?;
+            if ordinal != expected_ordinal {
+                return Err(invalid_guest(format!(
+                    "v2 conflict resolver returned ordinal {ordinal}, expected {expected_ordinal}",
+                )));
+            }
+            let resolved = match resolution {
+                WasmConflictResolution::Take(side) => {
+                    local_counters.conflict_resolution_takes =
+                        local_counters.conflict_resolution_takes.saturating_add(1);
+                    WasmConflictResolution::Take(side)
+                }
+                WasmConflictResolution::Delete => WasmConflictResolution::Delete,
+                WasmConflictResolution::Replace {
+                    snapshot_content,
+                    effect,
+                } => {
+                    let snapshot = resolve_guest_bytes(
+                        actor,
+                        transition.transition,
+                        outputs,
+                        snapshot_content,
+                        &mut budget,
+                        &mut local_counters,
+                    )
+                    .await?;
+                    let snapshot = canonicalize_v2_snapshot(&snapshot)?;
+                    WasmConflictResolution::Replace {
+                        snapshot_content: WasmHostBytes::Inline(snapshot),
+                        effect,
+                    }
+                }
+            };
+            resolutions.push(resolved);
+            if resolutions.len() > expected_count {
+                return Err(invalid_guest(
+                    "v2 conflict resolver returned more results than input conflicts",
+                ));
+            }
+        }
+    }
+    if resolutions.len() != expected_count {
+        return Err(invalid_guest(format!(
+            "v2 conflict resolver returned {} results for {expected_count} input conflicts",
+            resolutions.len()
+        )));
+    }
+    local_counters.conflict_resolution_records =
+        u64::try_from(resolutions.len()).unwrap_or(u64::MAX);
+    let runtime_counters = actor.finish_transition(transition.transition).await?;
+    Ok(ValidatedConflictTransition {
+        resolutions,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
 }
@@ -1466,6 +1735,58 @@ fn prevalidate_change_page(
             }
         }
     }
+    budget.preflight_cursor_page(
+        inline_bytes,
+        output_bytes,
+        0,
+        references,
+        minimum_attachment_reads,
+    )
+}
+
+/// Preflights every complete snapshot returned by a static conflict resolver.
+/// This must run before `resolve_guest_bytes`: an output-backed replacement's
+/// declared length is guest-controlled, and `read_output_range` intentionally
+/// reserves its final buffer capacity before draining bounded chunks.
+fn prevalidate_conflict_resolution_page(
+    page: &WasmConflictResolutionPage,
+    budget: &mut OutputDrainBudget,
+) -> Result<(), LixError> {
+    let mut inline_bytes = 0u64;
+    let mut output_bytes = 0u64;
+    let mut minimum_attachment_reads = 0u64;
+    let mut references = 0u32;
+    for resolution in &page.resolutions {
+        let WasmConflictResolution::Replace {
+            snapshot_content, ..
+        } = resolution
+        else {
+            continue;
+        };
+        match snapshot_content {
+            WasmGuestBytes::Inline(bytes) => {
+                inline_bytes = inline_bytes
+                    .checked_add(bytes.len() as u64)
+                    .ok_or_else(|| {
+                        invalid_guest("v2 conflict replacement inline bytes overflowed")
+                    })?;
+            }
+            WasmGuestBytes::Output(range) => {
+                output_bytes = output_bytes.checked_add(range.length).ok_or_else(|| {
+                    invalid_guest("v2 conflict replacement output bytes overflowed")
+                })?;
+                minimum_attachment_reads = minimum_attachment_reads
+                    .checked_add(budget.minimum_attachment_reads(range.length))
+                    .ok_or_else(|| invalid_guest("v2 attachment page count overflowed"))?;
+                references = references
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_guest("v2 output references overflowed"))?;
+            }
+        }
+    }
+    // Resolution pages are packet-v1 frames, so the runtime has already
+    // charged their wire metadata. Only the replacement values are charged
+    // here, as for a change page.
     budget.preflight_cursor_page(
         inline_bytes,
         output_bytes,
@@ -1794,6 +2115,15 @@ fn merge_counter_snapshots(
         filesystem_sync_full_renders: local
             .filesystem_sync_full_renders
             .max(runtime.filesystem_sync_full_renders),
+        conflict_resolution_calls: local
+            .conflict_resolution_calls
+            .max(runtime.conflict_resolution_calls),
+        conflict_resolution_records: local
+            .conflict_resolution_records
+            .max(runtime.conflict_resolution_records),
+        conflict_resolution_takes: local
+            .conflict_resolution_takes
+            .max(runtime.conflict_resolution_takes),
     }
 }
 
@@ -2133,6 +2463,7 @@ mod tests {
 
     struct FakeActor {
         change_pages: VecDeque<WasmChangePage>,
+        resolution_pages: VecDeque<WasmConflictResolutionPage>,
         edit_pages: VecDeque<WasmEditPage>,
         outputs: BTreeMap<(WasmByteOutputsHandle, u32), Vec<u8>>,
         max_read_prefix: usize,
@@ -2148,6 +2479,7 @@ mod tests {
         fn default() -> Self {
             Self {
                 change_pages: VecDeque::new(),
+                resolution_pages: VecDeque::new(),
                 edit_pages: VecDeque::new(),
                 outputs: BTreeMap::new(),
                 max_read_prefix: usize::MAX,
@@ -2215,6 +2547,15 @@ mod tests {
             _max_bytes: u32,
         ) -> Result<Option<WasmChangePage>, LixError> {
             Ok(self.change_pages.pop_front())
+        }
+
+        async fn next_resolution_page(
+            &mut self,
+            _transition: WasmTransitionHandle,
+            _cursor: crate::wasm::WasmResolutionCursorHandle,
+            _max_bytes: u32,
+        ) -> Result<Option<WasmConflictResolutionPage>, LixError> {
+            Ok(self.resolution_pages.pop_front())
         }
 
         async fn next_edit_page(
@@ -2291,6 +2632,114 @@ mod tests {
             self.retired = true;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn conflict_drain_requires_contiguous_host_ordinals() {
+        let transition = WasmConflictTransition {
+            transition: WasmTransitionHandle(41),
+            resolutions: crate::wasm::WasmResolutionCursorHandle(42),
+        };
+        let page = WasmConflictResolutionPage {
+            format_version: PACKET_FORMAT_V1,
+            ordinals: vec![1],
+            resolutions: vec![WasmConflictResolution::Take(
+                crate::wasm::WasmConflictTake::B,
+            )],
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            resolution_pages: [page].into(),
+            ..FakeActor::default()
+        };
+
+        let error = drain_conflict_transition_resolutions(
+            &mut actor,
+            transition,
+            1,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect_err("a reordered resolution must be rejected");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert_eq!(actor.discarded_transitions, vec![transition.transition]);
+        assert!(!actor.finished);
+    }
+
+    #[tokio::test]
+    async fn conflict_drain_preserves_take_without_snapshot_output() {
+        let transition = WasmConflictTransition {
+            transition: WasmTransitionHandle(51),
+            resolutions: crate::wasm::WasmResolutionCursorHandle(52),
+        };
+        let page = WasmConflictResolutionPage {
+            format_version: PACKET_FORMAT_V1,
+            ordinals: vec![0, 1],
+            resolutions: vec![
+                WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B),
+                WasmConflictResolution::Delete,
+            ],
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            resolution_pages: [page].into(),
+            ..FakeActor::default()
+        };
+
+        let drained = drain_conflict_transition_resolutions(
+            &mut actor,
+            transition,
+            2,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect("aligned resolution cursor should drain");
+        assert_eq!(drained.resolutions.len(), 2);
+        assert_eq!(drained.counters.conflict_resolution_calls, 1);
+        assert_eq!(drained.counters.conflict_resolution_records, 2);
+        assert_eq!(drained.counters.conflict_resolution_takes, 1);
+        assert!(actor.finished);
+    }
+
+    #[tokio::test]
+    async fn conflict_drain_rejects_oversized_replacement_before_output_read() {
+        let transition = WasmConflictTransition {
+            transition: WasmTransitionHandle(61),
+            resolutions: crate::wasm::WasmResolutionCursorHandle(62),
+        };
+        let limits = WasmTransitionLimits::default();
+        let page = WasmConflictResolutionPage {
+            format_version: PACKET_FORMAT_V1,
+            ordinals: vec![0],
+            resolutions: vec![WasmConflictResolution::Replace {
+                snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
+                    index: 0,
+                    offset: 0,
+                    length: limits
+                        .max_total_bytes
+                        .checked_add(1)
+                        .expect("default total-byte budget has headroom"),
+                }),
+                effect: WasmChangeEffect::Content,
+            }],
+            outputs: Some(WasmByteOutputsHandle(63)),
+        };
+        let mut actor = FakeActor {
+            resolution_pages: [page].into(),
+            ..FakeActor::default()
+        };
+
+        let error = drain_conflict_transition_resolutions(&mut actor, transition, 1, limits)
+            .await
+            .expect_err("oversized replacement must fail before output allocation or reads");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("max_total_bytes"), "{error:?}");
+        assert_eq!(
+            actor.output_len_calls, 0,
+            "the preflight must reject before querying the guest output table"
+        );
+        assert_eq!(actor.discarded_transitions, vec![transition.transition]);
+        assert!(!actor.finished);
     }
 
     #[tokio::test]

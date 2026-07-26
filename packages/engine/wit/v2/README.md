@@ -15,7 +15,7 @@ authoring SDK.
 | Concern | Canonical source |
 |---|---|
 | Component types, resources, limits, and lifecycle | [`lix-plugin-v2.wit`](lix-plugin-v2.wit) |
-| Packet framing, ordering, snapshot semantics, and validation | [`packet-v1.md`](packet-v1.md) |
+| Packet framing, ordering, snapshot semantics, conflict-resolution alignment, and validation | [`packet-v1.md`](packet-v1.md) |
 | Generated Rust binding invocation and typed WIT adapters | [`CSV`](../../../../plugins/csv-v2/src/bindings.rs), [`JSON`](../../../../plugins/json-v2/src/bindings.rs), [`Markdown`](../../../../plugins/markdown-v2/src/bindings.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/bindings.rs) |
 | Checked packet codecs | [`CSV`](../../../../plugins/csv-v2/src/packet.rs), [`JSON`](../../../../plugins/json-v2/src/packet.rs), [`Markdown`](../../../../plugins/markdown-v2/src/packet.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/packet.rs) |
 | Manifest fields and archive paths | [`plugins/csv-v2/manifest.json`](../../../../plugins/csv-v2/manifest.json) |
@@ -46,7 +46,7 @@ authoring SDK.
    production reference for that adapter. There is no standalone production v2
    author SDK to depend on yet.
 3. Add a `manifest.json` with `runtime: "wasm-component-v2"`, the exact
-   `api_version: "2.0.0"`, a unique `key`, a `match.path_glob`, optional
+   `api_version: "2.1.0"`, a unique `key`, a `match.path_glob`, optional
    `match.content_type` (`"text"` or `"binary"`), `entry: "plugin.wasm"`,
    and every schema path in `schemas`. Schema keys are part of the durable
    plugin contract; an existing schema definition cannot be replaced in place
@@ -77,6 +77,10 @@ reference; there is no generic v2 packaging CLI yet.
   successor document plus sparse, complete semantic changes.
 - `document.entities-changed`: consume final merge-resolved changes and return
   a successor document plus sparse byte edits in accepted-base coordinates.
+- `resolve-conflicts`: consume a lazy, statically scoped batch of colliding
+  semantic entities and return one deterministic aligned resolution per input.
+  It has no `document` resource; the host renders the resulting changes later
+  through `entities-changed`.
 - Every cursor must produce bounded, non-empty pages and permanent EOF. A
   transition is not accepted until the host drains and validates its output;
   traps, rejected output, and discarded transitions must leave the old
@@ -93,6 +97,29 @@ format-specific semantic operation is unsupported. The host reports it as
 `LIX_INVALID_PARAM`, discards only that prospective transition, and keeps the
 accepted document and Store reusable. A malformed packet, trap, or
 `plugin-error.internal` remains an invalid-plugin failure.
+
+## Conflict-resolution rule
+
+The engine supplies each colliding entity as a lazy `base` / `a` / `b`
+triple only for one common live file incarnation with an identical descriptor
+and full path at all three merge roots. A rename, extension change, or
+ancestor-directory move is an ordinary merge conflict in this version. `a`
+and `b` are already canonically ordered by durable
+`(updated_at, change_id)`, so a resolver must not use branch direction or page
+arrival order as authority. Its cursor returns exactly one result per supplied
+conflict and echoes the host-assigned ordinal: `take(base|a|b)`, a
+complete replacement snapshot, or `delete`. `take(b)` is the required deterministic fallback
+when a format cannot safely compose the change, and does not require reading a
+large attachment into guest memory.
+
+Use a bounded, format-local heuristic only where it is clear. For example, a
+CSV row entity may combine independent changes to distinct stable cell slots;
+same-cell edits and row-layout/shape changes should take canonical `b`.
+A Markdown paragraph entity may combine non-overlapping textual edits and take
+`b` for overlap or syntax it cannot safely preserve. The resolver never
+hydrates a document solely to make this decision, and it does not represent
+unresolved alternatives durably. Persisted JJ-style conflict rows and
+interactive resolution are deferred to a later data-model API.
 
 ## Stable IDs
 
@@ -116,7 +143,7 @@ The CSV/TSV, JSON, Markdown, and Excalidraw components above are the in-tree
 production references. Plugin selection applies the Component contract above;
 there is no cross-runtime selection behavior.
 
-Installation accepts the exact `2.0.0` API version. Replacing an owned plugin
+Installation accepts the exact `2.1.0` API version. Replacing an owned plugin
 is a compatible generation update: its API version, matcher, content type,
 schema-key set, and ID-allocation contract remain stable.
 
@@ -161,4 +188,7 @@ native core tests.
 Component boundary. It is a transient arena, not a RocksDB/SlateDB storage
 format. Packet framing and resource glue are SDK/runtime concerns and are not a
 frozen general authoring facade. Format code should operate on typed entities,
-entity changes, and byte edits behind that adapter.
+entity changes, conflict triples/resolutions, and byte edits behind that
+adapter. Conflict input and output remain lazy and paged: a selection result
+does not copy the selected snapshot through guest memory, while a merged value
+uses one bounded replacement attachment when necessary.

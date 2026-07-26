@@ -8,13 +8,18 @@ wit_bindgen::generate!({
 use crate::core::{
     ByteEdit as CoreByteEdit, Document as CoreDocument, EntityChange as CoreEntityChange,
     EntityImportBuilder, IdNamespace as CoreIdNamespace, InputSplice as CoreInputSplice,
+    ROW_SCHEMA_KEY, RowConflictResolution, resolve_row_conflict,
 };
-use crate::packet::{ChangeStream, FORMAT_VERSION, decode_change_page, decode_entity_page};
+use crate::packet::{
+    ChangeStream, ConflictRecord, ConflictResolution, ConflictSnapshot, FORMAT_VERSION,
+    ResolutionStream, decode_change_page, decode_conflict_page, decode_entity_page,
+};
 use exports::lix::plugin::api::{
     ByteOutputs, ChangeCursor, ChangePage, Document, EditCursor, EditPage, EntityTransition,
     EntityUpdate, FileTransition, FileUpdate, Guest, GuestByteOutputs, GuestChangeCursor,
-    GuestDocument, GuestEditCursor, InputBytes, OpenEntitiesInput, OpenFileInput, OutputBytes,
-    OutputRange, OutputSplice, PluginError,
+    GuestDocument, GuestEditCursor, GuestResolutionCursor, InputBytes, OpenEntitiesInput,
+    OpenFileInput, OutputBytes, OutputRange, OutputSplice, PluginError, ResolutionCursor,
+    ResolutionPage,
 };
 use lix::plugin::host::{ByteSource, ByteSources, PacketSource, SourceError, TransitionBudget};
 use std::cell::RefCell;
@@ -46,6 +51,21 @@ struct CsvEditCursor {
 #[derive(Debug)]
 struct EditCursorState {
     edits: VecDeque<CoreByteEdit>,
+    eof: bool,
+}
+
+/// The static resolver owns the lazily supplied conflict source.  It consumes
+/// one bounded input page at a time when the host drains its output cursor, so
+/// a large file with many independent conflicts never creates a guest-sized
+/// list of snapshots or resolutions.
+struct CsvResolutionCursor {
+    state: RefCell<ResolutionCursorState>,
+}
+
+struct ResolutionCursorState {
+    source: PacketSource,
+    pending: ResolutionStream,
+    source_eof: bool,
     eof: bool,
 }
 
@@ -203,6 +223,69 @@ fn drain_changes(
     Ok(output)
 }
 
+fn materialize_conflict_snapshot(
+    snapshot: &ConflictSnapshot,
+    attachments: Option<&ByteSources>,
+    budget: &TransitionBudget,
+) -> Result<Vec<u8>, PluginError> {
+    snapshot
+        .materialize(&mut |index, offset, length| {
+            read_attachment(attachments, budget, index, offset, length)
+        })
+        .map_err(plugin_error)
+}
+
+/// Conflict values are normally one compact CSV row. A pathological giant row
+/// is an edge case rather than a reason to copy three multi-megabyte values
+/// through the guest; retain the deterministic lazy b-wins path there.
+const MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES: u64 = 64 * 1024;
+
+fn resolve_conflict_record(
+    conflict: ConflictRecord,
+    attachments: Option<&ByteSources>,
+    budget: &TransitionBudget,
+) -> Result<ConflictResolution, PluginError> {
+    // Non-row schema records (including the CSV table/dialect entity) have no
+    // safe field-level merge. Their canonical b version wins without
+    // touching any lazy snapshot attachment.
+    if conflict.schema_key != ROW_SCHEMA_KEY {
+        return Ok(if conflict.b.is_some() {
+            ConflictResolution::TakeB
+        } else {
+            ConflictResolution::Delete
+        });
+    }
+
+    let (Some(base), Some(a), Some(b)) = (&conflict.base, &conflict.a, &conflict.b) else {
+        return Ok(if conflict.b.is_some() {
+            ConflictResolution::TakeB
+        } else {
+            ConflictResolution::Delete
+        });
+    };
+    if [base, a, b]
+        .into_iter()
+        .any(|snapshot| snapshot.len() > MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES)
+    {
+        return Ok(ConflictResolution::TakeB);
+    }
+
+    // The row-specific algorithm is the only path which reads all three
+    // snapshots. A take result remains source-backed on the host; a composed
+    // row becomes the one small replacement attachment when necessary.
+    let base = materialize_conflict_snapshot(base, attachments, budget)?;
+    let a = materialize_conflict_snapshot(a, attachments, budget)?;
+    let b = materialize_conflict_snapshot(b, attachments, budget)?;
+    Ok(
+        match resolve_row_conflict(Some(&base), Some(&a), Some(&b)) {
+            RowConflictResolution::TakeA => ConflictResolution::TakeA,
+            RowConflictResolution::TakeB => ConflictResolution::TakeB,
+            RowConflictResolution::Replace(snapshot) => ConflictResolution::Replace(snapshot),
+            RowConflictResolution::Delete => ConflictResolution::Delete,
+        },
+    )
+}
+
 fn file_transition(document: CoreDocument, stream: ChangeStream) -> FileTransition {
     FileTransition {
         document: Document::new(CsvDocument(document)),
@@ -233,6 +316,7 @@ impl Guest for CsvGuest {
     type ChangeCursor = CsvChangeCursor;
     type EditCursor = CsvEditCursor;
     type Document = CsvDocument;
+    type ResolutionCursor = CsvResolutionCursor;
 
     fn open_file(
         budget: &TransitionBudget,
@@ -269,6 +353,24 @@ impl Guest for CsvGuest {
             None => vec![edit],
         };
         Ok(entity_transition(document, edits))
+    }
+
+    fn resolve_conflicts(
+        _budget: &TransitionBudget,
+        input: exports::lix::plugin::api::ConflictUpdate,
+    ) -> Result<ResolutionCursor, PluginError> {
+        // Keep the packet source owned by the returned cursor.  The host's
+        // transition budget spans both this call and cursor draining, so this
+        // is still one bounded transition while avoiding eager conflict input
+        // materialization in guest memory.
+        Ok(ResolutionCursor::new(CsvResolutionCursor {
+            state: RefCell::new(ResolutionCursorState {
+                source: input.conflicts,
+                pending: ResolutionStream::default(),
+                source_eof: false,
+                eof: false,
+            }),
+        }))
     }
 }
 
@@ -369,6 +471,79 @@ impl GuestChangeCursor for CsvChangeCursor {
             payload: page.payload,
             attachments,
         }))
+    }
+}
+
+impl GuestResolutionCursor for CsvResolutionCursor {
+    fn next(
+        &self,
+        budget: &TransitionBudget,
+        max_bytes: u32,
+    ) -> Result<Option<ResolutionPage>, PluginError> {
+        let mut state = self.state.borrow_mut();
+        if state.eof {
+            return Ok(None);
+        }
+        let max_record_bytes = budget.limits().max_record_bytes;
+        loop {
+            if let Some(page) = state
+                .pending
+                .next_page(max_bytes, max_record_bytes)
+                .map_err(|error| {
+                    if error.contains("record cap") {
+                        PluginError::RecordTooLarge(u64::from(max_record_bytes) + 1)
+                    } else if error.contains("page cap") {
+                        PluginError::RecordTooLarge(u64::from(max_bytes) + 1)
+                    } else {
+                        plugin_error(error)
+                    }
+                })?
+            {
+                let attachments = if page.attachments.is_empty() {
+                    None
+                } else {
+                    Some(ByteOutputs::new(CsvByteOutputs {
+                        values: page.attachments,
+                    }))
+                };
+                return Ok(Some(ResolutionPage {
+                    format_version: FORMAT_VERSION,
+                    record_count: page.record_count,
+                    payload: page.payload,
+                    attachments,
+                }));
+            }
+            if state.source_eof {
+                state.eof = true;
+                return Ok(None);
+            }
+
+            let source_page_cap = budget.limits().max_page_bytes.max(1);
+            let Some(page) = state
+                .source
+                .next(budget, source_page_cap)
+                .map_err(source_error)?
+            else {
+                state.source_eof = true;
+                continue;
+            };
+            if page.format_version != FORMAT_VERSION {
+                return Err(plugin_error(format!(
+                    "unsupported packet version {}",
+                    page.format_version
+                )));
+            }
+            let conflicts =
+                decode_conflict_page(&page.payload, page.record_count).map_err(plugin_error)?;
+            let mut resolutions = Vec::with_capacity(conflicts.len());
+            for conflict in conflicts {
+                let ordinal = conflict.ordinal;
+                let resolution =
+                    resolve_conflict_record(conflict, page.attachments.as_ref(), budget)?;
+                resolutions.push((ordinal, resolution));
+            }
+            state.pending.extend(resolutions);
+        }
     }
 }
 

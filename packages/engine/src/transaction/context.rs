@@ -54,9 +54,10 @@ use crate::plugin::{
     PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
     PluginActorLease, PluginActorStore, PluginArchiveInstallPlan, PluginContentType,
     PluginDetectedChange, PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
-    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntitySource,
-    build_file_update_splices, drain_entity_transition_edits, drain_file_transition_changes,
+    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, drain_conflict_transition_resolutions,
+    drain_entity_transition_edits, drain_file_transition_changes,
     host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
     inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
     local_mutation_identity, plugin_install_plan_from_archive_path,
@@ -100,10 +101,10 @@ use crate::transaction::validation::{
     validate_prepared_writes,
 };
 use crate::wasm::{
-    WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmDocumentHandle,
-    WasmEntityChange, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes,
-    WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
-    WasmPluginSelection, WasmTransitionLimits,
+    WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictUpdate,
+    WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityUpdate, WasmFileDescriptor,
+    WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
+    WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -804,6 +805,118 @@ where
         self.pending_plugin_actor_publications
             .extend(actor_publications);
         Ok(outcome)
+    }
+
+    /// Runs the stateless conflict resolver for one pinned v2 plugin
+    /// generation. Unlike normal file mutation this creates no persistent
+    /// document actor: a merge may need to resolve one row from a large file,
+    /// and the resulting rows are rendered once by the ordinary staged-write
+    /// reconciliation path.
+    ///
+    /// The caller supplies a registry entry loaded from the historical merge
+    /// roots, not the mutable current registry. This keeps `b` selection
+    /// and plugin code selection deterministic across merge direction and
+    /// retries.
+    pub(crate) async fn resolve_v2_plugin_conflicts(
+        &mut self,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
+    ) -> Result<ValidatedConflictTransition, LixError> {
+        self.ensure_plugin_generation_read_guard().await;
+        let limits = WasmTransitionLimits::default();
+        let expected_count = conflicts.len();
+        let source = VecEntityConflictSource::new(conflicts, limits)?;
+        let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+        let factory = match self
+            .plugin_host
+            .cached_plugin_v2_factory(plugin.key(), wasm_hash)?
+        {
+            Some(factory) => factory,
+            None => {
+                let read = SharedStorageAdapterRead::new(
+                    self.storage
+                        .begin_read(StorageReadOptions::default())
+                        .await?,
+                );
+                let reader = self.binary_cas.reader(read);
+                let wasm = load_transaction_blob_bytes(&reader, &self.staged_writes, &[wasm_hash])
+                    .await?
+                    .into_vec()
+                    .into_iter()
+                    .next()
+                    .flatten()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!(
+                                "plugin registry references missing WASM blob '{}'",
+                                wasm_hash.to_hex()
+                            ),
+                        )
+                    })?;
+                let installed = plugin.to_installed_plugin(wasm)?;
+                self.plugin_host
+                    .load_or_compile_v2_factory(&installed)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_conflict_factory_compile"
+                    ))
+                    .await?
+            }
+        };
+
+        // Static conflict resolution is short lived, but it still owns a
+        // Wasmtime Store and must honor the same workspace-wide admission
+        // bound as retained document actors.
+        let permit = self.plugin_host.actor_cache().admit_store()?;
+        let actor = factory
+            .instantiate_actor()
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_conflict_actor_instantiate"
+            ))
+            .await?;
+        let mut store = PluginActorStore::new(actor, permit);
+        let transition = match store
+            .actor_mut()
+            .resolve_conflicts(
+                limits,
+                WasmConflictUpdate {
+                    descriptor,
+                    conflicts: Box::new(source),
+                },
+            )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_resolve_conflicts"
+            ))
+            .await
+        {
+            Ok(transition) => transition,
+            Err(error) => {
+                let _ = store.actor_mut().retire().await;
+                return Err(error);
+            }
+        };
+        let validated = match drain_conflict_transition_resolutions(
+            store.actor_mut(),
+            transition,
+            expected_count,
+            limits,
+        )
+        .await
+        {
+            Ok(validated) => validated,
+            Err(error) => {
+                let _ = store.actor_mut().retire().await;
+                return Err(error);
+            }
+        };
+        store.actor_mut().retire().await?;
+        self.plugin_host
+            .record_v2_transition_counters(validated.counters);
+        Ok(validated)
     }
 
     async fn scan_visible_live_state(
@@ -2832,9 +2945,12 @@ where
                     ))
                     .await?;
                 let source = ArcByteSource::new(submitted_bytes.clone());
+                let cold_limits = WasmTransitionLimits::for_cold_file_bytes(
+                    u64::try_from(submitted_bytes.len()).unwrap_or(u64::MAX),
+                );
                 let transition = actor
                     .open_file(
-                        limits,
+                        cold_limits,
                         WasmOpenFileInput {
                             descriptor,
                             file: Arc::new(source),
@@ -2846,13 +2962,17 @@ where
                         "lix.perf.plugin_open_file"
                     ))
                     .await?;
-                let validated =
-                    drain_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
-                        .instrument(tracing::debug_span!(
-                            target: "lix_perf",
-                            "lix.perf.plugin_open_file_drain"
-                        ))
-                        .await?;
+                let validated = drain_file_transition_changes(
+                    actor.as_mut(),
+                    transition,
+                    &schemas,
+                    cold_limits,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_open_file_drain"
+                ))
+                .await?;
                 let changes = validated.changes;
                 let mut counters = validated.counters;
                 counters.host_full_content_classification_bytes = full_content_classification_bytes
@@ -6189,13 +6309,13 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: "plugin_csv_v2".to_string(),
             runtime: crate::plugin::PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: "*.csv".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"api_version":"2.0.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: "lix_plugin_archive::plugin_csv_v2".to_string(),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),

@@ -27,8 +27,9 @@ pub(crate) use id_namespace::{
     validate_namespace_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, V2SchemaAllowlist, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntitySource, build_file_update_splices, drain_entity_transition_edits,
+    ArcByteSource, V2SchemaAllowlist, ValidatedConflictTransition, ValidatedSameLengthOutputSplice,
+    VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
+    drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, transport_splice_preserves_utf8,
 };

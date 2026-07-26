@@ -3644,6 +3644,140 @@ pub struct RowSnapshot {
     pub layout: RowLayout,
 }
 
+/// Deterministic result of merging one three-way CSV row conflict.
+///
+/// `a` and `b` are supplied by the engine's stable order rather than
+/// the direction of a branch merge.  That makes the fallback independent of
+/// which branch happened to initiate the merge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowConflictResolution {
+    TakeA,
+    TakeB,
+    Replace(Vec<u8>),
+    Delete,
+}
+
+/// Resolves a concurrent edit of one CSV row without a hydrated document.
+///
+/// The fast path composes edits to different same-index cells.  Row identity,
+/// order, field count, quoting, and terminator layout are structural: when any
+/// of those differs, or both sides replace the same cell differently, the
+/// deterministic `b` side wins.  This keeps the common spreadsheet case
+/// intuitive while deliberately avoiding a speculative row-structure CRDT.
+pub fn resolve_row_conflict(
+    base: Option<&[u8]>,
+    a: Option<&[u8]>,
+    b: Option<&[u8]>,
+) -> RowConflictResolution {
+    // These cases avoid JSON parsing and, for a lazy host packet, let the
+    // bindings retain the selected source without copying it into Wasm.
+    if a == b || base == a {
+        return match b {
+            Some(_) => RowConflictResolution::TakeB,
+            None => RowConflictResolution::Delete,
+        };
+    }
+    if base == b {
+        return match a {
+            Some(_) => RowConflictResolution::TakeA,
+            None => RowConflictResolution::Delete,
+        };
+    }
+
+    let (Some(base), Some(a), Some(b)) = (base, a, b) else {
+        return match b {
+            Some(_) => RowConflictResolution::TakeB,
+            None => RowConflictResolution::Delete,
+        };
+    };
+    let (Ok(base), Ok(a), Ok(b)) = (
+        parse_row_snapshot(base),
+        parse_row_snapshot(a),
+        parse_row_snapshot(b),
+    ) else {
+        return RowConflictResolution::TakeB;
+    };
+
+    if base.id != a.id
+        || base.id != b.id
+        || base.order_key != a.order_key
+        || base.order_key != b.order_key
+        || base.layout != a.layout
+        || base.layout != b.layout
+        || base.cells.len() != a.cells.len()
+        || base.cells.len() != b.cells.len()
+    {
+        return RowConflictResolution::TakeB;
+    }
+
+    let mut merged = b.cells.clone();
+    let mut differs_from_b = false;
+    for (index, merged_cell) in merged.iter_mut().enumerate() {
+        let a_changed = base.cells[index] != a.cells[index];
+        let b_changed = base.cells[index] != b.cells[index];
+        match (a_changed, b_changed) {
+            (false, _) => {}
+            (true, false) => {
+                merged_cell.clone_from(&a.cells[index]);
+                differs_from_b = true;
+            }
+            (true, true) if a.cells[index] == b.cells[index] => {}
+            (true, true) => return RowConflictResolution::TakeB,
+        }
+    }
+    if !differs_from_b {
+        return RowConflictResolution::TakeB;
+    }
+    let merged = RowSnapshot {
+        id: b.id,
+        order_key: b.order_key,
+        cells: merged,
+        layout: b.layout,
+    };
+    canonical_row_snapshot(&merged)
+        .map(RowConflictResolution::Replace)
+        .unwrap_or(RowConflictResolution::TakeB)
+}
+
+fn canonical_row_snapshot(snapshot: &RowSnapshot) -> Result<Vec<u8>, String> {
+    let mut output = Vec::with_capacity(128);
+    output.extend_from_slice(b"{\"id\":");
+    serde_json::to_writer(&mut output, &snapshot.id).map_err(|error| error.to_string())?;
+    output.extend_from_slice(b",\"order_key\":");
+    serde_json::to_writer(&mut output, &snapshot.order_key).map_err(|error| error.to_string())?;
+    output.extend_from_slice(b",\"cells\":[");
+    for (index, cell) in snapshot.cells.iter().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+        serde_json::to_writer(&mut output, cell).map_err(|error| error.to_string())?;
+    }
+    output.push(b']');
+    if !snapshot.layout.is_default() {
+        output.extend_from_slice(b",\"layout\":{");
+        let has_force_quote = !snapshot.layout.force_quote.is_empty();
+        if has_force_quote {
+            output.extend_from_slice(b"\"force_quote\":");
+            serde_json::to_writer(
+                &mut output,
+                &URL_SAFE_NO_PAD.encode(&snapshot.layout.force_quote),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(ending) = snapshot.layout.terminator {
+            if has_force_quote {
+                output.push(b',');
+            }
+            output.extend_from_slice(b"\"terminator\":");
+            serde_json::to_writer(&mut output, ending.map_or("", Terminator::snapshot))
+                .map_err(|error| error.to_string())?;
+        }
+        output.push(b'}');
+    }
+    output.push(b'}');
+    Ok(output)
+}
+
 pub fn parse_row_snapshot(bytes: &[u8]) -> Result<RowSnapshot, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("invalid CSV row snapshot: {error}"))?;
