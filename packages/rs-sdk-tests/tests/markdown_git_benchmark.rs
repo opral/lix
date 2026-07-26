@@ -19,6 +19,7 @@ const DEFAULT_EDIT_SAMPLES: usize = 20;
 const DEFAULT_MERGE_SAMPLES: usize = 7;
 const DEFAULT_COLD_SAMPLES: usize = 5;
 const DEFAULT_PROFILE_SAMPLES: usize = 200;
+const DEFAULT_SYNTAX_RICH_SAMPLES: usize = 3;
 const PARAGRAPH_BODY_BYTES: usize = 496;
 
 #[derive(Debug)]
@@ -108,6 +109,59 @@ async fn markdown_lix_byte_hotpath_profile() {
         &bytes,
     );
     lix.close().await.expect("close Markdown profile Lix");
+}
+
+/// Guards the fallback side of the canonical literal-prose optimization with
+/// a realistic GFM document. The timer deliberately follows the ordinary
+/// public SQL write path and excludes workspace/plugin installation.
+#[tokio::test]
+#[ignore = "manual syntax-rich Markdown initial-import control"]
+async fn markdown_syntax_rich_initial_import_control() {
+    init_perf_tracing();
+
+    let target_bytes = env_usize("LIX_MARKDOWN_SYNTAX_RICH_BENCH_BYTES", DEFAULT_TARGET_BYTES);
+    let samples = env_usize(
+        "LIX_MARKDOWN_SYNTAX_RICH_BENCH_SAMPLES",
+        DEFAULT_SYNTAX_RICH_SAMPLES,
+    );
+    assert!(samples > 0);
+    let source = syntax_rich_markdown_corpus(target_bytes);
+    assert!(source.len() >= target_bytes.saturating_sub(1_024));
+    let archive = build_markdown_v2_plugin_archive();
+    let mut imports = Vec::with_capacity(samples);
+
+    for _sample in 0..samples {
+        let root = tempfile::tempdir().expect("create syntax-rich Markdown benchmark directory");
+        let lix = open_lix_with_rocksdb(root.path()).await;
+        install_plugin(&lix, "plugin_markdown_incremental_v2", &archive).await;
+
+        let started = Instant::now();
+        write_file(&lix, "/syntax-rich.md", source.clone()).await;
+        imports.push(started.elapsed());
+
+        assert_same_bytes(
+            "syntax-rich Markdown import must preserve exact source bytes",
+            &read_file(&lix, "/syntax-rich.md").await,
+            &source,
+        );
+        let file_id = file_id_at_path(&lix, "/syntax-rich.md").await;
+        assert!(
+            !markdown_nodes_by_kind(&lix, &file_id, "table_cell")
+                .await
+                .is_empty(),
+            "syntax-rich import must materialize semantic table-cell entities"
+        );
+        lix.close()
+            .await
+            .expect("close syntax-rich Markdown benchmark Lix");
+    }
+
+    print_duration_metric("syntax_rich_initial_import", "lix-semantic", &imports);
+    eprintln!(
+        "markdown_syntax_rich_control corpus_bytes={} samples={}",
+        source.len(),
+        samples,
+    );
 }
 
 #[tokio::test]
@@ -732,6 +786,33 @@ fn markdown_corpus(target_bytes: usize) -> Corpus {
         edit_offsets,
         texts,
     }
+}
+
+fn syntax_rich_markdown_corpus(target_bytes: usize) -> Vec<u8> {
+    const RICH_BLOCK_INTERVAL: usize = 64;
+
+    let mut bytes = Vec::with_capacity(target_bytes + 512);
+    for index in 0usize.. {
+        let prose = format!("P{index:06} {}\n\n", paragraph_body(index));
+        if bytes.len() + prose.len() > target_bytes {
+            break;
+        }
+        bytes.extend_from_slice(prose.as_bytes());
+
+        // A single non-literal block makes the entire document take the
+        // canonical-rendering fallback. Keeping these periodic mirrors a
+        // typical prose document and avoids treating an all-table stress case
+        // as the 90%-path control.
+        if index % RICH_BLOCK_INTERVAL == RICH_BLOCK_INTERVAL - 1 {
+            let block = format!(
+                "## Section {index}\n\nParagraph {index} has *emphasis*, **strong**, ~~delete~~, [a link](https://example.com/{index}), and `code`.\n\n- alpha {index}\n- beta {index}\n\n| key | value |\n| --- | :--- |\n| left {index} | right {index} |\n\n```rust\nlet value_{index} = {index};\n```\n\n> quoted paragraph {index}\n\n"
+            );
+            if bytes.len() + block.len() <= target_bytes {
+                bytes.extend_from_slice(block.as_bytes());
+            }
+        }
+    }
+    bytes
 }
 
 fn spread_index(sample: usize, samples: usize, upper: usize) -> usize {

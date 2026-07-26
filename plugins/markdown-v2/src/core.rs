@@ -1,4 +1,7 @@
-use crate::markdown_file::{ParsedMarkdown, parse_file, parse_markdown_source, render_tree};
+use crate::markdown_file::{
+    ParsedMarkdown, parse_file, parse_file_with_literal_fast_path, parse_markdown_source,
+    render_tree,
+};
 use crate::model::{
     InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
     replace_column_ids, semantic_payload,
@@ -1906,11 +1909,29 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+        Self::open_file_with_literal_fast_path(bytes, path, namespace, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_file_forced_canonical_fallback(
+        bytes: Vec<u8>,
+        path: Option<&str>,
+        namespace: IdNamespace,
+    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+        Self::open_file_with_literal_fast_path(bytes, path, namespace, false)
+    }
+
+    fn open_file_with_literal_fast_path(
+        bytes: Vec<u8>,
+        path: Option<&str>,
+        namespace: IdNamespace,
+        allow_literal_fast_path: bool,
+    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let file = File {
             filename: path.map(ToOwned::to_owned),
             data: bytes.clone(),
         };
-        let mut parsed = parse_file(&file)?;
+        let mut parsed = parse_file_with_literal_fast_path(&file, allow_literal_fast_path)?;
         retain_noncanonical_source(&mut parsed, &file.data)?;
         let top_level_ranges = parsed.top_level_ranges.clone();
         let detected = detect_changes_for_markdown(&Projection::default(), parsed, namespace)?;
