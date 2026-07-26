@@ -91,7 +91,7 @@ required-features = ["storage-benches"]
 name = "tracked_working_diff"
 path = "benches/tracked_working_diff.rs"
 harness = false
-required-features = ["rocksdb"]
+required-features = ["storage-benches"]
 
 [[bench]]
 name = "slatedb_file_api"

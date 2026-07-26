@@ -7,9 +7,9 @@
 //! working set.
 //!
 //! ```text
-//! cargo bench -p lix_engine_benchmarks --bench tracked_working_diff -- \
+//! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
 //!   setup repeated /tmp/lix-working-diff-repeated 10000 1000 10
-//! cargo bench -p lix_engine_benchmarks --bench tracked_working_diff -- \
+//! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
 //!   measure /tmp/lix-working-diff-repeated 11
 //! ```
 //!
@@ -20,6 +20,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use lix_engine::storage_adapter::StorageAdapter;
+use lix_engine::storage_bench::diff_tracked_commits_for_bench;
 use lix_engine::{Engine, ExecuteBatchStatement, Storage, Value};
 use lix_rocksdb_storage::RocksDB;
 
@@ -103,6 +105,27 @@ fn main() {
             );
             runtime.block_on(measure(Path::new(path), repetitions));
         }
+        "measure-history" => {
+            let Some(base_commit_id) = args.get(3) else {
+                print_usage();
+                return;
+            };
+            let Some(head_commit_id) = args.get(4) else {
+                print_usage();
+                return;
+            };
+            let repetitions = parse_usize(
+                args.get(5),
+                DEFAULT_MEASURE_REPETITIONS,
+                "measurement repetitions",
+            );
+            runtime.block_on(measure_history(
+                Path::new(path),
+                base_commit_id,
+                head_commit_id,
+                repetitions,
+            ));
+        }
         "checkpoint" => runtime.block_on(checkpoint(Path::new(path))),
         _ => print_usage(),
     }
@@ -113,6 +136,7 @@ fn print_usage() {
         "usage:\n  tracked_working_diff setup <directory> <repeated|disjoint> \
          [rows] [commits] [changes-per-commit]\n  \
          tracked_working_diff measure <directory> [repetitions]\n  \
+         tracked_working_diff measure-history <directory> <base-commit-id> <head-commit-id> [repetitions]\n  \
          tracked_working_diff checkpoint <directory>"
     );
 }
@@ -161,7 +185,7 @@ async fn setup(
     seed_rows(&session, row_count).await;
     let seed_elapsed = seed_start.elapsed();
     let initial_checkpoint_start = Instant::now();
-    session
+    let initial_checkpoint = session
         .create_checkpoint()
         .await
         .expect("create tracked-working-diff initial checkpoint");
@@ -178,14 +202,25 @@ async fn setup(
         working_changes, expected_changes,
         "populated working-diff fixture must expose every expected identity"
     );
+    let branch_id = session
+        .active_branch_id()
+        .await
+        .expect("load tracked-working-diff branch id");
+    let head_commit_id = engine
+        .load_branch_head_commit_id(&branch_id)
+        .await
+        .expect("load tracked-working-diff branch head")
+        .expect("tracked-working-diff fixture must have a branch head");
     drop(session);
     drop(engine);
     storage.flush().expect("flush tracked-working-diff RocksDB");
     println!(
         "tracked_working_diff setup backend=rocksdb shape={} rows={row_count} commits={commit_count} \
          changes_per_commit={changes_per_commit} working_changes={working_changes} \
-         seed_ms={:.3} initial_checkpoint_ms={:.3} writes_ms={:.3}",
+         base_commit_id={} head_commit_id={} seed_ms={:.3} initial_checkpoint_ms={:.3} writes_ms={:.3}",
         shape_name(shape),
+        initial_checkpoint.commit_id,
+        head_commit_id,
         millis(seed_elapsed),
         millis(initial_checkpoint_elapsed),
         millis(writes_elapsed),
@@ -222,6 +257,66 @@ async fn measure(path: &Path, repetitions: usize) {
     sorted.sort_unstable();
     println!(
         "tracked_working_diff measure backend=rocksdb working_changes={expected_changes} \
+         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        millis(sorted[sorted.len() / 2]),
+        mean_millis(&latencies),
+        millis(sorted[0]),
+        millis(*sorted.last().expect("measurement samples are non-empty")),
+    );
+}
+
+/// Measures the cold historical diff path rather than `lix_working_change`'s
+/// serving-head accelerator. The setup checkpoint is a durable root and the
+/// later ordinary commits are rootless, which makes this a populated
+/// first-parent replay interval.
+async fn measure_history(
+    path: &Path,
+    base_commit_id: &str,
+    head_commit_id: &str,
+    repetitions: usize,
+) {
+    assert!(path.exists(), "fixture {} does not exist", path.display());
+    let storage = RocksDB::open(path).expect("open tracked-working-diff RocksDB");
+    let adapter = StorageAdapter::new(storage.clone());
+    let engine = Engine::new(storage)
+        .await
+        .expect("open tracked-working-diff engine");
+    let session = engine
+        .open_workspace_session()
+        .await
+        .expect("open tracked-working-diff session");
+    let expected_changes = working_change_count(&session).await;
+    assert!(
+        expected_changes > 0,
+        "fixture has no populated working changes"
+    );
+
+    let warm = diff_tracked_commits_for_bench(&adapter, base_commit_id, head_commit_id)
+        .await
+        .expect("warm historical tracked diff");
+    assert_eq!(warm.entries, expected_changes);
+    assert!(
+        warm.left_has_durable_root && !warm.right_has_durable_root,
+        "measure-history requires checkpoint -> rootless first-parent replay"
+    );
+
+    let mut latencies = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        let start = Instant::now();
+        let result = diff_tracked_commits_for_bench(&adapter, base_commit_id, head_commit_id)
+            .await
+            .expect("measure historical tracked diff");
+        latencies.push(start.elapsed());
+        assert_eq!(result.entries, expected_changes);
+        assert!(
+            result.left_has_durable_root && !result.right_has_durable_root,
+            "historical measurement must remain checkpoint -> rootless"
+        );
+    }
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    println!(
+        "tracked_working_diff measure-history backend=rocksdb working_changes={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
         millis(sorted[sorted.len() / 2]),
         mean_millis(&latencies),
