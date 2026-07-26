@@ -711,7 +711,7 @@ mod tests {
                     .is_ok_and(|id| id == receipt.main_branch_id)
                     && row
                         .get::<String>("commit_id")
-                        .is_ok_and(|commit_id| commit_id == receipt.initial_commit_id.to_string())
+                        .is_ok_and(|commit_id| commit_id == receipt.initial_commit_id)
             }),
             "the normal branch-ref SQL surface must retain its synthesized control row"
         );
