@@ -50,11 +50,12 @@ use crate::plugin::{
     PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
     PluginActorLease, PluginActorStore, PluginArchiveInstallPlan, PluginContentType,
     PluginDetectedChange, PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, VecEntityChangeSource,
-    VecEntitySource, build_file_update_splices, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
-    host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
-    is_reservation_key, local_mutation_identity, plugin_install_plan_from_archive_path,
+    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntitySource,
+    build_file_update_splices, drain_entity_transition_edits, drain_file_transition_changes,
+    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
+    inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
+    local_mutation_identity, plugin_install_plan_from_archive_path,
     plugin_key_from_archive_file_id, plugin_state_live_state_projection,
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
     transport_splice_preserves_utf8, validate_host_allocated_changes,
@@ -3155,32 +3156,32 @@ where
                 "lix.perf.plugin_semantic_render"
             ))
             .await;
-            let (publication, rendered_bytes, counters) = match transition {
-                Ok(transition) => transition,
-                Err((error, publication)) => {
-                    if was_chained {
-                        self.pending_plugin_actor_publications.push(publication);
-                    } else {
-                        publication.discard().await;
+            let (publication, rendered_bytes, same_length_output_splice, counters) =
+                match transition {
+                    Ok(transition) => transition,
+                    Err((error, publication)) => {
+                        if was_chained {
+                            self.pending_plugin_actor_publications.push(publication);
+                        } else {
+                            publication.discard().await;
+                        }
+                        discard_plugin_actor_publications(std::mem::take(
+                            &mut reconciliation.actor_publications,
+                        ))
+                        .await;
+                        return Err(error);
                     }
-                    discard_plugin_actor_publications(std::mem::take(
-                        &mut reconciliation.actor_publications,
-                    ))
-                    .await;
-                    return Err(error);
-                }
-            };
+                };
             self.plugin_host.record_v2_transition_counters(counters);
-            let rendered_file = TransactionFileData::new(
+            let rendered_file = semantic_rendered_file_data(
                 file_key.file_id.clone(),
-                Some(group.path),
-                Some(group.filename),
+                group.path,
+                group.filename,
                 file_key.branch_id.clone(),
-                false,
-                false,
+                &visible_materialization,
                 rendered_bytes,
-            )
-            .with_had_blob_ref(true);
+                same_length_output_splice,
+            );
             file_data.push(rendered_file);
             reconciliation
                 .materialized_file_keys
@@ -4699,6 +4700,44 @@ impl PendingPluginActorPublication {
     }
 }
 
+/// Builds the file write for an accepted semantic renderer transition.
+///
+/// The visible materialization was loaded from the same durable blob-ref row
+/// whose semantic root fenced the actor call. `same_length_output_splice` is
+/// host-validated renderer metadata, never a guest assertion. Pairing the two
+/// lets the private CAS writer reuse only chunks from that exact base blob;
+/// unavailable, malformed, or mismatched state still follows canonical full
+/// staging.
+fn semantic_rendered_file_data(
+    file_id: String,
+    path: String,
+    filename: String,
+    branch_id: String,
+    visible_materialization: &VisibleV2Materialization,
+    rendered_bytes: crate::Blob,
+    same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
+) -> TransactionFileData {
+    let mut rendered_file = TransactionFileData::new(
+        file_id,
+        Some(path),
+        Some(filename),
+        branch_id,
+        false,
+        false,
+        rendered_bytes,
+    )
+    .with_had_blob_ref(true)
+    .with_base_blob_hash(Some(visible_materialization.blob_hash));
+    if let Some(splice) = same_length_output_splice {
+        rendered_file.set_verified_same_length_blob_splice(
+            visible_materialization.blob_hash,
+            splice.offset,
+            splice.length,
+        );
+    }
+    rendered_file
+}
+
 async fn render_v2_semantic_changes_with_lease(
     mut lease: PluginActorLease,
     successor_key: PluginActorKey,
@@ -4712,6 +4751,7 @@ async fn render_v2_semantic_changes_with_lease(
     (
         PendingPluginActorPublication,
         crate::Blob,
+        Option<ValidatedSameLengthOutputSplice>,
         crate::wasm::WasmTransitionCounters,
     ),
     (LixError, PendingPluginActorPublication),
@@ -4794,6 +4834,7 @@ async fn render_v2_semantic_changes_with_lease(
         return Err((error, publication(lease)));
     }
     let rendered_bytes = rendered.bytes.clone();
+    let same_length_output_splice = rendered.same_length_output_splice;
     let mut counters = rendered.counters;
     counters.private_document_cache_hits = 1;
     counters.durable_semantic_changes = change_count;
@@ -4809,7 +4850,12 @@ async fn render_v2_semantic_changes_with_lease(
     {
         return Err((error, publication(lease)));
     }
-    Ok((publication(lease), rendered_bytes, counters))
+    Ok((
+        publication(lease),
+        rendered_bytes,
+        same_length_output_splice,
+        counters,
+    ))
 }
 
 async fn discard_plugin_actor_publications(publications: Vec<PendingPluginActorPublication>) {
@@ -5680,6 +5726,56 @@ mod tests {
         let error = decode_visible_v2_materialization(&row("other-file"), "file-a")
             .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+    }
+
+    #[test]
+    fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
+        let base_blob_hash = BlobHash::from_content(b"abcdef");
+        let materialization = VisibleV2Materialization {
+            semantic_root: "semantic-root".to_string(),
+            blob_hash: base_blob_hash,
+        };
+        let rendered = semantic_rendered_file_data(
+            "file-a".to_string(),
+            "/document.md".to_string(),
+            "document.md".to_string(),
+            "main".to_string(),
+            &materialization,
+            b"abXYef".as_slice().into(),
+            Some(ValidatedSameLengthOutputSplice {
+                offset: 2,
+                length: 2,
+            }),
+        );
+
+        assert_eq!(rendered.base_blob_hash(), Some(base_blob_hash));
+        assert_eq!(
+            rendered.same_length_blob_splice(),
+            Some(crate::binary_cas::BlobSameLengthSplice::new(
+                base_blob_hash,
+                2,
+                2,
+            ))
+        );
+
+        let malformed = semantic_rendered_file_data(
+            "file-a".to_string(),
+            "/document.md".to_string(),
+            "document.md".to_string(),
+            "main".to_string(),
+            &materialization,
+            b"abXYef".as_slice().into(),
+            Some(ValidatedSameLengthOutputSplice {
+                offset: 6,
+                length: 1,
+            }),
+        );
+        assert_eq!(malformed.base_blob_hash(), Some(base_blob_hash));
+        assert_eq!(
+            malformed.same_length_blob_splice(),
+            None,
+            "transaction-side bounds checks must force malformed metadata through the ordinary CAS path"
+        );
     }
 
     #[test]

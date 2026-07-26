@@ -1062,11 +1062,28 @@ pub(crate) struct ResolvedOutputSplice {
     pub(crate) insert: Vec<u8>,
 }
 
+/// One fixed-width renderer splice which the host has applied against the
+/// accepted actor bytes.
+///
+/// This is deliberately not guest authority. It is created only after the
+/// complete renderer output has passed host range/order validation and has
+/// been reconstructed from the immutable base. Transaction code may pair it
+/// with an independently loaded durable blob hash as a private CAS hint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValidatedSameLengthOutputSplice {
+    pub(crate) offset: usize,
+    pub(crate) length: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedEntityTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) bytes: Blob,
     pub(crate) bytes_sha256: Option<FileBytesSha256>,
+    /// Present only for one non-empty fixed-width edit that the host applied
+    /// to the complete accepted base. It carries no inserted guest bytes and
+    /// is not persisted.
+    pub(crate) same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
     #[cfg(test)]
     pub(crate) edits: Vec<ResolvedOutputSplice>,
     pub(crate) counters: WasmTransitionCounters,
@@ -1237,21 +1254,24 @@ async fn drain_entity_transition_edits_inner(
         }
     }
 
-    let bytes = if let (Some(expected), Some(expected_delta)) = (&expected, expected_delta) {
-        validate_resolved_output_against_known_delta(base, expected, expected_delta, &edits)?;
-        expected.clone()
-    } else {
-        let bytes: Blob = apply_resolved_output_splices(base, &edits)?.into();
-        if expected
-            .as_ref()
-            .is_some_and(|expected| expected.as_ref() != bytes.as_ref())
-        {
-            return Err(invalid_guest(
-                "v2 renderer edits do not reproduce the independently expected bytes",
-            ));
-        }
-        bytes
-    };
+    let (bytes, same_length_output_splice) =
+        if let (Some(expected), Some(expected_delta)) = (&expected, expected_delta) {
+            validate_resolved_output_against_known_delta(base, expected, expected_delta, &edits)?;
+            (expected.clone(), None)
+        } else {
+            let (rendered_bytes, same_length_output_splice) =
+                apply_resolved_output_splices(base, &edits)?;
+            let bytes: Blob = rendered_bytes.into();
+            if expected
+                .as_ref()
+                .is_some_and(|expected| expected.as_ref() != bytes.as_ref())
+            {
+                return Err(invalid_guest(
+                    "v2 renderer edits do not reproduce the independently expected bytes",
+                ));
+            }
+            (bytes, same_length_output_splice)
+        };
     // Cold-open validation benefits from caching the accepted protocol
     // digest. A normal semantic render does not: defer that O(file) SHA-256
     // until a later request actually presents transport splice provenance.
@@ -1261,10 +1281,33 @@ async fn drain_entity_transition_edits_inner(
         document: transition.document,
         bytes,
         bytes_sha256,
+        same_length_output_splice,
         #[cfg(test)]
         edits,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
+}
+
+/// Extracts a private CAS hint after the surrounding output application has
+/// completed its range/order validation. A guest cannot manufacture this fact
+/// by merely emitting splice metadata: malformed, overlapping,
+/// out-of-bounds, empty, length-changing, and multi-splice outputs all yield
+/// no hint.
+fn same_length_output_splice_after_host_validation(
+    base_len: usize,
+    output_len: usize,
+    edits: &[ResolvedOutputSplice],
+) -> Option<ValidatedSameLengthOutputSplice> {
+    let [edit] = edits else {
+        return None;
+    };
+    let offset = usize::try_from(edit.offset).ok()?;
+    let length = usize::try_from(edit.delete_len).ok()?;
+    let end = offset.checked_add(length)?;
+    if length == 0 || length != edit.insert.len() || end > base_len || output_len != base_len {
+        return None;
+    }
+    Some(ValidatedSameLengthOutputSplice { offset, length })
 }
 
 async fn cleanup_rejected_transition(
@@ -1651,7 +1694,7 @@ impl OutputDrainBudget {
 fn apply_resolved_output_splices(
     base: &[u8],
     edits: &[ResolvedOutputSplice],
-) -> Result<Vec<u8>, LixError> {
+) -> Result<(Vec<u8>, Option<ValidatedSameLengthOutputSplice>), LixError> {
     let mut capacity = base.len();
     let mut previous_start = None;
     let mut previous_end = 0usize;
@@ -1691,7 +1734,9 @@ fn apply_resolved_output_splices(
         cursor = end;
     }
     bytes.extend_from_slice(&base[cursor..]);
-    Ok(bytes)
+    let same_length_output_splice =
+        same_length_output_splice_after_host_validation(base.len(), bytes.len(), edits);
+    Ok((bytes, same_length_output_splice))
 }
 
 fn merge_counter_snapshots(
@@ -2466,6 +2511,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_drain_marks_one_host_validated_same_length_splice() {
+        let mut actor = FakeActor {
+            edit_pages: [WasmEditPage {
+                edits: vec![WasmOutputSplice {
+                    offset: 2,
+                    delete_len: 2,
+                    insert: WasmGuestBytes::Inline(b"XY".to_vec()),
+                }],
+                outputs: None,
+            }]
+            .into(),
+            ..FakeActor::default()
+        };
+        let drained = drain_entity_transition_edits(
+            &mut actor,
+            WasmEntityTransition {
+                transition: WasmTransitionHandle(1),
+                document: WasmDocumentHandle(2),
+                edits: WasmEditCursorHandle(3),
+            },
+            b"abcdef",
+            None,
+            None,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect("one valid fixed-width renderer edit should drain");
+
+        assert_eq!(drained.bytes.as_ref(), b"abXYef");
+        assert_eq!(
+            drained.same_length_output_splice,
+            Some(ValidatedSameLengthOutputSplice {
+                offset: 2,
+                length: 2,
+            })
+        );
+        assert!(actor.finished);
+    }
+
+    #[test]
+    fn only_one_nonempty_fixed_width_output_splice_is_cas_eligible() {
+        let fixed_width = ResolvedOutputSplice {
+            offset: 2,
+            delete_len: 2,
+            insert: b"XY".to_vec(),
+        };
+        assert_eq!(
+            same_length_output_splice_after_host_validation(
+                b"abcdef".len(),
+                b"abXYef".len(),
+                std::slice::from_ref(&fixed_width),
+            ),
+            Some(ValidatedSameLengthOutputSplice {
+                offset: 2,
+                length: 2,
+            })
+        );
+
+        let length_changing = ResolvedOutputSplice {
+            offset: 2,
+            delete_len: 1,
+            insert: b"XY".to_vec(),
+        };
+        assert_eq!(
+            same_length_output_splice_after_host_validation(
+                b"abcdef".len(),
+                b"abXYdef".len(),
+                std::slice::from_ref(&length_changing),
+            ),
+            None
+        );
+        assert_eq!(
+            same_length_output_splice_after_host_validation(
+                b"abcdef".len(),
+                b"aXcdYf".len(),
+                &[
+                    ResolvedOutputSplice {
+                        offset: 1,
+                        delete_len: 1,
+                        insert: b"X".to_vec(),
+                    },
+                    ResolvedOutputSplice {
+                        offset: 4,
+                        delete_len: 1,
+                        insert: b"Y".to_vec(),
+                    },
+                ],
+            ),
+            None,
+        );
+        assert_eq!(
+            same_length_output_splice_after_host_validation(
+                b"abcdef".len(),
+                b"abcdef".len(),
+                &[ResolvedOutputSplice {
+                    offset: 6,
+                    delete_len: 1,
+                    insert: b"X".to_vec(),
+                }],
+            ),
+            None,
+        );
+    }
+
+    #[tokio::test]
     async fn edit_drain_reuses_exact_expected_blob_after_local_delta_proof() {
         let mut actor = FakeActor {
             edit_pages: [WasmEditPage {
@@ -2501,6 +2651,10 @@ mod tests {
         .unwrap();
         assert_eq!(drained.bytes.as_ptr(), expected.as_ptr());
         assert_eq!(drained.bytes.len(), expected.len());
+        assert_eq!(
+            drained.same_length_output_splice, None,
+            "known-delta validation reuses independently supplied bytes and never grants CAS splice provenance"
+        );
         assert!(actor.finished);
     }
 }
