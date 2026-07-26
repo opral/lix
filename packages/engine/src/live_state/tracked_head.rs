@@ -27,6 +27,7 @@ use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
+    JsonStoreWriter,
 };
 use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::{
@@ -433,7 +434,6 @@ impl TrackedHeadContext {
     /// may use historical replay, but that same generation preserves the
     /// branch's history-free untracked members until a fresh complete serving
     /// generation is published.
-    #[expect(clippy::unused_self)]
     pub(crate) async fn stage_collect_stale_current_state_generations<S>(
         &self,
         store: &S,
@@ -1162,14 +1162,12 @@ where
                     )?;
                 }
             }
-            JsonStoreContext::new()
-                .writer()
-                .stage_untracked_reclaim_candidates(
-                    self.writes,
-                    retired_untracked_json_refs
-                        .into_iter()
-                        .map(JsonRef::from_hash_bytes),
-                );
+            JsonStoreWriter::stage_untracked_reclaim_candidates(
+                self.writes,
+                retired_untracked_json_refs
+                    .into_iter()
+                    .map(JsonRef::from_hash_bytes),
+            );
         } else {
             stage_bootstrap_groups(
                 self.writes,

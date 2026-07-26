@@ -196,9 +196,7 @@ impl JsonStoreWriter {
     /// current-state owner in this atomic write. Repeated content hashes are
     /// idempotent: they remain one durable GC hint until a sweep proves them
     /// dead.
-    #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub(crate) fn stage_untracked_reclaim_candidates(
-        &self,
         writes: &mut StorageWriteSet,
         refs: impl IntoIterator<Item = JsonRef>,
     ) {
@@ -222,9 +220,7 @@ impl JsonStoreWriter {
 
     /// Removes only candidate hints whose payload was proved dead (or whose
     /// key was malformed) from the same pinned GC view.
-    #[expect(clippy::needless_pass_by_ref_mut, clippy::unused_self)]
     pub(crate) fn stage_delete_untracked_reclaim_candidates(
-        &self,
         writes: &mut StorageWriteSet,
         keys: impl IntoIterator<Item = StorageKey>,
     ) {

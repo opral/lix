@@ -228,8 +228,7 @@ where
             return;
         }
         let sql = format!(
-            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{}', lix_json('{{\"lane\":\"untracked\"}}'), true)",
-            UNTRACKED_PROBE_PATH
+            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', lix_json('{{\"lane\":\"untracked\"}}'), true)"
         );
         let affected = execute(&self.session, &sql).await.rows_affected();
         assert_eq!(affected, 1, "insert untracked overlay probe");

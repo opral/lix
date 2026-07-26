@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot};
-use crate::json_store::{JsonStoreContext, UntrackedJsonReclaimCandidate};
+use crate::json_store::{JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate};
 use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
@@ -483,7 +483,7 @@ where
         .collect::<Vec<_>>();
     let json_writer = JsonStoreContext::new().writer();
     json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
-    json_writer.stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
+    JsonStoreWriter::stage_delete_untracked_reclaim_candidates(writes, consumed_candidate_keys);
     // Checkpoint publication leaves prior dirty-index generations unreachable
     // in O(1). Reclaim those auxiliary records only in the asynchronous GC
     // pass so a foreground checkpoint never pays a history-sized delete cost.
@@ -952,9 +952,10 @@ mod tests {
     async fn stage_untracked_reclaim_candidate(storage: &Memory, json_ref: JsonRef) {
         let storage_adapter = StorageAdapter::new(storage.clone());
         let mut writes = storage_adapter.new_write_set();
-        JsonStoreContext::new()
-            .writer()
-            .stage_untracked_reclaim_candidates(&mut writes, [json_ref]);
+        crate::json_store::JsonStoreWriter::stage_untracked_reclaim_candidates(
+            &mut writes,
+            [json_ref],
+        );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await

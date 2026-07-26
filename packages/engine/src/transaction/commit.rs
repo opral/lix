@@ -1449,8 +1449,7 @@ async fn stage_branch_head_control_publications(
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "checkpoint '{}' has no published branch control for '{}'",
-                        checkpoint_commit_id, branch_id
+                        "checkpoint '{checkpoint_commit_id}' has no published branch control for '{branch_id}'"
                     ),
                 )
             })?;
