@@ -35,7 +35,7 @@ use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
-    EntityBatchReader, EntityBatchRequest, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
+    EntitySnapshotReader, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
     WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
@@ -60,7 +60,7 @@ pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
-    entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
+    entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
     query_source: Option<SqlHistoryQuerySource<S>>,
@@ -86,7 +86,7 @@ where
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
-                        entity_batch_reader.clone(),
+                        entity_snapshot_reader.clone(),
                     )),
                     WriteAccess::read_only(),
                 )?;
@@ -100,7 +100,7 @@ where
                         spec,
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
-                        entity_batch_reader.clone(),
+                        entity_snapshot_reader.clone(),
                     )),
                     WriteAccess::read_only(),
                 )?;
@@ -198,7 +198,7 @@ struct EntitySpec {
     surface_name: String,
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
-    entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
+    entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     branch_binding: BranchBinding,
@@ -210,14 +210,14 @@ impl EntitySpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         active_branch_id: String,
-        entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
+        entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
     ) -> Self {
         Self {
             surface_name: spec.schema_key.clone(),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
             live_state,
-            entity_batch_reader,
+            entity_snapshot_reader,
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
         }
@@ -237,14 +237,14 @@ impl EntitySpec {
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
-        entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
+        entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
     ) -> Self {
         Self {
             surface_name: format!("{}_by_branch", spec.schema_key),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
             live_state,
-            entity_batch_reader,
+            entity_snapshot_reader,
             branch_ref,
             branch_binding: BranchBinding::explicit(),
         }
@@ -333,8 +333,8 @@ impl TableSpec for EntitySpec {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = EntityBatchProjection::for_request(&request);
-        let direct_entity_batch = direct_entity_batch_eligible(&schema, &request, &row_filters)
-            .then(|| self.entity_batch_reader.clone())
+        let direct_entity_snapshot = direct_entity_batch_eligible(&schema, &request, &row_filters)
+            .then(|| self.entity_snapshot_reader.clone())
             .flatten();
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
@@ -347,7 +347,7 @@ impl TableSpec for EntitySpec {
                     request,
                     row_filters,
                     batch_projection,
-                    direct_entity_batch,
+                    direct_entity_snapshot,
                 ),
                 |(
                     spec,
@@ -356,18 +356,24 @@ impl TableSpec for EntitySpec {
                     request,
                     row_filters,
                     batch_projection,
-                    direct_entity_batch,
+                    direct_entity_snapshot,
                 )| async move {
-                    if let Some(direct_entity_batch) = direct_entity_batch
-                        && let Some(batch) = direct_entity_batch
-                            .scan_entity_batch(EntityBatchRequest {
-                                spec: Arc::clone(&spec),
-                                schema: Arc::clone(&schema),
-                                live_request: request.clone(),
-                            })
-                            .await?
+                    if let Some(direct_entity_snapshot) = direct_entity_snapshot
+                        && let Some(rows) = direct_entity_snapshot
+                            .scan_entity_snapshots(request.clone())
+                            .await
+                            .map_err(lix_error_to_datafusion_error)?
                     {
-                        return Ok(batch);
+                        let decoder = EntityProjectionDecoder::new(
+                            &spec,
+                            schema.fields().iter().map(|field| field.name().as_str()),
+                        )
+                        .map_err(entity_projection_error_to_datafusion_error)?;
+                        let columns = decoder
+                            .decode_arrow_columns(rows.iter().map(Option::as_deref))
+                            .map_err(entity_projection_error_to_datafusion_error)?;
+                        return RecordBatch::try_new(schema, columns)
+                            .map_err(DataFusionError::from);
                     }
                     let mut rows = live_state
                         .scan_rows(&request)

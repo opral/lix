@@ -1529,7 +1529,11 @@ async fn scan_entries(
 
 /// Broad entity projection consumes only snapshot payloads. Scan the fixed
 /// schema prefix and retain member bytes without allocating logical row
-/// identities or intermediate JSON strings.
+/// identities or intermediate JSON strings. `schema_group_prefix` uses the
+/// order-preserving entity-PK codec, so entries are returned in ascending
+/// logical primary-key order. Every live member is retained; file-backed
+/// siblings for one primary key are adjacent but intentionally have no extra
+/// tie ordering contract.
 async fn scan_entity_snapshots(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,

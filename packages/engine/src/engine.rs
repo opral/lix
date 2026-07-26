@@ -401,7 +401,7 @@ mod tests {
         StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
     };
 
-    async fn register_json_pointer_schema(session: &SessionContext<Memory>) {
+    async fn register_json_pointer_schema_in_scope(session: &SessionContext<Memory>, global: bool) {
         let schema = json!({
             "x-lix-key": "json_pointer",
             "x-lix-primary-key": ["/path"],
@@ -418,14 +418,25 @@ mod tests {
         assert_eq!(
             session
                 .execute(
-                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
-                    &[crate::Value::Text(schema.to_string())],
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), $2, false)",
+                    &[
+                        crate::Value::Text(schema.to_string()),
+                        crate::Value::Boolean(global),
+                    ],
                 )
                 .await
                 .expect("register json_pointer schema")
                 .rows_affected(),
             1
         );
+    }
+
+    async fn register_json_pointer_schema(session: &SessionContext<Memory>) {
+        register_json_pointer_schema_in_scope(session, false).await;
+    }
+
+    async fn register_global_json_pointer_schema(session: &SessionContext<Memory>) {
+        register_json_pointer_schema_in_scope(session, true).await;
     }
 
     #[tokio::test]
@@ -684,6 +695,210 @@ mod tests {
                 .get::<serde_json::Value>("value")
                 .expect("tracked row value"),
             json!({"n": 2})
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_public_fast_path_preserves_canonical_primary_key_order() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        // These values exercise the order-preserving tracked-head codec's
+        // edge cases: empty strings, embedded NULs, control bytes, and UTF-8.
+        // The no-LIMIT single-PK query below is the native public-result
+        // shape; the two-key ORDER BY forces the ordinary SQL executor and is
+        // the semantic control.
+        let paths = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
+        for (index, path) in paths.iter().enumerate() {
+            assert_eq!(
+                session
+                    .execute(
+                        "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))",
+                        &[
+                            crate::Value::Text((*path).to_string()),
+                            crate::Value::Text(json!({"index": index}).to_string()),
+                        ],
+                    )
+                    .await
+                    .expect("write ordered tracked row")
+                    .rows_affected(),
+                1
+            );
+        }
+
+        let native_shape = session
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("native public tracked read should execute");
+        let generic_control = session
+            .execute(
+                "SELECT path, value FROM json_pointer ORDER BY path, path",
+                &[],
+            )
+            .await
+            .expect("generic ordering control should execute");
+        let native_values = native_shape
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        let generic_values = generic_control
+            .rows()
+            .iter()
+            .map(|row| row.values().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            native_values, generic_values,
+            "the direct result must retain the normal SQL order and values"
+        );
+        assert_eq!(
+            native_shape
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("tracked row path"))
+                .collect::<Vec<_>>(),
+            paths,
+            "the raw tracked-head scan is ordered by the visible string PK"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_public_fast_path_falls_back_for_staged_transaction_rows() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) VALUES ('/committed', lix_json('{\"source\":\"tracked\"}'))",
+                &[],
+            )
+            .await
+            .expect("write committed tracked row");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should open");
+        transaction
+            .execute(
+                "INSERT INTO json_pointer (path, value) VALUES ('/staged', lix_json('{\"source\":\"staged\"}'))",
+                &[],
+            )
+            .await
+            .expect("stage tracked row");
+        let rows = transaction
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("transaction read must retain its staged overlay");
+        assert_eq!(
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("row path"))
+                .collect::<Vec<_>>(),
+            ["/committed", "/staged"],
+            "transaction contexts have no raw snapshot capability and must use the generic overlay"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction rollback should succeed");
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_public_fast_path_falls_back_for_untracked_entity_rows() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/untracked', lix_json('{\"source\":\"untracked\"}'), true)",
+                &[],
+            )
+            .await
+            .expect("write untracked entity row");
+
+        let rows = session
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("mixed tracked/untracked read should execute");
+        assert_eq!(
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("untracked path"))
+                .collect::<Vec<_>>(),
+            ["/untracked"],
+            "normal SQL must retain the merged tracked/untracked visibility path"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_public_fast_path_falls_back_for_global_tracked_rows() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let global_session = engine
+            .open_session(GLOBAL_BRANCH_ID)
+            .await
+            .expect("global session should open");
+        register_global_json_pointer_schema(&global_session).await;
+        global_session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_global, lixcol_untracked) \
+                 VALUES ('/global', lix_json('{\"source\":\"global\"}'), true, false)",
+                &[],
+            )
+            .await
+            .expect("write global tracked entity row");
+
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        let rows = session
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("global-overlaid tracked read should execute");
+        assert_eq!(
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("global path"))
+                .collect::<Vec<_>>(),
+            ["/global"],
+            "a global tracked overlay must retain the general visibility resolver"
         );
     }
 

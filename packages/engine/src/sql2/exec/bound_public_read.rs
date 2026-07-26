@@ -1,4 +1,4 @@
-//! Strict native reads for the common public entity primary-key shape.
+//! Strict native reads for common public entity shapes.
 //!
 //! Lix keeps the full SQL surface in DataFusion.  This module intentionally
 //! recognizes only a small shape which has a direct, row-oriented execution
@@ -19,6 +19,9 @@ use crate::entity_pk::EntityPk;
 use crate::live_state::{LiveStateFilter, LiveStateProjection, LiveStateScanRequest};
 use crate::sql2::SqlExecutionContext;
 use crate::sql2::catalog::{EntityColumnType, PublicSurfaceKind};
+use crate::sql2::entity_projection::{
+    EntityProjectionDecoder, entity_projection_error_to_lix_error,
+};
 use crate::{LixError, SqlQueryResult, Value};
 
 /// Attempts the one public entity read shape that can be evaluated directly
@@ -33,7 +36,10 @@ pub(crate) async fn try_execute_bound_public_read<C>(
 where
     C: SqlExecutionContext + ?Sized,
 {
-    let Some(shape) = strict_entity_primary_key_read(statement, params) else {
+    let Some(shape) = strict_entity_primary_key_read(statement, params)
+        .map(StrictEntityRead::PrimaryKey)
+        .or_else(|| strict_entity_broad_read(statement, params).map(StrictEntityRead::Broad))
+    else {
         return Ok(None);
     };
 
@@ -43,7 +49,7 @@ where
     crate::sql2::bind_read_statement(sql, statement)?;
 
     let catalog = ctx.public_catalog().await?;
-    let Some(surface) = catalog.surface(&shape.table_name) else {
+    let Some(surface) = catalog.surface(shape.table_name()) else {
         return Ok(None);
     };
     let PublicSurfaceKind::EntityBase { schema_key } = &surface.kind else {
@@ -55,53 +61,101 @@ where
     let Some(primary_key_column) = single_top_level_string_primary_key(spec) else {
         return Ok(None);
     };
-    if primary_key_column != shape.primary_key_column
-        || shape.projection.iter().any(|column| {
-            !matches!(
-                spec.visible_column(column).map(|column| column.column_type),
-                Some(EntityColumnType::String | EntityColumnType::Json)
-            )
-        })
-    {
-        return Ok(None);
+    match shape {
+        StrictEntityRead::PrimaryKey(shape) => {
+            if primary_key_column != shape.primary_key_column
+                || shape.projection.iter().any(|column| {
+                    !matches!(
+                        spec.visible_column(column).map(|column| column.column_type),
+                        Some(EntityColumnType::String | EntityColumnType::Json)
+                    )
+                })
+            {
+                return Ok(None);
+            }
+
+            let entity_pks = shape
+                .primary_key_values
+                .into_iter()
+                .map(EntityPk::single)
+                .collect::<Vec<_>>();
+            let mut rows = ctx
+                .live_state()
+                .scan_rows(&LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec![schema_key.clone()],
+                        entity_pks,
+                        branch_ids: vec![ctx.active_branch_id().to_string()],
+                        include_tombstones: false,
+                        ..LiveStateFilter::default()
+                    },
+                    projection: LiveStateProjection {
+                        columns: vec!["snapshot_content".to_string()],
+                    },
+                    limit: None,
+                })
+                .await?;
+
+            // The accepted ORDER BY is the complete one-column primary key.
+            // Retain multiple file-backed identities for one logical primary
+            // key; `file_id` is a first-class row identity and must not be
+            // collapsed by this route.
+            rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
+            let result_rows = rows
+                .iter()
+                .map(|row| {
+                    materialize_row(spec, &shape.projection, row.snapshot_content.as_deref())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            Ok(Some(SqlQueryResult {
+                columns: shape.projection,
+                rows: result_rows,
+                notices: Vec::new(),
+            }))
+        }
+        StrictEntityRead::Broad(shape) => {
+            if primary_key_column != shape.primary_key_column
+                || shape
+                    .projection
+                    .iter()
+                    .any(|column| spec.visible_column(column).is_none())
+            {
+                return Ok(None);
+            }
+            let Some(reader) = ctx.entity_snapshot_reader() else {
+                return Ok(None);
+            };
+            let Some(snapshots) = reader
+                .scan_entity_snapshots(LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec![schema_key.clone()],
+                        branch_ids: vec![ctx.active_branch_id().to_string()],
+                        include_tombstones: false,
+                        ..LiveStateFilter::default()
+                    },
+                    projection: LiveStateProjection {
+                        columns: vec!["snapshot_content".to_string()],
+                    },
+                    limit: None,
+                })
+                .await?
+            else {
+                return Ok(None);
+            };
+            let decoder =
+                EntityProjectionDecoder::new(spec, shape.projection.iter().map(String::as_str))
+                    .map_err(entity_projection_error_to_lix_error)?;
+            let rows = decoder
+                .decode_value_rows(snapshots.iter().map(Option::as_deref))
+                .map_err(entity_projection_error_to_lix_error)?;
+            Ok(Some(SqlQueryResult {
+                columns: shape.projection,
+                rows,
+                notices: Vec::new(),
+            }))
+        }
     }
-
-    let entity_pks = shape
-        .primary_key_values
-        .into_iter()
-        .map(EntityPk::single)
-        .collect::<Vec<_>>();
-    let mut rows = ctx
-        .live_state()
-        .scan_rows(&LiveStateScanRequest {
-            filter: LiveStateFilter {
-                schema_keys: vec![schema_key.clone()],
-                entity_pks,
-                branch_ids: vec![ctx.active_branch_id().to_string()],
-                include_tombstones: false,
-                ..LiveStateFilter::default()
-            },
-            projection: LiveStateProjection {
-                columns: vec!["snapshot_content".to_string()],
-            },
-            limit: None,
-        })
-        .await?;
-
-    // The accepted ORDER BY is the complete one-column primary key. Retain
-    // multiple file-backed identities for one logical primary key; `file_id`
-    // is a first-class row identity and must not be collapsed by this route.
-    rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
-    let result_rows = rows
-        .iter()
-        .map(|row| materialize_row(spec, &shape.projection, row.snapshot_content.as_deref()))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(Some(SqlQueryResult {
-        columns: shape.projection,
-        rows: result_rows,
-        notices: Vec::new(),
-    }))
 }
 
 fn single_top_level_string_primary_key(
@@ -190,6 +244,27 @@ struct StrictEntityPrimaryKeyRead {
     primary_key_values: Vec<String>,
 }
 
+enum StrictEntityRead {
+    PrimaryKey(StrictEntityPrimaryKeyRead),
+    Broad(StrictEntityBroadRead),
+}
+
+impl StrictEntityRead {
+    fn table_name(&self) -> &str {
+        match self {
+            Self::PrimaryKey(shape) => &shape.table_name,
+            Self::Broad(shape) => &shape.table_name,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct StrictEntityBroadRead {
+    table_name: String,
+    projection: Vec<String>,
+    primary_key_column: String,
+}
+
 /// Recognizes a single, active entity table with an `IN`/`=` primary-key
 /// predicate and canonical ascending primary-key order. It intentionally does
 /// not inspect catalog metadata: catalog mismatches are handled by the caller
@@ -217,6 +292,29 @@ fn strict_entity_primary_key_read(
         projection,
         primary_key_column,
         primary_key_values,
+    })
+}
+
+/// Recognizes the canonical broad tracked entity read. The packed head index
+/// already stores one schema in primary-key order, so this shape can return
+/// final public rows without routing an otherwise no-op sort through
+/// DataFusion. Any clause that needs general SQL semantics remains a normal
+/// DataFusion query.
+fn strict_entity_broad_read(
+    statement: &DataFusionStatement,
+    params: &[Value],
+) -> Option<StrictEntityBroadRead> {
+    if !params.is_empty() {
+        return None;
+    }
+    let (query, select, table_name) = strict_single_table_select(statement)?;
+    if query.limit_clause.is_some() || query.fetch.is_some() || select.selection.is_some() {
+        return None;
+    }
+    Some(StrictEntityBroadRead {
+        table_name,
+        projection: strict_projection(&select.projection)?,
+        primary_key_column: canonical_ascending_order_column(query)?,
     })
 }
 
@@ -307,17 +405,18 @@ fn strict_single_table_select(
 fn strict_projection(
     projection: &[datafusion::sql::sqlparser::ast::SelectItem],
 ) -> Option<Vec<String>> {
-    projection
-        .iter()
-        .map(|item| match item {
-            datafusion::sql::sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(column))
-                if column.quote_style.is_none() =>
-            {
-                Some(column.value.to_ascii_lowercase())
-            }
-            _ => None,
-        })
-        .collect()
+    let columns =
+        projection
+            .iter()
+            .map(|item| match item {
+                datafusion::sql::sqlparser::ast::SelectItem::UnnamedExpr(Expr::Identifier(
+                    column,
+                )) if column.quote_style.is_none() => Some(column.value.to_ascii_lowercase()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+    let unique_count = columns.iter().collect::<BTreeSet<_>>().len();
+    (unique_count == columns.len()).then_some(columns)
 }
 
 fn strict_primary_key_values(expression: &Expr, params: &[Value]) -> Option<(String, Vec<String>)> {
@@ -375,22 +474,26 @@ fn strict_text_value(
 }
 
 fn canonical_primary_key_order(query: &Query, primary_key_column: &str) -> bool {
+    canonical_ascending_order_column(query).as_deref() == Some(primary_key_column)
+}
+
+fn canonical_ascending_order_column(query: &Query) -> Option<String> {
     let Some(order_by) = &query.order_by else {
-        return false;
+        return None;
     };
     if order_by.interpolate.is_some() {
-        return false;
+        return None;
     }
     let OrderByKind::Expressions(expressions) = &order_by.kind else {
-        return false;
+        return None;
     };
     let [order] = expressions.as_slice() else {
-        return false;
+        return None;
     };
-    order.with_fill.is_none()
+    (order.with_fill.is_none()
         && order.options.asc != Some(false)
-        && order.options.nulls_first.is_none()
-        && strict_identifier(&order.expr).as_deref() == Some(primary_key_column)
+        && order.options.nulls_first.is_none())
+    .then(|| strict_identifier(&order.expr))?
 }
 
 fn strict_identifier(expression: &Expr) -> Option<String> {
@@ -441,6 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_benchmark_broad_read() {
+        let shape = strict_entity_broad_read(
+            &parse("SELECT path, value FROM json_pointer ORDER BY path"),
+            &[],
+        )
+        .expect("benchmark query should use the broad direct route");
+
+        assert_eq!(shape.table_name, "json_pointer");
+        assert_eq!(shape.projection, ["path", "value"]);
+        assert_eq!(shape.primary_key_column, "path");
+    }
+
+    #[test]
     fn rejects_noncanonical_or_ambiguous_sql() {
         for sql in [
             "SELECT path, value FROM json_pointer WHERE path IN ('/a')",
@@ -454,5 +570,31 @@ mod tests {
                 "{sql} must fall back"
             );
         }
+    }
+
+    #[test]
+    fn broad_read_rejects_any_clause_that_needs_general_sql() {
+        for sql in [
+            "SELECT path, value FROM json_pointer",
+            "SELECT path, value FROM json_pointer ORDER BY path DESC",
+            "SELECT path, value FROM json_pointer WHERE true ORDER BY path",
+            "SELECT path, value FROM json_pointer ORDER BY path LIMIT 1",
+            "SELECT path, value FROM json_pointer AS p ORDER BY path",
+            "SELECT * FROM json_pointer ORDER BY path",
+            "SELECT path, path FROM json_pointer ORDER BY path",
+        ] {
+            assert!(
+                strict_entity_broad_read(&parse(sql), &[]).is_none(),
+                "{sql} must fall back"
+            );
+        }
+        assert!(
+            strict_entity_broad_read(
+                &parse("SELECT path, value FROM json_pointer ORDER BY path"),
+                &[Value::Text("unused".to_string())],
+            )
+            .is_none(),
+            "an unused parameter must retain normal SQL validation"
+        );
     }
 }
