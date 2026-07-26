@@ -41,7 +41,7 @@ pub(crate) use context::{
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
-pub(crate) use entity_batch::{EntityBatchReader, EntityBatchRequest, TrackedEntityBatchReader};
+pub(crate) use entity_batch::{EntitySnapshotReader, TrackedEntitySnapshotReader};
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{

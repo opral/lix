@@ -518,7 +518,7 @@ where
         session,
         ctx.active_branch_id(),
         ctx.live_state(),
-        ctx.entity_batch_reader(),
+        ctx.entity_snapshot_reader(),
         Arc::clone(&branch_ref),
         needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
         if needs_entity_history {

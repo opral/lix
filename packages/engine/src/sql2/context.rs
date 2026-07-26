@@ -64,11 +64,11 @@ pub(crate) trait SqlExecutionContext: Sync {
 
     fn active_branch_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateReader>;
-    /// Supplies the committed tracked-head entity serving capability when the
+    /// Supplies the committed tracked-head entity snapshot capability when the
     /// read context can prove it is scoped to one immutable storage snapshot.
     /// Generic and transaction contexts intentionally retain the default
     /// materialized-row path.
-    fn entity_batch_reader(&self) -> Option<Arc<dyn super::EntityBatchReader>> {
+    fn entity_snapshot_reader(&self) -> Option<Arc<dyn super::EntitySnapshotReader>> {
         None
     }
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
