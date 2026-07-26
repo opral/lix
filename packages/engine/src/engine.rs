@@ -563,7 +563,7 @@ mod tests {
         writes.put(
             crate::init::REPOSITORY_PROTOCOL_SPACE,
             crate::init::REPOSITORY_PROTOCOL_KEY,
-            &b"tracked-direct-plane.v6"[..],
+            &b"tracked-direct-plane.v8"[..],
         );
         for group in groups {
             writes.put(
@@ -609,7 +609,7 @@ mod tests {
         writes.put(
             crate::init::REPOSITORY_PROTOCOL_SPACE,
             crate::init::REPOSITORY_PROTOCOL_KEY,
-            &b"tracked-direct-plane.v6"[..],
+            &b"tracked-direct-plane.v8"[..],
         );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())

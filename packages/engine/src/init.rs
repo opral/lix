@@ -39,15 +39,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The v8 direct branch-control plane binds checkpoint-relative first-before
-/// summaries and their sparse-index coverage to the serving-head marker.
-/// Those proofs are only sound for repositories initialized with this
-/// protocol, so opening an older store must fail closed rather than mixing an
-/// older group wire format with current visibility and working-diff rules.
+/// The v9 direct branch-control plane uses bounded packed tracked commit-delta
+/// segments. Those records are replayed by both historical reads and diffs,
+/// so opening an older store must fail closed rather than mixing one-row delta
+/// storage with the current visibility and working-diff rules.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v8";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v9";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -97,7 +96,7 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
 /// Pure seed plan for initializing an engine repository.
 ///
 /// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
-/// the v6 direct control plane and retain a standalone immutable branch-ref
+/// the v9 direct control plane and retain a standalone immutable branch-ref
 /// ledger change; only ordinary untracked data enters the flat live-state
 /// sidecar.
 pub(crate) struct InitSeedPlan {
@@ -358,7 +357,7 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        // Seed both visible branches with a complete v6 serving generation.
+        // Seed both visible branches with a complete v9 serving generation.
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
         // historical fallback immediately after initialization.
