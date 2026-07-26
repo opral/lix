@@ -1,3 +1,4 @@
+use crate::markdown_file::parse_markdown_source;
 use crate::{
     ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace, InputSplice, NODE_SCHEMA_KEY,
 };
@@ -372,4 +373,70 @@ fn entity_edit_returns_a_minimal_file_splice_and_preserves_old_fork() {
     assert_eq!(edits[0].insert.as_slice(), b"After");
     assert_eq!(after.accepted_bytes(), b"After\n\nUntouched\n");
     assert_eq!(old.accepted_bytes(), source);
+}
+
+#[test]
+fn canonical_literal_prose_fast_path_matches_forced_fallback_bytes_and_entities() {
+    let cases = [
+        "Café, naïve prose — with commas, semicolons; parentheses (like these), and a question?\n\nSecond paragraph has 42% ordinary prose.\n",
+        "Unicode punctuation… “quoted prose” stays literal; so do apostrophes.\n\nA second plain paragraph, too.\n",
+    ];
+
+    for (index, source) in cases.into_iter().enumerate() {
+        let parsed = parse_markdown_source(source).expect("literal prose should parse");
+        assert!(
+            parsed.canonical_literal_paragraph_layout,
+            "{source:?} should meet the strict literal-prose predicate"
+        );
+        assert_eq!(parsed.canonical_render.as_deref(), Some(source.as_bytes()));
+
+        let namespace = IdNamespace::from_halves(12, u64::try_from(index).unwrap());
+        let (fast_document, fast_changes) =
+            Document::open_file(source.as_bytes().to_vec(), Some("prose.md"), namespace)
+                .expect("fast-path document should open");
+        let (fallback_document, fallback_changes) = Document::open_file_forced_canonical_fallback(
+            source.as_bytes().to_vec(),
+            Some("prose.md"),
+            namespace,
+        )
+        .expect("forced-fallback document should open");
+
+        assert_eq!(fast_document.accepted_bytes(), source.as_bytes());
+        assert_eq!(fallback_document.accepted_bytes(), source.as_bytes());
+        assert_eq!(fast_changes, fallback_changes);
+    }
+}
+
+#[test]
+fn literal_prose_fast_path_rejects_markdown_syntax_and_noncanonical_layout() {
+    let cases = [
+        ("heading", "# Heading\n\nPlain prose.\n"),
+        ("inline syntax", "Plain *emphasis* is Markdown syntax.\n"),
+        (
+            "soft line break",
+            "Plain prose\ncontinues on the next line.\n",
+        ),
+        (
+            "extra blank line",
+            "First paragraph.\n\n\nSecond paragraph.\n",
+        ),
+        (
+            "trailing spaces",
+            "First paragraph.  \n\nSecond paragraph.\n",
+        ),
+        ("crlf", "First paragraph.\r\n\r\nSecond paragraph.\r\n"),
+        (
+            "unsafe literal punctuation",
+            "A [literal] bracket needs serializer escaping.\n",
+        ),
+    ];
+
+    for (name, source) in cases {
+        let parsed = parse_markdown_source(source)
+            .unwrap_or_else(|error| panic!("{name} should remain valid Markdown: {error:?}"));
+        assert!(
+            !parsed.canonical_literal_paragraph_layout,
+            "{name} must use the existing canonical-render fallback"
+        );
+    }
 }

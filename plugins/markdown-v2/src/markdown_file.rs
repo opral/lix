@@ -18,6 +18,10 @@ use uuid::Uuid;
 pub(crate) struct ParsedMarkdown {
     pub(crate) root: NodeTree,
     pub(crate) top_level_ranges: Vec<Range<usize>>,
+    /// The source was proven to be canonical literal prose directly from the
+    /// parser AST and source spans. `parse_markdown_source` can then retain
+    /// the original bytes without building and serializing a second AST.
+    pub(crate) canonical_literal_paragraph_layout: bool,
     /// The stable canonical bytes already rendered while parsing. Callers that
     /// need to compare source layout can consume this instead of rendering the
     /// reconstructed tree a second time.
@@ -25,9 +29,16 @@ pub(crate) struct ParsedMarkdown {
 }
 
 pub(crate) fn parse_file(file: &File) -> Result<ParsedMarkdown, PluginError> {
+    parse_file_with_literal_fast_path(file, true)
+}
+
+pub(crate) fn parse_file_with_literal_fast_path(
+    file: &File,
+    allow_literal_fast_path: bool,
+) -> Result<ParsedMarkdown, PluginError> {
     let (buf, encoding) = buffer_with_encoding(&file.data);
     let (decoded, _had_errors) = encoding.decode_without_bom_handling(buf);
-    parse_markdown_source(&decoded)
+    parse_markdown_source_with_literal_fast_path(&decoded, allow_literal_fast_path)
 }
 
 fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
@@ -41,11 +52,25 @@ fn buffer_with_encoding(buf: &[u8]) -> (&[u8], &'static Encoding) {
 }
 
 pub(crate) fn parse_markdown_source(source: &str) -> Result<ParsedMarkdown, PluginError> {
+    parse_markdown_source_with_literal_fast_path(source, true)
+}
+
+fn parse_markdown_source_with_literal_fast_path(
+    source: &str,
+    allow_literal_fast_path: bool,
+) -> Result<ParsedMarkdown, PluginError> {
+    let mut parsed = parse_markdown_source_once(source)?;
+    let source_is_canonical_literal_paragraph_layout = parsed.canonical_literal_paragraph_layout;
+    if allow_literal_fast_path && source_is_canonical_literal_paragraph_layout {
+        parsed.canonical_render = Some(source.as_bytes().to_vec());
+        return Ok(parsed);
+    }
     let mut canonical = source.to_string();
-    let mut parsed = parse_markdown_source_once(&canonical)?;
     for _ in 0..8 {
         let rendered = render_tree(&parsed.root)?;
         if rendered == canonical.as_bytes() {
+            parsed.canonical_literal_paragraph_layout =
+                source_is_canonical_literal_paragraph_layout;
             parsed.canonical_render = Some(rendered);
             return Ok(parsed);
         }
@@ -80,6 +105,8 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
     }
 
     repair_definition_adjacency(&mut output.document, source);
+    let canonical_literal_paragraph_layout =
+        canonical_literal_paragraph_layout(&output.document, source);
     let top_level_ranges = output
         .document
         .children
@@ -116,8 +143,135 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
     Ok(ParsedMarkdown {
         root,
         top_level_ranges,
+        canonical_literal_paragraph_layout,
         canonical_render: None,
     })
+}
+
+/// Proves that the parser produced the exact canonical form for a deliberately
+/// narrow, high-frequency Markdown shape: one literal text paragraph per
+/// line, blank-line separated, ending in LF. The predicate runs on parser AST
+/// spans before NodeTree payload JSON is built, so its linear scan is much
+/// cheaper than the canonical serializer/fixpoint work it avoids.
+///
+/// The character filter excludes every ASCII construct whose Markdown
+/// serializer may add an escape. It intentionally accepts ordinary prose,
+/// Unicode, and punctuation that is never escaped in a literal paragraph.
+fn canonical_literal_paragraph_layout(document: &md::Document, source: &str) -> bool {
+    if source.is_empty() || !source.ends_with('\n') || source.as_bytes().contains(&b'\r') {
+        return false;
+    }
+    let Some(body) = source.strip_suffix('\n') else {
+        return false;
+    };
+    if body.is_empty() || document.children.is_empty() {
+        return false;
+    }
+
+    let mut start = 0;
+    for (index, block) in document.children.iter().enumerate() {
+        let last = index + 1 == document.children.len();
+        let end = if last {
+            body.len()
+        } else {
+            let Some(relative) = body[start..].find("\n\n") else {
+                return false;
+            };
+            start + relative
+        };
+        let Some(raw) = source.get(start..end) else {
+            return false;
+        };
+        if !literal_paragraph_source_is_safe(raw) {
+            return false;
+        }
+
+        let md::Block::Paragraph(paragraph) = block else {
+            return false;
+        };
+        let Some(paragraph_span) = paragraph.meta.span else {
+            return false;
+        };
+        if paragraph_span.start != start || paragraph_span.end != end {
+            return false;
+        }
+        let [md::Inline::Text(text)] = paragraph.children.as_slice() else {
+            return false;
+        };
+        let Some(text_span) = text.meta.span else {
+            return false;
+        };
+        if text_span.start != start || text_span.end != end || text.value != raw {
+            return false;
+        }
+
+        if last {
+            return end + 1 == source.len();
+        }
+        start = end + 2;
+    }
+    false
+}
+
+fn literal_paragraph_source_is_safe(raw: &str) -> bool {
+    let Some(first) = raw.chars().next() else {
+        return false;
+    };
+    if matches!(first, ' ' | '\t' | '-' | '+' | '=' | '>')
+        || matches!(raw.chars().last(), Some(' ' | '\t'))
+        || raw.contains('\n')
+        || starts_with_ambiguous_ordered_list_marker(raw)
+    {
+        return false;
+    }
+    let bytes = raw.as_bytes();
+    for (index, &byte) in bytes.iter().enumerate() {
+        if matches!(
+            byte,
+            b'\\'
+                | b'&'
+                | b'`'
+                | b'|'
+                | b'*'
+                | b'_'
+                | b'+'
+                | b'='
+                | b'~'
+                | b'^'
+                | b'['
+                | b']'
+                | b'$'
+                | b'<'
+                | b'>'
+                | b'{'
+                | b'}'
+                | b':'
+                | b'@'
+                | b'#'
+                | b'\0'
+        ) {
+            return false;
+        }
+        if byte == b'.' && index >= 3 && bytes[index - 3..index].eq_ignore_ascii_case(b"www") {
+            return false;
+        }
+    }
+    raw.chars().all(|character| {
+        character == ' ' || (!character.is_control() && !character.is_whitespace())
+    })
+}
+
+fn starts_with_ambiguous_ordered_list_marker(raw: &str) -> bool {
+    let digits = raw.bytes().take_while(u8::is_ascii_digit).count();
+    let Some(marker) = raw.as_bytes().get(digits) else {
+        return false;
+    };
+    if !matches!(*marker, b'.' | b')') {
+        return false;
+    }
+    raw.get(digits + 1..)
+        .and_then(|tail| tail.chars().next())
+        .is_none_or(char::is_whitespace)
 }
 
 fn repair_definition_adjacency(document: &mut md::Document, source: &str) {
