@@ -82,7 +82,6 @@ class RemoteLixBinding implements LixBinding {
 	readonly #requestBlobBases = new Map<string, RequestBlobBase>();
 	#sessionId: string | undefined;
 	#activeBranchId: string | undefined;
-	#supportsRequestBlobSplice = false;
 	#requestBlobBaseBytes = 0;
 	#acceptingOperations = true;
 	#operationQueue: Promise<void> = Promise.resolve();
@@ -137,7 +136,6 @@ class RemoteLixBinding implements LixBinding {
 		);
 		this.#sessionId = handshake.sessionId;
 		this.#activeBranchId = handshake.activeBranchId;
-		this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
 	}
 
 	async execute(
@@ -262,7 +260,6 @@ class RemoteLixBinding implements LixBinding {
 					throw protocolError("remote handshake changed sessionId");
 				}
 				this.#activeBranchId = handshake.activeBranchId;
-				this.#supportsRequestBlobSplice = handshake.requestBlobSplice;
 			}
 			return this.#activeBranchId;
 		});
@@ -493,7 +490,6 @@ class RemoteLixBinding implements LixBinding {
 		const prepared = await Promise.all(
 			params.map(async (param, index): Promise<PreparedRequestParam> => {
 				if (
-					!this.#supportsRequestBlobSplice ||
 					param.kind !== "blob" ||
 					param.blob.byteLength < REQUEST_BLOB_DELTA_MIN_BYTES ||
 					param.blob.byteLength > REQUEST_BLOB_BASE_MAX_BYTES

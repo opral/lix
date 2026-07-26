@@ -519,7 +519,7 @@ test("remote execute keeps small and low-saving blob updates full", async () => 
 	expect(bodies[2]).not.toHaveProperty("cacheBlobs");
 });
 
-test("remote execute keeps large writes full without the splice capability", async () => {
+test("remote protocol v1 uses blob splices without capability negotiation", async () => {
 	const bodies: Array<Record<string, unknown>> = [];
 	const lix = await openLix({
 		server: {
@@ -552,12 +552,14 @@ test("remote execute keeps large writes full without the splice capability", asy
 	await lix.close();
 
 	expect(bodies).toHaveLength(2);
-	for (const body of bodies) {
-		expect((body.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
-			"blob",
-		);
-		expect(body).not.toHaveProperty("cacheBlobs");
-	}
+	expect((bodies[0]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob",
+	);
+	expect(bodies[0]?.cacheBlobs).toBe(true);
+	expect((bodies[1]?.params as Array<Record<string, unknown>>)[0]?.kind).toBe(
+		"blob-splice",
+	);
+	expect(bodies[1]?.cacheBlobs).toBe(true);
 });
 
 test("remote executeBatch uses blob splices for stable statement slots", async () => {
@@ -1174,7 +1176,6 @@ function handshakeResponse() {
 		protocolVersion: 1,
 		activeBranchId: "main-id",
 		sessionId: "session-1",
-		capabilities: { requestBlobSplice: true },
 	});
 }
 

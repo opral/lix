@@ -6,26 +6,6 @@ import {
 	encodeWireValue,
 } from "./protocol.js";
 
-test.each([
-	[undefined, false],
-	[{}, false],
-	[{ requestBlobSplice: false }, false],
-	[{ requestBlobSplice: "true" }, false],
-	[{ requestBlobSplice: true }, true],
-])(
-	"remote handshake negotiates only the exact blob splice capability: %j",
-	(capabilities, expected) => {
-		expect(
-			decodeHandshake({
-				protocolVersion: 1,
-				activeBranchId: "main-id",
-				sessionId: "session-1",
-				...(capabilities === undefined ? {} : { capabilities }),
-			}).requestBlobSplice,
-		).toBe(expected);
-	},
-);
-
 test("remote blobs use native typed-array base64 when available", () => {
 	const prototype = Uint8Array.prototype as Uint8Array & {
 		toBase64?: () => string;
