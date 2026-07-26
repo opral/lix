@@ -964,9 +964,9 @@ where
         };
         let mut keys = BTreeSet::new();
         for commit_id in interval {
-            for (key, _) in
-                storage::scan_commit_delta_values(&self.store, commit_id, &request.schema_keys)
-                    .await?
+            for (key, _) in self
+                .scan_replayed_commit_delta_values(commit_id, &request.schema_keys)
+                .await?
             {
                 if request.matches_key(&key) {
                     keys.insert(key);
@@ -1347,6 +1347,26 @@ where
         Ok(output)
     }
 
+    /// Scans one commit's packed deltas and promotes the decoded values into
+    /// the existing identity cache. A diff first discovers its changed keys by
+    /// scanning the first-parent interval, then resolves those same keys at
+    /// both endpoints. Keeping the scan's decoded values avoids reopening the
+    /// same packed segment for the endpoint replay while preserving the
+    /// cache's identity-routed semantics.
+    async fn scan_replayed_commit_delta_values(
+        &mut self,
+        commit_id: CommitId,
+        schema_keys: &[String],
+    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+        let entries =
+            storage::scan_commit_delta_values(&self.store, commit_id, schema_keys).await?;
+        for (key, value) in &entries {
+            self.commit_delta_value_cache
+                .insert((commit_id, key.clone()), Some(value.clone()));
+        }
+        Ok(entries)
+    }
+
     /// Replays a partially constrained rootless scan without first
     /// reconstructing every tracked identity. The schema prefix is enough to
     /// discard unrelated commit deltas at storage-read time; entity and file
@@ -1373,9 +1393,9 @@ where
             BTreeMap::new()
         };
         for commit_id in commits.iter().rev() {
-            for (key, delta) in
-                storage::scan_commit_delta_values(&self.store, *commit_id, &request.schema_keys)
-                    .await?
+            for (key, delta) in self
+                .scan_replayed_commit_delta_values(*commit_id, &request.schema_keys)
+                .await?
             {
                 if !request.matches_key(&key) {
                     continue;

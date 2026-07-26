@@ -4,29 +4,32 @@
     clippy::cmp_owned
 )]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::changelog::{ChangeId, CommitId};
-use crate::common::LixTimestamp;
+use crate::changelog::CommitId;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageError,
-    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StoragePrefix,
-    StorageProjectedValue, StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId,
-    StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyResult,
+    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
+    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::tracked_state::codec::{
-    PendingChunkWrite, decode_key, encode_key_ref, encode_schema_key_prefix,
+    DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkWrite, decode_key,
+    decode_node_ref, decode_value, encode_key_ref, encode_leaf_node, encode_schema_key_prefix,
+    encode_value_ref,
 };
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_TREE_CHUNK_NAMESPACE: &str = "tracked_state.tree_chunk";
 pub(crate) const TRACKED_STATE_COMMIT_ROOT_NAMESPACE: &str = "tracked_state.commit_root";
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_NAMESPACE: &str = "tracked_state.commit_delta.v1";
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
+    "tracked_state.commit_delta_manifest.v2";
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
+    "tracked_state.commit_delta_segment.v2";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -35,16 +38,22 @@ pub(crate) const TRACKED_STATE_COMMIT_ROOT_SPACE: StorageSpace = StorageSpace::n
     StorageSpaceId(0x0004_0004),
     TRACKED_STATE_COMMIT_ROOT_NAMESPACE,
 );
-/// Identity-addressable mutation records for each tracked commit.
+/// One commit-addressed directory for bounded packed tracked deltas.
 ///
-/// Immutable roots are sparse checkpoints. This compact delta table keeps
-/// historical point reads bounded across rootless first-parent intervals:
-/// callers can probe only the requested identities instead of hydrating every
-/// changelog change merely to discover its key.
-pub(crate) const TRACKED_STATE_COMMIT_DELTA_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0004_0010),
-    TRACKED_STATE_COMMIT_DELTA_NAMESPACE,
+/// Immutable roots are sparse checkpoints. The manifest maps an identity to
+/// one small front-coded segment, avoiding both one RocksDB key per mutation
+/// on writes and full-commit hydration for historical point replay.
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0019),
+    TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE,
 );
+pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_001a),
+    TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
+);
+
+const COMMIT_DELTA_SEGMENT_ROWS: usize = 256;
+const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD2";
 
 // Version the root metadata independently of storage backends. Version 3 is a
 // hard cut for derived commit rows, prefix-friendly keys, and compact tree
@@ -52,13 +61,24 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SPACE: StorageSpace = StorageSpace::
 // inherited or traversed.
 const TRACKED_STATE_COMMIT_ROOT_MAGIC: &[u8] = b"LXTR3";
 
-#[derive(Debug, Clone, Copy, musli::Encode, musli::Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
-struct CommitDeltaValue {
-    change_id: ChangeId,
-    deleted: bool,
-    created_at: LixTimestamp,
-    updated_at: LixTimestamp,
+struct CommitDeltaManifest {
+    /// A complete leaf payload for a commit that fits in one segment. Keeping
+    /// it in the directory preserves the one-record shape of tiny commits;
+    /// larger commits use the indexed segment list below.
+    #[musli(bytes)]
+    inline_segment: Vec<u8>,
+    segments: Vec<CommitDeltaSegmentBounds>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct CommitDeltaSegmentBounds {
+    #[musli(bytes)]
+    first_key: Vec<u8>,
+    #[musli(bytes)]
+    last_key: Vec<u8>,
 }
 
 async fn get_one(
@@ -92,14 +112,23 @@ fn commit_root_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
-fn commit_delta_prefix(commit_id: CommitId) -> Vec<u8> {
+fn commit_delta_manifest_key(commit_id: CommitId) -> Vec<u8> {
     commit_id.as_uuid().as_bytes().to_vec()
 }
 
-fn commit_delta_key(commit_id: CommitId, key: TrackedStateKeyRef<'_>) -> Vec<u8> {
-    let mut encoded = commit_delta_prefix(commit_id);
-    encoded.extend_from_slice(&encode_key_ref(key));
-    encoded
+fn commit_delta_segment_key(
+    commit_id: CommitId,
+    segment_index: usize,
+) -> Result<Vec<u8>, LixError> {
+    let segment_index = u32::try_from(segment_index).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta has too many packed segments",
+        )
+    })?;
+    let mut encoded = commit_delta_manifest_key(commit_id);
+    encoded.extend_from_slice(&segment_index.to_be_bytes());
+    Ok(encoded)
 }
 
 pub(crate) async fn load_commit_root(
@@ -150,65 +179,125 @@ pub(crate) fn stage_delete_commit_root(writes: &mut StorageWriteSet, commit_id: 
     );
 }
 
-/// Removes every identity delta for a collected commit. Unlike immutable tree
-/// chunks, these keys are commit-addressed and therefore cannot be reclaimed
-/// by content-addressed storage maintenance.
+/// Removes every packed identity-delta segment for a collected commit.
+///
+/// Unlike immutable tree chunks, these records are commit-addressed and
+/// therefore cannot be reclaimed by content-addressed storage maintenance.
+/// The manifest makes collection bounded by the number of packed segments
+/// instead of requiring a full prefix scan and one delete per changed row.
 pub(crate) async fn stage_delete_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     commit_id: CommitId,
 ) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        TRACKED_STATE_COMMIT_DELTA_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(commit_delta_prefix(commit_id)),
-        },
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(());
+    };
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 0, 1);
+    writes.reserve_space(
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        0,
+        manifest.segments.len(),
     );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    projection: StorageCoreProjection::KeyOnly,
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            writes.delete(TRACKED_STATE_COMMIT_DELTA_SPACE, entry.key);
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
+    writes.delete(
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        key(commit_delta_manifest_key(commit_id)),
+    );
+    for segment_index in 0..manifest.segments.len() {
+        writes.delete(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(commit_delta_segment_key(commit_id, segment_index)?),
+        );
     }
     Ok(())
 }
 
-pub(crate) fn stage_commit_delta(
+/// Stages all tracked mutations for one immutable commit as bounded, sorted
+/// front-coded segments plus one tiny directory. A full commit no longer
+/// writes one backend key for every affected identity.
+pub(crate) fn stage_commit_deltas(
     writes: &mut StorageWriteSet,
-    delta: TrackedStateDeltaRef<'_>,
+    deltas: &[TrackedStateDeltaRef<'_>],
 ) -> Result<(), LixError> {
-    let key = commit_delta_key(
-        delta.commit_id,
-        TrackedStateKeyRef {
-            schema_key: delta.schema_key,
-            file_id: delta.file_id,
-            entity_pk: delta.entity_pk,
-        },
-    );
-    let value = CommitDeltaValue {
-        change_id: delta.change_id,
-        deleted: delta.deleted,
-        created_at: delta.created_at,
-        updated_at: delta.updated_at,
+    let Some(&commit_id) = deltas.first().map(|delta| &delta.commit_id) else {
+        return Ok(());
     };
+    let mut entries = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        if delta.commit_id != commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state cannot pack deltas from different commits together",
+            ));
+        }
+        entries.push(EncodedLeafEntry {
+            key: encode_key_ref(TrackedStateKeyRef {
+                schema_key: delta.schema_key,
+                file_id: delta.file_id,
+                entity_pk: delta.entity_pk,
+            }),
+            value: encode_value_ref(TrackedStateIndexValueRef {
+                change_id: delta.change_id,
+                commit_id: delta.commit_id,
+                deleted: delta.deleted,
+                created_at: delta.created_at,
+                updated_at: delta.updated_at,
+            }),
+        });
+    }
+    entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+    if entries.windows(2).any(|pair| pair[0].key == pair[1].key) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state commit_delta for commit '{commit_id}' contains duplicate identities"
+            ),
+        ));
+    }
+
+    let segment_count = entries.len().div_ceil(COMMIT_DELTA_SEGMENT_ROWS);
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, 1, 0);
+    if segment_count == 1 {
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            key(commit_delta_manifest_key(commit_id)),
+            value(encode_commit_delta_manifest(&CommitDeltaManifest {
+                inline_segment: encode_commit_delta_segment(&entries),
+                segments: Vec::new(),
+            })?),
+        );
+        return Ok(());
+    }
+    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
+    let mut manifest = CommitDeltaManifest {
+        inline_segment: Vec::new(),
+        segments: Vec::with_capacity(segment_count),
+    };
+    for (segment_index, entries) in entries.chunks(COMMIT_DELTA_SEGMENT_ROWS).enumerate() {
+        let first_key = entries
+            .first()
+            .expect("non-empty packed commit-delta segment")
+            .key
+            .clone();
+        let last_key = entries
+            .last()
+            .expect("non-empty packed commit-delta segment")
+            .key
+            .clone();
+        manifest.segments.push(CommitDeltaSegmentBounds {
+            first_key,
+            last_key,
+        });
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            key(commit_delta_segment_key(commit_id, segment_index)?),
+            value(encode_commit_delta_segment(entries)),
+        );
+    }
     writes.put(
-        TRACKED_STATE_COMMIT_DELTA_SPACE,
-        self::key(key),
-        self::value(storage_codec::encode("tracked_state commit_delta", &value)?),
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        key(commit_delta_manifest_key(commit_id)),
+        value(encode_commit_delta_manifest(&manifest)?),
     );
     Ok(())
 }
@@ -221,46 +310,71 @@ pub(crate) async fn load_commit_delta_values(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let storage_keys = keys
+    let mut values = vec![None; keys.len()];
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(values);
+    };
+    if let Some(inline_segment) = manifest.inline_segment() {
+        let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
+        for (output_index, key) in keys.iter().enumerate() {
+            let encoded_key = encode_key_ref(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+            values[output_index] = find_commit_delta_value(&leaf, &encoded_key, commit_id)?;
+        }
+        return Ok(values);
+    }
+    let mut lookups_by_segment = BTreeMap::<usize, Vec<(usize, Vec<u8>)>>::new();
+    for (output_index, key) in keys.iter().enumerate() {
+        let encoded_key = encode_key_ref(TrackedStateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+        if let Some(segment_index) = commit_delta_segment_for_key(&manifest, &encoded_key) {
+            lookups_by_segment
+                .entry(segment_index)
+                .or_default()
+                .push((output_index, encoded_key));
+        }
+    }
+    if lookups_by_segment.is_empty() {
+        return Ok(values);
+    }
+    let segment_indices = lookups_by_segment.keys().copied().collect::<Vec<_>>();
+    let storage_keys = segment_indices
         .iter()
-        .map(|key| {
-            StorageKey(Bytes::from(commit_delta_key(
-                commit_id,
-                TrackedStateKeyRef {
-                    schema_key: &key.schema_key,
-                    file_id: key.file_id.as_deref(),
-                    entity_pk: &key.entity_pk,
-                },
-            )))
+        .map(|&segment_index| {
+            commit_delta_segment_key(commit_id, segment_index)
+                .map(|key| StorageKey(Bytes::from(key)))
         })
-        .collect::<Vec<_>>();
-    let result = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SPACE, &storage_keys)
+        .collect::<Result<Vec<_>, _>>()?;
+    let result = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
-    result
-        .value
-        .into_iter()
-        .map(|value| {
-            let Some(value) = value else {
-                return Ok(None);
-            };
-            let bytes = full_value(value).ok_or_else(|| {
+    for ((segment_index, lookups), value) in lookups_by_segment.into_iter().zip(result.value) {
+        let bytes = value
+            .and_then(full_value)
+            .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
-                    "tracked_state commit_delta point read returned key-only value",
+                    format!(
+                        "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                    ),
                 )
             })?;
-            let value =
-                storage_codec::decode::<CommitDeltaValue>("tracked_state commit_delta", &bytes)?;
-            Ok(Some(TrackedStateIndexValue {
-                change_id: value.change_id,
-                commit_id,
-                deleted: value.deleted,
-                created_at: value.created_at,
-                updated_at: value.updated_at,
-            }))
-        })
-        .collect()
+        let leaf = decode_commit_delta_segment(
+            &bytes,
+            Some(&manifest.segments[segment_index]),
+            commit_id,
+        )?;
+        for (output_index, encoded_key) in lookups {
+            values[output_index] = find_commit_delta_value(&leaf, &encoded_key, commit_id)?;
+        }
+    }
+    Ok(values)
 }
 
 /// Scans only the mutations in one commit that belong to one of the requested
@@ -272,81 +386,340 @@ pub(crate) async fn scan_commit_delta_values(
     commit_id: CommitId,
     schema_keys: &[String],
 ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-    let commit_prefix = commit_delta_prefix(commit_id);
-    let mut prefixes = if schema_keys.is_empty() {
-        vec![commit_prefix.clone()]
-    } else {
-        schema_keys
-            .iter()
-            .map(|schema_key| {
-                let mut prefix = commit_prefix.clone();
-                prefix.extend_from_slice(&encode_schema_key_prefix(schema_key));
-                prefix
-            })
-            .collect::<Vec<_>>()
+    let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
+        return Ok(Vec::new());
     };
-    prefixes.sort();
-    prefixes.dedup();
-
+    let requested_schemas = schema_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    if let Some(inline_segment) = manifest.inline_segment() {
+        let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
+        let mut entries = Vec::with_capacity(leaf.len());
+        collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
+        return Ok(entries);
+    }
+    let segment_indices = commit_delta_segments_for_schemas(&manifest, &requested_schemas);
+    if segment_indices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let storage_keys = segment_indices
+        .iter()
+        .map(|&segment_index| {
+            commit_delta_segment_key(commit_id, segment_index)
+                .map(|key| StorageKey(Bytes::from(key)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?;
     let mut entries = Vec::new();
-    for prefix in prefixes {
-        let plan = ScanPlan::prefix(
-            TRACKED_STATE_COMMIT_DELTA_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix.clone()),
-            },
-        );
-        let mut resume_after = None;
-        loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
+    for (segment_index, value) in segment_indices.into_iter().zip(segments.value) {
+        let bytes = value
+            .and_then(full_value)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
+                    ),
                 )
-                .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
-                let encoded_key = entry
-                    .key
-                    .0
-                    .strip_prefix(commit_prefix.as_slice())
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            "tracked_state commit_delta scan escaped its commit prefix",
-                        )
-                    })?;
-                let key = decode_key(encoded_key)?;
-                let bytes = full_value(entry.value).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "tracked_state commit_delta scan returned key-only value",
-                    )
-                })?;
-                let value = storage_codec::decode::<CommitDeltaValue>(
-                    "tracked_state commit_delta",
-                    &bytes,
-                )?;
-                entries.push((
-                    key,
-                    TrackedStateIndexValue {
-                        change_id: value.change_id,
-                        commit_id,
-                        deleted: value.deleted,
-                        created_at: value.created_at,
-                        updated_at: value.updated_at,
-                    },
-                ));
-            }
-            if !page.value.has_more || resume_after.is_none() {
-                break;
-            }
-        }
+            })?;
+        let leaf = decode_commit_delta_segment(
+            &bytes,
+            Some(&manifest.segments[segment_index]),
+            commit_id,
+        )?;
+        collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
     }
     Ok(entries)
+}
+
+fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8>, LixError> {
+    let payload = storage_codec::encode("tracked_state packed commit_delta manifest", manifest)?;
+    let mut encoded = Vec::with_capacity(COMMIT_DELTA_FORMAT_MAGIC.len() + payload.len());
+    encoded.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
+
+fn decode_commit_delta_manifest(bytes: &[u8]) -> Result<CommitDeltaManifest, LixError> {
+    let Some(payload) = bytes.strip_prefix(COMMIT_DELTA_FORMAT_MAGIC) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta manifest has an unsupported format; recreate the repository",
+        ));
+    };
+    let manifest = storage_codec::decode("tracked_state packed commit_delta manifest", payload)?;
+    validate_commit_delta_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+async fn load_commit_delta_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+) -> Result<Option<CommitDeltaManifest>, LixError> {
+    let Some(bytes) = get_one(
+        store,
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        commit_delta_manifest_key(commit_id),
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    decode_commit_delta_manifest(&bytes).map(Some)
+}
+
+fn validate_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<(), LixError> {
+    if !manifest.inline_segment.is_empty() {
+        if !manifest.segments.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta manifest mixes inline and indexed segments",
+            ));
+        }
+        return Ok(());
+    }
+    if manifest.segments.is_empty() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta manifest has no segments",
+        ));
+    }
+    let mut previous_last: Option<&[u8]> = None;
+    for bounds in &manifest.segments {
+        if bounds.first_key.is_empty() || bounds.last_key.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta manifest has an empty segment bound",
+            ));
+        }
+        if bounds.first_key > bounds.last_key {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta manifest has inverted segment bounds",
+            ));
+        }
+        if previous_last.is_some_and(|previous_last| previous_last >= bounds.first_key.as_slice()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta manifest has overlapping segment bounds",
+            ));
+        }
+        previous_last = Some(&bounds.last_key);
+    }
+    Ok(())
+}
+
+impl CommitDeltaManifest {
+    fn inline_segment(&self) -> Option<&[u8]> {
+        (!self.inline_segment.is_empty()).then_some(self.inline_segment.as_slice())
+    }
+}
+
+fn commit_delta_segment_for_key(manifest: &CommitDeltaManifest, key: &[u8]) -> Option<usize> {
+    let mut lower = 0usize;
+    let mut upper = manifest.segments.len();
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        if manifest.segments[middle].first_key.as_slice() <= key {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    let segment_index = lower.checked_sub(1)?;
+    (key <= manifest.segments[segment_index].last_key.as_slice()).then_some(segment_index)
+}
+
+fn commit_delta_segments_for_schemas(
+    manifest: &CommitDeltaManifest,
+    schema_keys: &BTreeSet<&str>,
+) -> Vec<usize> {
+    if schema_keys.is_empty() {
+        return (0..manifest.segments.len()).collect();
+    }
+    manifest
+        .segments
+        .iter()
+        .enumerate()
+        .filter_map(|(segment_index, bounds)| {
+            schema_keys
+                .iter()
+                .copied()
+                .any(|schema_key| commit_delta_segment_overlaps_schema(bounds, schema_key))
+                .then_some(segment_index)
+        })
+        .collect()
+}
+
+fn commit_delta_segment_overlaps_schema(
+    bounds: &CommitDeltaSegmentBounds,
+    schema_key: &str,
+) -> bool {
+    let schema_prefix = encode_schema_key_prefix(schema_key);
+    let Some(schema_end) = prefix_successor(&schema_prefix) else {
+        return true;
+    };
+    bounds.last_key.as_slice() >= schema_prefix.as_slice()
+        && bounds.first_key.as_slice() < schema_end.as_slice()
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut successor = prefix.to_vec();
+    while let Some(last) = successor.last_mut() {
+        if *last != u8::MAX {
+            *last += 1;
+            return Some(successor);
+        }
+        successor.pop();
+    }
+    None
+}
+
+fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
+    let leaf = encode_leaf_node(entries);
+    let mut encoded = Vec::with_capacity(COMMIT_DELTA_FORMAT_MAGIC.len() + leaf.len());
+    encoded.extend_from_slice(COMMIT_DELTA_FORMAT_MAGIC);
+    encoded.extend_from_slice(&leaf);
+    encoded
+}
+
+fn decode_commit_delta_segment(
+    bytes: &[u8],
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+    expected_commit_id: CommitId,
+) -> Result<DecodedLeafNodeRef, LixError> {
+    let Some(leaf_bytes) = bytes.strip_prefix(COMMIT_DELTA_FORMAT_MAGIC) else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta segment has an unsupported format; recreate the repository",
+        ));
+    };
+    let leaf = match decode_node_ref(leaf_bytes)? {
+        DecodedNodeRef::Leaf(leaf) => leaf,
+        DecodedNodeRef::Internal(_) => {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta segment contains an internal tree node",
+            ));
+        }
+    };
+    if leaf.len() == 0 || leaf.len() > COMMIT_DELTA_SEGMENT_ROWS {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta segment has an invalid entry count",
+        ));
+    }
+    if let Some(expected_bounds) = expected_bounds
+        && (leaf.first_key() != Some(expected_bounds.first_key.as_slice())
+            || leaf.last_key() != Some(expected_bounds.last_key.as_slice()))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta segment does not match its manifest bounds",
+        ));
+    }
+    let mut previous_key: Option<&[u8]> = None;
+    for entry_index in 0..leaf.len() {
+        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state packed commit_delta leaf has a missing entry",
+            )
+        })?;
+        if previous_key.is_some_and(|previous_key| previous_key >= entry.key) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta segment keys are not strictly ordered",
+            ));
+        }
+        let value = decode_value(entry.value)?;
+        if value.commit_id != expected_commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state packed commit_delta for commit '{expected_commit_id}' contains an entry for commit '{}'",
+                    value.commit_id
+                ),
+            ));
+        }
+        previous_key = Some(entry.key);
+    }
+    Ok(leaf)
+}
+
+fn collect_commit_delta_leaf_entries(
+    leaf: &DecodedLeafNodeRef,
+    commit_id: CommitId,
+    requested_schemas: &BTreeSet<&str>,
+    entries: &mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
+) -> Result<(), LixError> {
+    for entry_index in 0..leaf.len() {
+        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state packed commit_delta leaf has a missing entry",
+            )
+        })?;
+        let key = decode_key(entry.key)?;
+        if !requested_schemas.is_empty() && !requested_schemas.contains(key.schema_key.as_str()) {
+            continue;
+        }
+        let value = decode_value(entry.value)?;
+        if value.commit_id != commit_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state packed commit_delta for commit '{commit_id}' contains an entry for commit '{}'",
+                    value.commit_id
+                ),
+            ));
+        }
+        entries.push((key, value));
+    }
+    Ok(())
+}
+
+fn find_commit_delta_value(
+    leaf: &DecodedLeafNodeRef,
+    target_key: &[u8],
+    expected_commit_id: CommitId,
+) -> Result<Option<TrackedStateIndexValue>, LixError> {
+    let mut lower = 0usize;
+    let mut upper = leaf.len();
+    while lower < upper {
+        let middle = lower + (upper - lower) / 2;
+        let key = leaf.key(middle)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state packed commit_delta leaf has a missing key",
+            )
+        })?;
+        if key < target_key {
+            lower = middle + 1;
+        } else {
+            upper = middle;
+        }
+    }
+    let Some(entry) = leaf.entry(lower)? else {
+        return Ok(None);
+    };
+    if entry.key != target_key {
+        return Ok(None);
+    }
+    let value = decode_value(entry.value)?;
+    if value.commit_id != expected_commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state packed commit_delta for commit '{expected_commit_id}' contains an entry for commit '{}'",
+                value.commit_id
+            ),
+        ));
+    }
+    Ok(Some(value))
 }
 
 pub(crate) async fn read_chunk(
@@ -564,8 +937,11 @@ mod tests {
         BINARY_CAS_MANIFEST_SPACE,
     };
     use crate::changelog::{
-        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, CommitId,
+        CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE,
+        ChangeId, CommitId,
     };
+    use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
     use crate::gc::{CHECKPOINT_GC_STATE_SPACE, CHECKPOINT_RECOVERY_REF_SPACE};
     use crate::init::REPOSITORY_PROTOCOL_SPACE;
     use crate::json_store::store::JSON_SPACE;
@@ -574,15 +950,350 @@ mod tests {
         TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
         TRACKED_WORKING_DIFF_GROUP_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::types::{
-        TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
+        TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
+        TrackedStateIndexValue, TrackedStateKey, TrackedStateRootId,
     };
 
     use super::{
-        TRACKED_STATE_COMMIT_DELTA_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
-        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_root,
-        encode_commit_root,
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
+        TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_delta_manifest, decode_commit_root,
+        encode_commit_root, load_commit_delta_values, scan_commit_delta_values,
+        stage_commit_deltas, stage_delete_commit_deltas,
     };
+
+    #[derive(Clone)]
+    struct CommitDeltaFixture {
+        schema_key: String,
+        file_id: Option<String>,
+        entity_pk: EntityPk,
+        change_id: ChangeId,
+        deleted: bool,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+    }
+
+    impl CommitDeltaFixture {
+        fn key(&self) -> TrackedStateKey {
+            TrackedStateKey {
+                schema_key: self.schema_key.clone(),
+                file_id: self.file_id.clone(),
+                entity_pk: self.entity_pk.clone(),
+            }
+        }
+
+        fn value(&self, commit_id: CommitId) -> TrackedStateIndexValue {
+            TrackedStateIndexValue {
+                change_id: self.change_id,
+                commit_id,
+                deleted: self.deleted,
+                created_at: self.created_at,
+                updated_at: self.updated_at,
+            }
+        }
+    }
+
+    fn packed_commit_delta_fixtures() -> Vec<CommitDeltaFixture> {
+        (0..300)
+            .map(|index| CommitDeltaFixture {
+                schema_key: if index % 2 == 0 {
+                    "alpha".to_string()
+                } else {
+                    "beta".to_string()
+                },
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index:04}")),
+                change_id: ChangeId::for_test_label(&format!("packed-delta-change-{index}")),
+                deleted: index % 7 == 0,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index.into()),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy((index + 1).into()),
+            })
+            .collect()
+    }
+
+    fn commit_delta_refs(
+        commit_id: CommitId,
+        fixtures: &[CommitDeltaFixture],
+    ) -> Vec<TrackedStateDeltaRef<'_>> {
+        fixtures
+            .iter()
+            .map(|fixture| TrackedStateDeltaRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                entity_pk: &fixture.entity_pk,
+                change_id: fixture.change_id,
+                commit_id,
+                deleted: fixture.deleted,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn packed_commit_deltas_preserve_point_and_schema_replay() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("packed-delta-commit");
+        let fixtures = packed_commit_delta_fixtures();
+        let deltas = fixtures
+            .iter()
+            .map(|fixture| TrackedStateDeltaRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                entity_pk: &fixture.entity_pk,
+                change_id: fixture.change_id,
+                commit_id,
+                deleted: fixture.deleted,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
+        assert_eq!(
+            writes.stats().staged_puts,
+            3,
+            "300 rows should use one manifest and two bounded segments"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("packed deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let missing = TrackedStateKey {
+            schema_key: "alpha".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::single("not-present"),
+        };
+        let point_keys = vec![
+            fixtures[0].key(),
+            fixtures[255].key(),
+            missing,
+            fixtures[0].key(),
+        ];
+        let point_values = load_commit_delta_values(&read, commit_id, &point_keys)
+            .await
+            .expect("point replay should load packed deltas");
+        assert_eq!(
+            point_values,
+            vec![
+                Some(fixtures[0].value(commit_id)),
+                Some(fixtures[255].value(commit_id)),
+                None,
+                Some(fixtures[0].value(commit_id)),
+            ]
+        );
+
+        let alpha = scan_commit_delta_values(&read, commit_id, &["alpha".to_string()])
+            .await
+            .expect("schema replay should scan packed deltas");
+        assert_eq!(alpha.len(), 150);
+        assert!(alpha.iter().all(|(key, _)| key.schema_key == "alpha"));
+        assert!(alpha.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        let all = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("unconstrained replay should scan packed deltas");
+        assert_eq!(all.len(), fixtures.len());
+        assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
+
+    #[tokio::test]
+    async fn single_segment_commit_delta_stays_inline() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("inline-packed-delta-commit");
+        let fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should contain one row");
+        let delta = TrackedStateDeltaRef {
+            schema_key: &fixture.schema_key,
+            file_id: fixture.file_id.as_deref(),
+            entity_pk: &fixture.entity_pk,
+            change_id: fixture.change_id,
+            commit_id,
+            deleted: fixture.deleted,
+            created_at: fixture.created_at,
+            updated_at: fixture.updated_at,
+        };
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &[delta]).expect("inline delta should stage");
+        assert_eq!(
+            writes.stats().staged_puts,
+            1,
+            "a one-segment commit should remain one physical record"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("inline delta should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        assert_eq!(
+            load_commit_delta_values(&read, commit_id, &[fixture.key()])
+                .await
+                .expect("inline point replay should load"),
+            vec![Some(fixture.value(commit_id))]
+        );
+        assert_eq!(
+            scan_commit_delta_values(&read, commit_id, std::slice::from_ref(&fixture.schema_key))
+                .await
+                .expect("inline schema replay should load"),
+            vec![(fixture.key(), fixture.value(commit_id))]
+        );
+
+        let mut deletes = storage.new_write_set();
+        stage_delete_commit_deltas(&read, &mut deletes, commit_id)
+            .await
+            .expect("inline delta should stage for deletion");
+        assert_eq!(
+            deletes.stats().staged_deletes,
+            1,
+            "GC should delete the inline manifest only"
+        );
+    }
+
+    #[tokio::test]
+    async fn packed_commit_delta_gc_deletes_manifest_and_segments() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("packed-delta-gc");
+        let fixtures = packed_commit_delta_fixtures();
+        let deltas = fixtures
+            .iter()
+            .map(|fixture| TrackedStateDeltaRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                entity_pk: &fixture.entity_pk,
+                change_id: fixture.change_id,
+                commit_id,
+                deleted: fixture.deleted,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            })
+            .collect::<Vec<_>>();
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("packed deltas should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("packed deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let mut deletes = storage.new_write_set();
+        stage_delete_commit_deltas(&read, &mut deletes, commit_id)
+            .await
+            .expect("packed deltas should stage for deletion");
+        assert_eq!(
+            deletes.stats().staged_deletes,
+            3,
+            "GC should delete one manifest and two packed segments"
+        );
+        storage
+            .commit_write_set(deletes, StorageWriteOptions::default())
+            .await
+            .expect("packed delta deletion should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("post-GC read should open");
+        assert!(
+            load_commit_delta_values(&read, commit_id, &[fixtures[0].key()])
+                .await
+                .expect("post-GC point replay should load")
+                .into_iter()
+                .all(|value| value.is_none())
+        );
+        assert!(
+            scan_commit_delta_values(&read, commit_id, &[])
+                .await
+                .expect("post-GC scan replay should load")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn packed_commit_delta_boundary_keeps_file_identity_and_sparse_schema_replay() {
+        let storage = StorageAdapter::new(Memory::new());
+        let inline_commit_id = CommitId::for_test_label("packed-delta-inline-boundary");
+        let indexed_commit_id = CommitId::for_test_label("packed-delta-indexed-boundary");
+        let fixtures = (0..257)
+            .map(|index| CommitDeltaFixture {
+                schema_key: match index {
+                    255 => "sparse".to_string(),
+                    256 => "zeta".to_string(),
+                    _ => "alpha".to_string(),
+                },
+                file_id: (index == 255).then(|| "sparse-file".to_string()),
+                entity_pk: EntityPk::single(format!("boundary-{index:04}")),
+                change_id: ChangeId::for_test_label(&format!("boundary-change-{index}")),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index.into()),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy((index + 1).into()),
+            })
+            .collect::<Vec<_>>();
+
+        let mut inline_writes = storage.new_write_set();
+        let inline_deltas = commit_delta_refs(inline_commit_id, &fixtures[..256]);
+        stage_commit_deltas(&mut inline_writes, &inline_deltas)
+            .expect("256 deltas should stay inline");
+        assert_eq!(inline_writes.stats().staged_puts, 1);
+        storage
+            .commit_write_set(inline_writes, StorageWriteOptions::default())
+            .await
+            .expect("inline boundary deltas should commit");
+
+        let mut indexed_writes = storage.new_write_set();
+        let indexed_deltas = commit_delta_refs(indexed_commit_id, &fixtures);
+        stage_commit_deltas(&mut indexed_writes, &indexed_deltas)
+            .expect("257 deltas should use indexed segments");
+        assert_eq!(indexed_writes.stats().staged_puts, 3);
+        storage
+            .commit_write_set(indexed_writes, StorageWriteOptions::default())
+            .await
+            .expect("indexed boundary deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let sparse = &fixtures[255];
+        assert_eq!(
+            load_commit_delta_values(&read, indexed_commit_id, &[sparse.key()])
+                .await
+                .expect("file-scoped point replay should load"),
+            vec![Some(sparse.value(indexed_commit_id))]
+        );
+        assert_eq!(
+            scan_commit_delta_values(&read, indexed_commit_id, &["sparse".to_string()])
+                .await
+                .expect("sparse schema replay should load"),
+            vec![(sparse.key(), sparse.value(indexed_commit_id))]
+        );
+    }
+
+    #[test]
+    fn packed_commit_delta_manifest_rejects_unknown_format() {
+        let error = decode_commit_delta_manifest(b"LXCD1not-a-v2-manifest")
+            .expect_err("old packed manifests must fail loudly");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported format; recreate the repository")
+        );
+    }
 
     #[test]
     fn native_storage_space_ids_are_unique_across_owner_layouts() {
@@ -598,7 +1309,8 @@ mod tests {
             JSON_SPACE,
             TRACKED_STATE_TREE_CHUNK_SPACE,
             TRACKED_STATE_COMMIT_ROOT_SPACE,
-            TRACKED_STATE_COMMIT_DELTA_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,

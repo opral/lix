@@ -33,9 +33,9 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    TRACKED_STATE_COMMIT_DELTA_SPACE, TrackedStateContext, TrackedStateDeltaRef,
-    TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns,
-    TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref, stage_commit_delta,
+    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
+    TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
+    TrackedStateScanRequest, encode_key_ref, stage_commit_deltas,
 };
 use crate::transaction::staging::{
     PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
@@ -1082,29 +1082,11 @@ fn stage_tracked_commit_delta_index(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
 ) -> Result<(), LixError> {
-    let delta_count = tracked_roots
-        .iter()
-        .map(|root| {
-            tracked_row_indices_by_commit
-                .get(&root.commit_id)
-                .map_or(0, Vec::len)
-                + staged_commits
-                    .get(&root.commit_id)
-                    .map_or(0, |staged| staged.selected_change_refs.len())
-        })
-        .sum::<usize>();
-    writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SPACE, delta_count, 0);
     for root in tracked_roots {
-        for &row_index in tracked_row_indices_by_commit
+        let state_row_indices = tracked_row_indices_by_commit
             .get(&root.commit_id)
             .map(Vec::as_slice)
-            .unwrap_or_default()
-        {
-            stage_commit_delta(
-                writes,
-                tracked_delta_from_state_row(&state_rows[row_index])?,
-            )?;
-        }
+            .unwrap_or_default();
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -1114,12 +1096,18 @@ fn stage_tracked_commit_delta_index(
                 ),
             )
         })?;
-        for change_ref in &staged.selected_change_refs {
-            stage_commit_delta(
-                writes,
-                tracked_delta_from_selected_change_ref(change_ref, root.commit_id)?,
-            )?;
+        let mut deltas =
+            Vec::with_capacity(state_row_indices.len() + staged.selected_change_refs.len());
+        for &row_index in state_row_indices {
+            deltas.push(tracked_delta_from_state_row(&state_rows[row_index])?);
         }
+        for change_ref in &staged.selected_change_refs {
+            deltas.push(tracked_delta_from_selected_change_ref(
+                change_ref,
+                root.commit_id,
+            )?);
+        }
+        stage_commit_deltas(writes, &deltas)?;
     }
     Ok(())
 }
