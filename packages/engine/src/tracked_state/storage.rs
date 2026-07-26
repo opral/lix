@@ -572,6 +572,7 @@ mod tests {
     use crate::live_state::{
         LIVE_STATE_INDEX_ROW_SPACE, LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
         TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
+        TRACKED_WORKING_DIFF_GROUP_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateRootId,
@@ -592,6 +593,8 @@ mod tests {
             TRACKED_HEAD_GROUP_SPACE,
             TRACKED_HEAD_MEMBER_SPACE,
             TRACKED_HEAD_MARKER_SPACE,
+            TRACKED_WORKING_DIFF_GROUP_SPACE,
+            TRACKED_WORKING_DIFF_MARKER_SPACE,
             JSON_SPACE,
             TRACKED_STATE_TREE_CHUNK_SPACE,
             TRACKED_STATE_COMMIT_ROOT_SPACE,

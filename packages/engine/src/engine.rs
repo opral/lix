@@ -4,6 +4,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::BinaryCasContext;
 use crate::branch::{BranchContext, BranchRefReader};
 use crate::catalog::{CatalogContext, CatalogFingerprint};
+use crate::changelog::COMMIT_SPACE;
 use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
@@ -18,7 +19,10 @@ use crate::plugin::{
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
 use crate::storage_adapter::Storage;
-use crate::storage_adapter::{SharedStorageAdapterRead, StorageReadOptions, StorageWriteOptions};
+use crate::storage_adapter::{
+    ScanPlan, SharedStorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageReadOptions,
+    StorageScanOptions, StorageWriteOptions,
+};
 use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
 use crate::telemetry::TelemetrySink;
 use crate::tracked_state::TrackedStateContext;
@@ -319,26 +323,70 @@ where
 {
     let read =
         SharedStorageAdapterRead::new(storage.begin_read(StorageReadOptions::default()).await?);
-    let protocol_read = read.clone();
-    let reader = live_state.reader(read);
-    let initialized = reader
-        .load_row(&LiveStateRowRequest {
-            schema_key: "lix_key_value".to_string(),
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
-            entity_pk: EntityPk::single("lix_id"),
-            file_id: NullableKeyFilter::Null,
-        })
-        .await?
-        .is_some();
-
-    if initialized {
-        return crate::init::assert_repository_protocol(&protocol_read).await;
+    match crate::init::repository_protocol_status(&read).await? {
+        // The protocol check must precede the live-state read: tracked-head
+        // spaces keep their physical IDs across hard layout cuts, so an old
+        // group value could otherwise be decoded before we reject it.
+        crate::init::RepositoryProtocolStatus::Current => {
+            let reader = live_state.reader(read);
+            let initialized = reader
+                .load_row(&LiveStateRowRequest {
+                    schema_key: "lix_key_value".to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    entity_pk: EntityPk::single("lix_id"),
+                    file_id: NullableKeyFilter::Null,
+                })
+                .await?
+                .is_some();
+            if initialized {
+                Ok(())
+            } else {
+                Err(not_initialized_error())
+            }
+        }
+        crate::init::RepositoryProtocolStatus::Unsupported => {
+            Err(crate::init::unsupported_repository_protocol_error())
+        }
+        crate::init::RepositoryProtocolStatus::Missing => {
+            // A raw changelog key is the initialization sentinel. Unlike a
+            // live-state lookup it cannot parse an old tracked-head layout.
+            if repository_has_changelog_commit(&read).await? {
+                Err(crate::init::unsupported_repository_protocol_error())
+            } else {
+                Err(not_initialized_error())
+            }
+        }
     }
+}
 
-    Err(LixError::new(
+async fn repository_has_changelog_commit(
+    read: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+) -> Result<bool, LixError> {
+    Ok(!ScanPlan::prefix(
+        COMMIT_SPACE,
+        StoragePrefix {
+            bytes: bytes::Bytes::new(),
+        },
+    )
+    .collect(
+        read,
+        StorageScanOptions {
+            projection: StorageCoreProjection::KeyOnly,
+            limit_rows: 1,
+            ..StorageScanOptions::default()
+        },
+    )
+    .await?
+    .value
+    .entries
+    .is_empty())
+}
+
+fn not_initialized_error() -> LixError {
+    LixError::new(
         "LIX_ERROR_NOT_INITIALIZED",
         "engine storage is not initialized; call Engine::initialize(...) before Engine::new(...)",
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -347,8 +395,8 @@ mod tests {
 
     use super::*;
     use crate::storage_adapter::{
-        Memory, PointReadPlan, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
-        StorageSpaceId, StorageValue,
+        Memory, PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix,
+        StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
     };
 
     #[tokio::test]
@@ -480,6 +528,96 @@ mod tests {
 
         let Err(error) = Engine::new(storage).await else {
             panic!("initialized pre-protocol storage must fail closed");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn predecessor_protocol_is_rejected_before_old_head_bytes_are_decoded() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read initialized head groups");
+        let groups = ScanPlan::prefix(
+            crate::live_state::TRACKED_HEAD_GROUP_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("scan initialized head groups")
+        .value
+        .entries;
+        assert!(
+            !groups.is_empty(),
+            "initialized repository must have head groups"
+        );
+
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"tracked-direct-plane.v6"[..],
+        );
+        for group in groups {
+            writes.put(
+                crate::live_state::TRACKED_HEAD_GROUP_SPACE,
+                group.key,
+                StorageValue {
+                    bytes: Bytes::from_static(b"predecessor-head-bytes"),
+                },
+            );
+        }
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("predecessor bytes should commit");
+
+        let Err(error) = Engine::new(storage).await else {
+            panic!("predecessor protocol must fail before head visibility reads");
+        };
+        assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn initialize_refuses_to_overwrite_existing_repository() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("first initialization should succeed");
+
+        let Err(error) = Engine::initialize(storage).await else {
+            panic!("initialization must not overwrite an existing repository");
+        };
+        assert_eq!(error.code, "LIX_ERROR_ALREADY_INITIALIZED");
+    }
+
+    #[tokio::test]
+    async fn initialize_refuses_to_overwrite_a_predecessor_protocol() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("first initialization should succeed");
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"tracked-direct-plane.v6"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("write predecessor protocol marker");
+
+        let Err(error) = Engine::initialize(storage).await else {
+            panic!("initialization must not overwrite a predecessor protocol");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }

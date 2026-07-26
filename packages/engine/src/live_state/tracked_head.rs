@@ -4,7 +4,7 @@
 //! generation-keyed serving state for one branch head, letting the normal
 //! live-state path range scan rows and hydrate JSON directly without replaying
 //! changelog history. A marker binds a generation to the branch ref's commit.
-//! Any mismatch is a cache miss and callers take the historical fallback.
+//! Any mismatch is a direct-plane miss and callers take the historical fallback.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
-use crate::branch::BranchHeadControl;
+use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -26,23 +26,25 @@ use crate::json_store::{
 use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
-    StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteSet,
+    StorageProjectedValue, StorageReadEntry, StorageScanOptions, StorageSpace, StorageSpaceId,
+    StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateFilter, TrackedStateKey, TrackedStateScanRequest,
+    MaterializedTrackedStateRow, TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity,
+    TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStateFilter,
+    TrackedStateKey, TrackedStateScanRequest,
 };
 
-// v5 makes the durable tracked head authoritative for normal current reads.
+// v6 makes the durable tracked head authoritative for normal current reads.
 // A physical record owns every file-backed member of one logical entity PK.
 // Public entity reads know `(branch, schema, entity_pk)` but intentionally do
 // not invent a `file_id`; keeping those members together lets that common
 // lookup be a RocksDB point get rather than a prefix scan. Repositories use a
-// protocol gate, so v4 bytes are never interpreted as v5 groups.
-pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.tracked_head_group.v5";
-pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.tracked_head_member.v5";
-pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v5";
+// protocol gate, so predecessor bytes are never interpreted as v6 groups.
+pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.tracked_head_group.v6";
+pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.tracked_head_member.v6";
+pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v6";
 pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0012), TRACKED_HEAD_GROUP_NAMESPACE);
 /// File-id projection for explicit file-backed identities.
@@ -58,6 +60,22 @@ pub(crate) const TRACKED_HEAD_MEMBER_SPACE: StorageSpace =
 pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0014), TRACKED_HEAD_MARKER_NAMESPACE);
 
+/// Sparse enumeration index for the first-before summaries co-located in v6
+/// head groups. It contains no row payload: the authoritative current row
+/// and its immutable baseline remain one physical group record.
+pub(crate) const TRACKED_WORKING_DIFF_GROUP_NAMESPACE: &str =
+    "live_state.tracked_working_diff_group.v2";
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str =
+    "live_state.tracked_working_diff_marker.v2";
+pub(crate) const TRACKED_WORKING_DIFF_GROUP_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0016),
+    TRACKED_WORKING_DIFF_GROUP_NAMESPACE,
+);
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0018),
+    TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
+);
+
 /// Immutable manifest for the currently readable generation of a branch.
 ///
 /// A new generation is used after a branch ref moves away from the parent of
@@ -68,6 +86,122 @@ pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
 struct TrackedHeadMarker {
     head_commit_id: CommitId,
     generation: CommitId,
+    /// Checkpoint whose first-before baselines live in this generation.
+    /// `None` means the head is still a correct serving projection but cannot
+    /// answer a checkpoint-relative direct diff.
+    #[musli(with = storage_codec::option)]
+    working_diff_checkpoint_commit_id: Option<CommitId>,
+}
+
+/// The current serving generation plus the checkpoint epoch to which its
+/// first-before summaries are bound. This is a read-side observation only;
+/// the private marker remains the durable wire record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrackedHeadMarkerInfo {
+    pub(crate) generation: CommitId,
+    pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
+}
+
+/// The active checkpoint epoch for the sparse working-diff indexes.
+///
+/// `None` is the freshly published checkpoint state: it is known empty until
+/// the first ordinary child bootstraps a complete v6 serving generation.
+/// Once initialized, the generation is immutable for serial normal commits;
+/// the tracked-head marker and branch control publish the moving head.
+#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct TrackedWorkingDiffEpoch {
+    pub(crate) checkpoint_commit_id: CommitId,
+    // Musli's built-in packed Option encoding is terminal-field oriented.
+    // This explicit bool-prefixed representation keeps `coverage` readable
+    // when a freshly published checkpoint has no generation yet.
+    #[musli(with = storage_codec::option)]
+    pub(crate) generation: Option<CommitId>,
+    pub(crate) coverage: WorkingDiffIndexCoverage,
+}
+
+/// A tiny atomic coverage proof for the current checkpoint's group index.
+///
+/// Count catches loss or duplication; the XOR of BLAKE3 key hashes also
+/// catches a same-count replacement without adding another read structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+pub(crate) struct WorkingDiffIndexCoverage {
+    group_count: u64,
+    group_key_xor: JsonRef,
+}
+
+impl Default for WorkingDiffIndexCoverage {
+    fn default() -> Self {
+        Self {
+            group_count: 0,
+            group_key_xor: JsonRef::from_hash_bytes([0; JSON_REF_BYTES]),
+        }
+    }
+}
+
+impl WorkingDiffIndexCoverage {
+    fn add_encoded_group_key(&mut self, key: &[u8]) -> Option<()> {
+        self.group_count = self.group_count.checked_add(1)?;
+        let hash = blake3::hash(key);
+        let mut group_key_xor = *self.group_key_xor.as_hash_array();
+        for (target, source) in group_key_xor.iter_mut().zip(hash.as_bytes()) {
+            *target ^= source;
+        }
+        self.group_key_xor = JsonRef::from_hash_bytes(group_key_xor);
+        Some(())
+    }
+}
+
+/// A checkpoint-relative direct diff assembled from the current v6 head.
+/// This is internal plumbing for SQL working-change and checkpoint compaction;
+/// the public API remains the existing tracked-state diff representation.
+pub(crate) struct TrackedWorkingDiff {
+    pub(crate) checkpoint_commit_id: CommitId,
+    pub(crate) diff: TrackedStateDiff,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingDiffBaseline {
+    Clean,
+    Absent(CommitId),
+    Present {
+        checkpoint_commit_id: CommitId,
+        version: WorkingDiffVersion,
+    },
+}
+
+impl WorkingDiffBaseline {
+    fn is_for_checkpoint(self, checkpoint_commit_id: Option<CommitId>) -> bool {
+        match (self, checkpoint_commit_id) {
+            (
+                Self::Absent(baseline_checkpoint_id)
+                | Self::Present {
+                    checkpoint_commit_id: baseline_checkpoint_id,
+                    ..
+                },
+                Some(checkpoint_commit_id),
+            ) => baseline_checkpoint_id == checkpoint_commit_id,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkingDiffVersion {
+    change_id: ChangeId,
+    commit_id: CommitId,
+    deleted: bool,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    snapshot: WorkingDiffSlotFingerprint,
+    metadata: WorkingDiffSlotFingerprint,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WorkingDiffSlotFingerprint {
+    kind: u8,
+    hash: [u8; JSON_REF_BYTES],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
@@ -81,7 +215,7 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
-/// The physical v5 key for all current members of one logical entity PK.
+/// The physical v6 key for all current members of one logical entity PK.
 ///
 /// `file_id` is deliberately not a key part. It remains part of the packed
 /// group value so a tombstone or a file-backed variant affects only its own
@@ -172,6 +306,12 @@ struct BranchRef<'a> {
     branch_id: &'a str,
 }
 
+#[derive(Debug, Clone, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct BranchRefKey {
+    branch_id: String,
+}
+
 /// Zero-copy normal tracked mutation staged into a head generation.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedHeadDeltaRef<'a> {
@@ -250,7 +390,7 @@ where
 {
     /// v6 control-plane variant of [`Self::scan_live_rows_if_current`].
     ///
-    /// The direct branch control and the v5 marker are published in one
+    /// The direct branch control and the v6 marker are published in one
     /// storage commit. Requiring both the head and generation to agree makes
     /// a partially rebuilt or stale group projection a clean historical
     /// fallback rather than visible current state.
@@ -269,7 +409,7 @@ where
     }
 
     /// Returns `None` when this branch has no projection for the canonical
-    /// branch ref. That is a cache miss, not empty tracked state.
+    /// branch ref. That is a direct-plane miss, not empty tracked state.
     #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,
@@ -455,17 +595,83 @@ where
             .map(|marker| marker.generation))
     }
 
-    /// Returns the durable v5 generation only when it is atomically bound to
-    /// the observed v6 branch control.
-    pub(crate) async fn generation_if_control_current(
+    /// Returns the durable serving generation and working-diff epoch binding
+    /// only when both are atomically bound to the observed branch control.
+    pub(crate) async fn marker_info_if_control_current(
         &self,
         branch_id: &str,
         control: BranchHeadControl,
-    ) -> Result<Option<CommitId>, LixError> {
+    ) -> Result<Option<TrackedHeadMarkerInfo>, LixError> {
         Ok(self
             .marker_if_control_current(branch_id, control)
             .await?
-            .map(|marker| marker.generation))
+            .map(|marker| TrackedHeadMarkerInfo {
+                generation: marker.generation,
+                working_diff_checkpoint_commit_id: marker.working_diff_checkpoint_commit_id,
+            }))
+    }
+
+    /// Loads the checkpoint epoch marker without treating it as visibility.
+    /// Commit staging combines it with a coherent v6 branch-control
+    /// observation before deciding whether it can preserve first-before
+    /// summaries.
+    pub(crate) async fn working_diff_epoch(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
+        load_tracked_working_diff_epoch(&self.store, branch_id).await
+    }
+
+    /// Returns an O(ever-dirty groups since checkpoint) tracked diff only when the sparse
+    /// working-diff epoch and the current v6 serving generation agree. Any
+    /// missing, stale, or malformed auxiliary record returns `None`, leaving
+    /// the canonical historical replay path authoritative.
+    pub(crate) async fn working_diff_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<Option<TrackedWorkingDiff>, LixError> {
+        // The marker is an accelerator, not a source of visibility. A
+        // malformed or unavailable auxiliary marker selects canonical replay
+        // instead of making a valid SQL query fail.
+        let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
+            return Ok(None);
+        };
+        let Some(generation) = epoch.generation else {
+            return Ok(
+                (epoch.checkpoint_commit_id == control.head_commit_id).then_some(
+                    TrackedWorkingDiff {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        diff: TrackedStateDiff::default(),
+                    },
+                ),
+            );
+        };
+        let Ok(Some(marker)) = self.marker_if_control_current(branch_id, control).await else {
+            return Ok(None);
+        };
+        if generation != control.generation
+            || marker.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
+        {
+            return Ok(None);
+        }
+        let Some(entries) = working_diff_entries_from_current_head(
+            &self.store,
+            branch_id,
+            epoch.checkpoint_commit_id,
+            generation,
+            epoch.coverage,
+            &request.filter,
+        )
+        .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(TrackedWorkingDiff {
+            checkpoint_commit_id: epoch.checkpoint_commit_id,
+            diff: TrackedStateDiff { entries },
+        }))
     }
 
     #[cfg(test)]
@@ -506,6 +712,7 @@ where
     /// generation from a caller-provided parent snapshot. The latter is used
     /// after branch movement and for old repositories which predate this
     /// serving table.
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_commit(
         &mut self,
         branch_id: &str,
@@ -515,11 +722,41 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<CommitId, LixError> {
+        let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+        self.stage_commit_with_working_diff(
+            branch_id,
+            parent_generation,
+            new_head,
+            deltas,
+            absence_guards,
+            parent_rows,
+            None,
+            None,
+            &mut working_diff_coverage,
+        )
+        .await
+    }
+
+    /// Internal variant used only when an active checkpoint epoch makes the
+    /// v6 group baseline authoritative for `lix_working_change`.
+    pub(crate) async fn stage_commit_with_working_diff(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[TrackedHeadDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
+        working_diff_marker_checkpoint_commit_id: Option<CommitId>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        working_diff_coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
         let matches_parent = parent_generation.is_some();
         let generation = parent_generation.unwrap_or(new_head);
         let marker = TrackedHeadMarker {
             head_commit_id: new_head,
             generation,
+            working_diff_checkpoint_commit_id: working_diff_marker_checkpoint_commit_id,
         };
         // Preflight the only fallible publication bytes before staging an
         // incremental generation in the caller's write set. A failed writer
@@ -530,7 +767,7 @@ where
         // Sorting borrowed deltas establishes both the exact-mutation
         // uniqueness check and the group order needed for a streaming merge.
         // The normal matching-generation path must never reconstruct every
-        // v5 member in an owned BTreeMap just to change one member.
+        // v6 member in an owned BTreeMap just to change one member.
         let mut sorted_deltas = deltas.iter().collect::<Vec<_>>();
         sorted_deltas.sort_unstable_by(|left, right| compare_head_deltas(left, right));
         for pair in sorted_deltas.windows(2) {
@@ -563,12 +800,24 @@ where
                     previous.as_deref(),
                     &sorted_deltas[group.deltas.clone()],
                     absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
                 )?);
             }
             for (group, next) in groups.iter().zip(next_groups) {
+                let became_dirty_group = next.became_dirty_group;
                 stage_put_group_bytes(self.writes, &group.identity, next.bytes);
                 for (file_id, value) in next.explicit_member_projections {
                     stage_put_file_member_bytes(self.writes, &group.identity, file_id, &value);
+                }
+                if became_dirty_group {
+                    stage_put_working_diff_group_index(
+                        self.writes,
+                        working_diff_coverage,
+                        working_diff_capture_checkpoint_commit_id.expect(
+                            "a newly dirty group requires an active working-diff checkpoint",
+                        ),
+                        &group.identity,
+                    )?;
                 }
             }
         } else {
@@ -579,6 +828,8 @@ where
                 &sorted_deltas,
                 absence_guards,
                 parent_rows.unwrap_or_default(),
+                working_diff_capture_checkpoint_commit_id,
+                working_diff_coverage,
             )?;
         }
         stage_marker_encoded(self.writes, marker_key, marker_value);
@@ -586,7 +837,7 @@ where
     }
 }
 
-/// One contiguous range of sorted mutations for a physical v5 group.
+/// One contiguous range of sorted mutations for a physical v6 group.
 ///
 /// The range borrows the transaction's deltas, while the group identity is
 /// owned once. This is intentionally not a map of decoded members: matching
@@ -605,6 +856,7 @@ struct HeadGroupMutation {
 struct EncodedHeadGroup<'a> {
     bytes: Vec<u8>,
     explicit_member_projections: Vec<(&'a str, Vec<u8>)>,
+    became_dirty_group: bool,
 }
 
 fn compare_head_deltas(
@@ -658,7 +910,7 @@ fn group_sorted_head_deltas(
     groups
 }
 
-/// Builds a fresh v5 generation after a branch movement.
+/// Builds a fresh v6 generation after a branch movement.
 ///
 /// This path necessarily starts from materialized parent rows, so it retains
 /// the simple owned-map implementation. Ordinary commits keep their parent
@@ -670,8 +922,12 @@ fn stage_bootstrap_groups(
     deltas: &[&TrackedHeadDeltaRef<'_>],
     absence_guards: &BTreeSet<TrackedStateKey>,
     parent_rows: Vec<MaterializedTrackedStateRow>,
+    working_diff_checkpoint_commit_id: Option<CommitId>,
+    working_diff_coverage: &mut WorkingDiffIndexCoverage,
 ) -> Result<(), LixError> {
     let mut groups = BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, Vec<u8>>>::new();
+    let mut baselines =
+        BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, WorkingDiffBaseline>>::new();
     for row in parent_rows {
         let MaterializedTrackedStateRow {
             entity_pk,
@@ -712,9 +968,9 @@ fn stage_bootstrap_groups(
                 .as_deref()
                 .map_or(JsonSlot::None, JsonSlot::from_json),
         };
-        let members = groups.entry(identity).or_default();
+        let members = groups.entry(identity.clone()).or_default();
         if members
-            .insert(file_id, encode_head_value(&value.as_ref())?)
+            .insert(file_id.clone(), encode_head_value(&value.as_ref())?)
             .is_some()
         {
             return Err(LixError::new(
@@ -722,8 +978,13 @@ fn stage_bootstrap_groups(
                 "tracked-head bootstrap contains duplicate full row identity",
             ));
         }
+        baselines
+            .entry(identity)
+            .or_default()
+            .insert(file_id, WorkingDiffBaseline::Clean);
     }
 
+    let mut dirty_groups = BTreeSet::new();
     for delta in deltas {
         let group = HeadGroupIdentity {
             branch_id: branch_id.to_string(),
@@ -731,19 +992,32 @@ fn stage_bootstrap_groups(
             schema_key: delta.schema_key.to_string(),
             entity_pk: delta.entity_pk.clone(),
         };
-        let members = groups.entry(group).or_default();
-        let created_at = match members.get(&delta.file_id.map(str::to_string)) {
+        let file_id = delta.file_id.map(str::to_string);
+        let members = groups.entry(group.clone()).or_default();
+        let baseline_members = baselines.entry(group.clone()).or_default();
+        let baseline = match members.get(&file_id) {
             Some(existing) => {
                 let existing = decode_head_value(existing)?;
                 reject_guarded_live_member(absence_guards, delta, existing)?;
-                existing.created_at
+                working_diff_baseline_for_existing_value(
+                    existing,
+                    working_diff_checkpoint_commit_id,
+                )
             }
+            None => working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
+        };
+        let created_at = match members.get(&file_id) {
+            Some(existing) => decode_head_value(existing)?.created_at,
             None => delta.created_at,
         };
         members.insert(
-            delta.file_id.map(str::to_string),
+            file_id.clone(),
             encode_head_value(&delta.value_ref(created_at))?,
         );
+        baseline_members.insert(file_id.clone(), baseline);
+        if working_diff_checkpoint_commit_id.is_some() {
+            dirty_groups.insert(group.clone());
+        }
     }
 
     writes.reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
@@ -753,17 +1027,30 @@ fn stage_bootstrap_groups(
         .sum();
     writes.reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
     for (identity, members) in groups {
-        stage_put_group_members(writes, &identity, &members)?;
+        let member_baselines = baselines
+            .get(&identity)
+            .ok_or_else(|| head_group_error("bootstrap group is missing working-diff baselines"))?;
+        stage_put_group_members_with_baselines(writes, &identity, &members, member_baselines)?;
         for (file_id, value) in &members {
             if file_id.is_some() {
                 stage_put_member_bytes(writes, &identity, file_id.as_deref(), value)?;
             }
         }
     }
+    if let Some(checkpoint_commit_id) = working_diff_checkpoint_commit_id {
+        for group in &dirty_groups {
+            stage_put_working_diff_group_index(
+                writes,
+                working_diff_coverage,
+                checkpoint_commit_id,
+                group,
+            )?;
+        }
+    }
     Ok(())
 }
 
-/// Merges one existing v5 group and its sorted mutations without decoding the
+/// Merges one existing v6 group and its sorted mutations without decoding the
 /// whole group into owned member values. Every old member is still parsed and
 /// validated before it is copied, so an unrelated malformed sibling cannot be
 /// silently republished.
@@ -771,6 +1058,7 @@ fn encode_incremental_group<'a>(
     previous: Option<&[u8]>,
     deltas: &[&TrackedHeadDeltaRef<'a>],
     absence_guards: &BTreeSet<TrackedStateKey>,
+    working_diff_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<EncodedHeadGroup<'a>, LixError> {
     debug_assert!(!deltas.is_empty());
     debug_assert!(
@@ -788,6 +1076,8 @@ fn encode_incremental_group<'a>(
     encoded.push(HEAD_GROUP_VALUE_VERSION);
     encoded.extend_from_slice(&[0; 4]);
     let mut member_count = 0usize;
+    let mut previous_has_current_dirty_member = false;
+    let mut became_current_dirty_member = false;
     let mut explicit_member_projections = Vec::new();
     explicit_member_projections
         .try_reserve(
@@ -805,25 +1095,47 @@ fn encode_incremental_group<'a>(
                     &mut encoded,
                     delta,
                     delta.created_at,
+                    working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
                     &mut explicit_member_projections,
                 )?;
+                became_current_dirty_member |= working_diff_checkpoint_commit_id.is_some();
                 increment_head_group_member_count(&mut member_count)?;
                 break;
             };
             match member.file_id.cmp(&delta.file_id) {
                 Ordering::Less => {
-                    append_head_group_member(&mut encoded, member.file_id, member.value)?;
+                    previous_has_current_dirty_member |= member
+                        .baseline
+                        .is_for_checkpoint(working_diff_checkpoint_commit_id);
+                    append_head_group_member(
+                        &mut encoded,
+                        member.file_id,
+                        member.value,
+                        member.baseline,
+                    )?;
                     increment_head_group_member_count(&mut member_count)?;
                     current = next_head_group_member(&mut cursor)?;
                 }
                 Ordering::Equal => {
                     reject_guarded_live_member(absence_guards, delta, member.head)?;
+                    let (baseline, became_dirty) = working_diff_baseline_for_existing_delta(
+                        member.baseline,
+                        member.head,
+                        working_diff_checkpoint_commit_id,
+                    );
+                    previous_has_current_dirty_member |= member
+                        .baseline
+                        .is_for_checkpoint(working_diff_checkpoint_commit_id);
                     append_delta_head_group_member(
                         &mut encoded,
                         delta,
                         member.head.created_at,
+                        baseline,
                         &mut explicit_member_projections,
                     )?;
+                    if became_dirty {
+                        became_current_dirty_member = true;
+                    }
                     increment_head_group_member_count(&mut member_count)?;
                     current = next_head_group_member(&mut cursor)?;
                     break;
@@ -833,8 +1145,10 @@ fn encode_incremental_group<'a>(
                         &mut encoded,
                         delta,
                         delta.created_at,
+                        working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
                         &mut explicit_member_projections,
                     )?;
+                    became_current_dirty_member |= working_diff_checkpoint_commit_id.is_some();
                     increment_head_group_member_count(&mut member_count)?;
                     break;
                 }
@@ -842,7 +1156,10 @@ fn encode_incremental_group<'a>(
         }
     }
     while let Some(member) = current {
-        append_head_group_member(&mut encoded, member.file_id, member.value)?;
+        previous_has_current_dirty_member |= member
+            .baseline
+            .is_for_checkpoint(working_diff_checkpoint_commit_id);
+        append_head_group_member(&mut encoded, member.file_id, member.value, member.baseline)?;
         increment_head_group_member_count(&mut member_count)?;
         current = next_head_group_member(&mut cursor)?;
     }
@@ -853,7 +1170,45 @@ fn encode_incremental_group<'a>(
     Ok(EncodedHeadGroup {
         bytes: encoded,
         explicit_member_projections,
+        became_dirty_group: working_diff_checkpoint_commit_id.is_some()
+            && !previous_has_current_dirty_member
+            && became_current_dirty_member,
     })
+}
+
+fn working_diff_baseline_for_absent_delta(
+    checkpoint_commit_id: Option<CommitId>,
+) -> WorkingDiffBaseline {
+    checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, WorkingDiffBaseline::Absent)
+}
+
+fn working_diff_baseline_for_existing_value(
+    prior_value: HeadValueView<'_>,
+    checkpoint_commit_id: Option<CommitId>,
+) -> WorkingDiffBaseline {
+    checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, |checkpoint_commit_id| {
+        WorkingDiffBaseline::Present {
+            checkpoint_commit_id,
+            version: prior_value.working_diff_version(),
+        }
+    })
+}
+
+fn working_diff_baseline_for_existing_delta(
+    prior: WorkingDiffBaseline,
+    prior_value: HeadValueView<'_>,
+    checkpoint_commit_id: Option<CommitId>,
+) -> (WorkingDiffBaseline, bool) {
+    match checkpoint_commit_id {
+        Some(checkpoint_commit_id) if !prior.is_for_checkpoint(Some(checkpoint_commit_id)) => (
+            WorkingDiffBaseline::Present {
+                checkpoint_commit_id,
+                version: prior_value.working_diff_version(),
+            },
+            true,
+        ),
+        _ => (prior, false),
+    }
 }
 
 fn increment_head_group_member_count(member_count: &mut usize) -> Result<(), LixError> {
@@ -894,10 +1249,11 @@ fn append_delta_head_group_member<'a>(
     encoded: &mut Vec<u8>,
     delta: &TrackedHeadDeltaRef<'a>,
     created_at: LixTimestamp,
+    baseline: WorkingDiffBaseline,
     explicit_member_projections: &mut Vec<(&'a str, Vec<u8>)>,
 ) -> Result<(), LixError> {
     let value = encode_head_value(&delta.value_ref(created_at))?;
-    append_head_group_member(encoded, delta.file_id, &value)?;
+    append_head_group_member(encoded, delta.file_id, &value, baseline)?;
     // The group is authoritative. An unchanged explicit projection already
     // belongs to this generation, so only rewrite projections whose member
     // changed in this commit.
@@ -938,7 +1294,7 @@ async fn load_marker(
         .transpose()
 }
 
-/// Loads packed v5 groups without materializing their members.
+/// Loads packed v6 groups without materializing their members.
 async fn load_group_bytes<'a>(
     store: &(impl StorageAdapterRead + ?Sized),
     identities: impl IntoIterator<Item = &'a HeadGroupIdentity>,
@@ -961,7 +1317,7 @@ async fn load_group_bytes<'a>(
 }
 
 /// Loads the explicit-file member projection. Its physical access pattern is
-/// intentionally the same single-key point lookup as v4 so file-id queries
+/// intentionally the same single-key point lookup as the prior member layout so file-id queries
 /// do not become proportional to the size of their logical PK group.
 async fn load_member_bytes(
     store: &(impl StorageAdapterRead + ?Sized),
@@ -1084,6 +1440,203 @@ async fn scan_entries(
         }
     }
     Ok(rows)
+}
+
+/// Reads the checkpoint's sparse dirty-group index and resolves before images
+/// from authoritative v6 group values. The index is auxiliary: its complete
+/// key coverage is verified before any result is returned, so a bad record is
+/// a fallback (`None`), never an empty diff.
+async fn working_diff_entries_from_current_head(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+    expected_coverage: WorkingDiffIndexCoverage,
+    filter: &TrackedStateFilter,
+) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
+    let (groups, require_current_dirty_member) =
+        match exact_group_identities(branch_id, generation, filter) {
+            Some(groups) => (groups, false),
+            None => {
+                let Some(groups) = scan_working_diff_group_index(
+                    store,
+                    branch_id,
+                    checkpoint_commit_id,
+                    generation,
+                    expected_coverage,
+                    filter,
+                )
+                .await?
+                else {
+                    return Ok(None);
+                };
+                (groups, true)
+            }
+        };
+
+    let values = load_group_bytes(store, &groups).await?;
+    let mut dirty_rows = Vec::new();
+    for (group, value) in groups.into_iter().zip(values) {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let Ok(members) = decode_head_group_members(&value) else {
+            return Ok(None);
+        };
+        let mut has_current_dirty_member = false;
+        for member in members {
+            if !member
+                .baseline
+                .is_for_checkpoint(Some(checkpoint_commit_id))
+            {
+                continue;
+            }
+            has_current_dirty_member = true;
+            let identity = HeadRowIdentity {
+                schema_key: group.schema_key.clone(),
+                entity_pk: group.entity_pk.clone(),
+                file_id: member.file_id,
+            };
+            if matches_filter(&identity, filter) {
+                let after = match decode_head_value(&member.value) {
+                    Ok(value) => value.working_diff_version(),
+                    Err(_) => return Ok(None),
+                };
+                dirty_rows.push((identity, member.baseline, after));
+            }
+        }
+        if require_current_dirty_member && !has_current_dirty_member {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(
+        dirty_rows
+            .into_iter()
+            .filter_map(|(identity, baseline, after)| {
+                classify_working_diff_entry(identity, baseline, after)
+            })
+            .collect(),
+    ))
+}
+
+async fn scan_working_diff_group_index(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+    expected_coverage: WorkingDiffIndexCoverage,
+    filter: &TrackedStateFilter,
+) -> Result<Option<Vec<HeadGroupIdentity>>, LixError> {
+    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
+    let plan = ScanPlan::prefix(
+        TRACKED_WORKING_DIFF_GROUP_SPACE,
+        StoragePrefix {
+            bytes: Bytes::from(scope.clone()),
+        },
+    );
+    let mut actual_coverage = WorkingDiffIndexCoverage::default();
+    let mut found = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            if !is_working_diff_index_value(&entry.value)
+                || actual_coverage
+                    .add_encoded_group_key(entry.key.0.as_ref())
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            let Ok(identity) = decode_working_diff_group_key_in_scope(entry.key.0.as_ref(), &scope)
+            else {
+                return Ok(None);
+            };
+            if matches_group_filter(&identity, filter) {
+                found.push(HeadGroupIdentity {
+                    branch_id: branch_id.to_string(),
+                    generation,
+                    schema_key: identity.schema_key,
+                    entity_pk: identity.entity_pk,
+                });
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    if actual_coverage != expected_coverage {
+        return Ok(None);
+    }
+    found.sort();
+    found.dedup();
+    Ok(Some(found))
+}
+
+fn is_working_diff_index_value(value: &StorageProjectedValue) -> bool {
+    matches!(value, StorageProjectedValue::FullValue(bytes) if bytes.as_ref() == WORKING_DIFF_INDEX_VALUE)
+}
+
+fn classify_working_diff_entry(
+    identity: HeadRowIdentity,
+    baseline: WorkingDiffBaseline,
+    after_version: WorkingDiffVersion,
+) -> Option<TrackedStateDiffEntry> {
+    let before_version = match baseline {
+        WorkingDiffBaseline::Clean => return None,
+        WorkingDiffBaseline::Absent(_) => None,
+        WorkingDiffBaseline::Present { version, .. } => Some(version),
+    };
+    let before = before_version.map(|version| version.into_diff_row(&identity));
+    let after = after_version.into_diff_row(&identity);
+    let identity = TrackedStateDiffIdentity {
+        schema_key: identity.schema_key,
+        entity_pk: identity.entity_pk,
+        file_id: identity.file_id,
+    };
+    match (
+        before.as_ref().filter(|row| !row.deleted),
+        (!after.deleted).then_some(&after),
+    ) {
+        (None, None) => None,
+        (None, Some(_)) => Some(TrackedStateDiffEntry {
+            identity,
+            kind: TrackedStateDiffKind::Added,
+            before,
+            after: Some(after),
+        }),
+        (Some(_), None) => Some(TrackedStateDiffEntry {
+            identity,
+            kind: TrackedStateDiffKind::Removed,
+            before,
+            after: Some(after),
+        }),
+        (Some(_), Some(_))
+            if before_version.is_some_and(|version| version.payload_eq(after_version)) =>
+        {
+            None
+        }
+        (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
+            identity,
+            kind: TrackedStateDiffKind::Modified,
+            before,
+            after: Some(after),
+        }),
+    }
+}
+
+fn matches_group_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
+    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&identity.entity_pk))
 }
 
 fn exact_group_identities(
@@ -1305,6 +1858,230 @@ fn stage_marker_encoded(writes: &mut StorageWriteSet, key: Vec<u8>, value: Vec<u
     );
 }
 
+/// Publishes the checkpoint epoch that owns the sparse working-diff indexes.
+/// The surrounding branch-control CAS makes this marker, the v6 head groups,
+/// and the current branch head one atomic visibility boundary.
+pub(crate) fn stage_tracked_working_diff_epoch(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    epoch: TrackedWorkingDiffEpoch,
+) -> Result<(), LixError> {
+    writes.put(
+        TRACKED_WORKING_DIFF_MARKER_SPACE,
+        StorageKey(Bytes::from(marker_key(branch_id)?)),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode(
+                "tracked working-diff marker",
+                &epoch,
+            )?),
+        },
+    );
+    Ok(())
+}
+
+async fn load_tracked_working_diff_epoch(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
+    let result = PointReadPlan::new(
+        TRACKED_WORKING_DIFF_MARKER_SPACE,
+        &[StorageKey(Bytes::from(marker_key(branch_id)?))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    result
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .map(|value| {
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked working-diff marker read unexpectedly omitted its value",
+                ));
+            };
+            storage_codec::decode("tracked working-diff marker", &bytes)
+        })
+        .transpose()
+}
+
+/// Reclaims sparse dirty-index records outside every currently published
+/// checkpoint epoch. This deliberately runs only from repository GC: a
+/// checkpoint reset is O(1), while old index prefixes are unreachable as soon
+/// as its marker commits.
+pub(crate) async fn stage_collect_stale_working_diff_indexes<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+) -> Result<(), LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    let controls = BranchHeadControlContext::new()
+        .reader(store.clone())
+        .scan()
+        .await?
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    let active = stage_active_working_diff_scopes(store, writes, &controls).await?;
+    stage_collect_stale_working_diff_space(
+        store,
+        writes,
+        TRACKED_WORKING_DIFF_GROUP_SPACE,
+        |entry| {
+            is_working_diff_index_value(&entry.value)
+                && decode_working_diff_group_key(entry.key.0.as_ref()).is_ok_and(
+                    |(checkpoint_commit_id, identity)| {
+                        active.get(&identity.branch_id).is_some_and(|scope| {
+                            scope.checkpoint_commit_id == checkpoint_commit_id
+                                && scope.generation == identity.generation
+                        })
+                    },
+                )
+        },
+    )
+    .await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActiveWorkingDiffScope {
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+}
+
+/// Validates and keeps only auxiliary epochs that are presently bound by the
+/// authoritative branch control and tracked-head marker. Broken auxiliary
+/// bytes are reclaimed here rather than turning background GC into a retry
+/// loop; normal readers already select canonical replay for the same cases.
+async fn stage_active_working_diff_scopes<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    controls: &BTreeMap<String, BranchHeadControl>,
+) -> Result<BTreeMap<String, ActiveWorkingDiffScope>, LixError>
+where
+    S: StorageAdapterRead + Clone,
+{
+    let plan = ScanPlan::prefix(
+        TRACKED_WORKING_DIFF_MARKER_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut active = BTreeMap::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let key: BranchRefKey = match storage_codec::decode(
+                "tracked working-diff marker key",
+                entry.key.0.as_ref(),
+            ) {
+                Ok(key) => key,
+                Err(_) => {
+                    writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
+                    continue;
+                }
+            };
+            let StorageProjectedValue::FullValue(bytes) = entry.value else {
+                writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
+                continue;
+            };
+            let epoch: TrackedWorkingDiffEpoch =
+                match storage_codec::decode("tracked working-diff marker", &bytes) {
+                    Ok(epoch) => epoch,
+                    Err(_) => {
+                        writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
+                        continue;
+                    }
+                };
+            let Some(control) = controls.get(&key.branch_id).copied() else {
+                writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
+                continue;
+            };
+            let valid = match epoch.generation {
+                // A checkpoint reset is known empty and deliberately leaves
+                // the prior serving group generation intact until its first
+                // ordinary child captures a new baseline.
+                None => epoch.checkpoint_commit_id == control.head_commit_id,
+                Some(generation) if generation == control.generation => {
+                    matches!(
+                        TrackedHeadContext::new()
+                            .reader(store.clone())
+                            .marker_info_if_control_current(&key.branch_id, control)
+                            .await,
+                        Ok(Some(marker))
+                            if marker.working_diff_checkpoint_commit_id
+                                == Some(epoch.checkpoint_commit_id)
+                    )
+                }
+                Some(_) => false,
+            };
+            if !valid || active.contains_key(&key.branch_id) {
+                writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
+                continue;
+            }
+            if let Some(generation) = epoch.generation {
+                active.insert(
+                    key.branch_id,
+                    ActiveWorkingDiffScope {
+                        checkpoint_commit_id: epoch.checkpoint_commit_id,
+                        generation,
+                    },
+                );
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(active)
+}
+
+async fn stage_collect_stale_working_diff_space(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    space: StorageSpace,
+    is_active: impl Fn(&StorageReadEntry) -> bool,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            if !is_active(&entry) {
+                writes.delete(space, entry.key);
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn stage_put(
     writes: &mut StorageWriteSet,
@@ -1334,12 +2111,27 @@ fn stage_put_ref(
     Ok(())
 }
 
+#[cfg(test)]
 fn stage_put_group_members(
     writes: &mut StorageWriteSet,
     identity: &HeadGroupIdentity,
     members: &BTreeMap<Option<String>, Vec<u8>>,
 ) -> Result<(), LixError> {
     stage_put_group_bytes(writes, identity, encode_head_group_members(members)?);
+    Ok(())
+}
+
+fn stage_put_group_members_with_baselines(
+    writes: &mut StorageWriteSet,
+    identity: &HeadGroupIdentity,
+    members: &BTreeMap<Option<String>, Vec<u8>>,
+    baselines: &BTreeMap<Option<String>, WorkingDiffBaseline>,
+) -> Result<(), LixError> {
+    stage_put_group_bytes(
+        writes,
+        identity,
+        encode_head_group_members_with_baselines(members, baselines)?,
+    );
     Ok(())
 }
 
@@ -1355,6 +2147,28 @@ fn stage_put_group_bytes(
             bytes: Bytes::from(bytes),
         },
     );
+}
+
+const WORKING_DIFF_INDEX_VALUE: &[u8] = b"\x01";
+
+fn stage_put_working_diff_group_index(
+    writes: &mut StorageWriteSet,
+    coverage: &mut WorkingDiffIndexCoverage,
+    checkpoint_commit_id: CommitId,
+    identity: &HeadGroupIdentity,
+) -> Result<(), LixError> {
+    let key = encode_working_diff_group_key(checkpoint_commit_id, identity);
+    coverage
+        .add_encoded_group_key(&key)
+        .ok_or_else(|| head_group_error("working-diff group index count exceeds u64"))?;
+    writes.put(
+        TRACKED_WORKING_DIFF_GROUP_SPACE,
+        StorageKey(Bytes::from(key)),
+        StorageValue {
+            bytes: Bytes::from_static(WORKING_DIFF_INDEX_VALUE),
+        },
+    );
+    Ok(())
 }
 
 fn stage_put_member_bytes(
@@ -1406,6 +2220,32 @@ fn encode_group_key(identity: &HeadGroupIdentity) -> Vec<u8> {
     out
 }
 
+fn encode_working_diff_scope_prefix(
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(branch_id.len() + 2 + 2 * GENERATION_BYTES);
+    write_key_string(&mut out, branch_id, KEY_PART_FINAL);
+    out.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
+    out.extend_from_slice(generation.as_uuid().as_bytes());
+    out
+}
+
+fn encode_working_diff_group_key(
+    checkpoint_commit_id: CommitId,
+    identity: &HeadGroupIdentity,
+) -> Vec<u8> {
+    let mut out = encode_working_diff_scope_prefix(
+        &identity.branch_id,
+        checkpoint_commit_id,
+        identity.generation,
+    );
+    write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
+    write_entity_pk(&mut out, &identity.entity_pk);
+    out
+}
+
 fn encode_member_key(identity: &HeadIdentity) -> Vec<u8> {
     debug_assert!(identity.file_id.is_some());
     let mut out = encode_scope_prefix(&identity.branch_id, identity.generation);
@@ -1437,6 +2277,33 @@ fn decode_group_key(bytes: &[u8]) -> Result<HeadGroupIdentity, LixError> {
         schema_key,
         entity_pk,
     })
+}
+
+fn decode_working_diff_group_key(bytes: &[u8]) -> Result<(CommitId, HeadGroupIdentity), LixError> {
+    let mut offset = 0usize;
+    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("branch id has an invalid terminator"));
+    }
+    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
+    let generation = read_generation(bytes, &mut offset)?;
+    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
+    if schema_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("schema key has an invalid terminator"));
+    }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("working-diff group key has trailing bytes"));
+    }
+    Ok((
+        checkpoint_commit_id,
+        HeadGroupIdentity {
+            branch_id,
+            generation,
+            schema_key,
+            entity_pk,
+        },
+    ))
 }
 
 fn decode_member_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
@@ -1486,6 +2353,31 @@ fn decode_group_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdenti
     let entity_pk = read_entity_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
         return Err(key_codec_error("group key has trailing bytes"));
+    }
+    Ok(HeadRowIdentity {
+        schema_key,
+        entity_pk,
+        file_id: None,
+    })
+}
+
+fn decode_working_diff_group_key_in_scope(
+    bytes: &[u8],
+    scope: &[u8],
+) -> Result<HeadRowIdentity, LixError> {
+    if !bytes.starts_with(scope) {
+        return Err(key_codec_error(
+            "does not begin with the scanned working-diff checkpoint-generation scope",
+        ));
+    }
+    let mut offset = scope.len();
+    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
+    if schema_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error("schema key has an invalid terminator"));
+    }
+    let entity_pk = read_entity_pk(bytes, &mut offset)?;
+    if offset != bytes.len() {
+        return Err(key_codec_error("working-diff group key has trailing bytes"));
     }
     Ok(HeadRowIdentity {
         schema_key,
@@ -1681,7 +2573,7 @@ fn decode_marker_value(value: StorageProjectedValue) -> Result<TrackedHeadMarker
     storage_codec::decode("tracked-head marker", &bytes)
 }
 
-/// v5 packs all file-backed members of one logical entity PK into one
+/// v6 packs all file-backed members of one logical entity PK into one
 /// canonical current-state group. The individual member payload is the proven
 /// fixed-header v3 value below; only the outer framing is new.
 ///
@@ -1699,15 +2591,24 @@ fn decode_marker_value(value: StorageProjectedValue) -> Result<TrackedHeadMarker
 /// Members are strictly sorted by Rust's `Option<String>` ordering. This
 /// makes scans deterministic and, more importantly, rejects silently
 /// duplicated full identities at the storage boundary.
-const HEAD_GROUP_VALUE_VERSION: u8 = 1;
+const HEAD_GROUP_VALUE_VERSION: u8 = 3;
 const HEAD_GROUP_HEADER_BYTES: usize = 5;
+const WORKING_DIFF_BASELINE_CLEAN: u8 = 0;
+const WORKING_DIFF_BASELINE_ABSENT: u8 = 1;
+const WORKING_DIFF_BASELINE_PRESENT: u8 = 2;
+const WORKING_DIFF_SLOT_NONE: u8 = 0;
+const WORKING_DIFF_SLOT_REF: u8 = 1;
+const WORKING_DIFF_SLOT_INLINE: u8 = 2;
+const WORKING_DIFF_VERSION_BYTES: usize =
+    16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
 
 struct HeadGroupMemberBytes {
     file_id: Option<String>,
     value: Bytes,
+    baseline: WorkingDiffBaseline,
 }
 
-/// A validated, borrowed member from a v5 group value.
+/// A validated, borrowed member from a v6 group value.
 ///
 /// The incremental writer uses this cursor to copy untouched member bytes
 /// directly into the next group while retaining the old fixed-header value
@@ -1717,9 +2618,10 @@ struct HeadGroupMemberView<'a> {
     file_id: Option<&'a str>,
     value: &'a [u8],
     head: HeadValueView<'a>,
+    baseline: WorkingDiffBaseline,
 }
 
-/// Streaming parser for the authoritative v5 group bytes.
+/// Streaming parser for the authoritative v6 group bytes.
 ///
 /// Unlike the reader-side decoder, this does not allocate a `String`,
 /// `Bytes`, or map for every member. It still enforces the complete wire
@@ -1802,12 +2704,14 @@ impl<'a> HeadGroupMembers<'a> {
             .ok_or_else(|| head_group_error("is truncated in member value"))?;
         let head = decode_head_value(value)?;
         self.offset = value_end;
+        let baseline = decode_working_diff_baseline(self.bytes, &mut self.offset)?;
         self.remaining -= 1;
         self.prior_file_id = Some(file_id);
         Ok(Some(HeadGroupMemberView {
             file_id,
             value,
             head,
+            baseline,
         }))
     }
 }
@@ -1816,6 +2720,7 @@ fn append_head_group_member(
     encoded: &mut Vec<u8>,
     file_id: Option<&str>,
     value: &[u8],
+    baseline: WorkingDiffBaseline,
 ) -> Result<(), LixError> {
     let file_id_bytes = match file_id {
         None => 0,
@@ -1831,6 +2736,7 @@ fn append_head_group_member(
         .checked_add(file_id_bytes)
         .and_then(|length| length.checked_add(4))
         .and_then(|length| length.checked_add(value.len()))
+        .and_then(|length| length.checked_add(working_diff_baseline_len(baseline)))
         .ok_or_else(|| head_group_error("group value length overflow"))?;
     encoded
         .len()
@@ -1854,15 +2760,200 @@ fn append_head_group_member(
         u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
     encoded.extend_from_slice(&value_len.to_be_bytes());
     encoded.extend_from_slice(value);
+    encode_working_diff_baseline(encoded, baseline);
     Ok(())
 }
 
+fn working_diff_baseline_len(baseline: WorkingDiffBaseline) -> usize {
+    match baseline {
+        WorkingDiffBaseline::Clean => 1,
+        WorkingDiffBaseline::Absent(_) => 1 + UUID_BYTES,
+        WorkingDiffBaseline::Present { .. } => 1 + UUID_BYTES + WORKING_DIFF_VERSION_BYTES,
+    }
+}
+
+fn encode_working_diff_baseline(encoded: &mut Vec<u8>, baseline: WorkingDiffBaseline) {
+    match baseline {
+        WorkingDiffBaseline::Clean => encoded.push(WORKING_DIFF_BASELINE_CLEAN),
+        WorkingDiffBaseline::Absent(checkpoint_commit_id) => {
+            encoded.push(WORKING_DIFF_BASELINE_ABSENT);
+            encoded.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
+        }
+        WorkingDiffBaseline::Present {
+            checkpoint_commit_id,
+            version,
+        } => {
+            encoded.push(WORKING_DIFF_BASELINE_PRESENT);
+            encoded.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
+            encode_working_diff_version(encoded, version);
+        }
+    }
+}
+
+fn encode_working_diff_version(encoded: &mut Vec<u8>, version: WorkingDiffVersion) {
+    encoded.extend_from_slice(version.change_id.as_uuid().as_bytes());
+    encoded.extend_from_slice(version.commit_id.as_uuid().as_bytes());
+    encoded.push(u8::from(version.deleted));
+    encoded.extend_from_slice(&version.created_at.packed().to_be_bytes());
+    encoded.extend_from_slice(&version.updated_at.packed().to_be_bytes());
+    encode_working_diff_slot(encoded, version.snapshot);
+    encode_working_diff_slot(encoded, version.metadata);
+}
+
+fn encode_working_diff_slot(encoded: &mut Vec<u8>, slot: WorkingDiffSlotFingerprint) {
+    encoded.push(slot.kind);
+    encoded.extend_from_slice(&slot.hash);
+}
+
+fn decode_working_diff_baseline(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<WorkingDiffBaseline, LixError> {
+    let tag = *bytes
+        .get(*offset)
+        .ok_or_else(|| head_group_error("is truncated before working-diff baseline"))?;
+    *offset += 1;
+    match tag {
+        WORKING_DIFF_BASELINE_CLEAN => Ok(WorkingDiffBaseline::Clean),
+        WORKING_DIFF_BASELINE_ABSENT => Ok(WorkingDiffBaseline::Absent(CommitId::new(
+            uuid_from_working_diff_bytes(
+                take_working_diff_bytes(bytes, offset, UUID_BYTES)?,
+                "baseline checkpoint id",
+            )?,
+        ))),
+        WORKING_DIFF_BASELINE_PRESENT => {
+            let checkpoint_commit_id = CommitId::new(uuid_from_working_diff_bytes(
+                take_working_diff_bytes(bytes, offset, UUID_BYTES)?,
+                "baseline checkpoint id",
+            )?);
+            let version = decode_working_diff_version(bytes, offset)?;
+            Ok(WorkingDiffBaseline::Present {
+                checkpoint_commit_id,
+                version,
+            })
+        }
+        _ => Err(head_group_error("has an invalid working-diff baseline tag")),
+    }
+}
+
+fn decode_working_diff_version(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<WorkingDiffVersion, LixError> {
+    let payload = take_working_diff_bytes(bytes, offset, WORKING_DIFF_VERSION_BYTES)?;
+    let mut field_offset = 0usize;
+    let change_id = ChangeId::new(uuid_from_working_diff_bytes(
+        take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?,
+        "change id",
+    )?);
+    let commit_id = CommitId::new(uuid_from_working_diff_bytes(
+        take_working_diff_bytes(payload, &mut field_offset, UUID_BYTES)?,
+        "commit id",
+    )?);
+    let deleted = match *take_working_diff_bytes(payload, &mut field_offset, 1)?
+        .first()
+        .ok_or_else(|| head_group_error("working-diff deletion flag is missing"))?
+    {
+        0 => false,
+        1 => true,
+        _ => return Err(head_group_error("working-diff deletion flag is invalid")),
+    };
+    let created_at = LixTimestamp::from_packed(read_u64(
+        take_working_diff_bytes(payload, &mut field_offset, 8)?,
+        "working-diff created_at",
+    )?)
+    .map_err(|error| head_group_error(&format!("invalid working-diff created_at: {error}")))?;
+    let updated_at = LixTimestamp::from_packed(read_u64(
+        take_working_diff_bytes(payload, &mut field_offset, 8)?,
+        "working-diff updated_at",
+    )?)
+    .map_err(|error| head_group_error(&format!("invalid working-diff updated_at: {error}")))?;
+    let snapshot = decode_working_diff_slot(payload, &mut field_offset, "snapshot")?;
+    let metadata = decode_working_diff_slot(payload, &mut field_offset, "metadata")?;
+    debug_assert_eq!(field_offset, WORKING_DIFF_VERSION_BYTES);
+    Ok(WorkingDiffVersion {
+        change_id,
+        commit_id,
+        deleted,
+        created_at,
+        updated_at,
+        snapshot,
+        metadata,
+    })
+}
+
+fn decode_working_diff_slot(
+    bytes: &[u8],
+    offset: &mut usize,
+    field: &str,
+) -> Result<WorkingDiffSlotFingerprint, LixError> {
+    let kind = *take_working_diff_bytes(bytes, offset, 1)?
+        .first()
+        .ok_or_else(|| head_group_error(&format!("working-diff {field} kind is missing")))?;
+    if !matches!(
+        kind,
+        WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_REF | WORKING_DIFF_SLOT_INLINE
+    ) {
+        return Err(head_group_error(&format!(
+            "working-diff {field} slot kind is invalid"
+        )));
+    }
+    let hash: [u8; JSON_REF_BYTES] = take_working_diff_bytes(bytes, offset, JSON_REF_BYTES)?
+        .try_into()
+        .map_err(|_| head_group_error(&format!("working-diff {field} hash is invalid")))?;
+    if kind == WORKING_DIFF_SLOT_NONE && hash != [0; JSON_REF_BYTES] {
+        return Err(head_group_error(&format!(
+            "working-diff {field} none slot must have a zero hash"
+        )));
+    }
+    Ok(WorkingDiffSlotFingerprint { kind, hash })
+}
+
+fn take_working_diff_bytes<'a>(
+    bytes: &'a [u8],
+    offset: &mut usize,
+    length: usize,
+) -> Result<&'a [u8], LixError> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| head_group_error("working-diff value offset overflow"))?;
+    let value = bytes
+        .get(*offset..end)
+        .ok_or_else(|| head_group_error("is truncated in working-diff value"))?;
+    *offset = end;
+    Ok(value)
+}
+
+fn uuid_from_working_diff_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
+    let bytes: [u8; UUID_BYTES] = bytes
+        .try_into()
+        .map_err(|_| head_group_error(&format!("working-diff {field} has invalid width")))?;
+    Ok(uuid::Uuid::from_bytes(bytes))
+}
+
+#[cfg(test)]
 fn encode_head_group_members(
     members: &BTreeMap<Option<String>, Vec<u8>>,
+) -> Result<Vec<u8>, LixError> {
+    let baselines = members
+        .keys()
+        .cloned()
+        .map(|file_id| (file_id, WorkingDiffBaseline::Clean))
+        .collect::<BTreeMap<_, _>>();
+    encode_head_group_members_with_baselines(members, &baselines)
+}
+
+fn encode_head_group_members_with_baselines(
+    members: &BTreeMap<Option<String>, Vec<u8>>,
+    baselines: &BTreeMap<Option<String>, WorkingDiffBaseline>,
 ) -> Result<Vec<u8>, LixError> {
     let member_count =
         u32::try_from(members.len()).map_err(|_| head_group_error("member count exceeds u32"))?;
     let payload_len = members.iter().try_fold(0usize, |total, (file_id, value)| {
+        let baseline = baselines
+            .get(file_id)
+            .copied()
+            .ok_or_else(|| head_group_error("is missing a working-diff baseline for one member"))?;
         let file_id_len = file_id.as_ref().map_or(0, String::len);
         u32::try_from(file_id_len).map_err(|_| head_group_error("file id exceeds u32"))?;
         let file_id_bytes = if file_id.is_some() {
@@ -1878,6 +2969,7 @@ fn encode_head_group_members(
             .checked_add(file_id_bytes)
             .and_then(|length| length.checked_add(4))
             .and_then(|length| length.checked_add(value.len()))
+            .and_then(|length| length.checked_add(working_diff_baseline_len(baseline)))
             .ok_or_else(|| head_group_error("group value length overflow"))?;
         total
             .checked_add(member_len)
@@ -1890,6 +2982,10 @@ fn encode_head_group_members(
     encoded.push(HEAD_GROUP_VALUE_VERSION);
     encoded.extend_from_slice(&member_count.to_be_bytes());
     for (file_id, value) in members {
+        let baseline = baselines
+            .get(file_id)
+            .copied()
+            .ok_or_else(|| head_group_error("is missing a working-diff baseline for one member"))?;
         match file_id {
             None => encoded.push(FILE_ID_NONE),
             Some(file_id) => {
@@ -1904,6 +3000,7 @@ fn encode_head_group_members(
             u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
         encoded.extend_from_slice(&value_len.to_be_bytes());
         encoded.extend_from_slice(value);
+        encode_working_diff_baseline(&mut encoded, baseline);
     }
     debug_assert_eq!(encoded.len(), capacity);
     Ok(encoded)
@@ -1967,10 +3064,12 @@ fn decode_head_group_members(bytes: &[u8]) -> Result<Vec<HeadGroupMemberBytes>, 
             .ok_or_else(|| head_group_error("is truncated in member value"))?;
         decode_head_value(value)?;
         offset = value_end;
+        let baseline = decode_working_diff_baseline(bytes, &mut offset)?;
         prior_file_id = Some(file_id.clone());
         members.push(HeadGroupMemberBytes {
             file_id,
             value: Bytes::copy_from_slice(value),
+            baseline,
         });
     }
     if offset != bytes.len() {
@@ -1996,7 +3095,7 @@ fn read_group_u32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize
 fn head_group_error(message: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("invalid tracked-head v5 group: {message}"),
+        format!("invalid tracked-head v6 group: {message}"),
     )
 }
 
@@ -2051,6 +3150,60 @@ struct HeadValueView<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotView<'a>,
     metadata: HeadSlotView<'a>,
+}
+
+impl HeadValueView<'_> {
+    fn working_diff_version(self) -> WorkingDiffVersion {
+        WorkingDiffVersion {
+            change_id: self.change_id,
+            commit_id: self.commit_id,
+            deleted: self.deleted,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            snapshot: working_diff_slot_fingerprint(self.snapshot),
+            metadata: working_diff_slot_fingerprint(self.metadata),
+        }
+    }
+}
+
+impl WorkingDiffVersion {
+    fn payload_eq(self, other: Self) -> bool {
+        // Keep the accelerator's net-change classification identical to the
+        // canonical tracked diff: a shared change record is intrinsically the
+        // same payload, otherwise compare the two stored payload slots.
+        self.change_id == other.change_id
+            || (self.snapshot == other.snapshot && self.metadata == other.metadata)
+    }
+
+    fn into_diff_row(self, identity: &HeadRowIdentity) -> TrackedStateDiffRow {
+        TrackedStateDiffRow {
+            entity_pk: identity.entity_pk.clone(),
+            schema_key: identity.schema_key.clone(),
+            file_id: identity.file_id.clone(),
+            deleted: self.deleted,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            change_id: self.change_id,
+            commit_id: self.commit_id,
+        }
+    }
+}
+
+fn working_diff_slot_fingerprint(slot: HeadSlotView<'_>) -> WorkingDiffSlotFingerprint {
+    match slot {
+        HeadSlotView::None => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_NONE,
+            hash: [0; JSON_REF_BYTES],
+        },
+        HeadSlotView::Ref(json_ref) => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_REF,
+            hash: *json_ref.as_hash_array(),
+        },
+        HeadSlotView::Inline(json) => WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_INLINE,
+            hash: *JsonRef::for_content(json.as_bytes()).as_hash_array(),
+        },
+    }
 }
 
 fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
@@ -2439,7 +3592,7 @@ mod tests {
     }
 
     #[test]
-    fn v5_group_codec_roundtrips_sorted_members_and_rejects_corruption() {
+    fn v6_group_codec_roundtrips_sorted_members_and_rejects_corruption() {
         let mut members = BTreeMap::new();
         members.insert(
             None,
@@ -2477,6 +3630,368 @@ mod tests {
         let mut bad_version = encoded;
         bad_version[0] = HEAD_GROUP_VALUE_VERSION + 1;
         assert!(decode_head_group_members(&bad_version).is_err());
+    }
+
+    #[test]
+    fn working_diff_payload_equality_matches_canonical_change_identity_semantics() {
+        let slot = WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_INLINE,
+            hash: [1; JSON_REF_BYTES],
+        };
+        let other_slot = WorkingDiffSlotFingerprint {
+            kind: WORKING_DIFF_SLOT_INLINE,
+            hash: [2; JSON_REF_BYTES],
+        };
+        let baseline = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("same-change"),
+            commit_id: CommitId::for_test_label("baseline-commit"),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            snapshot: slot,
+            metadata: slot,
+        };
+        let same_change = WorkingDiffVersion {
+            snapshot: other_slot,
+            metadata: other_slot,
+            ..baseline
+        };
+        let same_payload = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("different-change"),
+            ..baseline
+        };
+        let different_payload = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("different-change"),
+            snapshot: other_slot,
+            ..baseline
+        };
+
+        assert!(baseline.payload_eq(same_change));
+        assert!(baseline.payload_eq(same_payload));
+        assert!(!baseline.payload_eq(different_payload));
+    }
+
+    #[tokio::test]
+    async fn working_diff_restarts_after_a_noop_checkpoint_and_verifies_coverage() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let first_head = CommitId::for_test_label("first-head");
+        let no_op_checkpoint = CommitId::for_test_label("no-op-checkpoint");
+        let second_head = CommitId::for_test_label("second-head");
+        let entity_pk = EntityPk::single("row");
+        let control = |head_commit_id| BranchHeadControl {
+            head_commit_id,
+            generation: checkpoint,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: ChangeId::for_test_label("branch-ref"),
+        };
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open initial write read");
+        let mut writes = StorageWriteSet::new();
+        let mut initial_coverage = WorkingDiffIndexCoverage::default();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_with_working_diff(
+                branch_id,
+                None,
+                checkpoint,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("initial-change"),
+                    commit_id: checkpoint,
+                    deleted: false,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-01T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":\"one\"}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+                Some(checkpoint),
+                None,
+                &mut initial_coverage,
+            )
+            .await
+            .expect("stage clean checkpoint head");
+        assert_eq!(initial_coverage, WorkingDiffIndexCoverage::default());
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: checkpoint,
+                generation: Some(checkpoint),
+                coverage: initial_coverage,
+            },
+        )
+        .expect("stage initial epoch");
+        stage_branch_head_control(&mut writes, branch_id, control(checkpoint))
+            .expect("stage initial control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit initial head");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open first update read");
+        let mut writes = StorageWriteSet::new();
+        let mut first_coverage = WorkingDiffIndexCoverage::default();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_with_working_diff(
+                branch_id,
+                Some(checkpoint),
+                first_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("first-change"),
+                    commit_id: first_head,
+                    deleted: false,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":\"two\"}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+                Some(checkpoint),
+                Some(checkpoint),
+                &mut first_coverage,
+            )
+            .await
+            .expect("stage first update");
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: checkpoint,
+                generation: Some(checkpoint),
+                coverage: first_coverage,
+            },
+        )
+        .expect("stage first epoch");
+        stage_branch_head_control(&mut writes, branch_id, control(first_head))
+            .expect("stage first control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit first update");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open first direct read");
+        let first_diff = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_if_control_current(
+                branch_id,
+                control(first_head),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("first direct diff should read")
+            .expect("first direct diff should be current");
+        assert_eq!(first_diff.checkpoint_commit_id, checkpoint);
+        assert_eq!(first_diff.diff.entries.len(), 1);
+        assert_eq!(
+            first_diff.diff.entries[0].kind,
+            TrackedStateDiffKind::Modified
+        );
+        assert_eq!(
+            first_diff.diff.entries[0]
+                .before
+                .as_ref()
+                .expect("modified diff has before row")
+                .change_id,
+            ChangeId::for_test_label("initial-change")
+        );
+
+        // A net-zero checkpoint keeps the existing serving generation but
+        // starts a new diff epoch. Old first-before summaries stay harmless:
+        // the next mutation tags its own checkpoint and gets a new index key.
+        let mut writes = StorageWriteSet::new();
+        stage_marker(
+            &mut writes,
+            branch_id,
+            &TrackedHeadMarker {
+                head_commit_id: no_op_checkpoint,
+                generation: checkpoint,
+                working_diff_checkpoint_commit_id: Some(checkpoint),
+            },
+        )
+        .expect("stage no-op checkpoint head marker");
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: no_op_checkpoint,
+                generation: None,
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("reset no-op checkpoint epoch");
+        stage_branch_head_control(&mut writes, branch_id, control(no_op_checkpoint))
+            .expect("stage no-op checkpoint control");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit no-op checkpoint");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open no-op checkpoint epoch read");
+        assert_eq!(
+            TrackedHeadContext::new()
+                .reader(read)
+                .working_diff_epoch(branch_id)
+                .await
+                .expect("no-op checkpoint epoch should decode"),
+            Some(TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: no_op_checkpoint,
+                generation: None,
+                coverage: WorkingDiffIndexCoverage::default(),
+            })
+        );
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open no-op checkpoint read");
+        let empty_diff = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_if_control_current(
+                branch_id,
+                control(no_op_checkpoint),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("no-op checkpoint direct diff should read")
+            .expect("no-op checkpoint direct diff should be known empty");
+        assert!(empty_diff.diff.entries.is_empty());
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open second update read");
+        let mut writes = StorageWriteSet::new();
+        let mut second_coverage = WorkingDiffIndexCoverage::default();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_with_working_diff(
+                branch_id,
+                Some(checkpoint),
+                second_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "schema",
+                    file_id: None,
+                    entity_pk: &entity_pk,
+                    change_id: ChangeId::for_test_label("second-change"),
+                    commit_id: second_head,
+                    deleted: false,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-03T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"value\":\"three\"}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+                Some(no_op_checkpoint),
+                Some(no_op_checkpoint),
+                &mut second_coverage,
+            )
+            .await
+            .expect("stage second update");
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: no_op_checkpoint,
+                generation: Some(checkpoint),
+                coverage: second_coverage,
+            },
+        )
+        .expect("stage second epoch");
+        stage_branch_head_control(&mut writes, branch_id, control(second_head))
+            .expect("stage second control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit second update");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open second direct read");
+        let second_diff = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_if_control_current(
+                branch_id,
+                control(second_head),
+                &TrackedStateDiffRequest::default(),
+            )
+            .await
+            .expect("second direct diff should read")
+            .expect("second direct diff should be current");
+        assert_eq!(second_diff.checkpoint_commit_id, no_op_checkpoint);
+        assert_eq!(second_diff.diff.entries.len(), 1);
+        assert_eq!(
+            second_diff.diff.entries[0].kind,
+            TrackedStateDiffKind::Modified
+        );
+        assert_eq!(
+            second_diff.diff.entries[0]
+                .before
+                .as_ref()
+                .expect("modified diff has before row")
+                .change_id,
+            ChangeId::for_test_label("first-change")
+        );
+
+        let mut writes = StorageWriteSet::new();
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: no_op_checkpoint,
+                generation: Some(checkpoint),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("stage bad coverage epoch");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit bad coverage epoch");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open bad coverage read");
+        assert!(
+            TrackedHeadContext::new()
+                .reader(read)
+                .working_diff_if_control_current(
+                    branch_id,
+                    control(second_head),
+                    &TrackedStateDiffRequest::default(),
+                )
+                .await
+                .expect("bad coverage should not error")
+                .is_none(),
+            "bad index coverage must select canonical replay"
+        );
     }
 
     #[tokio::test]
@@ -2517,6 +4032,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: head,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage v3 marker");
@@ -2820,7 +4336,7 @@ mod tests {
 
         // The v6 control plane only validates the generation marker. Exact
         // file identity and schema-scoped file-id reads must still route to
-        // the v5 member projection even when every backing group is absent.
+        // the v6 member projection even when every backing group is absent.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3024,6 +4540,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: head,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage marker");
@@ -3085,6 +4602,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: head,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage marker");
@@ -3270,6 +4788,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: generation,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage initial marker");
@@ -3483,6 +5002,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: generation,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage existing head marker");
@@ -3549,6 +5069,7 @@ mod tests {
             &TrackedHeadMarker {
                 head_commit_id: generation,
                 generation,
+                working_diff_checkpoint_commit_id: None,
             },
         )
         .expect("stage existing tombstone marker");
@@ -3694,5 +5215,266 @@ mod tests {
         );
         assert_eq!(rows[0].created_at, ts("2026-01-01T00:00:00Z"));
         assert_eq!(rows[0].snapshot_content.as_deref(), Some("{\"value\":2}"));
+    }
+
+    #[tokio::test]
+    async fn working_diff_gc_reclaims_malformed_auxiliary_records() {
+        let storage = StorageAdapter::new(Memory::new());
+        let malformed_epoch_key = StorageKey(Bytes::from_static(b"not-a-working-diff-marker"));
+        let malformed_index_key = StorageKey(Bytes::from_static(b"not-a-working-diff-index"));
+        let mut writes = StorageWriteSet::new();
+        writes.put(
+            TRACKED_WORKING_DIFF_MARKER_SPACE,
+            malformed_epoch_key.clone(),
+            StorageValue {
+                bytes: Bytes::from_static(b"not-a-working-diff-epoch"),
+            },
+        );
+        writes.put(
+            TRACKED_WORKING_DIFF_GROUP_SPACE,
+            malformed_index_key.clone(),
+            StorageValue {
+                bytes: Bytes::from_static(WORKING_DIFF_INDEX_VALUE),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit malformed auxiliary records");
+
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open GC read"),
+        );
+        let mut gc_writes = StorageWriteSet::new();
+        stage_collect_stale_working_diff_indexes(&read, &mut gc_writes)
+            .await
+            .expect("GC must discard malformed auxiliary records");
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit GC auxiliary cleanup");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open cleanup verification read");
+        for (space, key) in [
+            (TRACKED_WORKING_DIFF_MARKER_SPACE, malformed_epoch_key),
+            (TRACKED_WORKING_DIFF_GROUP_SPACE, malformed_index_key),
+        ] {
+            let value = PointReadPlan::new(space, &[key])
+                .materialize(&read, StorageGetOptions::default())
+                .await
+                .expect("read cleaned auxiliary key")
+                .value
+                .into_iter()
+                .next()
+                .flatten();
+            assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
+        }
+    }
+
+    #[tokio::test]
+    async fn working_diff_gc_keeps_only_marker_bound_active_scopes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let active_generation = CommitId::for_test_label("active-generation");
+        let active_checkpoint = CommitId::for_test_label("active-checkpoint");
+        let active_group = HeadGroupIdentity {
+            branch_id: "active".to_string(),
+            generation: active_generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("active-row"),
+        };
+        let stale_generation = CommitId::for_test_label("stale-generation");
+        let stale_checkpoint = CommitId::for_test_label("stale-checkpoint");
+        let stale_group = HeadGroupIdentity {
+            branch_id: "stale".to_string(),
+            generation: stale_generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("stale-row"),
+        };
+        let orphan_generation = CommitId::for_test_label("orphan-generation");
+        let orphan_checkpoint = CommitId::for_test_label("orphan-checkpoint");
+        let orphan_group = HeadGroupIdentity {
+            branch_id: "deleted".to_string(),
+            generation: orphan_generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("orphan-row"),
+        };
+
+        let mut writes = StorageWriteSet::new();
+        let active_control = BranchHeadControl {
+            head_commit_id: active_generation,
+            generation: active_generation,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("active-ref"),
+        };
+        stage_marker(
+            &mut writes,
+            "active",
+            &TrackedHeadMarker {
+                head_commit_id: active_generation,
+                generation: active_generation,
+                working_diff_checkpoint_commit_id: Some(active_checkpoint),
+            },
+        )
+        .expect("stage active marker");
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            "active",
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: active_checkpoint,
+                generation: Some(active_generation),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("stage active epoch");
+        stage_branch_head_control(&mut writes, "active", active_control)
+            .expect("stage active control");
+
+        let stale_control = BranchHeadControl {
+            head_commit_id: stale_generation,
+            generation: stale_generation,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("stale-ref"),
+        };
+        stage_marker(
+            &mut writes,
+            "stale",
+            &TrackedHeadMarker {
+                head_commit_id: stale_generation,
+                generation: stale_generation,
+                working_diff_checkpoint_commit_id: Some(CommitId::for_test_label("wrong")),
+            },
+        )
+        .expect("stage stale marker");
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            "stale",
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: stale_checkpoint,
+                generation: Some(stale_generation),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("stage stale epoch");
+        stage_branch_head_control(&mut writes, "stale", stale_control)
+            .expect("stage stale control");
+
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            "deleted",
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: orphan_checkpoint,
+                generation: Some(orphan_generation),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("stage orphan epoch");
+
+        let mut coverage = WorkingDiffIndexCoverage::default();
+        for (checkpoint, group) in [
+            (active_checkpoint, &active_group),
+            (stale_checkpoint, &stale_group),
+            (orphan_checkpoint, &orphan_group),
+        ] {
+            stage_put_working_diff_group_index(&mut writes, &mut coverage, checkpoint, group)
+                .expect("stage working-diff index");
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit working-diff GC fixture");
+
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open working-diff GC read"),
+        );
+        let mut gc_writes = StorageWriteSet::new();
+        stage_collect_stale_working_diff_indexes(&read, &mut gc_writes)
+            .await
+            .expect("stage working-diff GC");
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit working-diff GC");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open working-diff GC verification read");
+        let active_epoch = PointReadPlan::new(
+            TRACKED_WORKING_DIFF_MARKER_SPACE,
+            &[StorageKey(Bytes::from(
+                marker_key("active").expect("active marker key"),
+            ))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read active epoch")
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+        assert!(active_epoch.is_some(), "active epoch must survive GC");
+
+        for (branch_id, checkpoint, group) in [
+            ("stale", stale_checkpoint, &stale_group),
+            ("deleted", orphan_checkpoint, &orphan_group),
+        ] {
+            let epoch = PointReadPlan::new(
+                TRACKED_WORKING_DIFF_MARKER_SPACE,
+                &[StorageKey(Bytes::from(
+                    marker_key(branch_id).expect("marker key"),
+                ))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read stale epoch")
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+            assert!(epoch.is_none(), "inactive epoch must be reclaimed");
+            let index = PointReadPlan::new(
+                TRACKED_WORKING_DIFF_GROUP_SPACE,
+                &[StorageKey(Bytes::from(encode_working_diff_group_key(
+                    checkpoint, group,
+                )))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read stale index")
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+            assert!(index.is_none(), "inactive index must be reclaimed");
+        }
+        let active_index = PointReadPlan::new(
+            TRACKED_WORKING_DIFF_GROUP_SPACE,
+            &[StorageKey(Bytes::from(encode_working_diff_group_key(
+                active_checkpoint,
+                &active_group,
+            )))],
+        )
+        .materialize(&read, StorageGetOptions::default())
+        .await
+        .expect("read active index")
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+        assert!(active_index.is_some(), "active index must survive GC");
     }
 }

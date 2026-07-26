@@ -2,7 +2,7 @@
 //!
 //! A branch head is a tiny mutable control-plane record, not a user row.  It
 //! therefore has its own space and exact-byte CAS token.  The current tracked
-//! serving generation lives beside the head so readers can bind a v5 group
+//! serving generation lives beside the head so readers can bind a v6 group
 //! marker to the same atomic publication without consulting `lix_branch_ref`
 //! through the mutable live-state index.
 
@@ -24,10 +24,10 @@ pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
 
 /// The one mutable publication record for a branch.
 ///
-/// `generation` is the physical v5 tracked-head generation currently serving
+/// `generation` is the physical v6 tracked-head generation currently serving
 /// `head_commit_id`. Serial normal commits retain it; a rewind, merge fence,
 /// or bootstrap gets a fresh generation and takes the historical fallback
-/// until a complete v5 projection is published.
+/// until a complete v6 projection is published.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct BranchHeadControl {
