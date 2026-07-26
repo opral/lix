@@ -72,7 +72,7 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
 pub use session::{
-    CoherentReadBatch, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
+    CoherentReadBatch, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, MutationIdentity, ObserveEvent, ObserveEvents,
     RequestBlobSpliceProvenance, Row, RowRef, TryFromValue, VerifiedRequestBlob,
 };
@@ -91,9 +91,9 @@ pub use storage::conformance::{
 pub use storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
     Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix, ProjectedValue,
-    PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
-    WriteOptions, WriteStats,
+    PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry, ReadOptions, ScanChunk,
+    ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+    StoredValue, WriteOptions, WriteStats,
 };
 
 pub(crate) const GLOBAL_BRANCH_ID: &str = "global";

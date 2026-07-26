@@ -85,6 +85,12 @@ export type SqlParam = JsonValue | Uint8Array | import("./value.js").Value;
 
 export type ExecuteOptions = {
 	originKey?: string;
+	/**
+	 * Stable identity for one logical remote SQL mutation. Supply the same key
+	 * when retrying after a lost response; remote Lix generates one per call
+	 * when this is omitted. This is sent as `Idempotency-Key`, not SQL options.
+	 */
+	idempotencyKey?: string;
 };
 
 export type LixBatchStatement = {
@@ -94,6 +100,8 @@ export type LixBatchStatement = {
 
 export type LixBatchOptions = {
 	originKey?: string;
+	/** See {@link ExecuteOptions.idempotencyKey}. */
+	idempotencyKey?: string;
 };
 
 export type ExecuteResult = {

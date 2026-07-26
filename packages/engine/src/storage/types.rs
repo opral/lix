@@ -88,6 +88,31 @@ pub enum ProjectedValue {
 pub struct ReadOptions {
     pub snapshot: Option<SnapshotRef>,
     pub consistency: ReadConsistency,
+    /// Minimum persistence boundary for rows returned by this read.
+    ///
+    /// Most engine reads use [`ReadDurability::Visible`], which permits a
+    /// backend to serve its latest committed in-memory state. Callers that
+    /// must distinguish a published write from one that has crossed the
+    /// backend's documented durable boundary use [`ReadDurability::Durable`].
+    /// Backends that cannot prove that boundary must return an explicit
+    /// storage error instead of silently downgrading the read.
+    pub durability: ReadDurability,
+}
+
+/// Persistence boundary required from a storage read.
+///
+/// This is deliberately separate from [`ReadConsistency`]: consistency
+/// chooses a snapshot/view, while durability controls which persistence tier
+/// may satisfy that view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadDurability {
+    /// The backend's normal committed view, which may include data awaiting a
+    /// background durability step.
+    #[default]
+    Visible,
+    /// Only data which the backend can prove has crossed its durable
+    /// persistence boundary.
+    Durable,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

@@ -19,6 +19,7 @@ pub use predicate::{
 pub use traits::{Storage, StorageRead, StorageWrite};
 pub use types::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SnapshotRef, SpaceId, StoredValue, WriteOptions, WriteStats,
+    Prefix, ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, SnapshotRef, SpaceId, StoredValue, WriteOptions,
+    WriteStats,
 };

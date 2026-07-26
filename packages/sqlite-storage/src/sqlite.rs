@@ -12,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, WriteOptions,
-    WriteStats,
+    PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rusqlite::types::ValueRef as SqlValueRef;
@@ -179,9 +179,12 @@ impl Storage for SQLite {
         Self: 'a;
     fn begin_read(
         &self,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            if opts.durability == ReadDurability::Durable {
+                return Err(StorageError::Durability);
+            }
             let conn = self
                 .read_pool
                 .lock()

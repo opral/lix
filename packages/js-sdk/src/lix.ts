@@ -437,6 +437,18 @@ function assertExecuteArgs(
 			receiver,
 		);
 	}
+	if (
+		options.idempotencyKey !== undefined &&
+		typeof options.idempotencyKey !== "string"
+	) {
+		throw invalidArgument(
+			"execute",
+			"options.idempotencyKey",
+			"string",
+			typeof options.idempotencyKey,
+			receiver,
+		);
+	}
 }
 
 function assertSqlArgs(
@@ -537,6 +549,17 @@ function assertBatchOptions(options?: LixBatchOptions) {
 			"options.originKey",
 			"string",
 			typeof options.originKey,
+		);
+	}
+	if (
+		options.idempotencyKey !== undefined &&
+		typeof options.idempotencyKey !== "string"
+	) {
+		throw invalidArgument(
+			"executeBatch",
+			"options.idempotencyKey",
+			"string",
+			typeof options.idempotencyKey,
 		);
 	}
 }

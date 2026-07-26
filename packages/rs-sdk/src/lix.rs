@@ -3,10 +3,10 @@ use lix_engine::wasm::WasmRuntime;
 use lix_engine::wasm::v2::WasmTransitionCounters;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
-    ExecuteBatchStatement, ExecuteOptions, ExecuteResult, ExecuteStatementMetadata,
-    ExecutionDisposition, LixError, Memory, MergeBranchOptions, MergeBranchPreview,
-    MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents, SessionContext, Storage,
-    SwitchBranchOptions, SwitchBranchReceipt, Value,
+    ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
+    ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
+    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
+    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -256,6 +256,26 @@ where
             .await
     }
 
+    #[doc(hidden)]
+    pub async fn execute_with_idempotency_and_options_and_metadata(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+        idempotency: Option<ExecuteIdempotency>,
+    ) -> Result<ExecuteResult, LixError> {
+        self.session
+            .execute_with_idempotency_and_options_and_metadata(
+                sql,
+                params,
+                options,
+                metadata,
+                idempotency,
+            )
+            .await
+    }
+
     /// Executes statements sequentially against one atomic snapshot.
     /// Pure reads share one read snapshot; batches containing writes retain
     /// transactional read-after-write and rollback semantics.
@@ -294,6 +314,24 @@ where
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.session
             .execute_batch_with_options_and_metadata(statements, options, statement_metadata)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn execute_batch_with_idempotency_and_options_and_metadata(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.session
+            .execute_batch_with_idempotency_and_options_and_metadata(
+                statements,
+                options,
+                statement_metadata,
+                idempotency,
+            )
             .await
     }
 

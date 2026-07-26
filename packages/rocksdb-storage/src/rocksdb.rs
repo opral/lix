@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use bytes::{Buf, Bytes};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
-    WriteStats,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use rocksdb::Snapshot;
@@ -142,9 +142,12 @@ impl Storage for RocksDB {
         Self: 'a;
     fn begin_read(
         &self,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            if opts.durability == ReadDurability::Durable {
+                return Err(StorageError::Durability);
+            }
             Ok(RocksDBRead {
                 snapshot: self.inner.db.snapshot(),
             })

@@ -61,7 +61,10 @@ use crate::plugin::{
     transport_splice_preserves_utf8, validate_host_allocated_changes,
     validate_namespace_reservation,
 };
-use crate::session::{SessionMode, load_workspace_branch_id_from_index};
+use crate::session::{
+    EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
+    encode_receipt, load_workspace_branch_id_from_index,
+};
 use crate::sql2::{
     ChangelogQuerySource, HistoryQuerySource, SessionFileViewKey, SessionFileViewMutation,
     SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
@@ -70,7 +73,7 @@ use crate::sql2::{
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    Memory, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
+    Memory, StoragePrecondition, StorageReadOptions, StorageWriteOptions, StorageWriteSetStats,
 };
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
@@ -228,6 +231,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
     origin_key: Option<String>,
+    idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
@@ -477,6 +481,7 @@ where
                 commit_boundary: None,
                 trust_filesystem_planner: false,
                 origin_key: None,
+                idempotency_receipt: None,
                 session_file_views,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
@@ -626,6 +631,15 @@ where
                     transaction.opening_tracked_mutation_revision.clone(),
                 ),
             );
+        }
+        if let Some((key, value)) = transaction.idempotency_receipt.take() {
+            writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
+            write_options
+                .preconditions
+                .push(StoragePrecondition::KeyAbsent {
+                    space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
+                    key,
+                });
         }
         // Keep the prepared commit's storage borrow independent from the
         // transaction so deterministic preparation failures can still drain
@@ -3449,6 +3463,24 @@ where
     /// Returns the active branch resolved inside this write transaction.
     pub(crate) fn active_branch_id(&self) -> &str {
         &self.active_branch_id
+    }
+
+    /// Stages the protocol replay receipt into this transaction's final
+    /// storage write set. The receipt is guarded by `KeyAbsent` during commit,
+    /// so it either publishes with the SQL mutation or not at all.
+    pub(crate) fn stage_execute_idempotency_receipt(
+        &mut self,
+        idempotency: &ExecuteIdempotency,
+        receipt: &ExecuteIdempotencyReceipt,
+    ) -> Result<(), LixError> {
+        if self.idempotency_receipt.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "a transaction may stage only one execute idempotency receipt",
+            ));
+        }
+        self.idempotency_receipt = Some(encode_receipt(idempotency, receipt)?);
+        Ok(())
     }
 
     /// Returns the content identity of the SQL schema catalog captured when

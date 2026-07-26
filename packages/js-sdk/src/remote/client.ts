@@ -41,6 +41,7 @@ import { readSseEvents } from "./sse.js";
 const OBSERVE_RETRY_BASE_MS = 100;
 const OBSERVE_RETRY_MAX_MS = 5_000;
 const REMOTE_SESSION_HEADER = "Lix-Session-Id";
+const IDEMPOTENCY_KEY_HEADER = "Idempotency-Key";
 const REQUEST_BLOB_DELTA_MIN_BYTES = 32 * 1024;
 const REQUEST_BLOB_DELTA_MIN_WIRE_RATIO = 0.9;
 const REQUEST_BLOB_COMPARE_WORD_BYTES = 8;
@@ -146,6 +147,8 @@ class RemoteLixBinding implements LixBinding {
 	): Promise<BindingExecuteResult> {
 		this.#assertOpen();
 		const snapshot = snapshotParams(params);
+		const idempotencyKey = idempotencyKeyFor(options?.idempotencyKey);
+		const requestOptions = remoteExecuteOptions(options);
 		return this.#enqueue(async () => {
 			const prepared = await this.#prepareParams(
 				snapshot,
@@ -154,10 +157,11 @@ class RemoteLixBinding implements LixBinding {
 			const request = (params: WireRequestValue[]) =>
 				this.#requestJson("execute", {
 					method: "POST",
+					headers: { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey },
 					body: JSON.stringify({
 						sql,
 						params,
-						...(options === undefined ? {} : { options }),
+						...(requestOptions === undefined ? {} : { options: requestOptions }),
 						...(prepared.cacheBlobs ? { cacheBlobs: true } : {}),
 					}),
 				});
@@ -176,6 +180,8 @@ class RemoteLixBinding implements LixBinding {
 		options?: LixBatchOptions,
 	): Promise<BindingExecuteResult[]> {
 		this.#assertOpen();
+		const idempotencyKey = idempotencyKeyFor(options?.idempotencyKey);
+		const requestOptions = remoteExecuteOptions(options);
 		const snapshot = statements.map((statement) => ({
 			sql: statement.sql,
 			params: snapshotParams(statement.params),
@@ -203,6 +209,7 @@ class RemoteLixBinding implements LixBinding {
 			const request = (full: boolean) =>
 				this.#requestJson("execute-batch", {
 					method: "POST",
+					headers: { [IDEMPOTENCY_KEY_HEADER]: idempotencyKey },
 					body: JSON.stringify({
 						statements: preparedStatements.map((statement) => ({
 							sql: statement.sql,
@@ -210,7 +217,7 @@ class RemoteLixBinding implements LixBinding {
 								? statement.prepared.fullParams()
 								: statement.prepared.params,
 						})),
-						...(options === undefined ? {} : { options }),
+						...(requestOptions === undefined ? {} : { options: requestOptions }),
 						...(cacheBlobs ? { cacheBlobs: true } : {}),
 					}),
 				});
@@ -384,6 +391,7 @@ class RemoteLixBinding implements LixBinding {
 		onRequestAttempt?: () => void,
 	): Promise<unknown> {
 		const headers = new Headers(await resolveHeaders(this.#headers));
+		new Headers(init.headers).forEach((value, name) => headers.set(name, value));
 		if (this.#sessionId === undefined) headers.delete(REMOTE_SESSION_HEADER);
 		else headers.set(REMOTE_SESSION_HEADER, this.#sessionId);
 		headers.set("accept", "application/json");
@@ -756,6 +764,35 @@ function blobSpliceIsAtLeastTenPercentSmaller(
 
 function base64EncodedLength(byteLength: number): number {
 	return 4 * Math.ceil(byteLength / 3);
+}
+
+function remoteExecuteOptions(
+	options: ExecuteOptions | LixBatchOptions | undefined,
+): { originKey?: string } | undefined {
+	if (options?.originKey === undefined) return undefined;
+	return { originKey: options.originKey };
+}
+
+function idempotencyKeyFor(provided: string | undefined): string {
+	if (provided !== undefined && typeof provided !== "string") {
+		throw new TypeError("options.idempotencyKey must be a string");
+	}
+	const key = provided ?? globalThis.crypto.randomUUID();
+	if (
+		key.length === 0 ||
+		key.length > 255 ||
+		![...key].every(
+			(character) =>
+				character.length === 1 &&
+				character.charCodeAt(0) >= 0x21 &&
+				character.charCodeAt(0) <= 0x7e,
+		)
+	) {
+		throw new TypeError(
+			"options.idempotencyKey must contain 1 to 255 visible ASCII characters",
+		);
+	}
+	return key;
 }
 
 async function requestWithFullBlobFallback<T>(
