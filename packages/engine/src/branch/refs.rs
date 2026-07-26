@@ -3,7 +3,7 @@ use crate::branch::{BranchHead, BranchHeadControlContext, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 
-/// Typed access to moving branch heads stored in the v6 control plane.
+/// Typed access to moving branch heads stored in the direct control plane.
 ///
 /// The control record is deliberately below live-state visibility, keeping
 /// the dependency acyclic: `branch-control -> tracked-head -> live-state`.
@@ -193,6 +193,9 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: commit_id,
                 generation: commit_id,
+                tracked_head_is_current: false,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
                 created_at: LixTimestamp::expect_parse(
                     "test branch ref created_at",
                     "2026-01-01T00:00:00Z",

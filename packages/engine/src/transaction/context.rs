@@ -46,9 +46,9 @@ use crate::gc::{
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
     LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    TrackedHeadContext, TrackedWorkingDiff,
+    StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_rows,
+    overlay_scan_rows,
 };
-use crate::live_state::{overlay_load_exact_rows, overlay_scan_rows};
 use crate::plugin::{
     ArcByteSource, BoundIdNamespace, CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
     PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
@@ -230,7 +230,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     functions: FunctionProviderHandle,
     /// Tracked-state revision observed by the coherent transaction-open read.
     /// Durable tracked publication must still be based on this revision;
-    /// untracked sidecar writes do not invalidate the snapshot.
+    /// untracked current-state writes do not invalidate the tracked snapshot.
     opening_tracked_mutation_revision: Option<Bytes>,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
@@ -520,10 +520,10 @@ where
             || !prepared_writes.commit_change_refs_by_branch.is_empty()
             || !prepared_writes.extra_commit_parents_by_branch.is_empty();
         let has_untracked_state_writes = prepared_writes.state_rows.iter().any(|row| row.untracked);
-        // Untracked rows are a mutable sidecar, but their validation can read
+        // Untracked rows are mutable current state, but their validation can read
         // tracked schemas, parents, uniqueness owners, or filesystem state.
         // Fence that snapshot without rotating the tracked revision: normal
-        // tracked transactions remain independent of sidecar-only commits.
+        // tracked transactions remain independent of untracked-only commits.
         let requires_tracked_snapshot_fence = tracked_state_changed || has_untracked_state_writes;
         let catalog_revision_changed = prepared_writes_change_catalog(&prepared_writes);
         let _commit_guard = begin_commit_boundary(commit_boundary.as_ref());
@@ -599,7 +599,6 @@ where
         let (mut writes, materialization_preconditions) =
             match commit::commit_prepared_writes_with_parent_heads(
                 &transaction.binary_cas,
-                transaction.live_state.index(),
                 Some(runtime_functions),
                 &commit_parent_heads,
                 &mut read,
@@ -4956,7 +4955,7 @@ struct PluginUpgradeBlobRefSnapshot {
 async fn preflight_owned_v2_generation_upgrades(
     host: &PluginRuntimeHost,
     base: &dyn crate::live_state::LiveStateReader,
-    staged: &impl crate::live_state::StagedLiveStateRows,
+    staged: &impl StagedLiveStateRows,
     base_blob_reader: &dyn BlobDataReader,
     staged_writes: &TransactionWriteBuffer,
     upgrades: &[PluginGenerationUpgrade],
@@ -5752,11 +5751,7 @@ mod tests {
     use crate::wasm::WasmEntity;
 
     fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
-            TrackedStateContext::new(),
-            crate::live_state::LiveStateIndexContext::new(),
-            CommitGraphContext::new(),
-        )
+        LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
@@ -6588,21 +6583,14 @@ mod tests {
             live_untracked_row.snapshot_content.as_deref(),
             Some(r#"{"key":"untracked-programmatic","value":"untracked"}"#)
         );
-        let untracked_change_id = live_untracked_row
-            .change_id
-            .expect("untracked current row should have a real change id");
-        let untracked_changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[untracked_change_id],
-            })
-            .await
-            .expect("changelog should load untracked change");
-        assert!(matches!(
-            untracked_changes.entries.as_slice(),
-            [Some(change)]
-                if change.entity_pk.as_single_string_owned().as_deref()
-                    == Ok("untracked-programmatic")
-        ));
+        assert_eq!(
+            live_untracked_row.change_id, None,
+            "ordinary untracked rows must not enter the changelog"
+        );
+        assert_eq!(
+            live_untracked_row.commit_id, None,
+            "ordinary untracked rows must not enter the commit graph"
+        );
 
         let tracked_rows = TrackedStateContext::new()
             .reader(

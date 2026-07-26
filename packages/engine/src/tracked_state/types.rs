@@ -119,8 +119,8 @@ pub(crate) struct TrackedStateCommitRootParent {
 ///
 /// Tracked rows are the serving state that can be rebuilt from changelog facts.
 /// They intentionally do not carry an `untracked` flag: commit roots contain
-/// tracked history only. Mutable untracked rows live in the separate flat
-/// portion of `live_state` and reference their ChangeRecords directly.
+/// tracked history only. Mutable untracked rows share the current-state
+/// projection with tracked rows, but never enter a commit root or changelog.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) entity_pk: EntityPk,

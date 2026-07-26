@@ -21,7 +21,10 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::FilesystemPathIndexReader;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreContext;
-use crate::live_state::{LiveStateContext, LiveStateIndexRowRequest, LiveStateReader};
+use crate::live_state::{
+    LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateProjection,
+    LiveStateReader,
+};
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::PluginRuntimeHost;
@@ -40,30 +43,29 @@ use super::transaction::{SessionOperationGuard, SessionTransactionManager, Sessi
 
 pub(crate) const WORKSPACE_BRANCH_KEY: &str = "lix_workspace_branch_id";
 
-/// Loads the workspace selector from its canonical untracked global index
-/// entry, then verifies that the selected branch still exists in the same
+/// Loads the workspace selector from its canonical untracked current-state
+/// member, then verifies that the selected branch still exists in the same
 /// storage snapshot.
-///
-/// The selector is engine-owned mutable state. Routing it through generic
-/// live-state visibility would also probe the immutable tracked head even
-/// though a tracked fallback is not a valid selector representation.
 pub(crate) async fn load_workspace_branch_id_from_index(
     live_state: &LiveStateContext,
     branch_ctx: &BranchContext,
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
     let mut rows = live_state
-        .index()
         .reader(reader)
-        .load_rows(
-            &[LiveStateIndexRowRequest {
+        .load_exact_rows(&LiveStateExactBatchRequest {
+            rows: vec![LiveStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(WORKSPACE_BRANCH_KEY),
                 file_id: None,
             }],
-            &["snapshot_content".to_string()],
-        )
+            projection: LiveStateProjection {
+                columns: vec!["snapshot_content".to_string()],
+            },
+            untracked: Some(true),
+            include_tombstones: false,
+        })
         .await?;
     let row = rows.pop().flatten().ok_or_else(|| {
         LixError::new(
@@ -641,7 +643,7 @@ where
     }
 
     fn entity_snapshot_reader(&self) -> Option<Arc<dyn crate::sql2::EntitySnapshotReader>> {
-        Some(Arc::new(crate::sql2::TrackedEntitySnapshotReader::new(
+        Some(Arc::new(crate::sql2::CurrentEntitySnapshotReader::new(
             Arc::clone(&self.live_state),
             self.read_store.clone(),
         )))

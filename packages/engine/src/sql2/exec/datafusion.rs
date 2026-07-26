@@ -2212,7 +2212,8 @@ mod tests {
         LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::{
-        ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlHistoryQuerySource,
+        ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
+        SqlHistoryQuerySource,
     };
     use crate::sql2::{
         PublicCatalog, WriteExecutorMode, WriteExecutorPath, create_write_logical_plan,
@@ -2227,6 +2228,7 @@ mod tests {
     };
     use crate::{Engine, ExecuteResult, SessionContext};
     use crate::{LixError, NullableKeyFilter, Value};
+    use bytes::Bytes;
     use datafusion::common::ScalarValue;
 
     struct DummyBlobReader;
@@ -2244,6 +2246,10 @@ mod tests {
     struct CountingRowsLiveStateReader {
         rows: Vec<MaterializedLiveStateRow>,
         scans: Arc<AtomicUsize>,
+    }
+    struct RecordingEntitySnapshotReader {
+        snapshots: Vec<Option<Bytes>>,
+        requests: Arc<Mutex<Vec<LiveStateScanRequest>>>,
     }
     struct DummyCommitGraphReader;
     struct DummyBranchRefReader;
@@ -2354,6 +2360,7 @@ mod tests {
         active_branch_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateReader>,
+        entity_snapshot_reader: Option<Arc<dyn EntitySnapshotReader>>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -2367,6 +2374,10 @@ mod tests {
 
         fn live_state(&self) -> Arc<dyn LiveStateReader> {
             Arc::clone(&self.live_state)
+        }
+
+        fn entity_snapshot_reader(&self) -> Option<Arc<dyn EntitySnapshotReader>> {
+            self.entity_snapshot_reader.clone()
         }
 
         fn filesystem_path_index(&self) -> Arc<dyn crate::filesystem::FilesystemPathIndexReader> {
@@ -2913,6 +2924,20 @@ mod tests {
     }
 
     #[async_trait]
+    impl EntitySnapshotReader for RecordingEntitySnapshotReader {
+        async fn scan_entity_snapshots(
+            &self,
+            request: LiveStateScanRequest,
+        ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+            self.requests
+                .lock()
+                .expect("captured snapshot requests lock")
+                .push(request);
+            Ok(Some(self.snapshots.clone()))
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_bytes_many(
             &self,
@@ -3128,6 +3153,7 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader: Arc::clone(&blob_reader),
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateReader>,
+            entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -3146,6 +3172,7 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader,
             live_state,
+            entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -3168,6 +3195,7 @@ mod tests {
                     live_test_state_row("entity-a", "branch-a", "A", false),
                 ],
             }),
+            entity_snapshot_reader: None,
             schema_definitions: vec![json!({
                 "x-lix-key": "test_state_schema",
                 "x-lix-primary-key": ["/id"],
@@ -3209,6 +3237,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_entity_primary_key_read_uses_tracked_snapshot_reader() {
+        let sql = "SELECT id, value FROM test_state_schema \
+                   WHERE id IN ('entity-b', 'entity-a', 'entity-b') ORDER BY id";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let snapshot_reader = Arc::new(RecordingEntitySnapshotReader {
+            snapshots: vec![
+                Some(Bytes::from_static(br#"{"id":"entity-a","value":"A"}"#)),
+                Some(Bytes::from_static(br#"{"id":"entity-b","value":"B"}"#)),
+            ],
+            requests: Arc::clone(&requests),
+        });
+        let scans = Arc::new(AtomicUsize::new(0));
+        let ctx = DummySqlExecutionContext {
+            active_branch_id: "branch-a",
+            blob_reader: Arc::new(DummyBlobReader),
+            live_state: Arc::new(CountingRowsLiveStateReader {
+                rows: Vec::new(),
+                scans: Arc::clone(&scans),
+            }),
+            entity_snapshot_reader: Some(snapshot_reader),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "value": { "type": "string" }
+                },
+                "required": ["id", "value"],
+                "additionalProperties": false
+            })],
+        };
+        let statement = crate::sql2::parse_statement(sql).expect("test SQL should parse");
+
+        let result = super::super::bound_public_read::try_execute_bound_public_read(
+            &ctx,
+            sql,
+            &statement,
+            &[],
+        )
+        .await
+        .expect("native route should execute")
+        .expect("exact public primary-key read should use native route");
+
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![
+                    Value::Text("entity-a".to_string()),
+                    Value::Text("A".to_string())
+                ],
+                vec![
+                    Value::Text("entity-b".to_string()),
+                    Value::Text("B".to_string())
+                ],
+            ]
+        );
+        assert_eq!(scans.load(Ordering::SeqCst), 0);
+        let requests = requests.lock().expect("captured snapshot requests lock");
+        let [request] = requests.as_slice() else {
+            panic!("native exact read must issue one snapshot request");
+        };
+        assert_eq!(request.filter.schema_keys, ["test_state_schema"]);
+        assert_eq!(
+            request.filter.entity_pks,
+            [
+                crate::entity_pk::EntityPk::single("entity-a"),
+                crate::entity_pk::EntityPk::single("entity-b"),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn execute_sql_collects_union_all_partitions() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateReader);
@@ -3216,6 +3317,7 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader,
             live_state,
+            entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -3236,6 +3338,7 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader,
             live_state,
+            entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -3271,6 +3374,7 @@ mod tests {
             active_branch_id: "branch-a",
             blob_reader,
             live_state,
+            entity_snapshot_reader: None,
             schema_definitions: vec![],
         };
 
@@ -3967,7 +4071,10 @@ mod tests {
         );
         assert_eq!(filter.branch_ids, vec!["branch-b"]);
         assert_eq!(filter.file_ids, vec![NullableKeyFilter::Null]);
-        assert_eq!(filter.untracked, Some(true));
+        // V12 has one canonical identity across retention. The probe remains
+        // narrowed by schema, PK, branch, and file ID, but must inspect both
+        // tracked and untracked rows so an upsert preserves existing retention.
+        assert_eq!(filter.untracked, None);
         assert!(!filter.include_tombstones);
 
         let staged_writes = staged_writes.lock().expect("staged writes lock");
@@ -5809,6 +5916,7 @@ mod tests {
                     live_blob_ref_row("file-a", "branch-a", &[0x41, 0x42]),
                 ],
             }),
+            entity_snapshot_reader: None,
             schema_definitions: vec![schema_definition],
         })
     }

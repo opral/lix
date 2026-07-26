@@ -217,15 +217,13 @@ where
 fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,
-        crate::live_state::LIVE_STATE_INDEX_ROW_SPACE,
-        crate::live_state::LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
-        crate::live_state::LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE,
+        crate::branch::BRANCH_HEAD_CONTROL_SPACE,
         crate::live_state::TRACKED_HEAD_GROUP_SPACE,
         crate::live_state::TRACKED_HEAD_MEMBER_SPACE,
-        crate::live_state::TRACKED_HEAD_MARKER_SPACE,
         crate::live_state::TRACKED_WORKING_DIFF_GROUP_SPACE,
         crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
         crate::json_store::store::JSON_SPACE,
+        crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
         crate::tracked_state::TRACKED_STATE_TREE_CHUNK_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,

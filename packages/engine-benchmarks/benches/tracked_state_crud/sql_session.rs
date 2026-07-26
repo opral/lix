@@ -8,6 +8,20 @@ use crate::workload::{WorkloadRow, sql_string};
 const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
+const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UntrackedFixture {
+    None,
+    OneUnrelated,
+    OneReadManyMember,
+}
+
+impl UntrackedFixture {
+    const fn has_untracked_row(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
 
 pub(crate) enum SqlFixture {
     SQLite(GenericSqlFixture<SQLite>),
@@ -16,7 +30,12 @@ pub(crate) enum SqlFixture {
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     session: SessionContext<StorageImpl>,
+    /// Number of tracked fixture rows. In mixed mode the untracked probe
+    /// replaces one of the requested rows rather than adding a 10,001st row.
     row_count: usize,
+    visible_row_count: usize,
+    untracked_fixture: UntrackedFixture,
+    read_many_by_pk_count: usize,
     insert_sql_chunks: Vec<String>,
     select_all_sql: String,
     select_many_by_pk_sql: String,
@@ -31,23 +50,53 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
 }
 
 pub(crate) async fn empty_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
+    empty_fixture_with_read_many_pk_count(profile, rows, READ_MANY_PK_COUNT).await
+}
+
+/// Builds a fixture whose setup-excluded multi-point SQL has exactly
+/// `read_many_by_pk_count` primary-key terms. Profile mode uses this to
+/// measure read-many scaling without changing the Criterion workload shape.
+pub(crate) async fn empty_fixture_with_read_many_pk_count(
+    profile: StorageProfile,
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+) -> SqlFixture {
+    assert!(
+        (1..=rows.len()).contains(&read_many_by_pk_count),
+        "read-many primary-key count must be between 1 and {}, got {read_many_by_pk_count}",
+        rows.len()
+    );
+    let untracked_fixture = profile_untracked_fixture();
     match profile.storage() {
         ProfileStorage::SQLite { storage, _dir: dir } => SqlFixture::SQLite(fixture_for_session(
             prepare_session(storage).await,
             rows,
+            read_many_by_pk_count,
+            untracked_fixture,
             dir,
         )),
         ProfileStorage::RocksDB { storage, _dir: dir } => SqlFixture::RocksDB(fixture_for_session(
             prepare_session(storage).await,
             rows,
+            read_many_by_pk_count,
+            untracked_fixture,
             dir,
         )),
     }
 }
 
 pub(crate) async fn seeded_fixture(profile: StorageProfile, rows: &[WorkloadRow]) -> SqlFixture {
-    let fixture = empty_fixture(profile, rows).await;
+    seeded_fixture_with_read_many_pk_count(profile, rows, READ_MANY_PK_COUNT).await
+}
+
+pub(crate) async fn seeded_fixture_with_read_many_pk_count(
+    profile: StorageProfile,
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+) -> SqlFixture {
+    let fixture = empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await;
     fixture.insert_all().await;
+    fixture.insert_untracked_probe().await;
     fixture
 }
 
@@ -56,6 +105,13 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.insert_all().await,
             Self::RocksDB(fixture) => fixture.insert_all().await,
+        }
+    }
+
+    async fn insert_untracked_probe(&self) {
+        match self {
+            Self::SQLite(fixture) => fixture.insert_untracked_probe().await,
+            Self::RocksDB(fixture) => fixture.insert_untracked_probe().await,
         }
     }
 
@@ -163,8 +219,19 @@ where
 
     async fn read_all(&self) -> usize {
         let result = std::hint::black_box(self.read_all_result().await);
-        assert_eq!(result.len(), self.row_count);
+        assert_eq!(result.len(), self.visible_row_count);
         result.len()
+    }
+
+    async fn insert_untracked_probe(&self) {
+        if !self.untracked_fixture.has_untracked_row() {
+            return;
+        }
+        let sql = format!(
+            "INSERT INTO json_pointer (path, value, lixcol_untracked) VALUES ('{UNTRACKED_PROBE_PATH}', lix_json('{{\"lane\":\"untracked\"}}'), true)"
+        );
+        let affected = execute(&self.session, &sql).await.rows_affected();
+        assert_eq!(affected, 1, "insert untracked overlay probe");
     }
 
     async fn read_all_result(&self) -> ExecuteResult {
@@ -173,7 +240,7 @@ where
 
     async fn read_many_by_pk(&self) -> usize {
         let result = std::hint::black_box(self.read_many_by_pk_result().await);
-        assert_eq!(result.len(), READ_MANY_PK_COUNT.min(self.row_count));
+        assert_eq!(result.len(), self.read_many_by_pk_count);
         result.len()
     }
 
@@ -239,7 +306,7 @@ where
         let affected = execute(&self.session, &self.delete_all_sql)
             .await
             .rows_affected();
-        assert_eq!(affected as usize, self.row_count);
+        assert_eq!(affected as usize, self.visible_row_count);
         affected as usize
     }
 
@@ -256,22 +323,41 @@ where
 fn fixture_for_session<StorageImpl>(
     session: SessionContext<StorageImpl>,
     rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+    untracked_fixture: UntrackedFixture,
     dir: tempfile::TempDir,
 ) -> GenericSqlFixture<StorageImpl>
 where
     StorageImpl: Storage,
 {
-    let mid = rows.len() / 2;
+    let tracked_rows = if untracked_fixture == UntrackedFixture::OneReadManyMember {
+        // The untracked probe occupies one selected identity, so keep the
+        // seeded and returned cardinality exactly equal to the baseline.
+        &rows[..rows.len() - 1]
+    } else {
+        rows
+    };
+    let mid = tracked_rows.len() / 2;
     GenericSqlFixture {
         session,
-        row_count: rows.len(),
-        insert_sql_chunks: rows.chunks(SQL_CHUNK_SIZE).map(insert_rows_sql).collect(),
+        row_count: tracked_rows.len(),
+        visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
+        untracked_fixture,
+        read_many_by_pk_count,
+        insert_sql_chunks: tracked_rows
+            .chunks(SQL_CHUNK_SIZE)
+            .map(insert_rows_sql)
+            .collect(),
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
-        select_many_by_pk_sql: select_by_pk_sql(&rows[..READ_MANY_PK_COUNT.min(rows.len())]),
-        select_one_by_pk_sql: select_by_pk_sql(&rows[mid..][..1]),
-        update_one_by_pk_sql: update_row_sql(&rows[mid]),
-        update_all_sql_rows: rows.iter().map(update_row_sql).collect(),
-        bound_update_all_params: rows
+        select_many_by_pk_sql: select_many_by_pk_sql(
+            rows,
+            read_many_by_pk_count,
+            untracked_fixture,
+        ),
+        select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
+        update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
+        update_all_sql_rows: tracked_rows.iter().map(update_row_sql).collect(),
+        bound_update_all_params: tracked_rows
             .iter()
             .map(|row| {
                 vec![
@@ -283,9 +369,25 @@ where
         delete_all_sql: "DELETE FROM json_pointer".to_string(),
         delete_one_by_pk_sql: format!(
             "DELETE FROM json_pointer WHERE path = '{}'",
-            sql_string(rows[mid].path.as_str())
+            sql_string(tracked_rows[mid].path.as_str())
         ),
         _dir: dir,
+    }
+}
+
+/// Profile-only unified-current-state fixture switch. `one_unrelated` keeps
+/// all selected rows tracked, proving an unrelated untracked row does not
+/// change routing. `one_read_many_member` replaces one selected tracked
+/// primary key with the untracked identity, proving normal SQL returns mixed
+/// state without an explicit lane predicate.
+fn profile_untracked_fixture() -> UntrackedFixture {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED").as_deref() {
+        Ok("one_unrelated") => UntrackedFixture::OneUnrelated,
+        Ok("one_read_many_member") => UntrackedFixture::OneReadManyMember,
+        Err(_) => UntrackedFixture::None,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_UNTRACKED '{other}'; expected one_unrelated or one_read_many_member"
+        ),
     }
 }
 
@@ -388,10 +490,35 @@ fn insert_rows_sql(rows: &[WorkloadRow]) -> String {
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {
+    select_by_paths_sql(rows.iter().map(|row| row.path.as_str()))
+}
+
+fn select_many_by_pk_sql(
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+    untracked_fixture: UntrackedFixture,
+) -> String {
+    if untracked_fixture == UntrackedFixture::OneReadManyMember {
+        assert!(
+            read_many_by_pk_count >= 2,
+            "one_read_many_member requires at least two selected primary keys"
+        );
+        return select_by_paths_sql(
+            rows[..read_many_by_pk_count - 1]
+                .iter()
+                .map(|row| row.path.as_str())
+                .chain(std::iter::once(UNTRACKED_PROBE_PATH)),
+        );
+    }
+    select_by_pk_sql(&rows[..read_many_by_pk_count])
+}
+
+fn select_by_paths_sql<'a>(paths: impl IntoIterator<Item = &'a str>) -> String {
     format!(
         "SELECT path, value FROM json_pointer WHERE path IN ({}) ORDER BY path",
-        rows.iter()
-            .map(|row| format!("'{}'", sql_string(row.path.as_str())))
+        paths
+            .into_iter()
+            .map(|path| format!("'{}'", sql_string(path)))
             .collect::<Vec<_>>()
             .join(",")
     )

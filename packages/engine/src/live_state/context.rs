@@ -10,15 +10,11 @@ use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
     FilesystemPathIndexRequest, build_path_index, load_path_index_revision,
 };
-use crate::live_state::index::{
-    LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexScanRequest,
-    load_untracked_schema_presence_marker,
-};
 use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowIdentity, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope, VisibilityRequest,
-    expanded_branch_ids, resolve_visible_rows,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowIdentity,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope,
+    VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -37,14 +33,12 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Tracked rows are resolved from the branch head's durable head projection;
-/// sparse immutable roots and changelog replay are historical fallbacks.
-/// Untracked and engine-owned current rows are resolved through a flat mutable
-/// identity-to-change index, then both sources are combined for serving.
+/// Normal rows are resolved from one durable current-state projection. Each
+/// packed member carries its own tracked|untracked retention, so readers do
+/// not route through a separate retention index or merge retention candidates.
 pub(crate) struct LiveStateContext {
     tracked_state: TrackedStateContext,
     tracked_head: TrackedHeadContext,
-    live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
@@ -52,13 +46,11 @@ pub(crate) struct LiveStateContext {
 impl LiveStateContext {
     pub(crate) fn new(
         tracked_state: TrackedStateContext,
-        live_index: LiveStateIndexContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         Self {
             tracked_state,
             tracked_head: TrackedHeadContext::new(),
-            live_index,
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
         }
@@ -73,14 +65,9 @@ impl LiveStateContext {
             store,
             tracked_state: self.tracked_state.clone(),
             tracked_head: self.tracked_head,
-            live_index: self.live_index.clone(),
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
         }
-    }
-
-    pub(crate) fn index(&self) -> &LiveStateIndexContext {
-        &self.live_index
     }
 
     pub(crate) fn advance_filesystem_path_indexes(
@@ -99,7 +86,6 @@ pub(crate) struct LiveStateStoreReader<S> {
     store: S,
     tracked_state: TrackedStateContext,
     tracked_head: TrackedHeadContext,
-    live_index: LiveStateIndexContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
 }
@@ -108,20 +94,20 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    /// Returns raw tracked snapshot bytes for one broad SQL entity scan.
+    /// Returns raw current-state snapshot bytes for one current SQL entity scan.
     ///
     /// `None` means the normal materialized visibility path remains
-    /// authoritative: untracked rows, a global overlay, multiple result
-    /// branch scopes, commit-derived state, or an unavailable tracked-head
-    /// projection all deliberately fall back rather than approximating
+    /// authoritative: a global branch projection, multiple result branch
+    /// scopes, commit-derived state, or an unavailable current-state
+    /// generation all deliberately fall back rather than approximating
     /// visibility.
     pub(crate) async fn scan_direct_entity_snapshots(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        // Engine construction admits only the v10 layout, whose complete
-        // untracked-schema marker makes a missing marker a tracked-only proof.
-        if request.filter.untracked == Some(true)
+        // V12 carries tracked and untracked members in one current-state
+        // group, so this route never probes a separate retention index or marker.
+        if request.filter.untracked.is_some()
             || request_may_include_commit_derived(request)
             || request
                 .filter
@@ -134,25 +120,10 @@ where
         let [schema_key] = request.filter.schema_keys.as_slice() else {
             return Ok(None);
         };
-        let scope = scan_scope(&self.store, &self.live_index, request, true).await?;
+        let scope = scan_scope(&self.store, request, true).await?;
         let [requested_branch_id] = scope.projection_branch_ids.as_slice() else {
             return Ok(None);
         };
-        // A normal SQL entity query transparently includes an untracked row
-        // when one exists. In a v10 repository the monotonic marker proves
-        // that every relevant branch/schema is tracked-only; otherwise the
-        // established merged visibility path remains authoritative. An
-        // explicit tracked-only request does not need this proof.
-        if request.filter.untracked.is_none() {
-            for branch_id in &scope.storage_branch_ids {
-                if load_untracked_schema_presence_marker(&self.store, branch_id, schema_key)
-                    .await?
-                    .is_some()
-                {
-                    return Ok(None);
-                }
-            }
-        }
         if scope
             .storage_branch_ids
             .iter()
@@ -182,6 +153,7 @@ where
                 requested_branch_id,
                 requested_control,
                 schema_key,
+                &request.filter.entity_pks,
                 request.limit,
             )
             .await
@@ -192,48 +164,41 @@ where
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
-        let reads_tracked =
-            request.filter.untracked != Some(true) && !is_commit_derived_only_request(request);
-        let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
+        let reads_tracked = !is_commit_derived_only_request(request);
+        let scope = scan_scope(store, request, reads_tracked).await?;
+        if let Some(rows) = self.scan_direct_tracked_pk_groups(request, &scope).await? {
+            return Ok(rows);
+        }
         let commit_derived_rows = if request.filter.untracked != Some(true) {
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?
         } else {
             Vec::new()
         };
-        let mut tracked_branch_rows =
-            if request.filter.untracked != Some(true) && !is_commit_derived_only_request(request) {
-                self.scan_tracked_branch_rows(request, &scope).await?
-            } else {
-                Vec::new()
-            };
-        let mut untracked_rows = if request.filter.untracked != Some(false)
-            && !is_commit_derived_only_request(request)
-        {
-            let branch_rows = stream::iter(scope.storage_branch_ids.clone())
-                .map(|branch_id| async move {
-                    let rows: Vec<_> = self
-                        .live_index
-                        .reader(store)
-                        .scan_rows(&index_scan_request_from_live(request, &branch_id))
-                        .await?
-                        .into_iter()
-                        .filter(|row| row.schema_key != BRANCH_REF_SCHEMA_KEY)
-                        .map(MaterializedLiveStateRow::from)
-                        .collect();
-                    Ok::<_, LixError>(rows)
-                })
-                .buffered(BRANCH_READ_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?;
-            branch_rows.into_iter().flatten().collect()
+        let mut tracked_branch_rows = if !is_commit_derived_only_request(request) {
+            self.scan_tracked_branch_rows(request, &scope).await?
         } else {
             Vec::new()
         };
         if request.filter.untracked != Some(false) {
-            untracked_rows.extend(scan_direct_branch_ref_rows(store, request, &scope).await?);
+            let branch_ref_rows = scan_direct_branch_ref_rows(store, request, &scope).await?;
+            if !branch_ref_rows.is_empty() {
+                tracked_branch_rows.push(TrackedBranchRows {
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    rows: branch_ref_rows,
+                    ordered_unique: false,
+                });
+            }
+        }
+        // The ordered single-branch route bypasses the generic visibility
+        // resolver, so apply the retention predicate before taking that fast
+        // path. Otherwise `untracked = Some(..)` accidentally returned both
+        // member kinds from an already-unified group.
+        for branch_rows in &mut tracked_branch_rows {
+            branch_rows
+                .rows
+                .retain(|row| current_row_matches_retention(row, request.filter.untracked));
         }
         if commit_derived_rows.is_empty()
-            && untracked_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
         {
@@ -249,7 +214,6 @@ where
                 .into_iter()
                 .flat_map(|branch_rows| branch_rows.rows),
         );
-        rows.extend(untracked_rows);
         Ok(resolve_visible_rows(
             rows,
             Vec::new(),
@@ -261,6 +225,70 @@ where
                 limit: request.limit,
             },
         ))
+    }
+
+    /// Serves finite entity-PK scans from packed current-state groups. Every
+    /// member already has its retention tag, so an unrelated untracked row
+    /// cannot route the selected tracked identities through a separate scan.
+    async fn scan_direct_tracked_pk_groups(
+        &self,
+        request: &LiveStateScanRequest,
+        scope: &LiveStateScanScope,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        if !matches!(request.filter.rows, LiveStateRowFilter::All)
+            || request.filter.branch_ids.is_empty()
+            || request.filter.schema_keys.is_empty()
+            || request.filter.entity_pks.is_empty()
+            || !request.filter.file_ids.is_empty()
+            || !request.filter.constraints.is_empty()
+            || request_may_include_commit_derived(request)
+            || request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == BRANCH_REF_SCHEMA_KEY)
+        {
+            return Ok(None);
+        }
+        let controls = scope
+            .storage_branch_ids
+            .iter()
+            .map(|branch_id| {
+                scope
+                    .branch_heads
+                    .get(branch_id)
+                    .copied()
+                    .map(|control| (branch_id.clone(), control))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(controls) = controls else {
+            return Ok(None);
+        };
+        let tracked_request = tracked_scan_request_from_live(request);
+        let Some(rows_by_branch) = self
+            .tracked_head
+            .reader(&self.store)
+            .scan_live_rows_for_current_controls(&controls, &tracked_request)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let rows = rows_by_branch
+            .into_iter()
+            .flat_map(|(_, rows)| rows)
+            .filter(|row| current_row_matches_retention(row, request.filter.untracked))
+            .collect();
+        Ok(Some(resolve_visible_rows(
+            rows,
+            Vec::new(),
+            &VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: scope.projection_branch_ids.clone(),
+                },
+                include_tombstones: request.filter.include_tombstones,
+                limit: request.limit,
+            },
+        )))
     }
 
     pub(crate) async fn load_row(
@@ -329,9 +357,12 @@ where
             },
             ..Default::default()
         };
-        let reads_tracked = request.untracked != Some(true);
-        let scope =
-            scan_scope(&self.store, &self.live_index, &scope_request, reads_tracked).await?;
+        // Current-state groups are authoritative for both retention modes.
+        // Even an untracked-only exact batch therefore needs the branch
+        // controls that select the active generation; treating that request
+        // as "not tracked" used to skip the controls entirely and made the
+        // workspace selector (an untracked row) invisible after V12 init.
+        let scope = scan_scope(&self.store, &scope_request, true).await?;
         let visible_branch_ids = scope
             .projection_branch_ids
             .iter()
@@ -362,91 +393,75 @@ where
         let mut candidates =
             std::collections::BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
 
-        if request.untracked != Some(true) {
-            let mut identities_by_branch = std::collections::BTreeMap::<String, Vec<_>>::new();
-            for identity in &storage_identities {
-                if scope.branch_heads.contains_key(&identity.branch_id) {
-                    identities_by_branch
-                        .entry(identity.branch_id.clone())
-                        .or_default()
-                        .push(identity.clone());
-                }
+        let mut identities_by_branch = std::collections::BTreeMap::<String, Vec<_>>::new();
+        for identity in &storage_identities {
+            if scope.branch_heads.contains_key(&identity.branch_id) {
+                identities_by_branch
+                    .entry(identity.branch_id.clone())
+                    .or_default()
+                    .push(identity.clone());
             }
-            let projection =
-                crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
-            let tracked_batches = stream::iter(identities_by_branch)
-                .map(|(branch_id, identities)| {
-                    let control = scope.branch_heads[&branch_id];
-                    let commit_id = control.head_commit_id.to_string();
-                    let projection = projection.clone();
-                    async move {
-                        let keys = identities
-                            .iter()
-                            .map(|identity| crate::tracked_state::TrackedStateKey {
-                                schema_key: identity.schema_key.clone(),
-                                entity_pk: identity.entity_pk.clone(),
-                                file_id: identity.file_id.clone(),
-                            })
-                            .collect::<Vec<_>>();
-                        let source = tracked_source_from_branch_id(&branch_id);
-                        let rows = if let Some(rows) = self
+        }
+        let projection =
+            crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
+        let current_batches = stream::iter(identities_by_branch)
+            .map(|(branch_id, identities)| {
+                let control = scope.branch_heads[&branch_id];
+                let commit_id = control.head_commit_id.to_string();
+                let projection = projection.clone();
+                async move {
+                    let keys = identities
+                        .iter()
+                        .map(|identity| crate::tracked_state::TrackedStateKey {
+                            schema_key: identity.schema_key.clone(),
+                            entity_pk: identity.entity_pk.clone(),
+                            file_id: identity.file_id.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let source = tracked_source_from_branch_id(&branch_id);
+                    let rows = if let Some(rows) = self
+                        .tracked_head
+                        .reader(&self.store)
+                        .load_projected_live_rows_if_control_current(
+                            &branch_id,
+                            control,
+                            &keys,
+                            &projection,
+                        )
+                        .await?
+                    {
+                        rows
+                    } else {
+                        let untracked_rows = self
                             .tracked_head
                             .reader(&self.store)
-                            .load_projected_live_rows_if_control_current(
+                            .load_untracked_projected_rows_for_generation(
                                 &branch_id,
-                                control,
+                                control.generation,
                                 &keys,
                                 &projection,
                             )
+                            .await?;
+                        self.tracked_state
+                            .reader(&self.store)
+                            .load_projected_rows_at_commit(&commit_id, &keys, &projection)
                             .await?
-                        {
-                            rows
-                        } else {
-                            self.tracked_state
-                                .reader(&self.store)
-                                .load_projected_rows_at_commit(&commit_id, &keys, &projection)
-                                .await?
-                                .into_iter()
-                                .map(|row| {
-                                    row.map(|row| project_tracked_row(row, &branch_id, source))
-                                })
-                                .collect()
-                        };
-                        Ok::<_, LixError>((branch_id, identities, rows))
-                    }
-                })
-                .buffered(BRANCH_READ_CONCURRENCY)
-                .try_collect::<Vec<_>>()
-                .await?;
-            for (_branch_id, identities, rows) in tracked_batches {
-                for (identity, row) in identities.into_iter().zip(rows) {
-                    if let Some(row) = row {
-                        candidates.insert(identity, row);
-                    }
+                            .into_iter()
+                            .map(|row| row.map(|row| project_tracked_row(row, &branch_id, source)))
+                            .zip(untracked_rows)
+                            .map(|(tracked, untracked)| untracked.or(tracked))
+                            .collect()
+                    };
+                    Ok::<_, LixError>((identities, rows))
                 }
-            }
-        }
-
-        if request.untracked != Some(false) {
-            let index_requests = storage_identities
-                .iter()
-                .map(|identity| crate::live_state::LiveStateIndexRowRequest {
-                    branch_id: identity.branch_id.clone(),
-                    schema_key: identity.schema_key.clone(),
-                    entity_pk: identity.entity_pk.clone(),
-                    file_id: identity.file_id.clone(),
-                })
-                .collect::<Vec<_>>();
-            let rows = self
-                .live_index
-                .reader(&self.store)
-                .load_rows(&index_requests, &request.projection.columns)
-                .await?;
-            for (identity, row) in storage_identities.iter().cloned().zip(rows) {
+            })
+            .buffered(BRANCH_READ_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (identities, rows) in current_batches {
+            for (identity, row) in identities.into_iter().zip(rows) {
                 if let Some(row) = row {
-                    // Mutable flat state is canonical over the tracked head for
-                    // the same storage identity.
-                    candidates.insert(identity, MaterializedLiveStateRow::from(row));
+                    candidates.insert(identity, row);
                 }
             }
         }
@@ -470,9 +485,17 @@ where
                     entity_pk: requested.entity_pk.clone(),
                     file_id: requested.file_id.clone(),
                 };
+                // Filter each source before branch/global precedence. A local
+                // row of the other retention must not mask a matching global
+                // row from an explicit retention-scoped internal read.
                 let mut row = candidates
                     .get(&branch_identity)
-                    .or_else(|| candidates.get(&global_identity))?
+                    .filter(|row| current_row_matches_retention(row, request.untracked))
+                    .or_else(|| {
+                        candidates
+                            .get(&global_identity)
+                            .filter(|row| current_row_matches_retention(row, request.untracked))
+                    })?
                     .clone();
                 if row.branch_id.as_ref() == GLOBAL_BRANCH_ID
                     && requested.branch_id != GLOBAL_BRANCH_ID
@@ -495,7 +518,7 @@ where
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
-        let scope = scan_scope(store, &self.live_index, request, reads_tracked).await?;
+        let scope = scan_scope(store, request, reads_tracked).await?;
         let commit_derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut tracked_branch_rows = if !is_commit_derived_only_request(request) {
@@ -503,6 +526,9 @@ where
         } else {
             Vec::new()
         };
+        for branch_rows in &mut tracked_branch_rows {
+            branch_rows.rows.retain(|row| !row.untracked);
+        }
         if commit_derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
@@ -561,25 +587,38 @@ where
                     {
                         (rows, true)
                     } else {
-                        (
-                            self.tracked_state
+                        let mut rows = self
+                            .tracked_state
+                            .reader(store)
+                            .scan_rows_at_commit(
+                                &control.head_commit_id.to_string(),
+                                &tracked_request,
+                            )
+                            .await?
+                            .into_iter()
+                            .map(|row| {
+                                project_tracked_row(
+                                    row,
+                                    &branch_id,
+                                    tracked_source_from_branch_id(&branch_id),
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        // Lifecycle fallback reconstructs only tracked
+                        // history. The old serving generation remains the
+                        // workspace source of truth for untracked members
+                        // until the next complete generation is published.
+                        rows.extend(
+                            self.tracked_head
                                 .reader(store)
-                                .scan_rows_at_commit(
-                                    &control.head_commit_id.to_string(),
+                                .scan_untracked_rows_for_generation(
+                                    &branch_id,
+                                    control.generation,
                                     &tracked_request,
                                 )
-                                .await?
-                                .into_iter()
-                                .map(|row| {
-                                    project_tracked_row(
-                                        row,
-                                        &branch_id,
-                                        tracked_source_from_branch_id(&branch_id),
-                                    )
-                                })
-                                .collect(),
-                            false,
-                        )
+                                .await?,
+                        );
+                        (rows, false)
                     };
                     Ok::<_, LixError>(TrackedBranchRows {
                         branch_id: branch_id.clone(),
@@ -703,10 +742,10 @@ async fn scan_commit_derived_rows(
 }
 
 /// Synthesizes the public `lix_branch_ref` metadata entity from authoritative
-/// v6 controls. The old physical flat row is intentionally filtered out at
-/// the caller so SQL/entity consumers keep seeing exactly one current ref per
-/// branch even while a rare lifecycle write retains its legacy projection for
-/// validation and changelog compatibility.
+/// branch-head controls. The mutable live-state projection is intentionally
+/// filtered out at the caller so SQL/entity consumers keep seeing exactly one
+/// current ref per branch while lifecycle operations retain their validated
+/// changelog fact.
 async fn scan_direct_branch_ref_rows(
     store: &(impl StorageAdapterRead + ?Sized),
     request: &LiveStateScanRequest,
@@ -766,7 +805,7 @@ fn direct_branch_ref_row(
     .map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            format!("failed to encode v6 direct branch-ref snapshot: {error}"),
+            format!("failed to encode direct branch-ref snapshot: {error}"),
         )
     })?;
     Ok(MaterializedLiveStateRow {
@@ -907,22 +946,6 @@ fn tracked_scan_request_from_live(request: &LiveStateScanRequest) -> TrackedStat
     }
 }
 
-fn index_scan_request_from_live(
-    request: &LiveStateScanRequest,
-    branch_id: &str,
-) -> LiveStateIndexScanRequest {
-    LiveStateIndexScanRequest {
-        branch_id: branch_id.to_string(),
-        filter: LiveStateIndexFilter {
-            schema_keys: request.filter.schema_keys.clone(),
-            entity_pks: request.filter.entity_pks.clone(),
-            file_ids: request.filter.file_ids.clone(),
-        },
-        projection: request.projection.columns.clone(),
-        limit: None,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveStateScanScope {
     storage_branch_ids: Vec<String>,
@@ -984,9 +1007,15 @@ fn finalize_ordered_unique_rows(
     rows
 }
 
+fn current_row_matches_retention(
+    row: &MaterializedLiveStateRow,
+    requested_untracked: Option<bool>,
+) -> bool {
+    requested_untracked.is_none_or(|untracked| row.untracked == untracked)
+}
+
 async fn scan_scope(
     store: &(impl StorageAdapterRead + ?Sized),
-    _live_index: &LiveStateIndexContext,
     request: &LiveStateScanRequest,
     resolve_branch_heads: bool,
 ) -> Result<LiveStateScanScope, LixError> {
@@ -1044,7 +1073,7 @@ async fn scan_scope(
     })
 }
 
-/// Loads v6 controls without touching the mutable live-state index. A
+/// Loads branch-head controls without touching the mutable live-state index. A
 /// nonempty request is point-read; the empty request is the explicit
 /// all-branches scan used only by broad scans.
 async fn load_branch_head_controls(
@@ -1144,10 +1173,9 @@ mod tests {
     use crate::changelog::{ChangeId, ChangeRecord, ChangelogAppend, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
-    use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::live_state::{
-        LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
-        TrackedHeadDeltaRef,
+        CurrentStateDeltaRef, LiveStateExactBatchRequest, LiveStateExactRowRequest,
+        LiveStateFilter, LiveStateProjection, TrackedHeadDeltaRef, WorkingDiffIndexCoverage,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
@@ -1178,11 +1206,7 @@ mod tests {
     }
 
     fn live_state_context() -> LiveStateContext {
-        LiveStateContext::new(
-            TrackedStateContext::new(),
-            LiveStateIndexContext::new(),
-            CommitGraphContext::new(),
-        )
+        LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
     }
 
     async fn stage_direct_entity_head(
@@ -1222,18 +1246,6 @@ mod tests {
             )
             .await
             .expect("stage direct entity head");
-        crate::branch::stage_branch_head_control(
-            &mut writes,
-            branch_id,
-            BranchHeadControl {
-                head_commit_id: head,
-                generation: head,
-                created_at: ts("2026-01-01T00:00:00Z"),
-                updated_at: ts("2026-01-01T00:00:00Z"),
-                ref_change_id: ChangeId::for_test_label(&format!("{branch_id}-branch-ref")),
-            },
-        )
-        .expect("stage direct entity branch control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -1241,11 +1253,148 @@ mod tests {
             .expect("commit direct entity head");
     }
 
+    #[derive(Clone, Copy)]
+    struct DirectTrackedHeadRow<'a> {
+        schema_key: &'a str,
+        entity_pk: &'a EntityPk,
+        file_id: Option<&'a str>,
+        snapshot: Option<&'a str>,
+        deleted: bool,
+    }
+
+    async fn stage_direct_tracked_head_rows(
+        storage: &StorageAdapter,
+        branch_id: &str,
+        head: CommitId,
+        rows: &[DirectTrackedHeadRow<'_>],
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open packed-head write read");
+        let mut writes = StorageWriteSet::new();
+        crate::init::stage_repository_protocol(&mut writes);
+        let deltas = rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| TrackedHeadDeltaRef {
+                schema_key: row.schema_key,
+                file_id: row.file_id,
+                entity_pk: row.entity_pk,
+                change_id: ChangeId::for_test_label(&format!("{branch_id}-change-{index}")),
+                commit_id: head,
+                deleted: row.deleted,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                snapshot: row.snapshot.map_or(
+                    crate::json_store::JsonSlotRef::None,
+                    crate::json_store::JsonSlotRef::Inline,
+                ),
+                metadata: crate::json_store::JsonSlotRef::None,
+            })
+            .collect::<Vec<_>>();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                None,
+                head,
+                &deltas,
+                &std::collections::BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage packed direct head");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed direct head");
+    }
+
+    async fn stage_direct_head_control(
+        storage: &StorageAdapter,
+        branch_id: &str,
+        head: CommitId,
+        tracked_head_is_current: bool,
+    ) {
+        let mut writes = StorageWriteSet::new();
+        crate::init::stage_repository_protocol(&mut writes);
+        crate::branch::stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id: head,
+                generation: head,
+                tracked_head_is_current,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                ref_change_id: ChangeId::for_test_label(&format!("{branch_id}-branch-ref")),
+            },
+        )
+        .expect("stage direct branch control");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit direct branch control");
+    }
+
+    fn finite_pk_scan_request(
+        branch_id: &str,
+        schema_key: &str,
+        entity_pks: Vec<EntityPk>,
+    ) -> LiveStateScanRequest {
+        LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![schema_key.to_string()],
+                entity_pks,
+                branch_ids: vec![branch_id.to_string()],
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        }
+    }
+
+    async fn scan_direct_tracked_pk_groups_for_test(
+        live_state: &LiveStateContext,
+        storage: &StorageAdapter,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open direct grouped scan read");
+        let scope = scan_scope(&read, request, true).await?;
+        live_state
+            .reader(read)
+            .scan_direct_tracked_pk_groups(request, &scope)
+            .await
+    }
+
+    async fn scan_rows_for_test(
+        live_state: &LiveStateContext,
+        storage: &StorageAdapter,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open normal scan read"),
+            )
+            .scan_rows(request)
+            .await
+    }
+
     async fn scan_direct_entity_snapshots_for_test(
         live_state: &LiveStateContext,
         storage: &StorageAdapter,
         branch_id: &str,
         schema_key: &str,
+        entity_pks: &[EntityPk],
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
         live_state
             .reader(
@@ -1257,6 +1406,7 @@ mod tests {
             .scan_direct_entity_snapshots(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![schema_key.to_string()],
+                    entity_pks: entity_pks.to_vec(),
                     branch_ids: vec![branch_id.to_string()],
                     ..LiveStateFilter::default()
                 },
@@ -1318,66 +1468,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_entity_snapshots_fall_back_when_the_untracked_lane_is_present() {
-        let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let branch_id = "branch";
-        let schema_key = "schema";
-        stage_direct_entity_head(
-            &storage,
-            branch_id,
-            CommitId::for_test_label("branch-head"),
-            schema_key,
-            &EntityPk::single("row"),
-            r#"{"value":"tracked"}"#,
-        )
-        .await;
-
-        let snapshots =
-            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
-                .await
-                .expect("tracked-only entity scan should execute")
-                .expect("tracked-only entity scan should use direct snapshots");
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(
-            snapshots[0]
-                .as_deref()
-                .and_then(|snapshot| std::str::from_utf8(snapshot).ok()),
-            Some(r#"{"value":"tracked"}"#)
-        );
-
-        let mut writes = StorageWriteSet::new();
-        crate::live_state::stage_untracked_schema_presence_marker(
-            &mut writes,
-            branch_id,
-            schema_key,
-        )
-        .expect("stage untracked schema marker");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit untracked schema marker");
-        assert!(
-            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
-                .await
-                .expect("mixed entity scan should execute")
-                .is_none(),
-            "normal SQL must retain the merged tracked/untracked visibility path"
-        );
-    }
-
-    #[tokio::test]
     async fn direct_entity_snapshots_fall_back_when_global_tracks_the_schema() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let branch_id = "branch";
         let schema_key = "schema";
+        let local_pk = EntityPk::single("local-row");
         stage_direct_entity_head(
             &storage,
             branch_id,
             CommitId::for_test_label("branch-head"),
             schema_key,
-            &EntityPk::single("local-row"),
+            &local_pk,
             r#"{"value":"local"}"#,
         )
         .await;
@@ -1392,11 +1494,438 @@ mod tests {
         .await;
 
         assert!(
-            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
-                .await
-                .expect("global-overlaid entity scan should execute")
-                .is_none(),
+            scan_direct_entity_snapshots_for_test(
+                &live_state,
+                &storage,
+                branch_id,
+                schema_key,
+                std::slice::from_ref(&local_pk),
+            )
+            .await
+            .expect("global-overlaid entity scan should execute")
+            .is_none(),
             "a global tracked row requires the established overlay resolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_entity_snapshots_fall_back_for_retention_scoped_reads() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        for untracked in [false, true] {
+            let snapshots = live_state
+                .reader(
+                    storage
+                        .begin_read(StorageReadOptions::default())
+                        .await
+                        .expect("open retention-scoped entity read"),
+                )
+                .scan_direct_entity_snapshots(&LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        entity_pks: vec![EntityPk::single("row")],
+                        branch_ids: vec!["branch".to_string()],
+                        untracked: Some(untracked),
+                        ..LiveStateFilter::default()
+                    },
+                    ..LiveStateScanRequest::default()
+                })
+                .await
+                .expect("retention-scoped entity read should execute");
+            assert!(
+                snapshots.is_none(),
+                "raw snapshot serving must not bypass retention filtering"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_entity_snapshots_read_sorted_exact_primary_keys() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let branch_id = "branch";
+        let schema_key = "schema";
+        let first = EntityPk::single("first");
+        let second = EntityPk::single("second");
+        let rows = [
+            DirectTrackedHeadRow {
+                schema_key,
+                entity_pk: &second,
+                file_id: None,
+                snapshot: Some(r#"{"id":"second","value":"two"}"#),
+                deleted: false,
+            },
+            DirectTrackedHeadRow {
+                schema_key,
+                entity_pk: &first,
+                file_id: None,
+                snapshot: Some(r#"{"id":"first","value":"one"}"#),
+                deleted: false,
+            },
+        ];
+        stage_direct_tracked_head_rows(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("exact-primary-keys"),
+            &rows,
+        )
+        .await;
+
+        let snapshots = scan_direct_entity_snapshots_for_test(
+            &live_state,
+            &storage,
+            branch_id,
+            schema_key,
+            &[
+                second.clone(),
+                EntityPk::single("missing"),
+                first.clone(),
+                second,
+            ],
+        )
+        .await
+        .expect("exact tracked entity scan should execute")
+        .expect("tracked-only exact entity scan should use direct snapshots");
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot
+                    .as_deref()
+                    .and_then(|bytes| std::str::from_utf8(bytes).ok()))
+                .collect::<Vec<_>>(),
+            vec![
+                Some(r#"{"id":"first","value":"one"}"#),
+                Some(r#"{"id":"second","value":"two"}"#),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn finite_pk_group_scan_returns_all_file_id_siblings() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let entity_pk = EntityPk::single("shared-entity");
+        let rows = [
+            DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &entity_pk,
+                file_id: Some("file-a"),
+                snapshot: Some(r#"{"value":"a"}"#),
+                deleted: false,
+            },
+            DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &entity_pk,
+                file_id: Some("file-b"),
+                snapshot: Some(r#"{"value":"b"}"#),
+                deleted: false,
+            },
+        ];
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("grouped-siblings"),
+            &rows,
+        )
+        .await;
+
+        let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
+        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            .await
+            .expect("direct grouped scan should execute")
+            .expect("finite tracked primary-key scan should use grouped route");
+        let file_values = direct
+            .iter()
+            .map(|row| (row.file_id.as_deref(), row.snapshot_content.as_deref()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            file_values,
+            std::collections::BTreeMap::from([
+                (Some("file-a"), Some(r#"{"value":"a"}"#)),
+                (Some("file-b"), Some(r#"{"value":"b"}"#)),
+            ])
+        );
+
+        let normal = scan_rows_for_test(&live_state, &storage, &request)
+            .await
+            .expect("normal finite primary-key scan should execute");
+        assert_eq!(normal, direct);
+    }
+
+    #[tokio::test]
+    async fn finite_pk_group_scan_resolves_branch_override_and_tombstone_against_global() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let entity_pk = EntityPk::single("shared-entity");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("global-head"),
+            &[DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &entity_pk,
+                file_id: None,
+                snapshot: Some(r#"{"value":"global"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
+        stage_direct_tracked_head_rows(
+            &storage,
+            "branch-a",
+            CommitId::for_test_label("branch-head"),
+            &[DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &entity_pk,
+                file_id: None,
+                snapshot: Some(r#"{"value":"branch"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
+
+        let request = finite_pk_scan_request("branch-a", "schema", vec![entity_pk.clone()]);
+        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            .await
+            .expect("direct grouped scan should execute")
+            .expect("current branch and global controls should use grouped route");
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].branch_id.as_ref(), "branch-a");
+        assert!(!direct[0].global);
+        assert_eq!(
+            direct[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"branch"}"#)
+        );
+        assert_eq!(
+            scan_rows_for_test(&live_state, &storage, &request)
+                .await
+                .expect("normal branch override scan should execute"),
+            direct
+        );
+
+        stage_direct_tracked_head_rows(
+            &storage,
+            "branch-a",
+            CommitId::for_test_label("branch-tombstone"),
+            &[DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &entity_pk,
+                file_id: None,
+                snapshot: None,
+                deleted: true,
+            }],
+        )
+        .await;
+
+        let hidden = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            .await
+            .expect("direct grouped tombstone scan should execute")
+            .expect("current controls should retain the grouped route");
+        assert!(hidden.is_empty(), "local tombstone must hide global row");
+        assert!(
+            scan_rows_for_test(&live_state, &storage, &request)
+                .await
+                .expect("normal branch tombstone scan should execute")
+                .is_empty()
+        );
+
+        let mut including_tombstones = request.clone();
+        including_tombstones.filter.include_tombstones = true;
+        let tombstones =
+            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &including_tombstones)
+                .await
+                .expect("direct grouped tombstone scan should execute")
+                .expect("current controls should retain the grouped route");
+        assert_eq!(tombstones.len(), 1);
+        assert!(tombstones[0].deleted);
+        assert!(!tombstones[0].global);
+        assert_eq!(tombstones[0].branch_id.as_ref(), "branch-a");
+    }
+
+    #[tokio::test]
+    async fn finite_pk_group_scan_serves_mixed_current_state() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let tracked_pk = EntityPk::single("tracked-entity");
+        let untracked_pk = EntityPk::single("untracked-entity");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("tracked-head"),
+            &[DirectTrackedHeadRow {
+                schema_key: "schema",
+                entity_pk: &tracked_pk,
+                file_id: None,
+                snapshot: Some(r#"{"value":"tracked"}"#),
+                deleted: false,
+            }],
+        )
+        .await;
+
+        let request = finite_pk_scan_request(
+            GLOBAL_BRANCH_ID,
+            "schema",
+            vec![tracked_pk.clone(), untracked_pk.clone()],
+        );
+        assert!(
+            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+                .await
+                .expect("initial direct grouped scan should execute")
+                .is_some(),
+            "the grouped current state serves tracked-only rows directly"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open untracked write read");
+        write_untracked_rows_to_store(
+            &storage,
+            &read,
+            &[MaterializedUntrackedStateRow {
+                entity_pk: untracked_pk.clone(),
+                schema_key: "schema".to_string(),
+                file_id: None,
+                snapshot_content: Some(r#"{"value":"untracked"}"#.to_string()),
+                metadata: None,
+                deleted: false,
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+                branch_id: GLOBAL_BRANCH_ID.to_string(),
+            }],
+        )
+        .await;
+
+        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            .await
+            .expect("mixed grouped scan should execute")
+            .expect("one current-state group serves both retention modes");
+        assert_eq!(direct.len(), 2);
+        let rows = scan_rows_for_test(&live_state, &storage, &request)
+            .await
+            .expect("mixed normal scan should execute");
+        assert_eq!(rows, direct);
+        assert_eq!(rows.len(), 2);
+        let tracked = rows
+            .iter()
+            .find(|row| row.entity_pk == tracked_pk)
+            .expect("tracked row should remain visible");
+        assert!(!tracked.untracked);
+        assert_eq!(
+            tracked.snapshot_content.as_deref(),
+            Some(r#"{"value":"tracked"}"#)
+        );
+        let untracked = rows
+            .iter()
+            .find(|row| row.entity_pk == untracked_pk)
+            .expect("untracked row should be merged into normal query results");
+        assert!(untracked.untracked);
+        assert_eq!(
+            untracked.snapshot_content.as_deref(),
+            Some(r#"{"value":"untracked"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_file_id_predicate_retains_member_read_path() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let entity_pk = EntityPk::single("shared-entity");
+        stage_direct_tracked_head_rows(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("member-path"),
+            &[
+                DirectTrackedHeadRow {
+                    schema_key: "schema",
+                    entity_pk: &entity_pk,
+                    file_id: Some("file-a"),
+                    snapshot: Some(r#"{"value":"a"}"#),
+                    deleted: false,
+                },
+                DirectTrackedHeadRow {
+                    schema_key: "schema",
+                    entity_pk: &entity_pk,
+                    file_id: Some("file-b"),
+                    snapshot: Some(r#"{"value":"b"}"#),
+                    deleted: false,
+                },
+            ],
+        )
+        .await;
+
+        let mut request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
+        request.filter.file_ids = vec![NullableKeyFilter::Value("file-a".to_string())];
+        assert!(
+            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+                .await
+                .expect("file-filtered direct grouped scan should execute")
+                .is_none(),
+            "an explicit file-id predicate must retain the member projection route"
+        );
+        let rows = scan_rows_for_test(&live_state, &storage, &request)
+            .await
+            .expect("file-filtered normal scan should execute");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id.as_deref(), Some("file-a"));
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"a"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn noncurrent_control_falls_back_to_historical_root_for_finite_pk_scan() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let entity_pk = EntityPk::single("historical-entity");
+        let mut historical = tracked_row_at_with_commit(
+            GLOBAL_BRANCH_ID,
+            "historical",
+            Some("history-change"),
+            "history-head",
+        );
+        historical.schema_key = "schema".to_string();
+        historical.entity_pk = entity_pk.clone();
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open historical root write read");
+        let mut writes = StorageWriteSet::new();
+        let mut json_writer = JsonStoreContext::new().writer();
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[historical])
+            .await
+            .expect("historical tracked root should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("historical tracked root should commit");
+        stage_direct_head_control(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("history-head"),
+            false,
+        )
+        .await;
+
+        let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
+        assert!(
+            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+                .await
+                .expect("noncurrent grouped scan should execute")
+                .is_none(),
+            "a noncurrent control must request the historical fallback"
+        );
+        let rows = scan_rows_for_test(&live_state, &storage, &request)
+            .await
+            .expect("historical fallback scan should execute");
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].untracked);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some(r#"{"value":"historical"}"#)
         );
     }
 
@@ -1408,131 +1937,246 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("current index read should open");
+            .expect("current-state read should open");
         let mut writes = storage.new_write_set();
         let mut json_writer = JsonStoreContext::new().writer();
-        let changes = rows
-            .iter()
-            .enumerate()
-            .map(|(index, row)| {
-                if let Some(snapshot) = row.snapshot_content.as_deref() {
-                    json_writer.stage_batch(
+        let mut branch_refs = std::collections::BTreeMap::new();
+        let mut rows_by_branch =
+            std::collections::BTreeMap::<String, Vec<&MaterializedUntrackedStateRow>>::new();
+        for row in rows {
+            if row.schema_key == BRANCH_REF_SCHEMA_KEY {
+                if row.deleted {
+                    continue;
+                }
+                let branch_id = row
+                    .entity_pk
+                    .as_single_string_owned()
+                    .expect("test branch ref must have one branch id key");
+                let snapshot = row
+                    .snapshot_content
+                    .as_deref()
+                    .expect("test branch ref must have a snapshot");
+                let commit_id = serde_json::from_str::<serde_json::Value>(snapshot)
+                    .expect("test branch-ref snapshot should be JSON")
+                    .get("commit_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|value| CommitId::parse_lix(value, "test branch-ref commit"))
+                    .transpose()
+                    .expect("test branch-ref commit should parse")
+                    .expect("test branch-ref snapshot should name a commit");
+                assert!(
+                    branch_refs
+                        .insert(
+                            branch_id,
+                            (commit_id, ts(&row.created_at), ts(&row.updated_at))
+                        )
+                        .is_none(),
+                    "test fixture contains duplicate branch refs"
+                );
+                continue;
+            }
+            if let Some(snapshot) = row.snapshot_content.as_deref() {
+                json_writer
+                    .stage_batch(
                         &mut writes,
                         JsonWritePlacementRef::OutOfBand,
                         [NormalizedJsonRef::trusted_prehashed(
                             snapshot,
                             JsonRef::for_content(snapshot.as_bytes()),
                         )],
-                    )?;
-                }
-                let change_id = ChangeId::for_test_label(&format!(
-                    "current:{}:{}:{index}",
-                    row.branch_id, row.schema_key
-                ));
-                Ok::<_, LixError>((
-                    row,
-                    ChangeRecord {
-                        format_version: 1,
-                        change_id,
-                        schema_key: row.schema_key.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                        file_id: row.file_id.clone(),
-                        snapshot: row
-                            .snapshot_content
-                            .as_deref()
-                            .map_or(crate::json_store::JsonSlot::None, |snapshot| {
-                                crate::json_store::JsonSlot::from_json(snapshot)
-                            }),
-                        metadata: row
-                            .metadata
-                            .as_deref()
-                            .map_or(crate::json_store::JsonSlot::None, |metadata| {
-                                crate::json_store::JsonSlot::from_json(metadata)
-                            }),
-                        created_at: ts(&row.updated_at),
-                        origin_key: None,
-                    },
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .expect("untracked changes should canonicalize");
-        let mut changelog_read = &read;
-        let mut changelog_writer =
-            crate::changelog::ChangelogContext::new().writer(&mut changelog_read, &mut writes);
-        crate::changelog::ChangelogWriter::stage_append(
-            &mut changelog_writer,
-            ChangelogAppend {
-                changes: changes.iter().map(|(_, change)| change.clone()).collect(),
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("untracked changes should write");
-        drop(changelog_writer);
-
-        // Unit fixtures historically modeled branch heads as flat
-        // `lix_branch_ref` rows. V6 deliberately rejects that physical
-        // authority, so keep the fixture's public row while seeding the
-        // matching direct control used by every production reader.
-        for (row, change) in &changes {
-            if row.schema_key != BRANCH_REF_SCHEMA_KEY || row.deleted {
-                continue;
+                    )
+                    .expect("untracked snapshot should stage");
             }
-            let branch_id = row
-                .entity_pk
-                .as_single_string_owned()
-                .expect("test branch ref must have one branch id key");
-            let snapshot = row
-                .snapshot_content
-                .as_deref()
-                .expect("test branch ref must have a snapshot");
-            let commit_id = serde_json::from_str::<serde_json::Value>(snapshot)
-                .expect("test branch-ref snapshot should be JSON")
-                .get("commit_id")
-                .and_then(serde_json::Value::as_str)
-                .map(|value| CommitId::parse_lix(value, "test branch-ref commit"))
-                .transpose()
-                .expect("test branch-ref commit should parse")
-                .expect("test branch-ref snapshot should name a commit");
+            if let Some(metadata) = row.metadata.as_deref() {
+                json_writer
+                    .stage_batch(
+                        &mut writes,
+                        JsonWritePlacementRef::OutOfBand,
+                        [NormalizedJsonRef::trusted_prehashed(
+                            metadata,
+                            JsonRef::for_content(metadata.as_bytes()),
+                        )],
+                    )
+                    .expect("untracked metadata should stage");
+            }
+            rows_by_branch
+                .entry(row.branch_id.clone())
+                .or_default()
+                .push(row);
+        }
+
+        // A branch ref selects a fresh current-state generation. Its tracked
+        // portion is reconstructed from the immutable root and its untracked
+        // portion is materialized into the same groups; no flat overlay or
+        // changelog record is involved for untracked rows.
+        for (branch_id, (head_commit_id, created_at, updated_at)) in branch_refs {
+            let branch_rows = rows_by_branch.remove(&branch_id).unwrap_or_default();
+            let head_commit_id_text = head_commit_id.to_string();
+            let mut tracked_reader = TrackedStateContext::new().reader(&read);
+            let parent_rows = if tracked_reader
+                .has_durable_commit_root(&head_commit_id_text)
+                .await
+                .expect("test branch root should inspect")
+            {
+                tracked_reader
+                    .scan_rows_at_commit(
+                        &head_commit_id_text,
+                        &TrackedStateScanRequest {
+                            filter: TrackedStateFilter {
+                                include_tombstones: true,
+                                ..Default::default()
+                            },
+                            read_columns: TrackedStateReadColumns::default(),
+                            limit: None,
+                        },
+                    )
+                    .await
+                    .expect("test branch root should load")
+            } else {
+                Vec::new()
+            };
+            let snapshots = branch_rows
+                .iter()
+                .map(|row| {
+                    row.snapshot_content.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let metadata = branch_rows
+                .iter()
+                .map(|row| {
+                    row.metadata.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let deltas = branch_rows
+                .iter()
+                .zip(snapshots.iter())
+                .zip(metadata.iter())
+                .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
+                    schema_key: &row.schema_key,
+                    file_id: row.file_id.as_deref(),
+                    entity_pk: &row.entity_pk,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: true,
+                    deleted: row.deleted,
+                    created_at: ts(&row.created_at),
+                    updated_at: ts(&row.updated_at),
+                    snapshot: snapshot.as_ref_slot(),
+                    metadata: metadata.as_ref_slot(),
+                })
+                .collect::<Vec<_>>();
+            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+            let generation = TrackedHeadContext::new()
+                .writer(&read, &mut writes)
+                .stage_current_state_with_working_diff(
+                    &branch_id,
+                    None,
+                    head_commit_id,
+                    &deltas,
+                    &std::collections::BTreeSet::new(),
+                    Some(parent_rows),
+                    None,
+                    None,
+                    &mut working_diff_coverage,
+                )
+                .await
+                .expect("test current-state generation should stage");
             crate::branch::stage_branch_head_control(
                 &mut writes,
                 &branch_id,
                 BranchHeadControl {
-                    head_commit_id: commit_id,
-                    generation: commit_id,
-                    created_at: ts(&row.created_at),
-                    updated_at: ts(&row.updated_at),
-                    ref_change_id: change.change_id,
+                    head_commit_id,
+                    generation,
+                    tracked_head_is_current: true,
+                    current_state_revision: 0,
+                    working_diff_checkpoint_commit_id: None,
+                    created_at,
+                    updated_at,
+                    ref_change_id: ChangeId::for_test_label(&format!(
+                        "test-branch-ref-{branch_id}"
+                    )),
                 },
             )
             .expect("test branch-head control should stage");
         }
 
-        let mut rows_by_branch = std::collections::BTreeMap::<&str, Vec<_>>::new();
-        for (row, change) in &changes {
-            rows_by_branch
-                .entry(&row.branch_id)
-                .or_default()
-                .push(LiveStateIndexDeltaRef {
+        // A pure untracked write mutates the active generation in place and
+        // publishes a distinct control revision so concurrent writers cannot
+        // satisfy the same stale control precondition.
+        for (branch_id, branch_rows) in rows_by_branch {
+            let control = BranchHeadControlContext::new()
+                .reader(&read)
+                .load(&branch_id)
+                .await
+                .expect("test branch control should load")
+                .expect("untracked fixture needs an existing branch control");
+            let snapshots = branch_rows
+                .iter()
+                .map(|row| {
+                    row.snapshot_content.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let metadata = branch_rows
+                .iter()
+                .map(|row| {
+                    row.metadata.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let deltas = branch_rows
+                .iter()
+                .zip(snapshots.iter())
+                .zip(metadata.iter())
+                .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
                     schema_key: &row.schema_key,
                     file_id: row.file_id.as_deref(),
                     entity_pk: &row.entity_pk,
-                    change_id: change.change_id,
+                    change_id: None,
                     commit_id: None,
+                    untracked: true,
                     deleted: row.deleted,
                     created_at: ts(&row.created_at),
                     updated_at: ts(&row.updated_at),
-                });
-        }
-        let live_index = LiveStateIndexContext::new();
-        let mut index_writer = live_index.writer(&read, &mut writes);
-        for (branch_id, deltas) in rows_by_branch {
-            index_writer
-                .stage_branch_rows(branch_id, deltas)
+                    snapshot: snapshot.as_ref_slot(),
+                    metadata: metadata.as_ref_slot(),
+                })
+                .collect::<Vec<_>>();
+            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+            TrackedHeadContext::new()
+                .writer(&read, &mut writes)
+                .stage_current_state_with_working_diff(
+                    &branch_id,
+                    Some(control.generation),
+                    control.head_commit_id,
+                    &deltas,
+                    &std::collections::BTreeSet::new(),
+                    None,
+                    None,
+                    None,
+                    &mut working_diff_coverage,
+                )
                 .await
-                .expect("current rows should write");
+                .expect("test untracked current state should stage");
+            crate::branch::stage_branch_head_control(
+                &mut writes,
+                &branch_id,
+                control
+                    .next_current_state_revision()
+                    .expect("test branch control revision should advance"),
+            )
+            .expect("test untracked control should stage");
         }
-        drop(index_writer);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1592,7 +2236,6 @@ mod tests {
         json_writer: &mut crate::json_store::JsonStoreWriter,
         rows: &[MaterializedLiveStateRow],
     ) -> Result<(), LixError> {
-        let mut current_rows = Vec::<(String, MaterializedTrackedStateRow)>::new();
         let mut tracked_rows_by_commit = std::collections::BTreeMap::<
             String,
             Vec<(
@@ -1624,7 +2267,6 @@ mod tests {
             if row.schema_key != COMMIT_SCHEMA_KEY {
                 let change = crate::test_support::tracked_change_from_materialized(&materialized)?;
                 stage_json_payloads_from_materialized(writes, json_writer, &materialized)?;
-                current_rows.push((row.branch_id.to_string(), materialized.clone()));
                 tracked_rows_by_commit
                     .entry(commit_id_text)
                     .or_default()
@@ -1698,28 +2340,6 @@ mod tests {
                 .await?;
         }
 
-        let mut current_rows_by_branch =
-            std::collections::BTreeMap::<&str, Vec<LiveStateIndexDeltaRef<'_>>>::new();
-        for (branch_id, row) in &current_rows {
-            current_rows_by_branch
-                .entry(branch_id)
-                .or_default()
-                .push(LiveStateIndexDeltaRef {
-                    schema_key: &row.schema_key,
-                    file_id: row.file_id.as_deref(),
-                    entity_pk: &row.entity_pk,
-                    change_id: row.change_id,
-                    commit_id: Some(row.commit_id),
-                    deleted: row.deleted,
-                    created_at: ts(&row.created_at),
-                    updated_at: ts(&row.updated_at),
-                });
-        }
-        let live_index = LiveStateIndexContext::new();
-        let mut index_writer = live_index.writer(store, writes);
-        for (branch_id, deltas) in current_rows_by_branch {
-            index_writer.stage_branch_rows(branch_id, deltas).await?;
-        }
         Ok(())
     }
 
@@ -1773,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn live_state_serves_untracked_change_from_flat_index() {
+    async fn live_state_serves_untracked_member_from_current_state() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 
@@ -1783,18 +2403,14 @@ mod tests {
             .expect("read should open");
         let mut writes = StorageWriteSet::new();
         let mut json_writer = JsonStoreContext::new().writer();
-        stage_materialized_live_rows(
-            &read,
-            &mut writes,
-            &mut json_writer,
-            &[tracked_row_with_commit(
-                "tracked-value",
-                Some("change-tracked"),
-                "commit-tracked",
-            )],
-        )
-        .await
-        .expect("tracked row should stage");
+        // Keep the tracked commit fixture separate from the untracked member
+        // under test: a single identity cannot change retention class.
+        let mut tracked_row =
+            tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
+        tracked_row.entity_pk = identity("tracked-tab");
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
+            .await
+            .expect("tracked row should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1818,7 +2434,7 @@ mod tests {
             Some("{\"value\":\"untracked-value\"}")
         );
         assert!(rows[0].untracked);
-        assert!(rows[0].change_id.is_some());
+        assert_eq!(rows[0].change_id, None);
 
         let loaded = live_state
             .reader(
@@ -1837,7 +2453,7 @@ mod tests {
             .expect("load should succeed")
             .expect("current row should be visible");
         assert!(loaded.untracked);
-        assert!(loaded.change_id.is_some());
+        assert_eq!(loaded.change_id, None);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"untracked-value\"}")
@@ -1845,7 +2461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_batch_preserves_duplicate_and_missing_slots_for_flat_rows() {
+    async fn exact_batch_preserves_duplicate_and_missing_slots_for_current_rows() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let read = storage
@@ -1854,18 +2470,14 @@ mod tests {
             .expect("read should open");
         let mut writes = StorageWriteSet::new();
         let mut json_writer = JsonStoreContext::new().writer();
-        stage_materialized_live_rows(
-            &read,
-            &mut writes,
-            &mut json_writer,
-            &[tracked_row_with_commit(
-                "tracked-value",
-                Some("change-tracked"),
-                "commit-tracked",
-            )],
-        )
-        .await
-        .expect("tracked row should stage");
+        // The tracked fixture establishes the branch head; use a distinct
+        // identity so the selected untracked row is not a retention conflict.
+        let mut tracked_row =
+            tracked_row_with_commit("tracked-value", Some("change-tracked"), "commit-tracked");
+        tracked_row.entity_pk = identity("tracked-tab");
+        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[tracked_row])
+            .await
+            .expect("tracked row should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -2030,11 +2642,7 @@ mod tests {
     async fn main_sees_global_row_by_reading_global_root_separately() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let live_state = LiveStateContext::new(
-            tracked_state.clone(),
-            crate::live_state::index::LiveStateIndexContext::new(),
-            CommitGraphContext::new(),
-        );
+        let live_state = LiveStateContext::new(tracked_state.clone(), CommitGraphContext::new());
 
         let read = storage
             .begin_read(StorageReadOptions::default())

@@ -1,10 +1,10 @@
-//! Durable v6 branch-head control records.
+//! Durable branch-head control records.
 //!
 //! A branch head is a tiny mutable control-plane record, not a user row.  It
 //! therefore has its own space and exact-byte CAS token.  The current tracked
-//! serving generation lives beside the head so readers can bind a v6 group
-//! marker to the same atomic publication without consulting `lix_branch_ref`
-//! through the mutable live-state index.
+//! serving generation lives beside the head, so readers can bind packed
+//! tracked-head groups to the same atomic publication without consulting
+//! `lix_branch_ref` through the mutable live-state index.
 
 use bytes::Bytes;
 
@@ -24,21 +24,49 @@ pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
 
 /// The one mutable publication record for a branch.
 ///
-/// `generation` is the physical v6 tracked-head generation currently serving
+/// `generation` is the physical tracked-head generation currently serving
 /// `head_commit_id`. Serial normal commits retain it; a rewind, merge fence,
 /// or bootstrap gets a fresh generation and takes the historical fallback
-/// until a complete v6 projection is published.
+/// until a complete projection is published. `tracked_head_is_current` is the
+/// publication bit for that projection, so this atomic control record is the
+/// only read-side fence for a normal tracked branch. The optional checkpoint
+/// binds the sparse working-diff accelerator to this exact publication; it is
+/// not a second visibility record. `current_state_revision` advances for
+/// every in-place current-state mutation, including history-free untracked
+/// writes. It is private storage protocol state and turns the control's CAS
+/// into a real write fence even when the public branch ref does not move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct BranchHeadControl {
     pub(crate) head_commit_id: CommitId,
     pub(crate) generation: CommitId,
+    pub(crate) tracked_head_is_current: bool,
+    pub(crate) current_state_revision: u64,
+    #[musli(with = storage_codec::option)]
+    pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
     /// Stable public `lixcol_created_at` for the synthesized branch-ref row.
     pub(crate) created_at: LixTimestamp,
     /// Public `lixcol_updated_at` for the last head publication.
     pub(crate) updated_at: LixTimestamp,
     /// Public `lixcol_change_id` for the last head publication.
     pub(crate) ref_change_id: ChangeId,
+}
+
+impl BranchHeadControl {
+    /// Returns the same public branch ref with a fresh private current-state
+    /// revision. A mutable group write must publish this alongside its exact
+    /// control precondition; otherwise two writers could both compare the
+    /// same unchanged control bytes and lose one group update.
+    pub(crate) fn next_current_state_revision(mut self) -> Result<Self, LixError> {
+        self.current_state_revision =
+            self.current_state_revision.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "branch current-state revision overflowed",
+                )
+            })?;
+        Ok(self)
+    }
 }
 
 /// One coherent point-read observation used for both generation selection and
@@ -265,6 +293,9 @@ mod tests {
         let first = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("first-head"),
             generation: CommitId::for_test_label("first-generation"),
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("first-ref-change"),
@@ -272,6 +303,9 @@ mod tests {
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
             generation: CommitId::for_test_label("first-generation"),
+            tracked_head_is_current: true,
+            current_state_revision: 1,
+            working_diff_checkpoint_commit_id: None,
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
