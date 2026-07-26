@@ -119,6 +119,9 @@ test("remote mode uses the workspace protocol without loading a local engine", a
 	expect(requests[1]?.headers.get("authorization")).toBe("Bearer token-2");
 	expect(requests[0]?.headers.has("lix-session-id")).toBe(false);
 	expect(requests[1]?.headers.get("lix-session-id")).toBe("session-1");
+	expect(requests[1]?.headers.get("idempotency-key")).toMatch(
+		/^[0-9a-f-]{36}$/,
+	);
 	expect(await requests[1]?.json()).toEqual({
 		sql: "SELECT $1, $2, $3, $4, $5, $6, $7",
 		params: [
@@ -253,6 +256,9 @@ test("remote executeBatch uses the first-class atomic batch endpoint", async () 
 	]);
 	expect(new URL(requests[1]?.url ?? "").pathname).toBe(
 		"/@acme/workspace/lix/v1/execute-batch",
+	);
+	expect(requests[1]?.headers.get("idempotency-key")).toMatch(
+		/^[0-9a-f-]{36}$/,
 	);
 	expect(await requests[1]?.json()).toEqual({
 		statements: [
@@ -392,6 +398,7 @@ test(
 
 test("remote execute retries a missing blob base once with full bytes", async () => {
 	const bodies: Array<Record<string, unknown>> = [];
+	const idempotencyKeys: string[] = [];
 	let rejectedDelta = false;
 	const lix = await openLix({
 		server: {
@@ -406,6 +413,7 @@ test("remote execute retries a missing blob base once with full bytes", async ()
 				}
 				const body = (await requestJson(request)) as Record<string, unknown>;
 				bodies.push(body);
+				idempotencyKeys.push(request.headers.get("idempotency-key") ?? "");
 				const param = (body.params as Array<Record<string, unknown>>)[0];
 				if (param?.kind === "blob-splice" && !rejectedDelta) {
 					rejectedDelta = true;
@@ -439,6 +447,40 @@ test("remote execute retries a missing blob base once with full bytes", async ()
 		"blob",
 	);
 	expect(bodies[2]?.cacheBlobs).toBe(true);
+	expect(idempotencyKeys[1]).toBe(idempotencyKeys[2]);
+	expect(idempotencyKeys[0]).not.toBe(idempotencyKeys[1]);
+});
+
+test("remote execute uses a caller idempotency key only as a header", async () => {
+	const requests: Request[] = [];
+	const lix = await openLix({
+		server: {
+			mode: "remote",
+			url: "https://lixray.test/workspace",
+			fetch: async (input, init) => {
+				const request = new Request(input, init);
+				requests.push(request.clone());
+				if (new URL(request.url).pathname.endsWith("/lix/v1/")) {
+					return handshakeResponse();
+				}
+				if (request.method === "DELETE") return new Response(null, { status: 204 });
+				return Response.json(emptyExecuteResponse());
+			},
+		},
+	});
+
+	await lix.execute("INSERT INTO lix_key_value (key, value) VALUES ('a', 'b')", [], {
+		idempotencyKey: "retry-identity-1",
+	});
+	await lix.close();
+
+	expect(requests[1]?.headers.get("idempotency-key")).toBe(
+		"retry-identity-1",
+	);
+	expect(await requests[1]?.json()).toEqual({
+		sql: "INSERT INTO lix_key_value (key, value) VALUES ('a', 'b')",
+		params: [],
+	});
 });
 
 test("remote execute keeps small and low-saving blob updates full", async () => {

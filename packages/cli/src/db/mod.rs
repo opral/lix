@@ -232,9 +232,12 @@ impl Storage for FileStorage {
         Self: 'a;
     fn begin_read(
         &self,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            if opts.durability == lix_sdk::ReadDurability::Durable {
+                return Err(StorageError::Durability);
+            }
             Ok(FileStorageRead {
                 kv: self
                     .kv

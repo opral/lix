@@ -111,6 +111,14 @@ impl SessionFileViews {
         }
     }
 
+    /// Discards every private acknowledgement after a commit outcome was
+    /// recovered from durable storage. The transaction may have published
+    /// before its post-commit actor publications and view updates ran; a cold
+    /// open on the next exact read is safer than retaining stale state.
+    pub(crate) fn clear(&self) {
+        self.lock().plugin_files.clear();
+    }
+
     pub(crate) fn plugin_file_mutations(&self) -> Vec<SessionFileViewMutation> {
         self.lock()
             .plugin_files

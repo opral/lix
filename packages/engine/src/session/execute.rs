@@ -10,8 +10,8 @@ use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch}
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
-    StorageWriteOptions, StorageWriteSet,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
+    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -24,7 +24,9 @@ use datafusion::sql::sqlparser::ast::{
 };
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use super::ExecuteIdempotency;
 use super::context::{SessionContext, SessionSqlExecutionContext, SessionWriteAccess};
+use super::idempotency::{ExecuteIdempotencyReceipt, load_receipt};
 use super::transaction::SessionTransaction;
 
 /// Result of executing one SQL statement through engine.
@@ -96,6 +98,15 @@ impl ExecuteResult {
 
     pub fn from_rows(columns: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
         Self::from_query_parts(columns, rows, 0, Vec::new())
+    }
+
+    pub(crate) fn from_idempotency_parts(
+        columns: Vec<String>,
+        rows: Vec<Vec<Value>>,
+        rows_affected: u64,
+        notices: Vec<LixNotice>,
+    ) -> Self {
+        Self::from_query_parts(columns, rows, rows_affected, notices)
     }
 
     fn from_query_parts(
@@ -419,6 +430,11 @@ enum ExecuteBatchExecution {
     Transaction(Vec<datafusion::sql::parser::Statement>),
 }
 
+enum IdempotencyReceiptResolution {
+    Absent,
+    Replay(ExecuteIdempotencyReceipt),
+}
+
 // Keep the single-file legacy-topology fallback semantically identical to the
 // public `lix_file` upsert. Batch writes intentionally stay direct-only.
 const NATIVE_FILE_UPSERT_SQL: &str = "INSERT INTO lix_file (path, data) VALUES ($1, $2) \
@@ -537,7 +553,36 @@ where
         metadata: ExecuteStatementMetadata,
     ) -> Result<ExecuteResult, LixError> {
         validate_execute_statement_metadata(params.len(), &metadata, None)?;
-        Box::pin(self.execute_with_kind(sql, params, options, metadata, "execute")).await
+        Box::pin(self.execute_with_kind(sql, params, options, metadata, "execute", None, false))
+            .await
+    }
+
+    /// Executes a protocol SQL request with durable replay for write routes.
+    ///
+    /// This is intentionally separate from the general engine execution API:
+    /// the protocol makes a clean hard cut requiring an idempotency key for
+    /// SQL writes, while in-process callers may continue to own their own
+    /// transaction/retry contract. Read routes ignore a supplied key.
+    #[doc(hidden)]
+    pub async fn execute_with_idempotency_and_options_and_metadata(
+        &self,
+        sql: &str,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+        idempotency: Option<ExecuteIdempotency>,
+    ) -> Result<ExecuteResult, LixError> {
+        validate_execute_statement_metadata(params.len(), &metadata, None)?;
+        Box::pin(self.execute_with_kind(
+            sql,
+            params,
+            options,
+            metadata,
+            "execute",
+            idempotency,
+            true,
+        ))
+        .await
     }
 
     /// Upserts one file's bytes by its full logical path without constructing
@@ -697,6 +742,8 @@ where
             ExecuteOptions::default(),
             ExecuteStatementMetadata::default(),
             "observe",
+            None,
+            false,
         )
         .await
     }
@@ -708,6 +755,8 @@ where
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
         execution_kind: &'static str,
+        idempotency: Option<ExecuteIdempotency>,
+        require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         let telemetry =
             SqlStatementTelemetry::start(self.telemetry.as_ref(), sql, execution_kind, None);
@@ -717,6 +766,8 @@ where
             options,
             metadata,
             execution_kind == "observe",
+            idempotency,
+            require_idempotency_for_writes,
         );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
@@ -735,10 +786,30 @@ where
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
         defer_file_view_acknowledgement: bool,
+        idempotency: Option<ExecuteIdempotency>,
+        require_idempotency_for_writes: bool,
     ) -> Result<ExecuteResult, LixError> {
         self.ensure_open()?;
         let statement = self.sql_planning_cache.parse_statement(sql)?;
         if sql2::bind_statement_route(&statement)? == sql2::BoundStatementRoute::Write {
+            if require_idempotency_for_writes && idempotency.is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_IDEMPOTENCY_KEY_REQUIRED,
+                    "Idempotency-Key is required for SQL mutations",
+                ));
+            }
+            if let Some(idempotency) = idempotency {
+                return self
+                    .execute_idempotent_write(
+                        sql,
+                        statement,
+                        params,
+                        options,
+                        metadata,
+                        idempotency,
+                    )
+                    .await;
+            }
             let write_access = self.begin_session_write_access().await?;
             let sql_for_error = sql.to_string();
             let sql_for_planning = sql_for_error.clone();
@@ -850,6 +921,154 @@ where
         Ok(result)
     }
 
+    async fn execute_idempotent_write(
+        &self,
+        sql: &str,
+        statement: DataFusionStatement,
+        params: &[Value],
+        options: ExecuteOptions,
+        metadata: ExecuteStatementMetadata,
+        idempotency: ExecuteIdempotency,
+    ) -> Result<ExecuteResult, LixError> {
+        if let IdempotencyReceiptResolution::Replay(receipt) =
+            self.resolve_idempotency_receipt(&idempotency).await?
+        {
+            return receipt.into_single_result();
+        }
+
+        let write_access = self.begin_session_write_access().await?;
+        let sql_for_error = sql.to_string();
+        let sql_for_planning = sql_for_error.clone();
+        let params = params.to_vec();
+        // The original identity is retained for post-commit recovery. The
+        // transaction closure owns its own copy because its future may outlive
+        // this call's immediate stack frame while the write lease is held.
+        let idempotency_for_commit = idempotency.clone();
+        let result = self
+            .with_write_transaction_reserved(write_access, |transaction| {
+                Box::pin(async move {
+                    let previous_origin_key = transaction.replace_origin_key(options.origin_key);
+                    let result = async {
+                        let tx_plan = transaction
+                            .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
+                        let result = sql2::execute_write_logical_plan_result_with_metadata(
+                            transaction,
+                            tx_plan,
+                            &params,
+                            &metadata,
+                        )
+                        .await?;
+                        let result = ExecuteResult::from_sql_write_result(result);
+                        let receipt =
+                            ExecuteIdempotencyReceipt::single(&idempotency_for_commit, &result)?;
+                        transaction
+                            .stage_execute_idempotency_receipt(&idempotency_for_commit, &receipt)?;
+                        Ok(result)
+                    }
+                    .await;
+                    transaction.replace_origin_key(previous_origin_key);
+                    result
+                })
+            })
+            .await
+            .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
+
+        match result {
+            Ok(result) => Ok(result),
+            Err(error)
+                if matches!(
+                    error.code.as_str(),
+                    LixError::CODE_TRANSACTION_CONFLICT
+                        | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                ) =>
+            {
+                match self.resolve_idempotency_receipt(&idempotency).await {
+                    Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
+                        // `Transaction::commit` did not return normally, so
+                        // its usual invalidation path was skipped. A remote
+                        // receipt proves that this transaction did publish;
+                        // wake local observers before acknowledging recovery.
+                        self.observe_invalidation.bump();
+                        // Post-commit plugin actor publication is also
+                        // skipped on the ambiguous path. Drop private views
+                        // rather than let a stale acknowledgement poison the
+                        // next plugin-backed edit.
+                        self.file_views.clear();
+                        receipt.into_single_result()
+                    }
+                    Ok(IdempotencyReceiptResolution::Absent) => Err(error),
+                    Err(recovery_error) => Err(recovery_error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn resolve_idempotency_receipt(
+        &self,
+        idempotency: &ExecuteIdempotency,
+    ) -> Result<IdempotencyReceiptResolution, LixError> {
+        let visible = self
+            .load_idempotency_receipt(idempotency, StorageReadDurability::Visible)
+            .await?;
+        let Some(visible) = visible else {
+            return Ok(IdempotencyReceiptResolution::Absent);
+        };
+        Self::require_matching_idempotency_receipt(&visible, idempotency)?;
+
+        let durable = match self
+            .load_idempotency_receipt(idempotency, StorageReadDurability::Durable)
+            .await
+        {
+            Ok(receipt) => receipt,
+            // A backend that cannot expose a durable tier cannot turn an
+            // ordinarily visible receipt into replay proof. Preserve the
+            // explicit unknown outcome instead of falsely acknowledging it.
+            Err(error) if error.code == LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => {
+                return Err(idempotency_outcome_unknown());
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(durable) = durable else {
+            return Err(idempotency_outcome_unknown());
+        };
+        Self::require_matching_idempotency_receipt(&durable, idempotency)?;
+        Ok(IdempotencyReceiptResolution::Replay(durable))
+    }
+
+    async fn load_idempotency_receipt(
+        &self,
+        idempotency: &ExecuteIdempotency,
+        durability: StorageReadDurability,
+    ) -> Result<Option<ExecuteIdempotencyReceipt>, LixError> {
+        self.ensure_open()?;
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions {
+                durability,
+                ..StorageReadOptions::default()
+            })
+            .await?;
+        let receipt = load_receipt(&read, idempotency).await?;
+        Ok(receipt)
+    }
+
+    fn require_matching_idempotency_receipt(
+        receipt: &ExecuteIdempotencyReceipt,
+        idempotency: &ExecuteIdempotency,
+    ) -> Result<(), LixError> {
+        if receipt.matches(idempotency) {
+            return Ok(());
+        }
+        Err(LixError::new(
+            LixError::CODE_IDEMPOTENCY_KEY_REUSED,
+            "Idempotency-Key was already used for a different SQL mutation or branch",
+        )
+        .with_details(serde_json::json!({
+            "retryable": false,
+        })))
+    }
+
     /// Executes SQL statements sequentially against one atomic snapshot.
     ///
     /// Pure-read batches share one immutable read snapshot and prepared SQL
@@ -889,8 +1108,46 @@ where
             TelemetrySpanKind::SqlBatch,
             statements.len(),
         );
-        let operation =
-            self.execute_batch_with_options_inner(statements, options, statement_metadata);
+        let operation = self.execute_batch_with_options_inner(
+            statements,
+            options,
+            statement_metadata,
+            None,
+            false,
+        );
+        let result = match telemetry.as_ref() {
+            Some(telemetry) => telemetry.instrument(operation).await,
+            None => operation.await,
+        };
+        if let Some(telemetry) = telemetry {
+            finish_operation(telemetry, &result);
+        }
+        result
+    }
+
+    /// Executes a protocol SQL batch with durable replay for batches that
+    /// contain at least one SQL write. Pure read batches and batches that only
+    /// persist runtime-function state retain their existing execution path.
+    #[doc(hidden)]
+    pub async fn execute_batch_with_idempotency_and_options_and_metadata(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let telemetry = start_batch(
+            self.telemetry.as_ref(),
+            TelemetrySpanKind::SqlBatch,
+            statements.len(),
+        );
+        let operation = self.execute_batch_with_options_inner(
+            statements,
+            options,
+            statement_metadata,
+            idempotency,
+            true,
+        );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
             None => operation.await,
@@ -906,6 +1163,8 @@ where
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
+        require_idempotency_for_writes: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
@@ -946,54 +1205,143 @@ where
                 self.execute_read_only_batch(&statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
-                let telemetry_sink = self.telemetry.clone();
-                self.with_write_transaction(move |transaction| {
-                    Box::pin(async move {
-                        let mut results = Vec::with_capacity(statements.len());
-                        for (statement_index, ((statement, parsed), metadata)) in statements
-                            .iter()
-                            .zip(parsed)
-                            .zip(statement_metadata)
-                            .enumerate()
-                        {
-                            let telemetry = SqlStatementTelemetry::start(
-                                telemetry_sink.as_ref(),
-                                &statement.sql,
-                                "batch",
-                                Some(statement_index),
-                            );
-                            let operation = async {
-                                execute_transaction_statement(
-                                    transaction,
-                                    &statement.sql,
-                                    parsed,
-                                    &statement.params,
-                                    options.clone(),
-                                    metadata,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    with_batch_statement_index(
-                                        normalize_sql_surface_error(error, &statement.sql),
-                                        statement_index,
-                                    )
-                                })
-                            };
-                            let result = match telemetry.as_ref() {
-                                Some(telemetry) => telemetry.instrument(operation).await,
-                                None => operation.await,
-                            };
-                            if let Some(telemetry) = telemetry {
-                                telemetry.finish(&result);
+                let contains_write =
+                    parsed.iter().try_fold(false, |contains_write, statement| {
+                        Ok::<_, LixError>(
+                            contains_write
+                                || sql2::bind_statement_route(statement)?
+                                    == sql2::BoundStatementRoute::Write,
+                        )
+                    })?;
+                if !contains_write {
+                    return self
+                        .execute_transaction_batch(
+                            statements,
+                            parsed,
+                            options,
+                            statement_metadata,
+                            None,
+                        )
+                        .await;
+                }
+                if require_idempotency_for_writes && idempotency.is_none() {
+                    return Err(LixError::new(
+                        LixError::CODE_IDEMPOTENCY_KEY_REQUIRED,
+                        "Idempotency-Key is required for SQL mutation batches",
+                    ));
+                }
+                let Some(idempotency) = idempotency else {
+                    return self
+                        .execute_transaction_batch(
+                            statements,
+                            parsed,
+                            options,
+                            statement_metadata,
+                            None,
+                        )
+                        .await;
+                };
+                if let IdempotencyReceiptResolution::Replay(receipt) =
+                    self.resolve_idempotency_receipt(&idempotency).await?
+                {
+                    return Ok(receipt.into_results());
+                }
+                let result = self
+                    .execute_transaction_batch(
+                        statements,
+                        parsed,
+                        options,
+                        statement_metadata,
+                        Some(idempotency.clone()),
+                    )
+                    .await;
+                match result {
+                    Ok(results) => Ok(results),
+                    Err(error)
+                        if matches!(
+                            error.code.as_str(),
+                            LixError::CODE_TRANSACTION_CONFLICT
+                                | LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+                        ) =>
+                    {
+                        match self.resolve_idempotency_receipt(&idempotency).await {
+                            Ok(IdempotencyReceiptResolution::Replay(receipt)) => {
+                                // See the single-statement recovery path:
+                                // positive receipt proof means a commit
+                                // happened after its normal invalidation
+                                // callback was bypassed by an ambiguous error.
+                                self.observe_invalidation.bump();
+                                self.file_views.clear();
+                                Ok(receipt.into_results())
                             }
-                            results.push(result?);
+                            Ok(IdempotencyReceiptResolution::Absent) => Err(error),
+                            Err(recovery_error) => Err(recovery_error),
                         }
-                        Ok(results)
-                    })
-                })
-                .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
         }
+    }
+
+    async fn execute_transaction_batch(
+        &self,
+        statements: Vec<ExecuteBatchStatement>,
+        parsed: Vec<DataFusionStatement>,
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        let telemetry_sink = self.telemetry.clone();
+        self.with_write_transaction(move |transaction| {
+            Box::pin(async move {
+                let mut results = Vec::with_capacity(statements.len());
+                for (statement_index, ((statement, parsed), metadata)) in statements
+                    .iter()
+                    .zip(parsed)
+                    .zip(statement_metadata)
+                    .enumerate()
+                {
+                    let telemetry = SqlStatementTelemetry::start(
+                        telemetry_sink.as_ref(),
+                        &statement.sql,
+                        "batch",
+                        Some(statement_index),
+                    );
+                    let operation = async {
+                        execute_transaction_statement(
+                            transaction,
+                            &statement.sql,
+                            parsed,
+                            &statement.params,
+                            options.clone(),
+                            metadata,
+                        )
+                        .await
+                        .map_err(|error| {
+                            with_batch_statement_index(
+                                normalize_sql_surface_error(error, &statement.sql),
+                                statement_index,
+                            )
+                        })
+                    };
+                    let result = match telemetry.as_ref() {
+                        Some(telemetry) => telemetry.instrument(operation).await,
+                        None => operation.await,
+                    };
+                    if let Some(telemetry) = telemetry {
+                        telemetry.finish(&result);
+                    }
+                    results.push(result?);
+                }
+                if let Some(idempotency) = &idempotency {
+                    let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
+                    transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+                }
+                Ok(results)
+            })
+        })
+        .await
     }
 
     async fn execute_read_only_batch(
@@ -2509,6 +2857,19 @@ where
             .await
             .map(ExecuteResult::from_sql_query_result),
     }
+}
+
+fn idempotency_outcome_unknown() -> LixError {
+    LixError::new(
+        LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN,
+        "the matching idempotency receipt is not yet durably visible",
+    )
+    .with_hint("Retry later with the same Idempotency-Key; do not issue a new mutation.")
+    .with_details(serde_json::json!({
+        "retryable": true,
+        "retryScope": "same-idempotency-key",
+        "outcome": "unknown",
+    }))
 }
 
 fn with_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {

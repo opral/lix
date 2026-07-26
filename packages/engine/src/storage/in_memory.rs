@@ -7,9 +7,9 @@ use bytes::Bytes;
 use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use crate::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
-    WriteStats,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
+    WriteOptions, WriteStats,
 };
 
 type InMemoryMap = BTreeMap<Key, Bytes>;
@@ -306,7 +306,10 @@ impl Storage for Memory {
         = MemoryWrite
     where
         Self: 'a;
-    async fn begin_read(&self, _opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+    async fn begin_read(&self, opts: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+        if opts.durability == ReadDurability::Durable {
+            return Err(StorageError::Durability);
+        }
         Ok(MemoryRead {
             entries: self.snapshot()?,
         })

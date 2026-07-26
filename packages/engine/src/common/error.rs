@@ -83,6 +83,10 @@ impl LixError {
     /// Storage I/O failed.
     pub const CODE_STORAGE_ERROR: &'static str = "LIX_STORAGE_ERROR";
 
+    /// The selected storage cannot prove the requested persistence boundary.
+    pub const CODE_STORAGE_DURABILITY_UNAVAILABLE: &'static str =
+        "LIX_STORAGE_DURABILITY_UNAVAILABLE";
+
     /// A newer storage client fenced this writer, so this Lix instance can no
     /// longer serve requests.
     pub const CODE_STORAGE_FENCED: &'static str = "LIX_STORAGE_FENCED";
@@ -95,6 +99,16 @@ impl LixError {
     /// a definitive result.
     pub const CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN: &'static str =
         "LIX_STORAGE_COMMIT_OUTCOME_UNKNOWN";
+
+    /// A server SQL mutation did not provide the required replay identity.
+    pub const CODE_IDEMPOTENCY_KEY_REQUIRED: &'static str = "LIX_IDEMPOTENCY_KEY_REQUIRED";
+
+    /// A replay identity was reused for a different logical mutation.
+    pub const CODE_IDEMPOTENCY_KEY_REUSED: &'static str = "LIX_IDEMPOTENCY_KEY_REUSED";
+
+    /// A mutation response cannot be retained safely for idempotent replay.
+    pub const CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE: &'static str =
+        "LIX_IDEMPOTENCY_RESPONSE_TOO_LARGE";
 
     /// Optimistic transaction publication lost a race with a newer commit.
     pub const CODE_TRANSACTION_CONFLICT: &'static str = "LIX_TRANSACTION_CONFLICT";
@@ -356,6 +370,10 @@ impl From<crate::storage_adapter::StorageError> for LixError {
                 "retryable": false,
                 "outcome": "unknown",
             })),
+            crate::storage_adapter::StorageError::Durability => Self::new(
+                Self::CODE_STORAGE_DURABILITY_UNAVAILABLE,
+                "the storage backend cannot prove the requested durability boundary",
+            ),
             error => Self::new(Self::CODE_STORAGE_ERROR, error.to_string()),
         }
     }

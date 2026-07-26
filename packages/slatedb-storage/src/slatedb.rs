@@ -16,16 +16,16 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
-    PreconditionFailure, ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions,
-    SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions,
-    WriteStats,
+    PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
+    WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
 use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
 use slatedb::config::{
-    CompressionCodec, ObjectStoreCacheOptions, ScanOptions as SlateDBScanOptions, Settings,
-    WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, DurabilityLevel, ObjectStoreCacheOptions, ReadOptions as SlateDBReadOptions,
+    ScanOptions as SlateDBScanOptions, Settings, WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -83,6 +83,7 @@ pub struct SlateDBCacheOptions {
 pub struct SlateDBRead {
     worker: SlateDBWorker,
     snapshot: Arc<DbSnapshot>,
+    durability: ReadDurability,
 }
 
 #[allow(missing_debug_implementations)]
@@ -199,7 +200,7 @@ impl Storage for SlateDB {
 
     fn begin_read(
         &self,
-        _opts: ReadOptions,
+        opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
             let snapshot = self
@@ -209,6 +210,7 @@ impl Storage for SlateDB {
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
                 snapshot,
+                durability: opts.durability,
             })
         }
     }
@@ -295,7 +297,7 @@ async fn snapshot_value(
 ) -> Result<Option<Bytes>, StorageError> {
     let key = physical_key(space, key)?;
     Ok(worker
-        .call_read(move |_db| get_snapshot_values(snapshot, vec![key]))
+        .call_read(move |_db| get_snapshot_values(snapshot, vec![key], ReadDurability::Visible))
         .await?
         .into_iter()
         .next()
@@ -319,9 +321,10 @@ impl StorageRead for SlateDBRead {
                 .map(|key| physical_key(space, key))
                 .collect::<Result<Vec<_>, _>>()?;
             let snapshot = Arc::clone(&self.snapshot);
+            let durability = self.durability;
             let values = self
                 .worker
-                .call_read(move |_db| get_snapshot_values(snapshot, physical_keys))
+                .call_read(move |_db| get_snapshot_values(snapshot, physical_keys, durability))
                 .await?;
             Ok(GetManyResult::new(
                 values
@@ -361,9 +364,10 @@ impl StorageRead for SlateDBRead {
             }
 
             let snapshot = Arc::clone(&self.snapshot);
+            let durability = self.durability;
             let mut iter = Some(
                 self.worker
-                    .call_read(move |_db| open_snapshot_scan(snapshot, bounds))
+                    .call_read(move |_db| open_snapshot_scan(snapshot, bounds, durability))
                     .await?,
             );
             let mut all_entries = Vec::with_capacity(opts.page_size());
@@ -947,11 +951,19 @@ impl EncodedBounds {
 async fn get_snapshot_values(
     snapshot: Arc<DbSnapshot>,
     keys: Vec<Key>,
+    durability: ReadDurability,
 ) -> Result<Vec<Option<Bytes>>, StorageError> {
+    let read_options = slatedb_read_options(durability);
     stream::iter(keys)
         .map(|key| {
             let snapshot = Arc::clone(&snapshot);
-            async move { snapshot.get(key.0).await.map_err(slatedb_error) }
+            let read_options = read_options.clone();
+            async move {
+                snapshot
+                    .get_with_options(key.0, &read_options)
+                    .await
+                    .map_err(slatedb_error)
+            }
         })
         .buffered(POINT_READ_CONCURRENCY)
         .try_collect()
@@ -974,8 +986,9 @@ enum ScanBatchState {
 async fn open_snapshot_scan(
     snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
+    durability: ReadDurability,
 ) -> Result<DbIterator, StorageError> {
-    let scan_options = slatedb_scan_options();
+    let scan_options = slatedb_scan_options(durability);
     snapshot
         .scan_with_options(bounds.range(), &scan_options)
         .await
@@ -1031,7 +1044,7 @@ async fn collect_snapshot_keys(
     snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
 ) -> Result<Vec<Key>, StorageError> {
-    let scan_options = slatedb_scan_options();
+    let scan_options = slatedb_scan_options(ReadDurability::Visible);
     let mut iter = snapshot
         .scan_with_options(bounds.range(), &scan_options)
         .await
@@ -1043,13 +1056,25 @@ async fn collect_snapshot_keys(
     Ok(keys)
 }
 
-fn slatedb_scan_options() -> SlateDBScanOptions {
+fn slatedb_read_options(durability: ReadDurability) -> SlateDBReadOptions {
+    SlateDBReadOptions::new().with_durability_filter(slatedb_durability_filter(durability))
+}
+
+fn slatedb_scan_options(durability: ReadDurability) -> SlateDBScanOptions {
     // SlateDB's default scan options fetch one block at a time. Keep iteration
     // ordered, but let SlateDB prefetch remote SST blocks behind the iterator.
     SlateDBScanOptions::default()
+        .with_durability_filter(slatedb_durability_filter(durability))
         .with_read_ahead_bytes(SCAN_READ_AHEAD_BYTES)
         .with_max_fetch_tasks(SCAN_MAX_FETCH_TASKS)
         .with_cache_blocks(SCAN_CACHE_BLOCKS)
+}
+
+fn slatedb_durability_filter(durability: ReadDurability) -> DurabilityLevel {
+    match durability {
+        ReadDurability::Visible => DurabilityLevel::Memory,
+        ReadDurability::Durable => DurabilityLevel::Remote,
+    }
 }
 
 fn max_lower_bound(left: Bound<Vec<u8>>, right: Bound<Vec<u8>>) -> Bound<Vec<u8>> {
@@ -1516,6 +1541,87 @@ mod tests {
             .expect("commit should finish after WAL durability")
             .expect("commit visibility value");
         committer.join().expect("join visibility committer");
+    }
+
+    #[test]
+    fn durable_reads_exclude_writes_awaiting_wal_upload() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let storage = SlateDB::open_object_store_with_options(
+            "test-durable-read-filter",
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open durable read storage");
+        let space = SpaceId(8);
+        let key = Key(Bytes::from_static(b"visible-before-remote-durable"));
+        let value = Bytes::from_static(b"value");
+
+        let blocked_write = store.block_next_write();
+        let committer_storage = storage.clone();
+        let committer_key = key.clone();
+        let committer_value = value.clone();
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let committer = std::thread::spawn(move || {
+            let mut write = block_on(committer_storage.begin_write(WriteOptions::default()))
+                .expect("begin durable read write");
+            block_on(write.put_many(
+                space,
+                PutBatch {
+                    entries: vec![PutEntry {
+                        key: committer_key,
+                        value: StoredValue {
+                            bytes: committer_value,
+                        },
+                    }],
+                },
+            ))
+            .expect("stage durable read row");
+            commit_tx
+                .send(block_on(write.commit()))
+                .expect("send durable read commit result");
+        });
+
+        blocked_write.wait_for_entries(1, "SlateDB WAL write");
+        let visible =
+            block_on(storage.begin_read(ReadOptions::default())).expect("begin visible read");
+        assert_eq!(
+            block_on(visible.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
+                .expect("read visible value")
+                .values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))],
+            "the ordinary read tier may include published in-memory state"
+        );
+        let durable = block_on(storage.begin_read(ReadOptions {
+            durability: ReadDurability::Durable,
+            ..ReadOptions::default()
+        }))
+        .expect("begin remote-durable read");
+        assert_eq!(
+            block_on(durable.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
+                .expect("read remote-durable value")
+                .values,
+            vec![None],
+            "a remote-durable read must not claim a blocked WAL upload persisted"
+        );
+
+        drop(blocked_write);
+        commit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("commit should complete after WAL durability")
+            .expect("commit durable read row");
+        committer.join().expect("join durable read committer");
+
+        let durable = block_on(storage.begin_read(ReadOptions {
+            durability: ReadDurability::Durable,
+            ..ReadOptions::default()
+        }))
+        .expect("begin completed remote-durable read");
+        assert_eq!(
+            block_on(durable.get_many(space, &[key], GetOptions::default()))
+                .expect("read completed remote-durable value")
+                .values,
+            vec![Some(ProjectedValue::FullValue(value))]
+        );
     }
 
     #[test]

@@ -14,12 +14,11 @@ use axum::{
     routing::{delete, get, post},
 };
 use lix_sdk::{
-    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteOptions, ExecuteResult,
-    ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, ObserveEvent, ObserveEvents,
-    Storage, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
+    Blob, CreateBranchOptions, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions,
+    ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, Lix, LixError, ObserveEvent,
+    ObserveEvents, Storage, SwitchBranchOptions, Value, VerifiedRequestBlob, WireValue,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -55,6 +54,8 @@ pub const PROTOCOL_PATH: &str = "/lix/v1";
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Header carrying the opaque server-issued session capability.
 pub const SESSION_ID_HEADER: &str = "lix-session-id";
+/// Standard request identity for replay-safe SQL mutations.
+pub const IDEMPOTENCY_KEY_HEADER: &str = "idempotency-key";
 /// Header distinguishing a missing file from a present empty file on the raw
 /// binary file-read endpoint.
 pub const FILE_FOUND_HEADER: &str = "lix-file-found";
@@ -91,9 +92,30 @@ const BLOB_BASE_MISSING_CODE: &str = "LIX_REMOTE_BLOB_BASE_MISSING";
 
 const SESSION_TOKEN_BYTES: usize = 32;
 const SESSION_TOKEN_HEX_LEN: usize = SESSION_TOKEN_BYTES * 2;
+const MAX_IDEMPOTENCY_COMPONENT_BYTES: usize = 255;
 const SESSION_OPEN_GATE_CLOSING: usize = 1 << (usize::BITS - 1);
 const SESSION_OPEN_GATE_COUNT_MASK: usize = !SESSION_OPEN_GATE_CLOSING;
 const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// A stable principal namespace injected by an authenticated protocol host.
+///
+/// This is deliberately a request extension rather than an HTTP header: an
+/// untrusted caller must never choose another principal's replay namespace.
+/// Lixray strips its reserved inbound header after authentication and inserts
+/// this extension before dispatching to the canonical protocol router.
+#[derive(Clone, Debug)]
+pub struct TrustedIdempotencyScope(String);
+
+impl TrustedIdempotencyScope {
+    /// Creates a scope after the host has authenticated and validated it.
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
 
 /// Resource limits for one workspace's remote protocol sessions.
 #[derive(Clone, Copy, Debug)]
@@ -607,6 +629,7 @@ where
         params: Vec<Value>,
         options: ExecuteOptions,
         metadata: ExecuteStatementMetadata,
+        idempotency: Option<ExecuteIdempotency>,
     ) -> Result<ExecuteResult, LixError> {
         let disposition = {
             let lix = self.record.lix.read().await;
@@ -615,15 +638,29 @@ where
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
-                    lix.execute_with_options_and_metadata(&sql, &params, options, metadata)
-                        .await
+                    let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
+                    lix.execute_with_idempotency_and_options_and_metadata(
+                        &sql,
+                        &params,
+                        options,
+                        metadata,
+                        idempotency,
+                    )
+                    .await
                 })
                 .await
             }
             ExecutionDisposition::Durable => {
                 self.run(move |lix| async move {
-                    lix.execute_with_options_and_metadata(&sql, &params, options, metadata)
-                        .await
+                    let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
+                    lix.execute_with_idempotency_and_options_and_metadata(
+                        &sql,
+                        &params,
+                        options,
+                        metadata,
+                        idempotency,
+                    )
+                    .await
                 })
                 .await
             }
@@ -635,6 +672,7 @@ where
         statements: Vec<ExecuteBatchStatement>,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let disposition = {
             let lix = self.record.lix.read().await;
@@ -643,10 +681,12 @@ where
         match disposition {
             ExecutionDisposition::CancellableRead => {
                 self.run_cancellable_read(move |lix| async move {
-                    lix.execute_batch_with_options_and_metadata(
+                    let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
+                    lix.execute_batch_with_idempotency_and_options_and_metadata(
                         &statements,
                         options,
                         statement_metadata,
+                        idempotency,
                     )
                     .await
                 })
@@ -654,10 +694,12 @@ where
             }
             ExecutionDisposition::Durable => {
                 self.run(move |lix| async move {
-                    lix.execute_batch_with_options_and_metadata(
+                    let idempotency = bind_idempotency_to_session_branch(&lix, idempotency).await?;
+                    lix.execute_batch_with_idempotency_and_options_and_metadata(
                         &statements,
                         options,
                         statement_metadata,
+                        idempotency,
                     )
                     .await
                 })
@@ -718,6 +760,19 @@ where
             events: Arc::new(Mutex::new(lix.observe(sql, params)?)),
             terminal_sender,
         })
+    }
+}
+
+async fn bind_idempotency_to_session_branch<S>(
+    lix: &Lix<S>,
+    idempotency: Option<ExecuteIdempotency>,
+) -> Result<Option<ExecuteIdempotency>, LixError>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    match idempotency {
+        Some(idempotency) => Ok(Some(idempotency.with_branch(lix.active_branch_id().await?))),
+        None => Ok(None),
     }
 }
 
@@ -1355,6 +1410,8 @@ where
 
 async fn execute<S>(
     Extension(lease): Extension<SessionLease<S>>,
+    scope: Option<Extension<TrustedIdempotencyScope>>,
+    headers: HeaderMap,
     Json(request): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, ApiError>
 where
@@ -1375,16 +1432,27 @@ where
         &mut cache_candidates,
         |sha256| lease.record.request_blob(sha256),
     )?;
-    let options = request.options.into();
+    let options: ExecuteOptions = request.options.into();
     let params = decoded.values;
     let metadata = decoded.metadata;
-    let result = lease.execute(sql, params, options, metadata).await?;
+    let idempotency = execute_idempotency(
+        &headers,
+        scope.map(|Extension(scope)| scope.into_inner()),
+        &sql,
+        &params,
+        options.origin_key.as_deref(),
+    )?;
+    let result = lease
+        .execute(sql, params, options, metadata, idempotency)
+        .await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(ExecuteResponse::try_from(result)?))
 }
 
 async fn execute_batch<S>(
     Extension(lease): Extension<SessionLease<S>>,
+    scope: Option<Extension<TrustedIdempotencyScope>>,
+    headers: HeaderMap,
     Json(request): Json<ExecuteBatchRequest>,
 ) -> Result<Json<Vec<ExecuteResponse>>, ApiError>
 where
@@ -1422,9 +1490,15 @@ where
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
     let (statements, statement_metadata): (Vec<_>, Vec<_>) = decoded_statements.into_iter().unzip();
-    let options = request.options.into();
+    let options: ExecuteOptions = request.options.into();
+    let idempotency = execute_batch_idempotency(
+        &headers,
+        scope.map(|Extension(scope)| scope.into_inner()),
+        &statements,
+        options.origin_key.as_deref(),
+    )?;
     let results = lease
-        .execute_batch(statements, options, statement_metadata)
+        .execute_batch(statements, options, statement_metadata, idempotency)
         .await?;
     lease.record.cache_request_blobs(cache_candidates);
     Ok(Json(
@@ -2450,7 +2524,10 @@ fn status_for_lix_error(error: &LixError) -> StatusCode {
         LixError::CODE_CLOSED | LixError::CODE_STORAGE_FENCED | LixError::CODE_STORAGE_CLOSED => {
             StatusCode::CONFLICT
         }
-        LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN => StatusCode::SERVICE_UNAVAILABLE,
+        LixError::CODE_IDEMPOTENCY_KEY_REUSED => StatusCode::CONFLICT,
+        LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
+        | LixError::CODE_STORAGE_DURABILITY_UNAVAILABLE => StatusCode::SERVICE_UNAVAILABLE,
+        LixError::CODE_IDEMPOTENCY_RESPONSE_TOO_LARGE => StatusCode::PAYLOAD_TOO_LARGE,
         LixError::CODE_PLUGIN_OBSERVATION_STALE => StatusCode::GONE,
         LixError::CODE_INTERNAL_ERROR => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
@@ -2536,6 +2613,115 @@ struct ExecuteBatchStatementRequest {
     sql: Option<String>,
     #[serde(default)]
     params: Vec<RequestWireValue>,
+}
+
+#[derive(Serialize)]
+struct ExecuteFingerprint<'a> {
+    sql: &'a str,
+    params: &'a [Value],
+    origin_key: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct ExecuteBatchFingerprint<'a> {
+    statements: Vec<ExecuteFingerprint<'a>>,
+    origin_key: Option<&'a str>,
+}
+
+fn execute_idempotency(
+    headers: &HeaderMap,
+    scope: Option<String>,
+    sql: &str,
+    params: &[Value],
+    origin_key: Option<&str>,
+) -> Result<Option<ExecuteIdempotency>, ApiError> {
+    let Some(key) = optional_idempotency_key(headers)? else {
+        return Ok(None);
+    };
+    let fingerprint = idempotency_fingerprint(
+        "execute",
+        &ExecuteFingerprint {
+            sql,
+            params,
+            origin_key,
+        },
+    )?;
+    Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
+}
+
+fn execute_batch_idempotency(
+    headers: &HeaderMap,
+    scope: Option<String>,
+    statements: &[ExecuteBatchStatement],
+    origin_key: Option<&str>,
+) -> Result<Option<ExecuteIdempotency>, ApiError> {
+    let Some(key) = optional_idempotency_key(headers)? else {
+        return Ok(None);
+    };
+    let fingerprint = idempotency_fingerprint(
+        "execute-batch",
+        &ExecuteBatchFingerprint {
+            statements: statements
+                .iter()
+                .map(|statement| ExecuteFingerprint {
+                    sql: &statement.sql,
+                    params: &statement.params,
+                    origin_key: None,
+                })
+                .collect(),
+            origin_key,
+        },
+    )?;
+    Ok(Some(ExecuteIdempotency::new(scope, key, fingerprint)))
+}
+
+fn optional_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let mut values = headers.get_all(IDEMPOTENCY_KEY_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::bad_request(
+            "Idempotency-Key must be sent at most once",
+        ));
+    }
+    let value = value.to_str().map_err(|_| {
+        ApiError::bad_request("Idempotency-Key must contain visible ASCII characters")
+    })?;
+    if value.is_empty()
+        || value.len() > MAX_IDEMPOTENCY_COMPONENT_BYTES
+        || !value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+    {
+        return Err(ApiError::bad_request(format!(
+            "Idempotency-Key must contain 1 to {MAX_IDEMPOTENCY_COMPONENT_BYTES} visible ASCII characters"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn idempotency_fingerprint(
+    operation: &'static str,
+    payload: &impl Serialize,
+) -> Result<[u8; 32], ApiError> {
+    #[derive(Serialize)]
+    struct Envelope<'a, T: ?Sized> {
+        version: u8,
+        operation: &'static str,
+        payload: &'a T,
+    }
+
+    let bytes = serde_json::to_vec(&Envelope {
+        version: 1,
+        operation,
+        payload,
+    })
+    .map_err(|error| {
+        ApiError::from(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("serialize idempotency request fingerprint: {error}"),
+        ))
+    })?;
+    Ok(Sha256::digest(bytes).into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3022,6 +3208,8 @@ mod tests {
         PutBatch, ReadOptions, RequestBlobSpliceProvenance, SpaceId, StorageError, StorageWrite,
         TracingTelemetrySink, WriteOptions, open_lix, open_lix_with_telemetry,
     };
+    use lix_slatedb_storage::{SlateDB, SlateDBObjectStoreOptions, SlateDBRead, SlateDBWrite};
+    use object_store::memory::InMemory as ObjectStoreMemory;
     use serde_json::{Value as JsonValue, json};
     use std::{
         io::{Read as _, Write as _},
@@ -3034,6 +3222,8 @@ mod tests {
         prelude::*,
         registry::LookupSpan,
     };
+
+    static TEST_IDEMPOTENCY_KEY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn terminal_storage_responses_are_non_retryable_conflicts_and_mark_runtime_recovery() {
@@ -3395,6 +3585,101 @@ mod tests {
             if self.fail_after_commit {
                 return Err(StorageError::CommitOutcomeUnknown(
                     "injected post-commit failure".to_string(),
+                ));
+            }
+            Ok(result)
+        }
+
+        async fn rollback(self) -> Result<(), StorageError> {
+            self.inner.rollback().await
+        }
+    }
+
+    /// Turns one definite SlateDB commit into the transport-style ambiguity
+    /// that occurs when an acknowledgement is lost after the write returns.
+    /// Unlike the Memory wrapper above, this preserves SlateDB's remote
+    /// durability read tier so the protocol can prove a positive receipt.
+    #[derive(Clone)]
+    struct PostCommitUnknownSlateDB {
+        inner: SlateDB,
+        fail_next_commit: Arc<AtomicBool>,
+    }
+
+    impl PostCommitUnknownSlateDB {
+        fn new() -> Self {
+            let inner = SlateDB::open_object_store_with_options(
+                "server-protocol-idempotency",
+                Arc::new(ObjectStoreMemory::new()),
+                SlateDBObjectStoreOptions::default(),
+            )
+            .expect("open SlateDB test storage");
+            Self {
+                inner,
+                fail_next_commit: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn fail_next_commit(&self) {
+            self.fail_next_commit.store(true, Ordering::Release);
+        }
+    }
+
+    struct PostCommitUnknownSlateDBWrite {
+        inner: SlateDBWrite,
+        fail_after_commit: bool,
+    }
+
+    impl Storage for PostCommitUnknownSlateDB {
+        type Read<'a>
+            = SlateDBRead
+        where
+            Self: 'a;
+        type Write<'a>
+            = PostCommitUnknownSlateDBWrite
+        where
+            Self: 'a;
+
+        async fn begin_read(&self, options: ReadOptions) -> Result<Self::Read<'_>, StorageError> {
+            self.inner.begin_read(options).await
+        }
+
+        async fn begin_write(
+            &self,
+            options: WriteOptions,
+        ) -> Result<Self::Write<'_>, StorageError> {
+            Ok(PostCommitUnknownSlateDBWrite {
+                inner: self.inner.begin_write(options).await?,
+                fail_after_commit: self.fail_next_commit.swap(false, Ordering::AcqRel),
+            })
+        }
+    }
+
+    impl StorageWrite for PostCommitUnknownSlateDBWrite {
+        async fn put_many(
+            &mut self,
+            space: SpaceId,
+            entries: PutBatch,
+        ) -> Result<(), StorageError> {
+            self.inner.put_many(space, entries).await
+        }
+
+        async fn delete_many(&mut self, space: SpaceId, keys: &[Key]) -> Result<(), StorageError> {
+            self.inner.delete_many(space, keys).await
+        }
+
+        async fn delete_range(
+            &mut self,
+            space: SpaceId,
+            range: KeyRange,
+        ) -> Result<(), StorageError> {
+            self.inner.delete_range(space, range).await
+        }
+
+        async fn commit(self) -> Result<CommitResult, StorageError> {
+            let result = self.inner.commit().await?;
+            if self.fail_after_commit {
+                return Err(StorageError::CommitOutcomeUnknown(
+                    "injected post-commit acknowledgement loss".to_string(),
                 ));
             }
             Ok(result)
@@ -4076,8 +4361,276 @@ mod tests {
         TestApp { server, router }
     }
 
+    async fn router_with_storage<S>(storage: S) -> Router
+    where
+        S: Storage + Clone + Send + Sync + 'static,
+    {
+        let lix = Arc::new(
+            open_lix(OpenLixOptions::new(storage))
+                .await
+                .expect("open Lix"),
+        );
+        handler(LixProtocolServer::new(lix))
+    }
+
     #[tokio::test]
-    async fn applied_write_with_unknown_commit_outcome_is_not_safe_to_retry() {
+    async fn sql_mutations_require_an_idempotency_key() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let response = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            &[],
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('no-key', 'rejected')"
+            })),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response_json(response).await["error"]["code"],
+            LixError::CODE_IDEMPOTENCY_KEY_REQUIRED
+        );
+        let persisted = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'no-key'"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(persisted).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_replays_a_post_commit_acknowledgement_loss_once() {
+        let storage = PostCommitUnknownSlateDB::new();
+        let router = router_with_storage(storage.clone()).await;
+        let (session_id, _) = new_session(&router).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "post-commit-ack-loss")];
+        let body = json!({
+            "sql": "INSERT INTO lix_key_value (key, value) VALUES ('once', 'persisted')"
+        });
+
+        storage.fail_next_commit();
+        let first = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "{:?}",
+            response_json(first).await
+        );
+
+        let replay = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            &headers,
+            Some(body),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+
+        let persisted = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'once'"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(persisted).await["rows"][0][0],
+            json!({ "kind": "int", "value": 1 })
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reuse_with_a_different_mutation_is_rejected() {
+        let app = app().await;
+        let (session_id, _) = new_session(&app.router).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "reuse-mismatch")];
+        let first = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            &headers,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('first', 'one')"
+            })),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let reused = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            &headers,
+            Some(json!({
+                "sql": "INSERT INTO lix_key_value (key, value) VALUES ('second', 'two')"
+            })),
+        )
+        .await;
+        assert_eq!(reused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(reused).await["error"]["code"],
+            LixError::CODE_IDEMPOTENCY_KEY_REUSED
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reuse_on_another_branch_is_rejected() {
+        let app = app().await;
+        let (main_session, _) = new_session(&app.router).await;
+        let created = request(
+            &app.router,
+            "POST",
+            "/lix/v1/branch/create",
+            Some(&main_session),
+            Some(json!({ "name": "Idempotency draft" })),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::OK);
+        let draft_branch = response_json(created).await["id"]
+            .as_str()
+            .expect("draft branch id")
+            .to_string();
+        let (draft_session, _) = new_session_at(&app.router, Some(&draft_branch)).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "same-key-different-branch")];
+        let body = json!({
+            "sql": "INSERT INTO lix_key_value (key, value) VALUES ('branch-bound-key', 'main')"
+        });
+
+        let first = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&main_session),
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let reused = request_with_headers(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&draft_session),
+            &headers,
+            Some(body),
+        )
+        .await;
+        assert_eq!(reused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response_json(reused).await["error"]["code"],
+            LixError::CODE_IDEMPOTENCY_KEY_REUSED
+        );
+
+        let draft_count = request(
+            &app.router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&draft_session),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key = 'branch-bound-key'"
+            })),
+        )
+        .await;
+        assert_eq!(draft_count.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(draft_count).await["rows"][0][0],
+            json!({ "kind": "int", "value": 0 })
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_batch_replays_all_results_after_acknowledgement_loss() {
+        let storage = PostCommitUnknownSlateDB::new();
+        let router = router_with_storage(storage.clone()).await;
+        let (session_id, _) = new_session(&router).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "batch-ack-loss")];
+        let body = json!({
+            "statements": [
+                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-first', 'one')" },
+                { "sql": "INSERT INTO lix_key_value (key, value) VALUES ('batch-second', 'two')" }
+            ]
+        });
+
+        storage.fail_next_commit();
+        let first = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            &headers,
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(
+            first.status(),
+            StatusCode::OK,
+            "{:?}",
+            response_json(first).await
+        );
+        let replay = request_with_headers(
+            &router,
+            "POST",
+            "/lix/v1/execute-batch",
+            Some(&session_id),
+            &headers,
+            Some(body),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(replay).await.as_array().map(Vec::len),
+            Some(2)
+        );
+
+        let persisted = request(
+            &router,
+            "POST",
+            "/lix/v1/execute",
+            Some(&session_id),
+            Some(json!({
+                "sql": "SELECT COUNT(*) FROM lix_key_value WHERE key IN ('batch-first', 'batch-second')"
+            })),
+        )
+        .await;
+        assert_eq!(persisted.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(persisted).await["rows"][0][0],
+            json!({ "kind": "int", "value": 2 })
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_write_without_durable_receipt_proof_is_not_acknowledged() {
         let storage = PostCommitUnknownStorage::new();
         let lix = Arc::new(
             open_lix(OpenLixOptions::new(storage.clone()))
@@ -4087,13 +4640,15 @@ mod tests {
         let server = LixProtocolServer::new(lix);
         let router = handler(server);
         let (session_id, _) = new_session(&router).await;
+        let headers = [(IDEMPOTENCY_KEY_HEADER, "memory-has-no-durable-proof")];
 
         storage.fail_next_commit();
-        let response = request(
+        let response = request_with_headers(
             &router,
             "POST",
             "/lix/v1/execute",
             Some(&session_id),
+            &headers,
             Some(json!({
                 "sql": "INSERT INTO lix_key_value (key, value) VALUES ('unknown-commit', 'written')"
             })),
@@ -4105,7 +4660,11 @@ mod tests {
             error["error"]["code"],
             LixError::CODE_STORAGE_COMMIT_OUTCOME_UNKNOWN
         );
-        assert_eq!(error["error"]["details"]["retryable"], false);
+        assert_eq!(error["error"]["details"]["retryable"], true);
+        assert_eq!(
+            error["error"]["details"]["retryScope"],
+            "same-idempotency-key"
+        );
         assert_eq!(error["error"]["details"]["outcome"], "unknown");
 
         let persisted = request(
@@ -4146,9 +4705,36 @@ mod tests {
         session_id: Option<&str>,
         body: Option<JsonValue>,
     ) -> Response {
+        let idempotency_key = (method == "POST"
+            && matches!(uri, "/lix/v1/execute" | "/lix/v1/execute-batch"))
+        .then(|| {
+            format!(
+                "server-protocol-test-{}",
+                TEST_IDEMPOTENCY_KEY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            )
+        });
+        let idempotency_headers = idempotency_key
+            .as_deref()
+            .map(|key| (IDEMPOTENCY_KEY_HEADER, key))
+            .into_iter()
+            .collect::<Vec<_>>();
+        request_with_headers(app, method, uri, session_id, &idempotency_headers, body).await
+    }
+
+    async fn request_with_headers(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        session_id: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Option<JsonValue>,
+    ) -> Response {
         let mut builder = Request::builder().method(method).uri(uri);
         if let Some(session_id) = session_id {
             builder = builder.header(SESSION_ID_HEADER, session_id);
+        }
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
         }
         let body = body.map_or_else(Body::empty, |body| {
             builder
@@ -7167,6 +7753,7 @@ mod tests {
                         .method("POST")
                         .uri("/lix/v1/execute")
                         .header(SESSION_ID_HEADER, operation_session_id)
+                        .header(IDEMPOTENCY_KEY_HEADER, "detached-write")
                         .header(axum::http::header::CONTENT_TYPE, "application/json")
                         .extension(notifier)
                         .body(Body::from(
