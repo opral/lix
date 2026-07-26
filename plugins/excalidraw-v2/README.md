@@ -1,14 +1,15 @@
 # Excalidraw v2 plugin
 
-This guest implements Excalidraw scenes on the Lix Wasm Component plugin API
-v2. Its semantic boundary follows the units users usually edit independently:
+This guest implements Excalidraw scenes on the
+[Lix Plugin API v2](../../packages/plugin-api/README.md). Its semantic boundary
+follows the units users usually edit independently:
 
 - one stable `excalidraw_scene` root for top-level scene metadata and layout;
 - one `excalidraw_element` per native element ID, with a fractional order key;
 - one `excalidraw_file` per native key in the `files` map.
 
 The element and file payloads are complete JSON encoded as strings. This is a
-deliberate packet-v1 compatibility choice: durable entity snapshots currently
+deliberate packet-v1 durable-representation constraint: entity snapshots currently
 reject JSON numbers, while Excalidraw geometry is predominantly numeric. It
 also keeps the plugin forward-compatible with element fields introduced by
 newer Excalidraw versions.

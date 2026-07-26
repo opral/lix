@@ -4,7 +4,6 @@ mod bindings;
 mod core;
 mod markdown_file;
 mod model;
-mod packet;
 pub mod schemas;
 
 pub use core::{

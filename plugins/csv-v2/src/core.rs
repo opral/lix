@@ -31,6 +31,15 @@ impl IdNamespace {
         bytes[16..].copy_from_slice(&ordinal.to_be_bytes());
         URL_SAFE_NO_PAD.encode(bytes)
     }
+
+    /// Converts one API-generated ID back into the compact namespace retained
+    /// by the CSV identity index. Author code never receives raw namespace
+    /// halves; this is only the reference core's storage optimization.
+    pub fn from_generated_id(id: &str) -> Result<Self, String> {
+        decode_generated_id(id.as_bytes())
+            .map(|(namespace, _)| Self(namespace))
+            .ok_or_else(|| "plugin API generated an invalid CSV identity".to_owned())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

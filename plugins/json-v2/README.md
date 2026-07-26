@@ -74,12 +74,12 @@ fence also reports `LIX_INVALID_PARAM` with a retry-oriented message.
 
 The plugin contract and transient packet encoding are defined by:
 
-- [the production v2 WIT contract](../../packages/engine/wit/v2/lix-plugin-v2.wit);
-- [the packet-v1 rules](../../packages/engine/wit/v2/packet-v1.md); and
-- [the v2 authoring guide](../../packages/engine/wit/v2/README.md).
+- [the public v2 WIT contract](../../packages/plugin-api/wit/lix-plugin-v2.wit); and
+- [the lix-plugin-api authoring guide](../../packages/plugin-api/README.md).
 
-The `bindings.rs` and `packet.rs` modules implement the Component boundary.
-Format parsing, recursive indexing, identity reconciliation, and incremental
+The [lix-plugin-api](../../packages/plugin-api/README.md) implements the Component
+boundary. `bindings.rs` maps JSON's format semantics into its four operations;
+format parsing, recursive indexing, identity reconciliation, and incremental
 transition logic stay in `core.rs`.
 
 From the repository root:

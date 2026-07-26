@@ -2,14 +2,12 @@
 
 This file is the normative encoding for `packet-page.format-version = 1`,
 `change-page.format-version = 1`, and `resolution-page.format-version = 1` in
-`lix-plugin-v2.wit`. The binary packet is an SDK/runtime detail rather than the
-intended format-authoring surface. There is no reusable production v2 SDK yet:
-each reference plugin keeps its checked codec and typed adapter beside its
-format core. The CSV
-[`packet.rs`](../../../../plugins/csv-v2/src/packet.rs) and
-[`bindings.rs`](../../../../plugins/csv-v2/src/bindings.rs) are the smallest
-current reference, not a frozen general SDK facade. Format logic should use
-typed entity, entity-change, and byte-edit values behind such an adapter.
+`lix-plugin-v2.wit`. The binary packet is an API/runtime detail rather than the
+format-authoring surface. The public
+[`lix_plugin_api_v2`](../../../plugin-api/README.md) package owns its checked
+codec and typed Component adapter. Format logic should use its typed entity,
+entity-change, conflict/resolution, and byte-edit values rather than this
+packet encoding.
 
 The packet is a transient Component-boundary arena. It is not a RocksDB or
 SlateDB storage format and must not be persisted as one.

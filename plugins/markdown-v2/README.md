@@ -1,7 +1,7 @@
 # Markdown Component v2 plugin
 
-This crate implements the production Lix Wasm Component plugin API v2 for
-GitHub Flavored Markdown. It retains the existing block/tree semantic model:
+This crate implements the production [Lix Plugin API v2](../../packages/plugin-api/README.md)
+for GitHub Flavored Markdown. It retains the existing block/tree semantic model:
 one `markdown_node_v2` entity per document, block, list/table structure, and
 text-bearing leaf. Inline syntax remains an embedded typed AST so independently
 addressable blocks stay small without duplicating descendant text.

@@ -1,71 +1,52 @@
-# Wasm Component plugin API
+# Component plugin runtime contract
 
-This directory is the source of truth for the production Component contract.
-The
-[incremental CSV/TSV](../../../../plugins/csv-v2/README.md) and
-[recursive JSON](../../../../plugins/json-v2/README.md),
-[Markdown](../../../../plugins/markdown-v2/README.md), and
-[Excalidraw](../../../../plugins/excalidraw-v2/README.md) plugins are executable
-production references. They deliberately keep format
-logic separate from the boundary adapter; v2 is not yet a standalone public
-authoring SDK.
+The author-facing API lives in
+[`packages/plugin-api`](../../../plugin-api/README.md). Its WIT copy is the
+public contract used by the Rust plugin API package.
 
-## Authoring map
+This directory contains the package-local mirror used by the engine's Wasmtime
+bindings. It must be byte-identical to
+[`packages/plugin-api/wit/lix-plugin-v2.wit`](../../../plugin-api/wit/lix-plugin-v2.wit);
+CI enforces that. Keeping the mirror lets the published engine crate generate
+its host bindings without depending on files outside its own archive.
 
-| Concern | Canonical source |
-|---|---|
-| Component types, resources, limits, and lifecycle | [`lix-plugin-v2.wit`](lix-plugin-v2.wit) |
-| Packet framing, ordering, snapshot semantics, conflict-resolution alignment, and validation | [`packet-v1.md`](packet-v1.md) |
-| Generated Rust binding invocation and typed WIT adapters | [`CSV`](../../../../plugins/csv-v2/src/bindings.rs), [`JSON`](../../../../plugins/json-v2/src/bindings.rs), [`Markdown`](../../../../plugins/markdown-v2/src/bindings.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/bindings.rs) |
-| Checked packet codecs | [`CSV`](../../../../plugins/csv-v2/src/packet.rs), [`JSON`](../../../../plugins/json-v2/src/packet.rs), [`Markdown`](../../../../plugins/markdown-v2/src/packet.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/packet.rs) |
-| Manifest fields and archive paths | [`plugins/csv-v2/manifest.json`](../../../../plugins/csv-v2/manifest.json) |
-| Schema annotations and stable-ID declaration | [`csv_v2_row.json`](../../../../plugins/csv-v2/schema/csv_v2_row.json) and [`csv_v2_table.json`](../../../../plugins/csv-v2/schema/csv_v2_table.json) |
-| Incremental document implementations | [`CSV`](../../../../plugins/csv-v2/src/core.rs), [`JSON`](../../../../plugins/json-v2/src/core.rs), [`Markdown`](../../../../plugins/markdown-v2/src/core.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/core.rs) |
-| Executable behavior tests | [`CSV`](../../../../plugins/csv-v2/src/tests.rs), [`JSON`](../../../../plugins/json-v2/src/tests.rs), [`Markdown`](../../../../plugins/markdown-v2/src/tests.rs), and [`Excalidraw`](../../../../plugins/excalidraw-v2/src/tests.rs) |
-| Host archive construction and end-to-end tests | [`packages/rs-sdk-tests/tests/e2e.rs`](../../../rs-sdk-tests/tests/e2e.rs) |
+## What plugin authors use
 
-## Authoring quickstart
+Authors depend on `lix_plugin_api_v2`, implement
+`FormatPlugin`, and export it with `export_v2!`. The public API has four
+typed transitions:
 
-1. Use `plugins/csv-v2` as the crate-layout reference. It is a `cdylib` using
-   `wit-bindgen` and exports the `plugin` world. Keep format logic separate from
-   the WIT and packet adapter, as `core.rs` is separate from `bindings.rs` and
-   `packet.rs` in the reference.
-2. Generate the Rust traits from this directory. A plugin crate beside
-   `plugins/csv-v2` uses:
+| Transition | Input | Output |
+|---|---|---|
+| `open_file` | initial bytes | durable entity changes |
+| `open_entities` | durable entities | sparse byte edits |
+| `file_changed` | verified base-relative byte splices | durable entity changes |
+| `entities_changed` | final entity changes | sparse byte edits |
 
-   ```rust
-   wit_bindgen::generate!({
-       path: "../../packages/engine/wit/v2",
-       world: "plugin",
-   });
-   ```
+The four transitions are intentional: they cover cold/warm ×
+bytes-to-entities/entities-to-bytes without an untyped event enum or invalid
+runtime states. A document must be immutable and cheap to clone because the
+runtime forks it for speculative work.
 
-   Adjust the relative path for a crate elsewhere. `wit-bindgen` generates the
-   WIT resources and traits; it does **not** currently generate a typed entity
-   packet facade. The CSV crate's `bindings.rs` and `packet.rs` are the checked
-   production reference for that adapter. There is no standalone production v2
-   author SDK to depend on yet.
-3. Add a `manifest.json` with `runtime: "wasm-component-v2"`, the exact
-   `api_version: "2.1.0"`, a unique `key`, a `match.path_glob`, optional
-   `match.content_type` (`"text"` or `"binary"`), `entry: "plugin.wasm"`,
-   and every schema path in `schemas`. Schema keys are part of the durable
-   plugin contract; an existing schema definition cannot be replaced in place
-   with an incompatible contract.
-4. Give each schema an `x-lix-key` and an `x-lix-primary-key` array of JSON
-   Pointers. Add `x-lix-id-allocation: "host-allocated"` only to a v2 schema
-   whose plugin allocates new primary keys from the transition namespace. The
-   current production gate also requires schemas in which JSON number nodes are
-   unreachable; use strings for values such as order keys. See the
-   [Snapshot JSON durable-representation gate](packet-v1.md#durable-representation-gate).
-5. Implement every lifecycle entry point below, then build the Wasm component
-   and exercise both the format core and the host integration.
+`FormatPlugin::resolve_conflict` is a fifth, stateless operation for colliding
+semantic entities. Its default deterministically takes canonical `b` (or
+deletes when `b` is absent); formats override it only for safe composition
+rules such as distinct CSV cells or disjoint Markdown text spans.
 
-The installable `.lixplugin` is a ZIP with the manifest and schemas at their
-declared paths and the built component at the manifest's `entry` path. The CSV
-end-to-end test's `build_csv_v2_plugin_archive` helper is the current packaging
-reference; there is no generic v2 packaging CLI yet.
+WIT resources, packet paging, output attachments, limits, and error lowering
+are internal to the API package. Normal format code works with typed entities,
+changes, conflict values/resolutions, IDs, sources, and sparse edits. Read
+[`packages/plugin-api/README.md`](../../../plugin-api/README.md) before using
+the lower-level protocol material here.
 
-## Lifecycle checklist
+## Format contract
+
+A plugin manifest declares `runtime: "wasm-component-v2"`,
+`api_version: "2.1.0"`, matchers, its component entry, and schemas. Each
+schema declares `x-lix-key` and `x-lix-primary-key`. A schema that lets the
+plugin create entities also declares `x-lix-id-allocation:
+"host-allocated"`; preserve known IDs and use `ids.id(ordinal)` only for new
+ones. Positions, row numbers, and byte offsets are not identities.
 
 - `open-file`: parse initial bytes, return an immutable `document`, and stream
   complete initial entity upserts.

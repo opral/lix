@@ -13,8 +13,10 @@ and a localized entity change can produce sparse byte edits, without crossing
 the component boundary with the rest of the file.
 
 The production contract is WIT package `lix:plugin@2.1.0` and packet format
-`packet-v1`. Their normative definitions live in
-[`packages/engine/wit/v2`](../../packages/engine/wit/v2).
+`packet-v1`. The public Rust authoring surface and canonical WIT copy live in
+[`packages/plugin-api`](../../packages/plugin-api/README.md). The engine and
+Rust SDK retain package-local WIT mirrors for generated host bindings; CI
+enforces byte-for-byte parity so every published crate remains self-contained.
 
 ## Motivation
 
@@ -251,9 +253,10 @@ helpers while preserving the same lifecycle. An optimized implementation can
 read only affected source ranges, update its syntax/identity index, and emit
 local deltas. There is no separate fast API.
 
-The first production plugins are executable references. A shared public SDK is
-deliberately deferred until repeated implementations show which adapter
-helpers are stable.
+The first production plugins are executable references and consumers of the
+shared public `lix_plugin_api_v2` package. It exposes the four irreducible
+cold/warm × byte/entity transitions while retaining WIT resources, packet
+codecs, paging, attachments, and bounds as runtime internals.
 
 ## Limits
 

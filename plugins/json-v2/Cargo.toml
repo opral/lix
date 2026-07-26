@@ -22,5 +22,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 base64 = "0.22"
 blake3 = "1"
+lix_plugin_api_v2 = { workspace = true }
 serde_json = { version = "1", features = ["raw_value"] }
-wit-bindgen = "0.57"
