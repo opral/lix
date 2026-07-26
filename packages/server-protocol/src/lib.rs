@@ -1387,7 +1387,6 @@ where
             active_branch_id,
             session_id: lease.session_id.clone(),
             capabilities: ProtocolCapabilities {
-                request_blob_splice: true,
                 binary_file_upsert: true,
                 binary_file_upsert_batch: true,
                 binary_file_read: true,
@@ -2555,7 +2554,6 @@ struct HandshakeResponse {
 // change the flat handshake response without reducing protocol complexity.
 #[allow(clippy::struct_excessive_bools)]
 struct ProtocolCapabilities {
-    request_blob_splice: bool,
     binary_file_upsert: bool,
     binary_file_upsert_batch: bool,
     binary_file_read: bool,
@@ -5113,7 +5111,7 @@ mod tests {
         let app = app().await;
         let (session_id, first) = new_session(&app.router).await;
         assert_eq!(first["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(first["capabilities"]["requestBlobSplice"], true);
+        assert!(first["capabilities"].get("requestBlobSplice").is_none());
         assert_eq!(first["capabilities"]["binaryFileUpsert"], true);
         assert_eq!(first["capabilities"]["binaryFileUpsertBatch"], true);
         assert_eq!(first["capabilities"]["binaryFileRead"], true);

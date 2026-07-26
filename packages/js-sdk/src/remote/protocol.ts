@@ -31,7 +31,6 @@ export type RemoteHandshake = {
 	protocolVersion: number;
 	activeBranchId: string;
 	sessionId: string;
-	requestBlobSplice: boolean;
 };
 
 export type RemoteHandshakeRequest = {
@@ -233,9 +232,6 @@ export function decodeHandshake(value: unknown): RemoteHandshake {
 		protocolVersion: REMOTE_PROTOCOL_VERSION,
 		activeBranchId: handshake.activeBranchId,
 		sessionId: handshake.sessionId,
-		requestBlobSplice:
-			isRecord(handshake.capabilities) &&
-			handshake.capabilities.requestBlobSplice === true,
 	};
 }
 
