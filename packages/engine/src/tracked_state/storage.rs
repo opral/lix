@@ -356,7 +356,7 @@ pub(crate) async fn load_commit_delta_values(
         .await?;
     for ((segment_index, lookups), value) in lookups_by_segment.into_iter().zip(result.value) {
         let bytes = value
-            .and_then(full_value)
+            .and_then(full_value_bytes)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -394,7 +394,7 @@ pub(crate) async fn scan_commit_delta_values(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
-        let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
+        let leaf = decode_commit_delta_leaf(inline_segment, None)?;
         let mut entries = Vec::with_capacity(leaf.len());
         collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
         return Ok(entries);
@@ -416,7 +416,7 @@ pub(crate) async fn scan_commit_delta_values(
     let mut entries = Vec::new();
     for (segment_index, value) in segment_indices.into_iter().zip(segments.value) {
         let bytes = value
-            .and_then(full_value)
+            .and_then(full_value_bytes)
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -425,11 +425,7 @@ pub(crate) async fn scan_commit_delta_values(
                     ),
                 )
             })?;
-        let leaf = decode_commit_delta_segment(
-            &bytes,
-            Some(&manifest.segments[segment_index]),
-            commit_id,
-        )?;
+        let leaf = decode_commit_delta_leaf(&bytes, Some(&manifest.segments[segment_index]))?;
         collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
     }
     Ok(entries)
@@ -586,10 +582,9 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
     encoded
 }
 
-fn decode_commit_delta_segment(
+fn decode_commit_delta_leaf(
     bytes: &[u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
-    expected_commit_id: CommitId,
 ) -> Result<DecodedLeafNodeRef, LixError> {
     let Some(leaf_bytes) = bytes.strip_prefix(COMMIT_DELTA_FORMAT_MAGIC) else {
         return Err(LixError::new(
@@ -621,6 +616,28 @@ fn decode_commit_delta_segment(
             "tracked_state commit_delta segment does not match its manifest bounds",
         ));
     }
+    Ok(leaf)
+}
+
+fn decode_commit_delta_segment(
+    bytes: &[u8],
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+    expected_commit_id: CommitId,
+) -> Result<DecodedLeafNodeRef, LixError> {
+    let leaf = decode_commit_delta_leaf(bytes, expected_bounds)?;
+    visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _| Ok(()))?;
+    Ok(leaf)
+}
+
+/// Visits each packed delta exactly once while validating the full immutable
+/// segment contract. Scan callers decode the key and retain matching values in
+/// the same pass; point callers use the no-op visitor before their binary
+/// search, preserving eager corruption detection.
+fn visit_commit_delta_leaf(
+    leaf: &DecodedLeafNodeRef,
+    expected_commit_id: CommitId,
+    mut visit: impl FnMut(&[u8], TrackedStateIndexValue) -> Result<(), LixError>,
+) -> Result<(), LixError> {
     let mut previous_key: Option<&[u8]> = None;
     for entry_index in 0..leaf.len() {
         let entry = leaf.entry(entry_index)?.ok_or_else(|| {
@@ -645,9 +662,10 @@ fn decode_commit_delta_segment(
                 ),
             ));
         }
+        visit(entry.key, value)?;
         previous_key = Some(entry.key);
     }
-    Ok(leaf)
+    Ok(())
 }
 
 fn collect_commit_delta_leaf_entries(
@@ -656,30 +674,13 @@ fn collect_commit_delta_leaf_entries(
     requested_schemas: &BTreeSet<&str>,
     entries: &mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
 ) -> Result<(), LixError> {
-    for entry_index in 0..leaf.len() {
-        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state packed commit_delta leaf has a missing entry",
-            )
-        })?;
-        let key = decode_key(entry.key)?;
-        if !requested_schemas.is_empty() && !requested_schemas.contains(key.schema_key.as_str()) {
-            continue;
+    visit_commit_delta_leaf(leaf, commit_id, |encoded_key, value| {
+        let key = decode_key(encoded_key)?;
+        if requested_schemas.is_empty() || requested_schemas.contains(key.schema_key.as_str()) {
+            entries.push((key, value));
         }
-        let value = decode_value(entry.value)?;
-        if value.commit_id != commit_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state packed commit_delta for commit '{commit_id}' contains an entry for commit '{}'",
-                    value.commit_id
-                ),
-            ));
-        }
-        entries.push((key, value));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn find_commit_delta_value(
@@ -900,11 +901,15 @@ fn value(bytes: Vec<u8>) -> StorageValue {
     }
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+fn full_value_bytes(value: StorageProjectedValue) -> Option<Bytes> {
     match value {
-        StorageProjectedValue::FullValue(bytes) => Some(bytes.to_vec()),
+        StorageProjectedValue::FullValue(bytes) => Some(bytes),
         StorageProjectedValue::KeyOnly => None,
     }
+}
+
+fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
+    full_value_bytes(value).map(|bytes| bytes.to_vec())
 }
 
 fn encode_commit_root(metadata: &TrackedStateCommitRoot) -> Result<Vec<u8>, LixError> {
@@ -952,17 +957,20 @@ mod tests {
         TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+    use crate::tracked_state::codec::{EncodedLeafEntry, encode_key_ref, encode_value_ref};
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
-        TrackedStateIndexValue, TrackedStateKey, TrackedStateRootId,
+        TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
+        TrackedStateRootId,
     };
 
     use super::{
-        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, decode_commit_delta_manifest, decode_commit_root,
-        encode_commit_root, load_commit_delta_values, scan_commit_delta_values,
-        stage_commit_deltas, stage_delete_commit_deltas,
+        CommitDeltaManifest, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
+        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, commit_delta_manifest_key,
+        decode_commit_delta_manifest, decode_commit_root, encode_commit_delta_manifest,
+        encode_commit_delta_segment, encode_commit_root, key, load_commit_delta_values,
+        scan_commit_delta_values, stage_commit_deltas, stage_delete_commit_deltas, value,
     };
 
     #[derive(Clone)]
@@ -1160,6 +1168,76 @@ mod tests {
             deletes.stats().staged_deletes,
             1,
             "GC should delete the inline manifest only"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_scan_validates_unselected_packed_delta_entries() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("packed-delta-expected-commit");
+        let wrong_commit_id = CommitId::for_test_label("packed-delta-wrong-commit");
+        let fixtures = packed_commit_delta_fixtures();
+        let alpha = &fixtures[0];
+        let beta = &fixtures[1];
+        let mut entries = vec![
+            EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &alpha.schema_key,
+                    file_id: alpha.file_id.as_deref(),
+                    entity_pk: &alpha.entity_pk,
+                }),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: alpha.change_id,
+                    commit_id,
+                    deleted: alpha.deleted,
+                    created_at: alpha.created_at,
+                    updated_at: alpha.updated_at,
+                }),
+            },
+            EncodedLeafEntry {
+                key: encode_key_ref(TrackedStateKeyRef {
+                    schema_key: &beta.schema_key,
+                    file_id: beta.file_id.as_deref(),
+                    entity_pk: &beta.entity_pk,
+                }),
+                value: encode_value_ref(TrackedStateIndexValueRef {
+                    change_id: beta.change_id,
+                    commit_id: wrong_commit_id,
+                    deleted: beta.deleted,
+                    created_at: beta.created_at,
+                    updated_at: beta.updated_at,
+                }),
+            },
+        ];
+        entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
+
+        let mut writes = storage.new_write_set();
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            key(commit_delta_manifest_key(commit_id)),
+            value(
+                encode_commit_delta_manifest(&CommitDeltaManifest {
+                    inline_segment: encode_commit_delta_segment(&entries),
+                    segments: Vec::new(),
+                })
+                .expect("inline manifest should encode"),
+            ),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = scan_commit_delta_values(&read, commit_id, &["alpha".to_string()])
+            .await
+            .expect_err("schema scans must validate entries outside the requested schema");
+        assert!(
+            error.to_string().contains("contains an entry for commit"),
+            "unexpected error: {error}"
         );
     }
 
