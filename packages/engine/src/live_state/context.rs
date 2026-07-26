@@ -119,14 +119,8 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        // This capability relies on v10's complete untracked-schema marker.
-        // Keep the proof at its storage-facing boundary so a future caller
-        // cannot accidentally treat a v9 marker absence as tracked-only.
-        if crate::init::repository_protocol_status(&self.store).await?
-            != crate::init::RepositoryProtocolStatus::Current
-        {
-            return Ok(None);
-        }
+        // Engine construction admits only the v10 layout, whose complete
+        // untracked-schema marker makes a missing marker a tracked-only proof.
         if request.filter.untracked == Some(true)
             || request_may_include_commit_derived(request)
             || request

@@ -48,7 +48,6 @@ pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
 const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v10";
-const LEGACY_REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v9";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -58,9 +57,6 @@ pub(crate) enum RepositoryProtocolStatus {
     /// The current layout records every untracked schema mutation, so direct
     /// tracked-head serving may prove that marker absence is safe.
     Current,
-    /// The compatible v9 layout lacks complete untracked-schema markers.
-    /// It remains readable through the generic visibility path only.
-    Legacy,
     Missing,
     Unsupported,
 }
@@ -87,11 +83,6 @@ pub(crate) async fn repository_protocol_status(
             if value.as_ref() == REPOSITORY_PROTOCOL_VALUE =>
         {
             RepositoryProtocolStatus::Current
-        }
-        Some(StorageProjectedValue::FullValue(value))
-            if value.as_ref() == LEGACY_REPOSITORY_PROTOCOL_VALUE =>
-        {
-            RepositoryProtocolStatus::Legacy
         }
         Some(_) => RepositoryProtocolStatus::Unsupported,
         None => RepositoryProtocolStatus::Missing,
@@ -460,7 +451,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match repository_protocol_status(read).await? {
-        RepositoryProtocolStatus::Current | RepositoryProtocolStatus::Legacy => Err(LixError::new(
+        RepositoryProtocolStatus::Current => Err(LixError::new(
             "LIX_ERROR_ALREADY_INITIALIZED",
             "engine storage is already initialized; initialization does not migrate or overwrite repositories",
         )),
