@@ -1069,7 +1069,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_directory_path_update_promotes_untracked_parents,
+    lix_directory_path_update_rejects_untracked_parent,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -1096,13 +1096,14 @@ simulation_test!(
             .await
             .expect("tracked directory insert should succeed");
 
-        session
+        let error = session
             .execute(
                 "UPDATE lix_directory SET path = '/archive/docs/' WHERE id = 'dir-docs'",
                 &[],
             )
             .await
-            .expect("directory path update should promote missing tracked parent");
+            .expect_err("directory path update must not promote an untracked parent");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
 
         let result = session
             .execute(
@@ -1119,15 +1120,15 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("dir-docs".to_string()),
-                    Value::Text("/archive/docs/".to_string()),
-                    Value::Text("dir-parent".to_string()),
+                    Value::Text("/docs/".to_string()),
+                    Value::Null,
                     Value::Boolean(false),
                 ],
                 vec![
                     Value::Text("dir-parent".to_string()),
                     Value::Text("/archive/".to_string()),
                     Value::Null,
-                    Value::Boolean(false),
+                    Value::Boolean(true),
                 ],
             ],
         );

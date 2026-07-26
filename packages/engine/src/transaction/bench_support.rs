@@ -4,7 +4,9 @@ use std::sync::Arc;
 use serde_json::{Value as JsonValue, json};
 
 use crate::binary_cas::BinaryCasContext;
-use crate::branch::{BranchContext, BranchHeadControl, stage_branch_head_control};
+use crate::branch::{
+    BranchContext, BranchHeadControl, BranchHeadControlContext, stage_branch_head_control,
+};
 use crate::catalog::CatalogContext;
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
@@ -12,10 +14,9 @@ use crate::changelog::{
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
-    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateRowRequest,
-    LiveStateScanRequest, TrackedHeadContext,
+    CurrentStateDeltaRef, LiveStateContext, LiveStateFilter, LiveStateProjection,
+    LiveStateRowRequest, LiveStateScanRequest, TrackedHeadContext, WorkingDiffIndexCoverage,
 };
-use crate::live_state::{LiveStateIndexContext, LiveStateIndexDeltaRef};
 use crate::session::SessionMode;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
@@ -91,7 +92,6 @@ where
         let tracked_state = Arc::new(TrackedStateContext::new());
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            LiveStateIndexContext::new(),
             crate::commit_graph::CommitGraphContext::new(),
         ));
         let branch_ctx = Arc::new(BranchContext::new());
@@ -348,46 +348,49 @@ where
     .expect("deterministic mode snapshot should serialize");
     let timestamp = LixTimestamp::expect_parse("created_at", "1970-01-01T00:00:00.000Z");
     let entity_pk = EntityPk::single(crate::functions::DETERMINISTIC_MODE_KEY);
-    let change_id = ChangeId::for_test_label("bench-deterministic-mode");
-    let mut read = SharedStorageAdapterRead::new(
+    let read = SharedStorageAdapterRead::new(
         storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("deterministic mode read should open"),
     );
     let mut writes = storage.new_write_set();
-    ChangelogContext::new()
-        .writer(&mut read, &mut writes)
-        .stage_append(ChangelogAppend {
-            changes: vec![ChangeRecord {
-                format_version: 2,
-                change_id,
-                entity_pk: entity_pk.clone(),
-                schema_key: "lix_key_value".to_string(),
-                file_id: None,
-                snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
-                metadata: crate::json_store::JsonSlot::None,
-                created_at: timestamp,
-                origin_key: None,
-            }],
-            ..ChangelogAppend::default()
-        })
+    let control = BranchHeadControlContext::new()
+        .reader(&read)
+        .load(GLOBAL_BRANCH_ID)
         .await
-        .expect("deterministic mode change should stage");
-    LiveStateIndexContext::new()
+        .expect("global branch control should load")
+        .expect("global branch control should exist");
+    assert!(
+        control.tracked_head_is_current,
+        "global current-state generation should be complete before deterministic mode seeding"
+    );
+    let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
+    let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+    TrackedHeadContext::new()
         .writer(&read, &mut writes)
-        .stage_branch_rows(
+        .stage_current_state_with_working_diff(
             GLOBAL_BRANCH_ID,
-            [LiveStateIndexDeltaRef {
+            Some(control.generation),
+            control.head_commit_id,
+            &[CurrentStateDeltaRef {
                 schema_key: "lix_key_value",
                 file_id: None,
                 entity_pk: &entity_pk,
-                change_id,
+                change_id: None,
                 commit_id: None,
+                untracked: true,
                 deleted: false,
                 created_at: timestamp,
                 updated_at: timestamp,
+                snapshot: snapshot.as_ref_slot(),
+                metadata: crate::json_store::JsonSlotRef::None,
             }],
+            &BTreeSet::new(),
+            None,
+            None,
+            None,
+            &mut working_diff_coverage,
         )
         .await
         .expect("deterministic mode current row should stage");
@@ -528,9 +531,10 @@ async fn seed_visible_schema_rows<StorageImpl>(
         .await
         .expect("schema fixture branch-ref changes should stage");
     // Match repository initialization: the immutable schema root and each
-    // visible branch control get a complete v5 serving generation before the
-    // timed fixture begins. Without these markers, the first timed tracked
-    // write bootstraps from history instead of exercising the normal path.
+    // visible branch control get a complete grouped current-state generation
+    // before the timed fixture begins. Otherwise the first timed tracked
+    // write would bootstrap from history instead of exercising the normal
+    // path.
     let tracked_head = TrackedHeadContext::new();
     let absence_guards = BTreeSet::new();
     for (branch_id, _, _, _) in &branch_refs {
@@ -547,29 +551,10 @@ async fn seed_visible_schema_rows<StorageImpl>(
             .await
             .expect("schema fixture tracked head should stage");
     }
-    let live_index = LiveStateIndexContext::new();
-    let mut current = live_index.writer(&read, &mut writes);
-    current
-        .stage_branch_rows(
-            GLOBAL_BRANCH_ID,
-            branch_refs
-                .iter()
-                .map(|(_, entity_pk, _, change_id)| LiveStateIndexDeltaRef {
-                    schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
-                    file_id: None,
-                    entity_pk,
-                    change_id: *change_id,
-                    commit_id: None,
-                    deleted: false,
-                    created_at: timestamp,
-                    updated_at: timestamp,
-                }),
-        )
-        .await
-        .expect("global current fixture should stage");
-    // Branch controls are the authoritative v6 publication fence. The
-    // branch-ref rows above remain part of the public fixture, but do not
-    // make a tracked root visible to transaction opening on their own.
+    // Branch controls are the authoritative publication fence. The
+    // branch-ref ledger changes above remain part of the public fixture, but
+    // branch refs are synthesized from controls rather than duplicated in
+    // current-state rows.
     for (branch_id, _, _, change_id) in &branch_refs {
         stage_branch_head_control(
             &mut writes,
@@ -577,6 +562,9 @@ async fn seed_visible_schema_rows<StorageImpl>(
             BranchHeadControl {
                 head_commit_id: commit_id,
                 generation: commit_id,
+                tracked_head_is_current: true,
+                current_state_revision: 0,
+                working_diff_checkpoint_commit_id: None,
                 created_at: timestamp,
                 updated_at: timestamp,
                 ref_change_id: *change_id,
@@ -589,7 +577,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
     crate::catalog::stage_catalog_revision(&mut writes);
     crate::storage_bench::commit_write_set_for_bench(&storage, writes)
         .await
-        .expect("schema fixture flat current rows should commit");
+        .expect("schema fixture grouped current state should commit");
 }
 
 fn json_pointer_schema() -> JsonValue {

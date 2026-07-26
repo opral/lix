@@ -1630,7 +1630,7 @@ where
                 .begin_read(StorageReadOptions::default())
                 .await?,
         );
-        runtime_functions
+        let function_preconditions = runtime_functions
             .stage_persist_if_needed(&read, &mut writes)
             .await?;
         if writes.is_empty() {
@@ -1644,9 +1644,11 @@ where
         }
         let commit_boundary = self.transaction_commit_boundary();
         let _commit_guard = begin_commit_boundary(Some(&commit_boundary));
+        let mut write_options = StorageWriteOptions::default();
+        write_options.preconditions.extend(function_preconditions);
         let prepared_commit = self
             .storage
-            .prepare_write_set(writes, StorageWriteOptions::default())
+            .prepare_write_set(writes, write_options)
             .await?;
         let stats = commit_at_boundary(Some(&commit_boundary), || async move {
             let (_commit, stats) = prepared_commit.commit().await?;

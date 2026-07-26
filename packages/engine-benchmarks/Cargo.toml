@@ -44,7 +44,7 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 [[test]]
 name = "exact_file_read_benchmark"
 path = "tests/exact_file_read_benchmark.rs"
-required-features = ["rocksdb", "slatedb"]
+required-features = ["rocksdb"]
 
 [[test]]
 name = "tracked_state_crud_public_result"

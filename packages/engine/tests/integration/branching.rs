@@ -836,6 +836,81 @@ simulation_test!(
 );
 
 simulation_test!(
+    merge_branch_rejects_selected_tracked_identity_that_conflicts_with_local_untracked,
+    |sim| async move {
+        let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.execute(
+            "INSERT INTO lix_key_value (key, value) VALUES ('merge-untracked-target-change', 'target')",
+            &[],
+        )
+        .await
+        .expect("main write should force a merge commit instead of fast-forward");
+        main.execute(
+            "INSERT INTO lix_key_value (key, value, lixcol_untracked) \
+             VALUES ('merge-selected-untracked-conflict', 'target-untracked', true)",
+            &[],
+        )
+        .await
+        .expect("target untracked row should succeed");
+        draft
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('merge-selected-untracked-conflict', 'source-tracked')",
+                &[],
+            )
+            .await
+            .expect("source tracked row should succeed");
+
+        let target_head_before = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("main head should load")
+            .expect("main head should exist");
+        let error = main
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: "draft-branch".to_string(),
+            })
+            .await
+            .expect_err("merge must reject a selected tracked/untracked identity collision");
+
+        assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
+        assert!(
+            error.message.contains("untracked current row"),
+            "unexpected merge error: {error:?}"
+        );
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("kind"))
+                .and_then(JsonValue::as_str),
+            Some("trackedUntrackedIdentityCollision")
+        );
+        assert_eq!(
+            engine
+                .load_branch_head_commit_id(sim.main_branch_id())
+                .await
+                .expect("main head should load")
+                .as_deref(),
+            Some(target_head_before.as_str()),
+            "rejected merge must not publish a branch move"
+        );
+        assert_key_value(
+            &main,
+            "merge-selected-untracked-conflict",
+            Some("\"target-untracked\""),
+        )
+        .await;
+        assert_key_value(
+            &draft,
+            "merge-selected-untracked-conflict",
+            Some("\"source-tracked\""),
+        )
+        .await;
+    }
+);
+
+simulation_test!(
     merge_branch_does_not_import_source_checkpoint_marker,
     |sim| async move {
         let (_engine, main, draft) = create_draft_from_main(&sim).await;

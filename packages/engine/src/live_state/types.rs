@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
-use crate::live_state::index::MaterializedLiveStateIndexRow;
 use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::{NullableKeyFilter, Value};
 
@@ -26,27 +25,6 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: Arc<str>,
-}
-
-impl From<MaterializedLiveStateIndexRow> for MaterializedLiveStateRow {
-    fn from(row: MaterializedLiveStateIndexRow) -> Self {
-        let global = row.branch_id == crate::GLOBAL_BRANCH_ID;
-        Self {
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            deleted: false,
-            created_at: LixTimestamp::expect_parse("live-state index created_at", &row.created_at),
-            updated_at: LixTimestamp::expect_parse("live-state index updated_at", &row.updated_at),
-            global,
-            change_id: Some(row.change_id),
-            commit_id: None,
-            untracked: true,
-            branch_id: row.branch_id.into(),
-        }
-    }
 }
 
 impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {

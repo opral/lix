@@ -20,6 +20,8 @@ fn prepare_json_ref(value: &str) -> JsonRef {
 use crate::GLOBAL_BRANCH_ID;
 #[cfg(test)]
 use crate::branch::{BranchHeadControl, stage_branch_head_control};
+#[cfg(test)]
+use crate::live_state::{CurrentStateDeltaRef, TrackedHeadContext, WorkingDiffIndexCoverage};
 
 #[cfg(test)]
 pub(crate) const TEST_EMPTY_ROOT_COMMIT_ID: &str = "01920000-0000-7000-8000-000000000001";
@@ -80,18 +82,6 @@ pub(crate) async fn seed_branch_head_with_rows(
     .expect("tracked root should write");
 
     let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
-    stage_branch_head_control(
-        &mut writes,
-        branch_id,
-        BranchHeadControl {
-            head_commit_id: commit_id,
-            generation: commit_id,
-            created_at: test_timestamp(),
-            updated_at: test_timestamp(),
-            ref_change_id: branch_ref_change_id,
-        },
-    )
-    .expect("direct branch-head control should stage");
     let branch_ref_entity_pk = crate::entity_pk::EntityPk::single(branch_id);
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
@@ -119,70 +109,75 @@ pub(crate) async fn seed_branch_head_with_rows(
             .await
             .expect("branch ref change should stage");
     }
-    crate::live_state::LiveStateIndexContext::new()
+    let snapshots = rows
+        .iter()
+        .map(|row| {
+            row.snapshot_content.as_deref().map_or(
+                crate::json_store::JsonSlot::None,
+                crate::json_store::JsonSlot::from_json,
+            )
+        })
+        .collect::<Vec<_>>();
+    let metadata = rows
+        .iter()
+        .map(|row| {
+            row.metadata
+                .as_ref()
+                .map_or(crate::json_store::JsonSlot::None, |value| {
+                    let serialized = crate::serialize_row_metadata(value);
+                    crate::json_store::JsonSlot::from_json(&serialized)
+                })
+        })
+        .collect::<Vec<_>>();
+    let deltas = rows
+        .iter()
+        .zip(snapshots.iter())
+        .zip(metadata.iter())
+        .map(|((row, snapshot), metadata)| CurrentStateDeltaRef {
+            schema_key: &row.schema_key,
+            file_id: row.file_id.as_deref(),
+            entity_pk: &row.entity_pk,
+            change_id: Some(row.change_id),
+            commit_id: Some(row.commit_id),
+            untracked: false,
+            deleted: row.deleted,
+            created_at: crate::common::LixTimestamp::expect_parse("created_at", &row.created_at),
+            updated_at: crate::common::LixTimestamp::expect_parse("updated_at", &row.updated_at),
+            snapshot: snapshot.as_ref_slot(),
+            metadata: metadata.as_ref_slot(),
+        })
+        .collect::<Vec<_>>();
+    let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
+    let generation = TrackedHeadContext::new()
         .writer(&read, &mut writes)
-        .stage_branch_rows(
-            GLOBAL_BRANCH_ID,
-            [crate::live_state::LiveStateIndexDeltaRef {
-                schema_key: crate::branch::BRANCH_REF_SCHEMA_KEY,
-                file_id: None,
-                entity_pk: &branch_ref_entity_pk,
-                change_id: branch_ref_change_id,
-                commit_id: None,
-                deleted: false,
-                created_at: test_timestamp(),
-                updated_at: test_timestamp(),
-            }]
-            .into_iter()
-            .chain(
-                rows.iter()
-                    .filter(|_| branch_id == GLOBAL_BRANCH_ID)
-                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
-                        schema_key: &row.schema_key,
-                        file_id: row.file_id.as_deref(),
-                        entity_pk: &row.entity_pk,
-                        change_id: row.change_id,
-                        commit_id: Some(row.commit_id),
-                        deleted: row.deleted,
-                        created_at: crate::common::LixTimestamp::expect_parse(
-                            "created_at",
-                            &row.created_at,
-                        ),
-                        updated_at: crate::common::LixTimestamp::expect_parse(
-                            "updated_at",
-                            &row.updated_at,
-                        ),
-                    }),
-            ),
+        .stage_current_state_with_working_diff(
+            branch_id,
+            None,
+            commit_id,
+            &deltas,
+            &std::collections::BTreeSet::new(),
+            None,
+            None,
+            None,
+            &mut working_diff_coverage,
         )
         .await
-        .expect("branch ref current row should stage");
-    if !rows.is_empty() && branch_id != GLOBAL_BRANCH_ID {
-        crate::live_state::LiveStateIndexContext::new()
-            .writer(&read, &mut writes)
-            .stage_branch_rows(
-                branch_id,
-                rows.iter()
-                    .map(|row| crate::live_state::LiveStateIndexDeltaRef {
-                        schema_key: &row.schema_key,
-                        file_id: row.file_id.as_deref(),
-                        entity_pk: &row.entity_pk,
-                        change_id: row.change_id,
-                        commit_id: Some(row.commit_id),
-                        deleted: row.deleted,
-                        created_at: crate::common::LixTimestamp::expect_parse(
-                            "created_at",
-                            &row.created_at,
-                        ),
-                        updated_at: crate::common::LixTimestamp::expect_parse(
-                            "updated_at",
-                            &row.updated_at,
-                        ),
-                    }),
-            )
-            .await
-            .expect("branch current rows should stage");
-    }
+        .expect("current-state seed should stage");
+    stage_branch_head_control(
+        &mut writes,
+        branch_id,
+        BranchHeadControl {
+            head_commit_id: commit_id,
+            generation,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: test_timestamp(),
+            updated_at: test_timestamp(),
+            ref_change_id: branch_ref_change_id,
+        },
+    )
+    .expect("direct branch-head control should stage");
     storage
         .commit_write_set(
             writes,

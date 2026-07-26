@@ -8,7 +8,7 @@
 //!
 //! ```text
 //! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
-//!   setup repeated /tmp/lix-working-diff-repeated 10000 1000 10
+//!   setup /tmp/lix-working-diff-repeated repeated 10000 1000 10
 //! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
 //!   measure /tmp/lix-working-diff-repeated 11
 //! ```

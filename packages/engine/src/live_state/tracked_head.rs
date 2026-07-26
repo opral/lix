@@ -1,10 +1,13 @@
-//! Materialized serving state for one tracked branch head.
+//! Materialized current serving state for one branch head.
 //!
 //! Commit roots are sparse historical checkpoints. This table is the durable,
 //! generation-keyed serving state for one branch head, letting the normal
 //! live-state path range scan rows and hydrate JSON directly without replaying
-//! changelog history. A marker binds a generation to the branch ref's commit.
-//! Any mismatch is a direct-plane miss and callers take the historical fallback.
+//! changelog history. A member is either `tracked` (and has a commit-backed
+//! history record) or `untracked` (and exists only here). The branch control
+//! binds a generation to the branch ref's commit. Any mismatch is a
+//! direct-plane miss and callers take the historical fallback for the tracked
+//! portion; untracked members never participate in that fallback.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +19,8 @@ use bytes::Bytes;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
+#[cfg(test)]
+use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::LixTimestamp;
@@ -36,15 +41,16 @@ use crate::tracked_state::{
     TrackedStateKey, TrackedStateScanRequest,
 };
 
-// v6 makes the durable tracked head authoritative for normal current reads.
+// V12 makes the durable current-state generation authoritative for normal
+// current reads.
 // A physical record owns every file-backed member of one logical entity PK.
 // Public entity reads know `(branch, schema, entity_pk)` but intentionally do
 // not invent a `file_id`; keeping those members together lets that common
 // lookup be a RocksDB point get rather than a prefix scan. Repositories use a
-// protocol gate, so predecessor bytes are never interpreted as v6 groups.
-pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.tracked_head_group.v6";
-pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.tracked_head_member.v6";
-pub(crate) const TRACKED_HEAD_MARKER_NAMESPACE: &str = "live_state.tracked_head_marker.v6";
+// protocol gate, so predecessor bytes are never interpreted as current-state
+// groups.
+pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.current_group.v12";
+pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.current_file_member.v12";
 pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0012), TRACKED_HEAD_GROUP_NAMESPACE);
 /// File-id projection for explicit file-backed identities.
@@ -57,16 +63,13 @@ pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
 /// unrelated entity groups.
 pub(crate) const TRACKED_HEAD_MEMBER_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0013), TRACKED_HEAD_MEMBER_NAMESPACE);
-pub(crate) const TRACKED_HEAD_MARKER_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0014), TRACKED_HEAD_MARKER_NAMESPACE);
-
-/// Sparse enumeration index for the first-before summaries co-located in v6
-/// head groups. It contains no row payload: the authoritative current row
+/// Sparse enumeration index for the first-before summaries co-located in
+/// current-state groups. It contains no row payload: the authoritative row
 /// and its immutable baseline remain one physical group record.
 pub(crate) const TRACKED_WORKING_DIFF_GROUP_NAMESPACE: &str =
-    "live_state.tracked_working_diff_group.v2";
+    "live_state.current_working_diff_group.v12";
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str =
-    "live_state.tracked_working_diff_marker.v2";
+    "live_state.current_working_diff_marker.v12";
 pub(crate) const TRACKED_WORKING_DIFF_GROUP_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0016),
     TRACKED_WORKING_DIFF_GROUP_NAMESPACE,
@@ -76,38 +79,12 @@ pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace:
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
 );
 
-/// Immutable manifest for the currently readable generation of a branch.
-///
-/// A new generation is used after a branch ref moves away from the parent of
-/// a normal commit. Old rows can remain in storage: they are unreachable
-/// without this marker and therefore cannot affect serving reads.
-#[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
-#[musli(packed)]
-struct TrackedHeadMarker {
-    head_commit_id: CommitId,
-    generation: CommitId,
-    /// Checkpoint whose first-before baselines live in this generation.
-    /// `None` means the head is still a correct serving projection but cannot
-    /// answer a checkpoint-relative direct diff.
-    #[musli(with = storage_codec::option)]
-    working_diff_checkpoint_commit_id: Option<CommitId>,
-}
-
-/// The current serving generation plus the checkpoint epoch to which its
-/// first-before summaries are bound. This is a read-side observation only;
-/// the private marker remains the durable wire record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct TrackedHeadMarkerInfo {
-    pub(crate) generation: CommitId,
-    pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
-}
-
 /// The active checkpoint epoch for the sparse working-diff indexes.
 ///
 /// `None` is the freshly published checkpoint state: it is known empty until
-/// the first ordinary child bootstraps a complete v6 serving generation.
+/// the first ordinary child bootstraps a complete current-state generation.
 /// Once initialized, the generation is immutable for serial normal commits;
-/// the tracked-head marker and branch control publish the moving head.
+/// the branch control publishes the moving head.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedWorkingDiffEpoch {
@@ -153,7 +130,8 @@ impl WorkingDiffIndexCoverage {
     }
 }
 
-/// A checkpoint-relative direct diff assembled from the current v6 head.
+/// A checkpoint-relative direct diff assembled from the current-state
+/// generation.
 /// This is internal plumbing for SQL working-change and checkpoint compaction;
 /// the public API remains the existing tracked-state diff representation.
 pub(crate) struct TrackedWorkingDiff {
@@ -215,7 +193,8 @@ struct HeadIdentity {
     file_id: Option<String>,
 }
 
-/// The physical v6 key for all current members of one logical entity PK.
+/// The physical current-state key for all current members of one logical
+/// entity PK.
 ///
 /// `file_id` is deliberately not a key part. It remains part of the packed
 /// group value so a tombstone or a file-backed variant affects only its own
@@ -259,15 +238,16 @@ impl HeadIdentity {
     }
 }
 
-/// Write-side representation of a v3 head row.
+/// Write-side representation of a v4 current-state row.
 ///
 /// This exists only while a transaction is being staged. Read-side code uses
 /// [`HeadValueView`], which parses the fixed header directly from RocksDB's
 /// returned bytes and never builds this allocation-heavy representation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadValue {
-    change_id: ChangeId,
-    commit_id: CommitId,
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -280,6 +260,7 @@ impl HeadValue {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
+            untracked: self.untracked,
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -291,8 +272,9 @@ impl HeadValue {
 
 #[derive(Debug, Clone, Copy)]
 struct HeadValueRef<'a> {
-    change_id: ChangeId,
-    commit_id: CommitId,
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -312,7 +294,12 @@ struct BranchRefKey {
     branch_id: String,
 }
 
-/// Zero-copy normal tracked mutation staged into a head generation.
+/// Zero-copy tracked mutation staged into a current-state generation.
+///
+/// This narrow convenience type keeps historical writers explicit. Normal
+/// serving publication converts it to [`CurrentStateDeltaRef`], which is also
+/// able to carry history-free untracked mutations.
+#[cfg(any(test, feature = "storage-benches"))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) schema_key: &'a str,
@@ -327,11 +314,52 @@ pub(crate) struct TrackedHeadDeltaRef<'a> {
     pub(crate) metadata: JsonSlotRef<'a>,
 }
 
+#[cfg(any(test, feature = "storage-benches"))]
 impl<'a> TrackedHeadDeltaRef<'a> {
+    fn as_current(&self) -> CurrentStateDeltaRef<'a> {
+        CurrentStateDeltaRef {
+            schema_key: self.schema_key,
+            file_id: self.file_id,
+            entity_pk: self.entity_pk,
+            change_id: Some(self.change_id),
+            commit_id: Some(self.commit_id),
+            untracked: false,
+            deleted: self.deleted,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            snapshot: self.snapshot,
+            metadata: self.metadata,
+        }
+    }
+}
+
+/// One mutation of the authoritative current serving state.
+///
+/// `tracked` mutations have both IDs and may create tombstones. `untracked`
+/// mutations have neither ID; deletion removes the member physically. This
+/// is deliberately the single write representation for the hot state plane,
+/// so callers never stage a separate untracked overlay.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CurrentStateDeltaRef<'a> {
+    pub(crate) schema_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) entity_pk: &'a EntityPk,
+    pub(crate) change_id: Option<ChangeId>,
+    pub(crate) commit_id: Option<CommitId>,
+    pub(crate) untracked: bool,
+    pub(crate) deleted: bool,
+    pub(crate) created_at: LixTimestamp,
+    pub(crate) updated_at: LixTimestamp,
+    pub(crate) snapshot: JsonSlotRef<'a>,
+    pub(crate) metadata: JsonSlotRef<'a>,
+}
+
+impl<'a> CurrentStateDeltaRef<'a> {
     fn value_ref(&self, created_at: LixTimestamp) -> HeadValueRef<'a> {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
+            untracked: self.untracked,
             deleted: self.deleted,
             created_at,
             updated_at: self.updated_at,
@@ -346,6 +374,22 @@ impl<'a> TrackedHeadDeltaRef<'a> {
                 self.metadata
             },
         }
+    }
+
+    fn validate(self) -> Result<(), LixError> {
+        match (self.untracked, self.change_id, self.commit_id, self.deleted) {
+            (false, Some(_), Some(_), _) | (true, None, None, false | true) => Ok(()),
+            (false, _, _, _) => Err(head_value_error(
+                "tracked current-state mutation must carry change_id and commit_id",
+            )),
+            (true, _, _, _) => Err(head_value_error(
+                "untracked current-state mutation must not carry change_id or commit_id",
+            )),
+        }
+    }
+
+    fn physically_deletes(self) -> bool {
+        self.untracked && self.deleted
     }
 }
 
@@ -377,6 +421,61 @@ impl TrackedHeadContext {
     {
         TrackedHeadWriter { store, writes }
     }
+
+    /// Reclaims derived current-state generations that no durable branch
+    /// control can select and returns their history-free payload refs. Both
+    /// the authoritative groups and their explicit file-id projections are
+    /// generation-scoped, so the control is the one ownership root for both
+    /// spaces. The caller compares the returned refs with its complete live
+    /// payload set before staging physical JSON deletion.
+    ///
+    /// A non-current control still owns its generation. Its tracked portion
+    /// may use historical replay, but that same generation preserves the
+    /// branch's history-free untracked members until a fresh complete serving
+    /// generation is published.
+    #[expect(clippy::unused_self)]
+    pub(crate) async fn stage_collect_stale_current_state_generations<S>(
+        &self,
+        store: &S,
+        writes: &mut StorageWriteSet,
+        controls: &[(String, BranchHeadControl)],
+    ) -> Result<Vec<JsonRef>, LixError>
+    where
+        S: StorageAdapterRead + ?Sized,
+    {
+        let active = active_current_state_generations(controls);
+        let mut stale_untracked_refs = BTreeSet::new();
+        stage_collect_stale_current_state_group_space(
+            store,
+            writes,
+            &active,
+            &mut stale_untracked_refs,
+        )
+        .await?;
+        stage_collect_stale_current_state_member_space(
+            store,
+            writes,
+            &active,
+            &mut stale_untracked_refs,
+        )
+        .await?;
+        Ok(stale_untracked_refs
+            .into_iter()
+            .map(JsonRef::from_hash_bytes)
+            .collect())
+    }
+}
+
+/// Converts the branch-control plane into the exact derived generations that
+/// are still reachable. A branch generation is meaningful only together with
+/// its branch id; a generation UUID alone is not a repository-global root.
+fn active_current_state_generations(
+    controls: &[(String, BranchHeadControl)],
+) -> BTreeSet<(String, CommitId)> {
+    controls
+        .iter()
+        .map(|(branch_id, control)| (branch_id.clone(), control.generation))
+        .collect()
 }
 
 /// Direct materializer for the current tracked branch generation.
@@ -388,24 +487,101 @@ impl<S> TrackedHeadStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    /// v6 control-plane variant of [`Self::scan_live_rows_if_current`].
+    /// Serves a projection published by the supplied atomic branch control.
     ///
-    /// The direct branch control and the v6 marker are published in one
-    /// storage commit. Requiring both the head and generation to agree makes
-    /// a partially rebuilt or stale group projection a clean historical
-    /// fallback rather than visible current state.
+    /// V12 publishes the group generation and its currentness bit in the
+    /// branch control itself. A control whose projection is not complete is a
+    /// clean historical fallback; a current control can read its generation
+    /// without a second marker lookup.
     pub(crate) async fn scan_live_rows_if_control_current(
         &self,
         branch_id: &str,
         control: BranchHeadControl,
         request: &TrackedStateScanRequest,
     ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        self.scan_live_rows_for_marker(
-            branch_id,
-            self.marker_if_control_current(branch_id, control).await?,
-            request,
-        )
-        .await
+        if !control.tracked_head_is_current {
+            return Ok(None);
+        }
+        self.scan_live_rows_for_generation(branch_id, control.generation, request)
+            .await
+    }
+
+    /// Batch-loads complete logical-PK groups from already-observed current
+    /// branch controls. A normal entity mutation knows a finite set of public
+    /// primary keys but not necessarily a file id, so the packed group is the
+    /// only correct point-read unit: all file-backed members must remain
+    /// candidates for UPDATE/DELETE.
+    ///
+    /// `None` is a conservative route miss. Callers retain the established
+    /// branch-by-branch reader for incomplete controls, broad scans, and
+    /// explicit file-id predicates.
+    pub(crate) async fn scan_live_rows_for_current_controls(
+        &self,
+        controls: &[(String, BranchHeadControl)],
+        request: &TrackedStateScanRequest,
+    ) -> Result<Option<Vec<(String, Vec<MaterializedLiveStateRow>)>>, LixError> {
+        if controls.is_empty()
+            || controls
+                .iter()
+                .any(|(_, control)| !control.tracked_head_is_current)
+            || request.filter.schema_keys.is_empty()
+            || request.filter.entity_pks.is_empty()
+            || !request.filter.file_ids.is_empty()
+            // This internal batch feeds the outer visibility resolver. It
+            // must retain all tombstones and defer limiting until branch and
+            // global overlays have been arbitrated.
+            || !request.filter.include_tombstones
+            || request.limit.is_some()
+        {
+            return Ok(None);
+        }
+
+        let groups =
+            controls
+                .iter()
+                .flat_map(|(branch_id, control)| {
+                    request
+                        .filter
+                        .schema_keys
+                        .iter()
+                        .flat_map(move |schema_key| {
+                            request.filter.entity_pks.iter().map(move |entity_pk| {
+                                HeadGroupIdentity {
+                                    branch_id: branch_id.clone(),
+                                    generation: control.generation,
+                                    schema_key: schema_key.clone(),
+                                    entity_pk: entity_pk.clone(),
+                                }
+                            })
+                        })
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+        let values = load_group_bytes(&self.store, &groups).await?;
+        let mut entries_by_branch = BTreeMap::<String, Vec<(HeadRowIdentity, Bytes)>>::new();
+        for (group, value) in groups.into_iter().zip(values) {
+            let Some(value) = value else {
+                continue;
+            };
+            let entries = entries_by_branch
+                .entry(group.branch_id.clone())
+                .or_default();
+            // `groups` was built directly from the requested schema and
+            // entity-PK sets, and this path rejects file-id predicates above.
+            // Rechecking those sets for every member would turn a 10k-PK
+            // multi-get into a quadratic membership scan.
+            extend_group_entries(entries, group, value, |_| true, None)?;
+        }
+
+        let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
+        let mut rows_by_branch = Vec::with_capacity(entries_by_branch.len());
+        for (branch_id, entries) in entries_by_branch {
+            let rows =
+                materialize_live_entries(&self.store, entries, projection, &branch_id).await?;
+            rows_by_branch.push((branch_id, rows));
+        }
+        Ok(Some(rows_by_branch))
     }
 
     /// Returns whether the serving generation has any rows for one entity
@@ -417,30 +593,35 @@ where
         control: BranchHeadControl,
         schema_key: &str,
     ) -> Result<Option<bool>, LixError> {
-        self.has_schema_rows_for_marker(
-            branch_id,
-            self.marker_if_control_current(branch_id, control).await?,
-            schema_key,
-        )
-        .await
+        if !control.tracked_head_is_current {
+            return Ok(None);
+        }
+        self.has_schema_rows_for_generation(branch_id, control.generation, schema_key)
+            .await
     }
 
     /// Streams one local entity schema directly from packed tracked-head
-    /// members into snapshot bytes. It intentionally omits all logical row
-    /// identities: broad SQL entity projection only consumes snapshots, and
-    /// avoiding entity-PK/schema/file-id materialization is the hot-path win.
-    /// Callers must prove no untracked or global overlay can contribute.
+    /// members into snapshot bytes. A caller may either scan the whole schema
+    /// or provide exact entity PKs. This intentionally omits all logical row
+    /// identities: entity projection only consumes snapshots, and avoiding
+    /// entity-PK/schema/file-id materialization is the hot-path win. Callers
+    /// must prove no untracked or global overlay can contribute.
     pub(crate) async fn scan_entity_snapshots_if_control_current(
         &self,
         branch_id: &str,
         control: BranchHeadControl,
         schema_key: &str,
+        entity_pks: &[EntityPk],
         limit: Option<usize>,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        self.scan_entity_snapshots_for_marker(
+        if !control.tracked_head_is_current {
+            return Ok(None);
+        }
+        self.scan_entity_snapshots_for_generation(
             branch_id,
-            self.marker_if_control_current(branch_id, control).await?,
+            control.generation,
             schema_key,
+            entity_pks,
             limit,
         )
         .await
@@ -455,31 +636,21 @@ where
         expected_head: &str,
         request: &TrackedStateScanRequest,
     ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        self.scan_live_rows_for_marker(
-            branch_id,
-            self.marker_if_current(branch_id, expected_head).await?,
-            request,
-        )
-        .await
-    }
-
-    async fn scan_live_rows_for_marker(
-        &self,
-        branch_id: &str,
-        marker: Option<TrackedHeadMarker>,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        let Some(marker) = marker else {
+        let Some(control) = self.control_if_current(branch_id, expected_head).await? else {
             return Ok(None);
         };
-        let entries = scan_entries(
-            &self.store,
-            branch_id,
-            marker.generation,
-            &request.filter,
-            None,
-        )
-        .await?;
+        self.scan_live_rows_for_generation(branch_id, control.generation, request)
+            .await
+    }
+
+    async fn scan_live_rows_for_generation(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        let entries =
+            scan_entries(&self.store, branch_id, generation, &request.filter, None).await?;
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let mut rows =
             materialize_live_entries(&self.store, entries, projection, branch_id).await?;
@@ -492,23 +663,54 @@ where
         Ok(Some(rows))
     }
 
-    async fn has_schema_rows_for_marker(
+    /// Reads only the history-free members from a physical generation without
+    /// consulting `tracked_head_is_current`. A branch ref may temporarily use
+    /// historical replay for its tracked portion after a lifecycle move, but
+    /// its untracked members remain live workspace state and must survive that
+    /// move. Normal current controls never take this route.
+    pub(crate) async fn scan_untracked_rows_for_generation(
         &self,
         branch_id: &str,
-        marker: Option<TrackedHeadMarker>,
+        generation: CommitId,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let mut rows = self
+            .scan_live_rows_for_generation(branch_id, generation, request)
+            .await?
+            .unwrap_or_default();
+        rows.retain(|row| row.untracked);
+        Ok(rows)
+    }
+
+    /// Exact counterpart to [`Self::scan_untracked_rows_for_generation`].
+    /// This is used only while a branch's tracked generation is being rebuilt;
+    /// current controls use the one-plane batch reader above.
+    pub(crate) async fn load_untracked_projected_rows_for_generation(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        keys: &[TrackedStateKey],
+        projection: &ChangeRecordProjection,
+    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        Ok(self
+            .load_projected_live_rows_for_generation(branch_id, generation, keys, projection)
+            .await?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.filter(|row| row.untracked))
+            .collect())
+    }
+
+    async fn has_schema_rows_for_generation(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
         schema_key: &str,
     ) -> Result<Option<bool>, LixError> {
-        let Some(marker) = marker else {
-            return Ok(None);
-        };
         let entries = ScanPlan::prefix(
             TRACKED_HEAD_GROUP_SPACE,
             StoragePrefix {
-                bytes: Bytes::from(schema_group_prefix(
-                    branch_id,
-                    marker.generation,
-                    schema_key,
-                )),
+                bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
             },
         )
         .collect(
@@ -523,19 +725,24 @@ where
         Ok(Some(!entries.value.entries.is_empty()))
     }
 
-    async fn scan_entity_snapshots_for_marker(
+    async fn scan_entity_snapshots_for_generation(
         &self,
         branch_id: &str,
-        marker: Option<TrackedHeadMarker>,
+        generation: CommitId,
         schema_key: &str,
+        entity_pks: &[EntityPk],
         limit: Option<usize>,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        let Some(marker) = marker else {
-            return Ok(None);
-        };
         Ok(Some(
-            scan_entity_snapshots(&self.store, branch_id, marker.generation, schema_key, limit)
-                .await?,
+            scan_entity_snapshots(
+                &self.store,
+                branch_id,
+                generation,
+                schema_key,
+                entity_pks,
+                limit,
+            )
+            .await?,
         ))
     }
 
@@ -549,35 +756,35 @@ where
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
     ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
-        self.load_projected_live_rows_for_marker(
+        let Some(control) = self.control_if_current(branch_id, expected_head).await? else {
+            return Ok(None);
+        };
+        self.load_projected_live_rows_for_generation(
             branch_id,
-            self.marker_if_current(branch_id, expected_head).await?,
+            control.generation,
             keys,
             projection,
         )
         .await
     }
 
-    async fn load_projected_live_rows_for_marker(
+    async fn load_projected_live_rows_for_generation(
         &self,
         branch_id: &str,
-        marker: Option<TrackedHeadMarker>,
+        generation: CommitId,
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
     ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
         if keys.is_empty() {
             return Ok(Some(Vec::new()));
         }
-        let Some(marker) = marker else {
-            return Ok(None);
-        };
 
         let mut output_indices = BTreeMap::<HeadIdentity, Vec<usize>>::new();
         for (index, key) in keys.iter().enumerate() {
             output_indices
                 .entry(HeadIdentity {
                     branch_id: branch_id.to_string(),
-                    generation: marker.generation,
+                    generation,
                     schema_key: key.schema_key.clone(),
                     entity_pk: key.entity_pk.clone(),
                     file_id: key.file_id.clone(),
@@ -647,7 +854,7 @@ where
         Ok(Some(output))
     }
 
-    /// v6 control-plane variant of
+    /// Current-state control-plane variant of
     /// [`Self::load_projected_live_rows_if_current`].
     pub(crate) async fn load_projected_live_rows_if_control_current(
         &self,
@@ -656,48 +863,20 @@ where
         keys: &[TrackedStateKey],
         projection: &ChangeRecordProjection,
     ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
-        self.load_projected_live_rows_for_marker(
+        if !control.tracked_head_is_current {
+            return Ok(None);
+        }
+        self.load_projected_live_rows_for_generation(
             branch_id,
-            self.marker_if_control_current(branch_id, control).await?,
+            control.generation,
             keys,
             projection,
         )
         .await
     }
 
-    /// Returns the durable serving generation exactly when the marker is
-    /// bound to `expected_head`. Commit staging passes this value directly to
-    /// the writer so a serial child needs one marker point read, not two.
-    #[cfg(test)]
-    pub(crate) async fn generation_if_current(
-        &self,
-        branch_id: &str,
-        expected_head: &str,
-    ) -> Result<Option<CommitId>, LixError> {
-        Ok(self
-            .marker_if_current(branch_id, expected_head)
-            .await?
-            .map(|marker| marker.generation))
-    }
-
-    /// Returns the durable serving generation and working-diff epoch binding
-    /// only when both are atomically bound to the observed branch control.
-    pub(crate) async fn marker_info_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-    ) -> Result<Option<TrackedHeadMarkerInfo>, LixError> {
-        Ok(self
-            .marker_if_control_current(branch_id, control)
-            .await?
-            .map(|marker| TrackedHeadMarkerInfo {
-                generation: marker.generation,
-                working_diff_checkpoint_commit_id: marker.working_diff_checkpoint_commit_id,
-            }))
-    }
-
     /// Loads the checkpoint epoch marker without treating it as visibility.
-    /// Commit staging combines it with a coherent v6 branch-control
+    /// Commit staging combines it with a coherent current-state branch-control
     /// observation before deciding whether it can preserve first-before
     /// summaries.
     pub(crate) async fn working_diff_epoch(
@@ -707,8 +886,56 @@ where
         load_tracked_working_diff_epoch(&self.store, branch_id).await
     }
 
+    /// Returns every out-of-band JSON payload owned by an active untracked
+    /// current-state generation. Tracked payloads are rooted through
+    /// changelog reachability; untracked members deliberately have no
+    /// changelog fact, so repository GC asks this one authoritative plane
+    /// directly.
+    ///
+    /// A generation without a matching branch control is derived, stale
+    /// serving state. It must neither keep an untracked payload live nor be
+    /// scanned as part of normal repository GC. Controls that are temporarily
+    /// non-current still retain their generation here: that generation is the
+    /// branch's workspace state while its tracked portion falls back to
+    /// historical replay.
+    pub(crate) async fn untracked_json_refs(
+        &self,
+        controls: &[(String, BranchHeadControl)],
+    ) -> Result<Vec<JsonRef>, LixError> {
+        let mut refs = BTreeSet::<[u8; JSON_REF_BYTES]>::new();
+        for (branch_id, generation) in active_current_state_generations(controls) {
+            let plan = ScanPlan::prefix(
+                TRACKED_HEAD_GROUP_SPACE,
+                StoragePrefix {
+                    bytes: Bytes::from(encode_scope_prefix(&branch_id, generation)),
+                },
+            );
+            let mut resume_after = None;
+            loop {
+                let page = plan
+                    .collect(
+                        &self.store,
+                        StorageScanOptions {
+                            resume_after: resume_after.clone(),
+                            ..StorageScanOptions::default()
+                        },
+                    )
+                    .await?;
+                resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+                for entry in page.value.entries {
+                    let value = full_value_bytes(entry.value)?;
+                    collect_untracked_json_refs_from_group(value.as_ref(), &mut refs)?;
+                }
+                if !page.value.has_more || resume_after.is_none() {
+                    break;
+                }
+            }
+        }
+        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
+    }
+
     /// Returns an O(ever-dirty groups since checkpoint) tracked diff only when the sparse
-    /// working-diff epoch and the current v6 serving generation agree. Any
+    /// working-diff epoch and the current serving generation agree. Any
     /// missing, stale, or malformed auxiliary record returns `None`, leaving
     /// the canonical historical replay path authoritative.
     pub(crate) async fn working_diff_if_control_current(
@@ -717,27 +944,25 @@ where
         control: BranchHeadControl,
         request: &TrackedStateDiffRequest,
     ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        // The marker is an accelerator, not a source of visibility. A
-        // malformed or unavailable auxiliary marker selects canonical replay
+        // The epoch is an accelerator, not a source of visibility. A
+        // malformed or unavailable auxiliary record selects canonical replay
         // instead of making a valid SQL query fail.
+        if !control.tracked_head_is_current {
+            return Ok(None);
+        }
         let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
             return Ok(None);
         };
         let Some(generation) = epoch.generation else {
-            return Ok(
-                (epoch.checkpoint_commit_id == control.head_commit_id).then_some(
-                    TrackedWorkingDiff {
-                        checkpoint_commit_id: epoch.checkpoint_commit_id,
-                        diff: TrackedStateDiff::default(),
-                    },
-                ),
-            );
-        };
-        let Ok(Some(marker)) = self.marker_if_control_current(branch_id, control).await else {
-            return Ok(None);
+            return Ok((epoch.checkpoint_commit_id == control.head_commit_id
+                && control.working_diff_checkpoint_commit_id == Some(epoch.checkpoint_commit_id))
+            .then_some(TrackedWorkingDiff {
+                checkpoint_commit_id: epoch.checkpoint_commit_id,
+                diff: TrackedStateDiff::default(),
+            }));
         };
         if generation != control.generation
-            || marker.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
+            || control.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
         {
             return Ok(None);
         }
@@ -760,25 +985,18 @@ where
     }
 
     #[cfg(test)]
-    async fn marker_if_current(
+    async fn control_if_current(
         &self,
         branch_id: &str,
         expected_head: &str,
-    ) -> Result<Option<TrackedHeadMarker>, LixError> {
+    ) -> Result<Option<BranchHeadControl>, LixError> {
         let expected_head = CommitId::parse_lix(expected_head, "tracked-head expected commit")?;
-        let marker = load_marker(&self.store, branch_id).await?;
-        Ok(marker.filter(|marker| marker.head_commit_id == expected_head))
-    }
-
-    async fn marker_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-    ) -> Result<Option<TrackedHeadMarker>, LixError> {
-        let marker = load_marker(&self.store, branch_id).await?;
-        Ok(marker.filter(|marker| {
-            marker.head_commit_id == control.head_commit_id
-                && marker.generation == control.generation
+        let control = BranchHeadControlContext::new()
+            .reader(&self.store)
+            .load(branch_id)
+            .await?;
+        Ok(control.filter(|control| {
+            control.tracked_head_is_current && control.head_commit_id == expected_head
         }))
     }
 }
@@ -794,9 +1012,7 @@ where
     S: StorageAdapterRead + ?Sized,
 {
     /// Incrementally updates a matching parent generation, or creates a fresh
-    /// generation from a caller-provided parent snapshot. The latter is used
-    /// after branch movement and for old repositories which predate this
-    /// serving table.
+    /// generation from a caller-provided parent snapshot after branch movement.
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_commit(
         &mut self,
@@ -808,22 +1024,26 @@ where
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
     ) -> Result<CommitId, LixError> {
         let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
-        self.stage_commit_with_working_diff(
-            branch_id,
-            parent_generation,
-            new_head,
-            deltas,
-            absence_guards,
-            parent_rows,
-            None,
-            None,
-            &mut working_diff_coverage,
-        )
-        .await
+        let generation = self
+            .stage_commit_with_working_diff(
+                branch_id,
+                parent_generation,
+                new_head,
+                deltas,
+                absence_guards,
+                parent_rows,
+                None,
+                &mut working_diff_coverage,
+            )
+            .await?;
+        #[cfg(test)]
+        stage_test_current_control(self.writes, branch_id, new_head, generation, None)?;
+        Ok(generation)
     }
 
     /// Internal variant used only when an active checkpoint epoch makes the
-    /// v6 group baseline authoritative for `lix_working_change`.
+    /// packed-group baseline authoritative for `lix_working_change`.
+    #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn stage_commit_with_working_diff(
         &mut self,
         branch_id: &str,
@@ -832,32 +1052,56 @@ where
         deltas: &[TrackedHeadDeltaRef<'_>],
         absence_guards: &BTreeSet<TrackedStateKey>,
         parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        working_diff_marker_checkpoint_commit_id: Option<CommitId>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        working_diff_coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        let deltas = deltas
+            .iter()
+            .map(TrackedHeadDeltaRef::as_current)
+            .collect::<Vec<_>>();
+        self.stage_current_state_with_working_diff(
+            branch_id,
+            parent_generation,
+            new_head,
+            &deltas,
+            absence_guards,
+            parent_rows,
+            None,
+            working_diff_capture_checkpoint_commit_id,
+            working_diff_coverage,
+        )
+        .await
+    }
+
+    /// Updates the single authoritative current-state plane. Tracked and
+    /// untracked rows share the same packed groups; only tracked members
+    /// contribute to a commit or to the working-diff accelerator.
+    pub(crate) async fn stage_current_state_with_working_diff(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         working_diff_coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
         let matches_parent = parent_generation.is_some();
         let generation = parent_generation.unwrap_or(new_head);
-        let marker = TrackedHeadMarker {
-            head_commit_id: new_head,
-            generation,
-            working_diff_checkpoint_commit_id: working_diff_marker_checkpoint_commit_id,
-        };
-        // Preflight the only fallible publication bytes before staging an
-        // incremental generation in the caller's write set. A failed writer
-        // must not leave any same-generation group mutation behind.
-        let marker_key = marker_key(branch_id)?;
-        let marker_value = storage_codec::encode("tracked-head marker", &marker)?;
-
         // Sorting borrowed deltas establishes both the exact-mutation
         // uniqueness check and the group order needed for a streaming merge.
         // The normal matching-generation path must never reconstruct every
-        // v6 member in an owned BTreeMap just to change one member.
+        // current-state member in an owned BTreeMap just to change one member.
         let mut sorted_deltas = deltas.iter().collect::<Vec<_>>();
+        for delta in &sorted_deltas {
+            delta.validate()?;
+        }
         sorted_deltas.sort_unstable_by(|left, right| compare_head_deltas(left, right));
         for pair in sorted_deltas.windows(2) {
             if compare_head_deltas(pair[0], pair[1]) == Ordering::Equal {
-                return Err(tracked_head_duplicate_delta_error(pair[1]));
+                return Err(current_state_duplicate_delta_error(pair[1]));
             }
         }
 
@@ -876,6 +1120,12 @@ where
                     .count(),
                 0,
             );
+            // A normal tracked mutation never inserts into this set. The
+            // incremental parser already visits the previous member for a
+            // matching identity, so collecting retired untracked refs here
+            // adds neither a storage read nor an allocation to the tracked
+            // hot path.
+            let mut retired_untracked_json_refs = BTreeSet::new();
             let mut next_groups = Vec::new();
             next_groups
                 .try_reserve(groups.len())
@@ -886,13 +1136,20 @@ where
                     &sorted_deltas[group.deltas.clone()],
                     absence_guards,
                     working_diff_capture_checkpoint_commit_id,
+                    &mut retired_untracked_json_refs,
                 )?);
             }
             for (group, next) in groups.iter().zip(next_groups) {
                 let became_dirty_group = next.became_dirty_group;
-                stage_put_group_bytes(self.writes, &group.identity, next.bytes);
+                match next.bytes {
+                    Some(bytes) => stage_put_group_bytes(self.writes, &group.identity, bytes),
+                    None => stage_delete_group(self.writes, &group.identity),
+                }
                 for (file_id, value) in next.explicit_member_projections {
                     stage_put_file_member_bytes(self.writes, &group.identity, file_id, &value);
+                }
+                for file_id in next.deleted_member_projections {
+                    stage_delete_file_member(self.writes, &group.identity, file_id);
                 }
                 if became_dirty_group {
                     stage_put_working_diff_group_index(
@@ -905,6 +1162,14 @@ where
                     )?;
                 }
             }
+            JsonStoreContext::new()
+                .writer()
+                .stage_untracked_reclaim_candidates(
+                    self.writes,
+                    retired_untracked_json_refs
+                        .into_iter()
+                        .map(JsonRef::from_hash_bytes),
+                );
         } else {
             stage_bootstrap_groups(
                 self.writes,
@@ -913,16 +1178,17 @@ where
                 &sorted_deltas,
                 absence_guards,
                 parent_rows.unwrap_or_default(),
+                preserved_untracked_rows.unwrap_or_default(),
                 working_diff_capture_checkpoint_commit_id,
                 working_diff_coverage,
             )?;
         }
-        stage_marker_encoded(self.writes, marker_key, marker_value);
         Ok(generation)
     }
 }
 
-/// One contiguous range of sorted mutations for a physical v6 group.
+/// One contiguous range of sorted mutations for a physical current-state
+/// group.
 ///
 /// The range borrows the transaction's deltas, while the group identity is
 /// owned once. This is intentionally not a map of decoded members: matching
@@ -939,14 +1205,15 @@ struct HeadGroupMutation {
 /// `stage_commit` all-or-nothing for the existing serving generation without
 /// rebuilding decoded member maps.
 struct EncodedHeadGroup<'a> {
-    bytes: Vec<u8>,
+    bytes: Option<Vec<u8>>,
     explicit_member_projections: Vec<(&'a str, Vec<u8>)>,
+    deleted_member_projections: Vec<&'a str>,
     became_dirty_group: bool,
 }
 
 fn compare_head_deltas(
-    left: &TrackedHeadDeltaRef<'_>,
-    right: &TrackedHeadDeltaRef<'_>,
+    left: &CurrentStateDeltaRef<'_>,
+    right: &CurrentStateDeltaRef<'_>,
 ) -> Ordering {
     left.schema_key
         .cmp(right.schema_key)
@@ -954,15 +1221,15 @@ fn compare_head_deltas(
         .then_with(|| left.file_id.cmp(&right.file_id))
 }
 
-fn same_head_group(left: &TrackedHeadDeltaRef<'_>, right: &TrackedHeadDeltaRef<'_>) -> bool {
+fn same_head_group(left: &CurrentStateDeltaRef<'_>, right: &CurrentStateDeltaRef<'_>) -> bool {
     left.schema_key == right.schema_key && left.entity_pk == right.entity_pk
 }
 
-fn tracked_head_duplicate_delta_error(delta: &TrackedHeadDeltaRef<'_>) -> LixError {
+fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!(
-            "tracked-head commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
+            "current-state commit contains duplicate mutation for schema '{}' entity_pk '{:?}' file_id '{:?}'",
             delta.schema_key, delta.entity_pk, delta.file_id
         ),
     )
@@ -971,7 +1238,7 @@ fn tracked_head_duplicate_delta_error(delta: &TrackedHeadDeltaRef<'_>) -> LixErr
 fn group_sorted_head_deltas(
     branch_id: &str,
     generation: CommitId,
-    deltas: &[&TrackedHeadDeltaRef<'_>],
+    deltas: &[&CurrentStateDeltaRef<'_>],
 ) -> Vec<HeadGroupMutation> {
     let mut groups = Vec::new();
     let mut start = 0;
@@ -995,7 +1262,7 @@ fn group_sorted_head_deltas(
     groups
 }
 
-/// Builds a fresh v6 generation after a branch movement.
+/// Builds a fresh current-state generation after a branch movement.
 ///
 /// This path necessarily starts from materialized parent rows, so it retains
 /// the simple owned-map implementation. Ordinary commits keep their parent
@@ -1004,9 +1271,10 @@ fn stage_bootstrap_groups(
     writes: &mut StorageWriteSet,
     branch_id: &str,
     generation: CommitId,
-    deltas: &[&TrackedHeadDeltaRef<'_>],
+    deltas: &[&CurrentStateDeltaRef<'_>],
     absence_guards: &BTreeSet<TrackedStateKey>,
     parent_rows: Vec<MaterializedTrackedStateRow>,
+    preserved_untracked_rows: Vec<MaterializedLiveStateRow>,
     working_diff_checkpoint_commit_id: Option<CommitId>,
     working_diff_coverage: &mut WorkingDiffIndexCoverage,
 ) -> Result<(), LixError> {
@@ -1041,8 +1309,9 @@ fn stage_bootstrap_groups(
             entity_pk,
         };
         let value = HeadValue {
-            change_id,
-            commit_id,
+            change_id: Some(change_id),
+            commit_id: Some(commit_id),
+            untracked: false,
             deleted,
             created_at: LixTimestamp::expect_parse("tracked-head parent created_at", &created_at),
             updated_at: LixTimestamp::expect_parse("tracked-head parent updated_at", &updated_at),
@@ -1069,8 +1338,67 @@ fn stage_bootstrap_groups(
             .insert(file_id, WorkingDiffBaseline::Clean);
     }
 
+    // A fresh tracked generation is a branch lifecycle operation, not an
+    // untracked-state reset. Copy history-free members from the previously
+    // serving generation before applying this transaction's mutations. The
+    // values are intentionally re-encoded rather than copied as opaque bytes
+    // because the new generation must retain the same group invariants and
+    // file-member projections as an ordinary current-state publication.
+    for row in preserved_untracked_rows {
+        if !row.untracked || row.deleted {
+            return Err(head_group_error(
+                "bootstrap preserved state must contain only live untracked members",
+            ));
+        }
+        let key = TrackedStateKey {
+            schema_key: row.schema_key.clone(),
+            entity_pk: row.entity_pk.clone(),
+            file_id: row.file_id.clone(),
+        };
+        if absence_guards.contains(&key) {
+            return Err(tracked_head_duplicate_insert_error(&key));
+        }
+        let identity = HeadGroupIdentity {
+            branch_id: branch_id.to_string(),
+            generation,
+            schema_key: row.schema_key,
+            entity_pk: row.entity_pk,
+        };
+        let value = HeadValue {
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            deleted: false,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            snapshot: row
+                .snapshot_content
+                .as_deref()
+                .map_or(JsonSlot::None, JsonSlot::from_json),
+            metadata: row
+                .metadata
+                .as_deref()
+                .map_or(JsonSlot::None, JsonSlot::from_json),
+        };
+        let members = groups.entry(identity.clone()).or_default();
+        if members
+            .insert(row.file_id.clone(), encode_head_value(&value.as_ref())?)
+            .is_some()
+        {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                "cannot materialize a tracked and untracked current row with the same identity",
+            ));
+        }
+        baselines
+            .entry(identity)
+            .or_default()
+            .insert(row.file_id, WorkingDiffBaseline::Clean);
+    }
+
     let mut dirty_groups = BTreeSet::new();
     for delta in deltas {
+        delta.validate()?;
         let group = HeadGroupIdentity {
             branch_id: branch_id.to_string(),
             generation,
@@ -1084,13 +1412,21 @@ fn stage_bootstrap_groups(
             Some(existing) => {
                 let existing = decode_head_value(existing)?;
                 reject_guarded_live_member(absence_guards, delta, existing)?;
+                reject_retention_change(delta, existing)?;
                 working_diff_baseline_for_existing_value(
                     existing,
                     working_diff_checkpoint_commit_id,
                 )
             }
-            None => working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
+            None => {
+                working_diff_baseline_for_absent_delta(delta, working_diff_checkpoint_commit_id)
+            }
         };
+        if delta.physically_deletes() {
+            members.remove(&file_id);
+            baseline_members.remove(&file_id);
+            continue;
+        }
         let created_at = match members.get(&file_id) {
             Some(existing) => decode_head_value(existing)?.created_at,
             None => delta.created_at,
@@ -1100,7 +1436,7 @@ fn stage_bootstrap_groups(
             encode_head_value(&delta.value_ref(created_at))?,
         );
         baseline_members.insert(file_id.clone(), baseline);
-        if working_diff_checkpoint_commit_id.is_some() {
+        if !delta.untracked && working_diff_checkpoint_commit_id.is_some() {
             dirty_groups.insert(group.clone());
         }
     }
@@ -1112,6 +1448,9 @@ fn stage_bootstrap_groups(
         .sum();
     writes.reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
     for (identity, members) in groups {
+        if members.is_empty() {
+            continue;
+        }
         let member_baselines = baselines
             .get(&identity)
             .ok_or_else(|| head_group_error("bootstrap group is missing working-diff baselines"))?;
@@ -1135,15 +1474,16 @@ fn stage_bootstrap_groups(
     Ok(())
 }
 
-/// Merges one existing v6 group and its sorted mutations without decoding the
+/// Merges one existing current-state group and its sorted mutations without decoding the
 /// whole group into owned member values. Every old member is still parsed and
 /// validated before it is copied, so an unrelated malformed sibling cannot be
 /// silently republished.
 fn encode_incremental_group<'a>(
     previous: Option<&[u8]>,
-    deltas: &[&TrackedHeadDeltaRef<'a>],
+    deltas: &[&CurrentStateDeltaRef<'a>],
     absence_guards: &BTreeSet<TrackedStateKey>,
     working_diff_checkpoint_commit_id: Option<CommitId>,
+    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<EncodedHeadGroup<'a>, LixError> {
     debug_assert!(!deltas.is_empty());
     debug_assert!(
@@ -1164,6 +1504,7 @@ fn encode_incremental_group<'a>(
     let mut previous_has_current_dirty_member = false;
     let mut became_current_dirty_member = false;
     let mut explicit_member_projections = Vec::new();
+    let mut deleted_member_projections = Vec::new();
     explicit_member_projections
         .try_reserve(
             deltas
@@ -1176,14 +1517,24 @@ fn encode_incremental_group<'a>(
     for delta in deltas {
         loop {
             let Some(member) = current else {
+                if delta.physically_deletes() {
+                    if let Some(file_id) = delta.file_id {
+                        deleted_member_projections.push(file_id);
+                    }
+                    break;
+                }
                 append_delta_head_group_member(
                     &mut encoded,
                     delta,
                     delta.created_at,
-                    working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
+                    working_diff_baseline_for_absent_delta(
+                        delta,
+                        working_diff_checkpoint_commit_id,
+                    ),
                     &mut explicit_member_projections,
                 )?;
-                became_current_dirty_member |= working_diff_checkpoint_commit_id.is_some();
+                became_current_dirty_member |=
+                    !delta.untracked && working_diff_checkpoint_commit_id.is_some();
                 increment_head_group_member_count(&mut member_count)?;
                 break;
             };
@@ -1203,9 +1554,25 @@ fn encode_incremental_group<'a>(
                 }
                 Ordering::Equal => {
                     reject_guarded_live_member(absence_guards, delta, member.head)?;
+                    reject_retention_change(delta, member.head)?;
+                    if member.head.untracked {
+                        collect_retired_untracked_json_refs(
+                            member.head,
+                            delta,
+                            retired_untracked_json_refs,
+                        );
+                    }
+                    if delta.physically_deletes() {
+                        if let Some(file_id) = delta.file_id {
+                            deleted_member_projections.push(file_id);
+                        }
+                        current = next_head_group_member(&mut cursor)?;
+                        break;
+                    }
                     let (baseline, became_dirty) = working_diff_baseline_for_existing_delta(
                         member.baseline,
                         member.head,
+                        delta,
                         working_diff_checkpoint_commit_id,
                     );
                     previous_has_current_dirty_member |= member
@@ -1226,14 +1593,24 @@ fn encode_incremental_group<'a>(
                     break;
                 }
                 Ordering::Greater => {
+                    if delta.physically_deletes() {
+                        if let Some(file_id) = delta.file_id {
+                            deleted_member_projections.push(file_id);
+                        }
+                        break;
+                    }
                     append_delta_head_group_member(
                         &mut encoded,
                         delta,
                         delta.created_at,
-                        working_diff_baseline_for_absent_delta(working_diff_checkpoint_commit_id),
+                        working_diff_baseline_for_absent_delta(
+                            delta,
+                            working_diff_checkpoint_commit_id,
+                        ),
                         &mut explicit_member_projections,
                     )?;
-                    became_current_dirty_member |= working_diff_checkpoint_commit_id.is_some();
+                    became_current_dirty_member |=
+                        !delta.untracked && working_diff_checkpoint_commit_id.is_some();
                     increment_head_group_member_count(&mut member_count)?;
                     break;
                 }
@@ -1249,49 +1626,97 @@ fn encode_incremental_group<'a>(
         current = next_head_group_member(&mut cursor)?;
     }
 
-    let member_count =
-        u32::try_from(member_count).map_err(|_| head_group_error("member count exceeds u32"))?;
-    encoded[1..HEAD_GROUP_HEADER_BYTES].copy_from_slice(&member_count.to_be_bytes());
+    let bytes = if member_count == 0 {
+        None
+    } else {
+        let member_count = u32::try_from(member_count)
+            .map_err(|_| head_group_error("member count exceeds u32"))?;
+        encoded[1..HEAD_GROUP_HEADER_BYTES].copy_from_slice(&member_count.to_be_bytes());
+        Some(encoded)
+    };
     Ok(EncodedHeadGroup {
-        bytes: encoded,
+        bytes,
         explicit_member_projections,
+        deleted_member_projections,
         became_dirty_group: working_diff_checkpoint_commit_id.is_some()
             && !previous_has_current_dirty_member
             && became_current_dirty_member,
     })
 }
 
+/// Records the out-of-band payload hashes that a matching untracked member
+/// stops owning. The hash is a content-addressed store key, not a row-local
+/// allocation, so the writer must only record a durable reclamation hint; GC
+/// later checks it against all active current-state and changelog owners.
+fn collect_retired_untracked_json_refs(
+    existing: HeadValueView<'_>,
+    delta: &CurrentStateDeltaRef<'_>,
+    retired: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) {
+    debug_assert!(existing.untracked);
+    if !delta.untracked {
+        return;
+    }
+    for old_slot in [existing.snapshot, existing.metadata] {
+        let HeadSlotView::Ref(old_ref) = old_slot else {
+            continue;
+        };
+        let retained_by_successor = !delta.physically_deletes()
+            && [delta.snapshot, delta.metadata].into_iter().any(
+                |new_slot| matches!(new_slot, JsonSlotRef::Ref(new_ref) if new_ref == &old_ref),
+            );
+        if !retained_by_successor {
+            retired.insert(*old_ref.as_hash_array());
+        }
+    }
+}
+
 fn working_diff_baseline_for_absent_delta(
+    delta: &CurrentStateDeltaRef<'_>,
     checkpoint_commit_id: Option<CommitId>,
 ) -> WorkingDiffBaseline {
-    checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, WorkingDiffBaseline::Absent)
+    if delta.untracked {
+        WorkingDiffBaseline::Clean
+    } else {
+        checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, WorkingDiffBaseline::Absent)
+    }
 }
 
 fn working_diff_baseline_for_existing_value(
     prior_value: HeadValueView<'_>,
     checkpoint_commit_id: Option<CommitId>,
 ) -> WorkingDiffBaseline {
-    checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, |checkpoint_commit_id| {
-        WorkingDiffBaseline::Present {
+    match (prior_value.working_diff_version(), checkpoint_commit_id) {
+        (Some(version), Some(checkpoint_commit_id)) => WorkingDiffBaseline::Present {
             checkpoint_commit_id,
-            version: prior_value.working_diff_version(),
-        }
-    })
+            version,
+        },
+        _ => WorkingDiffBaseline::Clean,
+    }
 }
 
 fn working_diff_baseline_for_existing_delta(
     prior: WorkingDiffBaseline,
     prior_value: HeadValueView<'_>,
+    delta: &CurrentStateDeltaRef<'_>,
     checkpoint_commit_id: Option<CommitId>,
 ) -> (WorkingDiffBaseline, bool) {
+    if delta.untracked || prior_value.untracked {
+        return (WorkingDiffBaseline::Clean, false);
+    }
     match checkpoint_commit_id {
-        Some(checkpoint_commit_id) if !prior.is_for_checkpoint(Some(checkpoint_commit_id)) => (
-            WorkingDiffBaseline::Present {
-                checkpoint_commit_id,
-                version: prior_value.working_diff_version(),
-            },
-            true,
-        ),
+        Some(checkpoint_commit_id) if !prior.is_for_checkpoint(Some(checkpoint_commit_id)) => {
+            let version = prior_value
+                .working_diff_version()
+                .expect("tracked current-state member has a diff version");
+            (
+                WorkingDiffBaseline::Present {
+                    checkpoint_commit_id,
+                    version,
+                },
+                true,
+            )
+        }
         _ => (prior, false),
     }
 }
@@ -1313,7 +1738,7 @@ fn next_head_group_member<'a>(
 
 fn reject_guarded_live_member(
     absence_guards: &BTreeSet<TrackedStateKey>,
-    delta: &TrackedHeadDeltaRef<'_>,
+    delta: &CurrentStateDeltaRef<'_>,
     existing: HeadValueView<'_>,
 ) -> Result<(), LixError> {
     if absence_guards.is_empty() || existing.deleted {
@@ -1330,9 +1755,42 @@ fn reject_guarded_live_member(
     Ok(())
 }
 
+/// Retention is an identity property, not a mutable value column. An UPDATE
+/// is planned against the current row and therefore preserves it; an INSERT
+/// finding an existing identity is rejected by `absence_guards` above. This
+/// additional fence makes an accidental tracked↔untracked promotion fail
+/// closed even on an internal write path that did not originate in SQL.
+fn reject_retention_change(
+    delta: &CurrentStateDeltaRef<'_>,
+    existing: HeadValueView<'_>,
+) -> Result<(), LixError> {
+    // A tracked tombstone is still the durable identity owner. Letting an
+    // untracked member overwrite it would erase the tracked checkpoint
+    // baseline and make a later diff silently miss the removal. Retention is
+    // therefore immutable while any physical member exists; untracked delete
+    // removes its member entirely, after which a new tracked insert is a new
+    // identity and cannot affect historical diff state.
+    if existing.untracked != delta.untracked {
+        return Err(LixError::new(
+            LixError::CODE_UNIQUE,
+            format!(
+                "cannot change retention for existing current-state row in schema '{}' entity_pk {:?}; delete it before inserting it as {}",
+                delta.schema_key,
+                delta.entity_pk,
+                if delta.untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                },
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn append_delta_head_group_member<'a>(
     encoded: &mut Vec<u8>,
-    delta: &TrackedHeadDeltaRef<'a>,
+    delta: &CurrentStateDeltaRef<'a>,
     created_at: LixTimestamp,
     baseline: WorkingDiffBaseline,
     explicit_member_projections: &mut Vec<(&'a str, Vec<u8>)>,
@@ -1362,24 +1820,7 @@ fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
     )
 }
 
-async fn load_marker(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-) -> Result<Option<TrackedHeadMarker>, LixError> {
-    let key = marker_key(branch_id)?;
-    let result = PointReadPlan::new(TRACKED_HEAD_MARKER_SPACE, &[StorageKey(Bytes::from(key))])
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    result
-        .value
-        .into_iter()
-        .next()
-        .flatten()
-        .map(decode_marker_value)
-        .transpose()
-}
-
-/// Loads packed v6 groups without materializing their members.
+/// Loads packed current-state groups without materializing their members.
 async fn load_group_bytes<'a>(
     store: &(impl StorageAdapterRead + ?Sized),
     identities: impl IntoIterator<Item = &'a HeadGroupIdentity>,
@@ -1463,7 +1904,13 @@ async fn scan_entries(
             let Some(value) = value else {
                 continue;
             };
-            extend_group_entries(&mut rows, group, value, filter, limit)?;
+            extend_group_entries(
+                &mut rows,
+                group,
+                value,
+                |identity| matches_file_filter(identity.file_id.as_ref(), &filter.file_ids),
+                limit,
+            )?;
             if limit.is_some_and(|limit| rows.len() >= limit) {
                 return Ok(rows);
             }
@@ -1512,7 +1959,7 @@ async fn scan_entries(
                         entity_pk: identity.entity_pk,
                     },
                     full_value_bytes(entry.value)?,
-                    filter,
+                    |identity| matches_filter(identity, filter),
                     limit,
                 )?;
                 if limit.is_some_and(|limit| rows.len() >= limit) {
@@ -1527,77 +1974,124 @@ async fn scan_entries(
     Ok(rows)
 }
 
-/// Broad entity projection consumes only snapshot payloads. Scan the fixed
-/// schema prefix and retain member bytes without allocating logical row
-/// identities or intermediate JSON strings. `schema_group_prefix` uses the
-/// order-preserving entity-PK codec, so entries are returned in ascending
-/// logical primary-key order. Every live member is retained; file-backed
-/// siblings for one primary key are adjacent but intentionally have no extra
-/// tie ordering contract.
+/// Entity projection consumes only snapshot payloads. It can scan a schema or
+/// point-read exact groups, retaining member bytes without allocating logical
+/// row identities or intermediate JSON strings. Both physical paths preserve
+/// ascending logical primary-key order. Every live member is retained;
+/// file-backed siblings for one primary key are adjacent but intentionally
+/// have no extra tie ordering contract.
 async fn scan_entity_snapshots(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
     generation: CommitId,
     schema_key: &str,
+    entity_pks: &[EntityPk],
     limit: Option<usize>,
 ) -> Result<Vec<Option<Bytes>>, LixError> {
     if matches!(limit, Some(0)) {
         return Ok(Vec::new());
     }
-    let plan = ScanPlan::prefix(
-        TRACKED_HEAD_GROUP_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
-        },
-    );
     let mut snapshots = Vec::new();
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let value = full_value_bytes(entry.value)?;
-            let mut members = HeadGroupMembers::new(value.as_ref())?;
-            while let Some(member) = members.next_member()? {
-                // `HeadGroupMembers` validates and decodes the fixed-header
-                // member once as it advances. Broad serving needs that same
-                // borrowed view, so do not reparse every member here.
-                let head = member.head;
-                if head.deleted {
-                    continue;
-                }
-                let row_index = snapshots.len();
-                let snapshot = match head.snapshot {
-                    HeadSlotView::None => None,
-                    HeadSlotView::Inline(snapshot) => Some(value.slice_ref(snapshot.as_bytes())),
-                    HeadSlotView::Ref(json_ref) => {
-                        json_refs.push(json_ref);
-                        deferred.push((row_index, json_ref));
-                        None
-                    }
-                };
-                snapshots.push(snapshot);
-                if limit.is_some_and(|limit| snapshots.len() >= limit) {
+    if entity_pks.is_empty() {
+        let plan = ScanPlan::prefix(
+            TRACKED_HEAD_GROUP_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
+            },
+        );
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    store,
+                    StorageScanOptions {
+                        resume_after: resume_after.clone(),
+                        ..StorageScanOptions::default()
+                    },
+                )
+                .await?;
+            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                if append_entity_snapshot_members(
+                    &mut snapshots,
+                    &mut json_refs,
+                    &mut deferred,
+                    full_value_bytes(entry.value)?,
+                    limit,
+                )? {
                     return materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred)
                         .await;
                 }
             }
+            if !page.value.has_more || resume_after.is_none() {
+                break;
+            }
         }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
+    } else {
+        let mut groups = entity_pks
+            .iter()
+            .cloned()
+            .map(|entity_pk| HeadGroupIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: schema_key.to_string(),
+                entity_pk,
+            })
+            .collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
+        let values = load_group_bytes(store, &groups).await?;
+        for value in values.into_iter().flatten() {
+            if append_entity_snapshot_members(
+                &mut snapshots,
+                &mut json_refs,
+                &mut deferred,
+                value,
+                limit,
+            )? {
+                break;
+            }
         }
     }
     materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred).await
+}
+
+/// Appends every live member of one packed group without constructing logical
+/// identities. Returns whether the caller's row limit has been reached.
+fn append_entity_snapshot_members(
+    snapshots: &mut Vec<Option<Bytes>>,
+    json_refs: &mut Vec<JsonRef>,
+    deferred: &mut Vec<(usize, JsonRef)>,
+    value: Bytes,
+    limit: Option<usize>,
+) -> Result<bool, LixError> {
+    let mut members = HeadGroupMembers::new(value.as_ref())?;
+    while let Some(member) = members.next_member()? {
+        // `HeadGroupMembers` validates and decodes the fixed-header member
+        // once as it advances. Snapshot serving needs that same borrowed view,
+        // so do not reparse every member into a materialized live-state row.
+        let head = member.head;
+        if head.deleted {
+            continue;
+        }
+        let row_index = snapshots.len();
+        let snapshot = match head.snapshot {
+            HeadSlotView::None => None,
+            HeadSlotView::Inline(snapshot) => Some(value.slice_ref(snapshot.as_bytes())),
+            HeadSlotView::Ref(json_ref) => {
+                json_refs.push(json_ref);
+                deferred.push((row_index, json_ref));
+                None
+            }
+        };
+        snapshots.push(snapshot);
+        if limit.is_some_and(|limit| snapshots.len() >= limit) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn materialize_entity_snapshot_refs(
@@ -1639,7 +2133,7 @@ async fn materialize_entity_snapshot_refs(
 }
 
 /// Reads the checkpoint's sparse dirty-group index and resolves before images
-/// from authoritative v6 group values. The index is auxiliary: its complete
+/// from authoritative current-state group values. The index is auxiliary: its complete
 /// key coverage is verified before any result is returned, so a bad record is
 /// a fallback (`None`), never an empty diff.
 async fn working_diff_entries_from_current_head(
@@ -1681,6 +2175,15 @@ async fn working_diff_entries_from_current_head(
         };
         let mut has_current_dirty_member = false;
         for member in members {
+            let Ok(after) = decode_head_value(&member.value) else {
+                return Ok(None);
+            };
+            if after.untracked {
+                if member.baseline != WorkingDiffBaseline::Clean {
+                    return Ok(None);
+                }
+                continue;
+            }
             if !member
                 .baseline
                 .is_for_checkpoint(Some(checkpoint_commit_id))
@@ -1693,10 +2196,12 @@ async fn working_diff_entries_from_current_head(
                 entity_pk: group.entity_pk.clone(),
                 file_id: member.file_id,
             };
-            if matches_filter(&identity, filter) {
-                let after = match decode_head_value(&member.value) {
-                    Ok(value) => value.working_diff_version(),
-                    Err(_) => return Ok(None),
+            // Both the exact-group route and the dirty-group index already
+            // prove this group's schema and entity PK. Only its member
+            // identity can still be filtered here.
+            if matches_file_filter(identity.file_id.as_ref(), &filter.file_ids) {
+                let Some(after) = after.working_diff_version() else {
+                    return Ok(None);
                 };
                 dirty_rows.push((identity, member.baseline, after));
             }
@@ -2006,7 +2511,7 @@ fn extend_group_entries(
     rows: &mut Vec<(HeadRowIdentity, Bytes)>,
     group: HeadGroupIdentity,
     value: Bytes,
-    filter: &TrackedStateFilter,
+    member_matches: impl Fn(&HeadRowIdentity) -> bool,
     limit: Option<usize>,
 ) -> Result<(), LixError> {
     for member in decode_head_group_members(&value)? {
@@ -2015,7 +2520,7 @@ fn extend_group_entries(
             entity_pk: group.entity_pk.clone(),
             file_id: member.file_id,
         };
-        if matches_filter(&identity, filter) {
+        if member_matches(&identity) {
             rows.push((identity, member.value));
             if limit.is_some_and(|limit| rows.len() >= limit) {
                 break;
@@ -2028,40 +2533,48 @@ fn extend_group_entries(
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
     (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
         && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&identity.entity_pk))
-        && (filter.file_ids.is_empty()
-            || filter.file_ids.iter().any(|filter| match filter {
-                NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => identity.file_id.is_none(),
-                NullableKeyFilter::Value(value) => identity.file_id.as_ref() == Some(value),
-            }))
+        && matches_file_filter(identity.file_id.as_ref(), &filter.file_ids)
+}
+
+fn matches_file_filter(file_id: Option<&String>, filters: &[NullableKeyFilter<String>]) -> bool {
+    filters.is_empty()
+        || filters.iter().any(|filter| match filter {
+            NullableKeyFilter::Any => true,
+            NullableKeyFilter::Null => file_id.is_none(),
+            NullableKeyFilter::Value(value) => file_id == Some(value),
+        })
 }
 
 #[cfg(test)]
-fn stage_marker(
+fn stage_test_current_control(
     writes: &mut StorageWriteSet,
     branch_id: &str,
-    marker: &TrackedHeadMarker,
+    head_commit_id: CommitId,
+    generation: CommitId,
+    working_diff_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<(), LixError> {
-    stage_marker_encoded(
+    let timestamp = LixTimestamp::expect_parse(
+        "tracked-head test control timestamp",
+        "2026-01-01T00:00:00Z",
+    );
+    stage_branch_head_control(
         writes,
-        marker_key(branch_id)?,
-        storage_codec::encode("tracked-head marker", marker)?,
-    );
-    Ok(())
-}
-
-fn stage_marker_encoded(writes: &mut StorageWriteSet, key: Vec<u8>, value: Vec<u8>) {
-    writes.put(
-        TRACKED_HEAD_MARKER_SPACE,
-        StorageKey(Bytes::from(key)),
-        StorageValue {
-            bytes: Bytes::from(value),
+        branch_id,
+        BranchHeadControl {
+            head_commit_id,
+            generation,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("tracked-head-test-control"),
         },
-    );
+    )
 }
 
 /// Publishes the checkpoint epoch that owns the sparse working-diff indexes.
-/// The surrounding branch-control CAS makes this marker, the v6 head groups,
+/// The surrounding branch-control CAS makes this marker, the current-state groups,
 /// and the current branch head one atomic visibility boundary.
 pub(crate) fn stage_tracked_working_diff_epoch(
     writes: &mut StorageWriteSet,
@@ -2070,7 +2583,7 @@ pub(crate) fn stage_tracked_working_diff_epoch(
 ) -> Result<(), LixError> {
     writes.put(
         TRACKED_WORKING_DIFF_MARKER_SPACE,
-        StorageKey(Bytes::from(marker_key(branch_id)?)),
+        StorageKey(Bytes::from(working_diff_marker_key(branch_id)?)),
         StorageValue {
             bytes: Bytes::from(storage_codec::encode(
                 "tracked working-diff marker",
@@ -2087,7 +2600,7 @@ async fn load_tracked_working_diff_epoch(
 ) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
     let result = PointReadPlan::new(
         TRACKED_WORKING_DIFF_MARKER_SPACE,
-        &[StorageKey(Bytes::from(marker_key(branch_id)?))],
+        &[StorageKey(Bytes::from(working_diff_marker_key(branch_id)?))],
     )
     .materialize(store, StorageGetOptions::default())
     .await?;
@@ -2126,22 +2639,17 @@ where
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let active = stage_active_working_diff_scopes(store, writes, &controls).await?;
-    stage_collect_stale_working_diff_space(
-        store,
-        writes,
-        TRACKED_WORKING_DIFF_GROUP_SPACE,
-        |entry| {
-            is_working_diff_index_value(&entry.value)
-                && decode_working_diff_group_key(entry.key.0.as_ref()).is_ok_and(
-                    |(checkpoint_commit_id, identity)| {
-                        active.get(&identity.branch_id).is_some_and(|scope| {
-                            scope.checkpoint_commit_id == checkpoint_commit_id
-                                && scope.generation == identity.generation
-                        })
-                    },
-                )
-        },
-    )
+    stage_collect_stale_derived_space(store, writes, TRACKED_WORKING_DIFF_GROUP_SPACE, |entry| {
+        is_working_diff_index_value(&entry.value)
+            && decode_working_diff_group_key(entry.key.0.as_ref()).is_ok_and(
+                |(checkpoint_commit_id, identity)| {
+                    active.get(&identity.branch_id).is_some_and(|scope| {
+                        scope.checkpoint_commit_id == checkpoint_commit_id
+                            && scope.generation == identity.generation
+                    })
+                },
+            )
+    })
     .await
 }
 
@@ -2152,9 +2660,9 @@ struct ActiveWorkingDiffScope {
 }
 
 /// Validates and keeps only auxiliary epochs that are presently bound by the
-/// authoritative branch control and tracked-head marker. Broken auxiliary
-/// bytes are reclaimed here rather than turning background GC into a retry
-/// loop; normal readers already select canonical replay for the same cases.
+/// authoritative branch control. Broken auxiliary bytes are reclaimed here
+/// rather than turning background GC into a retry loop; normal readers already
+/// select canonical replay for the same cases.
 async fn stage_active_working_diff_scopes<S>(
     store: &S,
     writes: &mut StorageWriteSet,
@@ -2213,17 +2721,16 @@ where
                 // A checkpoint reset is known empty and deliberately leaves
                 // the prior serving group generation intact until its first
                 // ordinary child captures a new baseline.
-                None => epoch.checkpoint_commit_id == control.head_commit_id,
+                None => {
+                    epoch.checkpoint_commit_id == control.head_commit_id
+                        && (!control.tracked_head_is_current
+                            || control.working_diff_checkpoint_commit_id
+                                == Some(epoch.checkpoint_commit_id))
+                }
                 Some(generation) if generation == control.generation => {
-                    matches!(
-                        TrackedHeadContext::new()
-                            .reader(store.clone())
-                            .marker_info_if_control_current(&key.branch_id, control)
-                            .await,
-                        Ok(Some(marker))
-                            if marker.working_diff_checkpoint_commit_id
-                                == Some(epoch.checkpoint_commit_id)
-                    )
+                    control.tracked_head_is_current
+                        && control.working_diff_checkpoint_commit_id
+                            == Some(epoch.checkpoint_commit_id)
                 }
                 Some(_) => false,
             };
@@ -2248,7 +2755,133 @@ where
     Ok(active)
 }
 
-async fn stage_collect_stale_working_diff_space(
+/// Deletes stale authoritative groups and records the history-free payloads
+/// they used to own. Stale bytes are intentionally tolerated here: no valid
+/// control can select them, so cleanup must not turn a corrupt abandoned
+/// generation into a permanent GC failure.
+async fn stage_collect_stale_current_state_group_space(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    active: &BTreeSet<(String, CommitId)>,
+    stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        TRACKED_HEAD_GROUP_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let is_active = decode_group_key(entry.key.0.as_ref())
+                .is_ok_and(|identity| active.contains(&(identity.branch_id, identity.generation)));
+            if is_active {
+                continue;
+            }
+            if let StorageProjectedValue::FullValue(bytes) = &entry.value {
+                // The group will be deleted regardless. Only a completely
+                // decoded stale group can contribute a payload deletion
+                // candidate; malformed abandoned bytes remain safe offline
+                // repair debt instead of making background GC fail.
+                let _ =
+                    collect_untracked_json_refs_from_group(bytes.as_ref(), stale_untracked_refs);
+            }
+            writes.delete(TRACKED_HEAD_GROUP_SPACE, entry.key);
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Deletes stale explicit-file projections. They duplicate authoritative
+/// group values, but collecting their refs as well covers an orphaned
+/// projection whose group was lost before this sweep.
+async fn stage_collect_stale_current_state_member_space(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    active: &BTreeSet<(String, CommitId)>,
+    stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        TRACKED_HEAD_MEMBER_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let is_active = decode_member_key(entry.key.0.as_ref())
+                .is_ok_and(|identity| active.contains(&(identity.branch_id, identity.generation)));
+            if is_active {
+                continue;
+            }
+            if let StorageProjectedValue::FullValue(bytes) = &entry.value {
+                if let Ok(head) = decode_head_value(bytes.as_ref()) {
+                    collect_untracked_json_refs_from_head(head, stale_untracked_refs);
+                }
+            }
+            writes.delete(TRACKED_HEAD_MEMBER_SPACE, entry.key);
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn collect_untracked_json_refs_from_group(
+    bytes: &[u8],
+    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let mut members = HeadGroupMembers::new(bytes)?;
+    while let Some(member) = members.next_member()? {
+        collect_untracked_json_refs_from_head(member.head, refs);
+    }
+    Ok(())
+}
+
+fn collect_untracked_json_refs_from_head(
+    head: HeadValueView<'_>,
+    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) {
+    if !head.untracked {
+        return;
+    }
+    for slot in [head.snapshot, head.metadata] {
+        if let HeadSlotView::Ref(json_ref) = slot {
+            refs.insert(*json_ref.as_hash_array());
+        }
+    }
+}
+
+/// Deletes records from a derived storage plane unless their key is still
+/// reachable from an authoritative control record. Malformed keys are also
+/// derived garbage: they cannot be selected by a valid reader.
+async fn stage_collect_stale_derived_space(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     space: StorageSpace,
@@ -2351,6 +2984,13 @@ fn stage_put_group_bytes(
     );
 }
 
+fn stage_delete_group(writes: &mut StorageWriteSet, identity: &HeadGroupIdentity) {
+    writes.delete(
+        TRACKED_HEAD_GROUP_SPACE,
+        StorageKey(Bytes::from(encode_group_key(identity))),
+    );
+}
+
 const WORKING_DIFF_INDEX_VALUE: &[u8] = b"\x01";
 
 fn stage_put_working_diff_group_index(
@@ -2411,8 +3051,26 @@ fn stage_put_file_member_bytes(
     );
 }
 
-fn marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
-    storage_codec::encode("tracked-head marker key", &BranchRef { branch_id })
+fn stage_delete_file_member(
+    writes: &mut StorageWriteSet,
+    group: &HeadGroupIdentity,
+    file_id: &str,
+) {
+    let identity = HeadIdentity {
+        branch_id: group.branch_id.clone(),
+        generation: group.generation,
+        schema_key: group.schema_key.clone(),
+        entity_pk: group.entity_pk.clone(),
+        file_id: Some(file_id.to_string()),
+    };
+    writes.delete(
+        TRACKED_HEAD_MEMBER_SPACE,
+        StorageKey(Bytes::from(encode_member_key(&identity))),
+    );
+}
+
+fn working_diff_marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode("tracked working-diff marker key", &BranchRef { branch_id })
 }
 
 fn encode_group_key(identity: &HeadGroupIdentity) -> Vec<u8> {
@@ -2457,7 +3115,6 @@ fn encode_member_key(identity: &HeadIdentity) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
 fn decode_group_key(bytes: &[u8]) -> Result<HeadGroupIdentity, LixError> {
     let mut offset = 0usize;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
@@ -2765,35 +3422,25 @@ fn key_codec_error(message: &str) -> LixError {
     )
 }
 
-fn decode_marker_value(value: StorageProjectedValue) -> Result<TrackedHeadMarker, LixError> {
-    let StorageProjectedValue::FullValue(bytes) = value else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-head marker read unexpectedly omitted its value",
-        ));
-    };
-    storage_codec::decode("tracked-head marker", &bytes)
-}
-
-/// v6 packs all file-backed members of one logical entity PK into one
+/// v12 packs all file-backed members of one logical entity PK into one
 /// canonical current-state group. The individual member payload is the proven
 /// fixed-header v3 value below; only the outer framing is new.
 ///
 /// ```text
-///  0      group format version (1)
+///  0      group format version (4)
 ///  1..5   member count (big endian u32)
 ///  repeated:
 ///    0      file-id tag (0 = none, 1 = UTF-8 string)
 ///    1..5   file-id byte length when tag = 1 (big endian u32)
 ///    ...    file-id UTF-8 bytes when tag = 1
-///    ...    v3 member byte length (big endian u32)
-///    ...    v3 member bytes
+///    ...    v4 member byte length (big endian u32)
+///    ...    v4 member bytes
 /// ```
 ///
 /// Members are strictly sorted by Rust's `Option<String>` ordering. This
 /// makes scans deterministic and, more importantly, rejects silently
 /// duplicated full identities at the storage boundary.
-const HEAD_GROUP_VALUE_VERSION: u8 = 3;
+const HEAD_GROUP_VALUE_VERSION: u8 = 4;
 const HEAD_GROUP_HEADER_BYTES: usize = 5;
 const WORKING_DIFF_BASELINE_CLEAN: u8 = 0;
 const WORKING_DIFF_BASELINE_ABSENT: u8 = 1;
@@ -2810,7 +3457,7 @@ struct HeadGroupMemberBytes {
     baseline: WorkingDiffBaseline,
 }
 
-/// A validated, borrowed member from a v6 group value.
+/// A validated, borrowed member from a current-state group value.
 ///
 /// The incremental writer uses this cursor to copy untouched member bytes
 /// directly into the next group while retaining the old fixed-header value
@@ -2823,7 +3470,7 @@ struct HeadGroupMemberView<'a> {
     baseline: WorkingDiffBaseline,
 }
 
-/// Streaming parser for the authoritative v6 group bytes.
+/// Streaming parser for the authoritative current-state group bytes.
 ///
 /// Unlike the reader-side decoder, this does not allocate a `String`,
 /// `Bytes`, or map for every member. It still enforces the complete wire
@@ -2907,6 +3554,11 @@ impl<'a> HeadGroupMembers<'a> {
         let head = decode_head_value(value)?;
         self.offset = value_end;
         let baseline = decode_working_diff_baseline(self.bytes, &mut self.offset)?;
+        if head.untracked && baseline != WorkingDiffBaseline::Clean {
+            return Err(head_group_error(
+                "untracked current-state member has a working-diff baseline",
+            ));
+        }
         self.remaining -= 1;
         self.prior_file_id = Some(file_id);
         Ok(Some(HeadGroupMemberView {
@@ -3264,9 +3916,14 @@ fn decode_head_group_members(bytes: &[u8]) -> Result<Vec<HeadGroupMemberBytes>, 
         let value = bytes
             .get(offset..value_end)
             .ok_or_else(|| head_group_error("is truncated in member value"))?;
-        decode_head_value(value)?;
+        let head = decode_head_value(value)?;
         offset = value_end;
         let baseline = decode_working_diff_baseline(bytes, &mut offset)?;
+        if head.untracked && baseline != WorkingDiffBaseline::Clean {
+            return Err(head_group_error(
+                "untracked current-state member has a working-diff baseline",
+            ));
+        }
         prior_file_id = Some(file_id.clone());
         members.push(HeadGroupMemberBytes {
             file_id,
@@ -3297,18 +3954,18 @@ fn read_group_u32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize
 fn head_group_error(message: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("invalid tracked-head v6 group: {message}"),
+        format!("invalid current-state group: {message}"),
     )
 }
 
-/// v3 head values are intentionally a small, fixed-header wire record rather
+/// v4 current-state values are intentionally a small, fixed-header wire record rather
 /// than a general Musli struct. The normal read path needs only these fields,
 /// and decoding a Musli `JsonSlot` first allocated an intermediate value for
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (3)
-///  1      deleted + snapshot/metadata kinds
+///  0      format version (4)
+///  1      deleted + untracked + snapshot/metadata kinds
 ///  2..18  change UUID
 /// 18..34  commit UUID
 /// 34..42  created_at packed timestamp (big endian)
@@ -3321,13 +3978,15 @@ fn head_group_error(message: &str) -> LixError {
 /// Slot payloads are either inline UTF-8 JSON or a fixed 32-byte `JsonRef`.
 /// This makes parsing bounded and lets the scan path build the final
 /// `MaterializedLiveStateRow` in one pass.
-const HEAD_VALUE_VERSION: u8 = 3;
+const HEAD_VALUE_VERSION: u8 = 4;
 const HEAD_VALUE_HEADER_BYTES: usize = 58;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
 const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
+const HEAD_VALUE_UNTRACKED: u8 = 0b0010_0000;
 const HEAD_VALUE_SLOT_MASK: u8 = 0b11;
 const HEAD_VALUE_ALLOWED_FLAGS: u8 = HEAD_VALUE_DELETED
+    | HEAD_VALUE_UNTRACKED
     | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_SNAPSHOT_SHIFT)
     | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_METADATA_SHIFT);
 const HEAD_SLOT_NONE: u8 = 0;
@@ -3345,8 +4004,9 @@ enum HeadSlotView<'a> {
 
 #[derive(Debug, Clone, Copy)]
 struct HeadValueView<'a> {
-    change_id: ChangeId,
-    commit_id: CommitId,
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+    untracked: bool,
     deleted: bool,
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
@@ -3355,16 +4015,16 @@ struct HeadValueView<'a> {
 }
 
 impl HeadValueView<'_> {
-    fn working_diff_version(self) -> WorkingDiffVersion {
-        WorkingDiffVersion {
-            change_id: self.change_id,
-            commit_id: self.commit_id,
+    fn working_diff_version(self) -> Option<WorkingDiffVersion> {
+        Some(WorkingDiffVersion {
+            change_id: self.change_id?,
+            commit_id: self.commit_id?,
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
             snapshot: working_diff_slot_fingerprint(self.snapshot),
             metadata: working_diff_slot_fingerprint(self.metadata),
-        }
+        })
     }
 }
 
@@ -3413,8 +4073,31 @@ fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
     let metadata_kind = encoded_slot_kind(value.metadata);
     if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
         return Err(head_value_error(
-            "deleted tracked-head rows must not carry JSON payloads",
+            "deleted current-state rows must not carry JSON payloads",
         ));
+    }
+    match (
+        value.untracked,
+        value.change_id,
+        value.commit_id,
+        value.deleted,
+    ) {
+        (false, Some(_), Some(_), _) | (true, None, None, false) => {}
+        (true, _, _, true) => {
+            return Err(head_value_error(
+                "untracked current-state rows must be deleted physically",
+            ));
+        }
+        (false, _, _, _) => {
+            return Err(head_value_error(
+                "tracked current-state rows must carry change_id and commit_id",
+            ));
+        }
+        (true, _, _, false) => {
+            return Err(head_value_error(
+                "untracked current-state rows must not carry change_id or commit_id",
+            ));
+        }
     }
     let snapshot_len = encoded_slot_len(value.snapshot);
     let metadata_len = encoded_slot_len(value.metadata);
@@ -3425,11 +4108,14 @@ fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
     let mut bytes = Vec::with_capacity(capacity);
     bytes.push(HEAD_VALUE_VERSION);
     let mut flags = if value.deleted { HEAD_VALUE_DELETED } else { 0 };
+    if value.untracked {
+        flags |= HEAD_VALUE_UNTRACKED;
+    }
     flags |= snapshot_kind << HEAD_VALUE_SNAPSHOT_SHIFT;
     flags |= metadata_kind << HEAD_VALUE_METADATA_SHIFT;
     bytes.push(flags);
-    bytes.extend_from_slice(value.change_id.as_uuid().as_bytes());
-    bytes.extend_from_slice(value.commit_id.as_uuid().as_bytes());
+    bytes.extend_from_slice(value.change_id.unwrap_or_default().as_uuid().as_bytes());
+    bytes.extend_from_slice(value.commit_id.unwrap_or_default().as_uuid().as_bytes());
     bytes.extend_from_slice(&value.created_at.packed().to_be_bytes());
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
@@ -3483,7 +4169,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v3 fixed header"));
+        return Err(head_value_error("row is shorter than the v4 fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -3493,12 +4179,12 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     }
     let flags = bytes[1];
     if flags & !HEAD_VALUE_ALLOWED_FLAGS != 0 {
-        return Err(head_value_error("row has unknown v3 flag bits"));
+        return Err(head_value_error("row has unknown v4 flag bits"));
     }
     let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
-    let change_id = ChangeId::new(uuid_from_head_bytes(&bytes[2..18], "change id")?);
-    let commit_id = CommitId::new(uuid_from_head_bytes(&bytes[18..34], "commit id")?);
+    let change_uuid = uuid_from_head_bytes(&bytes[2..18], "change id")?;
+    let commit_uuid = uuid_from_head_bytes(&bytes[18..34], "commit id")?;
     let created_at = LixTimestamp::from_packed(read_u64(&bytes[34..42], "created_at")?)
         .map_err(|error| head_value_error(&format!("invalid created_at: {error}")))?;
     let updated_at = LixTimestamp::from_packed(read_u64(&bytes[42..50], "updated_at")?)
@@ -3529,14 +4215,39 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         "metadata",
     )?;
     let deleted = flags & HEAD_VALUE_DELETED != 0;
+    let untracked = flags & HEAD_VALUE_UNTRACKED != 0;
     if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
         return Err(head_value_error(
-            "deleted tracked-head rows must not carry JSON payloads",
+            "deleted current-state rows must not carry JSON payloads",
         ));
     }
+    let (change_id, commit_id) = if untracked {
+        if deleted {
+            return Err(head_value_error(
+                "untracked current-state rows must be deleted physically",
+            ));
+        }
+        if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
+            return Err(head_value_error(
+                "untracked current-state rows must use nil change and commit ids",
+            ));
+        }
+        (None, None)
+    } else {
+        if change_uuid == uuid::Uuid::nil() || commit_uuid == uuid::Uuid::nil() {
+            return Err(head_value_error(
+                "tracked current-state rows must use non-nil change and commit ids",
+            ));
+        }
+        (
+            Some(ChangeId::new(change_uuid)),
+            Some(CommitId::new(commit_uuid)),
+        )
+    };
     Ok(HeadValueView {
         change_id,
         commit_id,
+        untracked,
         deleted,
         created_at,
         updated_at,
@@ -3659,9 +4370,9 @@ async fn materialize_live_entries(
             created_at: value.created_at,
             updated_at: value.updated_at,
             global,
-            change_id: Some(value.change_id),
-            commit_id: Some(value.commit_id),
-            untracked: false,
+            change_id: value.change_id,
+            commit_id: value.commit_id,
+            untracked: value.untracked,
             branch_id: Arc::clone(&branch_id),
         });
     }
@@ -3752,8 +4463,9 @@ mod tests {
 
     fn head_value(change: &str, commit_id: CommitId) -> HeadValue {
         HeadValue {
-            change_id: ChangeId::for_test_label(change),
-            commit_id,
+            change_id: Some(ChangeId::for_test_label(change)),
+            commit_id: Some(commit_id),
+            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
@@ -3766,8 +4478,9 @@ mod tests {
     fn v3_value_codec_roundtrips_fixed_header_inline_and_ref_slots() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
         let value = HeadValueRef {
-            change_id: ChangeId::for_test_label("change"),
-            commit_id: CommitId::for_test_label("commit"),
+            change_id: Some(ChangeId::for_test_label("change")),
+            commit_id: Some(CommitId::for_test_label("commit")),
+            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
@@ -3822,7 +4535,7 @@ mod tests {
             decode_head_value(&decoded[2].value)
                 .expect("member should preserve v3 payload")
                 .change_id,
-            ChangeId::for_test_label("file-b")
+            Some(ChangeId::for_test_label("file-b"))
         );
 
         let mut trailing = encoded.clone();
@@ -3885,6 +4598,15 @@ mod tests {
         let control = |head_commit_id| BranchHeadControl {
             head_commit_id,
             generation: checkpoint,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(
+                if head_commit_id == checkpoint || head_commit_id == first_head {
+                    checkpoint
+                } else {
+                    no_op_checkpoint
+                },
+            ),
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
@@ -3916,7 +4638,6 @@ mod tests {
                 }],
                 &BTreeSet::new(),
                 None,
-                Some(checkpoint),
                 None,
                 &mut initial_coverage,
             )
@@ -3967,7 +4688,6 @@ mod tests {
                 }],
                 &BTreeSet::new(),
                 None,
-                Some(checkpoint),
                 Some(checkpoint),
                 &mut first_coverage,
             )
@@ -4024,16 +4744,6 @@ mod tests {
         // starts a new diff epoch. Old first-before summaries stay harmless:
         // the next mutation tags its own checkpoint and gets a new index key.
         let mut writes = StorageWriteSet::new();
-        stage_marker(
-            &mut writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: no_op_checkpoint,
-                generation: checkpoint,
-                working_diff_checkpoint_commit_id: Some(checkpoint),
-            },
-        )
-        .expect("stage no-op checkpoint head marker");
         stage_tracked_working_diff_epoch(
             &mut writes,
             branch_id,
@@ -4110,7 +4820,6 @@ mod tests {
                 &BTreeSet::new(),
                 None,
                 Some(no_op_checkpoint),
-                Some(no_op_checkpoint),
                 &mut second_coverage,
             )
             .await
@@ -4162,6 +4871,50 @@ mod tests {
             ChangeId::for_test_label("first-change")
         );
 
+        // An auxiliary epoch with the right physical generation but a
+        // different checkpoint must never become a direct diff result. In
+        // particular, an exact-PK request must not turn that stale epoch into
+        // a plausible empty diff.
+        let stale_checkpoint = CommitId::for_test_label("stale-checkpoint");
+        let mut writes = StorageWriteSet::new();
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: stale_checkpoint,
+                generation: Some(checkpoint),
+                coverage: second_coverage,
+            },
+        )
+        .expect("stage same-generation stale epoch");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit same-generation stale epoch");
+        for request in [
+            TrackedStateDiffRequest::default(),
+            TrackedStateDiffRequest {
+                filter: TrackedStateFilter {
+                    entity_pks: vec![entity_pk.clone()],
+                    ..Default::default()
+                },
+            },
+        ] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open stale epoch direct read");
+            assert!(
+                TrackedHeadContext::new()
+                    .reader(read)
+                    .working_diff_if_control_current(branch_id, control(second_head), &request)
+                    .await
+                    .expect("stale epoch should not error")
+                    .is_none(),
+                "a same-generation stale epoch must select canonical replay"
+            );
+        }
+
         let mut writes = StorageWriteSet::new();
         stage_tracked_working_diff_epoch(
             &mut writes,
@@ -4205,6 +4958,9 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             generation,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
@@ -4230,8 +4986,9 @@ mod tests {
             &mut writes,
             &row_identity,
             &HeadValue {
-                change_id: ChangeId::for_test_label("change"),
-                commit_id: head,
+                change_id: Some(ChangeId::for_test_label("change")),
+                commit_id: Some(head),
+                untracked: false,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
@@ -4244,8 +5001,9 @@ mod tests {
             &mut writes,
             &identity(branch_id, generation, "deleted"),
             &HeadValue {
-                change_id: ChangeId::for_test_label("deleted-change"),
-                commit_id: head,
+                change_id: Some(ChangeId::for_test_label("deleted-change")),
+                commit_id: Some(head),
+                untracked: false,
                 deleted: true,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
@@ -4254,16 +5012,6 @@ mod tests {
             },
         )
         .expect("stage tombstone member");
-        stage_marker(
-            &mut writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: head,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage v3 marker");
         stage_branch_head_control(&mut writes, branch_id, control)
             .expect("stage matching branch control");
         storage
@@ -4275,9 +5023,20 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open direct entity snapshot read");
+        let exact_entity_pks = vec![
+            EntityPk::single("missing"),
+            EntityPk::single("row"),
+            EntityPk::single("row"),
+        ];
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", None)
+            .scan_entity_snapshots_if_control_current(
+                branch_id,
+                control,
+                "schema",
+                &exact_entity_pks,
+                None,
+            )
             .await
             .expect("direct entity snapshots should read")
             .expect("matching control should serve snapshots");
@@ -4296,7 +5055,7 @@ mod tests {
             .expect("open limited direct entity snapshot read");
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", Some(1))
+            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", &[], Some(1))
             .await
             .expect("limited direct entity snapshots should read")
             .expect("matching control should serve snapshots");
@@ -4381,6 +5140,9 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             generation: head,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
@@ -4447,8 +5209,6 @@ mod tests {
             .stage_commit(branch_id, None, head, &deltas, &BTreeSet::new(), None)
             .await
             .expect("stage grouped head");
-        stage_branch_head_control(&mut writes, branch_id, control)
-            .expect("stage matching v6 control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4522,6 +5282,33 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![None, Some("file-a"), Some("file-b")]
         );
+
+        // Exact group keys establish schema and entity PK, but file-id
+        // predicates still select individual members within that group.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open null file-id read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &head.to_string(),
+                &TrackedStateScanRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_string()],
+                        entity_pks: vec![entity_pk.clone()],
+                        file_ids: vec![NullableKeyFilter::Null],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("null file-id read should execute")
+            .expect("marker should match");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].file_id, None);
 
         // Remove only the group to prove the exact-file read never needs to
         // fetch/parse sibling members. This is intentionally an impossible
@@ -4801,16 +5588,8 @@ mod tests {
             )
             .expect("stage row");
         }
-        stage_marker(
-            &mut writes,
-            "branch",
-            &TrackedHeadMarker {
-                head_commit_id: head,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage marker");
+        stage_test_current_control(&mut writes, "branch", head, generation, None)
+            .expect("stage current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -4847,14 +5626,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn marker_gates_generations_and_rows_roundtrip() {
+    async fn branch_control_gates_generations_and_rows_roundtrip() {
         let storage = StorageAdapter::new(Memory::new());
         let generation = CommitId::for_test_label("generation");
         let head = CommitId::for_test_label("head");
         let identity = identity("branch", generation, "row");
         let value = HeadValue {
-            change_id: ChangeId::for_test_label("change"),
-            commit_id: head,
+            change_id: Some(ChangeId::for_test_label("change")),
+            commit_id: Some(head),
+            untracked: false,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:01Z"),
@@ -4863,16 +5643,8 @@ mod tests {
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &value).expect("stage row");
-        stage_marker(
-            &mut writes,
-            "branch",
-            &TrackedHeadMarker {
-                head_commit_id: head,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage marker");
+        stage_test_current_control(&mut writes, "branch", head, generation, None)
+            .expect("stage current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5049,16 +5821,8 @@ mod tests {
                     .expect("stage initial explicit member");
             }
         }
-        stage_marker(
-            &mut writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: generation,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage initial marker");
+        stage_test_current_control(&mut writes, branch_id, generation, generation, None)
+            .expect("stage initial current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5166,7 +5930,7 @@ mod tests {
             } else {
                 ChangeId::for_test_label("file-b-first")
             };
-            assert_eq!(value.change_id, expected_change);
+            assert_eq!(value.change_id, Some(expected_change));
         }
     }
 
@@ -5263,16 +6027,8 @@ mod tests {
             &head_value("first-change", generation),
         )
         .expect("stage existing live row");
-        stage_marker(
-            &mut writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: generation,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage existing head marker");
+        stage_test_current_control(&mut writes, branch_id, generation, generation, None)
+            .expect("stage existing current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5330,16 +6086,8 @@ mod tests {
         tombstone.metadata = JsonSlot::None;
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &identity, &tombstone).expect("stage existing tombstone");
-        stage_marker(
-            &mut writes,
-            branch_id,
-            &TrackedHeadMarker {
-                head_commit_id: generation,
-                generation,
-                working_diff_checkpoint_commit_id: None,
-            },
-        )
-        .expect("stage existing tombstone marker");
+        stage_test_current_control(&mut writes, branch_id, generation, generation, None)
+            .expect("stage existing current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -5546,7 +6294,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn working_diff_gc_keeps_only_marker_bound_active_scopes() {
+    async fn working_diff_gc_keeps_only_control_bound_active_scopes() {
         let storage = StorageAdapter::new(Memory::new());
         let timestamp = ts("2026-01-01T00:00:00Z");
         let active_generation = CommitId::for_test_label("active-generation");
@@ -5578,20 +6326,13 @@ mod tests {
         let active_control = BranchHeadControl {
             head_commit_id: active_generation,
             generation: active_generation,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(active_checkpoint),
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("active-ref"),
         };
-        stage_marker(
-            &mut writes,
-            "active",
-            &TrackedHeadMarker {
-                head_commit_id: active_generation,
-                generation: active_generation,
-                working_diff_checkpoint_commit_id: Some(active_checkpoint),
-            },
-        )
-        .expect("stage active marker");
         stage_tracked_working_diff_epoch(
             &mut writes,
             "active",
@@ -5608,20 +6349,13 @@ mod tests {
         let stale_control = BranchHeadControl {
             head_commit_id: stale_generation,
             generation: stale_generation,
+            tracked_head_is_current: false,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: ChangeId::for_test_label("stale-ref"),
         };
-        stage_marker(
-            &mut writes,
-            "stale",
-            &TrackedHeadMarker {
-                head_commit_id: stale_generation,
-                generation: stale_generation,
-                working_diff_checkpoint_commit_id: Some(CommitId::for_test_label("wrong")),
-            },
-        )
-        .expect("stage stale marker");
         stage_tracked_working_diff_epoch(
             &mut writes,
             "stale",
@@ -5683,7 +6417,7 @@ mod tests {
         let active_epoch = PointReadPlan::new(
             TRACKED_WORKING_DIFF_MARKER_SPACE,
             &[StorageKey(Bytes::from(
-                marker_key("active").expect("active marker key"),
+                working_diff_marker_key("active").expect("active working-diff marker key"),
             ))],
         )
         .materialize(&read, StorageGetOptions::default())
@@ -5702,7 +6436,7 @@ mod tests {
             let epoch = PointReadPlan::new(
                 TRACKED_WORKING_DIFF_MARKER_SPACE,
                 &[StorageKey(Bytes::from(
-                    marker_key(branch_id).expect("marker key"),
+                    working_diff_marker_key(branch_id).expect("working-diff marker key"),
                 ))],
             )
             .materialize(&read, StorageGetOptions::default())
@@ -5743,5 +6477,129 @@ mod tests {
         .next()
         .flatten();
         assert!(active_index.is_some(), "active index must survive GC");
+    }
+
+    #[tokio::test]
+    async fn current_state_gc_keeps_only_control_bound_untracked_generations() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "main";
+        let active_generation = CommitId::for_test_label("active-current-generation");
+        let stale_generation = CommitId::for_test_label("stale-current-generation");
+        let active_snapshot = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
+        let stale_snapshot = JsonRef::from_hash_bytes([9; JSON_REF_BYTES]);
+        let timestamp = ts("2026-01-01T00:00:00Z");
+        let active_identity = HeadIdentity {
+            branch_id: branch_id.to_string(),
+            generation: active_generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("active-row"),
+            file_id: Some("active-file".to_string()),
+        };
+        let stale_identity = HeadIdentity {
+            branch_id: branch_id.to_string(),
+            generation: stale_generation,
+            schema_key: "schema".to_string(),
+            entity_pk: EntityPk::single("stale-row"),
+            file_id: Some("stale-file".to_string()),
+        };
+        let active_control = BranchHeadControl {
+            head_commit_id: active_generation,
+            generation: active_generation,
+            // A lifecycle fallback still owns the same untracked workspace
+            // state even while its tracked portion is rebuilt.
+            tracked_head_is_current: false,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: ChangeId::for_test_label("active-current-ref"),
+        };
+        let controls = vec![(branch_id.to_string(), active_control)];
+
+        let untracked = |snapshot| HeadValue {
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            deleted: false,
+            created_at: timestamp,
+            updated_at: timestamp,
+            snapshot: JsonSlot::Ref(snapshot),
+            metadata: JsonSlot::None,
+        };
+        let mut writes = StorageWriteSet::new();
+        stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
+            .expect("stage active untracked member");
+        stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
+            .expect("stage stale untracked member");
+        stage_branch_head_control(&mut writes, branch_id, active_control)
+            .expect("stage active branch control");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit current-state GC fixture");
+
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open current-state GC read"),
+        );
+        let rooted = TrackedHeadContext::new()
+            .reader(read.clone())
+            .untracked_json_refs(&controls)
+            .await
+            .expect("discover active untracked payload roots");
+        assert_eq!(rooted, vec![active_snapshot]);
+
+        let mut gc_writes = StorageWriteSet::new();
+        let stale_refs = TrackedHeadContext::new()
+            .stage_collect_stale_current_state_generations(&read, &mut gc_writes, &controls)
+            .await
+            .expect("stage stale current-state cleanup");
+        assert_eq!(stale_refs, vec![stale_snapshot]);
+        drop(read);
+        storage
+            .commit_write_set(gc_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit stale current-state cleanup");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open current-state GC verification read");
+        for (label, identity, expected) in [
+            ("active", &active_identity, true),
+            ("stale", &stale_identity, false),
+        ] {
+            let group = PointReadPlan::new(
+                TRACKED_HEAD_GROUP_SPACE,
+                &[StorageKey(Bytes::from(encode_group_key(
+                    &identity.group_identity(),
+                )))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read current-state group")
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some();
+            assert_eq!(group, expected, "{label} group reachability");
+
+            let member = PointReadPlan::new(
+                TRACKED_HEAD_MEMBER_SPACE,
+                &[StorageKey(Bytes::from(encode_member_key(identity)))],
+            )
+            .materialize(&read, StorageGetOptions::default())
+            .await
+            .expect("read current-state member projection")
+            .value
+            .into_iter()
+            .next()
+            .flatten()
+            .is_some();
+            assert_eq!(member, expected, "{label} member reachability");
+        }
     }
 }

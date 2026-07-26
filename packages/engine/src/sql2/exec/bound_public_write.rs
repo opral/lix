@@ -1219,7 +1219,6 @@ fn candidate_matches_insert_identity(
         && candidate.file_id == insert_row.file_id
         && candidate.branch_id.as_ref() == insert_row.branch_id
         && candidate.global == insert_row.global
-        && candidate.untracked == insert_row.untracked
 }
 
 async fn scan_entity_conflict_candidates(
@@ -1230,37 +1229,32 @@ async fn scan_entity_conflict_candidates(
     let mut branch_ids = std::collections::BTreeSet::new();
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
-    let mut untracked_values = std::collections::BTreeSet::new();
     for row in insert_rows {
         branch_ids.insert(row.branch_id.clone());
         entity_pks.insert(insert_row_entity_pk(row, spec)?);
         file_ids.insert(row.file_id.clone());
-        untracked_values.insert(row.untracked);
     }
     let file_ids = file_ids
         .into_iter()
         .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
         .collect::<Vec<_>>();
 
-    let mut candidates = Vec::new();
-    for untracked in untracked_values {
-        let rows = ctx
-            .scan_live_state(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![spec.schema_key.clone()],
-                    entity_pks: entity_pks.iter().cloned().collect(),
-                    branch_ids: branch_ids.iter().cloned().collect(),
-                    file_ids: file_ids.clone(),
-                    untracked: Some(untracked),
-                    include_tombstones: false,
-                    ..LiveStateFilter::default()
-                },
-                ..LiveStateScanRequest::default()
-            })
-            .await?;
-        candidates.extend(rows);
-    }
-    Ok(candidates)
+    // Retention is an attribute of the one canonical live identity, not part
+    // of SQL conflict identity. A tracked INSERT therefore conflicts with an
+    // existing untracked row (and vice versa); `DO UPDATE` then preserves the
+    // existing row's retention through `entity_replace_row_from_live`.
+    ctx.scan_live_state(&LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![spec.schema_key.clone()],
+            entity_pks: entity_pks.into_iter().collect(),
+            branch_ids: branch_ids.into_iter().collect(),
+            file_ids,
+            include_tombstones: false,
+            ..LiveStateFilter::default()
+        },
+        ..LiveStateScanRequest::default()
+    })
+    .await
 }
 
 async fn scan_entity_candidates(

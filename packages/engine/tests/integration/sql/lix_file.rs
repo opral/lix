@@ -2702,7 +2702,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_file_tracked_path_insert_promotes_untracked_parent_directory,
+    lix_file_tracked_path_insert_rejects_untracked_parent_directory,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -2722,14 +2722,15 @@ simulation_test!(
             .await
             .expect("untracked parent insert should succeed");
 
-        session
+        let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
-            .expect("tracked file insert should promote untracked parent");
+            .expect_err("tracked file insert must not promote an untracked parent");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
 
         let directories = session
             .execute(
@@ -2745,7 +2746,7 @@ simulation_test!(
             vec![vec![
                 Value::Text("dir-scratch".to_string()),
                 Value::Text("/scratch/".to_string()),
-                Value::Boolean(false),
+                Value::Boolean(true),
             ]],
         );
 
@@ -2758,15 +2759,7 @@ simulation_test!(
             )
             .await
             .expect("file read should succeed");
-        assert_rows_eq(
-            files,
-            vec![vec![
-                Value::Text("file-readme".to_string()),
-                Value::Text("/scratch/readme.md".to_string()),
-                Value::Text("dir-scratch".to_string()),
-                Value::Blob(b"hello".to_vec().into()),
-            ]],
-        );
+        assert!(files.is_empty(), "failed insert must not create a file");
     }
 );
 

@@ -9,7 +9,6 @@ use crate::commit_graph::CommitGraphContext;
 use crate::entity_pk::EntityPk;
 use crate::init::InitReceipt;
 use crate::live_state::LiveStateContext;
-use crate::live_state::LiveStateIndexContext;
 use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
@@ -111,12 +110,7 @@ where
     pub async fn initialize(storage: StorageImpl) -> Result<InitReceipt, LixError> {
         let storage = StorageAdapter::new(storage);
 
-        crate::init::initialize(
-            storage,
-            &TrackedStateContext::new(),
-            &LiveStateIndexContext::new(),
-        )
-        .await
+        crate::init::initialize(storage, &TrackedStateContext::new()).await
     }
 
     /// Creates a clean DataFusion-first engine over an initialized storage.
@@ -158,11 +152,9 @@ where
         )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());
-        let live_index = LiveStateIndexContext::new();
         let commit_graph = CommitGraphContext::new();
         let live_state = Arc::new(LiveStateContext::new(
             tracked_state.as_ref().clone(),
-            live_index,
             commit_graph,
         ));
         let branch_ctx = Arc::new(BranchContext::new());
@@ -465,11 +457,11 @@ mod tests {
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("legacy sidecar bytes should commit");
+            .expect("predecessor bytes should commit");
 
         let engine = Engine::new(storage)
             .await
-            .expect("legacy sidecar bytes must not affect engine open");
+            .expect("predecessor bytes must not affect engine open");
         assert_eq!(
             engine
                 .load_branch_head_commit_id(&receipt.main_branch_id)
@@ -572,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_v9_protocol_is_rejected() {
+    async fn predecessor_v10_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -582,7 +574,7 @@ mod tests {
         writes.put(
             crate::init::REPOSITORY_PROTOCOL_SPACE,
             crate::init::REPOSITORY_PROTOCOL_KEY,
-            &b"tracked-direct-plane.v9"[..],
+            &b"tracked-direct-plane.v10"[..],
         );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -590,7 +582,7 @@ mod tests {
             .expect("legacy protocol marker should commit");
 
         let Err(error) = Engine::new(storage).await else {
-            panic!("v9 repository must fail closed");
+            panic!("v10 repository must fail closed");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }
@@ -770,7 +762,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tracked_entity_public_fast_path_falls_back_for_untracked_entity_rows() {
+    async fn current_state_group_serves_mixed_tracked_and_untracked_entity_rows() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -783,6 +775,14 @@ mod tests {
             .await
             .expect("workspace session should open");
         register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/tracked', lix_json('{\"source\":\"tracked\"}'))",
+                &[],
+            )
+            .await
+            .expect("write tracked entity row");
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
@@ -801,8 +801,297 @@ mod tests {
                 .iter()
                 .map(|row| row.get::<String>("path").expect("untracked path"))
                 .collect::<Vec<_>>(),
-            ["/untracked"],
-            "normal SQL must retain the merged tracked/untracked visibility path"
+            ["/tracked", "/untracked"],
+            "one current-state group must serve both retentions without a separate merge"
+        );
+
+        let error = session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/tracked', lix_json('{\"source\":\"collision\"}'), true)",
+                &[],
+            )
+            .await
+            .expect_err("an untracked insert must not shadow a tracked identity");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+
+        let error = session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/untracked', lix_json('{\"source\":\"collision\"}'))",
+                &[],
+            )
+            .await
+            .expect_err("a tracked insert must not shadow an untracked identity");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                     VALUES ('/tracked', lix_json('{\"source\":\"tracked-upsert\"}'), true) \
+                     ON CONFLICT (path) DO UPDATE SET value = excluded.value",
+                    &[],
+                )
+                .await
+                .expect("upsert should update the existing tracked row")
+                .rows_affected(),
+            1
+        );
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                     VALUES ('/untracked', lix_json('{\"source\":\"untracked-upsert\"}'), false) \
+                     ON CONFLICT (path) DO UPDATE SET value = excluded.value",
+                    &[],
+                )
+                .await
+                .expect("upsert should update the existing untracked row")
+                .rows_affected(),
+            1
+        );
+
+        let rows = session
+            .execute(
+                "SELECT path, value, lixcol_untracked FROM json_pointer ORDER BY path",
+                &[],
+            )
+            .await
+            .expect("updated mixed-retention rows should remain readable");
+        let tracked = rows
+            .rows()
+            .iter()
+            .find(|row| {
+                row.get::<String>("path")
+                    .is_ok_and(|path| path == "/tracked")
+            })
+            .expect("tracked row should remain visible");
+        assert!(
+            !tracked
+                .get::<bool>("lixcol_untracked")
+                .expect("tracked retention should be visible")
+        );
+        assert_eq!(
+            tracked
+                .get::<serde_json::Value>("value")
+                .expect("tracked value should be visible"),
+            json!({"source": "tracked-upsert"})
+        );
+        let untracked = rows
+            .rows()
+            .iter()
+            .find(|row| {
+                row.get::<String>("path")
+                    .is_ok_and(|path| path == "/untracked")
+            })
+            .expect("untracked row should remain visible");
+        assert!(
+            untracked
+                .get::<bool>("lixcol_untracked")
+                .expect("untracked retention should be visible")
+        );
+        assert_eq!(
+            untracked
+                .get::<serde_json::Value>("value")
+                .expect("untracked value should be visible"),
+            json!({"source": "untracked-upsert"})
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_public_entity_write_is_history_free_and_diff_invisible() {
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+
+        let head_before = engine
+            .load_branch_head_commit_id(&receipt.main_branch_id)
+            .await
+            .expect("main branch head should load before untracked write");
+        let changes_before = session
+            .execute("SELECT COUNT(*) AS changes FROM lix_change", &[])
+            .await
+            .expect("changelog count before untracked write should execute")
+            .rows()[0]
+            .get::<i64>("changes")
+            .expect("changelog count should be numeric");
+        let diff_before = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_working_change \
+                 WHERE schema_key = 'json_pointer'",
+                &[],
+            )
+            .await
+            .expect("working diff before untracked write should execute")
+            .rows()[0]
+            .get::<i64>("entries")
+            .expect("working diff count should be numeric");
+        assert_eq!(
+            diff_before, 0,
+            "the schema registration itself must not create a json_pointer diff"
+        );
+
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                     VALUES ('/history-free', lix_json('{\"source\":\"untracked\"}'), true)",
+                    &[],
+                )
+                .await
+                .expect("untracked public write should execute")
+                .rows_affected(),
+            1
+        );
+
+        let head_after = engine
+            .load_branch_head_commit_id(&receipt.main_branch_id)
+            .await
+            .expect("main branch head should load after untracked write");
+        let changes_after = session
+            .execute("SELECT COUNT(*) AS changes FROM lix_change", &[])
+            .await
+            .expect("changelog count after untracked write should execute")
+            .rows()[0]
+            .get::<i64>("changes")
+            .expect("changelog count should be numeric");
+        let diff_after = session
+            .execute(
+                "SELECT COUNT(*) AS entries FROM lix_working_change \
+                 WHERE schema_key = 'json_pointer'",
+                &[],
+            )
+            .await
+            .expect("working diff after untracked write should execute")
+            .rows()[0]
+            .get::<i64>("entries")
+            .expect("working diff count should be numeric");
+
+        assert_eq!(
+            head_after, head_before,
+            "an untracked-only write must not publish a new branch commit"
+        );
+        assert_eq!(
+            changes_after, changes_before,
+            "an untracked-only write must not append a changelog change"
+        );
+        assert_eq!(
+            diff_after, diff_before,
+            "untracked state must not participate in tracked working diffs"
+        );
+    }
+
+    #[tokio::test]
+    async fn untracked_state_survives_checkpoint_replay_and_next_current_materialization() {
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage.clone())
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/checkpointed', lix_json('{\"source\":\"tracked\"}'))",
+                &[],
+            )
+            .await
+            .expect("tracked row should commit before checkpoint");
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should publish a replay-backed tracked head");
+        let read = StorageAdapter::new(storage.clone())
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("control read should open");
+        let control = crate::branch::BranchHeadControlContext::new()
+            .reader(read)
+            .load(&receipt.main_branch_id)
+            .await
+            .expect("main control should load")
+            .expect("main control should exist");
+        assert!(
+            !control.tracked_head_is_current,
+            "selected checkpoint publication deliberately serves tracked rows from history"
+        );
+
+        // A replay-backed tracked head must not make workspace state
+        // unwritable. This mutates its retained current-state generation only;
+        // it neither advances the commit graph nor resets tracked state.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value, lixcol_untracked) \
+                 VALUES ('/workspace', lix_json('{\"source\":\"untracked\"}'), true)",
+                &[],
+            )
+            .await
+            .expect("untracked row should write while tracked state replays");
+        let workspace_row = session
+            .execute(
+                "SELECT value FROM json_pointer WHERE path = '/workspace'",
+                &[],
+            )
+            .await
+            .expect("untracked row should read through the replay fallback");
+        assert_eq!(
+            workspace_row.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("workspace value should decode"),
+            json!({"source": "untracked"})
+        );
+
+        // The next tracked child rebuilds a complete hot current-state
+        // generation from history and carries the history-free member forward.
+        session
+            .execute(
+                "INSERT INTO json_pointer (path, value) \
+                 VALUES ('/after-replay', lix_json('{\"source\":\"tracked\"}'))",
+                &[],
+            )
+            .await
+            .expect("tracked child should rematerialize current state");
+        let rows = session
+            .execute("SELECT path FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("rematerialized current state should read");
+        assert_eq!(
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("row path"))
+                .collect::<Vec<_>>(),
+            ["/after-replay", "/checkpointed", "/workspace"]
+        );
+        let read = StorageAdapter::new(storage)
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("current-control read should open");
+        assert!(
+            crate::branch::BranchHeadControlContext::new()
+                .reader(read)
+                .load(&receipt.main_branch_id)
+                .await
+                .expect("main control should load")
+                .expect("main control should exist")
+                .tracked_head_is_current,
+            "the tracked child must publish one complete current-state generation"
         );
     }
 

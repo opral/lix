@@ -3,7 +3,7 @@
 // assertion.
 #![allow(dead_code)]
 
-const READ_MANY_PK_COUNT: usize = 10;
+const READ_MANY_PK_COUNT: usize = 4;
 
 #[path = "../benches/tracked_state_crud/raw_sqlite.rs"]
 mod raw_sqlite;

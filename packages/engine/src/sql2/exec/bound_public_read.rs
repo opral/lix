@@ -79,22 +79,29 @@ where
                 .into_iter()
                 .map(EntityPk::single)
                 .collect::<Vec<_>>();
-            let mut rows = ctx
-                .live_state()
-                .scan_rows(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![schema_key.clone()],
-                        entity_pks,
-                        branch_ids: vec![ctx.active_branch_id().to_string()],
-                        include_tombstones: false,
-                        ..LiveStateFilter::default()
-                    },
-                    projection: LiveStateProjection {
-                        columns: vec!["snapshot_content".to_string()],
-                    },
-                    limit: None,
-                })
-                .await?;
+            let request = LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![schema_key.clone()],
+                    entity_pks,
+                    branch_ids: vec![ctx.active_branch_id().to_string()],
+                    include_tombstones: false,
+                    ..LiveStateFilter::default()
+                },
+                projection: LiveStateProjection {
+                    columns: vec!["snapshot_content".to_string()],
+                },
+                limit: None,
+            };
+            if let Some(reader) = ctx.entity_snapshot_reader()
+                && let Some(snapshots) = reader.scan_entity_snapshots(request.clone()).await?
+            {
+                return Ok(Some(SqlQueryResult {
+                    columns: shape.projection.clone(),
+                    rows: materialize_snapshot_rows(spec, &shape.projection, snapshots)?,
+                    notices: Vec::new(),
+                }));
+            }
+            let mut rows = ctx.live_state().scan_rows(&request).await?;
 
             // The accepted ORDER BY is the complete one-column primary key.
             // Retain multiple file-backed identities for one logical primary
@@ -143,12 +150,7 @@ where
             else {
                 return Ok(None);
             };
-            let decoder =
-                EntityProjectionDecoder::new(spec, shape.projection.iter().map(String::as_str))
-                    .map_err(entity_projection_error_to_lix_error)?;
-            let rows = decoder
-                .decode_value_rows(snapshots.iter().map(Option::as_deref))
-                .map_err(entity_projection_error_to_lix_error)?;
+            let rows = materialize_snapshot_rows(spec, &shape.projection, snapshots)?;
             Ok(Some(SqlQueryResult {
                 columns: shape.projection,
                 rows,
@@ -201,6 +203,18 @@ fn materialize_row(
             materialize_value(spec_column.column_type, value)
         })
         .collect()
+}
+
+fn materialize_snapshot_rows(
+    spec: &crate::sql2::catalog::EntitySurfaceSpec,
+    projection: &[String],
+    snapshots: Vec<Option<bytes::Bytes>>,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let decoder = EntityProjectionDecoder::new(spec, projection.iter().map(String::as_str))
+        .map_err(entity_projection_error_to_lix_error)?;
+    decoder
+        .decode_value_rows(snapshots.iter().map(Option::as_deref))
+        .map_err(entity_projection_error_to_lix_error)
 }
 
 fn materialize_value(

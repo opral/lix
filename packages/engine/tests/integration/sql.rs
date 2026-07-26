@@ -111,7 +111,7 @@ mod lix_registered_schema;
 mod metadata;
 mod read_only;
 mod udfs;
-mod untracked_change_ledger;
+mod untracked_current_state;
 
 use lix_engine::ExecuteResult;
 use lix_engine::Value;

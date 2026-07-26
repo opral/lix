@@ -183,6 +183,55 @@ impl StorageWriteSet {
         }
     }
 
+    /// Stages a batch of content-addressed puts with one lookup pass over the
+    /// already staged lane.
+    ///
+    /// This is for a caller that has an entire content-addressed batch ready
+    /// at once. Repeated [`Self::put_content_addressed`] calls each scan the
+    /// lane independently, which is needlessly quadratic for a large batch.
+    /// Identical entries already staged by an earlier batch are coalesced;
+    /// same-key, different-value entries remain duplicate mutations and are
+    /// deliberately left for the canonical validator to reject.
+    pub(crate) fn put_content_addressed_batch<I>(&mut self, space: StorageSpace, entries: I)
+    where
+        I: IntoIterator<Item = (Key, StoredValue)>,
+    {
+        let mut entries = entries.into_iter().peekable();
+        if entries.peek().is_none() {
+            return;
+        }
+
+        let (staged_puts, written_bytes) = {
+            let group = self.group_mut(space);
+            let mut existing = HashMap::with_capacity_and_hasher(
+                group.puts.len(),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+            for put in &group.puts {
+                existing
+                    .entry(put.key.clone())
+                    .or_insert_with(|| put.value.clone());
+            }
+
+            let mut staged_puts = 0;
+            let mut written_bytes = 0;
+            for (key, value) in entries {
+                if existing.get(&key).is_some_and(|prior| prior == &value) {
+                    continue;
+                }
+                if !existing.contains_key(&key) {
+                    existing.insert(key.clone(), value.clone());
+                }
+                written_bytes += value.bytes.len() as u64;
+                staged_puts += 1;
+                group.puts.push(PutEntry { key, value });
+            }
+            (staged_puts, written_bytes)
+        };
+        self.stats.staged_puts += staged_puts;
+        self.stats.written_bytes += written_bytes;
+    }
+
     pub fn delete<S, K>(&mut self, space: S, key: K)
     where
         S: IntoStorageSpace,
@@ -618,5 +667,37 @@ mod tests {
         assert_eq!(stats.delete_batches, 1);
         assert_eq!(commit.stats.put_entries, 2);
         assert_eq!(commit.stats.deleted_entries, 1);
+    }
+
+    #[test]
+    fn content_addressed_batch_coalesces_duplicates_across_staging_calls() {
+        let mut writes = StorageWriteSet::new();
+        writes.put_content_addressed_batch(
+            space(),
+            [
+                (key("a"), value("A")),
+                (key("b"), value("B")),
+                (key("a"), value("A")),
+            ],
+        );
+        writes
+            .put_content_addressed_batch(space(), [(key("b"), value("B")), (key("c"), value("C"))]);
+
+        assert_eq!(writes.stats().staged_puts, 3);
+        writes
+            .validate()
+            .expect("identical content-addressed candidates should coalesce");
+    }
+
+    #[test]
+    fn content_addressed_batch_preserves_conflicting_hash_validation() {
+        let mut writes = StorageWriteSet::new();
+        writes.put_content_addressed_batch(space(), [(key("a"), value("A"))]);
+        writes.put_content_addressed_batch(space(), [(key("a"), value("different"))]);
+
+        assert!(matches!(
+            writes.validate(),
+            Err(StorageWriteSetError::DuplicateMutation { .. })
+        ));
     }
 }

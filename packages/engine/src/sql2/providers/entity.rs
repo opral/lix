@@ -1351,7 +1351,6 @@ fn direct_entity_batch_eligible(
     !schema.fields().is_empty()
         && matches!(request.filter.rows, LiveStateRowFilter::All)
         && row_filters.is_empty()
-        && request.filter.entity_pks.is_empty()
         && request.filter.file_ids.is_empty()
         && request.filter.constraints.is_empty()
         && schema
@@ -1362,11 +1361,11 @@ fn direct_entity_batch_eligible(
 
 /// Selects the snapshot-to-Arrow implementation once per provider batch.
 ///
-/// Exact primary-key scans are latency-sensitive and keep their established
-/// serde-value path. Broad scans are dominated by decoding every snapshot, so
-/// they use the raw projection decoder that visits only selected fields. This
-/// is a physical execution choice; the SQL schema and result contract are the
-/// same in both cases.
+/// Exact primary-key scans retain their established serde-value fallback when
+/// a tracked-only snapshot proof is unavailable. Broad scans are dominated by
+/// decoding every snapshot, so their generic fallback uses the raw projection
+/// decoder that visits only selected fields. This is a physical execution
+/// choice; the SQL schema and result contract are the same in both cases.
 #[derive(Clone, Copy)]
 enum EntityBatchProjection {
     ParsedSnapshots,
@@ -1404,7 +1403,7 @@ fn entity_record_batch(
         }
         // Raw projection depends on the tracked write invariant: compact
         // TransactionJson bytes with no duplicate-key recovery semantics.
-        // Keep every sidecar/mixed batch on the established parser path.
+        // Keep every mixed-retention batch on the established parser path.
         EntityBatchProjection::RawTrackedProjection => {
             entity_record_batch_from_snapshots(spec, schema, rows)
         }
@@ -1814,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_entity_batch_is_broad_payload_only() {
+    fn direct_entity_batch_accepts_exact_payload_reads() {
         let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
         let system_schema = Schema::new(vec![Field::new("lixcol_entity_pk", DataType::Utf8, true)]);
         let mut request = LiveStateScanRequest::default();
@@ -1828,7 +1827,7 @@ mod tests {
             .filter
             .entity_pks
             .push(crate::entity_pk::EntityPk::single("row"));
-        assert!(!super::direct_entity_batch_eligible(
+        assert!(super::direct_entity_batch_eligible(
             &payload_schema,
             &request,
             &[]

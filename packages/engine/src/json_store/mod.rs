@@ -5,7 +5,10 @@ pub(crate) mod store;
 pub(crate) mod types;
 
 #[allow(unused_imports)]
-pub(crate) use context::{JsonStoreContext, JsonStoreReader, JsonStoreWriter};
+pub(crate) use context::{
+    JsonStoreContext, JsonStoreReader, JsonStoreWriter, UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
+    UntrackedJsonReclaimCandidate,
+};
 pub(crate) use types::{
     JSON_INLINE_MAX_BYTES, JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef,
     JsonWritePlacementRef, NormalizedJson, NormalizedJsonRef, json_slot_storage,

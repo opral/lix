@@ -16,8 +16,8 @@ use crate::entity_pk::EntityPk;
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
-    LiveStateIndexContext, LiveStateIndexDeltaRef, TrackedHeadContext, TrackedHeadDeltaRef,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+    CurrentStateDeltaRef, TrackedHeadContext, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    stage_tracked_working_diff_epoch,
 };
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
@@ -39,23 +39,22 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The v10 direct branch-control plane uses bounded packed tracked commit-delta
-/// segments and a complete untracked-schema presence record for every mutable
-/// flat-lane write. Those records are replayed by both historical reads and
-/// serving reads, so opening an older incompatible store must fail closed
-/// rather than mixing predecessor visibility rules with the current layout.
+/// V12 makes the packed current-state generation authoritative for both
+/// tracked and untracked rows. Untracked values have no separate index,
+/// presence marker, or standalone changelog record. Opening an older store
+/// must fail closed rather than mixing its former visibility rules with the
+/// unified current-state layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v10";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"unified-current-state.v12";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
 /// remain stable across hard layout cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepositoryProtocolStatus {
-    /// The current layout records every untracked schema mutation, so direct
-    /// tracked-head serving may prove that marker absence is safe.
+    /// The current layout has one authoritative current-state plane.
     Current,
     Missing,
     Unsupported,
@@ -92,16 +91,16 @@ pub(crate) async fn repository_protocol_status(
 pub(crate) fn unsupported_repository_protocol_error() -> LixError {
     LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
-        "repository uses an unsupported tracked direct-plane storage protocol; recreate the repository",
+        "repository uses an unsupported unified current-state storage protocol; recreate the repository",
     )
 }
 
 /// Pure seed plan for initializing an engine repository.
 ///
 /// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
-/// the v10 direct control plane and retain a standalone immutable branch-ref
-/// ledger change; only ordinary untracked data enters the flat untracked
-/// lane.
+/// the direct current-state control plane and retain a standalone immutable
+/// branch-ref ledger change; ordinary untracked data shares the same current
+/// state generation without creating a changelog fact.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
@@ -220,8 +219,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         created_at: timestamp,
     };
     // Keep one distinct public ref change id per initial branch, matching the
-    // old `lix_branch_ref` current rows without writing those rows into the
-    // normal sidecar plane.
+    // old `lix_branch_ref` current rows without materializing those rows in
+    // the ordinary current-state generation.
     let global_branch_ref_change = branch_ref_ledger_change(
         functions.call_uuid_v7(),
         GLOBAL_BRANCH_ID,
@@ -233,6 +232,9 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             generation: initial_commit_id,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
@@ -250,6 +252,9 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             generation: initial_commit_id,
+            tracked_head_is_current: true,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
@@ -295,7 +300,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 pub(crate) async fn initialize<StorageImpl>(
     storage: StorageAdapter<StorageImpl>,
     tracked_state: &TrackedStateContext,
-    live_index: &LiveStateIndexContext,
 ) -> Result<InitReceipt, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -316,11 +320,6 @@ where
         .iter()
         .map(seed_change_to_change_record)
         .collect::<Vec<_>>();
-    let untracked_changes = plan
-        .untracked_rows
-        .iter()
-        .map(seed_untracked_change_to_change_record)
-        .collect::<Vec<_>>();
     let branch_ref_ledger_changes = plan
         .branch_controls
         .iter()
@@ -334,7 +333,6 @@ where
         &plan,
         authored_changes
             .iter()
-            .chain(&untracked_changes)
             .chain(&branch_ref_ledger_changes)
             .cloned()
             .collect(),
@@ -360,18 +358,19 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        // Seed both visible branches with a complete v10 serving generation.
+        // Seed both visible branches with a complete V12 current-state generation.
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
         // historical fallback immediately after initialization.
-        let head_deltas = authored_changes
+        let tracked_head_deltas = authored_changes
             .iter()
-            .map(|change| TrackedHeadDeltaRef {
+            .map(|change| CurrentStateDeltaRef {
                 schema_key: &change.schema_key,
                 file_id: change.file_id.as_deref(),
                 entity_pk: &change.entity_pk,
-                change_id: change.change_id,
-                commit_id: plan.commit.id,
+                change_id: Some(change.change_id),
+                commit_id: Some(plan.commit.id),
+                untracked: false,
                 deleted: change.snapshot.is_none(),
                 created_at: change.created_at,
                 updated_at: change.created_at,
@@ -382,17 +381,33 @@ where
         let tracked_head = TrackedHeadContext::new();
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
+            let mut head_deltas = tracked_head_deltas.clone();
+            if branch.branch_id == GLOBAL_BRANCH_ID {
+                head_deltas.extend(plan.untracked_rows.iter().map(|row| CurrentStateDeltaRef {
+                    schema_key: &row.schema_key,
+                    file_id: None,
+                    entity_pk: &row.entity_pk,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: true,
+                    deleted: false,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                    snapshot: crate::json_store::JsonSlotRef::Inline(&row.snapshot_content),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                }));
+            }
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(&read, &mut writes)
-                .stage_commit_with_working_diff(
+                .stage_current_state_with_working_diff(
                     &branch.branch_id,
                     None,
                     plan.commit.id,
                     &head_deltas,
                     &absence_guards,
                     None,
-                    Some(plan.commit.id),
+                    None,
                     None,
                     &mut working_diff_coverage,
                 )
@@ -408,25 +423,6 @@ where
             )?;
             stage_branch_head_control(&mut writes, &branch.branch_id, branch.control)?;
         }
-
-        let mut index_writer = live_index.writer(&read, &mut writes);
-        index_writer
-            .stage_branch_rows(
-                GLOBAL_BRANCH_ID,
-                plan.untracked_rows
-                    .iter()
-                    .map(|row| LiveStateIndexDeltaRef {
-                        schema_key: &row.schema_key,
-                        file_id: None,
-                        entity_pk: &row.entity_pk,
-                        change_id: row.id,
-                        commit_id: None,
-                        deleted: false,
-                        created_at: row.created_at,
-                        updated_at: row.updated_at,
-                    }),
-            )
-            .await?;
     }
     crate::catalog::stage_catalog_revision(&mut writes);
     stage_repository_protocol(&mut writes);
@@ -576,7 +572,7 @@ fn untracked_row(
 
 /// The direct control owns a branch ref's current visibility, while this
 /// standalone fact preserves the public immutable `lix_change` ledger row.
-/// It intentionally does not enter `LiveStateIndex`.
+/// It is not a mutable current-state member.
 fn branch_ref_ledger_change(
     id: uuid::Uuid,
     branch_id: &str,
@@ -801,9 +797,7 @@ mod tests {
         let storage = Memory::new();
         let storage = StorageAdapter::new(storage);
         let tracked_state = TrackedStateContext::new();
-        let live_index = LiveStateIndexContext::new();
-
-        let receipt = initialize(storage.clone(), &tracked_state, &live_index)
+        let receipt = initialize(storage.clone(), &tracked_state)
             .await
             .expect("engine should initialize");
         let mut reader = ChangelogContext::new().reader(

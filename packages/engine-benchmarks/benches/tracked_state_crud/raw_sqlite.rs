@@ -9,11 +9,27 @@ pub(crate) struct RawSqliteFixture {
     rows: Vec<WorkloadRow>,
     read_many_by_pk_count: usize,
     read_many_by_pk_sql: String,
+    read_many_by_pk_literal_sql: String,
     literal_update_sql: Vec<String>,
     _dir: TempDir,
 }
 
 pub(crate) fn empty_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
+    empty_fixture_with_read_many_pk_count(rows, crate::READ_MANY_PK_COUNT)
+}
+
+/// Builds a fixture whose setup-excluded multi-point query has exactly
+/// `read_many_by_pk_count` primary-key terms. Profile mode uses this to
+/// measure read-many scaling without changing the Criterion workload shape.
+pub(crate) fn empty_fixture_with_read_many_pk_count(
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+) -> RawSqliteFixture {
+    assert!(
+        (1..=rows.len()).contains(&read_many_by_pk_count),
+        "read-many primary-key count must be between 1 and {}, got {read_many_by_pk_count}",
+        rows.len()
+    );
     let dir = tempfile::tempdir().expect("create raw sqlite benchmark directory");
     let path = dir.path().join("raw.sqlite");
     let connection = Connection::open(path).expect("open raw sqlite benchmark database");
@@ -32,19 +48,26 @@ pub(crate) fn empty_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
              ) WITHOUT ROWID;",
         )
         .expect("initialize raw sqlite benchmark database");
-    let read_many_by_pk_count = rows.len().min(crate::READ_MANY_PK_COUNT);
     RawSqliteFixture {
         connection,
         rows: rows.to_vec(),
         read_many_by_pk_count,
         read_many_by_pk_sql: select_many_by_pk_sql(read_many_by_pk_count),
+        read_many_by_pk_literal_sql: literal_select_many_by_pk_sql(rows, read_many_by_pk_count),
         literal_update_sql: rows.iter().map(literal_update_sql).collect(),
         _dir: dir,
     }
 }
 
 pub(crate) fn seeded_fixture(rows: &[WorkloadRow]) -> RawSqliteFixture {
-    let mut fixture = empty_fixture(rows);
+    seeded_fixture_with_read_many_pk_count(rows, crate::READ_MANY_PK_COUNT)
+}
+
+pub(crate) fn seeded_fixture_with_read_many_pk_count(
+    rows: &[WorkloadRow],
+    read_many_by_pk_count: usize,
+) -> RawSqliteFixture {
+    let mut fixture = empty_fixture_with_read_many_pk_count(rows, read_many_by_pk_count);
     fixture.insert_all();
     fixture
 }
@@ -210,6 +233,26 @@ impl RawSqliteFixture {
         Self::public_result_from_query(query, count)
     }
 
+    /// Runs the same literal `IN (...)` statement shape as the Lix SQL
+    /// fixture. This is intentionally not prepared/cached: it makes SQL
+    /// parsing and statement construction part of SQLite's baseline while
+    /// retaining the same owned public result materialization as Lix.
+    pub(crate) fn read_many_by_pk_literal_public_result(&self, count: usize) -> ExecuteResult {
+        let count = count.min(self.rows.len());
+        assert_eq!(
+            count, self.read_many_by_pk_count,
+            "literal read-many benchmark must use the fixture's setup-excluded query shape"
+        );
+        let mut statement = self
+            .connection
+            .prepare(&self.read_many_by_pk_literal_sql)
+            .expect("prepare literal raw sqlite multi-point read");
+        let query = statement
+            .query([])
+            .expect("query literal raw sqlite multi-point rows");
+        Self::public_result_from_query(query, count)
+    }
+
     pub(crate) fn update_all(&mut self) -> usize {
         let transaction = self
             .connection
@@ -327,6 +370,22 @@ fn select_many_by_pk_sql(count: usize) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("SELECT path, value FROM json_pointer WHERE path IN ({placeholders}) ORDER BY path")
+}
+
+fn literal_select_many_by_pk_sql(rows: &[WorkloadRow], count: usize) -> String {
+    assert!(count > 0, "read-many benchmark requires at least one row");
+    assert!(
+        count <= rows.len(),
+        "literal read-many count must not exceed fixture rows"
+    );
+    format!(
+        "SELECT path, value FROM json_pointer WHERE path IN ({}) ORDER BY path",
+        rows[..count]
+            .iter()
+            .map(|row| format!("'{}'", sql_string(row.path.as_str())))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
 }
 
 fn literal_update_sql(row: &WorkloadRow) -> String {

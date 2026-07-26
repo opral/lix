@@ -1110,14 +1110,14 @@ async fn plan_gc_from_store(
         .iter()
         .filter_map(|root| match root {
             GcRoot::StandaloneChange(change_id) => Some(*change_id),
-            GcRoot::BranchHead(_) => None,
+            GcRoot::BranchHead(_) | GcRoot::CurrentPayload(_) => None,
         })
         .collect::<BTreeSet<_>>();
     let mut pending = roots
         .iter()
         .filter_map(|root| match root {
             GcRoot::BranchHead(commit_id) => Some(*commit_id),
-            GcRoot::StandaloneChange(_) => None,
+            GcRoot::StandaloneChange(_) | GcRoot::CurrentPayload(_) => None,
         })
         .collect::<Vec<_>>();
 
@@ -1139,7 +1139,13 @@ async fn plan_gc_from_store(
         );
     }
 
-    let mut live_payloads = BTreeSet::<[u8; 32]>::new();
+    let mut live_payloads = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::CurrentPayload(json_ref) => Some(*json_ref.as_hash_array()),
+            GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
+        })
+        .collect::<BTreeSet<[u8; 32]>>();
     for change_id in &live_changes {
         let Some(change) = changes.get(change_id) else {
             return Err(LixError::new(

@@ -6,7 +6,7 @@ mod stage_rows;
 mod types;
 
 pub(crate) use context::BranchContext;
-#[cfg(test)]
+#[cfg(any(test, feature = "storage-benches"))]
 pub(crate) use control::BRANCH_HEAD_CONTROL_SPACE;
 pub(crate) use control::{
     BranchHeadControl, BranchHeadControlContext, BranchHeadControlObservation,
