@@ -968,9 +968,14 @@ where
         // than replaying the entire interval a second time to rediscover it.
         let mut latest_after_by_key = BTreeMap::new();
         for commit_id in interval {
-            for (key, value) in self
-                .scan_replayed_commit_delta_values(commit_id, &request.schema_keys)
-                .await?
+            // This interval is strictly newer than `ancestor_commit_id`, while
+            // the before-image replay below walks the ancestor and its own
+            // parents. Caching the descendant rows by `(commit, key)` cannot
+            // satisfy that replay, so keep this one-pass diff discovery free
+            // of duplicate key/value ownership.
+            for (key, value) in
+                storage::scan_commit_delta_values(&self.store, commit_id, &request.schema_keys)
+                    .await?
             {
                 if request.matches_key(&key) {
                     latest_after_by_key.entry(key).or_insert(value);
