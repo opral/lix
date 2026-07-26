@@ -26,9 +26,10 @@ use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest, TrackedHeadContext, TrackedHeadDeltaRef, branch_empty_precondition,
-    load_local_sidecar_branch_token, local_sidecar_branch_precondition, row_absent_precondition,
-    row_raw_token_precondition, stage_local_sidecar_branch_marker,
+    LiveStateIndexScanRequest, TrackedHeadContext, TrackedHeadDeltaRef, TrackedWorkingDiffEpoch,
+    WorkingDiffIndexCoverage, branch_empty_precondition, load_local_sidecar_branch_token,
+    local_sidecar_branch_precondition, row_absent_precondition, row_raw_token_precondition,
+    stage_local_sidecar_branch_marker, stage_tracked_working_diff_epoch,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
@@ -248,6 +249,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_head"
     ))
     .await?;
+    stage_checkpoint_working_diff_epochs(&mut writes, &prepared_writes.checkpoint_publications)?;
     stage_branch_head_control_publications(
         &mut writes,
         &normal_branch_controls,
@@ -862,7 +864,7 @@ async fn stage_flat_current_rows(
 }
 
 /// A branch ref targets changelog history, not an implementation detail of
-/// its sparse immutable-root checkpoints. Ordinary v4 commits intentionally
+/// its sparse immutable-root checkpoints. Ordinary v6 commits intentionally
 /// have no root, so validate the canonical commit record instead.
 async fn ensure_branch_ref_target_exists(
     read: &(impl StorageAdapterRead + ?Sized),
@@ -1136,7 +1138,6 @@ async fn stage_tracked_head(
     observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<BTreeMap<String, BranchHeadControl>, LixError> {
     let tracked_head = TrackedHeadContext::new();
-    let mut writer = tracked_head.writer(read, writes);
     let mut controls = BTreeMap::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
@@ -1188,20 +1189,63 @@ async fn stage_tracked_head(
             })
             .collect::<BTreeSet<_>>();
 
-        // The v4 marker is the durable authority for current state. It is
+        // The v6 marker is the durable authority for current state. It is
         // intentionally bound only to the first-parent commit: serial normal
         // commits can append deltas without materializing an immutable root.
-        let parent_generation = match (root.parent_commit_id, parent_control) {
+        let parent_marker = match (root.parent_commit_id, parent_control) {
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
             {
                 tracked_head
                     .reader(read)
-                    .generation_if_control_current(&root.branch_id, control)
+                    .marker_info_if_control_current(&root.branch_id, control)
                     .await?
             }
             _ => None,
         };
+        let parent_generation = parent_marker.map(|marker| marker.generation);
+        // The working-diff epoch is valid only when it names the exact
+        // parent generation being materialized. A just-published checkpoint
+        // has no active diff generation yet; its first ordinary child either
+        // reuses an already materialized serving generation or bootstraps one.
+        let working_diff_epoch = match (root.parent_commit_id, parent_control) {
+            (Some(parent_commit_id), Some(control))
+                if control.head_commit_id == parent_commit_id =>
+            {
+                match tracked_head
+                    .reader(read)
+                    .working_diff_epoch(&root.branch_id)
+                    .await
+                {
+                    Ok(Some(epoch))
+                        if epoch.generation == parent_generation
+                            && parent_generation == Some(control.generation)
+                            && parent_marker.is_some_and(|marker| {
+                                marker.working_diff_checkpoint_commit_id
+                                    == Some(epoch.checkpoint_commit_id)
+                            }) =>
+                    {
+                        Some(epoch)
+                    }
+                    Ok(Some(epoch))
+                        if epoch.generation.is_none()
+                            && epoch.checkpoint_commit_id == parent_commit_id =>
+                    {
+                        Some(epoch)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let working_diff_checkpoint_commit_id = working_diff_epoch
+            .as_ref()
+            .map(|epoch| epoch.checkpoint_commit_id);
+        let mut working_diff_coverage = working_diff_epoch
+            .as_ref()
+            .filter(|epoch| epoch.generation.is_some() && epoch.generation == parent_generation)
+            .map(|epoch| epoch.coverage)
+            .unwrap_or_default();
         let parent_is_current = parent_generation.is_some();
         let parent_rows = if parent_is_current || root.parent_commit_id.is_none() {
             None
@@ -1209,7 +1253,7 @@ async fn stage_tracked_head(
             // A parent staged earlier in this same write set is not visible
             // through `read`; publish no partial generation. Once committed,
             // current reads safely take the changelog-replay fallback until a
-            // following ordinary child bootstraps a complete v4 head.
+            // following ordinary child bootstraps a complete v6 head.
             if tracked_roots
                 .iter()
                 .any(|candidate| candidate.commit_id == parent_commit_id)
@@ -1240,16 +1284,32 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        let generation = writer
-            .stage_commit(
-                &root.branch_id,
-                parent_generation,
-                root.commit_id,
-                &deltas,
-                &absence_guards,
-                parent_rows,
-            )
-            .await?;
+        let generation = {
+            let mut writer = tracked_head.writer(read, writes);
+            writer
+                .stage_commit_with_working_diff(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &deltas,
+                    &absence_guards,
+                    parent_rows,
+                    working_diff_checkpoint_commit_id,
+                    working_diff_checkpoint_commit_id,
+                    &mut working_diff_coverage,
+                )
+                .await?
+        };
+        if let Some(epoch) = working_diff_epoch {
+            let next_epoch = TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: epoch.checkpoint_commit_id,
+                generation: Some(generation),
+                coverage: working_diff_coverage,
+            };
+            if next_epoch != epoch {
+                stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
+            }
+        }
         insert_direct_branch_control(
             &mut controls,
             &root.branch_id,
@@ -1257,6 +1317,39 @@ async fn stage_tracked_head(
         )?;
     }
     Ok(controls)
+}
+
+/// A selected-ref checkpoint has after images but no trustworthy first-before
+/// values. Reset its working-diff epoch to the known-empty state instead; the
+/// first ordinary child bootstraps a fresh v6 head generation and captures
+/// its own preimages.
+fn stage_checkpoint_working_diff_epochs(
+    writes: &mut StorageWriteSet,
+    publications: &[crate::gc::CheckpointPublication],
+) -> Result<(), LixError> {
+    let mut branches = BTreeSet::new();
+    for publication in publications {
+        let recovery = &publication.recovery_ref;
+        if !branches.insert(recovery.branch_id.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "transaction publishes more than one working-diff checkpoint epoch for branch '{}'",
+                    recovery.branch_id
+                ),
+            ));
+        }
+        stage_tracked_working_diff_epoch(
+            writes,
+            &recovery.branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: recovery.checkpoint_commit_id,
+                generation: None,
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn normal_branch_head_control(
@@ -1292,7 +1385,7 @@ fn insert_direct_branch_control(
 /// Publishes every v6 branch-head control under an exact-byte CAS token.
 ///
 /// Normal tracked commits arrive as `normal_controls`, built from the same
-/// parent/generation decision that wrote the v5 group marker. Explicit branch
+/// parent/generation decision that wrote the v6 group marker. Explicit branch
 /// management still enters the prepared-row pipeline for validation and
 /// changelog compatibility, but its authoritative moving head is lowered
 /// here as well. This deliberately keeps the rare lifecycle lane compatible
@@ -1335,12 +1428,12 @@ async fn stage_branch_head_control_publications(
             .head_commit_id
             .map(|head_commit_id| BranchHeadControl {
                 head_commit_id,
-                // Repointing to the same head must not invalidate a complete v5
+                // Repointing to the same head must not invalidate a complete v6
                 // serving generation merely because public ref metadata changed.
                 generation: existing
                     .filter(|control| control.head_commit_id == head_commit_id)
                     .map_or(head_commit_id, |control| control.generation),
-                // The flat v5 branch-ref projection preserved creation time on
+                // The direct branch-ref projection preserves creation time on
                 // replacement. The control record owns that same public fact.
                 created_at: existing.map_or(target.created_at, |control| control.created_at),
                 updated_at: target.updated_at,
@@ -1439,7 +1532,7 @@ fn explicit_branch_head_targets(
 }
 
 /// Takes one coherent raw point batch for every control this materialization
-/// can publish. The result is threaded through v5 generation selection and
+/// can publish. The result is threaded through v6 generation selection and
 /// final CAS staging, so the control plane adds exactly one control batch to
 /// a commit rather than a head lookup plus a second token lookup.
 async fn observe_branch_head_controls(
@@ -1602,7 +1695,7 @@ async fn stage_tracked_roots(
 /// Immutable roots are a cold-path history structure. Keep them at topology
 /// and checkpoint fences, plus any staged first-parent ancestors necessary to
 /// build that fence in one atomic write set. Ordinary serial commits are
-/// represented only by the changelog and the v4 durable head projection.
+/// represented only by the changelog and the v6 durable head projection.
 fn tracked_root_fence_ids(
     tracked_roots: &[PendingTrackedRoot],
     force_all: bool,
@@ -3148,6 +3241,134 @@ mod tests {
             counts.marker_get_many_calls.load(Ordering::Relaxed),
             1,
             "serial tracked-head staging must reuse the generation it already read"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_working_diff_epoch_is_not_promoted_into_the_next_head() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let first_commit = commit_id("epoch-first-commit");
+
+        let mut first = tracked_branch_row("branch-a", "epoch-first-change");
+        first.commit_id = Some(first_commit);
+        let mut first_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open first commit read");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut first_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![first],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["epoch-first-change"],
+                        "epoch-first-commit",
+                        "epoch-first-commit-change",
+                        "epoch-first-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("first commit should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("first commit should persist");
+
+        // This deliberately names the right serving generation but a
+        // checkpoint that the marker never bound. It models a stale or
+        // corrupted auxiliary epoch; the next serial commit must not turn it
+        // into authoritative visibility.
+        let mut stale_epoch_writes = StorageWriteSet::new();
+        stage_tracked_working_diff_epoch(
+            &mut stale_epoch_writes,
+            "branch-a",
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id: commit_id("wrong-checkpoint"),
+                generation: Some(first_commit),
+                coverage: WorkingDiffIndexCoverage::default(),
+            },
+        )
+        .expect("stage stale epoch");
+        storage
+            .commit_write_set(stale_epoch_writes, StorageWriteOptions::default())
+            .await
+            .expect("persist stale epoch");
+
+        let second_commit = commit_id("epoch-second-commit");
+        let mut second = tracked_branch_row("branch-a", "epoch-second-change");
+        second.commit_id = Some(second_commit);
+        let mut second_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open second commit read");
+        let (writes, _) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            &LiveStateIndexContext::new(),
+            None,
+            &mut second_read,
+            PreparedWriteSet {
+                insert_identities: BTreeMap::new(),
+                state_rows: vec![second],
+                commit_change_refs_by_branch: BTreeMap::from([(
+                    "branch-a".to_string(),
+                    change_refs_with(
+                        ["epoch-second-change"],
+                        "epoch-second-commit",
+                        "epoch-second-commit-change",
+                        "epoch-second-branch-ref-change",
+                    ),
+                )]),
+                first_commit_parent_override_by_branch: BTreeMap::new(),
+                checkpoint_publications: Vec::new(),
+                extra_commit_parents_by_branch: BTreeMap::new(),
+                file_data_writes: Vec::new(),
+            },
+        )
+        .await
+        .expect("second commit should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("second commit should persist");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open direct-diff verification read");
+        let control = BranchHeadControlContext::new()
+            .reader(&read)
+            .load("branch-a")
+            .await
+            .expect("load branch control")
+            .expect("branch control must exist");
+        assert_eq!(control.head_commit_id, second_commit);
+        assert!(
+            TrackedHeadContext::new()
+                .reader(read)
+                .working_diff_if_control_current(
+                    "branch-a",
+                    control,
+                    &crate::tracked_state::TrackedStateDiffRequest::default(),
+                )
+                .await
+                .expect("stale epoch must select fallback, not error")
+                .is_none(),
+            "a stale epoch must not be rebound by a later serial commit"
         );
     }
 

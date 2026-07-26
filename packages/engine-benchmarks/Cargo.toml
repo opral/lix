@@ -88,6 +88,12 @@ harness = false
 required-features = ["storage-benches"]
 
 [[bench]]
+name = "tracked_working_diff"
+path = "benches/tracked_working_diff.rs"
+harness = false
+required-features = ["rocksdb"]
+
+[[bench]]
 name = "slatedb_file_api"
 path = "benches/slatedb_file_api.rs"
 harness = false

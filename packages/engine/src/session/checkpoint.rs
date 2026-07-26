@@ -58,41 +58,58 @@ where
                             )
                             .await?
                     };
-                    let direct_checkpoint = {
-                        let mut tracked = transaction.tracked_state_reader().await;
-                        latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id).await?
-                    };
-                    let previous_checkpoint_commit_id = match direct_checkpoint {
-                        Some(commit_id) => commit_id,
-                        None => {
-                            let mut reader = transaction.commit_graph_reader().await;
-                            checkpoint_history_from_head(&mut reader, &head_commit_id)
+                    let direct_working_diff = transaction
+                        .working_diff_at_head(
+                            &branch_id,
+                            head_commit_id,
+                            &TrackedStateDiffRequest::default(),
+                        )
+                        .await?;
+                    let previous_checkpoint_commit_id = if let Some(direct) = &direct_working_diff {
+                        direct.checkpoint_commit_id
+                    } else {
+                        let direct_checkpoint = {
+                            let mut tracked = transaction.tracked_state_reader().await;
+                            latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id)
                                 .await?
-                                .into_iter()
-                                .next()
-                                .ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_INTERNAL_ERROR,
-                                        format!(
-                                            "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
-                                        ),
-                                    )
-                                })?
-                                .commit_id
+                        };
+                        match direct_checkpoint {
+                            Some(commit_id) => commit_id,
+                            None => {
+                                let mut reader = transaction.commit_graph_reader().await;
+                                checkpoint_history_from_head(&mut reader, &head_commit_id)
+                                    .await?
+                                    .into_iter()
+                                    .next()
+                                    .ok_or_else(|| {
+                                        LixError::new(
+                                            LixError::CODE_INTERNAL_ERROR,
+                                            format!(
+                                                "branch '{branch_id}' has no checkpoint baseline in its first-parent history"
+                                            ),
+                                        )
+                                    })?
+                                    .commit_id
+                            }
                         }
                     };
                     let interval_has_commits =
                         head_commit_id != previous_checkpoint_commit_id;
                     let selected_changes = {
-                        let mut reader = transaction.tracked_state_reader().await;
-                        reader
-                            .diff_commits(
-                                &previous_checkpoint_commit_id.to_string(),
-                                &head_commit_id.to_string(),
-                                &TrackedStateDiffRequest::default(),
-                            )
-                            .await?
-                            .entries
+                        let entries = if let Some(direct) = direct_working_diff {
+                            direct.diff.entries
+                        } else {
+                            let mut reader = transaction.tracked_state_reader().await;
+                            reader
+                                .diff_commits(
+                                    &previous_checkpoint_commit_id.to_string(),
+                                    &head_commit_id.to_string(),
+                                    &TrackedStateDiffRequest::default(),
+                                )
+                                .await?
+                                .entries
+                        };
+                        entries
                             .into_iter()
                             .filter(|entry| {
                                 entry.identity.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY

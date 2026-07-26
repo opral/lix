@@ -23,7 +23,9 @@ pub(crate) use reader::load_exact_rows_via_scan_for_test;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
     TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MARKER_SPACE, TRACKED_HEAD_MEMBER_SPACE,
-    TrackedHeadContext, TrackedHeadDeltaRef,
+    TRACKED_WORKING_DIFF_GROUP_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
+    TrackedHeadDeltaRef, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    stage_collect_stale_working_diff_indexes, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{

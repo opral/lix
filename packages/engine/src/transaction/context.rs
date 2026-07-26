@@ -20,7 +20,10 @@ use tracing::Instrument as _;
 
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
-use crate::branch::{BRANCH_REF_SCHEMA_KEY, BranchContext, BranchRefReader, branch_ref_stage_row};
+use crate::branch::{
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
+    branch_ref_stage_row,
+};
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision,
     stage_catalog_revision,
@@ -43,6 +46,7 @@ use crate::gc::{
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
     LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    TrackedHeadContext, TrackedWorkingDiff,
 };
 use crate::live_state::{overlay_load_exact_rows, overlay_scan_rows};
 use crate::plugin::{
@@ -78,7 +82,7 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
-use crate::tracked_state::{TrackedStateContext, TrackedStateStoreReader};
+use crate::tracked_state::{TrackedStateContext, TrackedStateDiffRequest, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY, normalize_transaction_write_row,
@@ -3678,6 +3682,36 @@ where
             .expect("open transaction read scope");
         self.tracked_state
             .reader(SharedStorageAdapterRead::new(read))
+    }
+
+    /// Attempts the current branch's checkpoint-relative direct diff from one
+    /// transaction-scoped snapshot. A missing or stale accelerator is an
+    /// ordinary `None`; callers retain the historical tracked-state oracle.
+    pub(crate) async fn working_diff_at_head(
+        &self,
+        branch_id: &str,
+        head_commit_id: CommitId,
+        request: &TrackedStateDiffRequest,
+    ) -> Result<Option<TrackedWorkingDiff>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let Some(control) = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load(branch_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if control.head_commit_id != head_commit_id {
+            return Ok(None);
+        }
+        TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_if_control_current(branch_id, control, request)
+            .await
     }
 
     /// Creates a commit-graph reader scoped to this write transaction.

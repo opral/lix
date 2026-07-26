@@ -17,6 +17,7 @@ use crate::functions::FunctionProviderHandle;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     LiveStateIndexContext, LiveStateIndexDeltaRef, TrackedHeadContext, TrackedHeadDeltaRef,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
 };
 use crate::schema::{
     registered_schema_entity_pk, schema_key_from_definition, seed_schema_definitions,
@@ -38,14 +39,25 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The v6 direct branch-control plane changes the authority for current
-/// branch heads. Those proofs are only sound for repositories initialized
-/// with this protocol, so opening an older store must fail closed rather than
-/// mixing a legacy `lix_branch_ref` row with current visibility rules.
+/// The v8 direct branch-control plane binds checkpoint-relative first-before
+/// summaries and their sparse-index coverage to the serving-head marker.
+/// Those proofs are only sound for repositories initialized with this
+/// protocol, so opening an older store must fail closed rather than mixing an
+/// older group wire format with current visibility and working-diff rules.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v6";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v8";
+
+/// Raw status of the repository protocol marker. Engine opening consults this
+/// before it touches any tracked-head space, whose physical IDs deliberately
+/// remain stable across hard layout cuts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepositoryProtocolStatus {
+    Current,
+    Missing,
+    Unsupported,
+}
 
 pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
     writes.put(
@@ -55,27 +67,31 @@ pub(crate) fn stage_repository_protocol(writes: &mut StorageWriteSet) {
     );
 }
 
-pub(crate) async fn assert_repository_protocol(
+pub(crate) async fn repository_protocol_status(
     read: &(impl StorageAdapterRead + ?Sized),
-) -> Result<(), LixError> {
+) -> Result<RepositoryProtocolStatus, LixError> {
     let values = PointReadPlan::new(
         REPOSITORY_PROTOCOL_SPACE,
         &[StorageKey(Bytes::from_static(REPOSITORY_PROTOCOL_KEY))],
     )
     .materialize(read, StorageGetOptions::default())
     .await?;
-    let supported = matches!(
-        values.value.into_iter().next().flatten(),
+    Ok(match values.value.into_iter().next().flatten() {
         Some(StorageProjectedValue::FullValue(value))
-            if value.as_ref() == REPOSITORY_PROTOCOL_VALUE
-    );
-    if supported {
-        return Ok(());
-    }
-    Err(LixError::new(
+            if value.as_ref() == REPOSITORY_PROTOCOL_VALUE =>
+        {
+            RepositoryProtocolStatus::Current
+        }
+        Some(_) => RepositoryProtocolStatus::Unsupported,
+        None => RepositoryProtocolStatus::Missing,
+    })
+}
+
+pub(crate) fn unsupported_repository_protocol_error() -> LixError {
+    LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
         "repository uses an unsupported tracked direct-plane storage protocol; recreate the repository",
-    ))
+    )
 }
 
 /// Pure seed plan for initializing an engine repository.
@@ -282,15 +298,16 @@ pub(crate) async fn initialize<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let functions = FunctionProviderHandle::system();
-    let plan = plan_init_seed(functions)?;
-    let receipt = plan.receipt.clone();
-
     let mut read = SharedStorageAdapterRead::new(
         storage
             .begin_read(crate::storage_adapter::StorageReadOptions::default())
             .await?,
     );
+    assert_empty_repository_for_initialize::<StorageImpl>(&read).await?;
+
+    let functions = FunctionProviderHandle::system();
+    let plan = plan_init_seed(functions)?;
+    let receipt = plan.receipt.clone();
     let mut writes = StorageWriteSet::new();
     let authored_changes = plan
         .changes
@@ -341,7 +358,7 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        // Seed both visible branches with a complete v5 serving generation.
+        // Seed both visible branches with a complete v6 serving generation.
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
         // historical fallback immediately after initialization.
@@ -363,17 +380,30 @@ where
         let tracked_head = TrackedHeadContext::new();
         let absence_guards = std::collections::BTreeSet::default();
         for branch in &plan.branch_controls {
+            let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             tracked_head
                 .writer(&read, &mut writes)
-                .stage_commit(
+                .stage_commit_with_working_diff(
                     &branch.branch_id,
                     None,
                     plan.commit.id,
                     &head_deltas,
                     &absence_guards,
                     None,
+                    Some(plan.commit.id),
+                    None,
+                    &mut working_diff_coverage,
                 )
                 .await?;
+            stage_tracked_working_diff_epoch(
+                &mut writes,
+                &branch.branch_id,
+                TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id: plan.commit.id,
+                    generation: Some(plan.commit.id),
+                    coverage: working_diff_coverage,
+                },
+            )?;
             stage_branch_head_control(&mut writes, &branch.branch_id, branch.control)?;
         }
 
@@ -406,6 +436,35 @@ where
         )
         .await?;
     Ok(receipt)
+}
+
+/// Initialization is a create operation, never a migration. The direct-head
+/// spaces intentionally retain their physical IDs across protocol cuts, so
+/// writing a new protocol marker over existing bytes would make old values
+/// look like current layout state.
+async fn assert_empty_repository_for_initialize<StorageImpl>(
+    read: &SharedStorageAdapterRead<StorageImpl::Read<'_>>,
+) -> Result<(), LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    match repository_protocol_status(read).await? {
+        RepositoryProtocolStatus::Current => Err(LixError::new(
+            "LIX_ERROR_ALREADY_INITIALIZED",
+            "engine storage is already initialized; initialization does not migrate or overwrite repositories",
+        )),
+        RepositoryProtocolStatus::Unsupported => Err(unsupported_repository_protocol_error()),
+        RepositoryProtocolStatus::Missing => {
+            if StorageAdapter::<StorageImpl>::load_mutation_revision_from_read(read)
+                .await?
+                .is_some()
+            {
+                Err(unsupported_repository_protocol_error())
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
 
 fn seed_change_to_change_record(change: &InitSeedChange) -> ChangeRecord {

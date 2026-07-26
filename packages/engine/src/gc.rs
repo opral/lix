@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot};
-use crate::live_state::LiveStateIndexContext;
+use crate::live_state::{LiveStateIndexContext, stage_collect_stale_working_diff_indexes};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
@@ -420,6 +420,10 @@ where
         crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
         crate::tracked_state::stage_delete_commit_deltas(&store, writes, *commit_id).await?;
     }
+    // Checkpoint publication leaves prior dirty-index generations unreachable
+    // in O(1). Reclaim those auxiliary records only in the asynchronous GC
+    // pass so a foreground checkpoint never pays a history-sized delete cost.
+    stage_collect_stale_working_diff_indexes(&store, writes).await?;
     let tracked_root_stage_us = elapsed_micros(phase_started);
 
     Ok(RepositoryGcPlan {

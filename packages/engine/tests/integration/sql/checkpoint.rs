@@ -225,6 +225,80 @@ simulation_test!(
 );
 
 simulation_test!(
+    working_change_reports_net_tracked_adds_and_removals_after_a_revert,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+
+        for (key, value) in [("working-removed", "old"), ("working-reverted", "old")] {
+            session
+                .execute(
+                    &format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')"),
+                    &[],
+                )
+                .await
+                .expect("tracked baseline insert should succeed");
+        }
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should succeed");
+
+        for sql in [
+            "UPDATE lix_key_value SET value = 'new' WHERE key = 'working-reverted'",
+            "UPDATE lix_key_value SET value = 'old' WHERE key = 'working-reverted'",
+            "DELETE FROM lix_key_value WHERE key = 'working-removed'",
+            "INSERT INTO lix_key_value (key, value) VALUES ('working-added', 'new')",
+        ] {
+            session
+                .execute(sql, &[])
+                .await
+                .expect("tracked working change should succeed");
+        }
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT entity_pk, change_kind \
+                 FROM lix_working_change \
+                 WHERE schema_key = 'lix_key_value' \
+                 ORDER BY entity_pk",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Json(json!(["working-added"])),
+                    Value::Text("added".to_string()),
+                ],
+                vec![
+                    Value::Json(json!(["working-removed"])),
+                    Value::Text("removed".to_string()),
+                ],
+            ],
+            "the direct working-diff path must collapse a payload revert",
+        );
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT change_kind \
+                 FROM lix_working_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_pk = lix_json('[\"working-removed\"]')",
+            )
+            .await,
+            vec![vec![Value::Text("removed".to_string())]],
+            "an exact PK filter must preserve the same net diff",
+        );
+    }
+);
+
+simulation_test!(
     filesystem_working_change_surfaces_compose_paths_and_directory_moves,
     |sim| async move {
         let engine = sim.boot_engine().await;
