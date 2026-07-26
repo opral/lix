@@ -4,8 +4,9 @@ use bytes::Bytes;
 
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapterRead, StorageCoreProjection, StoragePrefix, StorageProjectedValue,
-    StorageScanOptions, StorageWriteOptions, StorageWriteSet, StorageWriteSetError,
+    ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection, StoragePrefix,
+    StorageProjectedValue, StorageScanOptions, StorageWriteOptions, StorageWriteSet,
+    StorageWriteSetError,
 };
 use crate::{ReadOptions, WriteOptions};
 
@@ -24,6 +25,51 @@ pub struct BinaryCasWriteAccounting {
     pub chunk_lookup_miss_count: u64,
     pub chunk_lookup_elapsed_ns: u64,
     pub transaction_duplicate_chunk_count: u64,
+}
+
+/// Result of one benchmark-only historical tracked-state diff.
+///
+/// The durable-root flags prove which physical diff path the benchmark used:
+/// the intended populated case is a checkpoint on the left and a rootless
+/// ordinary commit on the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrackedHistoricalDiffBenchResult {
+    pub entries: usize,
+    pub left_has_durable_root: bool,
+    pub right_has_durable_root: bool,
+}
+
+/// Diffs two tracked commits through the production historical reader.
+///
+/// This is compiled only with `storage-benches`; it intentionally provides a
+/// narrow measurement bridge without expanding the normal engine API.
+#[inline(never)]
+pub async fn diff_tracked_commits_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    left_commit_id: &str,
+    right_commit_id: &str,
+) -> Result<TrackedHistoricalDiffBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    let mut reader = crate::tracked_state::TrackedStateContext::new().reader(read);
+    let left_has_durable_root = reader.has_durable_commit_root(left_commit_id).await?;
+    let right_has_durable_root = reader.has_durable_commit_root(right_commit_id).await?;
+    let entries = reader
+        .diff_commits(
+            left_commit_id,
+            right_commit_id,
+            &crate::tracked_state::TrackedStateDiffRequest::default(),
+        )
+        .await?
+        .entries
+        .len();
+    Ok(TrackedHistoricalDiffBenchResult {
+        entries,
+        left_has_durable_root,
+        right_has_durable_root,
+    })
 }
 
 pub fn reset_binary_cas_write_accounting() {
@@ -47,7 +93,7 @@ pub fn binary_cas_write_accounting() -> BinaryCasWriteAccounting {
 /// storage benchmarks so they can isolate CAS layout costs from SQL planning,
 /// validation, tracked state, and changelog work.
 pub async fn write_binary_cas_for_bench<StorageImpl>(
-    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+    storage: &StorageAdapter<StorageImpl>,
     bytes: &[u8],
 ) -> Result<String, crate::LixError>
 where
@@ -68,7 +114,7 @@ where
 /// Reads one payload through the production binary CAS. See
 /// [`write_binary_cas_for_bench`] for why this feature-gated helper exists.
 pub async fn read_binary_cas_for_bench<StorageImpl>(
-    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+    storage: &StorageAdapter<StorageImpl>,
     hash_hex: &str,
 ) -> Result<Option<Vec<u8>>, crate::LixError>
 where
@@ -118,7 +164,7 @@ pub struct StorageLayoutAccounting {
 }
 
 pub(crate) async fn commit_write_set_for_bench<StorageImpl>(
-    storage: &crate::storage_adapter::StorageAdapter<StorageImpl>,
+    storage: &StorageAdapter<StorageImpl>,
     writes: StorageWriteSet,
 ) -> Result<crate::storage_adapter::StorageWriteSetStats, StorageWriteSetError>
 where
