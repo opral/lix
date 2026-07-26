@@ -32,6 +32,20 @@ pub(crate) const LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE: StorageSpace = StorageSp
     LIVE_STATE_LOCAL_SIDECAR_BRANCH_NAMESPACE,
 );
 
+/// Records that the untracked lane has been used for one branch and schema.
+///
+/// The record is deliberately monotonic: a later untracked deletion leaves
+/// the marker in place, so serving reads never mistake a cleaned-up schema for
+/// one that has never had untracked state. The v10 repository protocol makes
+/// every flat-lane writer stage this marker, so its absence proves that this
+/// branch/schema has no untracked history in a current repository.
+pub(crate) const LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_NAMESPACE: &str =
+    "live_state.untracked_schema_presence.v1";
+pub(crate) const LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0017),
+    LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_NAMESPACE,
+);
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(super) struct FlatIdentity {
@@ -70,6 +84,13 @@ struct BranchPrefixRef<'a> {
 #[musli(packed)]
 struct SidecarBranchRef<'a> {
     branch_id: &'a str,
+}
+
+#[derive(musli::Encode)]
+#[musli(packed)]
+struct UntrackedSchemaRef<'a> {
+    branch_id: &'a str,
+    schema_key: &'a str,
 }
 
 #[derive(musli::Encode)]
@@ -367,6 +388,16 @@ fn sidecar_branch_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("local-sidecar branch key", &SidecarBranchRef { branch_id })
 }
 
+fn untracked_schema_presence_key(branch_id: &str, schema_key: &str) -> Result<Vec<u8>, LixError> {
+    storage_codec::encode(
+        "untracked schema-presence key",
+        &UntrackedSchemaRef {
+            branch_id,
+            schema_key,
+        },
+    )
+}
+
 pub(crate) fn branch_empty_precondition(branch_id: &str) -> Result<StoragePrecondition, LixError> {
     let prefix = storage_codec::encode(
         "flat live-state branch prefix",
@@ -402,6 +433,29 @@ pub(crate) fn stage_local_sidecar_branch_marker(
     Ok(())
 }
 
+/// Stages a durable, positive record that an untracked schema was written.
+///
+/// The marker is intentionally not removed. A present marker may
+/// conservatively send a serving read through its existing untracked-aware
+/// path. In a v10 repository, an absent marker proves that tracked serving
+/// heads alone determine this branch/schema's visible state.
+pub(crate) fn stage_untracked_schema_presence_marker(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    schema_key: &str,
+) -> Result<(), LixError> {
+    writes.put(
+        LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE,
+        StorageKey(Bytes::from(untracked_schema_presence_key(
+            branch_id, schema_key,
+        )?)),
+        StorageValue {
+            bytes: Bytes::from_static(b"\x01"),
+        },
+    );
+    Ok(())
+}
+
 /// Returns the branch-local sidecar revision token, when one exists.
 ///
 /// This is an exact-key probe, deliberately replacing the historical
@@ -424,6 +478,36 @@ pub(crate) async fn load_local_sidecar_branch_token(
         Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "local-sidecar token read unexpectedly omitted its value",
+        )),
+    }
+}
+
+/// Loads the positive untracked-schema marker, when the repository recorded
+/// one.
+///
+/// In a v10 repository, `None` proves the branch/schema has never used the
+/// untracked lane. `Some` proves that it has and serving reads must retain the
+/// existing untracked-aware path. Engine opening rejects predecessor storage
+/// protocols before this helper can be used for a certified fast path.
+pub(crate) async fn load_untracked_schema_presence_marker(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    schema_key: &str,
+) -> Result<Option<Bytes>, LixError> {
+    let result = PointReadPlan::new(
+        LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE,
+        &[StorageKey(Bytes::from(untracked_schema_presence_key(
+            branch_id, schema_key,
+        )?))],
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?;
+    match result.value.into_iter().next().flatten() {
+        None => Ok(None),
+        Some(StorageProjectedValue::FullValue(value)) => Ok(Some(value)),
+        Some(StorageProjectedValue::KeyOnly) => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "untracked schema-presence marker read unexpectedly omitted its value",
         )),
     }
 }
@@ -644,6 +728,53 @@ mod tests {
         for prefix in prefixes {
             assert!(key.starts_with(&prefix));
         }
+    }
+
+    #[tokio::test]
+    async fn untracked_schema_presence_marker_is_exact_per_branch_and_schema() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = StorageWriteSet::new();
+        stage_untracked_schema_presence_marker(&mut writes, "branch-a", "schema-a")
+            .expect("branch marker should stage");
+        stage_untracked_schema_presence_marker(&mut writes, crate::GLOBAL_BRANCH_ID, "schema-a")
+            .expect("global marker should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("markers should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("marker read should open");
+        assert!(
+            load_untracked_schema_presence_marker(&read, "branch-a", "schema-a")
+                .await
+                .expect("branch marker should load")
+                .is_some(),
+            "a staged scope must retain its positive marker"
+        );
+        assert!(
+            load_untracked_schema_presence_marker(&read, crate::GLOBAL_BRANCH_ID, "schema-a")
+                .await
+                .expect("global marker should load")
+                .is_some(),
+            "global and branch scopes must each retain their marker"
+        );
+        assert!(
+            load_untracked_schema_presence_marker(&read, "branch-a", "schema-b")
+                .await
+                .expect("unrecorded schema should load")
+                .is_none(),
+            "a marker for one schema must not bleed into another"
+        );
+        assert!(
+            load_untracked_schema_presence_marker(&read, "branch-b", "schema-a")
+                .await
+                .expect("unrecorded branch should load")
+                .is_none(),
+            "a marker for one branch must not bleed into another"
+        );
     }
 
     #[tokio::test]

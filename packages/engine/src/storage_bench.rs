@@ -219,6 +219,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         crate::live_state::LIVE_STATE_INDEX_ROW_SPACE,
         crate::live_state::LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+        crate::live_state::LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE,
         crate::live_state::TRACKED_HEAD_GROUP_SPACE,
         crate::live_state::TRACKED_HEAD_MEMBER_SPACE,
         crate::live_state::TRACKED_HEAD_MARKER_SPACE,

@@ -39,21 +39,28 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// The v9 direct branch-control plane uses bounded packed tracked commit-delta
-/// segments. Those records are replayed by both historical reads and diffs,
-/// so opening an older store must fail closed rather than mixing one-row delta
-/// storage with the current visibility and working-diff rules.
+/// The v10 direct branch-control plane uses bounded packed tracked commit-delta
+/// segments and a complete untracked-schema presence record for every mutable
+/// flat-lane write. Those records are replayed by both historical reads and
+/// serving reads, so opening an older incompatible store must fail closed
+/// rather than mixing predecessor visibility rules with the current layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v9";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v10";
+const LEGACY_REPOSITORY_PROTOCOL_VALUE: &[u8] = b"tracked-direct-plane.v9";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
 /// remain stable across hard layout cuts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepositoryProtocolStatus {
+    /// The current layout records every untracked schema mutation, so direct
+    /// tracked-head serving may prove that marker absence is safe.
     Current,
+    /// The compatible v9 layout lacks complete untracked-schema markers.
+    /// It remains readable through the generic visibility path only.
+    Legacy,
     Missing,
     Unsupported,
 }
@@ -81,6 +88,11 @@ pub(crate) async fn repository_protocol_status(
         {
             RepositoryProtocolStatus::Current
         }
+        Some(StorageProjectedValue::FullValue(value))
+            if value.as_ref() == LEGACY_REPOSITORY_PROTOCOL_VALUE =>
+        {
+            RepositoryProtocolStatus::Legacy
+        }
         Some(_) => RepositoryProtocolStatus::Unsupported,
         None => RepositoryProtocolStatus::Missing,
     })
@@ -96,9 +108,9 @@ pub(crate) fn unsupported_repository_protocol_error() -> LixError {
 /// Pure seed plan for initializing an engine repository.
 ///
 /// Tracked bootstrap facts go to the changelog. Moving heads are seeded in
-/// the v9 direct control plane and retain a standalone immutable branch-ref
-/// ledger change; only ordinary untracked data enters the flat live-state
-/// sidecar.
+/// the v10 direct control plane and retain a standalone immutable branch-ref
+/// ledger change; only ordinary untracked data enters the flat untracked
+/// lane.
 pub(crate) struct InitSeedPlan {
     commit: InitSeedCommit,
     changes: Vec<InitSeedChange>,
@@ -357,7 +369,7 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        // Seed both visible branches with a complete v9 serving generation.
+        // Seed both visible branches with a complete v10 serving generation.
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
         // historical fallback immediately after initialization.
@@ -448,7 +460,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     match repository_protocol_status(read).await? {
-        RepositoryProtocolStatus::Current => Err(LixError::new(
+        RepositoryProtocolStatus::Current | RepositoryProtocolStatus::Legacy => Err(LixError::new(
             "LIX_ERROR_ALREADY_INITIALIZED",
             "engine storage is already initialized; initialization does not migrate or overwrite repositories",
         )),

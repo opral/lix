@@ -327,7 +327,8 @@ where
         // The protocol check must precede the live-state read: tracked-head
         // spaces keep their physical IDs across hard layout cuts, so an old
         // group value could otherwise be decoded before we reject it.
-        crate::init::RepositoryProtocolStatus::Current => {
+        crate::init::RepositoryProtocolStatus::Current
+        | crate::init::RepositoryProtocolStatus::Legacy => {
             let reader = live_state.reader(read);
             let initialized = reader
                 .load_row(&LiveStateRowRequest {
@@ -392,12 +393,40 @@ fn not_initialized_error() -> LixError {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use serde_json::json;
 
     use super::*;
     use crate::storage_adapter::{
         Memory, PointReadPlan, ScanPlan, StorageGetOptions, StorageKey, StoragePrefix,
         StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
     };
+
+    async fn register_json_pointer_schema(session: &SessionContext<Memory>) {
+        let schema = json!({
+            "x-lix-key": "json_pointer",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "required": ["path", "value"],
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                }
+            },
+            "additionalProperties": false
+        });
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+                    &[crate::Value::Text(schema.to_string())],
+                )
+                .await
+                .expect("register json_pointer schema")
+                .rows_affected(),
+            1
+        );
+    }
 
     #[tokio::test]
     async fn engine_ignores_predecessor_state_bytes_and_leaves_them_untouched() {
@@ -530,6 +559,162 @@ mod tests {
             panic!("initialized pre-protocol storage must fail closed");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
+    }
+
+    #[tokio::test]
+    async fn legacy_v9_protocol_opens_and_uses_generic_entity_reads() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        {
+            let engine = Engine::new(storage.clone())
+                .await
+                .expect("current repository should open");
+            let session = engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open");
+            register_json_pointer_schema(&session).await;
+            assert_eq!(
+                session
+                    .execute(
+                        "INSERT INTO json_pointer (path, value) VALUES ('/legacy', lix_json('{\"version\":9}'))",
+                        &[],
+                    )
+                    .await
+                    .expect("write tracked-only legacy probe row")
+                    .rows_affected(),
+                1
+            );
+        }
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let mut writes = storage_adapter.new_write_set();
+        writes.put(
+            crate::init::REPOSITORY_PROTOCOL_SPACE,
+            crate::init::REPOSITORY_PROTOCOL_KEY,
+            &b"tracked-direct-plane.v9"[..],
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("legacy protocol marker should commit");
+
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("legacy protocol read should open");
+        assert_eq!(
+            crate::init::repository_protocol_status(&read)
+                .await
+                .expect("legacy protocol should decode"),
+            crate::init::RepositoryProtocolStatus::Legacy
+        );
+
+        let engine = Engine::new(storage)
+            .await
+            .expect("v9 repository should remain readable through the generic path");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        let rows = session
+            .execute("SELECT path, value FROM json_pointer ORDER BY path", &[])
+            .await
+            .expect("generic entity read should execute");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows.rows()[0]
+                .get::<String>("path")
+                .expect("legacy tracked row path"),
+            "/legacy"
+        );
+        assert_eq!(
+            rows.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("legacy tracked row value"),
+            json!({"version": 9}),
+            "v9 must preserve a tracked-only entity through the generic path"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_fast_path_serves_broad_sql_rows() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+        register_json_pointer_schema(&session).await;
+        assert_eq!(
+            session
+                .execute(
+                    "INSERT INTO json_pointer (path, value) VALUES ('/a', lix_json('{\"n\":1}')), ('/b', lix_json('{\"n\":2}')), ('/c', lix_json('{\"n\":3}'))",
+                    &[],
+                )
+                .await
+                .expect("write tracked rows")
+                .rows_affected(),
+            3
+        );
+
+        let rows = session
+            .execute(
+                "SELECT path, value FROM json_pointer ORDER BY path LIMIT 2",
+                &[],
+            )
+            .await
+            .expect("broad tracked SQL read should execute");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.rows()
+                .iter()
+                .map(|row| row.get::<String>("path").expect("tracked row path"))
+                .collect::<Vec<_>>(),
+            ["/a", "/b"]
+        );
+        assert_eq!(
+            rows.rows()[1]
+                .get::<serde_json::Value>("value")
+                .expect("tracked row value"),
+            json!({"n": 2})
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_entity_fast_path_keeps_synthesized_branch_refs_generic() {
+        let storage = Memory::new();
+        let receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized engine should open");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        let rows = session
+            .execute("SELECT id, commit_id FROM lix_branch_ref ORDER BY id", &[])
+            .await
+            .expect("synthesized branch refs should read through the generic path");
+        assert!(
+            rows.rows().iter().any(|row| {
+                row.get::<String>("id")
+                    .is_ok_and(|id| id == receipt.main_branch_id)
+                    && row
+                        .get::<String>("commit_id")
+                        .is_ok_and(|commit_id| commit_id == receipt.initial_commit_id)
+            }),
+            "the normal branch-ref SQL surface must retain its synthesized control row"
+        );
     }
 
     #[tokio::test]

@@ -25,9 +25,9 @@ use crate::json_store::{
 };
 use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
-    StorageProjectedValue, StorageReadEntry, StorageScanOptions, StorageSpace, StorageSpaceId,
-    StorageValue, StorageWriteSet,
+    PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
+    StorageKey, StoragePrefix, StorageProjectedValue, StorageReadEntry, StorageScanOptions,
+    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
@@ -408,6 +408,44 @@ where
         .await
     }
 
+    /// Returns whether the serving generation has any rows for one entity
+    /// schema. A caller uses this as an inexpensive global-overlay proof
+    /// before taking the direct local entity lane.
+    pub(crate) async fn has_schema_rows_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+    ) -> Result<Option<bool>, LixError> {
+        self.has_schema_rows_for_marker(
+            branch_id,
+            self.marker_if_control_current(branch_id, control).await?,
+            schema_key,
+        )
+        .await
+    }
+
+    /// Streams one local entity schema directly from packed tracked-head
+    /// members into snapshot bytes. It intentionally omits all logical row
+    /// identities: broad SQL entity projection only consumes snapshots, and
+    /// avoiding entity-PK/schema/file-id materialization is the hot-path win.
+    /// Callers must prove no untracked or global overlay can contribute.
+    pub(crate) async fn scan_entity_snapshots_if_control_current(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        self.scan_entity_snapshots_for_marker(
+            branch_id,
+            self.marker_if_control_current(branch_id, control).await?,
+            schema_key,
+            limit,
+        )
+        .await
+    }
+
     /// Returns `None` when this branch has no projection for the canonical
     /// branch ref. That is a direct-plane miss, not empty tracked state.
     #[cfg(test)]
@@ -452,6 +490,53 @@ where
             rows.truncate(limit);
         }
         Ok(Some(rows))
+    }
+
+    async fn has_schema_rows_for_marker(
+        &self,
+        branch_id: &str,
+        marker: Option<TrackedHeadMarker>,
+        schema_key: &str,
+    ) -> Result<Option<bool>, LixError> {
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        let entries = ScanPlan::prefix(
+            TRACKED_HEAD_GROUP_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(schema_group_prefix(
+                    branch_id,
+                    marker.generation,
+                    schema_key,
+                )),
+            },
+        )
+        .collect(
+            &self.store,
+            StorageScanOptions {
+                projection: StorageCoreProjection::KeyOnly,
+                limit_rows: 1,
+                ..StorageScanOptions::default()
+            },
+        )
+        .await?;
+        Ok(Some(!entries.value.entries.is_empty()))
+    }
+
+    async fn scan_entity_snapshots_for_marker(
+        &self,
+        branch_id: &str,
+        marker: Option<TrackedHeadMarker>,
+        schema_key: &str,
+        limit: Option<usize>,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        let Some(marker) = marker else {
+            return Ok(None);
+        };
+        Ok(Some(
+            scan_entity_snapshots(&self.store, branch_id, marker.generation, schema_key, limit)
+                .await?,
+        ))
     }
 
     /// Like the immutable-root point batch, preserves input cardinality and
@@ -1442,6 +1527,113 @@ async fn scan_entries(
     Ok(rows)
 }
 
+/// Broad entity projection consumes only snapshot payloads. Scan the fixed
+/// schema prefix and retain member bytes without allocating logical row
+/// identities or intermediate JSON strings.
+async fn scan_entity_snapshots(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    limit: Option<usize>,
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    if matches!(limit, Some(0)) {
+        return Ok(Vec::new());
+    }
+    let plan = ScanPlan::prefix(
+        TRACKED_HEAD_GROUP_SPACE,
+        StoragePrefix {
+            bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
+        },
+    );
+    let mut snapshots = Vec::new();
+    let mut json_refs = Vec::new();
+    let mut deferred = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let value = full_value_bytes(entry.value)?;
+            let mut members = HeadGroupMembers::new(value.as_ref())?;
+            while let Some(member) = members.next_member()? {
+                // `HeadGroupMembers` validates and decodes the fixed-header
+                // member once as it advances. Broad serving needs that same
+                // borrowed view, so do not reparse every member here.
+                let head = member.head;
+                if head.deleted {
+                    continue;
+                }
+                let row_index = snapshots.len();
+                let snapshot = match head.snapshot {
+                    HeadSlotView::None => None,
+                    HeadSlotView::Inline(snapshot) => Some(value.slice_ref(snapshot.as_bytes())),
+                    HeadSlotView::Ref(json_ref) => {
+                        json_refs.push(json_ref);
+                        deferred.push((row_index, json_ref));
+                        None
+                    }
+                };
+                snapshots.push(snapshot);
+                if limit.is_some_and(|limit| snapshots.len() >= limit) {
+                    return materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred)
+                        .await;
+                }
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred).await
+}
+
+async fn materialize_entity_snapshot_refs(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut snapshots: Vec<Option<Bytes>>,
+    json_refs: Vec<JsonRef>,
+    deferred: Vec<(usize, JsonRef)>,
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    if json_refs.is_empty() {
+        return Ok(snapshots);
+    }
+    let mut values = JsonStoreContext::new()
+        .load_bytes_many(
+            store,
+            JsonLoadRequestRef {
+                refs: &json_refs,
+                scope: JsonReadScopeRef::OutOfBand,
+            },
+        )
+        .await?
+        .into_values();
+    for (index, (row_index, json_ref)) in deferred.into_iter().enumerate() {
+        let bytes = values
+            .get_mut(index)
+            .ok_or_else(|| head_value_error("lost an out-of-band entity JSON value index"))?
+            .take()
+            .ok_or_else(|| {
+                head_value_error(&format!(
+                    "entity row is missing JSON payload '{}'",
+                    json_ref.to_hex()
+                ))
+            })?;
+        *snapshots
+            .get_mut(row_index)
+            .ok_or_else(|| head_value_error("lost an out-of-band entity JSON row index"))? =
+            Some(Bytes::from(bytes));
+    }
+    Ok(snapshots)
+}
+
 /// Reads the checkpoint's sparse dirty-group index and resolves before images
 /// from authoritative v6 group values. The index is auxiliary: its complete
 /// key coverage is verified before any result is returned, so a bad record is
@@ -1798,6 +1990,12 @@ fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
         }
     }
     prefixes
+}
+
+fn schema_group_prefix(branch_id: &str, generation: CommitId, schema_key: &str) -> Vec<u8> {
+    let mut prefix = encode_scope_prefix(branch_id, generation);
+    write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
+    prefix
 }
 
 fn extend_group_entries(
@@ -4000,6 +4198,14 @@ mod tests {
         let branch_id = "branch";
         let generation = CommitId::for_test_label("generation");
         let head = CommitId::for_test_label("head");
+        let control = BranchHeadControl {
+            head_commit_id: head,
+            generation,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            ref_change_id: ChangeId::for_test_label("branch-ref"),
+        };
+        let snapshot_content = r#"{"snapshot":true}"#;
         let long_metadata = format!("\"{}\"", "x".repeat(300));
         let mut writes = StorageWriteSet::new();
         let mut json_writer = JsonStoreContext::new().writer();
@@ -4007,10 +4213,14 @@ mod tests {
             .stage_batch(
                 &mut writes,
                 JsonWritePlacementRef::OutOfBand,
-                [NormalizedJsonRef::new(&long_metadata)],
+                [
+                    NormalizedJsonRef::new(snapshot_content),
+                    NormalizedJsonRef::new(&long_metadata),
+                ],
             )
-            .expect("stage out-of-band metadata");
-        let metadata_ref = refs[0];
+            .expect("stage out-of-band JSON");
+        let snapshot_ref = refs[0];
+        let metadata_ref = refs[1];
         let row_identity = identity(branch_id, generation, "row");
         stage_put(
             &mut writes,
@@ -4021,11 +4231,25 @@ mod tests {
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
                 updated_at: ts("2026-01-02T00:00:00Z"),
-                snapshot: JsonSlot::from_json("{\"snapshot\":true}"),
+                snapshot: JsonSlot::Ref(snapshot_ref),
                 metadata: JsonSlot::Ref(metadata_ref),
             },
         )
         .expect("stage v3 row");
+        stage_put(
+            &mut writes,
+            &identity(branch_id, generation, "deleted"),
+            &HeadValue {
+                change_id: ChangeId::for_test_label("deleted-change"),
+                commit_id: head,
+                deleted: true,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-02T00:00:00Z"),
+                snapshot: JsonSlot::None,
+                metadata: JsonSlot::None,
+            },
+        )
+        .expect("stage tombstone member");
         stage_marker(
             &mut writes,
             branch_id,
@@ -4036,10 +4260,49 @@ mod tests {
             },
         )
         .expect("stage v3 marker");
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("stage matching branch control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("commit v3 head");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open direct entity snapshot read");
+        let snapshots = TrackedHeadContext::new()
+            .reader(read)
+            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", None)
+            .await
+            .expect("direct entity snapshots should read")
+            .expect("matching control should serve snapshots");
+        assert_eq!(snapshots.len(), 1, "tombstone must not reach SQL rows");
+        assert_eq!(
+            snapshots[0]
+                .as_deref()
+                .and_then(|snapshot| std::str::from_utf8(snapshot).ok()),
+            Some(snapshot_content),
+            "out-of-band snapshot must be hydrated before Arrow decoding"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open limited direct entity snapshot read");
+        let snapshots = TrackedHeadContext::new()
+            .reader(read)
+            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", Some(1))
+            .await
+            .expect("limited direct entity snapshots should read")
+            .expect("matching control should serve snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0]
+                .as_deref()
+                .and_then(|snapshot| std::str::from_utf8(snapshot).ok()),
+            Some(snapshot_content)
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4099,7 +4362,7 @@ mod tests {
             .expect("matching marker");
         assert_eq!(rows.len(), 2);
         for row in rows.into_iter().flatten() {
-            assert_eq!(row.snapshot_content.as_deref(), Some("{\"snapshot\":true}"));
+            assert_eq!(row.snapshot_content.as_deref(), Some(snapshot_content));
             assert_eq!(row.metadata.as_deref(), Some(long_metadata.as_str()));
             assert_eq!(row.change_id, Some(ChangeId::for_test_label("change")));
             assert_eq!(row.commit_id, Some(head));

@@ -640,6 +640,13 @@ where
         Arc::new(self.live_state.reader(self.read_store.clone())) as Arc<dyn LiveStateReader>
     }
 
+    fn entity_batch_reader(&self) -> Option<Arc<dyn crate::sql2::EntityBatchReader>> {
+        Some(Arc::new(crate::sql2::TrackedEntityBatchReader::new(
+            Arc::clone(&self.live_state),
+            self.read_store.clone(),
+        )))
+    }
+
     fn filesystem_path_index(&self) -> Arc<dyn FilesystemPathIndexReader> {
         let reader: Arc<dyn FilesystemPathIndexReader> =
             Arc::new(self.live_state.reader(self.read_store.clone()));

@@ -5,6 +5,7 @@ mod catalog;
 mod change_materialization;
 mod context;
 mod dml;
+mod entity_batch;
 mod entity_projection;
 mod error;
 mod exec;
@@ -40,6 +41,7 @@ pub(crate) use context::{
     SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
     WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
+pub(crate) use entity_batch::{EntityBatchReader, EntityBatchRequest, TrackedEntityBatchReader};
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
