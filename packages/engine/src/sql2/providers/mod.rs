@@ -518,6 +518,7 @@ where
         session,
         ctx.active_branch_id(),
         ctx.live_state(),
+        ctx.entity_batch_reader(),
         Arc::clone(&branch_ref),
         needs_entity_history.then(|| Arc::new(tokio::sync::Mutex::new(ctx.commit_graph()))),
         if needs_entity_history {
@@ -1034,6 +1035,7 @@ mod tests {
             &session,
             "branch-a",
             Arc::new(EmptyLiveStateReader),
+            None,
             Arc::new(EmptyBranchRefReader),
             Some(Arc::new(tokio::sync::Mutex::new(Box::new(
                 EmptyCommitGraphReader,

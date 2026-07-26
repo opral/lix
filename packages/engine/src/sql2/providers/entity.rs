@@ -26,14 +26,17 @@ use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
     entity_surface_schema,
 };
-use crate::sql2::entity_projection::EntityProjectionDecoder;
+use crate::sql2::entity_projection::{
+    EntityProjectionDecoder, entity_projection_error_to_datafusion_error,
+};
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value};
 
 use crate::sql2::{
-    SqlHistoryQuerySource, SqlWriteContext, WriteAccess, WriteContextLiveStateReader,
+    EntityBatchReader, EntityBatchRequest, SqlHistoryQuerySource, SqlWriteContext, WriteAccess,
+    WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
@@ -57,6 +60,7 @@ pub(crate) async fn register_entity_providers<S>(
     ctx: &SessionContext,
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
+    entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     commit_graph: Option<Arc<tokio::sync::Mutex<Box<dyn CommitGraphReader>>>>,
     query_source: Option<SqlHistoryQuerySource<S>>,
@@ -82,6 +86,7 @@ where
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
                         active_branch_id.to_string(),
+                        entity_batch_reader.clone(),
                     )),
                     WriteAccess::read_only(),
                 )?;
@@ -95,6 +100,7 @@ where
                         spec,
                         Arc::clone(&live_state),
                         Arc::clone(&branch_ref),
+                        entity_batch_reader.clone(),
                     )),
                     WriteAccess::read_only(),
                 )?;
@@ -192,6 +198,7 @@ struct EntitySpec {
     surface_name: String,
     spec: Arc<EntitySurfaceSpec>,
     live_state: Arc<dyn LiveStateReader>,
+    entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
     branch_ref: Arc<dyn BranchRefReader>,
     schema: SchemaRef,
     branch_binding: BranchBinding,
@@ -203,12 +210,14 @@ impl EntitySpec {
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
         active_branch_id: String,
+        entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
     ) -> Self {
         Self {
             surface_name: spec.schema_key.clone(),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::Active),
             spec,
             live_state,
+            entity_batch_reader,
             branch_ref,
             branch_binding: BranchBinding::active(active_branch_id),
         }
@@ -221,19 +230,21 @@ impl EntitySpec {
     ) -> Self {
         let active_branch_id = write_ctx.active_branch_id();
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
-        Self::active(spec, live_state, branch_ref, active_branch_id)
+        Self::active(spec, live_state, branch_ref, active_branch_id, None)
     }
 
     fn by_branch(
         spec: Arc<EntitySurfaceSpec>,
         live_state: Arc<dyn LiveStateReader>,
         branch_ref: Arc<dyn BranchRefReader>,
+        entity_batch_reader: Option<Arc<dyn EntityBatchReader>>,
     ) -> Self {
         Self {
             surface_name: format!("{}_by_branch", spec.schema_key),
             schema: entity_surface_schema(&spec, EntitySurfaceShape::ByBranch),
             spec,
             live_state,
+            entity_batch_reader,
             branch_ref,
             branch_binding: BranchBinding::explicit(),
         }
@@ -245,7 +256,7 @@ impl EntitySpec {
         branch_ref: Arc<dyn BranchRefReader>,
     ) -> Self {
         let live_state = Arc::new(WriteContextLiveStateReader::new(write_ctx));
-        Self::by_branch(spec, live_state, branch_ref)
+        Self::by_branch(spec, live_state, branch_ref, None)
     }
 
     /// Plan-time scan derivation shared by `plan_scan` and the unit tests:
@@ -322,6 +333,9 @@ impl TableSpec for EntitySpec {
         let (schema, request, row_filters) =
             self.plan_scan_parts(projection, filters, limit).await?;
         let batch_projection = EntityBatchProjection::for_request(&request);
+        let direct_entity_batch = direct_entity_batch_eligible(&schema, &request, &row_filters)
+            .then(|| self.entity_batch_reader.clone())
+            .flatten();
         Ok(PlannedScan {
             schema: Arc::clone(&schema),
             ordering: None,
@@ -333,8 +347,28 @@ impl TableSpec for EntitySpec {
                     request,
                     row_filters,
                     batch_projection,
+                    direct_entity_batch,
                 ),
-                |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
+                |(
+                    spec,
+                    live_state,
+                    schema,
+                    request,
+                    row_filters,
+                    batch_projection,
+                    direct_entity_batch,
+                )| async move {
+                    if let Some(direct_entity_batch) = direct_entity_batch
+                        && let Some(batch) = direct_entity_batch
+                            .scan_entity_batch(EntityBatchRequest {
+                                spec: Arc::clone(&spec),
+                                schema: Arc::clone(&schema),
+                                live_request: request.clone(),
+                            })
+                            .await?
+                    {
+                        return Ok(batch);
+                    }
                     let mut rows = live_state
                         .scan_rows(&request)
                         .await
@@ -1303,6 +1337,23 @@ fn projection_column_names(schema: &Schema) -> Vec<String> {
         .collect()
 }
 
+fn direct_entity_batch_eligible(
+    schema: &Schema,
+    request: &LiveStateScanRequest,
+    row_filters: &[EntityRowFilter],
+) -> bool {
+    !schema.fields().is_empty()
+        && matches!(request.filter.rows, LiveStateRowFilter::All)
+        && row_filters.is_empty()
+        && request.filter.entity_pks.is_empty()
+        && request.filter.file_ids.is_empty()
+        && request.filter.constraints.is_empty()
+        && schema
+            .fields()
+            .iter()
+            .all(|field| !field.name().starts_with("lixcol_"))
+}
+
 /// Selects the snapshot-to-Arrow implementation once per provider batch.
 ///
 /// Exact primary-key scans are latency-sensitive and keep their established
@@ -1412,18 +1463,6 @@ fn entity_record_batch_from_raw_projection(
         .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
-}
-
-/// Keep malformed snapshots and provider-shape failures on the same
-/// DataFusion `Execution` error path as the pre-projection implementation.
-/// Typed value failures already carry a Lix error code and retain that
-/// existing SQL error contract.
-fn entity_projection_error_to_datafusion_error(error: LixError) -> DataFusionError {
-    if error.code == LixError::CODE_INTERNAL_ERROR {
-        DataFusionError::Execution(error.message)
-    } else {
-        lix_error_to_datafusion_error(error)
-    }
 }
 
 #[expect(trivial_casts)]
@@ -1567,6 +1606,7 @@ mod tests {
 
     use async_trait::async_trait;
     use datafusion::arrow::array::{Float64Array, Int64Array};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
     use datafusion::common::{Column, ScalarValue};
@@ -1581,8 +1621,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::live_state::{
-        LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowRequest,
-        LiveStateScanRequest, MaterializedLiveStateRow,
+        LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter,
+        LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
     };
     use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
@@ -1765,6 +1805,96 @@ mod tests {
             }))
             .expect("schema should derive entity surface spec"),
         )
+    }
+
+    #[test]
+    fn direct_entity_batch_is_broad_payload_only() {
+        let payload_schema = Schema::new(vec![Field::new("body", DataType::Utf8, true)]);
+        let system_schema = Schema::new(vec![Field::new("lixcol_entity_pk", DataType::Utf8, true)]);
+        let mut request = LiveStateScanRequest::default();
+        assert!(super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[]
+        ));
+
+        request
+            .filter
+            .entity_pks
+            .push(crate::entity_pk::EntityPk::single("row"));
+        assert!(!super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[]
+        ));
+        request.filter.entity_pks.clear();
+
+        request.filter.file_ids.push(crate::NullableKeyFilter::Null);
+        assert!(!super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[]
+        ));
+        request.filter.file_ids.clear();
+
+        request
+            .filter
+            .constraints
+            .push(crate::live_state::ScanConstraint {
+                field: crate::live_state::ScanField::EntityPk,
+                operator: crate::live_state::ScanOperator::Eq(crate::Value::Text(
+                    "row".to_string(),
+                )),
+            });
+        assert!(!super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[]
+        ));
+        request.filter.constraints.clear();
+
+        request.filter.rows = LiveStateRowFilter::None;
+        assert!(!super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[]
+        ));
+        request.filter.rows = LiveStateRowFilter::All;
+
+        assert!(!super::direct_entity_batch_eligible(
+            &system_schema,
+            &request,
+            &[]
+        ));
+        assert!(!super::direct_entity_batch_eligible(
+            &Schema::empty(),
+            &request,
+            &[]
+        ));
+        assert!(!super::direct_entity_batch_eligible(
+            &payload_schema,
+            &request,
+            &[super::EntityRowFilter::ColumnEq {
+                column: "body".to_string(),
+                column_type: EntityColumnType::String,
+                value: super::EntityFilterValue::String("hello".to_string()),
+            }]
+        ));
+    }
+
+    #[test]
+    fn zero_column_entity_batches_keep_row_count_on_the_generic_path() {
+        let spec = entity_insert_spec_with_primary_key();
+        let rows = [live_row(), live_row()];
+        let batch = entity_record_batch(
+            &spec,
+            Arc::new(Schema::empty()),
+            &rows,
+            super::EntityBatchProjection::ParsedSnapshots,
+        )
+        .expect("generic zero-column entity batch should build");
+        assert_eq!(batch.num_columns(), 0);
+        assert_eq!(batch.num_rows(), rows.len());
     }
 
     fn filter_pushdown_spec() -> Arc<super::EntitySurfaceSpec> {
@@ -2337,6 +2467,7 @@ mod tests {
                 spec,
                 Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
                 empty_branch_ref(),
+                None,
             )),
             WriteAccess::read_only(),
         );
@@ -2463,6 +2594,7 @@ mod tests {
             Arc::clone(&spec),
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_branch_ref(),
+            None,
         );
         let entity_pk_index = provider
             .schema
@@ -2502,6 +2634,7 @@ mod tests {
             Arc::clone(&spec),
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_branch_ref(),
+            None,
         );
         let entity_pk_index = provider
             .schema
@@ -2539,6 +2672,7 @@ mod tests {
             Arc::clone(&spec),
             Arc::new(EmptyLiveStateReader) as Arc<dyn LiveStateReader>,
             empty_branch_ref(),
+            None,
         );
         let entity_pk_index = provider
             .schema

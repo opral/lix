@@ -11,19 +11,33 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion::arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
+use datafusion::common::DataFusionError;
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 
 use crate::LixError;
 use crate::sql2::catalog::{EntityColumnType, EntitySurfaceSpec};
+use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 
 /// A projection decoder for the general entity provider.
-pub(super) struct EntityProjectionDecoder {
+pub(crate) struct EntityProjectionDecoder {
     schema_key: String,
     fields: Vec<EntityProjectionField>,
     slots_by_name: HashMap<String, Vec<usize>>,
+}
+
+/// Keep malformed snapshots and provider-shape failures on the same
+/// DataFusion `Execution` error path as the established entity projection.
+/// Typed value failures already carry a Lix error code and retain that SQL
+/// error contract.
+pub(crate) fn entity_projection_error_to_datafusion_error(error: LixError) -> DataFusionError {
+    if error.code == LixError::CODE_INTERNAL_ERROR {
+        DataFusionError::Execution(error.message)
+    } else {
+        lix_error_to_datafusion_error(error)
+    }
 }
 
 #[derive(Clone)]
@@ -34,7 +48,7 @@ struct EntityProjectionField {
 
 impl EntityProjectionDecoder {
     /// Builds a decoder for visible entity columns in output order.
-    pub(super) fn new<'a>(
+    pub(crate) fn new<'a>(
         spec: &EntitySurfaceSpec,
         columns: impl IntoIterator<Item = &'a str>,
     ) -> Result<Self, LixError> {
@@ -68,7 +82,7 @@ impl EntityProjectionDecoder {
     }
 
     /// Decodes a batch directly into Arrow arrays in constructor field order.
-    pub(super) fn decode_arrow_columns<'a>(
+    pub(crate) fn decode_arrow_columns<'a>(
         &self,
         snapshots: impl IntoIterator<Item = Option<&'a [u8]>>,
     ) -> Result<Vec<ArrayRef>, LixError> {

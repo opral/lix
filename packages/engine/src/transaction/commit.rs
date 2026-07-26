@@ -3204,6 +3204,17 @@ mod tests {
                 .is_some(),
             "a local sidecar write must durably mark its branch"
         );
+        assert!(
+            crate::live_state::load_untracked_schema_presence_marker(
+                &sidecar_marker_read,
+                "branch-a",
+                "test_schema",
+            )
+            .await
+            .expect("untracked schema marker should load")
+            .is_some(),
+            "a local untracked write must durably mark its branch/schema"
+        );
 
         let counts = Arc::new(TrackedHeadReadCounts::default());
         let mut second_read = StorageAdapterReadScope::new(CountingTrackedHeadRead {
@@ -3882,6 +3893,22 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("writes should commit");
+
+        let marker_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("untracked schema marker read should open");
+        assert!(
+            crate::live_state::load_untracked_schema_presence_marker(
+                &marker_read,
+                GLOBAL_BRANCH_ID,
+                "test_schema",
+            )
+            .await
+            .expect("untracked schema marker should load")
+            .is_some(),
+            "a global untracked write must durably mark its branch/schema"
+        );
 
         let loaded = LiveStateIndexContext::new()
             .reader(

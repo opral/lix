@@ -10,7 +10,7 @@ use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use super::storage::load_value;
 use super::storage::{
     FlatIdentity, FlatValue, LIVE_STATE_INDEX_ROW_SPACE, load_raw_tokens, load_values,
-    scan_all_values, scan_values, stage_delete, stage_put,
+    scan_all_values, scan_values, stage_delete, stage_put, stage_untracked_schema_presence_marker,
 };
 use super::{
     LiveStateIndexDeltaRef, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
@@ -271,6 +271,20 @@ where
                 },
                 delta,
             );
+        }
+        // The flat index is the sole durable lane for untracked and
+        // engine-owned current rows. Keep a monotonic schema marker beside
+        // every flat mutation so v10 repositories can prove that an absent
+        // marker means tracked heads alone determine visibility. This is
+        // centralized here because initialization and engine functions also
+        // write the flat lane without passing through transaction lowering.
+        let untracked_schemas = final_deltas
+            .values()
+            .filter(|delta| delta.commit_id.is_none())
+            .map(|delta| delta.schema_key)
+            .collect::<BTreeSet<_>>();
+        for schema_key in untracked_schemas {
+            stage_untracked_schema_presence_marker(self.writes, branch_id, schema_key)?;
         }
         let delete_count = final_deltas
             .values()

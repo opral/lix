@@ -9,12 +9,14 @@ pub(crate) mod visibility;
 pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
 #[allow(unused_imports)]
 pub(crate) use index::{
-    LIVE_STATE_INDEX_ROW_SPACE, LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE, LiveStateIndexContext,
-    LiveStateIndexDeltaRef, LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest,
-    LiveStateIndexScanRequest, LiveStateIndexStoreReader, LiveStateIndexWriter,
-    MaterializedLiveStateIndexRow, branch_empty_precondition, load_local_sidecar_branch_token,
-    local_sidecar_branch_precondition, row_absent_precondition, row_raw_token_precondition,
-    stage_local_sidecar_branch_marker,
+    LIVE_STATE_INDEX_ROW_SPACE, LIVE_STATE_LOCAL_SIDECAR_BRANCH_SPACE,
+    LIVE_STATE_UNTRACKED_SCHEMA_PRESENCE_SPACE, LiveStateIndexContext, LiveStateIndexDeltaRef,
+    LiveStateIndexFilter, LiveStateIndexRow, LiveStateIndexRowRequest, LiveStateIndexScanRequest,
+    LiveStateIndexStoreReader, LiveStateIndexWriter, MaterializedLiveStateIndexRow,
+    branch_empty_precondition, load_local_sidecar_branch_token,
+    load_untracked_schema_presence_marker, local_sidecar_branch_precondition,
+    row_absent_precondition, row_raw_token_precondition, stage_local_sidecar_branch_marker,
+    stage_untracked_schema_presence_marker,
 };
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;

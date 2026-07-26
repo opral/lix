@@ -12,6 +12,7 @@ use crate::filesystem::{
 };
 use crate::live_state::index::{
     LiveStateIndexContext, LiveStateIndexFilter, LiveStateIndexScanRequest,
+    load_untracked_schema_presence_marker,
 };
 use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
@@ -25,6 +26,7 @@ use crate::tracked_state::{
     TrackedStateScanRequest,
 };
 use async_trait::async_trait;
+use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, stream};
 
 const BRANCH_READ_CONCURRENCY: usize = 8;
@@ -106,6 +108,91 @@ impl<S> LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    /// Returns raw tracked snapshot bytes for one broad SQL entity scan.
+    ///
+    /// `None` means the normal materialized visibility path remains
+    /// authoritative: untracked rows, a global overlay, multiple result
+    /// branch scopes, commit-derived state, or an unavailable tracked-head
+    /// projection all deliberately fall back rather than approximating
+    /// visibility.
+    pub(crate) async fn scan_direct_entity_snapshots(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        // This capability relies on v10's complete untracked-schema marker.
+        // Keep the proof at its storage-facing boundary so a future caller
+        // cannot accidentally treat a v9 marker absence as tracked-only.
+        if crate::init::repository_protocol_status(&self.store).await?
+            != crate::init::RepositoryProtocolStatus::Current
+        {
+            return Ok(None);
+        }
+        if request.filter.untracked == Some(true)
+            || request_may_include_commit_derived(request)
+            || request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == BRANCH_REF_SCHEMA_KEY)
+        {
+            return Ok(None);
+        }
+        let [schema_key] = request.filter.schema_keys.as_slice() else {
+            return Ok(None);
+        };
+        let scope = scan_scope(&self.store, &self.live_index, request, true).await?;
+        let [requested_branch_id] = scope.projection_branch_ids.as_slice() else {
+            return Ok(None);
+        };
+        // A normal SQL entity query transparently includes an untracked row
+        // when one exists. In a v10 repository the monotonic marker proves
+        // that every relevant branch/schema is tracked-only; otherwise the
+        // established merged visibility path remains authoritative. An
+        // explicit tracked-only request does not need this proof.
+        if request.filter.untracked.is_none() {
+            for branch_id in &scope.storage_branch_ids {
+                if load_untracked_schema_presence_marker(&self.store, branch_id, schema_key)
+                    .await?
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        if scope
+            .storage_branch_ids
+            .iter()
+            .any(|branch_id| branch_id != requested_branch_id && branch_id != GLOBAL_BRANCH_ID)
+        {
+            return Ok(None);
+        }
+        let Some(requested_control) = scope.branch_heads.get(requested_branch_id).copied() else {
+            return Ok(None);
+        };
+        let tracked_head = self.tracked_head.reader(&self.store);
+        if requested_branch_id != GLOBAL_BRANCH_ID
+            && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
+        {
+            let Some(global_has_rows) = tracked_head
+                .has_schema_rows_if_control_current(GLOBAL_BRANCH_ID, global_control, schema_key)
+                .await?
+            else {
+                return Ok(None);
+            };
+            if global_has_rows {
+                return Ok(None);
+            }
+        }
+        tracked_head
+            .scan_entity_snapshots_if_control_current(
+                requested_branch_id,
+                requested_control,
+                schema_key,
+                request.limit,
+            )
+            .await
+    }
+
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
@@ -1066,6 +1153,7 @@ mod tests {
     use crate::live_state::index::{LiveStateIndexContext, LiveStateIndexDeltaRef};
     use crate::live_state::{
         LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter, LiveStateProjection,
+        TrackedHeadDeltaRef,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
@@ -1101,6 +1189,86 @@ mod tests {
             LiveStateIndexContext::new(),
             CommitGraphContext::new(),
         )
+    }
+
+    async fn stage_direct_entity_head(
+        storage: &StorageAdapter,
+        branch_id: &str,
+        head: CommitId,
+        schema_key: &str,
+        entity_pk: &EntityPk,
+        snapshot: &str,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open direct-head write read");
+        let mut writes = StorageWriteSet::new();
+        crate::init::stage_repository_protocol(&mut writes);
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                None,
+                head,
+                &[TrackedHeadDeltaRef {
+                    schema_key,
+                    file_id: None,
+                    entity_pk,
+                    change_id: ChangeId::for_test_label(&format!("{branch_id}-change")),
+                    commit_id: head,
+                    deleted: false,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-01T00:00:00Z"),
+                    snapshot: crate::json_store::JsonSlotRef::Inline(snapshot),
+                    metadata: crate::json_store::JsonSlotRef::None,
+                }],
+                &std::collections::BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage direct entity head");
+        crate::branch::stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            BranchHeadControl {
+                head_commit_id: head,
+                generation: head,
+                created_at: ts("2026-01-01T00:00:00Z"),
+                updated_at: ts("2026-01-01T00:00:00Z"),
+                ref_change_id: ChangeId::for_test_label(&format!("{branch_id}-branch-ref")),
+            },
+        )
+        .expect("stage direct entity branch control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit direct entity head");
+    }
+
+    async fn scan_direct_entity_snapshots_for_test(
+        live_state: &LiveStateContext,
+        storage: &StorageAdapter,
+        branch_id: &str,
+        schema_key: &str,
+    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
+        live_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("open direct entity read"),
+            )
+            .scan_direct_entity_snapshots(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![schema_key.to_string()],
+                    branch_ids: vec![branch_id.to_string()],
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .await
     }
 
     #[test]
@@ -1152,6 +1320,89 @@ mod tests {
             ordered_unique_branch_row_index(&[immutable_fallback], &requested_branch_ids),
             None,
             "the immutable-root fallback does not make the table ordering promise"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_entity_snapshots_fall_back_when_the_untracked_lane_is_present() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let branch_id = "branch";
+        let schema_key = "schema";
+        stage_direct_entity_head(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("branch-head"),
+            schema_key,
+            &EntityPk::single("row"),
+            r#"{"value":"tracked"}"#,
+        )
+        .await;
+
+        let snapshots =
+            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
+                .await
+                .expect("tracked-only entity scan should execute")
+                .expect("tracked-only entity scan should use direct snapshots");
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(
+            snapshots[0]
+                .as_deref()
+                .and_then(|snapshot| std::str::from_utf8(snapshot).ok()),
+            Some(r#"{"value":"tracked"}"#)
+        );
+
+        let mut writes = StorageWriteSet::new();
+        crate::live_state::stage_untracked_schema_presence_marker(
+            &mut writes,
+            branch_id,
+            schema_key,
+        )
+        .expect("stage untracked schema marker");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit untracked schema marker");
+        assert!(
+            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
+                .await
+                .expect("mixed entity scan should execute")
+                .is_none(),
+            "normal SQL must retain the merged tracked/untracked visibility path"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_entity_snapshots_fall_back_when_global_tracks_the_schema() {
+        let storage = StorageAdapter::new(Memory::new());
+        let live_state = live_state_context();
+        let branch_id = "branch";
+        let schema_key = "schema";
+        stage_direct_entity_head(
+            &storage,
+            branch_id,
+            CommitId::for_test_label("branch-head"),
+            schema_key,
+            &EntityPk::single("local-row"),
+            r#"{"value":"local"}"#,
+        )
+        .await;
+        stage_direct_entity_head(
+            &storage,
+            GLOBAL_BRANCH_ID,
+            CommitId::for_test_label("global-head"),
+            schema_key,
+            &EntityPk::single("global-row"),
+            r#"{"value":"global"}"#,
+        )
+        .await;
+
+        assert!(
+            scan_direct_entity_snapshots_for_test(&live_state, &storage, branch_id, schema_key)
+                .await
+                .expect("global-overlaid entity scan should execute")
+                .is_none(),
+            "a global tracked row requires the established overlay resolver"
         );
     }
 
