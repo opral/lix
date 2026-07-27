@@ -4,16 +4,19 @@
 )]
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fmt;
 use std::future::Future;
+use std::io::{Read, Seek, SeekFrom};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt, TryStreamExt};
+use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
@@ -21,8 +24,13 @@ use lix_engine::storage::{
     WriteOptions, WriteStats,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig};
-use object_store::ObjectStore;
 use object_store::local::LocalFileSystem;
+use object_store::path::Path as ObjectPath;
+use object_store::{
+    Attributes, CopyOptions, Extensions, GetOptions as ObjectStoreGetOptions, GetResult,
+    GetResultPayload, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult,
+};
 use slatedb::config::{
     CompressionCodec, DurabilityLevel, ObjectStoreCacheOptions, ReadOptions as SlateDBReadOptions,
     ScanOptions as SlateDBScanOptions, Settings, WriteOptions as SlateDBWriteOptions,
@@ -84,6 +92,167 @@ pub struct SlateDBCacheOptions {
     pub max_disk_cache_bytes: usize,
     pub block_cache_bytes: u64,
     pub metadata_cache_bytes: u64,
+}
+
+/// Reads local table ranges on the caller executor.
+///
+/// `LocalFileSystem::get_opts` schedules file open and metadata work on the
+/// blocking pool, and `GetResult::bytes` schedules the actual range read as a
+/// second task. `SlateDB::open` already permits local reads on the caller
+/// because it owns a dedicated current-thread runtime; doing the short local
+/// syscalls there removes both dispatches while preserving the upstream path,
+/// range, metadata, ETag, and precondition contracts.
+#[derive(Debug)]
+struct DirectLocalReads {
+    inner: LocalFileSystem,
+}
+
+impl fmt::Display for DirectLocalReads {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "direct-read {}", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for DirectLocalReads {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: ObjectStoreGetOptions,
+    ) -> object_store::Result<GetResult> {
+        let filesystem_path = self.inner.path_to_filesystem(location)?;
+        let mut file = std::fs::File::open(&filesystem_path)
+            .map_err(|source| direct_local_io_error(location, source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| direct_local_io_error(location, source))?;
+        if metadata.is_dir() {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "object is a directory".into(),
+            });
+        }
+        let size = metadata.len();
+        let modified = metadata
+            .modified()
+            .map_err(|source| direct_local_io_error(location, source))?;
+        let meta = ObjectMeta {
+            location: location.clone(),
+            last_modified: modified.into(),
+            size,
+            e_tag: Some(direct_local_etag(&metadata, modified)),
+            version: None,
+        };
+        options.check_preconditions(&meta)?;
+        let range = match options.range {
+            Some(range) => range
+                .as_range(size)
+                .map_err(|source| object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })?,
+            None => 0..size,
+        };
+        let bytes = if options.head || range.is_empty() {
+            Bytes::new()
+        } else {
+            file.seek(SeekFrom::Start(range.start))
+                .map_err(|source| direct_local_io_error(location, source))?;
+            let length = usize::try_from(range.end - range.start).map_err(|source| {
+                object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                }
+            })?;
+            let mut bytes = vec![0; length];
+            file.read_exact(&mut bytes)
+                .map_err(|source| direct_local_io_error(location, source))?;
+            Bytes::from(bytes)
+        };
+        Ok(GetResult {
+            payload: GetResultPayload::Stream(stream::once(async move { Ok(bytes) }).boxed()),
+            meta,
+            range,
+            attributes: Attributes::default(),
+            extensions: Extensions::default(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+fn direct_local_io_error(location: &ObjectPath, source: std::io::Error) -> object_store::Error {
+    if source.kind() == std::io::ErrorKind::NotFound {
+        object_store::Error::NotFound {
+            path: location.to_string(),
+            source: Box::new(source),
+        }
+    } else {
+        object_store::Error::Generic {
+            store: "LocalFileSystem",
+            source: Box::new(source),
+        }
+    }
+}
+
+fn direct_local_etag(metadata: &std::fs::Metadata, modified: SystemTime) -> String {
+    #[cfg(unix)]
+    let inode = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.ino()
+    };
+    #[cfg(not(unix))]
+    let inode = 0;
+    let modified_micros = modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    format!("{inode:x}-{modified_micros:x}-{:x}", metadata.len())
 }
 
 #[allow(missing_debug_implementations)]
@@ -488,8 +657,9 @@ impl SlateDB {
                 path.display()
             ))
         })?;
-        let object_store: Arc<dyn ObjectStore> =
-            Arc::new(LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?);
+        let object_store: Arc<dyn ObjectStore> = Arc::new(DirectLocalReads {
+            inner: LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?,
+        });
         Self::open_object_store_with_read_dispatch(
             DB_PATH,
             object_store,
@@ -3333,8 +3503,8 @@ mod tests {
         }
     }
 
-    impl std::fmt::Display for BlockingStore {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    impl fmt::Display for BlockingStore {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str("BlockingStore")
         }
     }
