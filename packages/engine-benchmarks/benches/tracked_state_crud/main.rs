@@ -207,6 +207,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             }
         }
         Ok("transaction") | Err(_) => {
+            let profile = profile_transaction_storage();
             if let Some(repeats) = hot_repeats {
                 profile_hot_transaction_operations(
                     runtime,
@@ -214,6 +215,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
                     operation,
                     read_many_pk_count,
                     repeats,
+                    profile,
                 );
             } else {
                 profile_transaction_operation(
@@ -222,6 +224,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
                     operation,
                     read_many_pk_count,
                     sample_count,
+                    profile,
                 );
             }
         }
@@ -297,6 +300,18 @@ fn profile_sql_session_storage() -> StorageProfile {
     }
 }
 
+fn profile_transaction_storage() -> StorageProfile {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE").as_deref() {
+        Ok("sqlite") => StorageProfile::SQLite,
+        Ok("rocksdb") | Err(_) => StorageProfile::RocksDB,
+        #[cfg(feature = "slatedb")]
+        Ok("slatedb") => StorageProfile::SlateDB,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, or slatedb"
+        ),
+    }
+}
+
 /// Keeps one seeded fixture alive for a repeatable profiling window. This
 /// deliberately trades representative cache behavior for a trace dominated
 /// by the operation itself rather than fixture construction.
@@ -306,14 +321,12 @@ fn profile_hot_transaction_operations(
     operation: TransactionBenchOp,
     read_many_pk_count: usize,
     repeats: usize,
+    profile: StorageProfile,
 ) {
     operation.assert_supports_hot_repeats();
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
-    let mut fixture = runtime.block_on(transaction_api::seeded_fixture(
-        StorageProfile::RocksDB,
-        rows,
-    ));
+    let mut fixture = runtime.block_on(transaction_api::seeded_fixture(profile, rows));
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
@@ -322,7 +335,8 @@ fn profile_hot_transaction_operations(
     let elapsed = start.elapsed();
     let profile_detail = profile_read_many_detail(operation, read_many_pk_count);
     println!(
-        "tracked_state_crud hot profile: transaction/lix_rocksdb/{}/{} repeats{profile_detail}: total={elapsed:?} per_operation={:?}",
+        "tracked_state_crud hot profile: transaction/{}/{}/{} repeats{profile_detail}: total={elapsed:?} per_operation={:?}",
+        profile.name(),
         profile_operation_name(operation),
         repeats,
         elapsed / repeats_u32,
@@ -473,19 +487,14 @@ fn profile_transaction_operation(
     operation: TransactionBenchOp,
     read_many_pk_count: usize,
     sample_count: usize,
+    profile: StorageProfile,
 ) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let mut fixture = if operation.needs_seed() {
-            runtime.block_on(transaction_api::seeded_fixture(
-                StorageProfile::RocksDB,
-                rows,
-            ))
+            runtime.block_on(transaction_api::seeded_fixture(profile, rows))
         } else {
-            runtime.block_on(transaction_api::empty_fixture(
-                StorageProfile::RocksDB,
-                rows,
-            ))
+            runtime.block_on(transaction_api::empty_fixture(profile, rows))
         };
         let start = Instant::now();
         let result = runtime.block_on(operation.run(&mut fixture, read_many_pk_count));
@@ -493,7 +502,7 @@ fn profile_transaction_operation(
         black_box(result);
     }
     print_profile_samples(
-        "transaction/lix_rocksdb",
+        &format!("transaction/{}", profile.name()),
         operation,
         read_many_pk_count,
         samples,

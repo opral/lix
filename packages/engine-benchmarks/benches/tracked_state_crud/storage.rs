@@ -1,4 +1,6 @@
 pub(crate) use lix_rocksdb_storage::RocksDB;
+#[cfg(feature = "slatedb")]
+pub(crate) use lix_slatedb_storage::SlateDB;
 pub(crate) use lix_sqlite_storage::SQLite;
 use tempfile::TempDir;
 
@@ -6,6 +8,8 @@ use tempfile::TempDir;
 pub(crate) enum StorageProfile {
     SQLite,
     RocksDB,
+    #[cfg(feature = "slatedb")]
+    SlateDB,
 }
 
 pub(crate) const STORAGE_PROFILES: [StorageProfile; 2] =
@@ -16,13 +20,26 @@ impl StorageProfile {
         match self {
             Self::SQLite => "lix_sqlite",
             Self::RocksDB => "lix_rocksdb",
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB => "lix_slatedb",
         }
     }
 }
 
 pub(crate) enum ProfileStorage {
-    SQLite { storage: SQLite, _dir: TempDir },
-    RocksDB { storage: RocksDB, _dir: TempDir },
+    SQLite {
+        storage: SQLite,
+        _dir: TempDir,
+    },
+    RocksDB {
+        storage: RocksDB,
+        _dir: TempDir,
+    },
+    #[cfg(feature = "slatedb")]
+    SlateDB {
+        storage: SlateDB,
+        _dir: TempDir,
+    },
 }
 
 impl StorageProfile {
@@ -39,6 +56,13 @@ impl StorageProfile {
                 let storage = RocksDB::open(dir.path().join("bench.rocksdb"))
                     .expect("open rocksdb bench storage");
                 ProfileStorage::RocksDB { storage, _dir: dir }
+            }
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB => {
+                let dir = TempDir::new().expect("create slatedb bench tempdir");
+                let storage =
+                    SlateDB::open(dir.path().join("bench.slatedb")).expect("open slatedb storage");
+                ProfileStorage::SlateDB { storage, _dir: dir }
             }
         }
     }

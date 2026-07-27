@@ -3,6 +3,8 @@ use lix_engine::transaction::bench::{
     BenchLayoutAccounting, BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
 };
 
+#[cfg(feature = "slatedb")]
+use crate::storage::SlateDB;
 use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, snapshot_value};
 
@@ -13,6 +15,11 @@ pub(crate) enum TransactionFixture {
     },
     RocksDB {
         fixture: BenchTransactionFixture<RocksDB>,
+        _dir: tempfile::TempDir,
+    },
+    #[cfg(feature = "slatedb")]
+    SlateDB {
+        fixture: BenchTransactionFixture<SlateDB>,
         _dir: tempfile::TempDir,
     },
 }
@@ -34,6 +41,11 @@ pub(crate) async fn empty_fixture(
             fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
             _dir: dir,
         },
+        #[cfg(feature = "slatedb")]
+        ProfileStorage::SlateDB { storage, _dir: dir } => TransactionFixture::SlateDB {
+            fixture: BenchTransactionFixture::new(StorageAdapter::new(storage), rows).await,
+            _dir: dir,
+        },
     }
 }
 
@@ -51,6 +63,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.seed().await,
             Self::RocksDB { fixture, .. } => fixture.seed().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.seed().await,
         }
     }
 
@@ -58,6 +72,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.insert_all().await,
             Self::RocksDB { fixture, .. } => fixture.insert_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.insert_all().await,
         }
     }
 
@@ -65,6 +81,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.insert_all_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.insert_all_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.insert_all_accounting().await,
         }
     }
 
@@ -72,6 +90,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.read_all().await,
             Self::RocksDB { fixture, .. } => fixture.read_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.read_all().await,
         }
     }
 
@@ -79,6 +99,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.read_many_by_pk(count).await,
             Self::RocksDB { fixture, .. } => fixture.read_many_by_pk(count).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.read_many_by_pk(count).await,
         }
     }
 
@@ -86,6 +108,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.read_one_by_pk().await,
             Self::RocksDB { fixture, .. } => fixture.read_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.read_one_by_pk().await,
         }
     }
 
@@ -93,6 +117,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.update_all().await,
             Self::RocksDB { fixture, .. } => fixture.update_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.update_all().await,
         }
     }
 
@@ -100,6 +126,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.update_all_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.update_all_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.update_all_accounting().await,
         }
     }
 
@@ -107,6 +135,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.update_one_by_pk().await,
             Self::RocksDB { fixture, .. } => fixture.update_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.update_one_by_pk().await,
         }
     }
 
@@ -114,6 +144,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.update_one_by_pk_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.update_one_by_pk_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.update_one_by_pk_accounting().await,
         }
     }
 
@@ -121,6 +153,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.delete_all().await,
             Self::RocksDB { fixture, .. } => fixture.delete_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.delete_all().await,
         }
     }
 
@@ -128,6 +162,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.delete_all_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.delete_all_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.delete_all_accounting().await,
         }
     }
 
@@ -135,6 +171,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.delete_one_by_pk().await,
             Self::RocksDB { fixture, .. } => fixture.delete_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.delete_one_by_pk().await,
         }
     }
 
@@ -142,6 +180,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.delete_one_by_pk_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.delete_one_by_pk_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.delete_one_by_pk_accounting().await,
         }
     }
 
@@ -149,6 +189,8 @@ impl TransactionFixture {
         match self {
             Self::SQLite { fixture, .. } => fixture.layout_accounting().await,
             Self::RocksDB { fixture, .. } => fixture.layout_accounting().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB { fixture, .. } => fixture.layout_accounting().await,
         }
     }
 }
