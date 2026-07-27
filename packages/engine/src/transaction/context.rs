@@ -900,11 +900,8 @@ where
         &mut self,
         write: &PreparedTransactionWrite,
     ) -> Result<(), LixError> {
-        let prospective_rows = prepared_transaction_write_rows(write)
-            .iter()
-            .map(MaterializedLiveStateRow::from)
-            .collect::<Vec<_>>();
-        if !prospective_rows.iter().any(|row| {
+        let prepared_rows = prepared_transaction_write_rows(write);
+        if !prepared_rows.iter().any(|row| {
             !row.global
                 && !row.untracked
                 && matches!(
@@ -914,6 +911,10 @@ where
         }) {
             return Ok(());
         }
+        let prospective_rows = prepared_rows
+            .iter()
+            .map(MaterializedLiveStateRow::from)
+            .collect::<Vec<_>>();
         let staged = self.staged_writes.staging_overlay()?;
         let prospective = ProspectiveStagedRows {
             staged: staged.clone(),

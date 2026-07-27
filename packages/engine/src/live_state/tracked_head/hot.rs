@@ -549,7 +549,7 @@ where
         let identities = sorted
             .iter()
             .map(|delta| {
-                hot_identity(
+                encode_hot_mutation_identity(
                     branch_id,
                     generation,
                     delta.schema_key,
@@ -561,17 +561,10 @@ where
         // Mutation validation must use primary rows rather than the file-id
         // projection. The projection is an equally-valued read accelerator,
         // not an ownership record.
-        let previous_values = hot_load_primary_identity_bytes(self.store, &identities).await?;
+        let previous_values =
+            hot_load_primary_mutation_identity_bytes(self.store, &identities).await?;
         let mut created_ats = Vec::with_capacity(sorted.len());
         let mut retired_untracked_json_refs = BTreeSet::new();
-        let delta_keys = sorted
-            .iter()
-            .map(|delta| TrackedStateKey {
-                schema_key: delta.schema_key.to_string(),
-                entity_pk: delta.entity_pk.clone(),
-                file_id: delta.file_id.map(str::to_string),
-            })
-            .collect::<BTreeSet<_>>();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
             let Some(previous) = previous else {
                 created_ats.push(delta.created_at);
@@ -589,11 +582,23 @@ where
             }
             created_ats.push(existing.created_at);
         }
-        let unmatched_guards = absence_guards
-            .iter()
-            .filter(|key| !delta_keys.contains(*key))
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let unmatched_guards = if absence_guards.is_empty() {
+            BTreeSet::new()
+        } else {
+            let delta_keys = sorted
+                .iter()
+                .map(|delta| TrackedStateKey {
+                    schema_key: delta.schema_key.to_string(),
+                    entity_pk: delta.entity_pk.clone(),
+                    file_id: delta.file_id.map(str::to_string),
+                })
+                .collect::<BTreeSet<_>>();
+            absence_guards
+                .iter()
+                .filter(|key| !delta_keys.contains(*key))
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
         reject_hot_absence_guards(self.store, branch_id, generation, &unmatched_guards).await?;
 
         // Build every fallible output before mutating the write set. The
@@ -604,10 +609,8 @@ where
         let mut next_coverage = *coverage;
         let mut diff_keys = Vec::new();
         let mut next_values = Vec::with_capacity(sorted.len());
-        for ((delta, identity), (created_at, previous)) in sorted
-            .iter()
-            .zip(&identities)
-            .zip(created_ats.iter().zip(&previous_values))
+        for (delta, (created_at, previous)) in
+            sorted.iter().zip(created_ats.iter().zip(&previous_values))
         {
             // Ordinary commits have no active checkpoint, so their baseline
             // is always disabled. Do not decode the row a second time merely
@@ -627,7 +630,14 @@ where
             if newly_dirty {
                 let checkpoint_commit_id = working_diff_capture_checkpoint_commit_id
                     .expect("a newly dirty hot row requires an active checkpoint");
-                let key = encode_hot_diff_key(checkpoint_commit_id, identity);
+                let key = encode_hot_diff_key_parts(
+                    branch_id,
+                    checkpoint_commit_id,
+                    generation,
+                    delta.schema_key,
+                    delta.entity_pk,
+                    delta.file_id,
+                );
                 next_coverage
                     .add_encoded_group_key(&key)
                     .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
@@ -652,12 +662,12 @@ where
             identities
                 .iter()
                 .zip(&next_values)
-                .filter(|(identity, value)| identity.file_id.is_some() && value.is_some())
+                .filter(|(identity, value)| identity.file_key.is_some() && value.is_some())
                 .count(),
             identities
                 .iter()
                 .zip(&next_values)
-                .filter(|(identity, value)| identity.file_id.is_some() && value.is_none())
+                .filter(|(identity, value)| identity.file_key.is_some() && value.is_none())
                 .count(),
         );
         self.writes
@@ -672,7 +682,7 @@ where
             );
         }
         for (identity, value) in identities.iter().zip(next_values) {
-            stage_hot_value(self.writes, identity, value);
+            stage_hot_mutation_value(self.writes, identity, value);
         }
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
@@ -1005,6 +1015,87 @@ fn hot_identity(
     }
 }
 
+struct EncodedHotMutationIdentity {
+    row_key: Bytes,
+    file_key: Option<Bytes>,
+}
+
+fn encode_hot_mutation_identity(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> EncodedHotMutationIdentity {
+    EncodedHotMutationIdentity {
+        row_key: Bytes::from(encode_hot_row_key_parts(
+            branch_id, generation, schema_key, entity_pk, file_id,
+        )),
+        file_key: file_id.map(|_| {
+            Bytes::from(encode_hot_file_key_parts(
+                branch_id, generation, schema_key, entity_pk, file_id,
+            ))
+        }),
+    }
+}
+
+async fn hot_load_primary_mutation_identity_bytes(
+    store: &(impl StorageAdapterRead + ?Sized),
+    identities: &[EncodedHotMutationIdentity],
+) -> Result<Vec<Option<Bytes>>, LixError> {
+    if identities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = identities
+        .iter()
+        .map(|identity| StorageKey(identity.row_key.clone()))
+        .collect::<Vec<_>>();
+    PointReadPlan::new(HOT_ROW_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value
+        .into_iter()
+        .map(|value| value.map(full_value_bytes).transpose())
+        .collect()
+}
+
+fn stage_hot_mutation_value(
+    writes: &mut StorageWriteSet,
+    identity: &EncodedHotMutationIdentity,
+    value: Option<Vec<u8>>,
+) {
+    let Some(value) = value else {
+        writes.delete(HOT_ROW_SPACE, StorageKey(identity.row_key.clone()));
+        if let Some(file_key) = &identity.file_key {
+            writes.delete(HOT_FILE_SPACE, StorageKey(file_key.clone()));
+        }
+        return;
+    };
+    if let Some(file_key) = &identity.file_key {
+        let value = Bytes::from(value);
+        writes.put(
+            HOT_ROW_SPACE,
+            StorageKey(identity.row_key.clone()),
+            StorageValue {
+                bytes: value.clone(),
+            },
+        );
+        writes.put(
+            HOT_FILE_SPACE,
+            StorageKey(file_key.clone()),
+            StorageValue { bytes: value },
+        );
+    } else {
+        writes.put(
+            HOT_ROW_SPACE,
+            StorageKey(identity.row_key.clone()),
+            StorageValue {
+                bytes: Bytes::from(value),
+            },
+        );
+    }
+}
+
 fn stage_hot_value(writes: &mut StorageWriteSet, identity: &HeadIdentity, value: Option<Vec<u8>>) {
     let Some(value) = value else {
         writes.delete(
@@ -1019,17 +1110,24 @@ fn stage_hot_value(writes: &mut StorageWriteSet, identity: &HeadIdentity, value:
         }
         return;
     };
-    writes.put(
-        HOT_ROW_SPACE,
-        StorageKey(Bytes::from(encode_hot_row_key(identity))),
-        StorageValue {
-            bytes: Bytes::from(value.clone()),
-        },
-    );
     if identity.file_id.is_some() {
+        let value = Bytes::from(value);
+        writes.put(
+            HOT_ROW_SPACE,
+            StorageKey(Bytes::from(encode_hot_row_key(identity))),
+            StorageValue {
+                bytes: value.clone(),
+            },
+        );
         writes.put(
             HOT_FILE_SPACE,
             StorageKey(Bytes::from(encode_hot_file_key(identity))),
+            StorageValue { bytes: value },
+        );
+    } else {
+        writes.put(
+            HOT_ROW_SPACE,
+            StorageKey(Bytes::from(encode_hot_row_key(identity))),
             StorageValue {
                 bytes: Bytes::from(value),
             },
@@ -1748,31 +1846,79 @@ fn hot_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
 }
 
 fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
-    let mut key = hot_scope_prefix(&identity.branch_id, identity.generation);
-    write_key_string(&mut key, &identity.schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut key, &identity.entity_pk);
-    write_file_id(&mut key, identity.file_id.as_deref());
+    encode_hot_row_key_parts(
+        &identity.branch_id,
+        identity.generation,
+        &identity.schema_key,
+        &identity.entity_pk,
+        identity.file_id.as_deref(),
+    )
+}
+
+fn encode_hot_row_key_parts(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    write_entity_pk(&mut key, entity_pk);
+    write_file_id(&mut key, file_id);
     key
 }
 
 fn encode_hot_file_key(identity: &HeadIdentity) -> Vec<u8> {
     debug_assert!(identity.file_id.is_some());
-    let mut key = hot_scope_prefix(&identity.branch_id, identity.generation);
-    write_key_string(&mut key, &identity.schema_key, KEY_PART_FINAL);
-    write_file_id(&mut key, identity.file_id.as_deref());
-    write_entity_pk(&mut key, &identity.entity_pk);
+    encode_hot_file_key_parts(
+        &identity.branch_id,
+        identity.generation,
+        &identity.schema_key,
+        &identity.entity_pk,
+        identity.file_id.as_deref(),
+    )
+}
+
+fn encode_hot_file_key_parts(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    debug_assert!(file_id.is_some());
+    let mut key = hot_scope_prefix(branch_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    write_file_id(&mut key, file_id);
+    write_entity_pk(&mut key, entity_pk);
     key
 }
 
+#[cfg(test)]
 fn encode_hot_diff_key(checkpoint_commit_id: CommitId, identity: &HeadIdentity) -> Vec<u8> {
-    let mut key = encode_working_diff_scope_prefix(
+    encode_hot_diff_key_parts(
         &identity.branch_id,
         checkpoint_commit_id,
         identity.generation,
-    );
-    write_key_string(&mut key, &identity.schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut key, &identity.entity_pk);
-    write_file_id(&mut key, identity.file_id.as_deref());
+        &identity.schema_key,
+        &identity.entity_pk,
+        identity.file_id.as_deref(),
+    )
+}
+
+fn encode_hot_diff_key_parts(
+    branch_id: &str,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> Vec<u8> {
+    let mut key = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    write_entity_pk(&mut key, entity_pk);
+    write_file_id(&mut key, file_id);
     key
 }
 
