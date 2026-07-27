@@ -376,7 +376,7 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let writer_permit = self.write_gate.acquire().await;
-            check_preconditions(&self.worker, &opts.preconditions).await?;
+            check_preconditions(&self.worker, &self.point_cache, &opts.preconditions).await?;
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 _writer_permit: writer_permit,
@@ -394,12 +394,14 @@ impl Storage for SlateDB {
 
 async fn check_preconditions(
     worker: &SlateDBWorker,
+    point_cache: &SnapshotPointCache,
     preconditions: &[Precondition],
 ) -> Result<(), StorageError> {
     if preconditions.is_empty() {
         return Ok(());
     }
     let preconditions = preconditions.to_vec();
+    let point_cache = point_cache.clone();
     let matches = worker
         .call_read(move |db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
@@ -422,12 +424,9 @@ async fn check_preconditions(
                     // receipt predicate). Evaluate each contiguous point run
                     // against this snapshot in one read operation rather than
                     // serializing a worker entry for every predicate.
-                    let values = get_snapshot_values(
-                        Arc::clone(&snapshot),
-                        point_keys,
-                        ReadDurability::Visible,
-                    )
-                    .await?;
+                    let values =
+                        get_cached_snapshot_values(Arc::clone(&snapshot), point_keys, &point_cache)
+                            .await?;
                     matches.extend(values.iter().enumerate().map(|(offset, value)| {
                         point_precondition_matches(&preconditions[start + offset], value.as_ref())
                     }));
@@ -466,6 +465,36 @@ async fn check_preconditions(
     } else {
         Err(StorageError::PreconditionFailed(failures))
     }
+}
+
+async fn get_cached_snapshot_values(
+    snapshot: Arc<DbSnapshot>,
+    keys: Vec<Key>,
+    point_cache: &SnapshotPointCache,
+) -> Result<Vec<Option<Bytes>>, StorageError> {
+    let sequence = snapshot.seq();
+    let mut values = vec![None; keys.len()];
+    point_cache.get_many(sequence, &keys, &mut values);
+    let missing = keys
+        .iter()
+        .enumerate()
+        .filter_map(|(index, key)| values[index].is_none().then_some((index, key.clone())))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let missing_keys = missing
+            .iter()
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        let fetched = get_snapshot_values(snapshot, missing_keys, ReadDurability::Visible).await?;
+        for ((index, key), value) in missing.into_iter().zip(fetched) {
+            point_cache.insert(sequence, key, value.clone());
+            values[index] = Some(value);
+        }
+    }
+    Ok(values
+        .into_iter()
+        .map(|value| value.expect("all SlateDB point-cache misses are filled"))
+        .collect())
 }
 
 fn point_precondition_physical_key(
