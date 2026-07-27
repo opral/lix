@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -29,10 +29,10 @@ use slatedb::config::{
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
-use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
+use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
 
 const DB_PATH: &str = "db";
 const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
@@ -69,6 +69,7 @@ pub struct SlateDB {
     path: PathBuf,
     worker: SlateDBWorker,
     write_gate: WriteGate,
+    write_pipeline: WritePipeline,
     point_cache: SnapshotPointCache,
 }
 
@@ -88,7 +89,9 @@ pub struct SlateDBCacheOptions {
 #[allow(missing_debug_implementations)]
 pub struct SlateDBRead {
     worker: SlateDBWorker,
+    write_pipeline: WritePipeline,
     snapshot: Arc<DbSnapshot>,
+    publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
 }
@@ -96,6 +99,7 @@ pub struct SlateDBRead {
 #[allow(missing_debug_implementations)]
 pub struct SlateDBWrite {
     worker: SlateDBWorker,
+    write_pipeline: WritePipeline,
     _writer_permit: OwnedMutexGuard<()>,
     await_durable: bool,
     base: Option<Arc<DbSnapshot>>,
@@ -131,6 +135,209 @@ struct SnapshotPointCacheKey {
 struct SnapshotPointCacheValue {
     value: Option<Bytes>,
     weight: usize,
+}
+
+#[derive(Clone, Default)]
+struct WritePipeline {
+    state: Arc<Mutex<WritePipelineState>>,
+}
+
+#[derive(Default)]
+struct WritePipelineState {
+    tail: Option<Arc<WriteCompletion>>,
+    visible: VecDeque<Arc<PublishedWrite>>,
+    point_publications: HashMap<Key, VecDeque<PointPublication>>,
+    active_views: BTreeMap<(u64, u64), usize>,
+    next_publication_id: u64,
+    terminal_error: Option<StorageError>,
+}
+
+struct PublishedWrite {
+    publication_id: u64,
+    overlay: Arc<BTreeMap<Key, Option<Bytes>>>,
+    persisted_sequence: AtomicU64,
+}
+
+struct PointPublication {
+    publication_id: u64,
+    write: Arc<PublishedWrite>,
+    value: Option<Bytes>,
+}
+
+struct PublicationView {
+    pipeline: WritePipeline,
+    snapshot_sequence: u64,
+    publication_id: u64,
+}
+
+struct WriteCompletion {
+    done: AtomicBool,
+    result: Mutex<Option<Result<u64, StorageError>>>,
+    notify: Notify,
+}
+
+const PENDING_WRITE_SEQUENCE: u64 = u64::MAX;
+
+impl WriteCompletion {
+    fn new() -> Self {
+        Self {
+            done: AtomicBool::new(false),
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    fn complete(&self, result: Result<u64, StorageError>) {
+        *self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(result);
+        self.done.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<u64, StorageError> {
+        loop {
+            let notified = self.notify.notified();
+            if self.done.load(Ordering::Acquire) {
+                return self
+                    .result
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                    .expect("completed SlateDB write has a result");
+            }
+            notified.await;
+        }
+    }
+}
+
+impl WritePipeline {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    async fn wait_for_visible(&self) -> Result<(), StorageError> {
+        let tail = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tail
+            .clone();
+        if let Some(tail) = tail {
+            tail.wait().await?;
+        }
+        self.terminal_error()
+    }
+
+    fn terminal_error(&self) -> Result<(), StorageError> {
+        let error = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminal_error
+            .clone();
+        error.map_or(Ok(()), Err)
+    }
+
+    fn capture(&self, snapshot_sequence: u64) -> PublicationView {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.visible.front().is_some_and(|write| {
+            let persisted = write.persisted_sequence.load(Ordering::Acquire);
+            persisted != PENDING_WRITE_SEQUENCE && persisted <= snapshot_sequence
+        }) {
+            state.visible.pop_front();
+        }
+        let publication_id = state.next_publication_id;
+        *state
+            .active_views
+            .entry((snapshot_sequence, publication_id))
+            .or_default() += 1;
+        cleanup_point_publications(&mut state);
+        PublicationView {
+            pipeline: self.clone(),
+            snapshot_sequence,
+            publication_id,
+        }
+    }
+
+    fn visible_writes(
+        &self,
+        snapshot_sequence: u64,
+        publication_id: u64,
+    ) -> Vec<Arc<PublishedWrite>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .visible
+            .iter()
+            .filter(|write| {
+                let persisted = write.persisted_sequence.load(Ordering::Acquire);
+                write.publication_id <= publication_id
+                    && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn point_value(
+        &self,
+        snapshot_sequence: u64,
+        publication_id: u64,
+        key: &Key,
+    ) -> Option<Option<Bytes>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .point_publications
+            .get(key)?
+            .iter()
+            .rev()
+            .find(|publication| {
+                let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
+                publication.publication_id <= publication_id
+                    && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
+            })
+            .map(|publication| publication.value.clone())
+    }
+}
+
+impl Drop for PublicationView {
+    fn drop(&mut self) {
+        let mut state = self
+            .pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (self.snapshot_sequence, self.publication_id);
+        let remove = state.active_views.get_mut(&key).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            state.active_views.remove(&key);
+        }
+        cleanup_point_publications(&mut state);
+    }
+}
+
+fn cleanup_point_publications(state: &mut WritePipelineState) {
+    let active_views = state.active_views.keys().copied().collect::<Vec<_>>();
+    state.point_publications.retain(|_, publications| {
+        publications.retain(|publication| {
+            let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
+            persisted == PENDING_WRITE_SEQUENCE
+                || active_views.iter().any(|(snapshot, captured)| {
+                    publication.publication_id <= *captured && persisted > *snapshot
+                })
+        });
+        !publications.is_empty()
+    });
 }
 
 impl SnapshotPointCache {
@@ -326,6 +533,7 @@ impl SlateDB {
             )?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
+            write_pipeline: WritePipeline::new(),
             point_cache: SnapshotPointCache::new(),
         })
     }
@@ -335,6 +543,7 @@ impl SlateDB {
     }
 
     pub async fn flush(&self) -> Result<(), StorageError> {
+        self.write_pipeline.wait_for_visible().await?;
         self.worker
             .call(|db| async move { db.flush().await.map_err(slatedb_error) })
             .await
@@ -357,13 +566,22 @@ impl Storage for SlateDB {
         opts: ReadOptions,
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
+            self.write_pipeline.terminal_error()?;
             let snapshot = self
                 .worker
                 .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
                 .await?;
+            let publication_view = if opts.durability == ReadDurability::Visible {
+                Some(self.write_pipeline.capture(snapshot.seq()))
+            } else {
+                None
+            };
+            self.write_pipeline.terminal_error()?;
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
+                write_pipeline: self.write_pipeline.clone(),
                 snapshot,
+                publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
             })
@@ -376,9 +594,16 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Write<'_>, StorageError>> + Send {
         async move {
             let writer_permit = self.write_gate.acquire().await;
-            check_preconditions(&self.worker, &self.point_cache, &opts.preconditions).await?;
+            check_preconditions(
+                &self.worker,
+                &self.write_pipeline,
+                &self.point_cache,
+                &opts.preconditions,
+            )
+            .await?;
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
+                write_pipeline: self.write_pipeline.clone(),
                 _writer_permit: writer_permit,
                 // The engine sets this only for the atomic mutation plus
                 // idempotency-receipt commit. Its replay contract requires a
@@ -394,6 +619,7 @@ impl Storage for SlateDB {
 
 async fn check_preconditions(
     worker: &SlateDBWorker,
+    write_pipeline: &WritePipeline,
     point_cache: &SnapshotPointCache,
     preconditions: &[Precondition],
 ) -> Result<(), StorageError> {
@@ -401,10 +627,15 @@ async fn check_preconditions(
         return Ok(());
     }
     let preconditions = preconditions.to_vec();
+    let write_pipeline = write_pipeline.clone();
+    let read_pipeline = write_pipeline.clone();
     let point_cache = point_cache.clone();
     let matches = worker
         .call_read(move |db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
+            let snapshot_sequence = snapshot.seq();
+            let publication_view = read_pipeline.capture(snapshot_sequence);
+            let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
             let mut index = 0;
             while index < preconditions.len() {
@@ -424,9 +655,19 @@ async fn check_preconditions(
                     // receipt predicate). Evaluate each contiguous point run
                     // against this snapshot in one read operation rather than
                     // serializing a worker entry for every predicate.
-                    let values =
-                        get_cached_snapshot_values(Arc::clone(&snapshot), point_keys, &point_cache)
-                            .await?;
+                    let mut values = get_cached_snapshot_values(
+                        Arc::clone(&snapshot),
+                        point_keys.clone(),
+                        &point_cache,
+                    )
+                    .await?;
+                    for (index, key) in point_keys.iter().enumerate() {
+                        if let Some(value) =
+                            read_pipeline.point_value(snapshot_sequence, publication_id, key)
+                        {
+                            values[index] = value;
+                        }
+                    }
                     matches.extend(values.iter().enumerate().map(|(offset, value)| {
                         point_precondition_matches(&preconditions[start + offset], value.as_ref())
                     }));
@@ -435,11 +676,25 @@ async fn check_preconditions(
 
                 let matches_precondition = match &preconditions[index] {
                     Precondition::RangeEmpty { space, range } => {
-                        let bounds =
-                            EncodedBounds::new(physical_range(*space, range.clone())?, None);
-                        collect_snapshot_keys(Arc::clone(&snapshot), bounds)
-                            .await?
-                            .is_empty()
+                        let range = physical_range(*space, range.clone())?;
+                        let bounds = EncodedBounds::new(range.clone(), None);
+                        let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
+                        let visible_writes =
+                            read_pipeline.visible_writes(snapshot_sequence, publication_id);
+                        for write in &visible_writes {
+                            for (key, value) in &*write.overlay {
+                                if range_contains_key(&range, key) {
+                                    if value.is_some() {
+                                        if !keys.contains(key) {
+                                            keys.push(key.clone());
+                                        }
+                                    } else {
+                                        keys.retain(|candidate| candidate != key);
+                                    }
+                                }
+                            }
+                        }
+                        keys.is_empty()
                     }
                     Precondition::BranchEquals { .. } => false,
                     Precondition::KeyAbsent { .. }
@@ -455,6 +710,7 @@ async fn check_preconditions(
             Ok(matches)
         })
         .await?;
+    write_pipeline.terminal_error()?;
     let failures = matches
         .into_iter()
         .enumerate()
@@ -533,6 +789,7 @@ impl StorageRead for SlateDBRead {
         opts: GetOptions,
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
+            self.write_pipeline.terminal_error()?;
             if keys.is_empty() {
                 return Ok(GetManyResult::new(Vec::new()));
             }
@@ -541,7 +798,7 @@ impl StorageRead for SlateDBRead {
                 let key = physical_key(space, key)?;
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
-                let value = if durability == ReadDurability::Visible {
+                let mut value = if durability == ReadDurability::Visible {
                     let sequence = snapshot.seq();
                     let cache = self.point_cache.clone();
                     if let Some(value) = cache.get(sequence, &key) {
@@ -563,14 +820,24 @@ impl StorageRead for SlateDBRead {
                                 get_snapshot_value(snapshot, fetched_key, durability)
                             })
                             .await?;
-                        cache.insert(sequence, key, value.clone());
+                        cache.insert(sequence, key.clone(), value.clone());
                         value
                     }
                 } else {
+                    let read_key = key.clone();
                     self.worker
-                        .call_read(move |_db| get_snapshot_value(snapshot, key, durability))
+                        .call_read(move |_db| get_snapshot_value(snapshot, read_key, durability))
                         .await?
                 };
+                if let Some(view) = &self.publication_view
+                    && let Some(published) = self.write_pipeline.point_value(
+                        view.snapshot_sequence,
+                        view.publication_id,
+                        &key,
+                    )
+                {
+                    value = published;
+                }
                 return Ok(GetManyResult::new(vec![
                     value.map(|value| project_value(value, opts.projection)),
                 ]));
@@ -582,7 +849,7 @@ impl StorageRead for SlateDBRead {
                 .collect::<Result<Vec<_>, _>>()?;
             let snapshot = Arc::clone(&self.snapshot);
             let durability = self.durability;
-            let values = if durability == ReadDurability::Visible {
+            let mut values = if durability == ReadDurability::Visible {
                 let sequence = snapshot.seq();
                 let cache = self.point_cache.clone();
                 let mut values = vec![None; physical_keys.len()];
@@ -626,10 +893,22 @@ impl StorageRead for SlateDBRead {
                     .map(|value| value.expect("all SlateDB point-read cache misses are filled"))
                     .collect()
             } else {
+                let read_keys = physical_keys.clone();
                 self.worker
-                    .call_read(move |_db| get_snapshot_values(snapshot, physical_keys, durability))
+                    .call_read(move |_db| get_snapshot_values(snapshot, read_keys, durability))
                     .await?
             };
+            for (key, value) in physical_keys.iter().zip(&mut values) {
+                if let Some(view) = &self.publication_view
+                    && let Some(published) = self.write_pipeline.point_value(
+                        view.snapshot_sequence,
+                        view.publication_id,
+                        key,
+                    )
+                {
+                    *value = published;
+                }
+            }
             Ok(GetManyResult::new(
                 values
                     .into_iter()
@@ -646,6 +925,7 @@ impl StorageRead for SlateDBRead {
         opts: ScanOptions,
     ) -> impl Future<Output = Result<ScanChunk, StorageError>> + Send {
         async move {
+            self.write_pipeline.terminal_error()?;
             if opts.page_size() == 0 {
                 return Ok(ScanChunk {
                     entries: Vec::new(),
@@ -669,6 +949,30 @@ impl StorageRead for SlateDBRead {
 
             let snapshot = Arc::clone(&self.snapshot);
             let durability = self.durability;
+            let visible_writes = self
+                .publication_view
+                .as_ref()
+                .map_or_else(Vec::new, |view| {
+                    self.write_pipeline
+                        .visible_writes(view.snapshot_sequence, view.publication_id)
+                });
+            if !visible_writes.is_empty() {
+                let page_size = opts.page_size();
+                let projection = opts.projection;
+                return self
+                    .worker
+                    .call_read(move |_db| {
+                        scan_snapshot_with_writes(
+                            snapshot,
+                            bounds,
+                            durability,
+                            visible_writes,
+                            page_size,
+                            projection,
+                        )
+                    })
+                    .await;
+            }
             let mut iter = Some(
                 self.worker
                     .call_read(move |_db| open_snapshot_scan(snapshot, bounds, durability))
@@ -774,6 +1078,7 @@ impl StorageWrite for SlateDBWrite {
             // the overlay is updated below, so a cancelled caller can safely
             // release this work instead of holding worker shutdown open.
             if self.base.is_none() {
+                self.write_pipeline.wait_for_visible().await?;
                 self.base = Some(
                     self.worker
                         .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
@@ -816,6 +1121,7 @@ impl StorageWrite for SlateDBWrite {
         async move {
             let Self {
                 worker,
+                write_pipeline,
                 _writer_permit: writer_permit,
                 await_durable,
                 overlay,
@@ -829,14 +1135,57 @@ impl StorageWrite for SlateDBWrite {
                 });
             }
 
-            worker
-                .call(move |db| async move {
-                    let _writer_permit = writer_permit;
+            worker.check_open()?;
+            write_pipeline.terminal_error()?;
+            let overlay = Arc::new(overlay);
+            let completion = Arc::new(WriteCompletion::new());
+            let (previous, published) = {
+                let mut state = write_pipeline
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.next_publication_id = state
+                    .next_publication_id
+                    .checked_add(1)
+                    .expect("SlateDB publication id overflow");
+                let publication_id = state.next_publication_id;
+                let published = Arc::new(PublishedWrite {
+                    publication_id,
+                    overlay: Arc::clone(&overlay),
+                    persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
+                });
+                let previous = state.tail.replace(Arc::clone(&completion));
+                state.visible.push_back(Arc::clone(&published));
+                for (key, value) in &*overlay {
+                    state
+                        .point_publications
+                        .entry(key.clone())
+                        .or_default()
+                        .push_back(PointPublication {
+                            publication_id,
+                            write: Arc::clone(&published),
+                            value: value.clone(),
+                        });
+                }
+                (previous, published)
+            };
+
+            let task_pipeline = write_pipeline.clone();
+            let task_completion = Arc::clone(&completion);
+            drop(writer_permit);
+            worker.spawn(move |db| async move {
+                if let Some(previous) = previous {
+                    let _ = previous.wait().await;
+                }
+                let prior_error = task_pipeline.terminal_error();
+                let result = if let Err(error) = prior_error {
+                    Err(error)
+                } else {
                     let mut batch = WriteBatch::new();
-                    for (key, value) in overlay {
+                    for (key, value) in &*overlay {
                         match value {
-                            Some(value) => batch.put_bytes(key.0, value),
-                            None => batch.delete(key.0),
+                            Some(value) => batch.put_bytes(key.0.clone(), value.clone()),
+                            None => batch.delete(key.0.clone()),
                         }
                     }
                     db.write_with_options(
@@ -847,18 +1196,35 @@ impl StorageWrite for SlateDBWrite {
                         },
                     )
                     .await
-                    .map_err(slatedb_error)?;
-                    // Ordinary commits return after local publication while
-                    // SlateDB batches their WAL upload. Receipt-bearing
-                    // idempotent commits instead wait for that upload so a
-                    // durable replay proof exists before acknowledgement.
-                    Ok(CommitResult {
-                        commit_id: None,
-                        stats,
-                    })
-                })
-                .await
-                .map_err(commit_outcome_unknown)
+                    .map(|handle| handle.seqnum())
+                    .map_err(slatedb_error)
+                    .map_err(commit_outcome_unknown)
+                };
+                match &result {
+                    Ok(sequence) => published
+                        .persisted_sequence
+                        .store(*sequence, Ordering::Release),
+                    Err(error) => {
+                        task_pipeline
+                            .state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .terminal_error = Some(error.clone());
+                    }
+                }
+                task_completion.complete(result);
+            });
+
+            // The writer gate protects precondition evaluation plus publication
+            // into the ordered adapter pipeline. Once published, later writers
+            // observe this overlay without waiting for SlateDB's task rendezvous.
+            if await_durable {
+                completion.wait().await?;
+            }
+            Ok(CommitResult {
+                commit_id: None,
+                stats,
+            })
         }
     }
 
@@ -977,6 +1343,27 @@ impl SlateDBWorker {
                 let _ = thread.join();
                 Err(error)
             }
+        }
+    }
+
+    fn spawn<F, Fut>(&self, operation: F)
+    where
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let in_flight = self.inner.in_flight.enter();
+        let db = Arc::clone(&self.inner.db);
+        self.inner.runtime.spawn(async move {
+            let _in_flight = in_flight;
+            operation(db).await;
+        });
+    }
+
+    fn check_open(&self) -> Result<(), StorageError> {
+        match self.inner.db.status().close_reason {
+            None => Ok(()),
+            Some(CloseReason::Fenced) => Err(StorageError::Fenced),
+            Some(reason) => Err(StorageError::Closed(format!("slatedb closed: {reason:?}"))),
         }
     }
 
@@ -1297,6 +1684,21 @@ impl EncodedBounds {
     fn range(&self) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
         (self.lower.clone(), self.upper.clone())
     }
+
+    fn contains(&self, key: &Key) -> bool {
+        let key = key.0.as_ref();
+        let above_lower = match &self.lower {
+            Bound::Included(lower) => key >= lower.as_slice(),
+            Bound::Excluded(lower) => key > lower.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let below_upper = match &self.upper {
+            Bound::Included(upper) => key <= upper.as_slice(),
+            Bound::Excluded(upper) => key < upper.as_slice(),
+            Bound::Unbounded => true,
+        };
+        above_lower && below_upper
+    }
 }
 
 async fn get_snapshot_values(
@@ -1403,6 +1805,85 @@ async fn scan_snapshot_batch(
     })
 }
 
+async fn scan_snapshot_with_writes(
+    snapshot: Arc<DbSnapshot>,
+    bounds: EncodedBounds,
+    durability: ReadDurability,
+    visible_writes: Vec<Arc<PublishedWrite>>,
+    page_size: usize,
+    projection: CoreProjection,
+) -> Result<ScanChunk, StorageError> {
+    let scan_options = slatedb_scan_options(durability);
+    let mut base_iter = snapshot
+        .scan_with_options(bounds.range(), &scan_options)
+        .await
+        .map_err(slatedb_error)?;
+    let mut overlay = BTreeMap::new();
+    for write in visible_writes {
+        for (key, value) in &*write.overlay {
+            if bounds.contains(key) {
+                overlay.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let mut overlay = overlay.into_iter().peekable();
+    let mut base_row = base_iter.next().await.map_err(slatedb_error)?;
+    let mut rows = Vec::with_capacity(page_size.saturating_add(1));
+    while rows.len() <= page_size {
+        let next = match (base_row.as_ref(), overlay.peek()) {
+            (Some(base_entry), Some((overlay_key, _))) => {
+                match base_entry.key.cmp(&overlay_key.0) {
+                    std::cmp::Ordering::Less => {
+                        let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
+                        base_row = base_iter.next().await.map_err(slatedb_error)?;
+                        Some(row)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let (key, value) = overlay
+                            .next()
+                            .expect("peeked SlateDB publication overlay entry");
+                        base_row = base_iter.next().await.map_err(slatedb_error)?;
+                        Some((key, value))
+                    }
+                    std::cmp::Ordering::Greater => overlay.next(),
+                }
+            }
+            (Some(base_entry), None) => {
+                let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
+                base_row = base_iter.next().await.map_err(slatedb_error)?;
+                Some(row)
+            }
+            (None, Some(_)) => overlay.next(),
+            (None, None) => None,
+        };
+        let Some((key, value)) = next else {
+            break;
+        };
+        if let Some(value) = value {
+            rows.push((key, value));
+        }
+    }
+
+    let has_more = rows.len() > page_size;
+    let entries = rows
+        .into_iter()
+        .take(page_size)
+        .map(|(key, value)| {
+            if key.0.len() < SPACE_PREFIX_LEN {
+                return Err(StorageError::Corruption(format!(
+                    "slatedb key was shorter than space prefix: {:?}",
+                    key.0
+                )));
+            }
+            Ok(ReadEntry {
+                key: Key(key.0.slice(SPACE_PREFIX_LEN..)),
+                value: project_value(value, projection),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(ScanChunk { entries, has_more })
+}
+
 async fn collect_snapshot_keys(
     snapshot: Arc<DbSnapshot>,
     bounds: EncodedBounds,
@@ -1502,7 +1983,7 @@ fn project_value(value: Bytes, projection: CoreProjection) -> ProjectedValue {
 
 fn slatedb_error(error: slatedb::Error) -> StorageError {
     match error.kind() {
-        slatedb::ErrorKind::Closed(slatedb::CloseReason::Fenced) => StorageError::Fenced,
+        slatedb::ErrorKind::Closed(CloseReason::Fenced) => StorageError::Fenced,
         // SlateDB's public contract requires a new instance after *any*
         // Closed reason. Keep fencing distinct for callers, while making
         // background-task failures and future close reasons terminal too.
@@ -1969,6 +2450,81 @@ mod tests {
     }
 
     #[test]
+    fn pending_publication_is_visible_to_points_scans_and_preconditions() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-pending-publication-overlay",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open pending-publication storage");
+        let blocker = Arc::new(WriteCompletion::new());
+        storage
+            .write_pipeline
+            .state
+            .lock()
+            .expect("lock write pipeline")
+            .tail = Some(Arc::clone(&blocker));
+
+        let space = SpaceId(7);
+        let key = Key(Bytes::from_static(b"pending"));
+        let value = Bytes::from_static(b"value");
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin pending write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage pending write");
+        block_on(write.commit()).expect("publish pending write");
+
+        let read =
+            block_on(storage.begin_read(ReadOptions::default())).expect("begin overlay read");
+        assert_eq!(
+            block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default(),))
+                .expect("read pending point")
+                .values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))]
+        );
+        assert_eq!(
+            block_on(read.scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                ScanOptions::default(),
+            ))
+            .expect("scan pending point")
+            .entries,
+            vec![ReadEntry {
+                key: key.clone(),
+                value: ProjectedValue::FullValue(value.clone()),
+            }]
+        );
+
+        let checked = block_on(storage.begin_write(WriteOptions {
+            preconditions: vec![Precondition::KeyValueEquals {
+                space,
+                key,
+                expected: value,
+            }],
+            ..WriteOptions::default()
+        }))
+        .expect("pending point satisfies the next writer precondition");
+        drop(checked);
+
+        blocker.complete(Ok(0));
+        block_on(storage.flush()).expect("flush released pending write");
+    }
+
+    #[test]
     fn visible_point_cache_isolated_by_snapshot_sequence() {
         let storage = SlateDB::open_object_store_with_options(
             "test-snapshot-point-cache",
@@ -2181,10 +2737,8 @@ mod tests {
 
     #[test]
     fn closed_slatedb_panic_is_a_distinct_terminal_storage_error() {
-        let error = slatedb::Error::closed(
-            "background worker panicked".to_string(),
-            slatedb::CloseReason::Panic,
-        );
+        let error =
+            slatedb::Error::closed("background worker panicked".to_string(), CloseReason::Panic);
 
         assert!(matches!(slatedb_error(error), StorageError::Closed(_)));
     }
@@ -2604,7 +3158,7 @@ mod tests {
     }
 
     async fn assert_dropping_pending_read_cancels_before_storage_close(storage: SlateDB) {
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(Notify::new());
         let release_for_read = Arc::clone(&release);
         let (started_tx, started_rx) = oneshot::channel();
         let worker = storage.worker.clone();
