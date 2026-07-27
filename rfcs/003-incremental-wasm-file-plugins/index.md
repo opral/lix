@@ -12,7 +12,7 @@ resources. A localized byte edit can therefore produce sparse entity changes,
 and a localized entity change can produce sparse byte edits, without crossing
 the component boundary with the rest of the file.
 
-The production contract is WIT package `lix:plugin@2.0.0` and packet format
+The production contract is WIT package `lix:plugin@2.1.0` and packet format
 `packet-v1`. Their normative definitions live in
 [`packages/engine/wit/v2`](../../packages/engine/wit/v2).
 
@@ -34,7 +34,8 @@ Each installed v2 plugin generation is compiled once. The engine creates an
 isolated actor for each owned file and branch. An actor contains a Wasm
 instance and one accepted immutable document handle.
 
-The lifecycle has two cold constructors and two warm transitions:
+The lifecycle has two cold constructors, two warm transitions, and one static
+merge-resolution phase:
 
 - `open-file` parses initial bytes and emits complete entity upserts.
 - `open-entities` reconstructs a document and canonical bytes from durable
@@ -42,11 +43,15 @@ The lifecycle has two cold constructors and two warm transitions:
 - `file-changed` consumes byte splices and emits sparse entity changes.
 - `entities-changed` consumes merge-resolved entity changes and emits sparse
   byte edits.
+- `resolve-conflicts` consumes only colliding semantic entity triples and
+  returns aligned deterministic resolutions before the ordinary
+  `entities-changed` render phase.
 
-Every transition returns a new document. The engine retains the old document
-until it has drained and validated all output and committed the transaction.
-A trap, timeout, invalid packet, failed constraint, or rollback therefore
-cannot corrupt the accepted actor.
+Every document transition returns a new document. `resolve-conflicts` returns
+only a resolution cursor and cannot mutate an actor. The engine retains the old
+document until it has drained and validated all output and committed the
+transaction. A trap, timeout, invalid packet, failed constraint, or rollback
+therefore cannot corrupt the accepted actor.
 
 File-scoped semantic SQL writes take the reverse path through
 `entities-changed` in the same database transaction. Multiple statements chain
@@ -61,6 +66,8 @@ WIT defines typed capabilities and resource lifetimes:
 
 - immutable byte sources with bounded random reads;
 - bounded cursors for entities, changes, and edits;
+- a lazy conflict source and aligned resolution cursor for static merge
+  resolution;
 - immutable documents and explicit `fork`;
 - lazy output attachments for large replacement bytes; and
 - transition budgets and descriptor metadata.
@@ -100,10 +107,97 @@ syntax tree.
 The JSON reference deliberately narrows direct semantic mutation to one
 existing scalar value. JSON byte writes remain authoritative for structure and
 lossless layout. This is a format policy, not a limitation of the V2 WIT
-contract: it retains the sparse scalar hot path, gives direct scalar writes
-commit-order last-write-wins behavior, and fails stale structural rebases
+contract: it retains the sparse scalar hot path, gives direct scalar writes an
+engine-local serialized overwrite rule, and fails stale structural rebases
 closed instead of recreating detached JSON nodes. First-class JSON conflict
 objects are deferred.
+
+## Plugin conflict resolution
+
+When merge analysis finds the same plugin-owned entity changed on both sides,
+the engine first proves a common live file incarnation (owner payload and
+incarnation ID), one identical descriptor and complete path, and one pinned
+plugin registry entry in all three roots, then invokes the plugin's static
+`resolve-conflicts` operation before any merge-specific document hydration or
+rendering. A divergent file rename, extension, ancestor-directory path, or
+plugin generation remains an ordinary merge conflict: a resolver must never
+render using target CSV descriptor/component facts while the merge selects
+source TSV metadata or a source plugin generation. The operation is batched per compatible
+file/plugin generation and receives a bounded lazy packet source.
+Each record contains the common `base` plus two divergent values named `a`
+and `b`. The engine assigns those names by durable `(updated_at,
+change_id)` order, not by target/source branch labels or transport arrival
+order. A merge therefore reaches the same plugin decision regardless of merge
+direction. `b` is the higher-ranked deterministic fallback, not an assertion
+that a client wall clock is authoritative; true arrival-order LWW belongs to a
+future host-issued transport rank.
+
+For ordinary local public-SQL writes today, the engine persists the timestamp
+and change ID used for this deterministic tuple. That tuple is auditable and
+total, but is deliberately neither commit order nor a distributed LWW protocol:
+physical clocks can tie or move backward. A future sync layer can replace the
+host comparison with an immutable HLC-style `write_rank` (with actor and
+mutation tie-breakers) without changing the plugin ABI: it still receives only
+`base`, lower-ranked `a`, and higher-ranked `b`.
+
+The resolver returns one result for each input record, echoing the host-assigned
+ordinal in the exact same order. It may `take(base|a|b)` without
+copying the selected snapshot through Wasm memory, `replace` it with one
+complete merged snapshot, or `delete` it. The host validates exact cardinality
+and ordinal alignment, applies the result to the semantic merge plan, then uses the existing
+`entities-changed` path to materialize the file once. There is intentionally no
+`document` parameter: resolving two small collisions must not cold-hydrate a
+large Markdown, CSV, or JSON file merely to access an actor-local index.
+
+The current contract assumes every *eligible semantic* conflict returns a
+result. A safe default for an unsupported, overlapping, malformed, or
+structural value conflict is the canonical `take(b)` choice; when `b` is
+absent, `delete` is the equivalent deterministic result. A divergent file
+lifecycle, descriptor, or plugin generation—delete-vs-edit, delete/recreate
+with a reused file ID, divergent rename/path, or any plugin generation
+change—is deliberately not handed to this value resolver: it
+remains an ordinary merge conflict rather than silently pairing live semantic
+rows with a deleted owner. Persisted JJ-style conflict rows containing multiple
+alternatives, explicit user resolution, and replication of unresolved values
+are intentionally deferred to a later data-model and protocol increment.
+
+### Granularity guidance
+
+Resolution quality comes from choosing stable entities that match a format's
+independently editable units. A CSV row can be one entity and can compose two
+changes that modify different same-index cells, provided identity, order,
+field count, quoting, and terminator layout still agree. Concurrent writes to
+the same cell, row moves, shape changes, and layout changes take `b` rather
+than pretending to implement a structural spreadsheet CRDT. A Markdown
+paragraph/block can apply a bounded three-way text heuristic for disjoint
+edits, then take `b` for overlap or syntax it cannot preserve. A giant
+value stored as one entity remains one merge unit; a plugin should take the
+lazy fallback rather than materialize arbitrary large triples for a marginal
+heuristic.
+
+Entity keys stay stable identity, not current byte offsets, row positions, or
+array indices. The API permits a future JSON plugin to use recursive member
+entities, but it does not require every format to use that granularity.
+
+### API-shape decision
+
+Three shapes were considered:
+
+1. A document-bound `document.resolve-conflicts` method would make an existing
+   actor index available, but forces cold hydration or actor acquisition for a
+   merge whose inputs may be only a few entities.
+2. One top-level Component call per conflict is direct to describe, but makes
+   boundary, resource, and trap overhead scale with the number of collisions
+   and prevents a bounded multi-record packet/attachment strategy.
+3. The chosen static batched lazy operation uses one call and one output cursor
+   per file/plugin generation. It keeps input snapshots as attachments until a
+   format heuristic actually needs them, permits zero-copy `take` results, and
+   reuses the existing single render path after semantic resolution.
+
+The choice is an end-to-end mechanism decision, not a claim that a lower-level
+ABI alone solves merge performance. Future measurements may refine page sizes,
+heuristics, or a small authoring helper without changing the semantic ordering
+and alignment contract.
 
 ## Identity
 
@@ -173,7 +267,11 @@ be evicted; otherwise the request fails deterministically and can be retried
 after commit or with a higher deployment limit. Both values are configurable
 through `EngineOptions`; they are deployment policy, not protocol guarantees.
 Correct plugins must also obey per-transition record, page, attachment, byte,
-fuel, and time budgets.
+fuel, and time budgets. The integrated host keeps the five-second default for
+warm edits and static conflict resolution. A cold `open-file` parse gets one
+additional second per started MiB of submitted input, capped at one minute, so
+the bounded 10 MiB import path is admissible on slower hosts without turning a
+hot transition into an unbounded one.
 
 Malformed or globally coupled syntax may require a larger invalidation region
 or a bounded full reparse. API v2 optimizes the common localized path; it does
@@ -181,13 +279,13 @@ not promise sublinear work for every possible edit.
 
 ## Contract scope
 
-`wasm-component-v2` at API version `2.0.0` is the Component plugin contract.
+`wasm-component-v2` at API version `2.1.0` is the Component plugin contract.
 A plugin declares it with:
 
 ```json
 {
   "runtime": "wasm-component-v2",
-  "api_version": "2.0.0"
+  "api_version": "2.1.0"
 }
 ```
 

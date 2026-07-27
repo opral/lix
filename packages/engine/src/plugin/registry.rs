@@ -23,6 +23,7 @@ use crate::{GLOBAL_BRANCH_ID, LixError};
 use super::InstalledPlugin;
 use super::manifest::{
     PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
+    validate_runtime_api_version,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 
@@ -831,6 +832,12 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
             entry.key
         ))
     })?;
+    validate_runtime_api_version(&manifest).map_err(|error| {
+        invalid_registry(format!(
+            "plugin '{}' manifest_json has an unsupported API version: {}",
+            entry.key, error.message
+        ))
+    })?;
     if manifest.key != entry.key
         || manifest.runtime != entry.runtime
         || manifest.api_version != entry.api_version
@@ -1099,7 +1106,7 @@ mod tests {
                 "schemas":["schema/default.json"],
                 "entry":"plugin.wasm",
                 "match":{{"path_glob":{path_glob:?}{content_type}}},
-                "api_version":"2.0.0",
+                "api_version":"2.1.0",
                 "runtime":"wasm-component-v2",
                 "key":{key:?}
             }}"#
@@ -1119,7 +1126,7 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type,
             entry: "plugin.wasm".to_string(),
@@ -1140,14 +1147,14 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: key.to_string(),
             runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: path_glob.to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"api_version":"2.0.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
+                r#"{{"api_version":"2.1.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1155,6 +1162,26 @@ mod tests {
             wasm_blob_hash: hash(hash_byte),
         })
         .expect("test v2 registry entry should be valid")
+    }
+
+    #[test]
+    fn durable_registry_rejects_pre_conflict_resolution_component_api() {
+        let mut legacy = v2_entry('a');
+        legacy.api_version = "2.0.0".to_owned();
+        legacy.manifest_json = legacy.manifest_json.replacen("2.1.0", "2.0.0", 1);
+        let plugins = vec![legacy];
+        let wire = PluginRegistryWire {
+            version: REGISTRY_FORMAT_VERSION,
+            plugin_count: 1,
+            generation: calculate_generation(&plugins).unwrap(),
+            plugins,
+        };
+
+        let error = PluginRegistry::from_wire(wire)
+            .expect_err("durable pre-conflict-resolution components must hard fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(error.message.contains("api_version"));
+        assert!(error.message.contains("2.1.0"));
     }
 
     #[test]
@@ -1167,7 +1194,7 @@ mod tests {
 
         let mut incompatible = Vec::new();
         let mut value = replacement.clone();
-        value.api_version = "2.1.0".to_string();
+        value.api_version = "2.2.0".to_string();
         incompatible.push(value);
         let mut value = replacement.clone();
         value.path_glob = "*.tsv".to_string();
@@ -1338,7 +1365,7 @@ mod tests {
         let mut input = PluginRegistryEntryInput {
             key: "plugin_a".to_string(),
             runtime: PluginRuntime::WasmComponentV2,
-            api_version: "2.0.0".to_string(),
+            api_version: "2.1.0".to_string(),
             path_glob: "*.json".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),

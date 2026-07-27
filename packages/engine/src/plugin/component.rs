@@ -10,10 +10,11 @@ use super::{
     PluginCatalogCache, PluginRegistry,
 };
 
-/// Installed plugins are untrusted workspace data. Bound every component
-/// instantiation and exported call so malformed or adversarial guest code
-/// cannot occupy a server executor indefinitely.
-const DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 5_000;
+/// Installed plugins are untrusted workspace data. This is the absolute
+/// per-export ceiling; a transition's tighter host budget remains authoritative
+/// for normal operations. The cold-file budget may extend up to this ceiling,
+/// but no guest call can exceed it.
+const MAX_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 60_000;
 /// Recursive plugins retain semantic indexes alongside accepted source bytes.
 pub(crate) const DEFAULT_PLUGIN_V2_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
 
@@ -26,7 +27,7 @@ fn plugin_v2_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> 
     }
     Ok(WasmLimits {
         max_memory_bytes,
-        timeout_ms: Some(DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS),
+        timeout_ms: Some(MAX_PLUGIN_EXECUTION_TIMEOUT_MS),
         ..WasmLimits::default()
     })
 }
@@ -213,7 +214,7 @@ mod tests {
         );
         assert_eq!(
             default_plugin_v2_wasm_limits().timeout_ms,
-            Some(DEFAULT_PLUGIN_EXECUTION_TIMEOUT_MS)
+            Some(MAX_PLUGIN_EXECUTION_TIMEOUT_MS)
         );
         assert!(plugin_v2_wasm_limits(0).is_err());
         assert_eq!(

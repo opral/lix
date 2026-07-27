@@ -9,12 +9,18 @@ use crate::core::{
     ByteEdit as CoreByteEdit, Document as CoreDocument, EntityChange as CoreEntityChange,
     EntityImportBuilder, IdNamespace as CoreIdNamespace, InputSplice as CoreInputSplice,
 };
-use crate::packet::{ChangeStream, FORMAT_VERSION, decode_change_page, decode_entity_page};
+use crate::packet::{
+    CANONICAL_FALLBACK_MAX_FRAMED_BYTES, CANONICAL_FALLBACK_MAX_RECORD_BYTES,
+    CanonicalConflictFallback, ChangeStream, FORMAT_VERSION,
+    ResolutionPage as PacketResolutionPage, canonical_fallback_page, decode_change_page,
+    decode_entity_page, scan_conflict_page,
+};
 use exports::lix::plugin::api::{
-    ByteOutputs, ChangeCursor, ChangePage, Document, EditCursor, EditPage, EntityTransition,
-    EntityUpdate, FileTransition, FileUpdate, Guest, GuestByteOutputs, GuestChangeCursor,
-    GuestDocument, GuestEditCursor, InputBytes, OpenEntitiesInput, OpenFileInput, OutputBytes,
-    OutputRange, OutputSplice, PluginError,
+    ByteOutputs, ChangeCursor, ChangePage, ConflictUpdate, Document, EditCursor, EditPage,
+    EntityTransition, EntityUpdate, FileTransition, FileUpdate, Guest, GuestByteOutputs,
+    GuestChangeCursor, GuestDocument, GuestEditCursor, GuestResolutionCursor, InputBytes,
+    OpenEntitiesInput, OpenFileInput, OutputBytes, OutputRange, OutputSplice, PluginError,
+    ResolutionCursor, ResolutionPage,
 };
 use lix::plugin::host::{ByteSource, ByteSources, PacketSource, SourceError, TransitionBudget};
 use std::cell::RefCell;
@@ -46,6 +52,20 @@ struct JsonEditCursor {
 #[derive(Debug)]
 struct EditCursorState {
     edits: VecDeque<CoreByteEdit>,
+    eof: bool,
+}
+
+/// Stateless conflict resolution retains only the packet source and compact
+/// canonical fallback metadata waiting to be echoed. It deliberately never
+/// owns a `CoreDocument` or any conflict snapshot.
+struct JsonResolutionCursor {
+    state: RefCell<ResolutionCursorState>,
+}
+
+struct ResolutionCursorState {
+    conflicts: PacketSource,
+    pending_fallbacks: VecDeque<CanonicalConflictFallback>,
+    input_eof: bool,
     eof: bool,
 }
 
@@ -217,6 +237,66 @@ fn drain_changes(
     Ok(output)
 }
 
+fn next_canonical_fallback_resolution_page(
+    state: &mut ResolutionCursorState,
+    budget: &TransitionBudget,
+    max_bytes: u32,
+) -> Result<Option<PacketResolutionPage>, PluginError> {
+    if max_bytes == 0 {
+        return Err(PluginError::LimitExceeded(
+            "resolution cursor max-bytes must be positive".to_owned(),
+        ));
+    }
+    if usize::try_from(budget.limits().max_record_bytes).expect("u32 fits usize")
+        < CANONICAL_FALLBACK_MAX_RECORD_BYTES
+    {
+        return Err(PluginError::RecordTooLarge(
+            CANONICAL_FALLBACK_MAX_RECORD_BYTES as u64,
+        ));
+    }
+    let output_capacity =
+        usize::try_from(max_bytes).expect("u32 fits usize") / CANONICAL_FALLBACK_MAX_FRAMED_BYTES;
+    if output_capacity == 0 {
+        return Err(PluginError::RecordTooLarge(
+            CANONICAL_FALLBACK_MAX_FRAMED_BYTES as u64,
+        ));
+    }
+
+    while state.pending_fallbacks.is_empty() && !state.input_eof {
+        let input_max_bytes = budget.limits().max_page_bytes.max(1);
+        let Some(page) = state
+            .conflicts
+            .next(budget, input_max_bytes)
+            .map_err(source_error)?
+        else {
+            state.input_eof = true;
+            break;
+        };
+        if page.format_version != FORMAT_VERSION {
+            return Err(plugin_error(format!(
+                "unsupported packet version {}",
+                page.format_version
+            )));
+        }
+        // The scanner advances over the key and all three lazy snapshots, but
+        // does not call `byte-sources.read`. A present B remains host-owned;
+        // an absent B becomes an explicit host tombstone.
+        state
+            .pending_fallbacks
+            .extend(scan_conflict_page(&page.payload, page.record_count).map_err(plugin_error)?);
+    }
+
+    if state.pending_fallbacks.is_empty() {
+        state.eof = true;
+        return Ok(None);
+    }
+    let count = state.pending_fallbacks.len().min(output_capacity);
+    let fallbacks = state.pending_fallbacks.drain(..count).collect::<Vec<_>>();
+    canonical_fallback_page(&fallbacks)
+        .map(Some)
+        .map_err(plugin_error)
+}
+
 fn file_transition(document: CoreDocument, stream: ChangeStream) -> FileTransition {
     FileTransition {
         document: Document::new(JsonDocument(document)),
@@ -247,6 +327,7 @@ impl Guest for JsonGuest {
     type ChangeCursor = JsonChangeCursor;
     type EditCursor = JsonEditCursor;
     type Document = JsonDocument;
+    type ResolutionCursor = JsonResolutionCursor;
 
     fn open_file(
         budget: &TransitionBudget,
@@ -283,6 +364,20 @@ impl Guest for JsonGuest {
             None => vec![edit],
         };
         Ok(entity_transition(document, edits))
+    }
+
+    fn resolve_conflicts(
+        _budget: &TransitionBudget,
+        input: ConflictUpdate,
+    ) -> Result<ResolutionCursor, PluginError> {
+        Ok(ResolutionCursor::new(JsonResolutionCursor {
+            state: RefCell::new(ResolutionCursorState {
+                conflicts: input.conflicts,
+                pending_fallbacks: VecDeque::new(),
+                input_eof: false,
+                eof: false,
+            }),
+        }))
     }
 }
 
@@ -375,6 +470,29 @@ impl GuestChangeCursor for JsonChangeCursor {
             record_count: page.record_count,
             payload: page.payload,
             attachments,
+        }))
+    }
+}
+
+impl GuestResolutionCursor for JsonResolutionCursor {
+    fn next(
+        &self,
+        budget: &TransitionBudget,
+        max_bytes: u32,
+    ) -> Result<Option<ResolutionPage>, PluginError> {
+        let mut state = self.state.borrow_mut();
+        if state.eof {
+            return Ok(None);
+        }
+        let Some(page) = next_canonical_fallback_resolution_page(&mut state, budget, max_bytes)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ResolutionPage {
+            format_version: FORMAT_VERSION,
+            record_count: page.record_count,
+            payload: page.payload,
+            attachments: None,
         }))
     }
 }

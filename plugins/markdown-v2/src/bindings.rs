@@ -10,12 +10,16 @@ use crate::core::{
     EntityRecord as CoreEntityRecord, IdNamespace as CoreIdNamespace,
     InputSplice as CoreInputSplice, PluginError as CorePluginError,
 };
-use crate::packet::{ChangeStream, FORMAT_VERSION, decode_change_page, decode_entity_page};
+use crate::packet::{
+    ChangeStream, ConflictResolution, ConflictSnapshot, EntityConflict, FORMAT_VERSION,
+    ResolutionStream, decode_change_page, decode_conflict_page, decode_entity_page,
+};
 use exports::lix::plugin::api::{
     ByteOutputs, ChangeCursor, ChangePage, Document, EditCursor, EditPage, EntityTransition,
     EntityUpdate, FileTransition, FileUpdate, Guest, GuestByteOutputs, GuestChangeCursor,
-    GuestDocument, GuestEditCursor, InputBytes, OpenEntitiesInput, OpenFileInput, OutputBytes,
-    OutputRange, OutputSplice, PluginError,
+    GuestDocument, GuestEditCursor, GuestResolutionCursor, InputBytes, OpenEntitiesInput,
+    OpenFileInput, OutputBytes, OutputRange, OutputSplice, PluginError, ResolutionCursor,
+    ResolutionPage,
 };
 use lix::plugin::host::{ByteSource, ByteSources, PacketSource, SourceError, TransitionBudget};
 use std::cell::RefCell;
@@ -47,6 +51,20 @@ struct MarkdownEditCursor {
 #[derive(Debug)]
 struct EditCursorState {
     edits: VecDeque<CoreByteEdit>,
+    eof: bool,
+}
+
+/// The static resolver owns its lazy conflict source. It reads at most one
+/// bounded host page when its result cursor is drained, rather than collecting
+/// every conflict in a large Markdown file before returning the cursor.
+struct MarkdownResolutionCursor {
+    state: RefCell<ResolutionCursorState>,
+}
+
+struct ResolutionCursorState {
+    source: PacketSource,
+    pending: ResolutionStream,
+    source_eof: bool,
     eof: bool,
 }
 
@@ -226,6 +244,76 @@ fn drain_changes(
     Ok(output)
 }
 
+/// Keep the semantic heuristic deliberately bounded. Plain paragraph snapshots
+/// are normally only a few hundred bytes; a large value should stay on the
+/// zero-copy deterministic `TakeB` path rather than allocating three
+/// arbitrary attachments in guest linear memory.
+const MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES: u64 = 64 * 1024;
+
+fn read_conflict_snapshot(
+    snapshot: &ConflictSnapshot,
+    attachments: Option<&ByteSources>,
+    budget: &TransitionBudget,
+) -> Result<Vec<u8>, PluginError> {
+    match snapshot {
+        ConflictSnapshot::Inline(bytes) => Ok(bytes.clone()),
+        ConflictSnapshot::Attachment {
+            index,
+            offset,
+            length,
+        } => read_attachment(attachments, budget, *index, *offset, *length),
+    }
+}
+
+fn resolve_conflict(
+    conflict: EntityConflict,
+    attachments: Option<&ByteSources>,
+    budget: &TransitionBudget,
+) -> Result<ConflictResolution, PluginError> {
+    // A canonical b tombstone wins without consulting any stale side.
+    // This is deliberately before the schema guard so malformed packets never
+    // emit `TakeB` for an absent value.
+    let Some(b) = conflict.b.as_ref() else {
+        return Ok(ConflictResolution::Delete);
+    };
+
+    // The host will invoke Markdown only for the plugin's own schema. Keeping
+    // this guard makes a malformed/mixed packet converge deterministically
+    // without asking the Markdown parser to interpret a foreign snapshot.
+    if conflict.schema_key != crate::NODE_SCHEMA_KEY {
+        return Ok(ConflictResolution::TakeB);
+    }
+
+    let Some(base) = conflict.base.as_ref() else {
+        return Ok(ConflictResolution::TakeB);
+    };
+    let Some(a) = conflict.a.as_ref() else {
+        return Ok(ConflictResolution::TakeB);
+    };
+    if [base, a, b]
+        .into_iter()
+        .any(|snapshot| snapshot.len() > MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES)
+    {
+        return Ok(ConflictResolution::TakeB);
+    }
+
+    let base = read_conflict_snapshot(base, attachments, budget)?;
+    let a = read_conflict_snapshot(a, attachments, budget)?;
+    let b = read_conflict_snapshot(b, attachments, budget)?;
+    let resolved =
+        CoreDocument::resolve_entity_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
+    match resolved {
+        None => Ok(ConflictResolution::Delete),
+        // Prefer b for semantically equal snapshots: b is the canonical
+        // fallback and retains its metadata. a and base remain typed choices
+        // for a future Markdown heuristic that selects either exact input.
+        Some(resolved) if resolved == b => Ok(ConflictResolution::TakeB),
+        Some(resolved) if resolved == a => Ok(ConflictResolution::TakeA),
+        Some(resolved) if resolved == base => Ok(ConflictResolution::TakeBase),
+        Some(resolved) => Ok(ConflictResolution::Replace(Arc::new(resolved))),
+    }
+}
+
 fn file_transition(document: CoreDocument, changes: Vec<CoreEntityChange>) -> FileTransition {
     FileTransition {
         document: Document::new(MarkdownDocument(document)),
@@ -256,6 +344,7 @@ impl Guest for MarkdownGuest {
     type ChangeCursor = MarkdownChangeCursor;
     type EditCursor = MarkdownEditCursor;
     type Document = MarkdownDocument;
+    type ResolutionCursor = MarkdownResolutionCursor;
 
     fn open_file(
         budget: &TransitionBudget,
@@ -282,6 +371,23 @@ impl Guest for MarkdownGuest {
         let (document, edits) =
             CoreDocument::open_entities(records, accepted).map_err(core_error)?;
         Ok(entity_transition(document, edits))
+    }
+
+    fn resolve_conflicts(
+        _budget: &TransitionBudget,
+        input: exports::lix::plugin::api::ConflictUpdate,
+    ) -> Result<ResolutionCursor, PluginError> {
+        // Keep the host packet source in the returned cursor. The transition
+        // budget covers this call and all cursor pages, allowing a large file
+        // to resolve one bounded input page at a time.
+        Ok(ResolutionCursor::new(MarkdownResolutionCursor {
+            state: RefCell::new(ResolutionCursorState {
+                source: input.conflicts,
+                pending: ResolutionStream::default(),
+                source_eof: false,
+                eof: false,
+            }),
+        }))
     }
 }
 
@@ -375,6 +481,78 @@ impl GuestChangeCursor for MarkdownChangeCursor {
             payload: page.payload,
             attachments,
         }))
+    }
+}
+
+impl GuestResolutionCursor for MarkdownResolutionCursor {
+    fn next(
+        &self,
+        budget: &TransitionBudget,
+        max_bytes: u32,
+    ) -> Result<Option<ResolutionPage>, PluginError> {
+        let max_record_bytes = budget.limits().max_record_bytes;
+        let mut state = self.state.borrow_mut();
+        if state.eof {
+            return Ok(None);
+        }
+        loop {
+            if let Some(page) = state
+                .pending
+                .next_page(max_bytes, max_record_bytes)
+                .map_err(|error| {
+                    if error.contains("record cap") {
+                        PluginError::RecordTooLarge(u64::from(max_record_bytes) + 1)
+                    } else if error.contains("page cap") {
+                        PluginError::RecordTooLarge(u64::from(max_bytes) + 1)
+                    } else {
+                        plugin_error(error)
+                    }
+                })?
+            {
+                let attachments = if page.attachments.is_empty() {
+                    None
+                } else {
+                    Some(ByteOutputs::new(MarkdownByteOutputs {
+                        values: page.attachments,
+                    }))
+                };
+                return Ok(Some(ResolutionPage {
+                    format_version: FORMAT_VERSION,
+                    record_count: page.record_count,
+                    payload: page.payload,
+                    attachments,
+                }));
+            }
+            if state.source_eof {
+                state.eof = true;
+                return Ok(None);
+            }
+
+            let source_page_cap = budget.limits().max_page_bytes.max(1);
+            let Some(page) = state
+                .source
+                .next(budget, source_page_cap)
+                .map_err(source_error)?
+            else {
+                state.source_eof = true;
+                continue;
+            };
+            if page.format_version != FORMAT_VERSION {
+                return Err(plugin_error(format!(
+                    "unsupported packet version {}",
+                    page.format_version
+                )));
+            }
+            let conflicts =
+                decode_conflict_page(&page.payload, page.record_count).map_err(plugin_error)?;
+            let mut resolutions = Vec::with_capacity(conflicts.len());
+            for conflict in conflicts {
+                let ordinal = conflict.ordinal;
+                let resolution = resolve_conflict(conflict, page.attachments.as_ref(), budget)?;
+                resolutions.push((ordinal, resolution));
+            }
+            state.pending.extend(resolutions);
+        }
     }
 }
 

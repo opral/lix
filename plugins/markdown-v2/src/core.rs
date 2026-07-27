@@ -3,7 +3,7 @@ use crate::markdown_file::{
     render_tree,
 };
 use crate::model::{
-    InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
+    InlineContent, InlineNode, NodeKind, NodeSnapshot, NodeTree, Projection, parse_inline_payload,
     replace_column_ids, semantic_payload,
 };
 use base64::Engine;
@@ -1904,6 +1904,28 @@ fn projection_after_detected_changes(
 }
 
 impl Document {
+    /// Resolves one concurrent Markdown entity change without depending on a
+    /// hydrated document.
+    ///
+    /// `a` and `b` are already in the engine's stable merge order.
+    /// The default is therefore an exact canonical `b` fallback. For the common case of
+    /// one plain-text paragraph changed by two disjoint single-span edits, we
+    /// can safely retain both edits instead. Everything structural, formatted,
+    /// deleted, malformed, or overlapping deliberately takes the b
+    /// snapshot unchanged.
+    pub fn resolve_entity_conflict(
+        base: Option<Vec<u8>>,
+        a: Option<Vec<u8>>,
+        b: Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        let b = b?;
+        let (Some(base), Some(a)) = (base, a) else {
+            return Some(b);
+        };
+
+        Some(merge_plain_paragraph_snapshots(&base, &a, &b).unwrap_or(b))
+    }
+
     pub fn open_file(
         bytes: Vec<u8>,
         path: Option<&str>,
@@ -2292,4 +2314,169 @@ impl Document {
     pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
         self.bytes.materialize()
     }
+}
+
+/// A single base-relative text replacement. Keeping this deliberately narrow
+/// gives merge an easily auditable happy path: two insertions at opposite ends
+/// of a word are independent, while a pair of arbitrary edit scripts is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TextReplacement {
+    start: usize,
+    end: usize,
+    insert: Vec<char>,
+}
+
+fn merge_plain_paragraph_snapshots(
+    base_snapshot: &[u8],
+    a_snapshot: &[u8],
+    b_snapshot: &[u8],
+) -> Option<Vec<u8>> {
+    let base = node_from_wire_snapshot(base_snapshot)?;
+    let a = node_from_wire_snapshot(a_snapshot)?;
+    let b = node_from_wire_snapshot(b_snapshot)?;
+
+    if !same_plain_paragraph_shape(&base, &a) || !same_plain_paragraph_shape(&base, &b) {
+        return None;
+    }
+
+    let base_text = single_text_value(&base)?;
+    let a_text = single_text_value(&a)?;
+    let b_text = single_text_value(&b)?;
+    let merged = merge_disjoint_text_replacements(&base_text, &a_text, &b_text)?;
+
+    let merged_node = replace_single_text(b, merged)?;
+    node_to_wire_snapshot(&merged_node)
+}
+
+fn node_from_wire_snapshot(snapshot: &[u8]) -> Option<NodeSnapshot> {
+    let logical = wire_to_logical(snapshot).ok()?;
+    serde_json::from_str(&logical).ok()
+}
+
+fn node_to_wire_snapshot(node: &NodeSnapshot) -> Option<Vec<u8>> {
+    let logical = serde_json::to_string(node).ok()?;
+    logical_to_wire(&logical).ok()
+}
+
+fn same_plain_paragraph_shape(base: &NodeSnapshot, side: &NodeSnapshot) -> bool {
+    base.kind == NodeKind::Paragraph
+        && side.kind == NodeKind::Paragraph
+        && base.id == side.id
+        && base.parent_id == side.parent_id
+        && base.order_key == side.order_key
+        && base.format == side.format
+}
+
+fn single_text_value(node: &NodeSnapshot) -> Option<String> {
+    let inlines = parse_inline_payload(&node.payload).ok()?;
+    let [
+        InlineNode {
+            content: InlineContent::Text { value },
+            ..
+        },
+    ] = inlines.as_slice()
+    else {
+        return None;
+    };
+    Some(value.clone())
+}
+
+fn replace_single_text(mut node: NodeSnapshot, value: String) -> Option<NodeSnapshot> {
+    let mut inlines = parse_inline_payload(&node.payload).ok()?;
+    let [
+        InlineNode {
+            content: InlineContent::Text { value: current },
+            ..
+        },
+    ] = inlines.as_mut_slice()
+    else {
+        return None;
+    };
+    *current = value;
+    node.payload["inline"] = serde_json::to_value(inlines).ok()?;
+    Some(node)
+}
+
+fn merge_disjoint_text_replacements(base: &str, a: &str, b: &str) -> Option<String> {
+    if a == b {
+        return Some(b.to_owned());
+    }
+    if a == base {
+        return Some(b.to_owned());
+    }
+    if b == base {
+        return Some(a.to_owned());
+    }
+
+    let base = base.chars().collect::<Vec<_>>();
+    let a = a.chars().collect::<Vec<_>>();
+    let b = b.chars().collect::<Vec<_>>();
+    let a_edit = single_text_replacement(&base, &a);
+    let b_edit = single_text_replacement(&base, &b);
+
+    if a_edit == b_edit {
+        return chars_to_string(&base, &[a_edit]);
+    }
+
+    if a_edit.start == b_edit.start && a_edit.end == b_edit.end && a_edit.start == a_edit.end {
+        // Concurrent inserts at one logical position have no destructive
+        // overlap. Preserve both in the same canonical a-then-b order
+        // regardless of which branch happened to initiate the merge.
+        return chars_to_string(
+            &base,
+            &[TextReplacement {
+                start: a_edit.start,
+                end: a_edit.end,
+                insert: a_edit
+                    .insert
+                    .iter()
+                    .chain(&b_edit.insert)
+                    .copied()
+                    .collect(),
+            }],
+        );
+    }
+
+    let mut edits = [a_edit, b_edit];
+    edits.sort_by_key(|edit| (edit.start, edit.end));
+    if edits[0].end > edits[1].start {
+        return None;
+    }
+    chars_to_string(&base, &edits)
+}
+
+fn single_text_replacement(base: &[char], side: &[char]) -> TextReplacement {
+    let start = base
+        .iter()
+        .zip(side)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix_cap = base.len().min(side.len()).saturating_sub(start);
+    let suffix = base
+        .iter()
+        .rev()
+        .zip(side.iter().rev())
+        .take(suffix_cap)
+        .take_while(|(left, right)| left == right)
+        .count();
+    TextReplacement {
+        start,
+        end: base.len() - suffix,
+        insert: side[start..side.len() - suffix].to_vec(),
+    }
+}
+
+fn chars_to_string(base: &[char], edits: &[TextReplacement]) -> Option<String> {
+    let mut output = String::new();
+    let mut cursor = 0;
+    for edit in edits {
+        if edit.start < cursor || edit.end < edit.start || edit.end > base.len() {
+            return None;
+        }
+        output.extend(base[cursor..edit.start].iter());
+        output.extend(edit.insert.iter());
+        cursor = edit.end;
+    }
+    output.extend(base[cursor..].iter());
+    Some(output)
 }

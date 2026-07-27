@@ -63,9 +63,10 @@ reordered, converted into a container, or reformatted through
 `entities-changed`. Those requests return `LIX_INVALID_PARAM` and must be
 expressed as an authoritative byte write instead.
 
-Actor transitions serialize direct scalar writes, so two writes to the same
-scalar use durable commit order as deterministic last-write-wins; edits to
-different scalars compose. A structural byte change fences a stale scalar or
+Actor transitions serialize direct scalar writes, so within one engine the
+later accepted write to the same scalar replaces the earlier one; edits to
+different scalars compose. This is an engine-local serialized-write rule, not
+a transport-level LWW claim. A structural byte change fences a stale scalar or
 multi-entity rebase rather than resurrecting or partially recreating removed
 nodes. The caller rereads the file and retries from the new structure. There
 are no first-class JSON conflict records in this version, so this stale-rebase

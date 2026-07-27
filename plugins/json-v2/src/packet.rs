@@ -11,6 +11,30 @@ pub struct ChangePage {
     pub attachments: Vec<Arc<Vec<u8>>>,
 }
 
+/// A page of static conflict resolutions. Canonical fallback results
+/// intentionally have no attachments: the host reuses the selected immutable
+/// input snapshot, or applies an explicit tombstone when canonical `b` is
+/// absent.
+#[derive(Clone, Debug)]
+pub struct ResolutionPage {
+    pub record_count: u32,
+    pub payload: Vec<u8>,
+}
+
+/// A canonical fallback is either a zero-copy `Take(B)` or an explicit
+/// `Delete` when the host's canonical B value is absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CanonicalConflictFallback {
+    pub ordinal: u32,
+    pub b_present: bool,
+}
+
+/// `Take(B)` is the largest canonical fallback record: tag, host-assigned
+/// ordinal, take side, plus its four-byte packet frame. `Delete` is one byte
+/// shorter, so this remains the safe cursor-capacity bound for both forms.
+pub const CANONICAL_FALLBACK_MAX_RECORD_BYTES: usize = 6;
+pub const CANONICAL_FALLBACK_MAX_FRAMED_BYTES: usize = 4 + CANONICAL_FALLBACK_MAX_RECORD_BYTES;
+
 #[derive(Clone, Debug)]
 pub enum ChangeStream {
     Initial(InitialChanges),
@@ -260,6 +284,15 @@ impl<'a> Decoder<'a> {
             .map_err(|error| format!("packet text is not UTF-8: {error}"))
     }
 
+    /// Advances over text without allocating or decoding it. Conflict
+    /// resolvers that choose an input side only need record alignment; the
+    /// engine owns identity validation and selected snapshot materialization.
+    fn skip_text(&mut self) -> Result<(), String> {
+        let len = usize::try_from(self.u32()?).expect("u32 fits usize");
+        self.take(len)?;
+        Ok(())
+    }
+
     fn key(&mut self) -> Result<(String, Vec<String>), String> {
         let schema_key = self.text()?;
         let count = usize::try_from(self.u32()?).expect("u32 fits usize");
@@ -271,6 +304,18 @@ impl<'a> Decoder<'a> {
             pk.push(self.text()?);
         }
         Ok((schema_key, pk))
+    }
+
+    fn skip_key(&mut self) -> Result<(), String> {
+        self.skip_text()?;
+        let count = usize::try_from(self.u32()?).expect("u32 fits usize");
+        if count > self.remaining() / 4 {
+            return Err("entity primary-key component count exceeds packet bounds".to_owned());
+        }
+        for _ in 0..count {
+            self.skip_text()?;
+        }
+        Ok(())
     }
 
     fn blob(
@@ -289,6 +334,38 @@ impl<'a> Decoder<'a> {
                 attachment(index, offset, length)
             }
             tag => Err(format!("unknown packet blob-ref tag {tag}")),
+        }
+    }
+
+    /// Advances over a blob reference without copying an inline snapshot or
+    /// calling into its attachment source.
+    fn skip_blob(&mut self) -> Result<(), String> {
+        match self.u8()? {
+            0 => {
+                let len = usize::try_from(self.u32()?).expect("u32 fits usize");
+                self.take(len)?;
+            }
+            1 => {
+                self.u32()?;
+                self.u64()?;
+                self.u64()?;
+            }
+            tag => return Err(format!("unknown packet blob-ref tag {tag}")),
+        }
+        Ok(())
+    }
+
+    /// Advances over a lazy conflict state and returns whether it contains a
+    /// live snapshot. A missing canonical B state must become an explicit
+    /// delete, never `Take(B)`.
+    fn skip_conflict_state(&mut self) -> Result<bool, String> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => {
+                self.skip_blob()?;
+                Ok(true)
+            }
+            tag => Err(format!("unknown packet conflict-state tag {tag}")),
         }
     }
 
@@ -317,6 +394,76 @@ fn framed_records(payload: &[u8], count: u32) -> Result<Vec<&[u8]>, String> {
     }
     decoder.finish()?;
     Ok(records)
+}
+
+/// Verifies and consumes a page of conflict triples without materializing any
+/// snapshot. This is the hot canonical-fallback path: output cardinality
+/// follows input framing while the host retains ownership of every selected
+/// version.
+pub fn scan_conflict_page(
+    payload: &[u8],
+    count: u32,
+) -> Result<Vec<CanonicalConflictFallback>, String> {
+    if count == 0 {
+        return Err("packet page must contain at least one record".to_owned());
+    }
+    let count = usize::try_from(count).expect("u32 fits usize");
+    if count > payload.len() / 4 {
+        return Err("packet record count exceeds payload bounds".to_owned());
+    }
+    let mut framed = Decoder::new(payload);
+    let mut fallbacks = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = usize::try_from(framed.u32()?).expect("u32 fits usize");
+        let bytes = framed.take(len)?;
+        let mut record = Decoder::new(bytes);
+        record.skip_key()?;
+        let ordinal = record.u32()?;
+        record.skip_conflict_state()?;
+        record.skip_conflict_state()?;
+        let b_present = record.skip_conflict_state()?;
+        record.finish()?;
+        fallbacks.push(CanonicalConflictFallback { ordinal, b_present });
+    }
+    framed.finish()?;
+    Ok(fallbacks)
+}
+
+/// Encodes one canonical result per consumed conflict. It never emits an
+/// attachment because selected bytes stay in host-owned conflict history.
+pub fn canonical_fallback_page(
+    fallbacks: &[CanonicalConflictFallback],
+) -> Result<ResolutionPage, String> {
+    if fallbacks.is_empty() {
+        return Err("resolution page must contain at least one record".to_owned());
+    }
+    let record_count =
+        u32::try_from(fallbacks.len()).map_err(|_| "resolution page has too many records")?;
+    let payload_len = fallbacks.iter().try_fold(0usize, |length, fallback| {
+        let record_bytes = if fallback.b_present { 6 } else { 5 };
+        length
+            .checked_add(4 + record_bytes)
+            .ok_or_else(|| "resolution page length overflow".to_owned())
+    })?;
+    let mut payload = Vec::with_capacity(payload_len);
+    for fallback in fallbacks {
+        if fallback.b_present {
+            put_u32(&mut payload, 6);
+            // Resolution tag 0 is Take; take side 2 is B.
+            payload.push(0);
+            put_u32(&mut payload, fallback.ordinal);
+            payload.push(2);
+        } else {
+            put_u32(&mut payload, 5);
+            // Resolution tag 2 is Delete.
+            payload.push(2);
+            put_u32(&mut payload, fallback.ordinal);
+        }
+    }
+    Ok(ResolutionPage {
+        record_count,
+        payload,
+    })
 }
 
 pub fn decode_entity_page(
@@ -444,6 +591,84 @@ mod tests {
         assert!(
             error.contains("record count exceeds payload bounds"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn conflict_scanner_skips_inline_and_attachment_snapshots() {
+        let mut record = Vec::new();
+        encode_key(&mut record, "json_property", &["large-value".to_owned()]).unwrap();
+        put_u32(&mut record, 0x4433_2211);
+
+        // Base is inline and a is absent. The selected b version is a
+        // lazy attachment, so a Take(B) resolver must only advance over
+        // metadata and never need an attachment callback.
+        record.extend_from_slice(&[1, 0]);
+        put_u32(&mut record, 4);
+        record.extend_from_slice(b"base");
+        record.push(0);
+        record.extend_from_slice(&[1, 1]);
+        put_u32(&mut record, 0);
+        record.extend_from_slice(&0u64.to_le_bytes());
+        record.extend_from_slice(&10_000_000u64.to_le_bytes());
+
+        let mut payload = Vec::new();
+        put_u32(&mut payload, u32::try_from(record.len()).unwrap());
+        payload.extend_from_slice(&record);
+        assert_eq!(
+            scan_conflict_page(&payload, 1).unwrap(),
+            [CanonicalConflictFallback {
+                ordinal: 0x4433_2211,
+                b_present: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn conflict_scanner_marks_an_absent_b_as_delete() {
+        let mut record = Vec::new();
+        encode_key(&mut record, "json_property", &["deleted".to_owned()]).unwrap();
+        put_u32(&mut record, 7);
+        // Base and A are present but canonical B is a tombstone.
+        record.extend_from_slice(&[1, 0]);
+        put_u32(&mut record, 4);
+        record.extend_from_slice(b"base");
+        record.extend_from_slice(&[1, 0]);
+        put_u32(&mut record, 1);
+        record.extend_from_slice(b"a");
+        record.push(0);
+        let mut payload = Vec::new();
+        put_u32(&mut payload, u32::try_from(record.len()).unwrap());
+        payload.extend_from_slice(&record);
+
+        assert_eq!(
+            scan_conflict_page(&payload, 1).unwrap(),
+            [CanonicalConflictFallback {
+                ordinal: 7,
+                b_present: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn canonical_fallback_page_is_framed_and_attachment_free() {
+        let page = canonical_fallback_page(&[
+            CanonicalConflictFallback {
+                ordinal: 0x4433_2211,
+                b_present: true,
+            },
+            CanonicalConflictFallback {
+                ordinal: 7,
+                b_present: false,
+            },
+        ])
+        .unwrap();
+        assert_eq!(page.record_count, 2);
+        assert_eq!(
+            page.payload,
+            [
+                6, 0, 0, 0, 0, 0x11, 0x22, 0x33, 0x44, 2, 5, 0, 0, 0, 2, 7, 0, 0, 0
+            ]
         );
     }
 }
