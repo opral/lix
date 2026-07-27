@@ -441,6 +441,7 @@ struct WritePipelineState {
     active_views: BTreeMap<(u64, u64), usize>,
     next_publication_id: u64,
     terminal_error: Option<StorageError>,
+    latest_snapshot: Option<Arc<DbSnapshot>>,
 }
 
 struct QueuedWrite {
@@ -536,6 +537,54 @@ impl WritePipeline {
             .terminal_error
             .clone();
         error.map_or(Ok(()), Err)
+    }
+
+    async fn snapshot(&self, worker: &SlateDBWorker) -> Result<Arc<DbSnapshot>, StorageError> {
+        let publication_id = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(snapshot) = state.latest_snapshot.clone() {
+                worker.check_open_fast()?;
+                return Ok(snapshot);
+            }
+            state.next_publication_id
+        };
+        let snapshot = worker
+            .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+            .await?;
+        let cacheable = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.next_publication_id == publication_id
+                && state
+                    .tail
+                    .as_ref()
+                    .is_none_or(|tail| tail.done.load(Ordering::Acquire))
+        };
+        if cacheable {
+            self.install_snapshot(Arc::clone(&snapshot));
+        } else {
+            worker.check_open_fast()?;
+        }
+        Ok(snapshot)
+    }
+
+    fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .latest_snapshot
+            .as_ref()
+            .is_none_or(|current| current.seq() <= snapshot.seq())
+        {
+            state.latest_snapshot = Some(snapshot);
+        }
     }
 
     fn capture(&self, snapshot_sequence: u64) -> PublicationView {
@@ -867,10 +916,7 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
             self.write_pipeline.terminal_error()?;
-            let snapshot = self
-                .worker
-                .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
-                .await?;
+            let snapshot = self.write_pipeline.snapshot(&self.worker).await?;
             let publication_view = if opts.durability == ReadDurability::Visible {
                 Some(self.write_pipeline.capture(snapshot.seq()))
             } else {
@@ -1448,6 +1494,12 @@ impl StorageWrite for SlateDBWrite {
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // A cached snapshot remains logically correct through the
+                // publication overlay, but it must not outlive that overlay
+                // after persistence. Force the next reader to fetch a current
+                // snapshot; `snapshot` caches it only when no publication
+                // raced the fetch and the write tail is complete.
+                state.latest_snapshot = None;
                 state.next_publication_id = state
                     .next_publication_id
                     .checked_add(1)
