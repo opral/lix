@@ -3,6 +3,10 @@ use std::time::{Duration, Instant};
 use criterion::measurement::WallTime;
 use criterion::{BatchSize, BenchmarkGroup, Criterion, black_box, criterion_group, criterion_main};
 
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod accounting;
 mod io_stats;
 mod kv_layout;

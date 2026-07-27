@@ -20,6 +20,10 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::storage_bench::diff_tracked_commits_for_bench;
 use lix_engine::{

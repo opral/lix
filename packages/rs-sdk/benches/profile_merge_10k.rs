@@ -16,6 +16,10 @@ use std::io::{Cursor, Write as _};
 use std::path::Path;
 use std::time::Instant;
 
+#[cfg(not(target_family = "wasm"))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const INITIAL_ROW_COUNT: usize = 10_000;
 const NEW_ROW_COUNT: usize = 10_000;
 const CSV_PATH: &str = "/large-merge.csv";
