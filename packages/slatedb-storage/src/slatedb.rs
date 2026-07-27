@@ -43,6 +43,8 @@ const POINT_READ_CONCURRENCY: usize = 64;
 const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
 const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
+const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
@@ -1017,18 +1019,19 @@ fn open_slatedb(
                 scan_interval: None,
                 ..ObjectStoreCacheOptions::default()
             };
-            let db_cache = SplitCache::new()
-                .with_block_cache(moka_cache(cache.block_cache_bytes))
-                .with_meta_cache(moka_cache(cache.metadata_cache_bytes))
-                .build();
-            builder = builder
-                .with_settings(settings)
-                .with_db_cache(Arc::new(db_cache));
+            builder = builder.with_settings(settings).with_db_cache(db_cache(
+                cache.block_cache_bytes,
+                cache.metadata_cache_bytes,
+            ));
         } else {
-            // The SlateDB dependency is compiled with Moka support so cached
-            // callers can choose bounded capacities. Keep default construction
-            // cacheless instead of accepting SlateDB's much larger defaults.
-            builder = builder.with_settings(settings).with_db_cache_disabled();
+            // Keep the default bounded instead of accepting SlateDB's much
+            // larger cache defaults. This captures hot SST blocks and
+            // metadata for normal default reads without enabling the optional
+            // disk object cache.
+            builder = builder.with_settings(settings).with_db_cache(db_cache(
+                DEFAULT_BLOCK_CACHE_BYTES,
+                DEFAULT_METADATA_CACHE_BYTES,
+            ));
         }
         builder.build().await.map_err(slatedb_error)
     })
@@ -1082,6 +1085,15 @@ fn moka_cache(capacity: u64) -> Option<Arc<dyn DbCache>> {
         time_to_live: None,
         time_to_idle: None,
     })))
+}
+
+fn db_cache(block_cache_bytes: u64, metadata_cache_bytes: u64) -> Arc<dyn DbCache> {
+    Arc::new(
+        SplitCache::new()
+            .with_block_cache(moka_cache(block_cache_bytes))
+            .with_meta_cache(moka_cache(metadata_cache_bytes))
+            .build(),
+    )
 }
 
 fn physical_key(space: SpaceId, key: &Key) -> Result<Key, StorageError> {
@@ -1452,8 +1464,99 @@ mod tests {
 
     #[test]
     fn cached_open_does_not_preload_ssts() {
+        let cache_dir = tempfile::tempdir().expect("create disk-cache directory");
+        assert_open_does_not_preload_ssts(
+            "test-on-demand-disk-cache",
+            SlateDBObjectStoreOptions {
+                cache: Some(SlateDBCacheOptions {
+                    root_folder: cache_dir.path().join("object-cache"),
+                    max_disk_cache_bytes: 16 * 1024 * 1024,
+                    block_cache_bytes: 0,
+                    metadata_cache_bytes: 0,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn default_memory_cache_does_not_preload_ssts() {
+        assert_open_does_not_preload_ssts(
+            "test-on-demand-memory-cache",
+            SlateDBObjectStoreOptions::default(),
+        );
+    }
+
+    fn assert_open_does_not_preload_ssts(db_path: &str, options: SlateDBObjectStoreOptions) {
         let inner = Arc::new(InMemory::new());
-        let db_path = "test-on-demand-disk-cache";
+        let db_path = db_path.to_string();
+        seed_compacted_sst(inner.clone(), &db_path);
+
+        let store = Arc::new(BlockingStore::new(inner));
+        let blocked_reads = store.block_compacted_reads();
+        let (opened_tx, opened_rx) = mpsc::channel();
+        let opener = std::thread::spawn(move || {
+            opened_tx
+                .send(SlateDB::open_object_store_with_options(
+                    db_path, store, options,
+                ))
+                .expect("send cached open result");
+        });
+
+        let opened = opened_rx.recv_timeout(Duration::from_secs(5));
+        drop(blocked_reads);
+        opener.join().expect("join cached opener");
+        let storage = opened
+            .expect("cached open must not wait for SST reads")
+            .expect("open cached SlateDB");
+        drop(storage);
+    }
+
+    #[test]
+    fn default_memory_cache_serves_a_warm_sst_read_without_object_store_access() {
+        let inner = Arc::new(InMemory::new());
+        let db_path = "test-default-memory-cache-hit";
+        seed_compacted_sst(inner.clone(), db_path);
+
+        let store = Arc::new(BlockingStore::new(inner));
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open default-memory-cache storage");
+
+        let first = block_on(storage.worker.call_read(|db| async move {
+            let snapshot = db.snapshot().await.map_err(slatedb_error)?;
+            snapshot.get(b"key").await.map_err(slatedb_error)
+        }))
+        .expect("warm raw SlateDB SST read");
+        assert_eq!(first, Some(Bytes::from_static(b"value")));
+
+        let blocked_reads = store.block_sst_reads();
+        let reader_storage = storage;
+        let (result_tx, result_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = block_on(reader_storage.worker.call_read(|db| async move {
+                let snapshot = db.snapshot().await.map_err(slatedb_error)?;
+                snapshot.get(b"key").await.map_err(slatedb_error)
+            }));
+            result_tx.send(result).expect("send warm raw read result");
+        });
+
+        let second = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => result.expect("warm raw read should succeed"),
+            Err(error) => {
+                drop(blocked_reads);
+                reader.join().expect("join blocked raw reader");
+                panic!("warm raw read touched the object store: {error}");
+            }
+        };
+        drop(blocked_reads);
+        reader.join().expect("join warm raw reader");
+        assert_eq!(second, Some(Bytes::from_static(b"value")));
+    }
+
+    fn seed_compacted_sst(inner: Arc<InMemory>, db_path: &str) {
         let physical_db_path = join_db_path(db_path, LZ4_FORMAT_PATH);
         Builder::new_current_thread()
             .enable_all()
@@ -1485,36 +1588,6 @@ mod tests {
                 .expect("flush raw SlateDB memtable");
                 db.close().await.expect("close raw SlateDB");
             });
-
-        let store = Arc::new(BlockingStore::new(inner));
-        let blocked_reads = store.block_compacted_reads();
-        let cache_dir = tempfile::tempdir().expect("create disk cache directory");
-        let cache_root = cache_dir.path().to_path_buf();
-        let (opened_tx, opened_rx) = mpsc::channel();
-        let opener = std::thread::spawn(move || {
-            opened_tx
-                .send(SlateDB::open_object_store_with_options(
-                    db_path,
-                    store,
-                    SlateDBObjectStoreOptions {
-                        cache: Some(SlateDBCacheOptions {
-                            root_folder: cache_root,
-                            max_disk_cache_bytes: 16 * 1024 * 1024,
-                            block_cache_bytes: 0,
-                            metadata_cache_bytes: 0,
-                        }),
-                    },
-                ))
-                .expect("send cached open result");
-        });
-
-        let opened = opened_rx.recv_timeout(Duration::from_secs(5));
-        drop(blocked_reads);
-        opener.join().expect("join cached opener");
-        let storage = opened
-            .expect("cached open must not wait for SST reads")
-            .expect("open cached SlateDB");
-        drop(storage);
     }
 
     #[test]
