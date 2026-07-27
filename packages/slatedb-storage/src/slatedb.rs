@@ -2214,11 +2214,18 @@ async fn scan_snapshot_with_writes(
     page_size: usize,
     projection: CoreProjection,
 ) -> Result<ScanChunk, StorageError> {
-    let scan_options = slatedb_scan_options(durability);
-    let mut base_iter = snapshot
-        .scan_with_options(bounds.range(), &scan_options)
-        .await
-        .map_err(slatedb_error)?;
+    if let [write] = visible_writes.as_slice() {
+        return scan_snapshot_with_single_write(
+            snapshot,
+            bounds,
+            durability,
+            Arc::clone(write),
+            page_size,
+            projection,
+        )
+        .await;
+    }
+
     let mut overlay = BTreeMap::new();
     for write in visible_writes {
         for (key, value) in &*write.overlay {
@@ -2227,7 +2234,105 @@ async fn scan_snapshot_with_writes(
             }
         }
     }
-    let mut overlay = overlay.into_iter().peekable();
+    merge_snapshot_with_overlay(
+        snapshot,
+        &bounds,
+        durability,
+        overlay.into_iter(),
+        page_size,
+        projection,
+    )
+    .await
+}
+
+async fn scan_snapshot_with_single_write(
+    snapshot: Arc<DbSnapshot>,
+    bounds: EncodedBounds,
+    durability: ReadDurability,
+    write: Arc<PublishedWrite>,
+    page_size: usize,
+    projection: CoreProjection,
+) -> Result<ScanChunk, StorageError> {
+    let scan_options = slatedb_scan_options(durability);
+    let mut base_iter = snapshot
+        .scan_with_options(bounds.range(), &scan_options)
+        .await
+        .map_err(slatedb_error)?;
+    let mut overlay_iter = write.overlay.iter().peekable();
+    let mut overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
+    let mut base_row = base_iter.next().await.map_err(slatedb_error)?;
+    let mut rows = Vec::with_capacity(page_size.saturating_add(1));
+    while rows.len() <= page_size {
+        let next = match (base_row.as_ref(), overlay_row.as_ref()) {
+            (Some(base_entry), Some((overlay_key, _))) => {
+                match base_entry.key.cmp(&overlay_key.0) {
+                    std::cmp::Ordering::Less => {
+                        let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
+                        base_row = base_iter.next().await.map_err(slatedb_error)?;
+                        Some(row)
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let row = overlay_row.take();
+                        overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
+                        base_row = base_iter.next().await.map_err(slatedb_error)?;
+                        row
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let row = overlay_row.take();
+                        overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
+                        row
+                    }
+                }
+            }
+            (Some(base_entry), None) => {
+                let row = (Key(base_entry.key.clone()), Some(base_entry.value.clone()));
+                base_row = base_iter.next().await.map_err(slatedb_error)?;
+                Some(row)
+            }
+            (None, Some(_)) => {
+                let row = overlay_row.take();
+                overlay_row = next_bounded_overlay(&mut overlay_iter, &bounds);
+                row
+            }
+            (None, None) => None,
+        };
+        let Some((key, value)) = next else {
+            break;
+        };
+        if let Some(value) = value {
+            rows.push((key, value));
+        }
+    }
+
+    project_scan_rows(rows, page_size, projection)
+}
+
+fn next_bounded_overlay(
+    overlay: &mut std::iter::Peekable<std::collections::btree_map::Iter<'_, Key, Option<Bytes>>>,
+    bounds: &EncodedBounds,
+) -> Option<(Key, Option<Bytes>)> {
+    for (key, value) in overlay.by_ref() {
+        if bounds.contains(key) {
+            return Some((key.clone(), value.clone()));
+        }
+    }
+    None
+}
+
+async fn merge_snapshot_with_overlay(
+    snapshot: Arc<DbSnapshot>,
+    bounds: &EncodedBounds,
+    durability: ReadDurability,
+    overlay: impl Iterator<Item = (Key, Option<Bytes>)>,
+    page_size: usize,
+    projection: CoreProjection,
+) -> Result<ScanChunk, StorageError> {
+    let scan_options = slatedb_scan_options(durability);
+    let mut base_iter = snapshot
+        .scan_with_options(bounds.range(), &scan_options)
+        .await
+        .map_err(slatedb_error)?;
+    let mut overlay = overlay.peekable();
     let mut base_row = base_iter.next().await.map_err(slatedb_error)?;
     let mut rows = Vec::with_capacity(page_size.saturating_add(1));
     while rows.len() <= page_size {
@@ -2265,6 +2370,14 @@ async fn scan_snapshot_with_writes(
         }
     }
 
+    project_scan_rows(rows, page_size, projection)
+}
+
+fn project_scan_rows(
+    rows: Vec<(Key, Bytes)>,
+    page_size: usize,
+    projection: CoreProjection,
+) -> Result<ScanChunk, StorageError> {
     let has_more = rows.len() > page_size;
     let entries = rows
         .into_iter()
