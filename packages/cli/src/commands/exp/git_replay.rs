@@ -17,6 +17,11 @@ use zip::write::SimpleFileOptions;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
+// Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
+// Keeping each flush below that floor lets the caller enqueue a small request
+// window before draining responses without depending on a platform's larger
+// pipe capacity or deadlocking behind a large blob response.
+const CAT_FILE_REQUESTS_PER_BATCH: usize = 4;
 const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text_v2";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
 
@@ -967,7 +972,7 @@ impl Drop for GitDiffTreeReader {
 struct GitBlobReader {
     repo_path: PathBuf,
     child: Option<Child>,
-    stdin: Option<BufWriter<ChildStdin>>,
+    stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     stderr_reader: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
 }
@@ -1006,92 +1011,107 @@ impl GitBlobReader {
         Ok(Self {
             repo_path: repo_path.to_path_buf(),
             child: Some(child),
-            stdin: Some(BufWriter::new(stdin)),
+            stdin: Some(stdin),
             stdout: BufReader::new(stdout),
             stderr_reader: Some(stderr_reader),
         })
     }
 
     fn read_blobs(&mut self, blob_ids: &[String]) -> Result<HashMap<String, Vec<u8>>, CliError> {
-        let mut blobs = HashMap::with_capacity(blob_ids.len());
         for requested_oid in blob_ids {
             if !is_full_git_oid(requested_oid.as_bytes()) {
                 return Err(CliError::msg(format!(
                     "refusing malformed git blob object id {requested_oid}"
                 )));
             }
-            let stdin = self
-                .stdin
-                .as_mut()
-                .ok_or_else(|| CliError::msg("persistent git cat-file is already closed"))?;
-            stdin
-                .write_all(requested_oid.as_bytes())
-                .and_then(|()| stdin.write_all(b"\n"))
-                .and_then(|()| stdin.flush())
-                .map_err(|source| {
-                    CliError::io("failed to request blob from git cat-file", source)
-                })?;
+        }
 
-            let mut header = Vec::new();
-            self.stdout
-                .read_until(b'\n', &mut header)
-                .map_err(|source| CliError::io("failed to read git cat-file header", source))?;
-            let Some(header_without_newline) = header.strip_suffix(b"\n") else {
-                return Err(CliError::msg(format!(
-                    "git cat-file output truncated while reading header for {requested_oid}"
-                )));
-            };
-            let header = std::str::from_utf8(header_without_newline).map_err(|_| {
-                CliError::msg(format!(
-                    "malformed non-UTF-8 git cat-file header for {requested_oid}"
-                ))
-            })?;
-            let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
-            if fields.len() == 2 && fields[1] == "missing" {
-                return Err(CliError::msg(format!(
-                    "missing blob object in git repository: {}",
-                    fields[0]
-                )));
+        let mut blobs = HashMap::with_capacity(blob_ids.len());
+        for request_batch in blob_ids.chunks(CAT_FILE_REQUESTS_PER_BATCH) {
+            self.request_blob_batch(request_batch)?;
+            for requested_oid in request_batch {
+                let data = self.read_blob_response(requested_oid)?;
+                blobs.insert(requested_oid.clone(), data);
             }
-            if fields.len() != 3 {
-                return Err(CliError::msg(format!(
-                    "malformed git cat-file header for {requested_oid}: {header}"
-                )));
-            }
-            if fields[0] != requested_oid {
-                return Err(CliError::msg(format!(
-                    "git cat-file object order mismatch: requested {requested_oid}, got {}",
-                    fields[0]
-                )));
-            }
-            if fields[1] != "blob" {
-                return Err(CliError::msg(format!(
-                    "git object {requested_oid} is {}, not a blob",
-                    fields[1]
-                )));
-            }
-            let size = fields[2].parse::<usize>().map_err(|_| {
-                CliError::msg(format!(
-                    "invalid blob size '{}' in git cat-file output for {requested_oid}",
-                    fields[2]
-                ))
-            })?;
-            let mut data = vec![0u8; size];
-            self.stdout.read_exact(&mut data).map_err(|source| {
-                CliError::io("git cat-file output truncated while reading blob", source)
-            })?;
-            let mut separator = [0u8; 1];
-            self.stdout.read_exact(&mut separator).map_err(|source| {
-                CliError::io("git cat-file output truncated after blob", source)
-            })?;
-            if separator != *b"\n" {
-                return Err(CliError::msg(format!(
-                    "malformed git cat-file output: blob {requested_oid} lacks trailing newline"
-                )));
-            }
-            blobs.insert(requested_oid.clone(), data);
         }
         Ok(blobs)
+    }
+
+    fn request_blob_batch(&mut self, blob_ids: &[String]) -> Result<(), CliError> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| CliError::msg("persistent git cat-file is already closed"))?;
+        let mut request = Vec::with_capacity(blob_ids.len() * 65);
+        for requested_oid in blob_ids {
+            request.extend_from_slice(requested_oid.as_bytes());
+            request.push(b'\n');
+        }
+        stdin
+            .write_all(&request)
+            .and_then(|()| stdin.flush())
+            .map_err(|source| CliError::io("failed to flush git cat-file requests", source))
+    }
+
+    fn read_blob_response(&mut self, requested_oid: &str) -> Result<Vec<u8>, CliError> {
+        let mut header = Vec::new();
+        self.stdout
+            .read_until(b'\n', &mut header)
+            .map_err(|source| CliError::io("failed to read git cat-file header", source))?;
+        let Some(header_without_newline) = header.strip_suffix(b"\n") else {
+            return Err(CliError::msg(format!(
+                "git cat-file output truncated while reading header for {requested_oid}"
+            )));
+        };
+        let header = std::str::from_utf8(header_without_newline).map_err(|_| {
+            CliError::msg(format!(
+                "malformed non-UTF-8 git cat-file header for {requested_oid}"
+            ))
+        })?;
+        let fields = header.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() == 2 && fields[1] == "missing" {
+            return Err(CliError::msg(format!(
+                "missing blob object in git repository: {}",
+                fields[0]
+            )));
+        }
+        if fields.len() != 3 {
+            return Err(CliError::msg(format!(
+                "malformed git cat-file header for {requested_oid}: {header}"
+            )));
+        }
+        if fields[0] != requested_oid {
+            return Err(CliError::msg(format!(
+                "git cat-file object order mismatch: requested {requested_oid}, got {}",
+                fields[0]
+            )));
+        }
+        if fields[1] != "blob" {
+            return Err(CliError::msg(format!(
+                "git object {requested_oid} is {}, not a blob",
+                fields[1]
+            )));
+        }
+        let size = fields[2].parse::<usize>().map_err(|_| {
+            CliError::msg(format!(
+                "invalid blob size '{}' in git cat-file output for {requested_oid}",
+                fields[2]
+            ))
+        })?;
+        let mut data = vec![0u8; size];
+        self.stdout.read_exact(&mut data).map_err(|source| {
+            CliError::io("git cat-file output truncated while reading blob", source)
+        })?;
+        let mut separator = [0u8; 1];
+        self.stdout
+            .read_exact(&mut separator)
+            .map_err(|source| CliError::io("git cat-file output truncated after blob", source))?;
+        if separator != *b"\n" {
+            return Err(CliError::msg(format!(
+                "malformed git cat-file output: blob {requested_oid} lacks trailing newline"
+            )));
+        }
+        Ok(data)
     }
 
     fn finish(&mut self) -> Result<(), CliError> {
@@ -2574,6 +2594,60 @@ mod tests {
             "/side.txt"
         );
 
+        fs::remove_dir_all(&repo).expect("fixture repository should be removable");
+    }
+
+    #[test]
+    fn persistent_blob_reader_batches_requests_before_draining_large_responses() {
+        let repo = unique_temp_dir();
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+
+        let mut large_blob = vec![b'x'; 128 * 1024];
+        large_blob.push(b'\n');
+        fs::write(repo.join("00-large.bin"), large_blob).expect("large blob should write");
+        for index in 0..CAT_FILE_REQUESTS_PER_BATCH {
+            fs::write(
+                repo.join(format!("item-{index:02}.txt")),
+                format!("blob {index}\n"),
+            )
+            .expect("small blob should write");
+        }
+        git_ok(&repo, &["add", "-A"]);
+
+        let index = run_git_text(&repo, &["ls-files".to_string(), "-s".to_string()], None)
+            .expect("index should list staged blobs");
+        let mut blob_ids = Vec::new();
+        let mut expected_by_oid = HashMap::new();
+        for line in index.lines() {
+            let (header, path) = line
+                .split_once('\t')
+                .expect("git ls-files record should contain a path separator");
+            let oid = header
+                .split_ascii_whitespace()
+                .nth(1)
+                .expect("git ls-files record should contain an object id");
+            blob_ids.push(oid.to_string());
+            expected_by_oid.insert(
+                oid.to_string(),
+                fs::read(repo.join(path)).expect("staged fixture data should read"),
+            );
+        }
+        assert_eq!(
+            blob_ids.len(),
+            CAT_FILE_REQUESTS_PER_BATCH + 1,
+            "fixture must exercise a second request batch"
+        );
+
+        let mut reader = GitBlobReader::spawn(&repo).expect("persistent blob reader should start");
+        let blobs = reader
+            .read_blobs(&blob_ids)
+            .expect("batched blob requests should preserve every response");
+        reader
+            .finish()
+            .expect("persistent blob reader should finish");
+
+        assert_eq!(blobs, expected_by_oid);
         fs::remove_dir_all(&repo).expect("fixture repository should be removable");
     }
 
