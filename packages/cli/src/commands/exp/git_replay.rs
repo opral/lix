@@ -464,7 +464,8 @@ fn execute_statements_as_transaction(
         })
         .collect::<Vec<_>>();
 
-    db::block_on(lix.execute_batch(&batch)).map_err(|error| {
+    db::block_on(lix.execute_batch_for_single_writer_ingest(&batch))
+    .map_err(|error| {
         let sql_preview = batch
             .first()
             .map(|statement| statement.sql.chars().take(160).collect::<String>())
@@ -2737,6 +2738,173 @@ mod tests {
             binary_rows.rows().is_empty(),
             "NUL-bearing file must remain a raw binary blob"
         );
+        db::block_on(lix.close()).expect("reopened Lix should close");
+
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
+    #[test]
+    fn rocksdb_replay_bounds_text_actor_lifecycle_across_hundred_commits() {
+        const TEXT_FILES: usize = 5;
+
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        let output = fixture.join("replay.rocksdb");
+        let profile = fixture.join("profile.json");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+
+        let mut expected_final = Vec::with_capacity(TEXT_FILES);
+        for index in 0..TEXT_FILES {
+            let bytes = format!("root-{index}\n").into_bytes();
+            fs::write(repo.join(format!("bulk-{index:02}.txt")), &bytes)
+                .expect("root text fixture should write");
+            expected_final.push(bytes);
+        }
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "root five text files"]);
+
+        // This one atomic replay batch updates every file that was just
+        // imported. It exercises the cold-open Existing path as well as the
+        // five New actors in the root commit.
+        for (index, bytes) in expected_final.iter_mut().enumerate() {
+            *bytes = format!("second-{index}\n").into_bytes();
+            fs::write(repo.join(format!("bulk-{index:02}.txt")), bytes)
+                .expect("second text fixture should write");
+        }
+        git_ok(&repo, &["add", "-A"]);
+        git_ok(&repo, &["commit", "-qm", "update five text files"]);
+
+        for revision in 2..100 {
+            let index = revision % TEXT_FILES;
+            let path = format!("bulk-{index:02}.txt");
+            let bytes = format!("revision-{revision}-{index}\n").into_bytes();
+            fs::write(repo.join(&path), &bytes).expect("history text fixture should write");
+            expected_final[index] = bytes;
+            let message = format!("revision {revision}");
+            git_ok(&repo, &["add", &path]);
+            git_ok(&repo, &["commit", "-qm", &message]);
+        }
+
+        run(ExpGitReplayArgs {
+            repo_path: repo,
+            output_rocksdb_path: output.clone(),
+            branch: "main".to_string(),
+            from_commit: None,
+            num_commits: Some(100),
+            verify_state: true,
+            force: false,
+            profile_json: Some(profile.clone()),
+        })
+        .expect("100-commit replay with five semantic files should complete");
+
+        let profile_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&profile).expect("replay profile should be written"))
+                .expect("replay profile should be valid JSON");
+        assert_eq!(
+            profile_json
+                .get("num_commits_requested")
+                .and_then(serde_json::Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            profile_json
+                .get("commits_replayed")
+                .and_then(serde_json::Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            profile_json
+                .get("commits_applied")
+                .and_then(serde_json::Value::as_u64),
+            Some(100)
+        );
+        assert_eq!(
+            profile_json
+                .get("commits_marker_only")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            profile_json
+                .get("changed_paths_total")
+                .and_then(serde_json::Value::as_u64),
+            Some(108)
+        );
+        let commits = profile_json
+            .get("commits")
+            .and_then(serde_json::Value::as_array)
+            .expect("profile commits should be an array");
+        assert_eq!(commits.len(), 100);
+        assert_eq!(
+            commits[0]
+                .get("inserts")
+                .and_then(serde_json::Value::as_u64),
+            Some(TEXT_FILES as u64)
+        );
+        assert_eq!(
+            commits[0]
+                .get("updates")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            commits[0]
+                .get("statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(2),
+            "five inserts and the replay marker must share one atomic batch"
+        );
+        assert_eq!(
+            commits[1]
+                .get("updates")
+                .and_then(serde_json::Value::as_u64),
+            Some(TEXT_FILES as u64)
+        );
+        assert_eq!(
+            commits[1]
+                .get("statement_count")
+                .and_then(serde_json::Value::as_u64),
+            Some(TEXT_FILES as u64 + 1),
+            "five updates and the replay marker must share one atomic batch"
+        );
+
+        let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
+        let lix = db::block_on(open_lix_with_storage(storage))
+            .expect("replay Lix should reopen with installed plugin");
+        for (index, expected) in expected_final.iter().enumerate() {
+            let path = format!("/bulk-{index:02}.txt");
+            let file_rows = db::block_on(lix.execute(
+                "SELECT data FROM lix_file WHERE path = ?",
+                &[Value::Text(path.clone())],
+            ))
+            .expect("reopened rendered text file should query");
+            assert_eq!(file_rows.rows().len(), 1, "expected one row for {path}");
+            let rendered = value_to_optional_blob(
+                file_rows.rows()[0]
+                    .get_index(0)
+                    .expect("rendered file row should contain data"),
+                "reopened rendered text data",
+            )
+            .expect("rendered text data should be a blob");
+            assert_eq!(
+                rendered,
+                Some(expected.as_slice()),
+                "wrong bytes for {path}"
+            );
+
+            let semantic_rows = db::block_on(lix.execute(
+                "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+                &[Value::Text(path.clone())],
+            ))
+            .expect("reopened Git-text rows should query");
+            assert!(
+                !semantic_rows.rows().is_empty(),
+                "text semantic rows should persist for {path}"
+            );
+        }
         db::block_on(lix.close()).expect("reopened Lix should close");
 
         fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
