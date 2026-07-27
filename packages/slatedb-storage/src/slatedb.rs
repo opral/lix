@@ -441,6 +441,45 @@ impl StorageRead for SlateDBRead {
                 return Ok(GetManyResult::new(Vec::new()));
             }
 
+            if let [key] = keys {
+                let key = physical_key(space, key)?;
+                let snapshot = Arc::clone(&self.snapshot);
+                let durability = self.durability;
+                let value = if durability == ReadDurability::Visible {
+                    let sequence = snapshot.seq();
+                    let cache = self.point_cache.clone();
+                    if let Some(value) = cache.get(sequence, &key) {
+                        // A cached value must still obey SlateDB's terminal close
+                        // boundary. This has no object-store I/O, but makes the
+                        // hit linearize at the same closed-state check as a real
+                        // snapshot read.
+                        self.worker
+                            .call_read(|db| async move {
+                                db.snapshot().await.map(|_| ()).map_err(slatedb_error)
+                            })
+                            .await?;
+                        value
+                    } else {
+                        let fetched_key = key.clone();
+                        let value = self
+                            .worker
+                            .call_read(move |_db| {
+                                get_snapshot_value(snapshot, fetched_key, durability)
+                            })
+                            .await?;
+                        cache.insert(sequence, key, value.clone());
+                        value
+                    }
+                } else {
+                    self.worker
+                        .call_read(move |_db| get_snapshot_value(snapshot, key, durability))
+                        .await?
+                };
+                return Ok(GetManyResult::new(vec![
+                    value.map(|value| project_value(value, opts.projection)),
+                ]));
+            }
+
             let physical_keys = keys
                 .iter()
                 .map(|key| physical_key(space, key))
@@ -1187,6 +1226,18 @@ async fn get_snapshot_values(
         .await
 }
 
+async fn get_snapshot_value(
+    snapshot: Arc<DbSnapshot>,
+    key: Key,
+    durability: ReadDurability,
+) -> Result<Option<Bytes>, StorageError> {
+    let read_options = slatedb_read_options(durability);
+    snapshot
+        .get_with_options(key.0, &read_options)
+        .await
+        .map_err(slatedb_error)
+}
+
 struct ScanBatch {
     iter: DbIterator,
     entries: Vec<(Key, ProjectedValue)>,
@@ -1690,9 +1741,32 @@ mod tests {
 
         let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin read");
         let result =
-            block_on(read.get_many(space, &[key], GetOptions::default())).expect("read row");
+            block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
+                .expect("read row");
 
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
+        assert_eq!(
+            block_on(read.get_many(
+                space,
+                std::slice::from_ref(&key),
+                GetOptions {
+                    projection: CoreProjection::KeyOnly,
+                },
+            ))
+            .expect("read singleton key only")
+            .values,
+            vec![Some(ProjectedValue::KeyOnly)]
+        );
+        assert_eq!(
+            block_on(read.get_many(
+                space,
+                &[Key(Bytes::from_static(b"missing"))],
+                GetOptions::default(),
+            ))
+            .expect("read singleton missing key")
+            .values,
+            vec![None]
+        );
     }
 
     #[test]
