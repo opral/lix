@@ -60,7 +60,16 @@ impl Document {
                 bytes: Arc::new(bytes),
             });
         }
-        let document = Self::from_lines(lines)?;
+        // A cold open constructs lines in strict order from one already
+        // validated byte stream. Host ordinal IDs and evenly-spaced order
+        // keys are unique by construction, so routing this through
+        // `from_lines` would only revalidate every line, populate two trees,
+        // sort the already-sorted vector, render the original file again, and
+        // validate that duplicate byte buffer a second time.
+        let document = Self(Arc::new(DocumentInner {
+            bytes: Arc::new(bytes),
+            lines,
+        }));
         let changes = document.all_upserts()?;
         Ok((document, changes))
     }
