@@ -1471,20 +1471,24 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == root.branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = state_rows
-            .iter()
-            .filter(|row| {
-                row.branch_id == root.branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.snapshot.is_some()
-                    && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-            })
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                entity_pk: row.entity_pk.clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .filter(|row| {
+                    row.branch_id == root.branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
+                })
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
@@ -1658,21 +1662,25 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = state_rows
-            .iter()
-            .filter(|row| {
-                row.untracked
-                    && row.branch_id == branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.snapshot.is_some()
-                    && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-            })
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                entity_pk: row.entity_pk.clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .filter(|row| {
+                    row.untracked
+                        && row.branch_id == branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
+                })
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
         let mut coverage = WorkingDiffIndexCoverage::default();
         tracked_head
             .writer(read, writes)
@@ -2004,21 +2012,26 @@ async fn stage_branch_head_control_publications(
                         .filter(|row| row.branch_id == branch_id)
                         .map(current_state_delta_from_engine_row),
                 );
-                let absence_guards = state_rows
-                    .iter()
-                    .filter(|row| {
-                        row.untracked
-                            && row.branch_id == branch_id
-                            && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                            && row.snapshot.is_some()
-                            && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-                    })
-                    .map(|row| TrackedStateKey {
-                        schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                    })
-                    .collect::<BTreeSet<_>>();
+                let absence_guards = if insert_identities.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    state_rows
+                        .iter()
+                        .filter(|row| {
+                            row.untracked
+                                && row.branch_id == branch_id
+                                && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                                && row.snapshot.is_some()
+                                && insert_identities
+                                    .contains_key(&PreparedStateRowIdentity::from(*row))
+                        })
+                        .map(|row| TrackedStateKey {
+                            schema_key: row.schema_key.clone(),
+                            file_id: row.file_id.clone(),
+                            entity_pk: row.entity_pk.clone(),
+                        })
+                        .collect()
+                };
                 let generation =
                     lifecycle_generation(&branch_id, head_commit_id, target.ref_change_id);
                 let mut coverage = WorkingDiffIndexCoverage::default();
@@ -2446,24 +2459,28 @@ async fn stage_tracked_roots(
                 tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
             }))
             .collect::<Result<Vec<_>, _>>()?;
-        let absence_guards = state_row_indices
-            .iter()
-            .filter_map(|&row_index| {
-                let row = &state_rows[row_index];
-                if row.snapshot.is_none() || row.untracked {
-                    return None;
-                }
-                let insert = insert_identities.get(&PreparedStateRowIdentity::from(row))?;
-                if insert.untracked() {
-                    return None;
-                }
-                Some(TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = &state_rows[row_index];
+                    if row.snapshot.is_none() || row.untracked {
+                        return None;
+                    }
+                    let insert = insert_identities.get(&PreparedStateRowIdentity::from(row))?;
+                    if insert.untracked() {
+                        return None;
+                    }
+                    Some(TrackedStateKey {
+                        schema_key: row.schema_key.clone(),
+                        file_id: row.file_id.clone(),
+                        entity_pk: row.entity_pk.clone(),
+                    })
                 })
-            })
-            .collect::<BTreeSet<_>>();
+                .collect()
+        };
         // Commit facts are canonical in changelog.commit and live-state derives
         // lix_commit rows from the commit graph. Keeping them out of this tree
         // also preserves the one-mutation path for ordinary singleton writes.
@@ -2699,45 +2716,49 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
     let commit_parent_branch_ids = prepared_writes
         .commit_change_refs_by_branch
         .keys()
-        .cloned()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut required_branch_ids = prepared_writes
         .state_rows
         .iter()
-        .map(|row| row.branch_id.clone())
+        .map(|row| row.branch_id.as_str())
         .chain(
             prepared_writes
                 .file_data_writes
                 .iter()
-                .map(|write| write.branch_id.clone()),
+                .map(|write| write.branch_id.as_str()),
         )
         .chain(
             prepared_writes
                 .first_commit_parent_override_by_branch
                 .keys()
-                .cloned(),
+                .map(String::as_str),
         )
         .chain(
             prepared_writes
                 .extra_commit_parents_by_branch
                 .keys()
-                .cloned(),
+                .map(String::as_str),
         )
         .collect::<BTreeSet<_>>();
-    required_branch_ids.extend(commit_parent_branch_ids.iter().cloned());
+    required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
 
     let branch_ref = branch_ctx.ref_reader(read);
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
-        let head = branch_ref.load_head_commit_id(&branch_id).await?;
+        let head = branch_ref.load_head_commit_id(branch_id).await?;
         if require_existing_non_global_targets
             && branch_id != crate::GLOBAL_BRANCH_ID
             && head.is_none()
         {
-            return Err(LixError::branch_not_found(branch_id, "commit", "target"));
+            return Err(LixError::branch_not_found(
+                branch_id.to_string(),
+                "commit",
+                "target",
+            ));
         }
         if commit_parent_branch_ids.contains(&branch_id) {
-            parent_heads.insert(branch_id, head);
+            parent_heads.insert(branch_id.to_string(), head);
         }
     }
     Ok(parent_heads)
