@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadOptions, SpaceId,
-    Storage, StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadDurability,
+    ReadOptions, SpaceId, Storage, StorageWrite, StoredValue, WriteOptions,
 };
 use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix_engine::storage_bench::{
@@ -23,10 +23,14 @@ const OPERATIONS: &[Operation] = &[
     Operation::DedupeWrite,
     Operation::HotRead,
     Operation::DurableSingletonRead,
+    Operation::VisibleHotBatchRead,
 ];
 const DEFAULT_WARMUPS: usize = 20;
 const DEFAULT_SAMPLES: usize = 200;
 const DIRECT_SINGLETON_SPACE: SpaceId = SpaceId(0x00ff_0002);
+const DIRECT_BATCH_SPACE: SpaceId = SpaceId(0x00ff_0004);
+const DIRECT_BATCH_KEYS: usize = 1024;
+const DIRECT_BATCH_KEY_SUFFIX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -49,6 +53,7 @@ enum Operation {
     DedupeWrite,
     HotRead,
     DurableSingletonRead,
+    VisibleHotBatchRead,
 }
 
 impl Display for Operation {
@@ -58,6 +63,7 @@ impl Display for Operation {
             Self::DedupeWrite => formatter.write_str("dedupe_write"),
             Self::HotRead => formatter.write_str("hot_read"),
             Self::DurableSingletonRead => formatter.write_str("durable_singleton_read"),
+            Self::VisibleHotBatchRead => formatter.write_str("visible_hot_batch_read"),
         }
     }
 }
@@ -193,6 +199,7 @@ struct BackendFixture<S: Storage> {
     stable_hash: String,
     direct_key: Key,
     direct_value_len: usize,
+    direct_batch_keys: Vec<Key>,
 }
 
 impl<S> BackendFixture<S>
@@ -206,6 +213,7 @@ where
         operation: Operation,
         direct_key: Key,
         direct_value_len: usize,
+        direct_batch_keys: Vec<Key>,
     ) -> Self {
         let storage = StorageAdapter::new(storage);
         let stable_bytes = deterministic_bytes(size, 0x5a17);
@@ -227,6 +235,7 @@ where
             stable_hash,
             direct_key,
             direct_value_len,
+            direct_batch_keys,
         }
     }
 
@@ -250,12 +259,19 @@ where
                 bytes: None,
                 expected_hash: None,
             },
+            Operation::VisibleHotBatchRead => PreparedOperation {
+                bytes: None,
+                expected_hash: None,
+            },
         }
     }
 
     async fn execute(&self, prepared: PreparedOperation) -> usize {
         if matches!(self.operation, Operation::DurableSingletonRead) {
             return self.read_durable_singleton().await;
+        }
+        if matches!(self.operation, Operation::VisibleHotBatchRead) {
+            return self.read_visible_hot_batch().await;
         }
         match prepared.bytes {
             Some(bytes) => {
@@ -311,6 +327,32 @@ where
         }
     }
 
+    async fn read_visible_hot_batch(&self) -> usize {
+        let read = self
+            .storage
+            .begin_read(ReadOptions::default())
+            .await
+            .expect("open visible hot batch read");
+        let values = read
+            .get_many(
+                DIRECT_BATCH_SPACE,
+                &self.direct_batch_keys,
+                GetOptions {
+                    projection: CoreProjection::KeyOnly,
+                },
+            )
+            .await
+            .expect("read visible hot batch values")
+            .values;
+        assert_eq!(values.len(), self.direct_batch_keys.len());
+        assert!(
+            values
+                .iter()
+                .all(|value| matches!(value, Some(ProjectedValue::KeyOnly)))
+        );
+        values.len()
+    }
+
     async fn layout(&self) -> Layout {
         let read = self
             .storage
@@ -341,6 +383,9 @@ impl Fixture {
         let direct_key = Key(Bytes::from_static(b"direct-singleton"));
         let direct_value = Bytes::from(vec![0xa5; size]);
         let direct_value_len = direct_value.len();
+        let direct_batch_keys = matches!(operation, Operation::VisibleHotBatchRead)
+            .then(direct_batch_keys)
+            .unwrap_or_default();
         match backend {
             Backend::Rocks => {
                 let storage = RocksDB::open(&database_path).expect("open benchmark RocksDB");
@@ -350,6 +395,9 @@ impl Fixture {
                         .flush()
                         .expect("flush direct durable RocksDB seed value");
                 }
+                if matches!(operation, Operation::VisibleHotBatchRead) {
+                    seed_direct_batch_values(&storage, &direct_batch_keys).await;
+                }
                 Self::Rocks(
                     BackendFixture::create(
                         storage,
@@ -358,6 +406,7 @@ impl Fixture {
                         operation,
                         direct_key,
                         direct_value_len,
+                        direct_batch_keys,
                     )
                     .await,
                 )
@@ -371,6 +420,9 @@ impl Fixture {
                         .await
                         .expect("flush direct durable SlateDB seed value");
                 }
+                if matches!(operation, Operation::VisibleHotBatchRead) {
+                    seed_direct_batch_values(&storage, &direct_batch_keys).await;
+                }
                 Self::Slate(
                     BackendFixture::create(
                         storage,
@@ -379,6 +431,7 @@ impl Fixture {
                         operation,
                         direct_key,
                         direct_value_len,
+                        direct_batch_keys,
                     )
                     .await,
                 )
@@ -439,6 +492,48 @@ where
         .commit()
         .await
         .expect("commit direct durable seed value");
+}
+
+async fn seed_direct_batch_values<S>(storage: &S, keys: &[Key])
+where
+    S: Storage,
+{
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("begin direct batch seed write");
+    write
+        .put_many(
+            DIRECT_BATCH_SPACE,
+            PutBatch {
+                entries: keys
+                    .iter()
+                    .cloned()
+                    .map(|key| PutEntry {
+                        key,
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"batch-value"),
+                        },
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .expect("stage direct batch seed values");
+    write
+        .commit()
+        .await
+        .expect("commit direct batch seed values");
+}
+
+fn direct_batch_keys() -> Vec<Key> {
+    (0..DIRECT_BATCH_KEYS)
+        .map(|index| {
+            Key(Bytes::from(format!(
+                "hot-batch-{index:04}-{DIRECT_BATCH_KEY_SUFFIX}"
+            )))
+        })
+        .collect()
 }
 
 #[derive(Default)]
