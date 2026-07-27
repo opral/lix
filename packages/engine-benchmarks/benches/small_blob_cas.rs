@@ -2,12 +2,16 @@ use std::fmt::{self, Display, Formatter};
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use lix_engine::storage_adapter::StorageAdapter;
+use bytes::Bytes;
+use lix_engine::storage::{
+    GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadOptions, SpaceId,
+    Storage, StorageWrite, StoredValue, WriteOptions,
+};
+use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix_engine::storage_bench::{
     binary_cas_write_accounting, layout_accounting, read_binary_cas_for_bench,
     reset_binary_cas_write_accounting, write_binary_cas_for_bench,
 };
-use lix_engine::{ReadOptions, Storage};
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
 use tempfile::TempDir;
@@ -18,9 +22,11 @@ const OPERATIONS: &[Operation] = &[
     Operation::UniqueWrite,
     Operation::DedupeWrite,
     Operation::HotRead,
+    Operation::DurableSingletonRead,
 ];
 const DEFAULT_WARMUPS: usize = 20;
 const DEFAULT_SAMPLES: usize = 200;
+const DIRECT_SINGLETON_SPACE: SpaceId = SpaceId(0x00ff_0002);
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -42,6 +48,7 @@ enum Operation {
     UniqueWrite,
     DedupeWrite,
     HotRead,
+    DurableSingletonRead,
 }
 
 impl Display for Operation {
@@ -50,6 +57,7 @@ impl Display for Operation {
             Self::UniqueWrite => formatter.write_str("unique_write"),
             Self::DedupeWrite => formatter.write_str("dedupe_write"),
             Self::HotRead => formatter.write_str("hot_read"),
+            Self::DurableSingletonRead => formatter.write_str("durable_singleton_read"),
         }
     }
 }
@@ -76,6 +84,13 @@ async fn run() {
             }
             for &operation in OPERATIONS {
                 if !selected("LIX_SMALL_BLOB_OPERATIONS", &operation.to_string()) {
+                    continue;
+                }
+                // RocksDB intentionally rejects the explicit durable tier, so
+                // do not compare it to SlateDB with mismatched read semantics.
+                if matches!(operation, Operation::DurableSingletonRead)
+                    && !matches!(backend, Backend::Slate)
+                {
                     continue;
                 }
                 run_case(backend, size, operation, warmups, samples).await;
@@ -176,13 +191,22 @@ struct BackendFixture<S: Storage> {
     version: u64,
     stable_bytes: Vec<u8>,
     stable_hash: String,
+    direct_key: Key,
+    direct_value_len: usize,
 }
 
 impl<S> BackendFixture<S>
 where
     S: Storage,
 {
-    async fn create(storage: S, temp_dir: TempDir, size: usize, operation: Operation) -> Self {
+    async fn create(
+        storage: S,
+        temp_dir: TempDir,
+        size: usize,
+        operation: Operation,
+        direct_key: Key,
+        direct_value_len: usize,
+    ) -> Self {
         let storage = StorageAdapter::new(storage);
         let stable_bytes = deterministic_bytes(size, 0x5a17);
         let stable_hash = write_binary_cas_for_bench(&storage, &stable_bytes)
@@ -201,6 +225,8 @@ where
             version: 1,
             stable_bytes,
             stable_hash,
+            direct_key,
+            direct_value_len,
         }
     }
 
@@ -220,10 +246,17 @@ where
                 bytes: None,
                 expected_hash: Some(self.stable_hash.clone()),
             },
+            Operation::DurableSingletonRead => PreparedOperation {
+                bytes: None,
+                expected_hash: None,
+            },
         }
     }
 
     async fn execute(&self, prepared: PreparedOperation) -> usize {
+        if matches!(self.operation, Operation::DurableSingletonRead) {
+            return self.read_durable_singleton().await;
+        }
         match prepared.bytes {
             Some(bytes) => {
                 let hash = write_binary_cas_for_bench(&self.storage, &bytes)
@@ -244,6 +277,37 @@ where
                     .expect("benchmark blob should exist");
                 bytes.len()
             }
+        }
+    }
+
+    async fn read_durable_singleton(&self) -> usize {
+        let read = self
+            .storage
+            .begin_read(ReadOptions {
+                durability: ReadDurability::Durable,
+                ..ReadOptions::default()
+            })
+            .await
+            .expect("open durable singleton read");
+        let value = read
+            .get_many(
+                DIRECT_SINGLETON_SPACE,
+                std::slice::from_ref(&self.direct_key),
+                GetOptions::default(),
+            )
+            .await
+            .expect("read durable singleton value")
+            .values
+            .into_iter()
+            .next()
+            .flatten()
+            .expect("durable singleton value should exist");
+        match value {
+            ProjectedValue::FullValue(value) => {
+                assert_eq!(value.len(), self.direct_value_len);
+                value.len()
+            }
+            ProjectedValue::KeyOnly => panic!("durable singleton read returned key only"),
         }
     }
 
@@ -274,14 +338,50 @@ impl Fixture {
     async fn new(backend: Backend, size: usize, operation: Operation) -> Self {
         let temp_dir = tempfile::tempdir().expect("create small blob benchmark directory");
         let database_path = temp_dir.path().join("database");
+        let direct_key = Key(Bytes::from_static(b"direct-singleton"));
+        let direct_value = Bytes::from(vec![0xa5; size]);
+        let direct_value_len = direct_value.len();
         match backend {
             Backend::Rocks => {
                 let storage = RocksDB::open(&database_path).expect("open benchmark RocksDB");
-                Self::Rocks(BackendFixture::create(storage, temp_dir, size, operation).await)
+                if matches!(operation, Operation::DurableSingletonRead) {
+                    seed_direct_durable_value(&storage, &direct_key, &direct_value).await;
+                    storage
+                        .flush()
+                        .expect("flush direct durable RocksDB seed value");
+                }
+                Self::Rocks(
+                    BackendFixture::create(
+                        storage,
+                        temp_dir,
+                        size,
+                        operation,
+                        direct_key,
+                        direct_value_len,
+                    )
+                    .await,
+                )
             }
             Backend::Slate => {
                 let storage = SlateDB::open(&database_path).expect("open benchmark SlateDB");
-                Self::Slate(BackendFixture::create(storage, temp_dir, size, operation).await)
+                if matches!(operation, Operation::DurableSingletonRead) {
+                    seed_direct_durable_value(&storage, &direct_key, &direct_value).await;
+                    storage
+                        .flush()
+                        .await
+                        .expect("flush direct durable SlateDB seed value");
+                }
+                Self::Slate(
+                    BackendFixture::create(
+                        storage,
+                        temp_dir,
+                        size,
+                        operation,
+                        direct_key,
+                        direct_value_len,
+                    )
+                    .await,
+                )
             }
         }
     }
@@ -311,6 +411,34 @@ impl Fixture {
             Self::Slate(fixture) => fixture.layout().await,
         }
     }
+}
+
+async fn seed_direct_durable_value<S>(storage: &S, key: &Key, value: &Bytes)
+where
+    S: Storage,
+{
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("begin direct durable seed write");
+    write
+        .put_many(
+            DIRECT_SINGLETON_SPACE,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        )
+        .await
+        .expect("stage direct durable seed value");
+    write
+        .commit()
+        .await
+        .expect("commit direct durable seed value");
 }
 
 #[derive(Default)]
