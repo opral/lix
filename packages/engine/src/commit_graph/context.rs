@@ -72,6 +72,32 @@ where
         self.load_changelog_commit(commit_id).await
     }
 
+    async fn load_commit_records(
+        &mut self,
+        commit_ids: &[CommitId],
+    ) -> Result<Vec<Option<CommitGraphCommitRecord>>, LixError> {
+        let mut reader = ChangelogContext::new().reader(&self.store);
+        reader
+            .load_commits(CommitLoadRequest {
+                commit_ids,
+                projection: CommitProjection::Record,
+            })
+            .await?
+            .entries
+            .into_iter()
+            .map(|entry| match entry {
+                None => Ok(None),
+                Some(CommitLoadEntry::Record(record)) => {
+                    Ok(Some(commit_graph_commit_record_from_commit_record(record)))
+                }
+                Some(CommitLoadEntry::Full { .. }) => Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "changelog record commit projection returned full entry",
+                )),
+            })
+            .collect()
+    }
+
     /// Loads every direct commit fact from the changelog.
     ///
     /// This is used by global commit surfaces where the caller wants the durable
@@ -136,7 +162,44 @@ where
         &mut self,
         left_commit_id: &CommitId,
         right_commit_id: &CommitId,
-    ) -> Result<CommitGraphCommit, LixError> {
+    ) -> Result<CommitId, LixError> {
+        let heads = self
+            .load_commit_records(&[*left_commit_id, *right_commit_id])
+            .await?;
+        let left = heads[0]
+            .as_ref()
+            .ok_or_else(|| missing_commit_graph_error(left_commit_id))?;
+        let right = heads[1]
+            .as_ref()
+            .ok_or_else(|| missing_commit_graph_error(right_commit_id))?;
+
+        if left_commit_id == right_commit_id {
+            return Ok(*left_commit_id);
+        }
+        if left.parent_commit_ids.as_slice() == [*right_commit_id] {
+            return Ok(*right_commit_id);
+        }
+        if right.parent_commit_ids.as_slice() == [*left_commit_id] {
+            return Ok(*left_commit_id);
+        }
+        if let ([left_parent], [right_parent]) = (
+            left.parent_commit_ids.as_slice(),
+            right.parent_commit_ids.as_slice(),
+        ) && left_parent == right_parent
+        {
+            if self
+                .load_commit_records(&[*left_parent])
+                .await?
+                .into_iter()
+                .next()
+                .flatten()
+                .is_none()
+            {
+                return Err(missing_commit_graph_error(left_parent));
+            }
+            return Ok(*left_parent);
+        }
+
         let ancestors = self
             .best_common_ancestors(left_commit_id, right_commit_id)
             .await?;
@@ -147,7 +210,7 @@ where
                     "commit_graph found no common history between '{left_commit_id}' and '{right_commit_id}'"
                 ),
             )),
-            [base] => Ok(base.clone()),
+            [base] => Ok(base.commit_id),
             _ => Err(LixError::ambiguous_merge_base(
                 left_commit_id,
                 right_commit_id,
@@ -290,27 +353,12 @@ where
         &mut self,
         commit_id: &CommitId,
     ) -> Result<Option<CommitGraphCommitRecord>, LixError> {
-        let mut reader = ChangelogContext::new().reader(&self.store);
-        let batch = reader
-            .load_commits(CommitLoadRequest {
-                commit_ids: std::slice::from_ref(commit_id),
-                projection: CommitProjection::Record,
-            })
-            .await?;
-        let Some(entry) = batch.entries.into_iter().next().flatten() else {
-            return Ok(None);
-        };
-        match entry {
-            CommitLoadEntry::Record(record) => Ok(Some(CommitGraphCommitRecord {
-                commit_id: record.commit_id,
-                parent_commit_ids: record.parent_commit_ids,
-                created_at: record.created_at,
-            })),
-            CommitLoadEntry::Full { .. } => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "changelog record commit projection returned full entry",
-            )),
-        }
+        Ok(self
+            .load_commit_records(std::slice::from_ref(commit_id))
+            .await?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     async fn load_canonical_changes(
@@ -359,6 +407,21 @@ fn commit_graph_change_from_change_record(change: ChangeRecord) -> CommitGraphCh
         created_at: change.created_at,
         origin_key: change.origin_key,
     }
+}
+
+fn commit_graph_commit_record_from_commit_record(record: CommitRecord) -> CommitGraphCommitRecord {
+    CommitGraphCommitRecord {
+        commit_id: record.commit_id,
+        parent_commit_ids: record.parent_commit_ids,
+        created_at: record.created_at,
+    }
+}
+
+fn missing_commit_graph_error(commit_id: &CommitId) -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!("commit_graph missing commit '{commit_id}'"),
+    )
 }
 
 #[async_trait::async_trait]

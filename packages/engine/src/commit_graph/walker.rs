@@ -699,7 +699,7 @@ mod tests {
             .await
             .expect("single merge base should resolve");
 
-        assert_eq!(base.commit_id, commit_id("commit-b"));
+        assert_eq!(base, commit_id("commit-b"));
     }
 
     #[tokio::test]
