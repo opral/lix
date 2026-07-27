@@ -361,10 +361,6 @@ where
         .await
         .expect("global branch control should load")
         .expect("global branch control should exist");
-    assert!(
-        control.tracked_head_is_current,
-        "global current-state generation should be complete before deterministic mode seeding"
-    );
     let snapshot = crate::json_store::JsonSlot::from_json(&snapshot_content);
     let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
     TrackedHeadContext::new()
@@ -562,7 +558,6 @@ async fn seed_visible_schema_rows<StorageImpl>(
             BranchHeadControl {
                 head_commit_id: commit_id,
                 generation: commit_id,
-                tracked_head_is_current: true,
                 current_state_revision: 0,
                 working_diff_checkpoint_commit_id: None,
                 created_at: timestamp,

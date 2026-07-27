@@ -149,7 +149,7 @@ where
                             Some(control) if control.head_commit_id == head.commit_id => {
                                 tracked_head
                                     .reader(store.clone())
-                                    .working_diff_if_control_current(
+                                    .working_diff_for_control(
                                         &head.branch_id,
                                         control,
                                         &route.diff_request,

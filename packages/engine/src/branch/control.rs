@@ -3,7 +3,7 @@
 //! A branch head is a tiny mutable control-plane record, not a user row.  It
 //! therefore has its own space and exact-byte CAS token.  The current tracked
 //! serving generation lives beside the head, so readers can bind packed
-//! tracked-head groups to the same atomic publication without consulting
+//! hot rows to the same atomic publication without consulting
 //! `lix_branch_ref` through the mutable live-state index.
 
 use bytes::Bytes;
@@ -18,29 +18,25 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v6";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v7";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0015), BRANCH_HEAD_CONTROL_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_001f), BRANCH_HEAD_CONTROL_NAMESPACE);
 
 /// The one mutable publication record for a branch.
 ///
-/// `generation` is the physical tracked-head generation currently serving
-/// `head_commit_id`. Serial normal commits retain it; a rewind, merge fence,
-/// or bootstrap gets a fresh generation and takes the historical fallback
-/// until a complete projection is published. `tracked_head_is_current` is the
-/// publication bit for that projection, so this atomic control record is the
-/// only read-side fence for a normal tracked branch. The optional checkpoint
-/// binds the sparse working-diff accelerator to this exact publication; it is
-/// not a second visibility record. `current_state_revision` advances for
-/// every in-place current-state mutation, including history-free untracked
-/// writes. It is private storage protocol state and turns the control's CAS
-/// into a real write fence even when the public branch ref does not move.
+/// `generation` names one complete physical hot-state snapshot serving
+/// `head_commit_id`. Serial commits retain it; lifecycle publications create
+/// a fresh complete generation and publish it atomically with this control.
+/// The optional checkpoint binds the sparse working-diff accelerator to that
+/// exact generation. `current_state_revision` advances for every in-place
+/// current-state mutation, including history-free untracked writes. It is
+/// private storage protocol state and turns the control's CAS into a real
+/// write fence even when the public branch ref does not move.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct BranchHeadControl {
     pub(crate) head_commit_id: CommitId,
     pub(crate) generation: CommitId,
-    pub(crate) tracked_head_is_current: bool,
     pub(crate) current_state_revision: u64,
     #[musli(with = storage_codec::option)]
     pub(crate) working_diff_checkpoint_commit_id: Option<CommitId>,
@@ -54,9 +50,9 @@ pub(crate) struct BranchHeadControl {
 
 impl BranchHeadControl {
     /// Returns the same public branch ref with a fresh private current-state
-    /// revision. A mutable group write must publish this alongside its exact
+    /// revision. A mutable hot-row write must publish this alongside its exact
     /// control precondition; otherwise two writers could both compare the
-    /// same unchanged control bytes and lose one group update.
+    /// same unchanged control bytes and lose one hot-state update.
     pub(crate) fn next_current_state_revision(mut self) -> Result<Self, LixError> {
         self.current_state_revision =
             self.current_state_revision.checked_add(1).ok_or_else(|| {
@@ -293,7 +289,6 @@ mod tests {
         let first = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("first-head"),
             generation: CommitId::for_test_label("first-generation"),
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
@@ -303,7 +298,6 @@ mod tests {
         let second = BranchHeadControl {
             head_commit_id: CommitId::for_test_label("second-head"),
             generation: CommitId::for_test_label("first-generation"),
-            tracked_head_is_current: true,
             current_state_revision: 1,
             working_diff_checkpoint_commit_id: None,
             created_at: first.created_at,

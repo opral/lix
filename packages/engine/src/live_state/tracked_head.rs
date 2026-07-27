@@ -1,18 +1,17 @@
-//! Materialized current serving state for one branch head.
+//! Unified, materialized live state for one branch head.
 //!
-//! Commit roots are sparse historical checkpoints. This table is the durable,
-//! generation-keyed serving state for one branch head, letting the normal
-//! live-state path range scan rows and hydrate JSON directly without replaying
-//! changelog history. A member is either `tracked` (and has a commit-backed
-//! history record) or `untracked` (and exists only here). The branch control
-//! binds a generation to the branch ref's commit. Any mismatch is a
-//! direct-plane miss and callers take the historical fallback for the tracked
-//! portion; untracked members never participate in that fallback.
+//! The V15 hot index has one row per full identity. Each row is tagged
+//! `tracked` or `untracked`: tracked mutations also enter history, while
+//! untracked mutations exist only in this serving plane. Normal reads consult
+//! this single index rather than merging a tracked snapshot with an untracked
+//! overlay.
+
+mod hot;
+
+pub(crate) use hot::{HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Range;
-
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,15 +24,16 @@ use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
+#[cfg(test)]
+use crate::json_store::JsonSlot;
 use crate::json_store::{
-    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext,
-    JsonStoreWriter,
+    JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlotRef, JsonStoreContext, JsonStoreWriter,
 };
 use crate::live_state::MaterializedLiveStateRow;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
-    StorageKey, StoragePrefix, StorageProjectedValue, StorageReadEntry, StorageScanOptions,
-    StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
+    StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::storage_codec;
 use crate::tracked_state::{
@@ -42,63 +42,26 @@ use crate::tracked_state::{
     TrackedStateKey, TrackedStateScanRequest,
 };
 
-// V12 makes the durable current-state generation authoritative for normal
-// current reads.
-// A physical record owns every file-backed member of one logical entity PK.
-// Public entity reads know `(branch, schema, entity_pk)` but intentionally do
-// not invent a `file_id`; keeping those members together lets that common
-// lookup be a RocksDB point get rather than a prefix scan. Repositories use a
-// protocol gate, so predecessor bytes are never interpreted as current-state
-// groups.
-pub(crate) const TRACKED_HEAD_GROUP_NAMESPACE: &str = "live_state.current_group.v12";
-pub(crate) const TRACKED_HEAD_MEMBER_NAMESPACE: &str = "live_state.current_file_member.v12";
-pub(crate) const TRACKED_HEAD_GROUP_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0012), TRACKED_HEAD_GROUP_NAMESPACE);
-/// File-id projection for explicit file-backed identities.
-///
-/// The group value remains authoritative for normal logical-PK reads. This
-/// narrow projection avoids turning `file_id = ?` reads into an unbounded
-/// group-value fetch when a logical PK has many file members. Its physical
-/// order is `(branch, generation, schema, file_id, entity_pk)`, so both an
-/// exact full identity and a schema-scoped file-id scan avoid unpacking
-/// unrelated entity groups.
-pub(crate) const TRACKED_HEAD_MEMBER_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_0013), TRACKED_HEAD_MEMBER_NAMESPACE);
-/// Sparse enumeration index for the first-before summaries co-located in
-/// current-state groups. It contains no row payload: the authoritative row
-/// and its immutable baseline remain one physical group record.
-pub(crate) const TRACKED_WORKING_DIFF_GROUP_NAMESPACE: &str =
-    "live_state.current_working_diff_group.v12";
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str =
-    "live_state.current_working_diff_marker.v12";
-pub(crate) const TRACKED_WORKING_DIFF_GROUP_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0004_0016),
-    TRACKED_WORKING_DIFF_GROUP_NAMESPACE,
-);
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v15";
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0004_0018),
+    StorageSpaceId(0x0004_001e),
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
 );
 
 /// The active checkpoint epoch for the sparse working-diff indexes.
 ///
-/// `None` is the freshly published checkpoint state: it is known empty until
-/// the first ordinary child bootstraps a complete current-state generation.
-/// Once initialized, the generation is immutable for serial normal commits;
-/// the branch control publishes the moving head.
+/// A current protocol marker always names the complete hot generation that
+/// owns it. Older marker encodings are rejected as malformed auxiliary data,
+/// which selects canonical diff replay and lets GC reclaim them.
 #[derive(Debug, Clone, PartialEq, Eq, musli::Encode, musli::Decode)]
 #[musli(packed)]
 pub(crate) struct TrackedWorkingDiffEpoch {
     pub(crate) checkpoint_commit_id: CommitId,
-    // Musli's built-in packed Option encoding is terminal-field oriented.
-    // This explicit bool-prefixed representation keeps `coverage` readable
-    // when a freshly published checkpoint has no generation yet.
-    #[musli(with = storage_codec::option)]
-    pub(crate) generation: Option<CommitId>,
+    pub(crate) generation: CommitId,
     pub(crate) coverage: WorkingDiffIndexCoverage,
 }
 
-/// A tiny atomic coverage proof for the current checkpoint's group index.
+/// A tiny atomic coverage proof for the current checkpoint's sparse row index.
 ///
 /// Count catches loss or duplication; the XOR of BLAKE3 key hashes also
 /// catches a same-count replacement without adding another read structure.
@@ -141,32 +104,6 @@ pub(crate) struct TrackedWorkingDiff {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkingDiffBaseline {
-    Clean,
-    Absent(CommitId),
-    Present {
-        checkpoint_commit_id: CommitId,
-        version: WorkingDiffVersion,
-    },
-}
-
-impl WorkingDiffBaseline {
-    fn is_for_checkpoint(self, checkpoint_commit_id: Option<CommitId>) -> bool {
-        match (self, checkpoint_commit_id) {
-            (
-                Self::Absent(baseline_checkpoint_id)
-                | Self::Present {
-                    checkpoint_commit_id: baseline_checkpoint_id,
-                    ..
-                },
-                Some(checkpoint_commit_id),
-            ) => baseline_checkpoint_id == checkpoint_commit_id,
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkingDiffVersion {
     change_id: ChangeId,
     commit_id: CommitId,
@@ -177,11 +114,37 @@ struct WorkingDiffVersion {
     metadata: WorkingDiffSlotFingerprint,
 }
 
+/// Checkpoint-relative state carried by the authoritative hot row.
+///
+/// The hot diff index is deliberately only a sparse enumeration aid.  The
+/// row itself owns the first-before image, so a normal tracked write can
+/// decide whether it is the first mutation from the primary row it already
+/// loaded for validation.  That eliminates a second point-read batch against
+/// the diff index from the CRUD write path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkingDiffBaseline {
+    /// No active checkpoint owns this generation.
+    Disabled,
+    /// This tracked row was present when the active checkpoint was published
+    /// and has not changed since.
+    Clean,
+    /// The first mutation after the checkpoint created this identity.
+    BeforeAbsent,
+    /// The first mutation after the checkpoint replaced this tracked value.
+    BeforePresent(WorkingDiffVersion),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct WorkingDiffSlotFingerprint {
     kind: u8,
     hash: [u8; JSON_REF_BYTES],
 }
+
+const WORKING_DIFF_SLOT_NONE: u8 = 0;
+const WORKING_DIFF_SLOT_REF: u8 = 1;
+const WORKING_DIFF_SLOT_INLINE: u8 = 2;
+const WORKING_DIFF_VERSION_BYTES: usize =
+    16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, musli::Encode, musli::Decode)]
 #[musli(packed)]
@@ -192,20 +155,6 @@ struct HeadIdentity {
     entity_pk: EntityPk,
     #[musli(with = storage_codec::option)]
     file_id: Option<String>,
-}
-
-/// The physical current-state key for all current members of one logical
-/// entity PK.
-///
-/// `file_id` is deliberately not a key part. It remains part of the packed
-/// group value so a tombstone or a file-backed variant affects only its own
-/// full row identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct HeadGroupIdentity {
-    branch_id: String,
-    generation: CommitId,
-    schema_key: String,
-    entity_pk: EntityPk,
 }
 
 /// The portion of a head-row key that varies within one branch generation.
@@ -228,22 +177,14 @@ impl HeadIdentity {
             file_id: self.file_id,
         }
     }
-
-    fn group_identity(&self) -> HeadGroupIdentity {
-        HeadGroupIdentity {
-            branch_id: self.branch_id.clone(),
-            generation: self.generation,
-            schema_key: self.schema_key.clone(),
-            entity_pk: self.entity_pk.clone(),
-        }
-    }
 }
 
-/// Write-side representation of a v4 current-state row.
+/// Test-only owned representation of a hot current-state row.
 ///
 /// This exists only while a transaction is being staged. Read-side code uses
 /// [`HeadValueView`], which parses the fixed header directly from RocksDB's
 /// returned bytes and never builds this allocation-heavy representation.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HeadValue {
     change_id: Option<ChangeId>,
@@ -256,6 +197,7 @@ struct HeadValue {
     metadata: JsonSlot,
 }
 
+#[cfg(test)]
 impl HeadValue {
     fn as_ref(&self) -> HeadValueRef<'_> {
         HeadValueRef {
@@ -267,6 +209,7 @@ impl HeadValue {
             updated_at: self.updated_at,
             snapshot: self.snapshot.as_ref_slot(),
             metadata: self.metadata.as_ref_slot(),
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
         }
     }
 }
@@ -281,6 +224,7 @@ struct HeadValueRef<'a> {
     updated_at: LixTimestamp,
     snapshot: JsonSlotRef<'a>,
     metadata: JsonSlotRef<'a>,
+    working_diff_baseline: WorkingDiffBaseline,
 }
 
 #[derive(Debug, Clone, Copy, musli::Encode)]
@@ -356,7 +300,11 @@ pub(crate) struct CurrentStateDeltaRef<'a> {
 }
 
 impl<'a> CurrentStateDeltaRef<'a> {
-    fn value_ref(&self, created_at: LixTimestamp) -> HeadValueRef<'a> {
+    fn value_ref(
+        &self,
+        created_at: LixTimestamp,
+        working_diff_baseline: WorkingDiffBaseline,
+    ) -> HeadValueRef<'a> {
         HeadValueRef {
             change_id: self.change_id,
             commit_id: self.commit_id,
@@ -374,6 +322,7 @@ impl<'a> CurrentStateDeltaRef<'a> {
             } else {
                 self.metadata
             },
+            working_diff_baseline,
         }
     }
 
@@ -404,11 +353,11 @@ impl TrackedHeadContext {
     }
 
     #[expect(clippy::unused_self)]
-    pub(crate) fn reader<S>(&self, store: S) -> TrackedHeadStoreReader<S>
+    pub(crate) fn reader<S>(&self, store: S) -> hot::HotStateStoreReader<S>
     where
         S: StorageAdapterRead,
     {
-        TrackedHeadStoreReader { store }
+        hot::HotStateStoreReader { store }
     }
 
     #[expect(clippy::unused_self)]
@@ -416,16 +365,16 @@ impl TrackedHeadContext {
         &'a self,
         store: &'a S,
         writes: &'a mut StorageWriteSet,
-    ) -> TrackedHeadWriter<'a, S>
+    ) -> hot::HotStateWriter<'a, S>
     where
         S: StorageAdapterRead + ?Sized,
     {
-        TrackedHeadWriter { store, writes }
+        hot::HotStateWriter { store, writes }
     }
 
     /// Reclaims derived current-state generations that no durable branch
     /// control can select and returns their history-free payload refs. Both
-    /// the authoritative groups and their explicit file-id projections are
+    /// the authoritative hot rows and their explicit file-id projections are
     /// generation-scoped, so the control is the one ownership root for both
     /// spaces. The caller compares the returned refs with its complete live
     /// payload set before staging physical JSON deletion.
@@ -443,26 +392,7 @@ impl TrackedHeadContext {
     where
         S: StorageAdapterRead + ?Sized,
     {
-        let active = active_current_state_generations(controls);
-        let mut stale_untracked_refs = BTreeSet::new();
-        stage_collect_stale_current_state_group_space(
-            store,
-            writes,
-            &active,
-            &mut stale_untracked_refs,
-        )
-        .await?;
-        stage_collect_stale_current_state_member_space(
-            store,
-            writes,
-            &active,
-            &mut stale_untracked_refs,
-        )
-        .await?;
-        Ok(stale_untracked_refs
-            .into_iter()
-            .map(JsonRef::from_hash_bytes)
-            .collect())
+        hot::stage_collect_stale_hot_generations(store, writes, controls).await
     }
 }
 
@@ -478,751 +408,6 @@ fn active_current_state_generations(
         .collect()
 }
 
-/// Direct materializer for the current tracked branch generation.
-pub(crate) struct TrackedHeadStoreReader<S> {
-    store: S,
-}
-
-impl<S> TrackedHeadStoreReader<S>
-where
-    S: StorageAdapterRead,
-{
-    /// Serves a projection published by the supplied atomic branch control.
-    ///
-    /// V12 publishes the group generation and its currentness bit in the
-    /// branch control itself. A control whose projection is not complete is a
-    /// clean historical fallback; a current control can read its generation
-    /// without a second marker lookup.
-    pub(crate) async fn scan_live_rows_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        if !control.tracked_head_is_current {
-            return Ok(None);
-        }
-        self.scan_live_rows_for_generation(branch_id, control.generation, request)
-            .await
-    }
-
-    /// Batch-loads complete logical-PK groups from already-observed current
-    /// branch controls. A normal entity mutation knows a finite set of public
-    /// primary keys but not necessarily a file id, so the packed group is the
-    /// only correct point-read unit: all file-backed members must remain
-    /// candidates for UPDATE/DELETE.
-    ///
-    /// `None` is a conservative route miss. Callers retain the established
-    /// branch-by-branch reader for incomplete controls, broad scans, and
-    /// explicit file-id predicates.
-    pub(crate) async fn scan_live_rows_for_current_controls(
-        &self,
-        controls: &[(String, BranchHeadControl)],
-        request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<(String, Vec<MaterializedLiveStateRow>)>>, LixError> {
-        if controls.is_empty()
-            || controls
-                .iter()
-                .any(|(_, control)| !control.tracked_head_is_current)
-            || request.filter.schema_keys.is_empty()
-            || request.filter.entity_pks.is_empty()
-            || !request.filter.file_ids.is_empty()
-            // This internal batch feeds the outer visibility resolver. It
-            // must retain all tombstones and defer limiting until branch and
-            // global overlays have been arbitrated.
-            || !request.filter.include_tombstones
-            || request.limit.is_some()
-        {
-            return Ok(None);
-        }
-
-        let groups =
-            controls
-                .iter()
-                .flat_map(|(branch_id, control)| {
-                    request
-                        .filter
-                        .schema_keys
-                        .iter()
-                        .flat_map(move |schema_key| {
-                            request.filter.entity_pks.iter().map(move |entity_pk| {
-                                HeadGroupIdentity {
-                                    branch_id: branch_id.clone(),
-                                    generation: control.generation,
-                                    schema_key: schema_key.clone(),
-                                    entity_pk: entity_pk.clone(),
-                                }
-                            })
-                        })
-                })
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>();
-        let values = load_group_bytes(&self.store, &groups).await?;
-        let mut entries_by_branch = BTreeMap::<String, Vec<(HeadRowIdentity, Bytes)>>::new();
-        for (group, value) in groups.into_iter().zip(values) {
-            let Some(value) = value else {
-                continue;
-            };
-            let entries = entries_by_branch
-                .entry(group.branch_id.clone())
-                .or_default();
-            // `groups` was built directly from the requested schema and
-            // entity-PK sets, and this path rejects file-id predicates above.
-            // Rechecking those sets for every member would turn a 10k-PK
-            // multi-get into a quadratic membership scan.
-            extend_group_entries(entries, group, value, |_| true, None)?;
-        }
-
-        let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-        let mut rows_by_branch = Vec::with_capacity(entries_by_branch.len());
-        for (branch_id, entries) in entries_by_branch {
-            let rows =
-                materialize_live_entries(&self.store, entries, projection, &branch_id).await?;
-            rows_by_branch.push((branch_id, rows));
-        }
-        Ok(Some(rows_by_branch))
-    }
-
-    /// Returns whether the serving generation has any rows for one entity
-    /// schema. A caller uses this as an inexpensive global-overlay proof
-    /// before taking the direct local entity lane.
-    pub(crate) async fn has_schema_rows_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        schema_key: &str,
-    ) -> Result<Option<bool>, LixError> {
-        if !control.tracked_head_is_current {
-            return Ok(None);
-        }
-        self.has_schema_rows_for_generation(branch_id, control.generation, schema_key)
-            .await
-    }
-
-    /// Streams one local entity schema directly from packed tracked-head
-    /// members into snapshot bytes. A caller may either scan the whole schema
-    /// or provide exact entity PKs. This intentionally omits all logical row
-    /// identities: entity projection only consumes snapshots, and avoiding
-    /// entity-PK/schema/file-id materialization is the hot-path win. Callers
-    /// must prove no untracked or global overlay can contribute.
-    pub(crate) async fn scan_entity_snapshots_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        schema_key: &str,
-        entity_pks: &[EntityPk],
-        limit: Option<usize>,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        if !control.tracked_head_is_current {
-            return Ok(None);
-        }
-        self.scan_entity_snapshots_for_generation(
-            branch_id,
-            control.generation,
-            schema_key,
-            entity_pks,
-            limit,
-        )
-        .await
-    }
-
-    /// Returns `None` when this branch has no projection for the canonical
-    /// branch ref. That is a direct-plane miss, not empty tracked state.
-    #[cfg(test)]
-    pub(crate) async fn scan_live_rows_if_current(
-        &self,
-        branch_id: &str,
-        expected_head: &str,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        let Some(control) = self.control_if_current(branch_id, expected_head).await? else {
-            return Ok(None);
-        };
-        self.scan_live_rows_for_generation(branch_id, control.generation, request)
-            .await
-    }
-
-    async fn scan_live_rows_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
-        let entries =
-            scan_entries(&self.store, branch_id, generation, &request.filter, None).await?;
-        let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-        let mut rows =
-            materialize_live_entries(&self.store, entries, projection, branch_id).await?;
-        if !request.filter.include_tombstones {
-            rows.retain(|row| !row.deleted);
-        }
-        if let Some(limit) = request.limit {
-            rows.truncate(limit);
-        }
-        Ok(Some(rows))
-    }
-
-    /// Reads only the history-free members from a physical generation without
-    /// consulting `tracked_head_is_current`. A branch ref may temporarily use
-    /// historical replay for its tracked portion after a lifecycle move, but
-    /// its untracked members remain live workspace state and must survive that
-    /// move. Normal current controls never take this route.
-    pub(crate) async fn scan_untracked_rows_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let mut rows = self
-            .scan_live_rows_for_generation(branch_id, generation, request)
-            .await?
-            .unwrap_or_default();
-        rows.retain(|row| row.untracked);
-        Ok(rows)
-    }
-
-    /// Exact counterpart to [`Self::scan_untracked_rows_for_generation`].
-    /// This is used only while a branch's tracked generation is being rebuilt;
-    /// current controls use the one-plane batch reader above.
-    pub(crate) async fn load_untracked_projected_rows_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        keys: &[TrackedStateKey],
-        projection: &ChangeRecordProjection,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        Ok(self
-            .load_projected_live_rows_for_generation(branch_id, generation, keys, projection)
-            .await?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| row.filter(|row| row.untracked))
-            .collect())
-    }
-
-    async fn has_schema_rows_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        schema_key: &str,
-    ) -> Result<Option<bool>, LixError> {
-        let entries = ScanPlan::prefix(
-            TRACKED_HEAD_GROUP_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
-            },
-        )
-        .collect(
-            &self.store,
-            StorageScanOptions {
-                projection: StorageCoreProjection::KeyOnly,
-                limit_rows: 1,
-                ..StorageScanOptions::default()
-            },
-        )
-        .await?;
-        Ok(Some(!entries.value.entries.is_empty()))
-    }
-
-    async fn scan_entity_snapshots_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        schema_key: &str,
-        entity_pks: &[EntityPk],
-        limit: Option<usize>,
-    ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        Ok(Some(
-            scan_entity_snapshots(
-                &self.store,
-                branch_id,
-                generation,
-                schema_key,
-                entity_pks,
-                limit,
-            )
-            .await?,
-        ))
-    }
-
-    /// Like the immutable-root point batch, preserves input cardinality and
-    /// returns tombstones for the visibility layer to resolve.
-    #[cfg(test)]
-    pub(crate) async fn load_projected_live_rows_if_current(
-        &self,
-        branch_id: &str,
-        expected_head: &str,
-        keys: &[TrackedStateKey],
-        projection: &ChangeRecordProjection,
-    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
-        let Some(control) = self.control_if_current(branch_id, expected_head).await? else {
-            return Ok(None);
-        };
-        self.load_projected_live_rows_for_generation(
-            branch_id,
-            control.generation,
-            keys,
-            projection,
-        )
-        .await
-    }
-
-    async fn load_projected_live_rows_for_generation(
-        &self,
-        branch_id: &str,
-        generation: CommitId,
-        keys: &[TrackedStateKey],
-        projection: &ChangeRecordProjection,
-    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
-        if keys.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-
-        let mut output_indices = BTreeMap::<HeadIdentity, Vec<usize>>::new();
-        for (index, key) in keys.iter().enumerate() {
-            output_indices
-                .entry(HeadIdentity {
-                    branch_id: branch_id.to_string(),
-                    generation,
-                    schema_key: key.schema_key.clone(),
-                    entity_pk: key.entity_pk.clone(),
-                    file_id: key.file_id.clone(),
-                })
-                .or_default()
-                .push(index);
-        }
-        let groups = output_indices
-            .keys()
-            .filter(|identity| identity.file_id.is_none())
-            .map(HeadIdentity::group_identity)
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        let member_identities = output_indices
-            .keys()
-            .filter(|identity| identity.file_id.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
-        let values = load_group_bytes(&self.store, &groups).await?;
-        let mut entries = Vec::new();
-        for (group, value) in groups.into_iter().zip(values) {
-            let Some(value) = value else {
-                continue;
-            };
-            for member in decode_head_group_members(&value)? {
-                let identity = HeadIdentity {
-                    branch_id: group.branch_id.clone(),
-                    generation: group.generation,
-                    schema_key: group.schema_key.clone(),
-                    entity_pk: group.entity_pk.clone(),
-                    file_id: member.file_id,
-                };
-                if output_indices.contains_key(&identity) {
-                    entries.push((identity.into_row_identity(), member.value));
-                }
-            }
-        }
-        let member_values = load_member_bytes(&self.store, &member_identities).await?;
-        for (identity, value) in member_identities.into_iter().zip(member_values) {
-            if let Some(value) = value {
-                entries.push((identity.into_row_identity(), value));
-            }
-        }
-        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        let rows_by_identity = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    HeadRowIdentity {
-                        schema_key: row.schema_key.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                        file_id: row.file_id.clone(),
-                    },
-                    row,
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut output = vec![None; keys.len()];
-        for (identity, indices) in output_indices {
-            if let Some(row) = rows_by_identity.get(&identity.into_row_identity()) {
-                for index in indices {
-                    output[index] = Some(row.clone());
-                }
-            }
-        }
-        Ok(Some(output))
-    }
-
-    /// Current-state control-plane variant of
-    /// [`Self::load_projected_live_rows_if_current`].
-    pub(crate) async fn load_projected_live_rows_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        keys: &[TrackedStateKey],
-        projection: &ChangeRecordProjection,
-    ) -> Result<Option<Vec<Option<MaterializedLiveStateRow>>>, LixError> {
-        if !control.tracked_head_is_current {
-            return Ok(None);
-        }
-        self.load_projected_live_rows_for_generation(
-            branch_id,
-            control.generation,
-            keys,
-            projection,
-        )
-        .await
-    }
-
-    /// Loads the checkpoint epoch marker without treating it as visibility.
-    /// Commit staging combines it with a coherent current-state branch-control
-    /// observation before deciding whether it can preserve first-before
-    /// summaries.
-    pub(crate) async fn working_diff_epoch(
-        &self,
-        branch_id: &str,
-    ) -> Result<Option<TrackedWorkingDiffEpoch>, LixError> {
-        load_tracked_working_diff_epoch(&self.store, branch_id).await
-    }
-
-    /// Returns every out-of-band JSON payload owned by an active untracked
-    /// current-state generation. Tracked payloads are rooted through
-    /// changelog reachability; untracked members deliberately have no
-    /// changelog fact, so repository GC asks this one authoritative plane
-    /// directly.
-    ///
-    /// A generation without a matching branch control is derived, stale
-    /// serving state. It must neither keep an untracked payload live nor be
-    /// scanned as part of normal repository GC. Controls that are temporarily
-    /// non-current still retain their generation here: that generation is the
-    /// branch's workspace state while its tracked portion falls back to
-    /// historical replay.
-    pub(crate) async fn untracked_json_refs(
-        &self,
-        controls: &[(String, BranchHeadControl)],
-    ) -> Result<Vec<JsonRef>, LixError> {
-        let mut refs = BTreeSet::<[u8; JSON_REF_BYTES]>::new();
-        for (branch_id, generation) in active_current_state_generations(controls) {
-            let plan = ScanPlan::prefix(
-                TRACKED_HEAD_GROUP_SPACE,
-                StoragePrefix {
-                    bytes: Bytes::from(encode_scope_prefix(&branch_id, generation)),
-                },
-            );
-            let mut resume_after = None;
-            loop {
-                let page = plan
-                    .collect(
-                        &self.store,
-                        StorageScanOptions {
-                            resume_after: resume_after.clone(),
-                            ..StorageScanOptions::default()
-                        },
-                    )
-                    .await?;
-                resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-                for entry in page.value.entries {
-                    let value = full_value_bytes(entry.value)?;
-                    collect_untracked_json_refs_from_group(value.as_ref(), &mut refs)?;
-                }
-                if !page.value.has_more || resume_after.is_none() {
-                    break;
-                }
-            }
-        }
-        Ok(refs.into_iter().map(JsonRef::from_hash_bytes).collect())
-    }
-
-    /// Returns an O(ever-dirty groups since checkpoint) tracked diff only when the sparse
-    /// working-diff epoch and the current serving generation agree. Any
-    /// missing, stale, or malformed auxiliary record returns `None`, leaving
-    /// the canonical historical replay path authoritative.
-    pub(crate) async fn working_diff_if_control_current(
-        &self,
-        branch_id: &str,
-        control: BranchHeadControl,
-        request: &TrackedStateDiffRequest,
-    ) -> Result<Option<TrackedWorkingDiff>, LixError> {
-        // The epoch is an accelerator, not a source of visibility. A
-        // malformed or unavailable auxiliary record selects canonical replay
-        // instead of making a valid SQL query fail.
-        if !control.tracked_head_is_current {
-            return Ok(None);
-        }
-        let Ok(Some(epoch)) = self.working_diff_epoch(branch_id).await else {
-            return Ok(None);
-        };
-        let Some(generation) = epoch.generation else {
-            return Ok((epoch.checkpoint_commit_id == control.head_commit_id
-                && control.working_diff_checkpoint_commit_id == Some(epoch.checkpoint_commit_id))
-            .then_some(TrackedWorkingDiff {
-                checkpoint_commit_id: epoch.checkpoint_commit_id,
-                diff: TrackedStateDiff::default(),
-            }));
-        };
-        if generation != control.generation
-            || control.working_diff_checkpoint_commit_id != Some(epoch.checkpoint_commit_id)
-        {
-            return Ok(None);
-        }
-        let Some(entries) = working_diff_entries_from_current_head(
-            &self.store,
-            branch_id,
-            epoch.checkpoint_commit_id,
-            generation,
-            epoch.coverage,
-            &request.filter,
-        )
-        .await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(TrackedWorkingDiff {
-            checkpoint_commit_id: epoch.checkpoint_commit_id,
-            diff: TrackedStateDiff { entries },
-        }))
-    }
-
-    #[cfg(test)]
-    async fn control_if_current(
-        &self,
-        branch_id: &str,
-        expected_head: &str,
-    ) -> Result<Option<BranchHeadControl>, LixError> {
-        let expected_head = CommitId::parse_lix(expected_head, "tracked-head expected commit")?;
-        let control = BranchHeadControlContext::new()
-            .reader(&self.store)
-            .load(branch_id)
-            .await?;
-        Ok(control.filter(|control| {
-            control.tracked_head_is_current && control.head_commit_id == expected_head
-        }))
-    }
-}
-
-/// Writer for an atomic branch-head projection update.
-pub(crate) struct TrackedHeadWriter<'a, S: ?Sized> {
-    store: &'a S,
-    writes: &'a mut StorageWriteSet,
-}
-
-impl<S> TrackedHeadWriter<'_, S>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    /// Incrementally updates a matching parent generation, or creates a fresh
-    /// generation from a caller-provided parent snapshot after branch movement.
-    #[cfg(any(test, feature = "storage-benches"))]
-    pub(crate) async fn stage_commit(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[TrackedHeadDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-    ) -> Result<CommitId, LixError> {
-        let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
-        let generation = self
-            .stage_commit_with_working_diff(
-                branch_id,
-                parent_generation,
-                new_head,
-                deltas,
-                absence_guards,
-                parent_rows,
-                None,
-                &mut working_diff_coverage,
-            )
-            .await?;
-        #[cfg(test)]
-        stage_test_current_control(self.writes, branch_id, new_head, generation, None)?;
-        Ok(generation)
-    }
-
-    /// Internal variant used only when an active checkpoint epoch makes the
-    /// packed-group baseline authoritative for `lix_working_change`.
-    #[cfg(any(test, feature = "storage-benches"))]
-    pub(crate) async fn stage_commit_with_working_diff(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[TrackedHeadDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        working_diff_coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        let deltas = deltas
-            .iter()
-            .map(TrackedHeadDeltaRef::as_current)
-            .collect::<Vec<_>>();
-        self.stage_current_state_with_working_diff(
-            branch_id,
-            parent_generation,
-            new_head,
-            &deltas,
-            absence_guards,
-            parent_rows,
-            None,
-            working_diff_capture_checkpoint_commit_id,
-            working_diff_coverage,
-        )
-        .await
-    }
-
-    /// Updates the single authoritative current-state plane. Tracked and
-    /// untracked rows share the same packed groups; only tracked members
-    /// contribute to a commit or to the working-diff accelerator.
-    pub(crate) async fn stage_current_state_with_working_diff(
-        &mut self,
-        branch_id: &str,
-        parent_generation: Option<CommitId>,
-        new_head: CommitId,
-        deltas: &[CurrentStateDeltaRef<'_>],
-        absence_guards: &BTreeSet<TrackedStateKey>,
-        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
-        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
-        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
-        working_diff_coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<CommitId, LixError> {
-        let matches_parent = parent_generation.is_some();
-        let generation = parent_generation.unwrap_or(new_head);
-        // Sorting borrowed deltas establishes both the exact-mutation
-        // uniqueness check and the group order needed for a streaming merge.
-        // The normal matching-generation path must never reconstruct every
-        // current-state member in an owned BTreeMap just to change one member.
-        let mut sorted_deltas = deltas.iter().collect::<Vec<_>>();
-        for delta in &sorted_deltas {
-            delta.validate()?;
-        }
-        sorted_deltas.sort_unstable_by(|left, right| compare_head_deltas(left, right));
-        for pair in sorted_deltas.windows(2) {
-            if compare_head_deltas(pair[0], pair[1]) == Ordering::Equal {
-                return Err(current_state_duplicate_delta_error(pair[1]));
-            }
-        }
-
-        if matches_parent {
-            let groups = group_sorted_head_deltas(branch_id, generation, &sorted_deltas);
-            let previous_groups =
-                load_group_bytes(self.store, groups.iter().map(|group| &group.identity)).await?;
-
-            self.writes
-                .reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
-            self.writes.reserve_space(
-                TRACKED_HEAD_MEMBER_SPACE,
-                sorted_deltas
-                    .iter()
-                    .filter(|delta| delta.file_id.is_some())
-                    .count(),
-                0,
-            );
-            // A normal tracked mutation never inserts into this set. The
-            // incremental parser already visits the previous member for a
-            // matching identity, so collecting retired untracked refs here
-            // adds neither a storage read nor an allocation to the tracked
-            // hot path.
-            let mut retired_untracked_json_refs = BTreeSet::new();
-            let mut next_groups = Vec::new();
-            next_groups
-                .try_reserve(groups.len())
-                .map_err(|_| head_group_error("cannot reserve staged group outputs"))?;
-            for (group, previous) in groups.iter().zip(previous_groups) {
-                next_groups.push(encode_incremental_group(
-                    previous.as_deref(),
-                    &sorted_deltas[group.deltas.clone()],
-                    absence_guards,
-                    working_diff_capture_checkpoint_commit_id,
-                    &mut retired_untracked_json_refs,
-                )?);
-            }
-            for (group, next) in groups.iter().zip(next_groups) {
-                let became_dirty_group = next.became_dirty_group;
-                match next.bytes {
-                    Some(bytes) => stage_put_group_bytes(self.writes, &group.identity, bytes),
-                    None => stage_delete_group(self.writes, &group.identity),
-                }
-                for (file_id, value) in next.explicit_member_projections {
-                    stage_put_file_member_bytes(self.writes, &group.identity, file_id, &value);
-                }
-                for file_id in next.deleted_member_projections {
-                    stage_delete_file_member(self.writes, &group.identity, file_id);
-                }
-                if became_dirty_group {
-                    stage_put_working_diff_group_index(
-                        self.writes,
-                        working_diff_coverage,
-                        working_diff_capture_checkpoint_commit_id.expect(
-                            "a newly dirty group requires an active working-diff checkpoint",
-                        ),
-                        &group.identity,
-                    )?;
-                }
-            }
-            JsonStoreWriter::stage_untracked_reclaim_candidates(
-                self.writes,
-                retired_untracked_json_refs
-                    .into_iter()
-                    .map(JsonRef::from_hash_bytes),
-            );
-        } else {
-            stage_bootstrap_groups(
-                self.writes,
-                branch_id,
-                generation,
-                &sorted_deltas,
-                absence_guards,
-                parent_rows.unwrap_or_default(),
-                preserved_untracked_rows.unwrap_or_default(),
-                working_diff_capture_checkpoint_commit_id,
-                working_diff_coverage,
-            )?;
-        }
-        Ok(generation)
-    }
-}
-
-/// One contiguous range of sorted mutations for a physical current-state
-/// group.
-///
-/// The range borrows the transaction's deltas, while the group identity is
-/// owned once. This is intentionally not a map of decoded members: matching
-/// generation commits merge the encoded old group directly into its next
-/// value.
-struct HeadGroupMutation {
-    identity: HeadGroupIdentity,
-    deltas: Range<usize>,
-}
-
-/// Fully validated replacement bytes for one matching-generation group.
-///
-/// Keeping these short-lived outputs until every group has validated makes
-/// `stage_commit` all-or-nothing for the existing serving generation without
-/// rebuilding decoded member maps.
-struct EncodedHeadGroup<'a> {
-    bytes: Option<Vec<u8>>,
-    explicit_member_projections: Vec<(&'a str, Vec<u8>)>,
-    deleted_member_projections: Vec<&'a str>,
-    became_dirty_group: bool,
-}
-
-fn compare_head_deltas(
-    left: &CurrentStateDeltaRef<'_>,
-    right: &CurrentStateDeltaRef<'_>,
-) -> Ordering {
-    left.schema_key
-        .cmp(right.schema_key)
-        .then_with(|| left.entity_pk.cmp(right.entity_pk))
-        .then_with(|| left.file_id.cmp(&right.file_id))
-}
-
-fn same_head_group(left: &CurrentStateDeltaRef<'_>, right: &CurrentStateDeltaRef<'_>) -> bool {
-    left.schema_key == right.schema_key && left.entity_pk == right.entity_pk
-}
-
 fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
@@ -1233,419 +418,6 @@ fn current_state_duplicate_delta_error(delta: &CurrentStateDeltaRef<'_>) -> LixE
     )
 }
 
-fn group_sorted_head_deltas(
-    branch_id: &str,
-    generation: CommitId,
-    deltas: &[&CurrentStateDeltaRef<'_>],
-) -> Vec<HeadGroupMutation> {
-    let mut groups = Vec::new();
-    let mut start = 0;
-    while start < deltas.len() {
-        let first = deltas[start];
-        let mut end = start + 1;
-        while end < deltas.len() && same_head_group(first, deltas[end]) {
-            end += 1;
-        }
-        groups.push(HeadGroupMutation {
-            identity: HeadGroupIdentity {
-                branch_id: branch_id.to_string(),
-                generation,
-                schema_key: first.schema_key.to_string(),
-                entity_pk: first.entity_pk.clone(),
-            },
-            deltas: start..end,
-        });
-        start = end;
-    }
-    groups
-}
-
-/// Builds a fresh current-state generation after a branch movement.
-///
-/// This path necessarily starts from materialized parent rows, so it retains
-/// the simple owned-map implementation. Ordinary commits keep their parent
-/// generation and use [`encode_incremental_group`] instead.
-fn stage_bootstrap_groups(
-    writes: &mut StorageWriteSet,
-    branch_id: &str,
-    generation: CommitId,
-    deltas: &[&CurrentStateDeltaRef<'_>],
-    absence_guards: &BTreeSet<TrackedStateKey>,
-    parent_rows: Vec<MaterializedTrackedStateRow>,
-    preserved_untracked_rows: Vec<MaterializedLiveStateRow>,
-    working_diff_checkpoint_commit_id: Option<CommitId>,
-    working_diff_coverage: &mut WorkingDiffIndexCoverage,
-) -> Result<(), LixError> {
-    let mut groups = BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, Vec<u8>>>::new();
-    let mut baselines =
-        BTreeMap::<HeadGroupIdentity, BTreeMap<Option<String>, WorkingDiffBaseline>>::new();
-    for row in parent_rows {
-        let MaterializedTrackedStateRow {
-            entity_pk,
-            schema_key,
-            file_id,
-            snapshot_content,
-            metadata,
-            deleted,
-            created_at,
-            updated_at,
-            change_id,
-            commit_id,
-        } = row;
-        let key = TrackedStateKey {
-            schema_key: schema_key.clone(),
-            entity_pk: entity_pk.clone(),
-            file_id: file_id.clone(),
-        };
-        if absence_guards.contains(&key) && !deleted {
-            return Err(tracked_head_duplicate_insert_error(&key));
-        }
-        let identity = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key,
-            entity_pk,
-        };
-        let value = HeadValue {
-            change_id: Some(change_id),
-            commit_id: Some(commit_id),
-            untracked: false,
-            deleted,
-            created_at: LixTimestamp::expect_parse("tracked-head parent created_at", &created_at),
-            updated_at: LixTimestamp::expect_parse("tracked-head parent updated_at", &updated_at),
-            snapshot: snapshot_content
-                .as_deref()
-                .map_or(JsonSlot::None, JsonSlot::from_json),
-            metadata: metadata
-                .as_deref()
-                .map_or(JsonSlot::None, JsonSlot::from_json),
-        };
-        let members = groups.entry(identity.clone()).or_default();
-        if members
-            .insert(file_id.clone(), encode_head_value(&value.as_ref())?)
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked-head bootstrap contains duplicate full row identity",
-            ));
-        }
-        baselines
-            .entry(identity)
-            .or_default()
-            .insert(file_id, WorkingDiffBaseline::Clean);
-    }
-
-    // A fresh tracked generation is a branch lifecycle operation, not an
-    // untracked-state reset. Copy history-free members from the previously
-    // serving generation before applying this transaction's mutations. The
-    // values are intentionally re-encoded rather than copied as opaque bytes
-    // because the new generation must retain the same group invariants and
-    // file-member projections as an ordinary current-state publication.
-    for row in preserved_untracked_rows {
-        if !row.untracked || row.deleted {
-            return Err(head_group_error(
-                "bootstrap preserved state must contain only live untracked members",
-            ));
-        }
-        let key = TrackedStateKey {
-            schema_key: row.schema_key.clone(),
-            entity_pk: row.entity_pk.clone(),
-            file_id: row.file_id.clone(),
-        };
-        if absence_guards.contains(&key) {
-            return Err(tracked_head_duplicate_insert_error(&key));
-        }
-        let identity = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: row.schema_key,
-            entity_pk: row.entity_pk,
-        };
-        let value = HeadValue {
-            change_id: None,
-            commit_id: None,
-            untracked: true,
-            deleted: false,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            snapshot: row
-                .snapshot_content
-                .as_deref()
-                .map_or(JsonSlot::None, JsonSlot::from_json),
-            metadata: row
-                .metadata
-                .as_deref()
-                .map_or(JsonSlot::None, JsonSlot::from_json),
-        };
-        let members = groups.entry(identity.clone()).or_default();
-        if members
-            .insert(row.file_id.clone(), encode_head_value(&value.as_ref())?)
-            .is_some()
-        {
-            return Err(LixError::new(
-                LixError::CODE_UNIQUE,
-                "cannot materialize a tracked and untracked current row with the same identity",
-            ));
-        }
-        baselines
-            .entry(identity)
-            .or_default()
-            .insert(row.file_id, WorkingDiffBaseline::Clean);
-    }
-
-    let mut dirty_groups = BTreeSet::new();
-    for delta in deltas {
-        delta.validate()?;
-        let group = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: delta.schema_key.to_string(),
-            entity_pk: delta.entity_pk.clone(),
-        };
-        let file_id = delta.file_id.map(str::to_string);
-        let members = groups.entry(group.clone()).or_default();
-        let baseline_members = baselines.entry(group.clone()).or_default();
-        let baseline = match members.get(&file_id) {
-            Some(existing) => {
-                let existing = decode_head_value(existing)?;
-                reject_guarded_live_member(absence_guards, delta, existing)?;
-                reject_retention_change(delta, existing)?;
-                working_diff_baseline_for_existing_value(
-                    existing,
-                    working_diff_checkpoint_commit_id,
-                )
-            }
-            None => {
-                working_diff_baseline_for_absent_delta(delta, working_diff_checkpoint_commit_id)
-            }
-        };
-        if delta.physically_deletes() {
-            members.remove(&file_id);
-            baseline_members.remove(&file_id);
-            continue;
-        }
-        let created_at = match members.get(&file_id) {
-            Some(existing) => decode_head_value(existing)?.created_at,
-            None => delta.created_at,
-        };
-        members.insert(
-            file_id.clone(),
-            encode_head_value(&delta.value_ref(created_at))?,
-        );
-        baseline_members.insert(file_id.clone(), baseline);
-        if !delta.untracked && working_diff_checkpoint_commit_id.is_some() {
-            dirty_groups.insert(group.clone());
-        }
-    }
-
-    writes.reserve_space(TRACKED_HEAD_GROUP_SPACE, groups.len(), 0);
-    let explicit_member_count = groups
-        .values()
-        .map(|members| members.keys().filter(|file_id| file_id.is_some()).count())
-        .sum();
-    writes.reserve_space(TRACKED_HEAD_MEMBER_SPACE, explicit_member_count, 0);
-    for (identity, members) in groups {
-        if members.is_empty() {
-            continue;
-        }
-        let member_baselines = baselines
-            .get(&identity)
-            .ok_or_else(|| head_group_error("bootstrap group is missing working-diff baselines"))?;
-        stage_put_group_members_with_baselines(writes, &identity, &members, member_baselines)?;
-        for (file_id, value) in &members {
-            if file_id.is_some() {
-                stage_put_member_bytes(writes, &identity, file_id.as_deref(), value)?;
-            }
-        }
-    }
-    if let Some(checkpoint_commit_id) = working_diff_checkpoint_commit_id {
-        for group in &dirty_groups {
-            stage_put_working_diff_group_index(
-                writes,
-                working_diff_coverage,
-                checkpoint_commit_id,
-                group,
-            )?;
-        }
-    }
-    Ok(())
-}
-
-/// Merges one existing current-state group and its sorted mutations without decoding the
-/// whole group into owned member values. Every old member is still parsed and
-/// validated before it is copied, so an unrelated malformed sibling cannot be
-/// silently republished.
-fn encode_incremental_group<'a>(
-    previous: Option<&[u8]>,
-    deltas: &[&CurrentStateDeltaRef<'a>],
-    absence_guards: &BTreeSet<TrackedStateKey>,
-    working_diff_checkpoint_commit_id: Option<CommitId>,
-    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<EncodedHeadGroup<'a>, LixError> {
-    debug_assert!(!deltas.is_empty());
-    debug_assert!(
-        deltas
-            .windows(2)
-            .all(|pair| compare_head_deltas(pair[0], pair[1]) == Ordering::Less)
-    );
-
-    let mut cursor = previous.map(HeadGroupMembers::new).transpose()?;
-    let mut current = next_head_group_member(&mut cursor)?;
-    let mut encoded = Vec::new();
-    encoded
-        .try_reserve(previous.map_or(HEAD_GROUP_HEADER_BYTES, <[u8]>::len))
-        .map_err(|_| head_group_error("cannot reserve group value bytes"))?;
-    encoded.push(HEAD_GROUP_VALUE_VERSION);
-    encoded.extend_from_slice(&[0; 4]);
-    let mut member_count = 0usize;
-    let mut previous_has_current_dirty_member = false;
-    let mut became_current_dirty_member = false;
-    let mut explicit_member_projections = Vec::new();
-    let mut deleted_member_projections = Vec::new();
-    explicit_member_projections
-        .try_reserve(
-            deltas
-                .iter()
-                .filter(|delta| delta.file_id.is_some())
-                .count(),
-        )
-        .map_err(|_| head_group_error("cannot reserve explicit member projections"))?;
-
-    for delta in deltas {
-        loop {
-            let Some(member) = current else {
-                if delta.physically_deletes() {
-                    if let Some(file_id) = delta.file_id {
-                        deleted_member_projections.push(file_id);
-                    }
-                    break;
-                }
-                append_delta_head_group_member(
-                    &mut encoded,
-                    delta,
-                    delta.created_at,
-                    working_diff_baseline_for_absent_delta(
-                        delta,
-                        working_diff_checkpoint_commit_id,
-                    ),
-                    &mut explicit_member_projections,
-                )?;
-                became_current_dirty_member |=
-                    !delta.untracked && working_diff_checkpoint_commit_id.is_some();
-                increment_head_group_member_count(&mut member_count)?;
-                break;
-            };
-            match member.file_id.cmp(&delta.file_id) {
-                Ordering::Less => {
-                    previous_has_current_dirty_member |= member
-                        .baseline
-                        .is_for_checkpoint(working_diff_checkpoint_commit_id);
-                    append_head_group_member(
-                        &mut encoded,
-                        member.file_id,
-                        member.value,
-                        member.baseline,
-                    )?;
-                    increment_head_group_member_count(&mut member_count)?;
-                    current = next_head_group_member(&mut cursor)?;
-                }
-                Ordering::Equal => {
-                    reject_guarded_live_member(absence_guards, delta, member.head)?;
-                    reject_retention_change(delta, member.head)?;
-                    if member.head.untracked {
-                        collect_retired_untracked_json_refs(
-                            member.head,
-                            delta,
-                            retired_untracked_json_refs,
-                        );
-                    }
-                    if delta.physically_deletes() {
-                        if let Some(file_id) = delta.file_id {
-                            deleted_member_projections.push(file_id);
-                        }
-                        current = next_head_group_member(&mut cursor)?;
-                        break;
-                    }
-                    let (baseline, became_dirty) = working_diff_baseline_for_existing_delta(
-                        member.baseline,
-                        member.head,
-                        delta,
-                        working_diff_checkpoint_commit_id,
-                    );
-                    previous_has_current_dirty_member |= member
-                        .baseline
-                        .is_for_checkpoint(working_diff_checkpoint_commit_id);
-                    append_delta_head_group_member(
-                        &mut encoded,
-                        delta,
-                        member.head.created_at,
-                        baseline,
-                        &mut explicit_member_projections,
-                    )?;
-                    if became_dirty {
-                        became_current_dirty_member = true;
-                    }
-                    increment_head_group_member_count(&mut member_count)?;
-                    current = next_head_group_member(&mut cursor)?;
-                    break;
-                }
-                Ordering::Greater => {
-                    if delta.physically_deletes() {
-                        if let Some(file_id) = delta.file_id {
-                            deleted_member_projections.push(file_id);
-                        }
-                        break;
-                    }
-                    append_delta_head_group_member(
-                        &mut encoded,
-                        delta,
-                        delta.created_at,
-                        working_diff_baseline_for_absent_delta(
-                            delta,
-                            working_diff_checkpoint_commit_id,
-                        ),
-                        &mut explicit_member_projections,
-                    )?;
-                    became_current_dirty_member |=
-                        !delta.untracked && working_diff_checkpoint_commit_id.is_some();
-                    increment_head_group_member_count(&mut member_count)?;
-                    break;
-                }
-            }
-        }
-    }
-    while let Some(member) = current {
-        previous_has_current_dirty_member |= member
-            .baseline
-            .is_for_checkpoint(working_diff_checkpoint_commit_id);
-        append_head_group_member(&mut encoded, member.file_id, member.value, member.baseline)?;
-        increment_head_group_member_count(&mut member_count)?;
-        current = next_head_group_member(&mut cursor)?;
-    }
-
-    let bytes = if member_count == 0 {
-        None
-    } else {
-        let member_count = u32::try_from(member_count)
-            .map_err(|_| head_group_error("member count exceeds u32"))?;
-        encoded[1..HEAD_GROUP_HEADER_BYTES].copy_from_slice(&member_count.to_be_bytes());
-        Some(encoded)
-    };
-    Ok(EncodedHeadGroup {
-        bytes,
-        explicit_member_projections,
-        deleted_member_projections,
-        became_dirty_group: working_diff_checkpoint_commit_id.is_some()
-            && !previous_has_current_dirty_member
-            && became_current_dirty_member,
-    })
-}
-
-/// Records the out-of-band payload hashes that a matching untracked member
-/// stops owning. The hash is a content-addressed store key, not a row-local
-/// allocation, so the writer must only record a durable reclamation hint; GC
-/// later checks it against all active current-state and changelog owners.
 fn collect_retired_untracked_json_refs(
     existing: HeadValueView<'_>,
     delta: &CurrentStateDeltaRef<'_>,
@@ -1667,71 +439,6 @@ fn collect_retired_untracked_json_refs(
             retired.insert(*old_ref.as_hash_array());
         }
     }
-}
-
-fn working_diff_baseline_for_absent_delta(
-    delta: &CurrentStateDeltaRef<'_>,
-    checkpoint_commit_id: Option<CommitId>,
-) -> WorkingDiffBaseline {
-    if delta.untracked {
-        WorkingDiffBaseline::Clean
-    } else {
-        checkpoint_commit_id.map_or(WorkingDiffBaseline::Clean, WorkingDiffBaseline::Absent)
-    }
-}
-
-fn working_diff_baseline_for_existing_value(
-    prior_value: HeadValueView<'_>,
-    checkpoint_commit_id: Option<CommitId>,
-) -> WorkingDiffBaseline {
-    match (prior_value.working_diff_version(), checkpoint_commit_id) {
-        (Some(version), Some(checkpoint_commit_id)) => WorkingDiffBaseline::Present {
-            checkpoint_commit_id,
-            version,
-        },
-        _ => WorkingDiffBaseline::Clean,
-    }
-}
-
-fn working_diff_baseline_for_existing_delta(
-    prior: WorkingDiffBaseline,
-    prior_value: HeadValueView<'_>,
-    delta: &CurrentStateDeltaRef<'_>,
-    checkpoint_commit_id: Option<CommitId>,
-) -> (WorkingDiffBaseline, bool) {
-    if delta.untracked || prior_value.untracked {
-        return (WorkingDiffBaseline::Clean, false);
-    }
-    match checkpoint_commit_id {
-        Some(checkpoint_commit_id) if !prior.is_for_checkpoint(Some(checkpoint_commit_id)) => {
-            let version = prior_value
-                .working_diff_version()
-                .expect("tracked current-state member has a diff version");
-            (
-                WorkingDiffBaseline::Present {
-                    checkpoint_commit_id,
-                    version,
-                },
-                true,
-            )
-        }
-        _ => (prior, false),
-    }
-}
-
-fn increment_head_group_member_count(member_count: &mut usize) -> Result<(), LixError> {
-    *member_count = member_count
-        .checked_add(1)
-        .ok_or_else(|| head_group_error("member count overflow"))?;
-    Ok(())
-}
-
-fn next_head_group_member<'a>(
-    cursor: &mut Option<HeadGroupMembers<'a>>,
-) -> Result<Option<HeadGroupMemberView<'a>>, LixError> {
-    cursor
-        .as_mut()
-        .map_or(Ok(None), HeadGroupMembers::next_member)
 }
 
 fn reject_guarded_live_member(
@@ -1786,24 +493,6 @@ fn reject_retention_change(
     Ok(())
 }
 
-fn append_delta_head_group_member<'a>(
-    encoded: &mut Vec<u8>,
-    delta: &CurrentStateDeltaRef<'a>,
-    created_at: LixTimestamp,
-    baseline: WorkingDiffBaseline,
-    explicit_member_projections: &mut Vec<(&'a str, Vec<u8>)>,
-) -> Result<(), LixError> {
-    let value = encode_head_value(&delta.value_ref(created_at))?;
-    append_head_group_member(encoded, delta.file_id, &value, baseline)?;
-    // The group is authoritative. An unchanged explicit projection already
-    // belongs to this generation, so only rewrite projections whose member
-    // changed in this commit.
-    if let Some(file_id) = delta.file_id {
-        explicit_member_projections.push((file_id, value));
-    }
-    Ok(())
-}
-
 fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
     let entity_pk = key
         .entity_pk
@@ -1816,280 +505,6 @@ fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
             key.schema_key
         ),
     )
-}
-
-/// Loads packed current-state groups without materializing their members.
-async fn load_group_bytes<'a>(
-    store: &(impl StorageAdapterRead + ?Sized),
-    identities: impl IntoIterator<Item = &'a HeadGroupIdentity>,
-) -> Result<Vec<Option<Bytes>>, LixError> {
-    let keys = identities
-        .into_iter()
-        .map(|identity| StorageKey(Bytes::from(encode_group_key(identity))))
-        .collect::<Vec<_>>();
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let result = PointReadPlan::new(TRACKED_HEAD_GROUP_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    result
-        .value
-        .into_iter()
-        .map(|value| value.map(full_value_bytes).transpose())
-        .collect()
-}
-
-/// Loads the explicit-file member projection. Its physical access pattern is
-/// intentionally the same single-key point lookup as the prior member layout so file-id queries
-/// do not become proportional to the size of their logical PK group.
-async fn load_member_bytes(
-    store: &(impl StorageAdapterRead + ?Sized),
-    identities: &[HeadIdentity],
-) -> Result<Vec<Option<Bytes>>, LixError> {
-    if identities.is_empty() {
-        return Ok(Vec::new());
-    }
-    debug_assert!(identities.iter().all(|identity| identity.file_id.is_some()));
-    let keys = identities
-        .iter()
-        .map(|identity| StorageKey(Bytes::from(encode_member_key(identity))))
-        .collect::<Vec<_>>();
-    let result = PointReadPlan::new(TRACKED_HEAD_MEMBER_SPACE, &keys)
-        .materialize(store, StorageGetOptions::default())
-        .await?;
-    result
-        .value
-        .into_iter()
-        .map(|value| value.map(full_value_bytes).transpose())
-        .collect()
-}
-
-async fn scan_entries(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-    limit: Option<usize>,
-) -> Result<Vec<(HeadRowIdentity, Bytes)>, LixError> {
-    if let Some(identities) = exact_explicit_member_identities(branch_id, generation, filter) {
-        let values = load_member_bytes(store, &identities).await?;
-        return Ok(identities
-            .into_iter()
-            .zip(values)
-            .filter_map(|(identity, value)| {
-                value.map(|value| (identity.into_row_identity(), value))
-            })
-            .take(limit.unwrap_or(usize::MAX))
-            .collect());
-    }
-    if let Some(prefixes) = explicit_member_scan_prefixes(branch_id, generation, filter) {
-        let mut rows = scan_explicit_member_entries(store, prefixes, filter).await?;
-        // Member projection keys are ordered by `file_id` before `entity_pk`.
-        // Restore the public logical order when callers request multiple file
-        // ids; the group route below is already ordered that way.
-        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
-        rows.dedup_by(|(left, _), (right, _)| left == right);
-        if let Some(limit) = limit {
-            rows.truncate(limit);
-        }
-        return Ok(rows);
-    }
-    if let Some(groups) = exact_group_identities(branch_id, generation, filter) {
-        let values = load_group_bytes(store, &groups).await?;
-        let mut rows = Vec::new();
-        for (group, value) in groups.into_iter().zip(values) {
-            let Some(value) = value else {
-                continue;
-            };
-            extend_group_entries(
-                &mut rows,
-                group,
-                value,
-                |identity| matches_file_filter(identity.file_id.as_ref(), &filter.file_ids),
-                limit,
-            )?;
-            if limit.is_some_and(|limit| rows.len() >= limit) {
-                return Ok(rows);
-            }
-        }
-        return Ok(rows);
-    }
-
-    let scope = encode_scope_prefix(branch_id, generation);
-    let mut prefixes = scan_prefixes(&scope, filter);
-    prefixes.sort();
-    prefixes.dedup();
-    let mut rows = Vec::new();
-    for prefix in prefixes {
-        let plan = ScanPlan::prefix(
-            TRACKED_HEAD_GROUP_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix),
-            },
-        );
-        let mut resume_after = None;
-        loop {
-            let remaining = limit.map(|limit| limit.saturating_sub(rows.len()));
-            if matches!(remaining, Some(0)) {
-                return Ok(rows);
-            }
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        limit_rows: remaining
-                            .unwrap_or_else(|| StorageScanOptions::default().limit_rows),
-                        ..StorageScanOptions::default()
-                    },
-                )
-                .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
-                let identity = decode_group_key_in_scope(entry.key.0.as_ref(), &scope)?;
-                extend_group_entries(
-                    &mut rows,
-                    HeadGroupIdentity {
-                        branch_id: branch_id.to_string(),
-                        generation,
-                        schema_key: identity.schema_key,
-                        entity_pk: identity.entity_pk,
-                    },
-                    full_value_bytes(entry.value)?,
-                    |identity| matches_filter(identity, filter),
-                    limit,
-                )?;
-                if limit.is_some_and(|limit| rows.len() >= limit) {
-                    return Ok(rows);
-                }
-            }
-            if !page.value.has_more || resume_after.is_none() {
-                break;
-            }
-        }
-    }
-    Ok(rows)
-}
-
-/// Entity projection consumes only snapshot payloads. It can scan a schema or
-/// point-read exact groups, retaining member bytes without allocating logical
-/// row identities or intermediate JSON strings. Both physical paths preserve
-/// ascending logical primary-key order. Every live member is retained;
-/// file-backed siblings for one primary key are adjacent but intentionally
-/// have no extra tie ordering contract.
-async fn scan_entity_snapshots(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    generation: CommitId,
-    schema_key: &str,
-    entity_pks: &[EntityPk],
-    limit: Option<usize>,
-) -> Result<Vec<Option<Bytes>>, LixError> {
-    if matches!(limit, Some(0)) {
-        return Ok(Vec::new());
-    }
-    let mut snapshots = Vec::new();
-    let mut json_refs = Vec::new();
-    let mut deferred = Vec::new();
-    if entity_pks.is_empty() {
-        let plan = ScanPlan::prefix(
-            TRACKED_HEAD_GROUP_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(schema_group_prefix(branch_id, generation, schema_key)),
-            },
-        );
-        let mut resume_after = None;
-        loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
-                .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
-                if append_entity_snapshot_members(
-                    &mut snapshots,
-                    &mut json_refs,
-                    &mut deferred,
-                    full_value_bytes(entry.value)?,
-                    limit,
-                )? {
-                    return materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred)
-                        .await;
-                }
-            }
-            if !page.value.has_more || resume_after.is_none() {
-                break;
-            }
-        }
-    } else {
-        let mut groups = entity_pks
-            .iter()
-            .cloned()
-            .map(|entity_pk| HeadGroupIdentity {
-                branch_id: branch_id.to_string(),
-                generation,
-                schema_key: schema_key.to_string(),
-                entity_pk,
-            })
-            .collect::<Vec<_>>();
-        groups.sort();
-        groups.dedup();
-        let values = load_group_bytes(store, &groups).await?;
-        for value in values.into_iter().flatten() {
-            if append_entity_snapshot_members(
-                &mut snapshots,
-                &mut json_refs,
-                &mut deferred,
-                value,
-                limit,
-            )? {
-                break;
-            }
-        }
-    }
-    materialize_entity_snapshot_refs(store, snapshots, json_refs, deferred).await
-}
-
-/// Appends every live member of one packed group without constructing logical
-/// identities. Returns whether the caller's row limit has been reached.
-fn append_entity_snapshot_members(
-    snapshots: &mut Vec<Option<Bytes>>,
-    json_refs: &mut Vec<JsonRef>,
-    deferred: &mut Vec<(usize, JsonRef)>,
-    value: Bytes,
-    limit: Option<usize>,
-) -> Result<bool, LixError> {
-    let mut members = HeadGroupMembers::new(value.as_ref())?;
-    while let Some(member) = members.next_member()? {
-        // `HeadGroupMembers` validates and decodes the fixed-header member
-        // once as it advances. Snapshot serving needs that same borrowed view,
-        // so do not reparse every member into a materialized live-state row.
-        let head = member.head;
-        if head.deleted {
-            continue;
-        }
-        let row_index = snapshots.len();
-        let snapshot = match head.snapshot {
-            HeadSlotView::None => None,
-            HeadSlotView::Inline(snapshot) => Some(value.slice_ref(snapshot.as_bytes())),
-            HeadSlotView::Ref(json_ref) => {
-                json_refs.push(json_ref);
-                deferred.push((row_index, json_ref));
-                None
-            }
-        };
-        snapshots.push(snapshot);
-        if limit.is_some_and(|limit| snapshots.len() >= limit) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 async fn materialize_entity_snapshot_refs(
@@ -2130,354 +545,6 @@ async fn materialize_entity_snapshot_refs(
     Ok(snapshots)
 }
 
-/// Reads the checkpoint's sparse dirty-group index and resolves before images
-/// from authoritative current-state group values. The index is auxiliary: its complete
-/// key coverage is verified before any result is returned, so a bad record is
-/// a fallback (`None`), never an empty diff.
-async fn working_diff_entries_from_current_head(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    expected_coverage: WorkingDiffIndexCoverage,
-    filter: &TrackedStateFilter,
-) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
-    let (groups, require_current_dirty_member) =
-        match exact_group_identities(branch_id, generation, filter) {
-            Some(groups) => (groups, false),
-            None => {
-                let Some(groups) = scan_working_diff_group_index(
-                    store,
-                    branch_id,
-                    checkpoint_commit_id,
-                    generation,
-                    expected_coverage,
-                    filter,
-                )
-                .await?
-                else {
-                    return Ok(None);
-                };
-                (groups, true)
-            }
-        };
-
-    let values = load_group_bytes(store, &groups).await?;
-    let mut dirty_rows = Vec::new();
-    for (group, value) in groups.into_iter().zip(values) {
-        let Some(value) = value else {
-            return Ok(None);
-        };
-        let Ok(members) = decode_head_group_members(&value) else {
-            return Ok(None);
-        };
-        let mut has_current_dirty_member = false;
-        for member in members {
-            let Ok(after) = decode_head_value(&member.value) else {
-                return Ok(None);
-            };
-            if after.untracked {
-                if member.baseline != WorkingDiffBaseline::Clean {
-                    return Ok(None);
-                }
-                continue;
-            }
-            if !member
-                .baseline
-                .is_for_checkpoint(Some(checkpoint_commit_id))
-            {
-                continue;
-            }
-            has_current_dirty_member = true;
-            let identity = HeadRowIdentity {
-                schema_key: group.schema_key.clone(),
-                entity_pk: group.entity_pk.clone(),
-                file_id: member.file_id,
-            };
-            // Both the exact-group route and the dirty-group index already
-            // prove this group's schema and entity PK. Only its member
-            // identity can still be filtered here.
-            if matches_file_filter(identity.file_id.as_ref(), &filter.file_ids) {
-                let Some(after) = after.working_diff_version() else {
-                    return Ok(None);
-                };
-                dirty_rows.push((identity, member.baseline, after));
-            }
-        }
-        if require_current_dirty_member && !has_current_dirty_member {
-            return Ok(None);
-        }
-    }
-
-    Ok(Some(
-        dirty_rows
-            .into_iter()
-            .filter_map(|(identity, baseline, after)| {
-                classify_working_diff_entry(identity, baseline, after)
-            })
-            .collect(),
-    ))
-}
-
-async fn scan_working_diff_group_index(
-    store: &(impl StorageAdapterRead + ?Sized),
-    branch_id: &str,
-    checkpoint_commit_id: CommitId,
-    generation: CommitId,
-    expected_coverage: WorkingDiffIndexCoverage,
-    filter: &TrackedStateFilter,
-) -> Result<Option<Vec<HeadGroupIdentity>>, LixError> {
-    let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
-    let plan = ScanPlan::prefix(
-        TRACKED_WORKING_DIFF_GROUP_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(scope.clone()),
-        },
-    );
-    let mut actual_coverage = WorkingDiffIndexCoverage::default();
-    let mut found = Vec::new();
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            if !is_working_diff_index_value(&entry.value)
-                || actual_coverage
-                    .add_encoded_group_key(entry.key.0.as_ref())
-                    .is_none()
-            {
-                return Ok(None);
-            }
-            let Ok(identity) = decode_working_diff_group_key_in_scope(entry.key.0.as_ref(), &scope)
-            else {
-                return Ok(None);
-            };
-            if matches_group_filter(&identity, filter) {
-                found.push(HeadGroupIdentity {
-                    branch_id: branch_id.to_string(),
-                    generation,
-                    schema_key: identity.schema_key,
-                    entity_pk: identity.entity_pk,
-                });
-            }
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    if actual_coverage != expected_coverage {
-        return Ok(None);
-    }
-    found.sort();
-    found.dedup();
-    Ok(Some(found))
-}
-
-fn is_working_diff_index_value(value: &StorageProjectedValue) -> bool {
-    matches!(value, StorageProjectedValue::FullValue(bytes) if bytes.as_ref() == WORKING_DIFF_INDEX_VALUE)
-}
-
-fn classify_working_diff_entry(
-    identity: HeadRowIdentity,
-    baseline: WorkingDiffBaseline,
-    after_version: WorkingDiffVersion,
-) -> Option<TrackedStateDiffEntry> {
-    let before_version = match baseline {
-        WorkingDiffBaseline::Clean => return None,
-        WorkingDiffBaseline::Absent(_) => None,
-        WorkingDiffBaseline::Present { version, .. } => Some(version),
-    };
-    let before = before_version.map(|version| version.into_diff_row(&identity));
-    let after = after_version.into_diff_row(&identity);
-    let identity = TrackedStateDiffIdentity {
-        schema_key: identity.schema_key,
-        entity_pk: identity.entity_pk,
-        file_id: identity.file_id,
-    };
-    match (
-        before.as_ref().filter(|row| !row.deleted),
-        (!after.deleted).then_some(&after),
-    ) {
-        (None, None) => None,
-        (None, Some(_)) => Some(TrackedStateDiffEntry {
-            identity,
-            kind: TrackedStateDiffKind::Added,
-            before,
-            after: Some(after),
-        }),
-        (Some(_), None) => Some(TrackedStateDiffEntry {
-            identity,
-            kind: TrackedStateDiffKind::Removed,
-            before,
-            after: Some(after),
-        }),
-        (Some(_), Some(_))
-            if before_version.is_some_and(|version| version.payload_eq(after_version)) =>
-        {
-            None
-        }
-        (Some(_), Some(_)) => Some(TrackedStateDiffEntry {
-            identity,
-            kind: TrackedStateDiffKind::Modified,
-            before,
-            after: Some(after),
-        }),
-    }
-}
-
-fn matches_group_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
-    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&identity.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&identity.entity_pk))
-}
-
-fn exact_group_identities(
-    branch_id: &str,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-) -> Option<Vec<HeadGroupIdentity>> {
-    if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
-        return None;
-    }
-    let mut identities = Vec::with_capacity(filter.schema_keys.len() * filter.entity_pks.len());
-    for schema_key in &filter.schema_keys {
-        for entity_pk in &filter.entity_pks {
-            identities.push(HeadGroupIdentity {
-                branch_id: branch_id.to_string(),
-                generation,
-                schema_key: schema_key.clone(),
-                entity_pk: entity_pk.clone(),
-            });
-        }
-    }
-    identities.sort();
-    identities.dedup();
-    Some(identities)
-}
-
-fn exact_explicit_member_identities(
-    branch_id: &str,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-) -> Option<Vec<HeadIdentity>> {
-    exact_group_identities(branch_id, generation, filter)?;
-    if filter.file_ids.is_empty()
-        || filter
-            .file_ids
-            .iter()
-            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
-    {
-        return None;
-    }
-    let mut identities = Vec::with_capacity(
-        filter.schema_keys.len() * filter.entity_pks.len() * filter.file_ids.len(),
-    );
-    for schema_key in &filter.schema_keys {
-        for entity_pk in &filter.entity_pks {
-            for file_id in &filter.file_ids {
-                let NullableKeyFilter::Value(file_id) = file_id else {
-                    unreachable!("explicit member filter checked above");
-                };
-                identities.push(HeadIdentity {
-                    branch_id: branch_id.to_string(),
-                    generation,
-                    schema_key: schema_key.clone(),
-                    entity_pk: entity_pk.clone(),
-                    file_id: Some(file_id.clone()),
-                });
-            }
-        }
-    }
-    identities.sort();
-    identities.dedup();
-    Some(identities)
-}
-
-/// A schema-scoped `file_id = ?` lookup cannot use the grouped primary
-/// serving record without decoding every logical PK in that schema. Explicit
-/// member rows use a file-id-first suffix solely for this access pattern.
-///
-/// Exact `(schema, entity_pk, file_id)` requests take the point-read route
-/// above. If the schema is unknown, no useful member-space prefix exists and
-/// we correctly retain the general group scan fallback.
-fn explicit_member_scan_prefixes(
-    branch_id: &str,
-    generation: CommitId,
-    filter: &TrackedStateFilter,
-) -> Option<Vec<Vec<u8>>> {
-    if filter.schema_keys.is_empty()
-        || filter.file_ids.is_empty()
-        || !filter.entity_pks.is_empty()
-        || filter
-            .file_ids
-            .iter()
-            .any(|file_id| !matches!(file_id, NullableKeyFilter::Value(_)))
-    {
-        return None;
-    }
-    let mut prefixes = Vec::with_capacity(filter.schema_keys.len() * filter.file_ids.len());
-    for schema_key in &filter.schema_keys {
-        for file_id in &filter.file_ids {
-            let NullableKeyFilter::Value(file_id) = file_id else {
-                unreachable!("explicit member scan filter checked above");
-            };
-            let mut prefix = encode_scope_prefix(branch_id, generation);
-            write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-            write_file_id(&mut prefix, Some(file_id));
-            prefixes.push(prefix);
-        }
-    }
-    prefixes.sort();
-    prefixes.dedup();
-    Some(prefixes)
-}
-
-async fn scan_explicit_member_entries(
-    store: &(impl StorageAdapterRead + ?Sized),
-    prefixes: Vec<Vec<u8>>,
-    filter: &TrackedStateFilter,
-) -> Result<Vec<(HeadRowIdentity, Bytes)>, LixError> {
-    let mut rows = Vec::new();
-    for prefix in prefixes {
-        let plan = ScanPlan::prefix(
-            TRACKED_HEAD_MEMBER_SPACE,
-            StoragePrefix {
-                bytes: Bytes::from(prefix),
-            },
-        );
-        let mut resume_after = None;
-        loop {
-            let page = plan
-                .collect(
-                    store,
-                    StorageScanOptions {
-                        resume_after: resume_after.clone(),
-                        ..StorageScanOptions::default()
-                    },
-                )
-                .await?;
-            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-            for entry in page.value.entries {
-                let identity = decode_member_key(entry.key.0.as_ref())?.into_row_identity();
-                if matches_filter(&identity, filter) {
-                    rows.push((identity, full_value_bytes(entry.value)?));
-                }
-            }
-            if !page.value.has_more || resume_after.is_none() {
-                break;
-            }
-        }
-    }
-    Ok(rows)
-}
-
 fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
     if filter.schema_keys.is_empty() {
         return vec![scope.to_vec()];
@@ -2497,35 +564,6 @@ fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
         }
     }
     prefixes
-}
-
-fn schema_group_prefix(branch_id: &str, generation: CommitId, schema_key: &str) -> Vec<u8> {
-    let mut prefix = encode_scope_prefix(branch_id, generation);
-    write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-    prefix
-}
-
-fn extend_group_entries(
-    rows: &mut Vec<(HeadRowIdentity, Bytes)>,
-    group: HeadGroupIdentity,
-    value: Bytes,
-    member_matches: impl Fn(&HeadRowIdentity) -> bool,
-    limit: Option<usize>,
-) -> Result<(), LixError> {
-    for member in decode_head_group_members(&value)? {
-        let identity = HeadRowIdentity {
-            schema_key: group.schema_key.clone(),
-            entity_pk: group.entity_pk.clone(),
-            file_id: member.file_id,
-        };
-        if member_matches(&identity) {
-            rows.push((identity, member.value));
-            if limit.is_some_and(|limit| rows.len() >= limit) {
-                break;
-            }
-        }
-    }
-    Ok(())
 }
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
@@ -2561,7 +599,6 @@ fn stage_test_current_control(
         BranchHeadControl {
             head_commit_id,
             generation,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id,
             created_at: timestamp,
@@ -2572,7 +609,7 @@ fn stage_test_current_control(
 }
 
 /// Publishes the checkpoint epoch that owns the sparse working-diff indexes.
-/// The surrounding branch-control CAS makes this marker, the current-state groups,
+/// The surrounding branch-control CAS makes this marker, the current hot rows,
 /// and the current branch head one atomic visibility boundary.
 pub(crate) fn stage_tracked_working_diff_epoch(
     writes: &mut StorageWriteSet,
@@ -2637,18 +674,7 @@ where
         .into_iter()
         .collect::<BTreeMap<_, _>>();
     let active = stage_active_working_diff_scopes(store, writes, &controls).await?;
-    stage_collect_stale_derived_space(store, writes, TRACKED_WORKING_DIFF_GROUP_SPACE, |entry| {
-        is_working_diff_index_value(&entry.value)
-            && decode_working_diff_group_key(entry.key.0.as_ref()).is_ok_and(
-                |(checkpoint_commit_id, identity)| {
-                    active.get(&identity.branch_id).is_some_and(|scope| {
-                        scope.checkpoint_commit_id == checkpoint_commit_id
-                            && scope.generation == identity.generation
-                    })
-                },
-            )
-    })
-    .await
+    hot::stage_collect_stale_hot_diff_records(store, writes, &active).await
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2715,36 +741,19 @@ where
                 writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
                 continue;
             };
-            let valid = match epoch.generation {
-                // A checkpoint reset is known empty and deliberately leaves
-                // the prior serving group generation intact until its first
-                // ordinary child captures a new baseline.
-                None => {
-                    epoch.checkpoint_commit_id == control.head_commit_id
-                        && (!control.tracked_head_is_current
-                            || control.working_diff_checkpoint_commit_id
-                                == Some(epoch.checkpoint_commit_id))
-                }
-                Some(generation) if generation == control.generation => {
-                    control.tracked_head_is_current
-                        && control.working_diff_checkpoint_commit_id
-                            == Some(epoch.checkpoint_commit_id)
-                }
-                Some(_) => false,
-            };
+            let valid = epoch.generation == control.generation
+                && control.working_diff_checkpoint_commit_id == Some(epoch.checkpoint_commit_id);
             if !valid || active.contains_key(&key.branch_id) {
                 writes.delete(TRACKED_WORKING_DIFF_MARKER_SPACE, entry.key);
                 continue;
             }
-            if let Some(generation) = epoch.generation {
-                active.insert(
-                    key.branch_id,
-                    ActiveWorkingDiffScope {
-                        checkpoint_commit_id: epoch.checkpoint_commit_id,
-                        generation,
-                    },
-                );
-            }
+            active.insert(
+                key.branch_id,
+                ActiveWorkingDiffScope {
+                    checkpoint_commit_id: epoch.checkpoint_commit_id,
+                    generation: epoch.generation,
+                },
+            );
         }
         if !page.value.has_more || resume_after.is_none() {
             break;
@@ -2753,329 +762,17 @@ where
     Ok(active)
 }
 
-/// Deletes stale authoritative groups and records the history-free payloads
-/// they used to own. Stale bytes are intentionally tolerated here: no valid
-/// control can select them, so cleanup must not turn a corrupt abandoned
-/// generation into a permanent GC failure.
-async fn stage_collect_stale_current_state_group_space(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    active: &BTreeSet<(String, CommitId)>,
-    stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        TRACKED_HEAD_GROUP_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let is_active = decode_group_key(entry.key.0.as_ref())
-                .is_ok_and(|identity| active.contains(&(identity.branch_id, identity.generation)));
-            if is_active {
-                continue;
-            }
-            if let StorageProjectedValue::FullValue(bytes) = &entry.value {
-                // The group will be deleted regardless. Only a completely
-                // decoded stale group can contribute a payload deletion
-                // candidate; malformed abandoned bytes remain safe offline
-                // repair debt instead of making background GC fail.
-                let _ =
-                    collect_untracked_json_refs_from_group(bytes.as_ref(), stale_untracked_refs);
-            }
-            writes.delete(TRACKED_HEAD_GROUP_SPACE, entry.key);
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-/// Deletes stale explicit-file projections. They duplicate authoritative
-/// group values, but collecting their refs as well covers an orphaned
-/// projection whose group was lost before this sweep.
-async fn stage_collect_stale_current_state_member_space(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    active: &BTreeSet<(String, CommitId)>,
-    stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        TRACKED_HEAD_MEMBER_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            let is_active = decode_member_key(entry.key.0.as_ref())
-                .is_ok_and(|identity| active.contains(&(identity.branch_id, identity.generation)));
-            if is_active {
-                continue;
-            }
-            if let StorageProjectedValue::FullValue(bytes) = &entry.value {
-                if let Ok(head) = decode_head_value(bytes.as_ref()) {
-                    collect_untracked_json_refs_from_head(head, stale_untracked_refs);
-                }
-            }
-            writes.delete(TRACKED_HEAD_MEMBER_SPACE, entry.key);
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn collect_untracked_json_refs_from_group(
-    bytes: &[u8],
-    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) -> Result<(), LixError> {
-    let mut members = HeadGroupMembers::new(bytes)?;
-    while let Some(member) = members.next_member()? {
-        collect_untracked_json_refs_from_head(member.head, refs);
-    }
-    Ok(())
-}
-
-fn collect_untracked_json_refs_from_head(
-    head: HeadValueView<'_>,
-    refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
-) {
-    if !head.untracked {
-        return;
-    }
-    for slot in [head.snapshot, head.metadata] {
-        if let HeadSlotView::Ref(json_ref) = slot {
-            refs.insert(*json_ref.as_hash_array());
-        }
-    }
-}
-
-/// Deletes records from a derived storage plane unless their key is still
-/// reachable from an authoritative control record. Malformed keys are also
-/// derived garbage: they cannot be selected by a valid reader.
-async fn stage_collect_stale_derived_space(
-    store: &(impl StorageAdapterRead + ?Sized),
-    writes: &mut StorageWriteSet,
-    space: StorageSpace,
-    is_active: impl Fn(&StorageReadEntry) -> bool,
-) -> Result<(), LixError> {
-    let plan = ScanPlan::prefix(
-        space,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    );
-    let mut resume_after = None;
-    loop {
-        let page = plan
-            .collect(
-                store,
-                StorageScanOptions {
-                    resume_after: resume_after.clone(),
-                    ..StorageScanOptions::default()
-                },
-            )
-            .await?;
-        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
-        for entry in page.value.entries {
-            if !is_active(&entry) {
-                writes.delete(space, entry.key);
-            }
-        }
-        if !page.value.has_more || resume_after.is_none() {
-            break;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn stage_put(
     writes: &mut StorageWriteSet,
     identity: &HeadIdentity,
     value: &HeadValue,
 ) -> Result<(), LixError> {
-    stage_put_ref(writes, identity, &value.as_ref())
-}
-
-#[cfg(test)]
-fn stage_put_ref(
-    writes: &mut StorageWriteSet,
-    identity: &HeadIdentity,
-    value: &HeadValueRef<'_>,
-) -> Result<(), LixError> {
-    let mut members = BTreeMap::new();
-    members.insert(identity.file_id.clone(), encode_head_value(value)?);
-    stage_put_group_members(writes, &identity.group_identity(), &members)?;
-    if identity.file_id.is_some() {
-        stage_put_member_bytes(
-            writes,
-            &identity.group_identity(),
-            identity.file_id.as_deref(),
-            &members[&identity.file_id],
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-fn stage_put_group_members(
-    writes: &mut StorageWriteSet,
-    identity: &HeadGroupIdentity,
-    members: &BTreeMap<Option<String>, Vec<u8>>,
-) -> Result<(), LixError> {
-    stage_put_group_bytes(writes, identity, encode_head_group_members(members)?);
-    Ok(())
-}
-
-fn stage_put_group_members_with_baselines(
-    writes: &mut StorageWriteSet,
-    identity: &HeadGroupIdentity,
-    members: &BTreeMap<Option<String>, Vec<u8>>,
-    baselines: &BTreeMap<Option<String>, WorkingDiffBaseline>,
-) -> Result<(), LixError> {
-    stage_put_group_bytes(
-        writes,
-        identity,
-        encode_head_group_members_with_baselines(members, baselines)?,
-    );
-    Ok(())
-}
-
-fn stage_put_group_bytes(
-    writes: &mut StorageWriteSet,
-    identity: &HeadGroupIdentity,
-    bytes: Vec<u8>,
-) {
-    writes.put(
-        TRACKED_HEAD_GROUP_SPACE,
-        StorageKey(Bytes::from(encode_group_key(identity))),
-        StorageValue {
-            bytes: Bytes::from(bytes),
-        },
-    );
-}
-
-fn stage_delete_group(writes: &mut StorageWriteSet, identity: &HeadGroupIdentity) {
-    writes.delete(
-        TRACKED_HEAD_GROUP_SPACE,
-        StorageKey(Bytes::from(encode_group_key(identity))),
-    );
-}
-
-const WORKING_DIFF_INDEX_VALUE: &[u8] = b"\x01";
-
-fn stage_put_working_diff_group_index(
-    writes: &mut StorageWriteSet,
-    coverage: &mut WorkingDiffIndexCoverage,
-    checkpoint_commit_id: CommitId,
-    identity: &HeadGroupIdentity,
-) -> Result<(), LixError> {
-    let key = encode_working_diff_group_key(checkpoint_commit_id, identity);
-    coverage
-        .add_encoded_group_key(&key)
-        .ok_or_else(|| head_group_error("working-diff group index count exceeds u64"))?;
-    writes.put(
-        TRACKED_WORKING_DIFF_GROUP_SPACE,
-        StorageKey(Bytes::from(key)),
-        StorageValue {
-            bytes: Bytes::from_static(WORKING_DIFF_INDEX_VALUE),
-        },
-    );
-    Ok(())
-}
-
-fn stage_put_member_bytes(
-    writes: &mut StorageWriteSet,
-    group: &HeadGroupIdentity,
-    file_id: Option<&str>,
-    value: &[u8],
-) -> Result<(), LixError> {
-    let Some(file_id) = file_id else {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked-head explicit member projection requires a file_id",
-        ));
-    };
-    stage_put_file_member_bytes(writes, group, file_id, value);
-    Ok(())
-}
-
-fn stage_put_file_member_bytes(
-    writes: &mut StorageWriteSet,
-    group: &HeadGroupIdentity,
-    file_id: &str,
-    value: &[u8],
-) {
-    let identity = HeadIdentity {
-        branch_id: group.branch_id.clone(),
-        generation: group.generation,
-        schema_key: group.schema_key.clone(),
-        entity_pk: group.entity_pk.clone(),
-        file_id: Some(file_id.to_string()),
-    };
-    writes.put(
-        TRACKED_HEAD_MEMBER_SPACE,
-        StorageKey(Bytes::from(encode_member_key(&identity))),
-        StorageValue {
-            bytes: Bytes::copy_from_slice(value),
-        },
-    );
-}
-
-fn stage_delete_file_member(
-    writes: &mut StorageWriteSet,
-    group: &HeadGroupIdentity,
-    file_id: &str,
-) {
-    let identity = HeadIdentity {
-        branch_id: group.branch_id.clone(),
-        generation: group.generation,
-        schema_key: group.schema_key.clone(),
-        entity_pk: group.entity_pk.clone(),
-        file_id: Some(file_id.to_string()),
-    };
-    writes.delete(
-        TRACKED_HEAD_MEMBER_SPACE,
-        StorageKey(Bytes::from(encode_member_key(&identity))),
-    );
+    hot::stage_test_hot_value(writes, identity, value)
 }
 
 fn working_diff_marker_key(branch_id: &str) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("tracked working-diff marker key", &BranchRef { branch_id })
-}
-
-fn encode_group_key(identity: &HeadGroupIdentity) -> Vec<u8> {
-    let mut out = encode_scope_prefix(&identity.branch_id, identity.generation);
-    write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut out, &identity.entity_pk);
-    out
 }
 
 fn encode_working_diff_scope_prefix(
@@ -3088,159 +785,6 @@ fn encode_working_diff_scope_prefix(
     out.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
     out.extend_from_slice(generation.as_uuid().as_bytes());
     out
-}
-
-fn encode_working_diff_group_key(
-    checkpoint_commit_id: CommitId,
-    identity: &HeadGroupIdentity,
-) -> Vec<u8> {
-    let mut out = encode_working_diff_scope_prefix(
-        &identity.branch_id,
-        checkpoint_commit_id,
-        identity.generation,
-    );
-    write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
-    write_entity_pk(&mut out, &identity.entity_pk);
-    out
-}
-
-fn encode_member_key(identity: &HeadIdentity) -> Vec<u8> {
-    debug_assert!(identity.file_id.is_some());
-    let mut out = encode_scope_prefix(&identity.branch_id, identity.generation);
-    write_key_string(&mut out, &identity.schema_key, KEY_PART_FINAL);
-    write_file_id(&mut out, identity.file_id.as_deref());
-    write_entity_pk(&mut out, &identity.entity_pk);
-    out
-}
-
-fn decode_group_key(bytes: &[u8]) -> Result<HeadGroupIdentity, LixError> {
-    let mut offset = 0usize;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("branch id has an invalid terminator"));
-    }
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("schema key has an invalid terminator"));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("group key has trailing bytes"));
-    }
-    Ok(HeadGroupIdentity {
-        branch_id,
-        generation,
-        schema_key,
-        entity_pk,
-    })
-}
-
-fn decode_working_diff_group_key(bytes: &[u8]) -> Result<(CommitId, HeadGroupIdentity), LixError> {
-    let mut offset = 0usize;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("branch id has an invalid terminator"));
-    }
-    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("schema key has an invalid terminator"));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("working-diff group key has trailing bytes"));
-    }
-    Ok((
-        checkpoint_commit_id,
-        HeadGroupIdentity {
-            branch_id,
-            generation,
-            schema_key,
-            entity_pk,
-        },
-    ))
-}
-
-fn decode_member_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
-    let mut offset = 0usize;
-    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
-    if branch_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("branch id has an invalid terminator"));
-    }
-    let generation = read_generation(bytes, &mut offset)?;
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("schema key has an invalid terminator"));
-    }
-    let file_id = read_file_id(bytes, &mut offset)?;
-    if file_id.is_none() {
-        return Err(key_codec_error("member key must contain a file id"));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("member key has trailing bytes"));
-    }
-    Ok(HeadIdentity {
-        branch_id,
-        generation,
-        schema_key,
-        entity_pk,
-        file_id,
-    })
-}
-
-/// Decodes only the mutable suffix of a group key from a prefix-scoped scan.
-///
-/// `ScanPlan::prefix` already constrains the branch and generation. We still
-/// verify the fixed scope before parsing the suffix so a malformed storage key
-/// cannot be interpreted as a row from the wrong generation.
-fn decode_group_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
-    if !bytes.starts_with(scope) {
-        return Err(key_codec_error(
-            "does not begin with the scanned branch-generation scope",
-        ));
-    }
-    let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("schema key has an invalid terminator"));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("group key has trailing bytes"));
-    }
-    Ok(HeadRowIdentity {
-        schema_key,
-        entity_pk,
-        file_id: None,
-    })
-}
-
-fn decode_working_diff_group_key_in_scope(
-    bytes: &[u8],
-    scope: &[u8],
-) -> Result<HeadRowIdentity, LixError> {
-    if !bytes.starts_with(scope) {
-        return Err(key_codec_error(
-            "does not begin with the scanned working-diff checkpoint-generation scope",
-        ));
-    }
-    let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error("schema key has an invalid terminator"));
-    }
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("working-diff group key has trailing bytes"));
-    }
-    Ok(HeadRowIdentity {
-        schema_key,
-        entity_pk,
-        file_id: None,
-    })
 }
 
 const KEY_ESCAPE: u8 = 0xff;
@@ -3420,228 +964,11 @@ fn key_codec_error(message: &str) -> LixError {
     )
 }
 
-/// v12 packs all file-backed members of one logical entity PK into one
-/// canonical current-state group. The individual member payload is the proven
-/// fixed-header v3 value below; only the outer framing is new.
+/// Fixed-width fingerprints embedded in the V5 hot-row checkpoint baseline.
 ///
-/// ```text
-///  0      group format version (4)
-///  1..5   member count (big endian u32)
-///  repeated:
-///    0      file-id tag (0 = none, 1 = UTF-8 string)
-///    1..5   file-id byte length when tag = 1 (big endian u32)
-///    ...    file-id UTF-8 bytes when tag = 1
-///    ...    v4 member byte length (big endian u32)
-///    ...    v4 member bytes
-/// ```
-///
-/// Members are strictly sorted by Rust's `Option<String>` ordering. This
-/// makes scans deterministic and, more importantly, rejects silently
-/// duplicated full identities at the storage boundary.
-const HEAD_GROUP_VALUE_VERSION: u8 = 4;
-const HEAD_GROUP_HEADER_BYTES: usize = 5;
-const WORKING_DIFF_BASELINE_CLEAN: u8 = 0;
-const WORKING_DIFF_BASELINE_ABSENT: u8 = 1;
-const WORKING_DIFF_BASELINE_PRESENT: u8 = 2;
-const WORKING_DIFF_SLOT_NONE: u8 = 0;
-const WORKING_DIFF_SLOT_REF: u8 = 1;
-const WORKING_DIFF_SLOT_INLINE: u8 = 2;
-const WORKING_DIFF_VERSION_BYTES: usize =
-    16 + 16 + 1 + 8 + 8 + 1 + JSON_REF_BYTES + 1 + JSON_REF_BYTES;
-
-struct HeadGroupMemberBytes {
-    file_id: Option<String>,
-    value: Bytes,
-    baseline: WorkingDiffBaseline,
-}
-
-/// A validated, borrowed member from a current-state group value.
-///
-/// The incremental writer uses this cursor to copy untouched member bytes
-/// directly into the next group while retaining the old fixed-header value
-/// needed to preserve `created_at` on a changed identity.
-#[derive(Clone, Copy)]
-struct HeadGroupMemberView<'a> {
-    file_id: Option<&'a str>,
-    value: &'a [u8],
-    head: HeadValueView<'a>,
-    baseline: WorkingDiffBaseline,
-}
-
-/// Streaming parser for the authoritative current-state group bytes.
-///
-/// Unlike the reader-side decoder, this does not allocate a `String`,
-/// `Bytes`, or map for every member. It still enforces the complete wire
-/// contract while every member is consumed, including untouched siblings.
-struct HeadGroupMembers<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    remaining: usize,
-    prior_file_id: Option<Option<&'a str>>,
-}
-
-impl<'a> HeadGroupMembers<'a> {
-    fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
-        if bytes.len() < HEAD_GROUP_HEADER_BYTES {
-            return Err(head_group_error("value is shorter than the fixed header"));
-        }
-        if bytes[0] != HEAD_GROUP_VALUE_VERSION {
-            return Err(head_group_error(&format!(
-                "unsupported group format version {}",
-                bytes[0]
-            )));
-        }
-        let remaining = usize::try_from(read_u32(&bytes[1..5], "group member count")?)
-            .map_err(|_| head_group_error("member count exceeds usize"))?;
-        Ok(Self {
-            bytes,
-            offset: HEAD_GROUP_HEADER_BYTES,
-            remaining,
-            prior_file_id: None,
-        })
-    }
-
-    fn next_member(&mut self) -> Result<Option<HeadGroupMemberView<'a>>, LixError> {
-        if self.remaining == 0 {
-            if self.offset != self.bytes.len() {
-                return Err(head_group_error("has trailing bytes"));
-            }
-            return Ok(None);
-        }
-
-        let tag = *self
-            .bytes
-            .get(self.offset)
-            .ok_or_else(|| head_group_error("is truncated before member file id"))?;
-        self.offset += 1;
-        let file_id = match tag {
-            FILE_ID_NONE => None,
-            FILE_ID_SOME => {
-                let file_id_len =
-                    read_group_u32(self.bytes, &mut self.offset, "member file-id length")?;
-                let file_id_end = self
-                    .offset
-                    .checked_add(file_id_len)
-                    .ok_or_else(|| head_group_error("member file-id length overflow"))?;
-                let file_id = self
-                    .bytes
-                    .get(self.offset..file_id_end)
-                    .ok_or_else(|| head_group_error("is truncated in member file id"))?;
-                self.offset = file_id_end;
-                Some(std::str::from_utf8(file_id).map_err(|error| {
-                    head_group_error(&format!("member file id is not UTF-8: {error}"))
-                })?)
-            }
-            _ => return Err(head_group_error("has an invalid member file-id tag")),
-        };
-        if self.prior_file_id.is_some_and(|prior| prior >= file_id) {
-            return Err(head_group_error(
-                "members are not strictly ordered by file id",
-            ));
-        }
-
-        let value_len = read_group_u32(self.bytes, &mut self.offset, "member value length")?;
-        let value_end = self
-            .offset
-            .checked_add(value_len)
-            .ok_or_else(|| head_group_error("member value length overflow"))?;
-        let value = self
-            .bytes
-            .get(self.offset..value_end)
-            .ok_or_else(|| head_group_error("is truncated in member value"))?;
-        let head = decode_head_value(value)?;
-        self.offset = value_end;
-        let baseline = decode_working_diff_baseline(self.bytes, &mut self.offset)?;
-        if head.untracked && baseline != WorkingDiffBaseline::Clean {
-            return Err(head_group_error(
-                "untracked current-state member has a working-diff baseline",
-            ));
-        }
-        self.remaining -= 1;
-        self.prior_file_id = Some(file_id);
-        Ok(Some(HeadGroupMemberView {
-            file_id,
-            value,
-            head,
-            baseline,
-        }))
-    }
-}
-
-fn append_head_group_member(
-    encoded: &mut Vec<u8>,
-    file_id: Option<&str>,
-    value: &[u8],
-    baseline: WorkingDiffBaseline,
-) -> Result<(), LixError> {
-    let file_id_bytes = match file_id {
-        None => 0,
-        Some(file_id) => {
-            u32::try_from(file_id.len()).map_err(|_| head_group_error("file id exceeds u32"))?;
-            4usize
-                .checked_add(file_id.len())
-                .ok_or_else(|| head_group_error("group value length overflow"))?
-        }
-    };
-    u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
-    let member_len = 1usize
-        .checked_add(file_id_bytes)
-        .and_then(|length| length.checked_add(4))
-        .and_then(|length| length.checked_add(value.len()))
-        .and_then(|length| length.checked_add(working_diff_baseline_len(baseline)))
-        .ok_or_else(|| head_group_error("group value length overflow"))?;
-    encoded
-        .len()
-        .checked_add(member_len)
-        .ok_or_else(|| head_group_error("group value length overflow"))?;
-    encoded
-        .try_reserve(member_len)
-        .map_err(|_| head_group_error("cannot reserve group value bytes"))?;
-
-    match file_id {
-        None => encoded.push(FILE_ID_NONE),
-        Some(file_id) => {
-            encoded.push(FILE_ID_SOME);
-            let file_id_len = u32::try_from(file_id.len())
-                .map_err(|_| head_group_error("file id exceeds u32"))?;
-            encoded.extend_from_slice(&file_id_len.to_be_bytes());
-            encoded.extend_from_slice(file_id.as_bytes());
-        }
-    }
-    let value_len =
-        u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
-    encoded.extend_from_slice(&value_len.to_be_bytes());
-    encoded.extend_from_slice(value);
-    encode_working_diff_baseline(encoded, baseline);
-    Ok(())
-}
-
-fn working_diff_baseline_len(baseline: WorkingDiffBaseline) -> usize {
-    match baseline {
-        WorkingDiffBaseline::Clean => 1,
-        WorkingDiffBaseline::Absent(_) => 1 + UUID_BYTES,
-        WorkingDiffBaseline::Present { .. } => 1 + UUID_BYTES + WORKING_DIFF_VERSION_BYTES,
-    }
-}
-
-fn encode_working_diff_baseline(encoded: &mut Vec<u8>, baseline: WorkingDiffBaseline) {
-    match baseline {
-        WorkingDiffBaseline::Clean => encoded.push(WORKING_DIFF_BASELINE_CLEAN),
-        WorkingDiffBaseline::Absent(checkpoint_commit_id) => {
-            encoded.push(WORKING_DIFF_BASELINE_ABSENT);
-            encoded.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
-        }
-        WorkingDiffBaseline::Present {
-            checkpoint_commit_id,
-            version,
-        } => {
-            encoded.push(WORKING_DIFF_BASELINE_PRESENT);
-            encoded.extend_from_slice(checkpoint_commit_id.as_uuid().as_bytes());
-            encode_working_diff_version(encoded, version);
-        }
-    }
-}
-
+/// The sparse hot-diff index stores keys only.  The corresponding authoritative
+/// hot row stores the first tracked before-image, which keeps the accelerator
+/// compact without requiring a second write-path point read.
 fn encode_working_diff_version(encoded: &mut Vec<u8>, version: WorkingDiffVersion) {
     encoded.extend_from_slice(version.change_id.as_uuid().as_bytes());
     encoded.extend_from_slice(version.commit_id.as_uuid().as_bytes());
@@ -3655,37 +982,6 @@ fn encode_working_diff_version(encoded: &mut Vec<u8>, version: WorkingDiffVersio
 fn encode_working_diff_slot(encoded: &mut Vec<u8>, slot: WorkingDiffSlotFingerprint) {
     encoded.push(slot.kind);
     encoded.extend_from_slice(&slot.hash);
-}
-
-fn decode_working_diff_baseline(
-    bytes: &[u8],
-    offset: &mut usize,
-) -> Result<WorkingDiffBaseline, LixError> {
-    let tag = *bytes
-        .get(*offset)
-        .ok_or_else(|| head_group_error("is truncated before working-diff baseline"))?;
-    *offset += 1;
-    match tag {
-        WORKING_DIFF_BASELINE_CLEAN => Ok(WorkingDiffBaseline::Clean),
-        WORKING_DIFF_BASELINE_ABSENT => Ok(WorkingDiffBaseline::Absent(CommitId::new(
-            uuid_from_working_diff_bytes(
-                take_working_diff_bytes(bytes, offset, UUID_BYTES)?,
-                "baseline checkpoint id",
-            )?,
-        ))),
-        WORKING_DIFF_BASELINE_PRESENT => {
-            let checkpoint_commit_id = CommitId::new(uuid_from_working_diff_bytes(
-                take_working_diff_bytes(bytes, offset, UUID_BYTES)?,
-                "baseline checkpoint id",
-            )?);
-            let version = decode_working_diff_version(bytes, offset)?;
-            Ok(WorkingDiffBaseline::Present {
-                checkpoint_commit_id,
-                version,
-            })
-        }
-        _ => Err(head_group_error("has an invalid working-diff baseline tag")),
-    }
 }
 
 fn decode_working_diff_version(
@@ -3704,22 +1000,22 @@ fn decode_working_diff_version(
     )?);
     let deleted = match *take_working_diff_bytes(payload, &mut field_offset, 1)?
         .first()
-        .ok_or_else(|| head_group_error("working-diff deletion flag is missing"))?
+        .ok_or_else(|| working_diff_error("deletion flag is missing"))?
     {
         0 => false,
         1 => true,
-        _ => return Err(head_group_error("working-diff deletion flag is invalid")),
+        _ => return Err(working_diff_error("deletion flag is invalid")),
     };
     let created_at = LixTimestamp::from_packed(read_u64(
         take_working_diff_bytes(payload, &mut field_offset, 8)?,
-        "working-diff created_at",
+        "created_at",
     )?)
-    .map_err(|error| head_group_error(&format!("invalid working-diff created_at: {error}")))?;
+    .map_err(|error| working_diff_error(&format!("invalid created_at: {error}")))?;
     let updated_at = LixTimestamp::from_packed(read_u64(
         take_working_diff_bytes(payload, &mut field_offset, 8)?,
-        "working-diff updated_at",
+        "updated_at",
     )?)
-    .map_err(|error| head_group_error(&format!("invalid working-diff updated_at: {error}")))?;
+    .map_err(|error| working_diff_error(&format!("invalid updated_at: {error}")))?;
     let snapshot = decode_working_diff_slot(payload, &mut field_offset, "snapshot")?;
     let metadata = decode_working_diff_slot(payload, &mut field_offset, "metadata")?;
     debug_assert_eq!(field_offset, WORKING_DIFF_VERSION_BYTES);
@@ -3741,21 +1037,19 @@ fn decode_working_diff_slot(
 ) -> Result<WorkingDiffSlotFingerprint, LixError> {
     let kind = *take_working_diff_bytes(bytes, offset, 1)?
         .first()
-        .ok_or_else(|| head_group_error(&format!("working-diff {field} kind is missing")))?;
+        .ok_or_else(|| working_diff_error(&format!("{field} kind is missing")))?;
     if !matches!(
         kind,
         WORKING_DIFF_SLOT_NONE | WORKING_DIFF_SLOT_REF | WORKING_DIFF_SLOT_INLINE
     ) {
-        return Err(head_group_error(&format!(
-            "working-diff {field} slot kind is invalid"
-        )));
+        return Err(working_diff_error(&format!("{field} slot kind is invalid")));
     }
     let hash: [u8; JSON_REF_BYTES] = take_working_diff_bytes(bytes, offset, JSON_REF_BYTES)?
         .try_into()
-        .map_err(|_| head_group_error(&format!("working-diff {field} hash is invalid")))?;
+        .map_err(|_| working_diff_error(&format!("{field} hash is invalid")))?;
     if kind == WORKING_DIFF_SLOT_NONE && hash != [0; JSON_REF_BYTES] {
-        return Err(head_group_error(&format!(
-            "working-diff {field} none slot must have a zero hash"
+        return Err(working_diff_error(&format!(
+            "{field} none slot must have a zero hash"
         )));
     }
     Ok(WorkingDiffSlotFingerprint { kind, hash })
@@ -3768,10 +1062,10 @@ fn take_working_diff_bytes<'a>(
 ) -> Result<&'a [u8], LixError> {
     let end = offset
         .checked_add(length)
-        .ok_or_else(|| head_group_error("working-diff value offset overflow"))?;
+        .ok_or_else(|| working_diff_error("value offset overflow"))?;
     let value = bytes
         .get(*offset..end)
-        .ok_or_else(|| head_group_error("is truncated in working-diff value"))?;
+        .ok_or_else(|| working_diff_error("value is truncated"))?;
     *offset = end;
     Ok(value)
 }
@@ -3779,217 +1073,54 @@ fn take_working_diff_bytes<'a>(
 fn uuid_from_working_diff_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes
         .try_into()
-        .map_err(|_| head_group_error(&format!("working-diff {field} has invalid width")))?;
+        .map_err(|_| working_diff_error(&format!("{field} has invalid width")))?;
     Ok(uuid::Uuid::from_bytes(bytes))
 }
 
-#[cfg(test)]
-fn encode_head_group_members(
-    members: &BTreeMap<Option<String>, Vec<u8>>,
-) -> Result<Vec<u8>, LixError> {
-    let baselines = members
-        .keys()
-        .cloned()
-        .map(|file_id| (file_id, WorkingDiffBaseline::Clean))
-        .collect::<BTreeMap<_, _>>();
-    encode_head_group_members_with_baselines(members, &baselines)
-}
-
-fn encode_head_group_members_with_baselines(
-    members: &BTreeMap<Option<String>, Vec<u8>>,
-    baselines: &BTreeMap<Option<String>, WorkingDiffBaseline>,
-) -> Result<Vec<u8>, LixError> {
-    let member_count =
-        u32::try_from(members.len()).map_err(|_| head_group_error("member count exceeds u32"))?;
-    let payload_len = members.iter().try_fold(0usize, |total, (file_id, value)| {
-        let baseline = baselines
-            .get(file_id)
-            .copied()
-            .ok_or_else(|| head_group_error("is missing a working-diff baseline for one member"))?;
-        let file_id_len = file_id.as_ref().map_or(0, String::len);
-        u32::try_from(file_id_len).map_err(|_| head_group_error("file id exceeds u32"))?;
-        let file_id_bytes = if file_id.is_some() {
-            4usize
-                .checked_add(file_id_len)
-                .ok_or_else(|| head_group_error("group value length overflow"))?
-        } else {
-            0
-        };
-        u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
-        decode_head_value(value)?;
-        let member_len = 1usize
-            .checked_add(file_id_bytes)
-            .and_then(|length| length.checked_add(4))
-            .and_then(|length| length.checked_add(value.len()))
-            .and_then(|length| length.checked_add(working_diff_baseline_len(baseline)))
-            .ok_or_else(|| head_group_error("group value length overflow"))?;
-        total
-            .checked_add(member_len)
-            .ok_or_else(|| head_group_error("group value length overflow"))
-    })?;
-    let capacity = HEAD_GROUP_HEADER_BYTES
-        .checked_add(payload_len)
-        .ok_or_else(|| head_group_error("group value length overflow"))?;
-    let mut encoded = Vec::with_capacity(capacity);
-    encoded.push(HEAD_GROUP_VALUE_VERSION);
-    encoded.extend_from_slice(&member_count.to_be_bytes());
-    for (file_id, value) in members {
-        let baseline = baselines
-            .get(file_id)
-            .copied()
-            .ok_or_else(|| head_group_error("is missing a working-diff baseline for one member"))?;
-        match file_id {
-            None => encoded.push(FILE_ID_NONE),
-            Some(file_id) => {
-                encoded.push(FILE_ID_SOME);
-                let file_id_len = u32::try_from(file_id.len())
-                    .map_err(|_| head_group_error("file id exceeds u32"))?;
-                encoded.extend_from_slice(&file_id_len.to_be_bytes());
-                encoded.extend_from_slice(file_id.as_bytes());
-            }
-        }
-        let value_len =
-            u32::try_from(value.len()).map_err(|_| head_group_error("member value exceeds u32"))?;
-        encoded.extend_from_slice(&value_len.to_be_bytes());
-        encoded.extend_from_slice(value);
-        encode_working_diff_baseline(&mut encoded, baseline);
-    }
-    debug_assert_eq!(encoded.len(), capacity);
-    Ok(encoded)
-}
-
-fn decode_head_group_members(bytes: &[u8]) -> Result<Vec<HeadGroupMemberBytes>, LixError> {
-    if bytes.len() < HEAD_GROUP_HEADER_BYTES {
-        return Err(head_group_error("value is shorter than the fixed header"));
-    }
-    if bytes[0] != HEAD_GROUP_VALUE_VERSION {
-        return Err(head_group_error(&format!(
-            "unsupported group format version {}",
-            bytes[0]
-        )));
-    }
-    let member_count = usize::try_from(read_u32(&bytes[1..5], "group member count")?)
-        .map_err(|_| head_group_error("member count exceeds usize"))?;
-    let mut offset = HEAD_GROUP_HEADER_BYTES;
-    let mut prior_file_id = None::<Option<String>>;
-    let mut members = Vec::with_capacity(member_count);
-    for _ in 0..member_count {
-        let tag = *bytes
-            .get(offset)
-            .ok_or_else(|| head_group_error("is truncated before member file id"))?;
-        offset += 1;
-        let file_id = match tag {
-            FILE_ID_NONE => None,
-            FILE_ID_SOME => {
-                let file_id_len = read_group_u32(bytes, &mut offset, "member file-id length")?;
-                let file_id_end = offset
-                    .checked_add(file_id_len)
-                    .ok_or_else(|| head_group_error("member file-id length overflow"))?;
-                let file_id = bytes
-                    .get(offset..file_id_end)
-                    .ok_or_else(|| head_group_error("is truncated in member file id"))?;
-                offset = file_id_end;
-                Some(
-                    std::str::from_utf8(file_id)
-                        .map_err(|error| {
-                            head_group_error(&format!("member file id is not UTF-8: {error}"))
-                        })?
-                        .to_string(),
-                )
-            }
-            _ => return Err(head_group_error("has an invalid member file-id tag")),
-        };
-        if prior_file_id
-            .as_ref()
-            .is_some_and(|prior| prior >= &file_id)
-        {
-            return Err(head_group_error(
-                "members are not strictly ordered by file id",
-            ));
-        }
-        let value_len = read_group_u32(bytes, &mut offset, "member value length")?;
-        let value_end = offset
-            .checked_add(value_len)
-            .ok_or_else(|| head_group_error("member value length overflow"))?;
-        let value = bytes
-            .get(offset..value_end)
-            .ok_or_else(|| head_group_error("is truncated in member value"))?;
-        let head = decode_head_value(value)?;
-        offset = value_end;
-        let baseline = decode_working_diff_baseline(bytes, &mut offset)?;
-        if head.untracked && baseline != WorkingDiffBaseline::Clean {
-            return Err(head_group_error(
-                "untracked current-state member has a working-diff baseline",
-            ));
-        }
-        prior_file_id = Some(file_id.clone());
-        members.push(HeadGroupMemberBytes {
-            file_id,
-            value: Bytes::copy_from_slice(value),
-            baseline,
-        });
-    }
-    if offset != bytes.len() {
-        return Err(head_group_error("has trailing bytes"));
-    }
-    Ok(members)
-}
-
-fn read_group_u32(bytes: &[u8], offset: &mut usize, field: &str) -> Result<usize, LixError> {
-    let end = offset
-        .checked_add(4)
-        .ok_or_else(|| head_group_error(&format!("{field} offset overflow")))?;
-    let value = read_u32(
-        bytes
-            .get(*offset..end)
-            .ok_or_else(|| head_group_error(&format!("is truncated before {field}")))?,
-        field,
-    )?;
-    *offset = end;
-    usize::try_from(value).map_err(|_| head_group_error(&format!("{field} exceeds usize")))
-}
-
-fn head_group_error(message: &str) -> LixError {
+fn working_diff_error(message: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("invalid current-state group: {message}"),
+        format!("invalid hot working-diff version: {message}"),
     )
 }
 
-/// v4 current-state values are intentionally a small, fixed-header wire record rather
+/// V5 current-state values are intentionally a small, fixed-header wire record rather
 /// than a general Musli struct. The normal read path needs only these fields,
 /// and decoding a Musli `JsonSlot` first allocated an intermediate value for
 /// every row before it was copied into a live-state row.
 ///
 /// ```text
-///  0      format version (4)
-///  1      deleted + untracked + snapshot/metadata kinds
+///  0      format version (5)
+///  1      deleted + untracked + snapshot/metadata kinds + diff baseline kind
 ///  2..18  change UUID
 /// 18..34  commit UUID
 /// 34..42  created_at packed timestamp (big endian)
 /// 42..50  updated_at packed timestamp (big endian)
 /// 50..54  snapshot payload byte length (big endian u32)
 /// 54..58  metadata payload byte length (big endian u32)
-/// 58..    snapshot payload, then metadata payload
+/// 58..    snapshot payload, metadata payload, then an optional fixed
+///          checkpoint before-image when the baseline kind is BeforePresent
 /// ```
 ///
 /// Slot payloads are either inline UTF-8 JSON or a fixed 32-byte `JsonRef`.
 /// This makes parsing bounded and lets the scan path build the final
 /// `MaterializedLiveStateRow` in one pass.
-const HEAD_VALUE_VERSION: u8 = 4;
+const HEAD_VALUE_VERSION: u8 = 5;
 const HEAD_VALUE_HEADER_BYTES: usize = 58;
 const HEAD_VALUE_DELETED: u8 = 0b0000_0001;
 const HEAD_VALUE_SNAPSHOT_SHIFT: u8 = 1;
 const HEAD_VALUE_METADATA_SHIFT: u8 = 3;
 const HEAD_VALUE_UNTRACKED: u8 = 0b0010_0000;
+const HEAD_VALUE_WORKING_DIFF_SHIFT: u8 = 6;
 const HEAD_VALUE_SLOT_MASK: u8 = 0b11;
-const HEAD_VALUE_ALLOWED_FLAGS: u8 = HEAD_VALUE_DELETED
-    | HEAD_VALUE_UNTRACKED
-    | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_SNAPSHOT_SHIFT)
-    | (HEAD_VALUE_SLOT_MASK << HEAD_VALUE_METADATA_SHIFT);
+const HEAD_VALUE_WORKING_DIFF_MASK: u8 = 0b11;
 const HEAD_SLOT_NONE: u8 = 0;
 const HEAD_SLOT_REF: u8 = 1;
 const HEAD_SLOT_INLINE: u8 = 2;
+const HEAD_WORKING_DIFF_DISABLED: u8 = 0;
+const HEAD_WORKING_DIFF_CLEAN: u8 = 1;
+const HEAD_WORKING_DIFF_BEFORE_ABSENT: u8 = 2;
+const HEAD_WORKING_DIFF_BEFORE_PRESENT: u8 = 3;
 const UUID_BYTES: usize = 16;
 const JSON_REF_BYTES: usize = 32;
 
@@ -4010,6 +1141,7 @@ struct HeadValueView<'a> {
     updated_at: LixTimestamp,
     snapshot: HeadSlotView<'a>,
     metadata: HeadSlotView<'a>,
+    working_diff_baseline: WorkingDiffBaseline,
 }
 
 impl HeadValueView<'_> {
@@ -4066,7 +1198,78 @@ fn working_diff_slot_fingerprint(slot: HeadSlotView<'_>) -> WorkingDiffSlotFinge
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum HeadSlotEncode<'a> {
+    None,
+    Ref(JsonRef),
+    Inline(&'a str),
+}
+
+impl<'a> From<JsonSlotRef<'a>> for HeadSlotEncode<'a> {
+    fn from(value: JsonSlotRef<'a>) -> Self {
+        match value {
+            JsonSlotRef::None => Self::None,
+            JsonSlotRef::Ref(value) => Self::Ref(*value),
+            JsonSlotRef::Inline(value) => Self::Inline(value),
+        }
+    }
+}
+
+impl<'a> From<HeadSlotView<'a>> for HeadSlotEncode<'a> {
+    fn from(value: HeadSlotView<'a>) -> Self {
+        match value {
+            HeadSlotView::None => Self::None,
+            HeadSlotView::Ref(value) => Self::Ref(value),
+            HeadSlotView::Inline(value) => Self::Inline(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HeadValueEncode<'a> {
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+    untracked: bool,
+    deleted: bool,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    snapshot: HeadSlotEncode<'a>,
+    metadata: HeadSlotEncode<'a>,
+    working_diff_baseline: WorkingDiffBaseline,
+}
+
 fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
+    encode_head_value_parts(HeadValueEncode {
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+        untracked: value.untracked,
+        deleted: value.deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        snapshot: value.snapshot.into(),
+        metadata: value.metadata.into(),
+        working_diff_baseline: value.working_diff_baseline,
+    })
+}
+
+fn reencode_head_value_with_baseline(
+    value: HeadValueView<'_>,
+    working_diff_baseline: WorkingDiffBaseline,
+) -> Result<Vec<u8>, LixError> {
+    encode_head_value_parts(HeadValueEncode {
+        change_id: value.change_id,
+        commit_id: value.commit_id,
+        untracked: value.untracked,
+        deleted: value.deleted,
+        created_at: value.created_at,
+        updated_at: value.updated_at,
+        snapshot: value.snapshot.into(),
+        metadata: value.metadata.into(),
+        working_diff_baseline,
+    })
+}
+
+fn encode_head_value_parts(value: HeadValueEncode<'_>) -> Result<Vec<u8>, LixError> {
     let snapshot_kind = encoded_slot_kind(value.snapshot);
     let metadata_kind = encoded_slot_kind(value.metadata);
     if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
@@ -4097,11 +1300,24 @@ fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
             ));
         }
     }
+    if value.untracked && value.working_diff_baseline != WorkingDiffBaseline::Disabled {
+        return Err(head_value_error(
+            "untracked current-state rows must not carry a working-diff baseline",
+        ));
+    }
     let snapshot_len = encoded_slot_len(value.snapshot);
     let metadata_len = encoded_slot_len(value.metadata);
     let capacity = HEAD_VALUE_HEADER_BYTES
         .checked_add(snapshot_len)
         .and_then(|bytes| bytes.checked_add(metadata_len))
+        .and_then(|bytes| {
+            bytes.checked_add(match value.working_diff_baseline {
+                WorkingDiffBaseline::BeforePresent(_) => WORKING_DIFF_VERSION_BYTES,
+                WorkingDiffBaseline::Disabled
+                | WorkingDiffBaseline::Clean
+                | WorkingDiffBaseline::BeforeAbsent => 0,
+            })
+        })
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
     let mut bytes = Vec::with_capacity(capacity);
     bytes.push(HEAD_VALUE_VERSION);
@@ -4111,6 +1327,8 @@ fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
     }
     flags |= snapshot_kind << HEAD_VALUE_SNAPSHOT_SHIFT;
     flags |= metadata_kind << HEAD_VALUE_METADATA_SHIFT;
+    flags |= encode_working_diff_baseline_tag(value.working_diff_baseline)
+        << HEAD_VALUE_WORKING_DIFF_SHIFT;
     bytes.push(flags);
     bytes.extend_from_slice(value.change_id.unwrap_or_default().as_uuid().as_bytes());
     bytes.extend_from_slice(value.commit_id.unwrap_or_default().as_uuid().as_bytes());
@@ -4118,41 +1336,53 @@ fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
     bytes.extend_from_slice(&value.updated_at.packed().to_be_bytes());
     bytes.extend_from_slice(
         &u32::try_from(snapshot_len)
-            .map_err(|_| head_value_error("snapshot payload exceeds v3 u32 limit"))?
+            .map_err(|_| head_value_error("snapshot payload exceeds v5 u32 limit"))?
             .to_be_bytes(),
     );
     bytes.extend_from_slice(
         &u32::try_from(metadata_len)
-            .map_err(|_| head_value_error("metadata payload exceeds v3 u32 limit"))?
+            .map_err(|_| head_value_error("metadata payload exceeds v5 u32 limit"))?
             .to_be_bytes(),
     );
     append_slot_payload(&mut bytes, value.snapshot);
     append_slot_payload(&mut bytes, value.metadata);
+    if let WorkingDiffBaseline::BeforePresent(version) = value.working_diff_baseline {
+        encode_working_diff_version(&mut bytes, version);
+    }
     debug_assert_eq!(bytes.len(), capacity);
     Ok(bytes)
 }
 
-fn encoded_slot_kind(slot: JsonSlotRef<'_>) -> u8 {
-    match slot {
-        JsonSlotRef::None => HEAD_SLOT_NONE,
-        JsonSlotRef::Ref(_) => HEAD_SLOT_REF,
-        JsonSlotRef::Inline(_) => HEAD_SLOT_INLINE,
+fn encode_working_diff_baseline_tag(baseline: WorkingDiffBaseline) -> u8 {
+    match baseline {
+        WorkingDiffBaseline::Disabled => HEAD_WORKING_DIFF_DISABLED,
+        WorkingDiffBaseline::Clean => HEAD_WORKING_DIFF_CLEAN,
+        WorkingDiffBaseline::BeforeAbsent => HEAD_WORKING_DIFF_BEFORE_ABSENT,
+        WorkingDiffBaseline::BeforePresent(_) => HEAD_WORKING_DIFF_BEFORE_PRESENT,
     }
 }
 
-fn encoded_slot_len(slot: JsonSlotRef<'_>) -> usize {
+fn encoded_slot_kind(slot: HeadSlotEncode<'_>) -> u8 {
     match slot {
-        JsonSlotRef::None => 0,
-        JsonSlotRef::Ref(_) => JSON_REF_BYTES,
-        JsonSlotRef::Inline(json) => json.len(),
+        HeadSlotEncode::None => HEAD_SLOT_NONE,
+        HeadSlotEncode::Ref(_) => HEAD_SLOT_REF,
+        HeadSlotEncode::Inline(_) => HEAD_SLOT_INLINE,
     }
 }
 
-fn append_slot_payload(bytes: &mut Vec<u8>, slot: JsonSlotRef<'_>) {
+fn encoded_slot_len(slot: HeadSlotEncode<'_>) -> usize {
     match slot {
-        JsonSlotRef::None => {}
-        JsonSlotRef::Ref(json_ref) => bytes.extend_from_slice(json_ref.as_hash_bytes()),
-        JsonSlotRef::Inline(json) => bytes.extend_from_slice(json.as_bytes()),
+        HeadSlotEncode::None => 0,
+        HeadSlotEncode::Ref(_) => JSON_REF_BYTES,
+        HeadSlotEncode::Inline(json) => json.len(),
+    }
+}
+
+fn append_slot_payload(bytes: &mut Vec<u8>, slot: HeadSlotEncode<'_>) {
+    match slot {
+        HeadSlotEncode::None => {}
+        HeadSlotEncode::Ref(json_ref) => bytes.extend_from_slice(json_ref.as_hash_bytes()),
+        HeadSlotEncode::Inline(json) => bytes.extend_from_slice(json.as_bytes()),
     }
 }
 
@@ -4167,7 +1397,7 @@ fn full_value_bytes(value: StorageProjectedValue) -> Result<Bytes, LixError> {
 
 fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     if bytes.len() < HEAD_VALUE_HEADER_BYTES {
-        return Err(head_value_error("row is shorter than the v4 fixed header"));
+        return Err(head_value_error("row is shorter than the v5 fixed header"));
     }
     if bytes[0] != HEAD_VALUE_VERSION {
         return Err(head_value_error(&format!(
@@ -4176,9 +1406,6 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         )));
     }
     let flags = bytes[1];
-    if flags & !HEAD_VALUE_ALLOWED_FLAGS != 0 {
-        return Err(head_value_error("row has unknown v4 flag bits"));
-    }
     let snapshot_kind = (flags >> HEAD_VALUE_SNAPSHOT_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let metadata_kind = (flags >> HEAD_VALUE_METADATA_SHIFT) & HEAD_VALUE_SLOT_MASK;
     let change_uuid = uuid_from_head_bytes(&bytes[2..18], "change id")?;
@@ -4197,11 +1424,6 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
     let metadata_end = snapshot_end
         .checked_add(metadata_len)
         .ok_or_else(|| head_value_error("metadata payload length overflow"))?;
-    if metadata_end != bytes.len() {
-        return Err(head_value_error(
-            "row payload lengths do not match the buffer",
-        ));
-    }
     let snapshot = decode_slot(
         snapshot_kind,
         &bytes[HEAD_VALUE_HEADER_BYTES..snapshot_end],
@@ -4212,6 +1434,22 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         &bytes[snapshot_end..metadata_end],
         "metadata",
     )?;
+    let baseline_tag = (flags >> HEAD_VALUE_WORKING_DIFF_SHIFT) & HEAD_VALUE_WORKING_DIFF_MASK;
+    let mut baseline_offset = metadata_end;
+    let working_diff_baseline = match baseline_tag {
+        HEAD_WORKING_DIFF_DISABLED => WorkingDiffBaseline::Disabled,
+        HEAD_WORKING_DIFF_CLEAN => WorkingDiffBaseline::Clean,
+        HEAD_WORKING_DIFF_BEFORE_ABSENT => WorkingDiffBaseline::BeforeAbsent,
+        HEAD_WORKING_DIFF_BEFORE_PRESENT => WorkingDiffBaseline::BeforePresent(
+            decode_working_diff_version(bytes, &mut baseline_offset)?,
+        ),
+        _ => unreachable!("two-bit working-diff baseline tag is exhaustive"),
+    };
+    if baseline_offset != bytes.len() {
+        return Err(head_value_error(
+            "row payload lengths do not match the buffer",
+        ));
+    }
     let deleted = flags & HEAD_VALUE_DELETED != 0;
     let untracked = flags & HEAD_VALUE_UNTRACKED != 0;
     if deleted && (snapshot != HeadSlotView::None || metadata != HeadSlotView::None) {
@@ -4228,6 +1466,11 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         if change_uuid != uuid::Uuid::nil() || commit_uuid != uuid::Uuid::nil() {
             return Err(head_value_error(
                 "untracked current-state rows must use nil change and commit ids",
+            ));
+        }
+        if working_diff_baseline != WorkingDiffBaseline::Disabled {
+            return Err(head_value_error(
+                "untracked current-state rows must not carry a working-diff baseline",
             ));
         }
         (None, None)
@@ -4251,13 +1494,14 @@ fn decode_head_value(bytes: &[u8]) -> Result<HeadValueView<'_>, LixError> {
         updated_at,
         snapshot,
         metadata,
+        working_diff_baseline,
     })
 }
 
 fn uuid_from_head_bytes(bytes: &[u8], field: &str) -> Result<uuid::Uuid, LixError> {
     let bytes: [u8; UUID_BYTES] = bytes.try_into().map_err(|_| {
         head_value_error(&format!(
-            "{field} must have {UUID_BYTES} bytes in the v3 header"
+            "{field} must have {UUID_BYTES} bytes in the v5 header"
         ))
     })?;
     Ok(uuid::Uuid::from_bytes(bytes))
@@ -4308,7 +1552,7 @@ fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotVie
 fn head_value_error(message: &str) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
-        format!("invalid tracked-head v3 row: {message}"),
+        format!("invalid hot live-state row: {message}"),
     )
 }
 
@@ -4324,7 +1568,7 @@ struct DeferredJson {
     json_ref: JsonRef,
 }
 
-/// Builds serving rows directly from a v3 wire value. The only allocations
+/// Builds serving rows directly from a V5 hot-row value. The only allocations
 /// here are the final `String` fields and identities which the public row type
 /// requires; there is no `HeadValue`/`MaterializedTrackedStateRow` staging
 /// layer to drop after each scan.
@@ -4472,8 +1716,124 @@ mod tests {
         }
     }
 
+    fn working_diff_control(
+        head_commit_id: CommitId,
+        generation: CommitId,
+        checkpoint_commit_id: CommitId,
+    ) -> BranchHeadControl {
+        BranchHeadControl {
+            head_commit_id,
+            generation,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:00Z"),
+            ref_change_id: ChangeId::for_test_label("working-diff-branch-ref"),
+        }
+    }
+
+    fn working_diff_delta<'a>(
+        entity_pk: &'a EntityPk,
+        file_id: Option<&'a str>,
+        change: &str,
+        commit_id: CommitId,
+        deleted: bool,
+        snapshot: &'a str,
+        metadata: Option<&'a str>,
+        updated_at: &str,
+    ) -> TrackedHeadDeltaRef<'a> {
+        TrackedHeadDeltaRef {
+            schema_key: "schema",
+            file_id,
+            entity_pk,
+            change_id: ChangeId::for_test_label(change),
+            commit_id,
+            deleted,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts(updated_at),
+            snapshot: JsonSlotRef::Inline(snapshot),
+            metadata: metadata.map_or(JsonSlotRef::None, JsonSlotRef::Inline),
+        }
+    }
+
+    async fn publish_working_diff_commit(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        head_commit_id: CommitId,
+        deltas: &[TrackedHeadDeltaRef<'_>],
+        checkpoint_commit_id: CommitId,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open working-diff write read");
+        let mut writes = StorageWriteSet::new();
+        let generation = TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_with_working_diff(
+                branch_id,
+                parent_generation,
+                head_commit_id,
+                deltas,
+                &BTreeSet::new(),
+                None,
+                Some(checkpoint_commit_id),
+                coverage,
+            )
+            .await
+            .expect("stage working-diff current state");
+        assert_eq!(generation, parent_generation.unwrap_or(head_commit_id));
+        stage_tracked_working_diff_epoch(
+            &mut writes,
+            branch_id,
+            TrackedWorkingDiffEpoch {
+                checkpoint_commit_id,
+                generation,
+                coverage: *coverage,
+            },
+        )
+        .expect("stage working-diff epoch");
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            working_diff_control(head_commit_id, generation, checkpoint_commit_id),
+        )
+        .expect("stage working-diff control");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit working-diff current state");
+    }
+
+    async fn read_working_diff(
+        storage: &StorageAdapter<Memory>,
+        branch_id: &str,
+        head_commit_id: CommitId,
+        generation: CommitId,
+        checkpoint_commit_id: CommitId,
+        request: &TrackedStateDiffRequest,
+    ) -> TrackedWorkingDiff {
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open working-diff read");
+        TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_for_control(
+                branch_id,
+                working_diff_control(head_commit_id, generation, checkpoint_commit_id),
+                request,
+            )
+            .await
+            .expect("read working diff")
+            .expect("working diff must be current")
+    }
+
     #[test]
-    fn v3_value_codec_roundtrips_fixed_header_inline_and_ref_slots() {
+    fn v5_value_codec_roundtrips_fixed_header_inline_and_ref_slots() {
         let snapshot_ref = JsonRef::from_hash_bytes([7; JSON_REF_BYTES]);
         let value = HeadValueRef {
             change_id: Some(ChangeId::for_test_label("change")),
@@ -4484,15 +1844,16 @@ mod tests {
             updated_at: ts("2026-01-02T00:00:00Z"),
             snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
             metadata: JsonSlotRef::Ref(&snapshot_ref),
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
         };
 
-        let bytes = encode_head_value(&value).expect("encode v3 row");
+        let bytes = encode_head_value(&value).expect("encode v5 row");
         assert_eq!(bytes[0], HEAD_VALUE_VERSION);
         assert_eq!(
             bytes.len(),
             HEAD_VALUE_HEADER_BYTES + "{\"snapshot\":true}".len() + JSON_REF_BYTES
         );
-        let decoded = decode_head_value(&bytes).expect("decode v3 row");
+        let decoded = decode_head_value(&bytes).expect("decode v5 row");
         assert_eq!(decoded.change_id, value.change_id);
         assert_eq!(decoded.commit_id, value.commit_id);
         assert_eq!(decoded.created_at, value.created_at);
@@ -4505,44 +1866,44 @@ mod tests {
     }
 
     #[test]
-    fn v6_group_codec_roundtrips_sorted_members_and_rejects_corruption() {
-        let mut members = BTreeMap::new();
-        members.insert(
-            None,
-            encode_head_value(&head_value("none", CommitId::for_test_label("head")).as_ref())
-                .expect("encode none member"),
-        );
-        members.insert(
-            Some("file-a".to_string()),
-            encode_head_value(&head_value("file-a", CommitId::for_test_label("head")).as_ref())
-                .expect("encode file-a member"),
-        );
-        members.insert(
-            Some("file-b".to_string()),
-            encode_head_value(&head_value("file-b", CommitId::for_test_label("head")).as_ref())
-                .expect("encode file-b member"),
-        );
+    fn v5_value_codec_embeds_a_tracked_first_before_baseline() {
+        let baseline = WorkingDiffVersion {
+            change_id: ChangeId::for_test_label("before-change"),
+            commit_id: CommitId::for_test_label("before-commit"),
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-01T00:00:01Z"),
+            snapshot: WorkingDiffSlotFingerprint {
+                kind: WORKING_DIFF_SLOT_INLINE,
+                hash: [3; JSON_REF_BYTES],
+            },
+            metadata: WorkingDiffSlotFingerprint {
+                kind: WORKING_DIFF_SLOT_NONE,
+                hash: [0; JSON_REF_BYTES],
+            },
+        };
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("current-change")),
+            commit_id: Some(CommitId::for_test_label("current-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline("{\"current\":true}"),
+            metadata: JsonSlotRef::None,
+            working_diff_baseline: WorkingDiffBaseline::BeforePresent(baseline),
+        };
 
-        let encoded = encode_head_group_members(&members).expect("encode group");
-        let decoded = decode_head_group_members(&encoded).expect("decode group");
-        assert_eq!(decoded.len(), 3);
-        assert_eq!(decoded[0].file_id, None);
-        assert_eq!(decoded[1].file_id.as_deref(), Some("file-a"));
-        assert_eq!(decoded[2].file_id.as_deref(), Some("file-b"));
+        let bytes = encode_head_value(&value).expect("encode v5 row with baseline");
         assert_eq!(
-            decode_head_value(&decoded[2].value)
-                .expect("member should preserve v3 payload")
-                .change_id,
-            Some(ChangeId::for_test_label("file-b"))
+            bytes.len(),
+            HEAD_VALUE_HEADER_BYTES + "{\"current\":true}".len() + WORKING_DIFF_VERSION_BYTES
         );
-
-        let mut trailing = encoded.clone();
-        trailing.push(0);
-        assert!(decode_head_group_members(&trailing).is_err());
-
-        let mut bad_version = encoded;
-        bad_version[0] = HEAD_GROUP_VALUE_VERSION + 1;
-        assert!(decode_head_group_members(&bad_version).is_err());
+        let decoded = decode_head_value(&bytes).expect("decode v5 row with baseline");
+        assert_eq!(
+            decoded.working_diff_baseline,
+            WorkingDiffBaseline::BeforePresent(baseline)
+        );
     }
 
     #[test]
@@ -4585,7 +1946,373 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn working_diff_restarts_after_a_noop_checkpoint_and_verifies_coverage() {
+    async fn working_diff_absent_delete_then_reinsert_is_added() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let delete_head = CommitId::for_test_label("delete");
+        let reinsert_head = CommitId::for_test_label("reinsert");
+        let entity_pk = EntityPk::single("row");
+        let mut coverage = WorkingDiffIndexCoverage::default();
+
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            None,
+            checkpoint,
+            &[],
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let delete = [working_diff_delta(
+            &entity_pk,
+            None,
+            "delete-absent",
+            delete_head,
+            true,
+            "{\"ignored\":true}",
+            None,
+            "2026-01-02T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            delete_head,
+            &delete,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+        let after_delete = read_working_diff(
+            &storage,
+            branch_id,
+            delete_head,
+            checkpoint,
+            checkpoint,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await;
+        assert!(
+            after_delete.diff.entries.is_empty(),
+            "deleting an identity that was absent at the checkpoint is net empty"
+        );
+
+        let reinsert = [working_diff_delta(
+            &entity_pk,
+            None,
+            "reinsert",
+            reinsert_head,
+            false,
+            "{\"value\":\"present\"}",
+            None,
+            "2026-01-03T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            reinsert_head,
+            &reinsert,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let diff = read_working_diff(
+            &storage,
+            branch_id,
+            reinsert_head,
+            checkpoint,
+            checkpoint,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await;
+        assert_eq!(coverage.group_count, 1, "one identity stays dirty");
+        assert_eq!(diff.checkpoint_commit_id, checkpoint);
+        assert_eq!(diff.diff.entries.len(), 1);
+        let entry = &diff.diff.entries[0];
+        assert_eq!(entry.kind, TrackedStateDiffKind::Added);
+        assert!(entry.before.is_none());
+        assert_eq!(
+            entry
+                .after
+                .as_ref()
+                .expect("added entry has an after row")
+                .change_id,
+            ChangeId::for_test_label("reinsert")
+        );
+    }
+
+    #[tokio::test]
+    async fn working_diff_clean_delete_then_restore_is_net_empty() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let delete_head = CommitId::for_test_label("delete");
+        let restore_head = CommitId::for_test_label("restore");
+        let entity_pk = EntityPk::single("row");
+        let mut coverage = WorkingDiffIndexCoverage::default();
+
+        let initial = [working_diff_delta(
+            &entity_pk,
+            None,
+            "initial",
+            checkpoint,
+            false,
+            "{\"value\":\"one\"}",
+            None,
+            "2026-01-01T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            None,
+            checkpoint,
+            &initial,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let delete = [working_diff_delta(
+            &entity_pk,
+            None,
+            "delete",
+            delete_head,
+            true,
+            "{\"ignored\":true}",
+            None,
+            "2026-01-02T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            delete_head,
+            &delete,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let restore = [working_diff_delta(
+            &entity_pk,
+            None,
+            "restore",
+            restore_head,
+            false,
+            "{\"value\":\"one\"}",
+            None,
+            "2026-01-03T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            restore_head,
+            &restore,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let diff = read_working_diff(
+            &storage,
+            branch_id,
+            restore_head,
+            checkpoint,
+            checkpoint,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await;
+        assert_eq!(
+            coverage.group_count, 1,
+            "the restore must not duplicate the dirty key"
+        );
+        assert!(
+            diff.diff.entries.is_empty(),
+            "matching checkpoint payloads are net empty even after a tombstone"
+        );
+    }
+
+    #[tokio::test]
+    async fn working_diff_metadata_only_mutation_is_modified() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let update_head = CommitId::for_test_label("metadata-update");
+        let entity_pk = EntityPk::single("row");
+        let mut coverage = WorkingDiffIndexCoverage::default();
+
+        let initial = [working_diff_delta(
+            &entity_pk,
+            None,
+            "initial",
+            checkpoint,
+            false,
+            "{\"value\":\"same\"}",
+            Some("{\"label\":\"before\"}"),
+            "2026-01-01T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            None,
+            checkpoint,
+            &initial,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let update = [working_diff_delta(
+            &entity_pk,
+            None,
+            "metadata-update",
+            update_head,
+            false,
+            "{\"value\":\"same\"}",
+            Some("{\"label\":\"after\"}"),
+            "2026-01-02T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            update_head,
+            &update,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let diff = read_working_diff(
+            &storage,
+            branch_id,
+            update_head,
+            checkpoint,
+            checkpoint,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await;
+        assert_eq!(diff.diff.entries.len(), 1);
+        let entry = &diff.diff.entries[0];
+        assert_eq!(entry.kind, TrackedStateDiffKind::Modified);
+        assert_eq!(
+            entry
+                .before
+                .as_ref()
+                .expect("modified entry has a before row")
+                .change_id,
+            ChangeId::for_test_label("initial")
+        );
+        assert_eq!(
+            entry
+                .after
+                .as_ref()
+                .expect("modified entry has an after row")
+                .change_id,
+            ChangeId::for_test_label("metadata-update")
+        );
+    }
+
+    #[tokio::test]
+    async fn working_diff_file_id_mutation_after_checkpoint_is_modified() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let checkpoint = CommitId::for_test_label("checkpoint");
+        let update_head = CommitId::for_test_label("file-update");
+        let entity_pk = EntityPk::single("row");
+        let file_id = "files/app.json";
+        let mut coverage = WorkingDiffIndexCoverage::default();
+
+        let initial = [working_diff_delta(
+            &entity_pk,
+            Some(file_id),
+            "initial-file",
+            checkpoint,
+            false,
+            "{\"value\":\"before\"}",
+            None,
+            "2026-01-01T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            None,
+            checkpoint,
+            &initial,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let update = [working_diff_delta(
+            &entity_pk,
+            Some(file_id),
+            "updated-file",
+            update_head,
+            false,
+            "{\"value\":\"after\"}",
+            None,
+            "2026-01-02T00:00:00Z",
+        )];
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            update_head,
+            &update,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let request = TrackedStateDiffRequest {
+            filter: TrackedStateFilter {
+                schema_keys: vec!["schema".to_string()],
+                entity_pks: vec![entity_pk.clone()],
+                file_ids: vec![NullableKeyFilter::Value(file_id.to_string())],
+                ..Default::default()
+            },
+        };
+        let diff = read_working_diff(
+            &storage,
+            branch_id,
+            update_head,
+            checkpoint,
+            checkpoint,
+            &request,
+        )
+        .await;
+        assert_eq!(diff.diff.entries.len(), 1);
+        let entry = &diff.diff.entries[0];
+        assert_eq!(entry.kind, TrackedStateDiffKind::Modified);
+        assert_eq!(entry.identity.entity_pk, entity_pk);
+        assert_eq!(entry.identity.file_id.as_deref(), Some(file_id));
+        assert_eq!(
+            entry
+                .before
+                .as_ref()
+                .expect("modified file entry has a before row")
+                .change_id,
+            ChangeId::for_test_label("initial-file")
+        );
+        assert_eq!(
+            entry
+                .after
+                .as_ref()
+                .expect("modified file entry has an after row")
+                .change_id,
+            ChangeId::for_test_label("updated-file")
+        );
+    }
+
+    #[tokio::test]
+    async fn working_diff_restarts_after_a_checkpoint_generation_and_verifies_coverage() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let checkpoint = CommitId::for_test_label("checkpoint");
@@ -4593,18 +2320,11 @@ mod tests {
         let no_op_checkpoint = CommitId::for_test_label("no-op-checkpoint");
         let second_head = CommitId::for_test_label("second-head");
         let entity_pk = EntityPk::single("row");
-        let control = |head_commit_id| BranchHeadControl {
+        let control = |head_commit_id, generation, checkpoint_commit_id| BranchHeadControl {
             head_commit_id,
-            generation: checkpoint,
-            tracked_head_is_current: true,
+            generation,
             current_state_revision: 0,
-            working_diff_checkpoint_commit_id: Some(
-                if head_commit_id == checkpoint || head_commit_id == first_head {
-                    checkpoint
-                } else {
-                    no_op_checkpoint
-                },
-            ),
+            working_diff_checkpoint_commit_id: Some(checkpoint_commit_id),
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("branch-ref"),
@@ -4636,7 +2356,7 @@ mod tests {
                 }],
                 &BTreeSet::new(),
                 None,
-                None,
+                Some(checkpoint),
                 &mut initial_coverage,
             )
             .await
@@ -4647,13 +2367,17 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: checkpoint,
-                generation: Some(checkpoint),
+                generation: checkpoint,
                 coverage: initial_coverage,
             },
         )
         .expect("stage initial epoch");
-        stage_branch_head_control(&mut writes, branch_id, control(checkpoint))
-            .expect("stage initial control");
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            control(checkpoint, checkpoint, checkpoint),
+        )
+        .expect("stage initial control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4696,13 +2420,17 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: checkpoint,
-                generation: Some(checkpoint),
+                generation: checkpoint,
                 coverage: first_coverage,
             },
         )
         .expect("stage first epoch");
-        stage_branch_head_control(&mut writes, branch_id, control(first_head))
-            .expect("stage first control");
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            control(first_head, checkpoint, checkpoint),
+        )
+        .expect("stage first control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4715,9 +2443,9 @@ mod tests {
             .expect("open first direct read");
         let first_diff = TrackedHeadContext::new()
             .reader(read)
-            .working_diff_if_control_current(
+            .working_diff_for_control(
                 branch_id,
-                control(first_head),
+                control(first_head, checkpoint, checkpoint),
                 &TrackedStateDiffRequest::default(),
             )
             .await
@@ -4738,22 +2466,58 @@ mod tests {
             ChangeId::for_test_label("initial-change")
         );
 
-        // A net-zero checkpoint keeps the existing serving generation but
-        // starts a new diff epoch. Old first-before summaries stay harmless:
-        // the next mutation tags its own checkpoint and gets a new index key.
+        // A checkpoint republishes a complete serving generation. Its tracked
+        // rows are all Clean in that new generation, so the old first-before
+        // baselines are neither read nor inherited by the next epoch.
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open no-op checkpoint write read");
         let mut writes = StorageWriteSet::new();
+        let mut no_op_coverage = WorkingDiffIndexCoverage::default();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit_with_working_diff(
+                branch_id,
+                None,
+                no_op_checkpoint,
+                &[],
+                &BTreeSet::new(),
+                Some(vec![MaterializedTrackedStateRow {
+                    entity_pk: entity_pk.clone(),
+                    schema_key: "schema".to_string(),
+                    file_id: None,
+                    snapshot_content: Some("{\"value\":\"two\"}".to_string()),
+                    metadata: None,
+                    deleted: false,
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    updated_at: "2026-01-02T00:00:00Z".to_string(),
+                    change_id: ChangeId::for_test_label("first-change"),
+                    commit_id: first_head,
+                }]),
+                Some(no_op_checkpoint),
+                &mut no_op_coverage,
+            )
+            .await
+            .expect("stage no-op checkpoint generation");
+        assert_eq!(no_op_coverage, WorkingDiffIndexCoverage::default());
         stage_tracked_working_diff_epoch(
             &mut writes,
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: None,
-                coverage: WorkingDiffIndexCoverage::default(),
+                generation: no_op_checkpoint,
+                coverage: no_op_coverage,
             },
         )
         .expect("reset no-op checkpoint epoch");
-        stage_branch_head_control(&mut writes, branch_id, control(no_op_checkpoint))
-            .expect("stage no-op checkpoint control");
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            control(no_op_checkpoint, no_op_checkpoint, no_op_checkpoint),
+        )
+        .expect("stage no-op checkpoint control");
+        drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -4771,7 +2535,7 @@ mod tests {
                 .expect("no-op checkpoint epoch should decode"),
             Some(TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: None,
+                generation: no_op_checkpoint,
                 coverage: WorkingDiffIndexCoverage::default(),
             })
         );
@@ -4781,9 +2545,9 @@ mod tests {
             .expect("open no-op checkpoint read");
         let empty_diff = TrackedHeadContext::new()
             .reader(read)
-            .working_diff_if_control_current(
+            .working_diff_for_control(
                 branch_id,
-                control(no_op_checkpoint),
+                control(no_op_checkpoint, no_op_checkpoint, no_op_checkpoint),
                 &TrackedStateDiffRequest::default(),
             )
             .await
@@ -4801,7 +2565,7 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_commit_with_working_diff(
                 branch_id,
-                Some(checkpoint),
+                Some(no_op_checkpoint),
                 second_head,
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
@@ -4827,13 +2591,17 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: Some(checkpoint),
+                generation: no_op_checkpoint,
                 coverage: second_coverage,
             },
         )
         .expect("stage second epoch");
-        stage_branch_head_control(&mut writes, branch_id, control(second_head))
-            .expect("stage second control");
+        stage_branch_head_control(
+            &mut writes,
+            branch_id,
+            control(second_head, no_op_checkpoint, no_op_checkpoint),
+        )
+        .expect("stage second control");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4846,9 +2614,9 @@ mod tests {
             .expect("open second direct read");
         let second_diff = TrackedHeadContext::new()
             .reader(read)
-            .working_diff_if_control_current(
+            .working_diff_for_control(
                 branch_id,
-                control(second_head),
+                control(second_head, no_op_checkpoint, no_op_checkpoint),
                 &TrackedStateDiffRequest::default(),
             )
             .await
@@ -4880,7 +2648,7 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: stale_checkpoint,
-                generation: Some(checkpoint),
+                generation: no_op_checkpoint,
                 coverage: second_coverage,
             },
         )
@@ -4905,7 +2673,11 @@ mod tests {
             assert!(
                 TrackedHeadContext::new()
                     .reader(read)
-                    .working_diff_if_control_current(branch_id, control(second_head), &request)
+                    .working_diff_for_control(
+                        branch_id,
+                        control(second_head, no_op_checkpoint, no_op_checkpoint),
+                        &request,
+                    )
                     .await
                     .expect("stale epoch should not error")
                     .is_none(),
@@ -4919,7 +2691,7 @@ mod tests {
             branch_id,
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: no_op_checkpoint,
-                generation: Some(checkpoint),
+                generation: no_op_checkpoint,
                 coverage: WorkingDiffIndexCoverage::default(),
             },
         )
@@ -4935,9 +2707,9 @@ mod tests {
         assert!(
             TrackedHeadContext::new()
                 .reader(read)
-                .working_diff_if_control_current(
+                .working_diff_for_control(
                     branch_id,
-                    control(second_head),
+                    control(second_head, no_op_checkpoint, no_op_checkpoint),
                     &TrackedStateDiffRequest::default(),
                 )
                 .await
@@ -4956,7 +2728,6 @@ mod tests {
         let control = BranchHeadControl {
             head_commit_id: head,
             generation,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -5028,16 +2799,9 @@ mod tests {
         ];
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots_if_control_current(
-                branch_id,
-                control,
-                "schema",
-                &exact_entity_pks,
-                None,
-            )
+            .scan_entity_snapshots(branch_id, control, "schema", &exact_entity_pks, None)
             .await
-            .expect("direct entity snapshots should read")
-            .expect("matching control should serve snapshots");
+            .expect("direct entity snapshots should read");
         assert_eq!(snapshots.len(), 1, "tombstone must not reach SQL rows");
         assert_eq!(
             snapshots[0]
@@ -5053,10 +2817,9 @@ mod tests {
             .expect("open limited direct entity snapshot read");
         let snapshots = TrackedHeadContext::new()
             .reader(read)
-            .scan_entity_snapshots_if_control_current(branch_id, control, "schema", &[], Some(1))
+            .scan_entity_snapshots(branch_id, control, "schema", &[], Some(1))
             .await
-            .expect("limited direct entity snapshots should read")
-            .expect("matching control should serve snapshots");
+            .expect("limited direct entity snapshots should read");
         assert_eq!(snapshots.len(), 1);
         assert_eq!(
             snapshots[0]
@@ -5131,14 +2894,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_file_id_reads_use_single_member_projection() {
+    async fn file_id_reads_use_file_first_hot_projection() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let head = CommitId::for_test_label("head");
         let control = BranchHeadControl {
             head_commit_id: head,
             generation: head,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -5206,52 +2968,30 @@ mod tests {
             .writer(&read, &mut writes)
             .stage_commit(branch_id, None, head, &deltas, &BTreeSet::new(), None)
             .await
-            .expect("stage grouped head");
+            .expect("stage hot head");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("commit grouped head");
+            .expect("commit hot head");
 
-        let group = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation: head,
-            schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
-        };
-        let second_group = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation: head,
-            schema_key: "schema".to_string(),
-            entity_pk: second_entity_pk.clone(),
-        };
-        let explicit_member = HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation: head,
-            schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
-            file_id: Some("file-b".to_string()),
-        };
-        let member_read = storage
+        let projection_read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open member verification read");
-        let member = PointReadPlan::new(
-            TRACKED_HEAD_MEMBER_SPACE,
-            &[StorageKey(Bytes::from(encode_member_key(&explicit_member)))],
+            .expect("open file projection verification read");
+        let projection_rows = ScanPlan::prefix(
+            HOT_FILE_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
         )
-        .materialize(&member_read, StorageGetOptions::default())
+        .collect(&projection_read, StorageScanOptions::default())
         .await
-        .expect("member projection should load")
+        .expect("file projection should scan")
         .value
-        .into_iter()
-        .next()
-        .flatten();
-        assert!(
-            member.is_some(),
-            "explicit file member needs a point record"
-        );
-        drop(member_read);
+        .entries;
+        assert_eq!(projection_rows.len(), 3, "every file row has a projection");
+        drop(projection_read);
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -5281,8 +3021,7 @@ mod tests {
             vec![None, Some("file-a"), Some("file-b")]
         );
 
-        // Exact group keys establish schema and entity PK, but file-id
-        // predicates still select individual members within that group.
+        // A null-file predicate selects only the null-file hot row.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5308,22 +3047,35 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id, None);
 
-        // Remove only the group to prove the exact-file read never needs to
-        // fetch/parse sibling members. This is intentionally an impossible
-        // committed state in production; it validates the physical route.
+        // Remove every authoritative primary row to prove that file-id reads
+        // are served by the complete file-first projection. This intentionally
+        // creates an impossible committed state; it validates the physical
+        // read route without depending on sibling-row decoding.
+        let primary_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open primary hot-row verification read");
+        let primary_rows = ScanPlan::prefix(
+            HOT_ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&primary_read, StorageScanOptions::default())
+        .await
+        .expect("primary hot rows should scan")
+        .value
+        .entries;
+        assert_eq!(primary_rows.len(), 4);
+        drop(primary_read);
         let mut writes = StorageWriteSet::new();
-        writes.delete(
-            TRACKED_HEAD_GROUP_SPACE,
-            StorageKey(Bytes::from(encode_group_key(&group))),
-        );
-        writes.delete(
-            TRACKED_HEAD_GROUP_SPACE,
-            StorageKey(Bytes::from(encode_group_key(&second_group))),
-        );
+        for row in primary_rows {
+            writes.delete(HOT_ROW_SPACE, row.key);
+        }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("remove group for route proof");
+            .expect("remove primary rows for route proof");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -5350,7 +3102,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id.as_deref(), Some("file-b"));
 
-        // A schema-scoped `file_id = ?` query also stays on the member
+        // A schema-scoped `file_id = ?` query also stays on the file-first
         // projection. This is the access pattern used by filesystem-backed
         // entity scans, where the entity PK is not known before the query.
         let read = storage
@@ -5386,16 +3138,16 @@ mod tests {
                 .all(|row| row.file_id.as_deref() == Some("file-b"))
         );
 
-        // The v6 control plane only validates the generation marker. Exact
-        // file identity and schema-scoped file-id reads must still route to
-        // the v6 member projection even when every backing group is absent.
+        // The branch control validates the published hot generation. Exact
+        // file identity and schema-scoped file-id reads still route to the
+        // V15 file projection even when every primary row is absent.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open v6 file-id scan");
+            .expect("open control-gated file-id scan");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .scan_live_rows_if_control_current(
+            .scan_live_rows(
                 branch_id,
                 control,
                 &TrackedStateScanRequest {
@@ -5408,8 +3160,7 @@ mod tests {
                 },
             )
             .await
-            .expect("v6 file-id scan should execute")
-            .expect("matching v6 control and marker");
+            .expect("control-bound file-id scan should execute");
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
@@ -5436,17 +3187,17 @@ mod tests {
             .expect("exact file read should execute")
             .expect("marker should match");
         assert_eq!(rows.len(), 1);
-        let row = rows[0].as_ref().expect("explicit member should resolve");
+        let row = rows[0].as_ref().expect("explicit file row should resolve");
         assert_eq!(row.file_id.as_deref(), Some("file-b"));
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
 
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open v6 exact file read");
+            .expect("open control-gated exact file read");
         let rows = TrackedHeadContext::new()
             .reader(read)
-            .load_projected_live_rows_if_control_current(
+            .load_projected_live_rows(
                 branch_id,
                 control,
                 &[TrackedStateKey {
@@ -5457,93 +3208,13 @@ mod tests {
                 &ChangeRecordProjection::full(),
             )
             .await
-            .expect("v6 exact file read should execute")
-            .expect("matching v6 control and marker");
+            .expect("control-bound exact file read should execute");
         assert_eq!(rows.len(), 1);
         let row = rows[0]
             .as_ref()
-            .expect("v6 explicit member should resolve without its group");
+            .expect("explicit file row should resolve through its projection");
         assert_eq!(row.file_id.as_deref(), Some("file-b"));
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
-    }
-
-    #[test]
-    fn group_and_member_keys_roundtrip_and_preserve_logical_order() {
-        let generation = CommitId::for_test_label("generation");
-        let strings = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
-        let mut groups = Vec::new();
-        for schema_key in strings {
-            for entity_first in strings {
-                for entity_pk in [
-                    EntityPk::single(entity_first),
-                    EntityPk::from_parts(vec![entity_first.to_string(), "tail".to_string()])
-                        .expect("tuple entity key should be valid"),
-                ] {
-                    groups.push(HeadGroupIdentity {
-                        branch_id: "branch\0name".to_string(),
-                        generation,
-                        schema_key: schema_key.to_string(),
-                        entity_pk: entity_pk.clone(),
-                    });
-                }
-            }
-        }
-        groups.sort();
-        groups.dedup();
-
-        for identity in &groups {
-            let encoded = encode_group_key(identity);
-            assert_eq!(
-                decode_group_key(&encoded).expect("group key should decode"),
-                *identity
-            );
-            let scope = encode_scope_prefix(&identity.branch_id, identity.generation);
-            assert_eq!(
-                decode_group_key_in_scope(&encoded, &scope)
-                    .expect("scope-decoded row key should decode"),
-                HeadRowIdentity {
-                    schema_key: identity.schema_key.clone(),
-                    entity_pk: identity.entity_pk.clone(),
-                    file_id: None,
-                }
-            );
-        }
-
-        let mut by_encoded = groups
-            .iter()
-            .cloned()
-            .map(|identity| (encode_group_key(&identity), identity))
-            .collect::<Vec<_>>();
-        by_encoded.sort_by(|left, right| left.0.cmp(&right.0));
-        assert_eq!(
-            by_encoded
-                .iter()
-                .map(|(_, identity)| identity)
-                .collect::<Vec<_>>(),
-            groups.iter().collect::<Vec<_>>()
-        );
-        for (index, (encoded, _)) in by_encoded.iter().enumerate() {
-            for (other_index, (other, _)) in by_encoded.iter().enumerate() {
-                if index != other_index {
-                    assert!(
-                        !other.starts_with(encoded),
-                        "complete row key {index} prefixes row key {other_index}"
-                    );
-                }
-            }
-        }
-
-        let member = HeadIdentity {
-            branch_id: "branch\0name".to_string(),
-            generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("entity"),
-            file_id: Some("file\0id".to_string()),
-        };
-        assert_eq!(
-            decode_member_key(&encode_member_key(&member)).expect("member key should decode"),
-            member
-        );
     }
 
     #[tokio::test]
@@ -5782,49 +3453,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_group_merge_preserves_untouched_members_and_file_projections() {
+    async fn incremental_row_update_preserves_siblings_and_file_projection() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
         let entity_pk = EntityPk::single("row");
-        let group = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
-        };
 
-        let mut members = BTreeMap::new();
-        members.insert(
-            None,
-            encode_head_value(&head_value("none-first", generation).as_ref())
-                .expect("encode none member"),
-        );
-        members.insert(
-            Some("file-a".to_string()),
-            encode_head_value(&head_value("file-a-first", generation).as_ref())
-                .expect("encode file-a member"),
-        );
-        members.insert(
-            Some("file-b".to_string()),
-            encode_head_value(&head_value("file-b-first", generation).as_ref())
-                .expect("encode file-b member"),
-        );
         let mut writes = StorageWriteSet::new();
-        stage_put_group_members(&mut writes, &group, &members).expect("stage initial group");
-        for (file_id, value) in &members {
-            if file_id.is_some() {
-                stage_put_member_bytes(&mut writes, &group, file_id.as_deref(), value)
-                    .expect("stage initial explicit member");
-            }
+        for (file_id, change_id) in [
+            (None, "none-first"),
+            (Some("file-a"), "file-a-first"),
+            (Some("file-b"), "file-b-first"),
+        ] {
+            stage_put(
+                &mut writes,
+                &HeadIdentity {
+                    branch_id: branch_id.to_string(),
+                    generation,
+                    schema_key: "schema".to_string(),
+                    entity_pk: entity_pk.clone(),
+                    file_id: file_id.map(str::to_string),
+                },
+                &head_value(change_id, generation),
+            )
+            .expect("stage initial hot row");
         }
         stage_test_current_control(&mut writes, branch_id, generation, generation, None)
             .expect("stage initial current control");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("commit initial group");
+            .expect("commit initial hot rows");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -5853,12 +3513,12 @@ mod tests {
                 None,
             )
             .await
-            .expect("stage streamed update");
+            .expect("stage direct row update");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("commit streamed update");
+            .expect("commit direct row update");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -5872,21 +3532,21 @@ mod tests {
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("scan streamed group")
+            .expect("scan hot rows")
             .expect("matching marker");
         assert_eq!(rows.len(), 3);
         let none = rows
             .iter()
             .find(|row| row.file_id.is_none())
-            .expect("none member remains");
+            .expect("null-file row remains");
         let file_a = rows
             .iter()
             .find(|row| row.file_id.as_deref() == Some("file-a"))
-            .expect("changed member remains");
+            .expect("changed file row remains");
         let file_b = rows
             .iter()
             .find(|row| row.file_id.as_deref() == Some("file-b"))
-            .expect("untouched member remains");
+            .expect("untouched file row remains");
         assert_eq!(none.change_id, Some(ChangeId::for_test_label("none-first")));
         assert_eq!(
             file_a.change_id,
@@ -5899,89 +3559,119 @@ mod tests {
         assert_eq!(file_a.created_at, ts("2026-01-01T00:00:00Z"));
         assert_eq!(file_a.updated_at, ts("2026-01-02T00:00:00Z"));
 
-        let identities = ["file-a", "file-b"].map(|file_id| HeadIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
-            file_id: Some(file_id.to_string()),
-        });
-        let keys = identities
-            .iter()
-            .map(|identity| StorageKey(Bytes::from(encode_member_key(identity))))
-            .collect::<Vec<_>>();
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open projection verification read");
-        let projections = PointReadPlan::new(TRACKED_HEAD_MEMBER_SPACE, &keys)
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("load explicit member projections")
-            .value;
-        for (identity, projection) in identities.into_iter().zip(projections) {
-            let value = full_value_bytes(projection.expect("projection remains present"))
-                .expect("projection has full bytes");
-            let value = decode_head_value(&value).expect("projection decodes");
-            let expected_change = if identity.file_id.as_deref() == Some("file-a") {
-                ChangeId::for_test_label("file-a-second")
-            } else {
-                ChangeId::for_test_label("file-b-first")
-            };
-            assert_eq!(value.change_id, Some(expected_change));
-        }
+            .expect("open file-projection verification read");
+        let projections = ScanPlan::prefix(
+            HOT_FILE_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("scan file projection")
+        .value
+        .entries;
+        assert_eq!(projections.len(), 2);
+        let projection_changes = projections
+            .into_iter()
+            .map(|projection| {
+                let bytes = full_value_bytes(projection.value).expect("projection has full bytes");
+                decode_head_value(&bytes)
+                    .expect("projection decodes")
+                    .change_id
+                    .expect("tracked projection has a change id")
+            })
+            .collect::<Vec<_>>();
+        assert!(projection_changes.contains(&ChangeId::for_test_label("file-a-second")));
+        assert!(projection_changes.contains(&ChangeId::for_test_label("file-b-first")));
     }
 
     #[tokio::test]
-    async fn incremental_group_rejects_corrupt_untouched_member_before_staging_publication() {
+    async fn incremental_row_update_does_not_decode_unrelated_hot_rows() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
         let second_head = CommitId::for_test_label("second-head");
         let entity_pk = EntityPk::single("row");
-        let group = HeadGroupIdentity {
-            branch_id: branch_id.to_string(),
-            generation,
-            schema_key: "schema".to_string(),
-            entity_pk: entity_pk.clone(),
-        };
-        let mut members = BTreeMap::new();
-        members.insert(
-            None,
-            encode_head_value(&head_value("none", generation).as_ref())
-                .expect("encode none member"),
-        );
-        members.insert(
-            Some("file-a".to_string()),
-            encode_head_value(&head_value("file-a", generation).as_ref())
-                .expect("encode file-a member"),
-        );
-        members.insert(
-            Some("file-b".to_string()),
-            encode_head_value(&head_value("file-b", generation).as_ref())
-                .expect("encode file-b member"),
-        );
-        let mut corrupt = encode_head_group_members(&members).expect("encode corrupt base group");
-        corrupt.push(0);
+        let unrelated_pk = EntityPk::single("unrelated");
+
         let mut initial_writes = StorageWriteSet::new();
-        initial_writes.put(
-            TRACKED_HEAD_GROUP_SPACE,
-            StorageKey(Bytes::from(encode_group_key(&group))),
-            StorageValue {
-                bytes: Bytes::from(corrupt),
+        stage_put(
+            &mut initial_writes,
+            &HeadIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: "schema".to_string(),
+                entity_pk: entity_pk.clone(),
+                file_id: Some("file-a".to_string()),
             },
-        );
+            &head_value("file-a-first", generation),
+        )
+        .expect("stage target hot row");
+        stage_put(
+            &mut initial_writes,
+            &HeadIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: "schema".to_string(),
+                entity_pk: unrelated_pk,
+                file_id: None,
+            },
+            &head_value("unrelated", generation),
+        )
+        .expect("stage unrelated hot row");
+        stage_test_current_control(&mut initial_writes, branch_id, generation, generation, None)
+            .expect("stage initial control");
         storage
             .commit_write_set(initial_writes, StorageWriteOptions::default())
             .await
-            .expect("commit corrupt group fixture");
+            .expect("commit initial hot rows");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open incremental read");
+            .expect("open corruption fixture read");
+        let unrelated_key = ScanPlan::prefix(
+            HOT_ROW_SPACE,
+            StoragePrefix {
+                bytes: Bytes::new(),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("scan hot rows for fixture")
+        .value
+        .entries
+        .into_iter()
+        .find_map(|entry| {
+            let value = full_value_bytes(entry.value).ok()?;
+            let value = decode_head_value(&value).ok()?;
+            (value.change_id == Some(ChangeId::for_test_label("unrelated"))).then_some(entry.key)
+        })
+        .expect("find unrelated row key");
+        drop(read);
+        let mut corrupt_writes = StorageWriteSet::new();
+        corrupt_writes.put(
+            HOT_ROW_SPACE,
+            unrelated_key,
+            StorageValue {
+                bytes: Bytes::from_static(b"corrupt unrelated hot row"),
+            },
+        );
+        storage
+            .commit_write_set(corrupt_writes, StorageWriteOptions::default())
+            .await
+            .expect("commit corrupt unrelated row");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open targeted incremental read");
         let mut writes = StorageWriteSet::new();
-        let error = TrackedHeadContext::new()
+        TrackedHeadContext::new()
             .writer(&read, &mut writes)
             .stage_commit(
                 branch_id,
@@ -6003,10 +3693,39 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("corrupt untouched member must reject the whole group");
-        assert!(error.message.contains("trailing bytes"));
-        assert_eq!(writes.stats().staged_puts, 0);
-        assert_eq!(writes.stats().staged_deletes, 0);
+            .expect("unrelated corrupt row must not block a direct update");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit direct hot-row update");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open exact file verification read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .load_projected_live_rows_if_current(
+                branch_id,
+                &second_head.to_string(),
+                &[TrackedStateKey {
+                    schema_key: "schema".to_string(),
+                    entity_pk,
+                    file_id: Some("file-a".to_string()),
+                }],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("exact file read should execute")
+            .expect("matching current control");
+        assert_eq!(
+            rows[0]
+                .as_ref()
+                .expect("target file row survives")
+                .change_id,
+            Some(ChangeId::for_test_label("file-a-second"))
+        );
     }
 
     #[tokio::test]
@@ -6244,10 +3963,10 @@ mod tests {
             },
         );
         writes.put(
-            TRACKED_WORKING_DIFF_GROUP_SPACE,
+            HOT_DIFF_SPACE,
             malformed_index_key.clone(),
             StorageValue {
-                bytes: Bytes::from_static(WORKING_DIFF_INDEX_VALUE),
+                bytes: Bytes::from_static(b"not-a-hot-diff-before-image"),
             },
         );
         storage
@@ -6277,7 +3996,7 @@ mod tests {
             .expect("open cleanup verification read");
         for (space, key) in [
             (TRACKED_WORKING_DIFF_MARKER_SPACE, malformed_epoch_key),
-            (TRACKED_WORKING_DIFF_GROUP_SPACE, malformed_index_key),
+            (HOT_DIFF_SPACE, malformed_index_key),
         ] {
             let value = PointReadPlan::new(space, &[key])
                 .materialize(&read, StorageGetOptions::default())
@@ -6289,192 +4008,6 @@ mod tests {
                 .flatten();
             assert!(value.is_none(), "malformed auxiliary key must be reclaimed");
         }
-    }
-
-    #[tokio::test]
-    async fn working_diff_gc_keeps_only_control_bound_active_scopes() {
-        let storage = StorageAdapter::new(Memory::new());
-        let timestamp = ts("2026-01-01T00:00:00Z");
-        let active_generation = CommitId::for_test_label("active-generation");
-        let active_checkpoint = CommitId::for_test_label("active-checkpoint");
-        let active_group = HeadGroupIdentity {
-            branch_id: "active".to_string(),
-            generation: active_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("active-row"),
-        };
-        let stale_generation = CommitId::for_test_label("stale-generation");
-        let stale_checkpoint = CommitId::for_test_label("stale-checkpoint");
-        let stale_group = HeadGroupIdentity {
-            branch_id: "stale".to_string(),
-            generation: stale_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("stale-row"),
-        };
-        let orphan_generation = CommitId::for_test_label("orphan-generation");
-        let orphan_checkpoint = CommitId::for_test_label("orphan-checkpoint");
-        let orphan_group = HeadGroupIdentity {
-            branch_id: "deleted".to_string(),
-            generation: orphan_generation,
-            schema_key: "schema".to_string(),
-            entity_pk: EntityPk::single("orphan-row"),
-        };
-
-        let mut writes = StorageWriteSet::new();
-        let active_control = BranchHeadControl {
-            head_commit_id: active_generation,
-            generation: active_generation,
-            tracked_head_is_current: true,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: Some(active_checkpoint),
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("active-ref"),
-        };
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "active",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: active_checkpoint,
-                generation: Some(active_generation),
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage active epoch");
-        stage_branch_head_control(&mut writes, "active", active_control)
-            .expect("stage active control");
-
-        let stale_control = BranchHeadControl {
-            head_commit_id: stale_generation,
-            generation: stale_generation,
-            tracked_head_is_current: false,
-            current_state_revision: 0,
-            working_diff_checkpoint_commit_id: None,
-            created_at: timestamp,
-            updated_at: timestamp,
-            ref_change_id: ChangeId::for_test_label("stale-ref"),
-        };
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "stale",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: stale_checkpoint,
-                generation: Some(stale_generation),
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage stale epoch");
-        stage_branch_head_control(&mut writes, "stale", stale_control)
-            .expect("stage stale control");
-
-        stage_tracked_working_diff_epoch(
-            &mut writes,
-            "deleted",
-            TrackedWorkingDiffEpoch {
-                checkpoint_commit_id: orphan_checkpoint,
-                generation: Some(orphan_generation),
-                coverage: WorkingDiffIndexCoverage::default(),
-            },
-        )
-        .expect("stage orphan epoch");
-
-        let mut coverage = WorkingDiffIndexCoverage::default();
-        for (checkpoint, group) in [
-            (active_checkpoint, &active_group),
-            (stale_checkpoint, &stale_group),
-            (orphan_checkpoint, &orphan_group),
-        ] {
-            stage_put_working_diff_group_index(&mut writes, &mut coverage, checkpoint, group)
-                .expect("stage working-diff index");
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit working-diff GC fixture");
-
-        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("open working-diff GC read"),
-        );
-        let mut gc_writes = StorageWriteSet::new();
-        stage_collect_stale_working_diff_indexes(&read, &mut gc_writes)
-            .await
-            .expect("stage working-diff GC");
-        drop(read);
-        storage
-            .commit_write_set(gc_writes, StorageWriteOptions::default())
-            .await
-            .expect("commit working-diff GC");
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open working-diff GC verification read");
-        let active_epoch = PointReadPlan::new(
-            TRACKED_WORKING_DIFF_MARKER_SPACE,
-            &[StorageKey(Bytes::from(
-                working_diff_marker_key("active").expect("active working-diff marker key"),
-            ))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read active epoch")
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-        assert!(active_epoch.is_some(), "active epoch must survive GC");
-
-        for (branch_id, checkpoint, group) in [
-            ("stale", stale_checkpoint, &stale_group),
-            ("deleted", orphan_checkpoint, &orphan_group),
-        ] {
-            let epoch = PointReadPlan::new(
-                TRACKED_WORKING_DIFF_MARKER_SPACE,
-                &[StorageKey(Bytes::from(
-                    working_diff_marker_key(branch_id).expect("working-diff marker key"),
-                ))],
-            )
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("read stale epoch")
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-            assert!(epoch.is_none(), "inactive epoch must be reclaimed");
-            let index = PointReadPlan::new(
-                TRACKED_WORKING_DIFF_GROUP_SPACE,
-                &[StorageKey(Bytes::from(encode_working_diff_group_key(
-                    checkpoint, group,
-                )))],
-            )
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("read stale index")
-            .value
-            .into_iter()
-            .next()
-            .flatten();
-            assert!(index.is_none(), "inactive index must be reclaimed");
-        }
-        let active_index = PointReadPlan::new(
-            TRACKED_WORKING_DIFF_GROUP_SPACE,
-            &[StorageKey(Bytes::from(encode_working_diff_group_key(
-                active_checkpoint,
-                &active_group,
-            )))],
-        )
-        .materialize(&read, StorageGetOptions::default())
-        .await
-        .expect("read active index")
-        .value
-        .into_iter()
-        .next()
-        .flatten();
-        assert!(active_index.is_some(), "active index must survive GC");
     }
 
     #[tokio::test]
@@ -6503,9 +4036,6 @@ mod tests {
         let active_control = BranchHeadControl {
             head_commit_id: active_generation,
             generation: active_generation,
-            // A lifecycle fallback still owns the same untracked workspace
-            // state even while its tracked portion is rebuilt.
-            tracked_head_is_current: false,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: timestamp,
@@ -6526,9 +4056,9 @@ mod tests {
         };
         let mut writes = StorageWriteSet::new();
         stage_put(&mut writes, &active_identity, &untracked(active_snapshot))
-            .expect("stage active untracked member");
+            .expect("stage active untracked hot row");
         stage_put(&mut writes, &stale_identity, &untracked(stale_snapshot))
-            .expect("stage stale untracked member");
+            .expect("stage stale untracked hot row");
         stage_branch_head_control(&mut writes, branch_id, active_control)
             .expect("stage active branch control");
         storage
@@ -6565,39 +4095,31 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("open current-state GC verification read");
-        for (label, identity, expected) in [
-            ("active", &active_identity, true),
-            ("stale", &stale_identity, false),
+        for (label, space) in [
+            ("primary hot row", HOT_ROW_SPACE),
+            ("file-first hot projection", HOT_FILE_SPACE),
         ] {
-            let group = PointReadPlan::new(
-                TRACKED_HEAD_GROUP_SPACE,
-                &[StorageKey(Bytes::from(encode_group_key(
-                    &identity.group_identity(),
-                )))],
+            let entries = ScanPlan::prefix(
+                space,
+                StoragePrefix {
+                    bytes: Bytes::new(),
+                },
             )
-            .materialize(&read, StorageGetOptions::default())
+            .collect(&read, StorageScanOptions::default())
             .await
-            .expect("read current-state group")
+            .expect("scan current-state hot storage")
             .value
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some();
-            assert_eq!(group, expected, "{label} group reachability");
-
-            let member = PointReadPlan::new(
-                TRACKED_HEAD_MEMBER_SPACE,
-                &[StorageKey(Bytes::from(encode_member_key(identity)))],
-            )
-            .materialize(&read, StorageGetOptions::default())
-            .await
-            .expect("read current-state member projection")
-            .value
-            .into_iter()
-            .next()
-            .flatten()
-            .is_some();
-            assert_eq!(member, expected, "{label} member reachability");
+            .entries;
+            assert_eq!(entries.len(), 1, "only active {label} survives GC");
+            let encoded =
+                full_value_bytes(entries.into_iter().next().expect("one hot value").value)
+                    .expect("hot value is present");
+            let value = decode_head_value(&encoded).expect("active hot value decodes");
+            assert!(value.untracked, "active hot value remains untracked");
+            match value.snapshot {
+                HeadSlotView::Ref(snapshot) => assert_eq!(snapshot, active_snapshot),
+                _ => panic!("active hot value must retain its JSON reference"),
+            }
         }
     }
 }

@@ -18,8 +18,7 @@ use crate::live_state::{
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
-    TrackedStateScanRequest,
+    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -33,11 +32,10 @@ const COMMIT_EDGE_SCHEMA_KEY: &str = "lix_commit_edge";
 
 /// Serving facade for visible live-state reads.
 ///
-/// Normal rows are resolved from one durable current-state projection. Each
-/// packed member carries its own tracked|untracked retention, so readers do
-/// not route through a separate retention index or merge retention candidates.
+/// Normal rows are resolved from one durable hot-state projection. Each row
+/// carries its own tracked|untracked retention, so readers do not route
+/// through a separate retention index or merge retention candidates.
 pub(crate) struct LiveStateContext {
-    tracked_state: TrackedStateContext,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -45,11 +43,10 @@ pub(crate) struct LiveStateContext {
 
 impl LiveStateContext {
     pub(crate) fn new(
-        tracked_state: TrackedStateContext,
+        _tracked_state: TrackedStateContext,
         commit_graph: CommitGraphContext,
     ) -> Self {
         Self {
-            tracked_state,
             tracked_head: TrackedHeadContext::new(),
             commit_graph,
             filesystem_path_index_cache: std::sync::Arc::new(FilesystemPathIndexCache::default()),
@@ -63,7 +60,6 @@ impl LiveStateContext {
     {
         LiveStateStoreReader {
             store,
-            tracked_state: self.tracked_state.clone(),
             tracked_head: self.tracked_head,
             commit_graph: self.commit_graph.clone(),
             filesystem_path_index_cache: std::sync::Arc::clone(&self.filesystem_path_index_cache),
@@ -84,7 +80,6 @@ impl LiveStateContext {
 /// Visible live-state reader backed by a caller-provided KV store.
 pub(crate) struct LiveStateStoreReader<S> {
     store: S,
-    tracked_state: TrackedStateContext,
     tracked_head: TrackedHeadContext,
     commit_graph: CommitGraphContext,
     filesystem_path_index_cache: std::sync::Arc<FilesystemPathIndexCache>,
@@ -98,15 +93,14 @@ where
     ///
     /// `None` means the normal materialized visibility path remains
     /// authoritative: a global branch projection, multiple result branch
-    /// scopes, commit-derived state, or an unavailable current-state
-    /// generation all deliberately fall back rather than approximating
-    /// visibility.
+    /// scopes, or commit-derived state all require its full visibility
+    /// semantics.
     pub(crate) async fn scan_direct_entity_snapshots(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Option<Vec<Option<Bytes>>>, LixError> {
-        // V12 carries tracked and untracked members in one current-state
-        // group, so this route never probes a separate retention index or marker.
+        // The hot index carries tracked and untracked rows in one serving
+        // plane, so this route never probes a separate retention index.
         if request.filter.untracked.is_some()
             || request_may_include_commit_derived(request)
             || request
@@ -138,25 +132,24 @@ where
         if requested_branch_id != GLOBAL_BRANCH_ID
             && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
         {
-            let Some(global_has_rows) = tracked_head
-                .has_schema_rows_if_control_current(GLOBAL_BRANCH_ID, global_control, schema_key)
-                .await?
-            else {
-                return Ok(None);
-            };
+            let global_has_rows = tracked_head
+                .has_schema_rows(GLOBAL_BRANCH_ID, global_control, schema_key)
+                .await?;
             if global_has_rows {
                 return Ok(None);
             }
         }
-        tracked_head
-            .scan_entity_snapshots_if_control_current(
-                requested_branch_id,
-                requested_control,
-                schema_key,
-                &request.filter.entity_pks,
-                request.limit,
-            )
-            .await
+        Ok(Some(
+            tracked_head
+                .scan_entity_snapshots(
+                    requested_branch_id,
+                    requested_control,
+                    schema_key,
+                    &request.filter.entity_pks,
+                    request.limit,
+                )
+                .await?,
+        ))
     }
 
     pub(crate) async fn scan_rows(
@@ -166,7 +159,7 @@ where
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, request, reads_tracked).await?;
-        if let Some(rows) = self.scan_direct_tracked_pk_groups(request, &scope).await? {
+        if let Some(rows) = self.scan_direct_entity_pk_rows(request, &scope).await? {
             return Ok(rows);
         }
         let commit_derived_rows = if request.filter.untracked != Some(true) {
@@ -174,15 +167,15 @@ where
         } else {
             Vec::new()
         };
-        let mut tracked_branch_rows = if !is_commit_derived_only_request(request) {
-            self.scan_tracked_branch_rows(request, &scope).await?
+        let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
+            self.scan_hot_branch_rows(request, &scope).await?
         } else {
             Vec::new()
         };
         if request.filter.untracked != Some(false) {
             let branch_ref_rows = scan_direct_branch_ref_rows(store, request, &scope).await?;
             if !branch_ref_rows.is_empty() {
-                tracked_branch_rows.push(TrackedBranchRows {
+                hot_branch_rows.push(HotBranchRows {
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
                     rows: branch_ref_rows,
                     ordered_unique: false,
@@ -193,24 +186,24 @@ where
         // resolver, so apply the retention predicate before taking that fast
         // path. Otherwise `untracked = Some(..)` accidentally returned both
         // member kinds from an already-unified group.
-        for branch_rows in &mut tracked_branch_rows {
+        for branch_rows in &mut hot_branch_rows {
             branch_rows
                 .rows
                 .retain(|row| current_row_matches_retention(row, request.filter.untracked));
         }
         if commit_derived_rows.is_empty()
             && let Some(index) =
-                ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
+                ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
             return Ok(finalize_ordered_unique_rows(
-                std::mem::take(&mut tracked_branch_rows[index].rows),
+                std::mem::take(&mut hot_branch_rows[index].rows),
                 request.filter.include_tombstones,
                 request.limit,
             ));
         }
         let mut rows = commit_derived_rows;
         rows.extend(
-            tracked_branch_rows
+            hot_branch_rows
                 .into_iter()
                 .flat_map(|branch_rows| branch_rows.rows),
         );
@@ -227,10 +220,10 @@ where
         ))
     }
 
-    /// Serves finite entity-PK scans from packed current-state groups. Every
-    /// member already has its retention tag, so an unrelated untracked row
-    /// cannot route the selected tracked identities through a separate scan.
-    async fn scan_direct_tracked_pk_groups(
+    /// Serves finite entity-PK scans from the hot current-state index. Every
+    /// row already has its retention tag, so an unrelated untracked row
+    /// cannot route selected tracked identities through a separate scan.
+    async fn scan_direct_entity_pk_rows(
         &self,
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
@@ -265,14 +258,11 @@ where
             return Ok(None);
         };
         let tracked_request = tracked_scan_request_from_live(request);
-        let Some(rows_by_branch) = self
+        let rows_by_branch = self
             .tracked_head
             .reader(&self.store)
-            .scan_live_rows_for_current_controls(&controls, &tracked_request)
-            .await?
-        else {
-            return Ok(None);
-        };
+            .scan_live_rows_for_controls(&controls, &tracked_request)
+            .await?;
         let rows = rows_by_branch
             .into_iter()
             .flat_map(|(_, rows)| rows)
@@ -357,11 +347,11 @@ where
             },
             ..Default::default()
         };
-        // Current-state groups are authoritative for both retention modes.
+        // The hot current-state rows are authoritative for both retention modes.
         // Even an untracked-only exact batch therefore needs the branch
         // controls that select the active generation; treating that request
         // as "not tracked" used to skip the controls entirely and made the
-        // workspace selector (an untracked row) invisible after V12 init.
+        // workspace selector (an untracked row) invisible after hot-index init.
         let scope = scan_scope(&self.store, &scope_request, true).await?;
         let visible_branch_ids = scope
             .projection_branch_ids
@@ -407,7 +397,6 @@ where
         let current_batches = stream::iter(identities_by_branch)
             .map(|(branch_id, identities)| {
                 let control = scope.branch_heads[&branch_id];
-                let commit_id = control.head_commit_id.to_string();
                 let projection = projection.clone();
                 async move {
                     let keys = identities
@@ -418,40 +407,11 @@ where
                             file_id: identity.file_id.clone(),
                         })
                         .collect::<Vec<_>>();
-                    let source = tracked_source_from_branch_id(&branch_id);
-                    let rows = if let Some(rows) = self
+                    let rows = self
                         .tracked_head
                         .reader(&self.store)
-                        .load_projected_live_rows_if_control_current(
-                            &branch_id,
-                            control,
-                            &keys,
-                            &projection,
-                        )
-                        .await?
-                    {
-                        rows
-                    } else {
-                        let untracked_rows = self
-                            .tracked_head
-                            .reader(&self.store)
-                            .load_untracked_projected_rows_for_generation(
-                                &branch_id,
-                                control.generation,
-                                &keys,
-                                &projection,
-                            )
-                            .await?;
-                        self.tracked_state
-                            .reader(&self.store)
-                            .load_projected_rows_at_commit(&commit_id, &keys, &projection)
-                            .await?
-                            .into_iter()
-                            .map(|row| row.map(|row| project_tracked_row(row, &branch_id, source)))
-                            .zip(untracked_rows)
-                            .map(|(tracked, untracked)| untracked.or(tracked))
-                            .collect()
-                    };
+                        .load_projected_live_rows(&branch_id, control, &keys, &projection)
+                        .await?;
                     Ok::<_, LixError>((identities, rows))
                 }
             })
@@ -521,27 +481,27 @@ where
         let scope = scan_scope(store, request, reads_tracked).await?;
         let commit_derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
-        let mut tracked_branch_rows = if !is_commit_derived_only_request(request) {
-            self.scan_tracked_branch_rows(request, &scope).await?
+        let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
+            self.scan_hot_branch_rows(request, &scope).await?
         } else {
             Vec::new()
         };
-        for branch_rows in &mut tracked_branch_rows {
+        for branch_rows in &mut hot_branch_rows {
             branch_rows.rows.retain(|row| !row.untracked);
         }
         if commit_derived_rows.is_empty()
             && let Some(index) =
-                ordered_unique_branch_row_index(&tracked_branch_rows, &scope.projection_branch_ids)
+                ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
             return Ok(finalize_ordered_unique_rows(
-                std::mem::take(&mut tracked_branch_rows[index].rows),
+                std::mem::take(&mut hot_branch_rows[index].rows),
                 request.filter.include_tombstones,
                 request.limit,
             ));
         }
         let mut rows = commit_derived_rows;
         rows.extend(
-            tracked_branch_rows
+            hot_branch_rows
                 .into_iter()
                 .flat_map(|branch_rows| branch_rows.rows),
         );
@@ -558,11 +518,11 @@ where
         ))
     }
 
-    async fn scan_tracked_branch_rows(
+    async fn scan_hot_branch_rows(
         &self,
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
-    ) -> Result<Vec<TrackedBranchRows>, LixError> {
+    ) -> Result<Vec<HotBranchRows>, LixError> {
         let store = &self.store;
         let tracked_request = tracked_scan_request_from_live(request);
         let branches = scope
@@ -579,51 +539,15 @@ where
             .map(|(branch_id, control)| {
                 let tracked_request = tracked_request.clone();
                 async move {
-                    let (rows, ordered_unique) = if let Some(rows) = self
+                    let rows = self
                         .tracked_head
                         .reader(store)
-                        .scan_live_rows_if_control_current(&branch_id, control, &tracked_request)
-                        .await?
-                    {
-                        (rows, true)
-                    } else {
-                        let mut rows = self
-                            .tracked_state
-                            .reader(store)
-                            .scan_rows_at_commit(
-                                &control.head_commit_id.to_string(),
-                                &tracked_request,
-                            )
-                            .await?
-                            .into_iter()
-                            .map(|row| {
-                                project_tracked_row(
-                                    row,
-                                    &branch_id,
-                                    tracked_source_from_branch_id(&branch_id),
-                                )
-                            })
-                            .collect::<Vec<_>>();
-                        // Lifecycle fallback reconstructs only tracked
-                        // history. The old serving generation remains the
-                        // workspace source of truth for untracked members
-                        // until the next complete generation is published.
-                        rows.extend(
-                            self.tracked_head
-                                .reader(store)
-                                .scan_untracked_rows_for_generation(
-                                    &branch_id,
-                                    control.generation,
-                                    &tracked_request,
-                                )
-                                .await?,
-                        );
-                        (rows, false)
-                    };
-                    Ok::<_, LixError>(TrackedBranchRows {
+                        .scan_live_rows(&branch_id, control, &tracked_request)
+                        .await?;
+                    Ok::<_, LixError>(HotBranchRows {
                         branch_id: branch_id.clone(),
                         rows,
-                        ordered_unique,
+                        ordered_unique: true,
                     })
                 }
             })
@@ -953,24 +877,22 @@ struct LiveStateScanScope {
     branch_heads: BranchHeads,
 }
 
-/// Rows read from one durable tracked branch source.
+/// Rows read from one durable hot-state branch source.
 ///
-/// A matching tracked-head projection is storage-key ordered by visible
-/// identity and has one row per identity. Immutable-root fallback rows retain
-/// their existing, more general materialization behavior and therefore never
-/// claim this fast-path contract.
-struct TrackedBranchRows {
+/// A matching hot-state projection is storage-key ordered by visible identity
+/// and has one row per identity.
+struct HotBranchRows {
     branch_id: String,
     rows: Vec<MaterializedLiveStateRow>,
     ordered_unique: bool,
 }
 
 /// Returns the only nonempty branch candidate when it can be served without
-/// overlay arbitration. Global rows, multiple requested branches, an
-/// immutable-root fallback, and staged/untracked candidates all stay on the
-/// general visibility path.
+/// branch/global visibility resolution. Global rows, multiple requested
+/// branches, and synthesized branch-ref candidates all stay on the general
+/// visibility path.
 fn ordered_unique_branch_row_index(
-    branch_rows: &[TrackedBranchRows],
+    branch_rows: &[HotBranchRows],
     projection_branch_ids: &[String],
 ) -> Option<usize> {
     let [requested_branch_id] = projection_branch_ids else {
@@ -1124,48 +1046,6 @@ async fn load_branch_head_control_ids(
         .collect())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrackedRowSource {
-    Global,
-    Branch,
-}
-
-fn tracked_source_from_branch_id(branch_id: &str) -> TrackedRowSource {
-    if branch_id == GLOBAL_BRANCH_ID {
-        TrackedRowSource::Global
-    } else {
-        TrackedRowSource::Branch
-    }
-}
-
-fn project_tracked_row(
-    row: MaterializedTrackedStateRow,
-    view_branch_id: &str,
-    source: TrackedRowSource,
-) -> MaterializedLiveStateRow {
-    MaterializedLiveStateRow {
-        entity_pk: row.entity_pk,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        snapshot_content: row.snapshot_content,
-        metadata: row.metadata,
-        deleted: row.deleted,
-        created_at: crate::common::LixTimestamp::expect_parse(
-            "tracked-state row created_at",
-            &row.created_at,
-        ),
-        updated_at: crate::common::LixTimestamp::expect_parse(
-            "tracked-state row updated_at",
-            &row.updated_at,
-        ),
-        global: source == TrackedRowSource::Global,
-        change_id: Some(row.change_id),
-        commit_id: Some(row.commit_id),
-        untracked: false,
-        branch_id: view_branch_id.into(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1179,7 +1059,9 @@ mod tests {
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
-    use crate::tracked_state::{TrackedStateDeltaRef, TrackedStateScanRequest};
+    use crate::tracked_state::{
+        MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
+    };
     use serde_json::json;
 
     const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -1271,7 +1153,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open packed-head write read");
+            .expect("open hot-state write read");
         let mut writes = StorageWriteSet::new();
         crate::init::stage_repository_protocol(&mut writes);
         let deltas = rows
@@ -1304,41 +1186,12 @@ mod tests {
                 None,
             )
             .await
-            .expect("stage packed direct head");
+            .expect("stage direct hot state");
         drop(read);
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
-            .expect("commit packed direct head");
-    }
-
-    async fn stage_direct_head_control(
-        storage: &StorageAdapter,
-        branch_id: &str,
-        head: CommitId,
-        tracked_head_is_current: bool,
-    ) {
-        let mut writes = StorageWriteSet::new();
-        crate::init::stage_repository_protocol(&mut writes);
-        crate::branch::stage_branch_head_control(
-            &mut writes,
-            branch_id,
-            BranchHeadControl {
-                head_commit_id: head,
-                generation: head,
-                tracked_head_is_current,
-                current_state_revision: 0,
-                working_diff_checkpoint_commit_id: None,
-                created_at: ts("2026-01-01T00:00:00Z"),
-                updated_at: ts("2026-01-01T00:00:00Z"),
-                ref_change_id: ChangeId::for_test_label(&format!("{branch_id}-branch-ref")),
-            },
-        )
-        .expect("stage direct branch control");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("commit direct branch control");
+            .expect("commit direct hot state");
     }
 
     fn finite_pk_scan_request(
@@ -1357,7 +1210,7 @@ mod tests {
         }
     }
 
-    async fn scan_direct_tracked_pk_groups_for_test(
+    async fn scan_direct_entity_pk_rows_for_test(
         live_state: &LiveStateContext,
         storage: &StorageAdapter,
         request: &LiveStateScanRequest,
@@ -1365,11 +1218,11 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open direct grouped scan read");
+            .expect("open direct hot-state scan read");
         let scope = scan_scope(&read, request, true).await?;
         live_state
             .reader(read)
-            .scan_direct_tracked_pk_groups(request, &scope)
+            .scan_direct_entity_pk_rows(request, &scope)
             .await
     }
 
@@ -1418,7 +1271,7 @@ mod tests {
     #[test]
     fn ordered_head_fast_path_requires_one_matching_branch_candidate() {
         let requested_branch_ids = vec!["branch".to_string()];
-        let branch = TrackedBranchRows {
+        let branch = HotBranchRows {
             branch_id: "branch".to_string(),
             rows: vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
@@ -1430,14 +1283,14 @@ mod tests {
             Some(0)
         );
 
-        let branch = TrackedBranchRows {
+        let branch = HotBranchRows {
             branch_id: "branch".to_string(),
             rows: vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
             )],
             ordered_unique: true,
         };
-        let global = TrackedBranchRows {
+        let global = HotBranchRows {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             rows: vec![tracked_row_at_with_commit(
                 GLOBAL_BRANCH_ID,
@@ -1450,10 +1303,10 @@ mod tests {
         assert_eq!(
             ordered_unique_branch_row_index(&[branch, global], &requested_branch_ids),
             None,
-            "a global candidate needs normal overlay arbitration"
+            "a global candidate needs normal branch/global resolution"
         );
 
-        let immutable_fallback = TrackedBranchRows {
+        let unordered_candidate = HotBranchRows {
             branch_id: "branch".to_string(),
             rows: vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
@@ -1461,9 +1314,9 @@ mod tests {
             ordered_unique: false,
         };
         assert_eq!(
-            ordered_unique_branch_row_index(&[immutable_fallback], &requested_branch_ids),
+            ordered_unique_branch_row_index(&[unordered_candidate], &requested_branch_ids),
             None,
-            "the immutable-root fallback does not make the table ordering promise"
+            "an unordered candidate does not make the table ordering promise"
         );
     }
 
@@ -1502,9 +1355,9 @@ mod tests {
                 std::slice::from_ref(&local_pk),
             )
             .await
-            .expect("global-overlaid entity scan should execute")
+            .expect("global entity scan should execute")
             .is_none(),
-            "a global tracked row requires the established overlay resolver"
+            "a global tracked row requires the established branch/global resolver"
         );
     }
 
@@ -1601,7 +1454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finite_pk_group_scan_returns_all_file_id_siblings() {
+    async fn finite_pk_hot_scan_returns_all_file_id_siblings() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let entity_pk = EntityPk::single("shared-entity");
@@ -1624,16 +1477,16 @@ mod tests {
         stage_direct_tracked_head_rows(
             &storage,
             GLOBAL_BRANCH_ID,
-            CommitId::for_test_label("grouped-siblings"),
+            CommitId::for_test_label("hot-row-siblings"),
             &rows,
         )
         .await;
 
         let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
-        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
-            .expect("direct grouped scan should execute")
-            .expect("finite tracked primary-key scan should use grouped route");
+            .expect("direct hot-state scan should execute")
+            .expect("finite tracked primary-key scan should use the hot route");
         let file_values = direct
             .iter()
             .map(|row| (row.file_id.as_deref(), row.snapshot_content.as_deref()))
@@ -1653,7 +1506,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finite_pk_group_scan_resolves_branch_override_and_tombstone_against_global() {
+    async fn finite_pk_hot_scan_resolves_branch_override_and_tombstone_against_global() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let entity_pk = EntityPk::single("shared-entity");
@@ -1685,10 +1538,10 @@ mod tests {
         .await;
 
         let request = finite_pk_scan_request("branch-a", "schema", vec![entity_pk.clone()]);
-        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
-            .expect("direct grouped scan should execute")
-            .expect("current branch and global controls should use grouped route");
+            .expect("direct hot-state scan should execute")
+            .expect("current branch and global controls should use the hot route");
         assert_eq!(direct.len(), 1);
         assert_eq!(direct[0].branch_id.as_ref(), "branch-a");
         assert!(!direct[0].global);
@@ -1717,10 +1570,10 @@ mod tests {
         )
         .await;
 
-        let hidden = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+        let hidden = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
-            .expect("direct grouped tombstone scan should execute")
-            .expect("current controls should retain the grouped route");
+            .expect("direct hot-state tombstone scan should execute")
+            .expect("current controls should retain the hot route");
         assert!(hidden.is_empty(), "local tombstone must hide global row");
         assert!(
             scan_rows_for_test(&live_state, &storage, &request)
@@ -1732,10 +1585,10 @@ mod tests {
         let mut including_tombstones = request.clone();
         including_tombstones.filter.include_tombstones = true;
         let tombstones =
-            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &including_tombstones)
+            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &including_tombstones)
                 .await
-                .expect("direct grouped tombstone scan should execute")
-                .expect("current controls should retain the grouped route");
+                .expect("direct hot-state tombstone scan should execute")
+                .expect("current controls should retain the hot route");
         assert_eq!(tombstones.len(), 1);
         assert!(tombstones[0].deleted);
         assert!(!tombstones[0].global);
@@ -1743,7 +1596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finite_pk_group_scan_serves_mixed_current_state() {
+    async fn finite_pk_hot_scan_serves_mixed_current_state() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
         let tracked_pk = EntityPk::single("tracked-entity");
@@ -1768,11 +1621,11 @@ mod tests {
             vec![tracked_pk.clone(), untracked_pk.clone()],
         );
         assert!(
-            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
                 .await
-                .expect("initial direct grouped scan should execute")
+                .expect("initial direct hot-state scan should execute")
                 .is_some(),
-            "the grouped current state serves tracked-only rows directly"
+            "the hot current state serves tracked-only rows directly"
         );
 
         let read = storage
@@ -1796,10 +1649,10 @@ mod tests {
         )
         .await;
 
-        let direct = scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+        let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
-            .expect("mixed grouped scan should execute")
-            .expect("one current-state group serves both retention modes");
+            .expect("mixed hot-state scan should execute")
+            .expect("one hot index serves both retention modes");
         assert_eq!(direct.len(), 2);
         let rows = scan_rows_for_test(&live_state, &storage, &request)
             .await
@@ -1857,9 +1710,9 @@ mod tests {
         let mut request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
         request.filter.file_ids = vec![NullableKeyFilter::Value("file-a".to_string())];
         assert!(
-            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
+            scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
                 .await
-                .expect("file-filtered direct grouped scan should execute")
+                .expect("file-filtered direct hot-state scan should execute")
                 .is_none(),
             "an explicit file-id predicate must retain the member projection route"
         );
@@ -1871,61 +1724,6 @@ mod tests {
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some(r#"{"value":"a"}"#)
-        );
-    }
-
-    #[tokio::test]
-    async fn noncurrent_control_falls_back_to_historical_root_for_finite_pk_scan() {
-        let storage = StorageAdapter::new(Memory::new());
-        let live_state = live_state_context();
-        let entity_pk = EntityPk::single("historical-entity");
-        let mut historical = tracked_row_at_with_commit(
-            GLOBAL_BRANCH_ID,
-            "historical",
-            Some("history-change"),
-            "history-head",
-        );
-        historical.schema_key = "schema".to_string();
-        historical.entity_pk = entity_pk.clone();
-
-        let read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open historical root write read");
-        let mut writes = StorageWriteSet::new();
-        let mut json_writer = JsonStoreContext::new().writer();
-        stage_materialized_live_rows(&read, &mut writes, &mut json_writer, &[historical])
-            .await
-            .expect("historical tracked root should stage");
-        drop(read);
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("historical tracked root should commit");
-        stage_direct_head_control(
-            &storage,
-            GLOBAL_BRANCH_ID,
-            CommitId::for_test_label("history-head"),
-            false,
-        )
-        .await;
-
-        let request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
-        assert!(
-            scan_direct_tracked_pk_groups_for_test(&live_state, &storage, &request)
-                .await
-                .expect("noncurrent grouped scan should execute")
-                .is_none(),
-            "a noncurrent control must request the historical fallback"
-        );
-        let rows = scan_rows_for_test(&live_state, &storage, &request)
-            .await
-            .expect("historical fallback scan should execute");
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].untracked);
-        assert_eq!(
-            rows[0].snapshot_content.as_deref(),
-            Some(r#"{"value":"historical"}"#)
         );
     }
 
@@ -2005,10 +1803,10 @@ mod tests {
                 .push(row);
         }
 
-        // A branch ref selects a fresh current-state generation. Its tracked
+        // A branch ref selects a fresh hot-state generation. Its tracked
         // portion is reconstructed from the immutable root and its untracked
-        // portion is materialized into the same groups; no flat overlay or
-        // changelog record is involved for untracked rows.
+        // portion is materialized into the same snapshot; untracked rows have
+        // no changelog record.
         for (branch_id, (head_commit_id, created_at, updated_at)) in branch_refs {
             let branch_rows = rows_by_branch.remove(&branch_id).unwrap_or_default();
             let head_commit_id_text = head_commit_id.to_string();
@@ -2093,7 +1891,6 @@ mod tests {
                 BranchHeadControl {
                     head_commit_id,
                     generation,
-                    tracked_head_is_current: true,
                     current_state_revision: 0,
                     working_diff_checkpoint_commit_id: None,
                     created_at,
@@ -2804,7 +2601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_rows_overlays_requested_branch_over_global() {
+    async fn scan_rows_resolves_requested_branch_over_global() {
         let storage = StorageAdapter::new(Memory::new());
         let live_state = live_state_context();
 

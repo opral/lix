@@ -169,7 +169,6 @@ pub(crate) async fn seed_branch_head_with_rows(
         BranchHeadControl {
             head_commit_id: commit_id,
             generation,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: None,
             created_at: test_timestamp(),

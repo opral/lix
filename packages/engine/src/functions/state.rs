@@ -119,7 +119,7 @@ pub(crate) async fn stage_sequence(
             &mut working_diff_coverage,
         )
         .await?;
-    // The grouped current-state mutation is fenced by an actual control-byte
+    // The hot-state mutation is fenced by an actual control-byte
     // change. Merely restaging the old control would let two writers both
     // satisfy the same CAS after the first write, losing one group update.
     stage_branch_head_control(
@@ -151,26 +151,9 @@ async fn load_key_value_row(
         metadata: false,
     };
     let reader = TrackedHeadContext::new().reader(read);
-    let rows = if control.tracked_head_is_current {
-        reader
-            .load_projected_live_rows_if_control_current(
-                GLOBAL_BRANCH_ID,
-                control,
-                &keys,
-                &projection,
-            )
-            .await?
-            .unwrap_or_default()
-    } else {
-        reader
-            .load_untracked_projected_rows_for_generation(
-                GLOBAL_BRANCH_ID,
-                control.generation,
-                &keys,
-                &projection,
-            )
-            .await?
-    };
+    let rows = reader
+        .load_projected_live_rows(GLOBAL_BRANCH_ID, control, &keys, &projection)
+        .await?;
     Ok(rows
         .into_iter()
         .next()

@@ -992,9 +992,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn untracked_state_survives_checkpoint_replay_and_next_current_materialization() {
+    async fn untracked_state_survives_checkpoint_and_next_tracked_write() {
         let storage = Memory::new();
-        let receipt = Engine::initialize(storage.clone())
+        Engine::initialize(storage.clone())
             .await
             .expect("engine should initialize");
         let engine = Engine::new(storage.clone())
@@ -1017,25 +1017,26 @@ mod tests {
         session
             .create_checkpoint()
             .await
-            .expect("checkpoint should publish a replay-backed tracked head");
-        let read = StorageAdapter::new(storage.clone())
-            .begin_read(StorageReadOptions::default())
+            .expect("checkpoint should publish a complete hot state");
+
+        // A checkpoint publishes a full hot state immediately. Reads do not
+        // replay tracked history and then overlay retained untracked rows.
+        let checkpointed_row = session
+            .execute(
+                "SELECT value FROM json_pointer WHERE path = '/checkpointed'",
+                &[],
+            )
             .await
-            .expect("control read should open");
-        let control = crate::branch::BranchHeadControlContext::new()
-            .reader(read)
-            .load(&receipt.main_branch_id)
-            .await
-            .expect("main control should load")
-            .expect("main control should exist");
-        assert!(
-            !control.tracked_head_is_current,
-            "selected checkpoint publication deliberately serves tracked rows from history"
+            .expect("checkpointed tracked row should read from the hot state");
+        assert_eq!(
+            checkpointed_row.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("checkpointed value should decode"),
+            json!({"source": "tracked"})
         );
 
-        // A replay-backed tracked head must not make workspace state
-        // unwritable. This mutates its retained current-state generation only;
-        // it neither advances the commit graph nor resets tracked state.
+        // A checkpointed branch remains writable. This history-free mutation
+        // updates the same complete hot generation without advancing history.
         session
             .execute(
                 "INSERT INTO json_pointer (path, value, lixcol_untracked) \
@@ -1043,14 +1044,14 @@ mod tests {
                 &[],
             )
             .await
-            .expect("untracked row should write while tracked state replays");
+            .expect("untracked row should write against the complete hot state");
         let workspace_row = session
             .execute(
                 "SELECT value FROM json_pointer WHERE path = '/workspace'",
                 &[],
             )
             .await
-            .expect("untracked row should read through the replay fallback");
+            .expect("untracked row should read from the complete hot state");
         assert_eq!(
             workspace_row.rows()[0]
                 .get::<serde_json::Value>("value")
@@ -1058,16 +1059,15 @@ mod tests {
             json!({"source": "untracked"})
         );
 
-        // The next tracked child rebuilds a complete hot current-state
-        // generation from history and carries the history-free member forward.
+        // The next tracked child carries the history-free member forward.
         session
             .execute(
                 "INSERT INTO json_pointer (path, value) \
-                 VALUES ('/after-replay', lix_json('{\"source\":\"tracked\"}'))",
+                 VALUES ('/after-checkpoint', lix_json('{\"source\":\"tracked\"}'))",
                 &[],
             )
             .await
-            .expect("tracked child should rematerialize current state");
+            .expect("tracked child should publish the next complete hot state");
         let rows = session
             .execute("SELECT path FROM json_pointer ORDER BY path", &[])
             .await
@@ -1077,21 +1077,7 @@ mod tests {
                 .iter()
                 .map(|row| row.get::<String>("path").expect("row path"))
                 .collect::<Vec<_>>(),
-            ["/after-replay", "/checkpointed", "/workspace"]
-        );
-        let read = StorageAdapter::new(storage)
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("current-control read should open");
-        assert!(
-            crate::branch::BranchHeadControlContext::new()
-                .reader(read)
-                .load(&receipt.main_branch_id)
-                .await
-                .expect("main control should load")
-                .expect("main control should exist")
-                .tracked_head_is_current,
-            "the tracked child must publish one complete current-state generation"
+            ["/after-checkpoint", "/checkpointed", "/workspace"]
         );
     }
 
@@ -1177,21 +1163,21 @@ mod tests {
         let read = storage_adapter
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("read initialized head groups");
-        let groups = ScanPlan::prefix(
-            crate::live_state::TRACKED_HEAD_GROUP_SPACE,
+            .expect("read initialized hot rows");
+        let hot_rows = ScanPlan::prefix(
+            crate::live_state::HOT_ROW_SPACE,
             StoragePrefix {
                 bytes: Bytes::new(),
             },
         )
         .collect(&read, StorageScanOptions::default())
         .await
-        .expect("scan initialized head groups")
+        .expect("scan initialized hot rows")
         .value
         .entries;
         assert!(
-            !groups.is_empty(),
-            "initialized repository must have head groups"
+            !hot_rows.is_empty(),
+            "initialized repository must have hot rows"
         );
 
         let mut writes = storage_adapter.new_write_set();
@@ -1200,10 +1186,10 @@ mod tests {
             crate::init::REPOSITORY_PROTOCOL_KEY,
             &b"tracked-direct-plane.v8"[..],
         );
-        for group in groups {
+        for hot_row in hot_rows {
             writes.put(
-                crate::live_state::TRACKED_HEAD_GROUP_SPACE,
-                group.key,
+                crate::live_state::HOT_ROW_SPACE,
+                hot_row.key,
                 StorageValue {
                     bytes: Bytes::from_static(b"predecessor-head-bytes"),
                 },

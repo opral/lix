@@ -193,7 +193,6 @@ mod tests {
             BranchHeadControl {
                 head_commit_id: commit_id,
                 generation: commit_id,
-                tracked_head_is_current: false,
                 current_state_revision: 0,
                 working_diff_checkpoint_commit_id: None,
                 created_at: LixTimestamp::expect_parse(

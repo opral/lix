@@ -59,7 +59,7 @@ pub(crate) async fn load_change_records<S>(
     change_ids: impl Iterator<Item = ChangeId>,
 ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError>
 where
-    S: StorageAdapterRead,
+    S: StorageAdapterRead + ?Sized,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -98,7 +98,7 @@ pub(crate) async fn materialize_change_payloads<S>(
     owner: &str,
 ) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
 where
-    S: StorageAdapterRead,
+    S: StorageAdapterRead + ?Sized,
 {
     let mut unique = Vec::new();
     let mut seen = HashSet::new();
@@ -197,7 +197,7 @@ async fn load_json_values<S>(
     json_refs: &[JsonRef],
 ) -> Result<Vec<Option<Vec<u8>>>, LixError>
 where
-    S: StorageAdapterRead,
+    S: StorageAdapterRead + ?Sized,
 {
     if json_refs.is_empty() {
         return Ok(Vec::new());

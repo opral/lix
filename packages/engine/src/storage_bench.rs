@@ -218,9 +218,9 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
     &[
         crate::init::REPOSITORY_PROTOCOL_SPACE,
         crate::branch::BRANCH_HEAD_CONTROL_SPACE,
-        crate::live_state::TRACKED_HEAD_GROUP_SPACE,
-        crate::live_state::TRACKED_HEAD_MEMBER_SPACE,
-        crate::live_state::TRACKED_WORKING_DIFF_GROUP_SPACE,
+        crate::live_state::HOT_ROW_SPACE,
+        crate::live_state::HOT_FILE_SPACE,
+        crate::live_state::HOT_DIFF_SPACE,
         crate::live_state::TRACKED_WORKING_DIFF_MARKER_SPACE,
         crate::json_store::store::JSON_SPACE,
         crate::json_store::UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
