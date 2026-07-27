@@ -17,7 +17,7 @@ use crate::changelog::{
 };
 use crate::entity_pk::EntityPk;
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
-use crate::tracked_state::codec::{encode_key_ref, encode_value_ref};
+use crate::tracked_state::codec::{encode_key, encode_key_ref, encode_value_ref};
 use crate::tracked_state::diff::{
     TrackedStateDiff, TrackedStateDiffRequest, TrackedStateDiffRow, diff_commits,
 };
@@ -27,14 +27,17 @@ use crate::tracked_state::merge::{self, TrackedStateMergePlan};
 use crate::tracked_state::storage;
 use crate::tracked_state::tree::TrackedStateTree;
 use crate::tracked_state::types::{
-    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue, TrackedStateKey,
-    TrackedStateKeyRef, TrackedStateMutation, TrackedStateRootId, TrackedStateTreeScanRequest,
+    TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateIndexValue,
+    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateMutation,
+    TrackedStateRootId, TrackedStateTreeScanRequest,
 };
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateRootMutationRef,
     TrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TrackedStateIdentity {
@@ -1634,6 +1637,78 @@ where
                 primary_chunk_puts: 0,
             });
         }
+        let explicit_keys = deltas
+            .iter()
+            .map(|delta| TrackedStateKey {
+                schema_key: delta.schema_key.to_string(),
+                file_id: delta.file_id.map(str::to_string),
+                entity_pk: delta.entity_pk.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let mut cascade_mutations = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        if let Some(base_root) = base_root.as_ref() {
+            let staged_read = storage::TrackedStateStagedRead::new(
+                self.store,
+                self.staged_roots.values(),
+                &self.chunk_overlay,
+            )?;
+            let mut cascades = BTreeMap::<String, &TrackedStateDeltaRef<'_>>::new();
+            for delta in &deltas {
+                if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
+                    || delta.file_id.is_some()
+                    || !delta.deleted
+                {
+                    continue;
+                }
+                let file_id = delta.entity_pk.as_single_string().map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("file descriptor tombstone has invalid identity: {error}"),
+                    )
+                })?;
+                cascades.insert(file_id.to_string(), delta);
+            }
+            if !cascades.is_empty() {
+                let rows = self
+                    .tree
+                    .scan(
+                        &staged_read,
+                        base_root,
+                        &TrackedStateTreeScanRequest {
+                            file_ids: cascades
+                                .keys()
+                                .cloned()
+                                .map(NullableKeyFilter::Value)
+                                .collect(),
+                            include_tombstones: false,
+                            ..TrackedStateTreeScanRequest::default()
+                        },
+                    )
+                    .await?;
+                for (key, value) in rows {
+                    if explicit_keys.contains(&key) {
+                        continue;
+                    }
+                    let cascade = cascades
+                        .get(
+                            key.file_id
+                                .as_deref()
+                                .expect("file-filtered tracked row requires file id"),
+                        )
+                        .expect("tracked scan only returns requested cascade ids");
+                    cascade_mutations.insert(
+                        encode_key(&key),
+                        encode_value_ref(TrackedStateIndexValueRef {
+                            change_id: cascade.change_id,
+                            commit_id: cascade.commit_id,
+                            deleted: true,
+                            created_at: value.created_at(),
+                            updated_at: cascade.updated_at,
+                        }),
+                    );
+                }
+            }
+        }
         let parent_values = if let Some(base_root) = base_root.as_ref() {
             let keys = deltas
                 .iter()
@@ -1656,7 +1731,11 @@ where
         } else {
             vec![None; deltas.len()]
         };
-        let mut mutations = Vec::with_capacity(deltas.len());
+        let mut mutations = cascade_mutations
+            .into_iter()
+            .map(|(key, value)| TrackedStateMutation::put_encoded(key, value))
+            .collect::<Vec<_>>();
+        mutations.reserve(deltas.len());
         for (delta, parent_value) in deltas.iter().zip(parent_values.iter()) {
             let key = TrackedStateKey {
                 schema_key: delta.schema_key.to_string(),
@@ -1685,7 +1764,7 @@ where
                 file_id: delta.file_id,
                 entity_pk: delta.entity_pk,
             };
-            let value = crate::tracked_state::types::TrackedStateIndexValueRef {
+            let value = TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
                 deleted: delta.deleted,
@@ -1698,6 +1777,7 @@ where
                 encode_value_ref(value),
             ));
         }
+        let changed_rows = mutations.len();
         let result = self
             .tree
             .apply_mutations_with_overlay(
@@ -1721,7 +1801,7 @@ where
                     }]
                 })
                 .unwrap_or_default(),
-            changed_key_count: u64::try_from(deltas.len()).map_err(|_| {
+            changed_key_count: u64::try_from(changed_rows).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked_state commit_root changed key count exceeds u64",
@@ -1758,7 +1838,7 @@ where
         Ok(TrackedStateWriteReport {
             commit_id: typed_commit_id,
             root_id: result.root_id,
-            changed_rows: deltas.len(),
+            changed_rows,
             primary_chunk_puts: result.chunk_count,
         })
     }
@@ -1772,6 +1852,7 @@ where
         parent_commit_id: Option<&str>,
         mutation_count: usize,
         first_mutation_key: &[u8],
+        file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'a>>,
         mutations: I,
     ) -> Result<Option<TrackedStateWriteReport>, LixError>
     where
@@ -1823,17 +1904,24 @@ where
             return Ok(None);
         }
 
-        let result = self
+        let (result, cascaded_rows) = self
             .tree
             .merge_and_stage_ordered_parent_mutations(
                 self.store,
                 self.writes,
                 &mut self.chunk_overlay,
                 &parent_metadata.root_id,
+                file_delete_cascades,
                 mutations,
                 Some(commit_id),
             )
             .await?;
+        let changed_rows = mutation_count.checked_add(cascaded_rows).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_root changed key count exceeds usize",
+            )
+        })?;
         let metadata = TrackedStateCommitRoot {
             commit_id: typed_commit_id,
             root_id: result.root_id.clone(),
@@ -1841,7 +1929,12 @@ where
                 commit_id: typed_parent_commit_id,
                 root_id: parent_metadata.root_id,
             }],
-            changed_key_count: mutation_count_u64,
+            changed_key_count: u64::try_from(changed_rows).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_root changed key count exceeds u64",
+                )
+            })?,
             row_count_estimate: u64::try_from(result.row_count).map_err(|_| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -1873,7 +1966,7 @@ where
         Ok(Some(TrackedStateWriteReport {
             commit_id: typed_commit_id,
             root_id: result.root_id,
-            changed_rows: mutation_count,
+            changed_rows,
             primary_chunk_puts: result.chunk_count,
         }))
     }
@@ -2192,6 +2285,7 @@ mod tests {
                     Some(&parent_commit_id),
                     child_rows.len(),
                     &first_child_key,
+                    &BTreeMap::new(),
                     child_rows.iter().map(|row| {
                         Ok(TrackedStateRootMutationRef {
                             delta: delta_from_materialized_row(row),
@@ -2329,6 +2423,7 @@ mod tests {
                 Some(&parent_commit_id),
                 child_rows.len(),
                 &first_child_key,
+                &BTreeMap::new(),
                 child_rows.iter().map(|row| {
                     Ok(TrackedStateRootMutationRef {
                         delta: delta_from_materialized_row(row),
@@ -2378,6 +2473,7 @@ mod tests {
                     Some(&parent_commit_id),
                     child_rows.len(),
                     &first_child_key,
+                    &BTreeMap::new(),
                     child_rows.iter().enumerate().map(|(index, row)| {
                         Ok(TrackedStateRootMutationRef {
                             delta: delta_from_materialized_row(row),
@@ -2429,6 +2525,7 @@ mod tests {
                     Some(&parent_commit_id),
                     child_rows.len(),
                     &first_child_key,
+                    &BTreeMap::new(),
                     child_rows.iter().map(|row| {
                         Ok(TrackedStateRootMutationRef {
                             delta: delta_from_materialized_row(row),
@@ -4105,6 +4202,81 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn file_descriptor_delete_cascade_survives_root_rebuild_and_recreate() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        let mut descriptor = row("file-a", "descriptor-create", "initial");
+        descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        let mut semantic = row("line-1", "semantic-create", "initial");
+        semantic.file_id = Some("file-a".to_string());
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "initial",
+            None,
+            &[descriptor.clone(), semantic],
+        )
+        .await
+        .expect("initial root should write");
+
+        let mut descriptor_delete = descriptor.clone();
+        descriptor_delete.snapshot_content = None;
+        descriptor_delete.deleted = true;
+        descriptor_delete.change_id = ChangeId::for_test_label("descriptor-delete");
+        descriptor_delete.commit_id = CommitId::for_test_label("delete");
+        descriptor_delete.updated_at = "2026-01-02T00:00:00Z".to_string();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "delete",
+            Some("initial"),
+            &[descriptor_delete],
+        )
+        .await
+        .expect("delete root should write");
+
+        descriptor.change_id = ChangeId::for_test_label("descriptor-recreate");
+        descriptor.commit_id = CommitId::for_test_label("recreate");
+        descriptor.updated_at = "2026-01-03T00:00:00Z".to_string();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "recreate",
+            Some("delete"),
+            &[descriptor],
+        )
+        .await
+        .expect("recreate root should write");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        let rows = tracked_state
+            .reader(read)
+            .scan_rows_at_commit(
+                "recreate",
+                &TrackedStateScanRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        include_tombstones: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("recreated root should scan");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].deleted);
+        assert_eq!(
+            rows[0].change_id,
+            ChangeId::for_test_label("descriptor-delete")
+        );
+    }
+
     async fn delete_root_chunk_for_test(storage: &StorageAdapter, commit_id: &str) {
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -4178,7 +4350,7 @@ mod tests {
                     ),
                 };
                 TrackedStateMutation::put_encoded(
-                    crate::tracked_state::codec::encode_key(&key),
+                    encode_key(&key),
                     crate::tracked_state::codec::encode_value(&value),
                 )
             })

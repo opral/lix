@@ -76,11 +76,6 @@ impl Domain {
         &self.file_scope
     }
 
-    #[expect(clippy::ref_option)]
-    pub(crate) fn is_exact_file(&self, file_id: &Option<String>) -> bool {
-        matches!(&self.file_scope, DomainFileScope::Exact(exact) if exact == file_id)
-    }
-
     pub(crate) fn with_untracked(&self, untracked: bool) -> Self {
         Self {
             branch_id: self.branch_id.clone(),
@@ -161,10 +156,6 @@ impl Domain {
     }
 
     pub(crate) fn branch_descriptor_domains_for_ref_delete(&self) -> Vec<Self> {
-        self.source_domains_that_can_reach()
-    }
-
-    pub(crate) fn file_scoped_row_domains_for_file_descriptor_delete(&self) -> Vec<Self> {
         self.source_domains_that_can_reach()
     }
 

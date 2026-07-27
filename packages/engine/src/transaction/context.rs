@@ -2706,6 +2706,12 @@ where
 
         let mut state_groups = BTreeMap::<PluginStateGroupKey, PluginStateGroup>::new();
         for (key, owner) in &owners {
+            // Descriptor deletion cascades file-scoped current state in the
+            // head materializer. Avoid hydrating the full plugin graph only
+            // to persist one historical tombstone per semantic entity.
+            if deleted_file_keys.contains_key(key) {
+                continue;
+            }
             let selected = selected_plugins.get(key);
             let semantic = semantic_groups.get(key).map(|group| &group.plugin);
             // A same-owner v2 write is authorized by an exact document
@@ -3731,43 +3737,23 @@ where
             reconciled_file_keys.insert(file_key);
         }
 
-        for (file_key, metadata) in deleted_file_keys {
+        for (file_key, _metadata) in deleted_file_keys {
             if reconciled_file_keys.contains(&file_key) {
                 continue;
             }
             reconciliation
                 .rows
                 .extend(self.v2_id_reservation_tombstones(&file_key).await?);
-            let Some(owner) = owners.get(&file_key) else {
+            if !owners.contains_key(&file_key) {
                 reconciliation.remove_session_file_view(SessionFileViewKey::new(
                     &file_key.branch_id,
                     &file_key.file_id,
                 ));
                 continue;
-            };
+            }
             reconciliation.remove_session_file_view(SessionFileViewKey::new(
                 &file_key.branch_id,
                 &file_key.file_id,
-            ));
-            let active_state = state_by_file
-                .get(&PluginStateFileKey {
-                    branch_id: file_key.branch_id.clone(),
-                    plugin_key: owner.plugin_key().to_string(),
-                    file_id: file_key.file_id.clone(),
-                })
-                .cloned()
-                .unwrap_or_default();
-            let context = FilesystemRowContext {
-                branch_id: file_key.branch_id.clone(),
-                global: false,
-                untracked: false,
-                file_id: None,
-                metadata,
-            };
-            reconciliation.rows.extend(plugin_state_tombstone_rows(
-                &active_state,
-                &file_key.file_id,
-                &context,
             ));
             reconciliation.rows.push(PluginFileOwner::delete_row(
                 file_key.file_id,
