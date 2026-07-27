@@ -1354,6 +1354,7 @@ where
                     &parsed,
                     &options,
                     &statement_metadata,
+                    telemetry_sink.as_ref(),
                 )
                 .await?
                 {
@@ -2189,6 +2190,7 @@ async fn try_execute_transaction_parameter_batch<StorageImpl>(
     parsed: &[DataFusionStatement],
     options: &ExecuteOptions,
     statement_metadata: &[ExecuteStatementMetadata],
+    telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
 ) -> Result<Option<Vec<ExecuteResult>>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -2226,7 +2228,7 @@ where
     .await;
     transaction.replace_origin_key(previous_origin_key);
 
-    execution
+    let result = execution
         .map(|results| {
             results.map(|results| {
                 results
@@ -2235,7 +2237,65 @@ where
                     .collect()
             })
         })
-        .map_err(|error| normalize_sql_surface_error(error, &first_statement.sql))
+        .map_err(|error| {
+            let error = normalize_sql_surface_error(error, &first_statement.sql);
+            if batch_statement_index(&error).is_some() {
+                error
+            } else {
+                with_batch_statement_index(error, 0)
+            }
+        });
+    finish_parameter_batch_statement_telemetry(telemetry_sink, statements, &result);
+    result
+}
+
+fn finish_parameter_batch_statement_telemetry(
+    telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
+    statements: &[ExecuteBatchStatement],
+    result: &Result<Option<Vec<ExecuteResult>>, LixError>,
+) {
+    match result {
+        Ok(Some(results)) => {
+            for (statement_index, (statement, result)) in statements.iter().zip(results).enumerate()
+            {
+                let Some(telemetry) = SqlStatementTelemetry::start(
+                    telemetry_sink,
+                    &statement.sql,
+                    "batch",
+                    Some(statement_index),
+                ) else {
+                    continue;
+                };
+                telemetry.finish(&Ok(result.clone()));
+            }
+        }
+        Err(error) => {
+            let statement_index = batch_statement_index(error).unwrap_or(0);
+            let Some(statement) = statements.get(statement_index) else {
+                return;
+            };
+            let Some(telemetry) = SqlStatementTelemetry::start(
+                telemetry_sink,
+                &statement.sql,
+                "batch",
+                Some(statement_index),
+            ) else {
+                return;
+            };
+            telemetry.finish(&Err(error.clone()));
+        }
+        Ok(None) => {}
+    }
+}
+
+fn batch_statement_index(error: &LixError) -> Option<usize> {
+    error
+        .details
+        .as_ref()
+        .and_then(JsonValue::as_object)
+        .and_then(|details| details.get("statementIndex"))
+        .and_then(JsonValue::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
 }
 
 async fn execute_transaction_write_auto<StorageImpl>(
@@ -3090,8 +3150,11 @@ fn sql_uses_public_filesystem_path_surface(sql: &str) -> bool {
 mod tests {
     use super::*;
     use crate::entity_pk::EntityPk;
+    use crate::telemetry::{
+        CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
+    };
     use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-    use crate::{Engine, Memory};
+    use crate::{Engine, EngineOptions, Memory};
 
     async fn open_session() -> SessionContext<Memory> {
         let storage = Memory::default();
@@ -3101,6 +3164,26 @@ mod tests {
         let engine = Engine::new(storage)
             .await
             .expect("initialized storage should create engine");
+        engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open")
+    }
+
+    async fn open_session_with_telemetry(
+        spans: Arc<std::sync::Mutex<Vec<CompletedTelemetrySpan>>>,
+    ) -> SessionContext<Memory> {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let sink = CallbackTelemetrySink::new(move |span| {
+            spans.lock().expect("telemetry span lock").push(span);
+        });
+        let engine =
+            Engine::new_with_options(storage, EngineOptions::new().with_telemetry(Arc::new(sink)))
+                .await
+                .expect("initialized storage should create engine");
         engine
             .open_workspace_session()
             .await
@@ -3575,6 +3658,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_keeps_parameterless_updates_sequential() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameterless_batch_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameterless_batch_probe (id, value) VALUES ('a', 'old')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let sql = "UPDATE parameterless_batch_probe SET value = 'new' WHERE id = 'a'";
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: Vec::new(),
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: Vec::new(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        let row = session
+            .execute(
+                "SELECT value FROM parameterless_batch_probe WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.rows()[0].get::<String>("value").unwrap(), "new");
+    }
+
+    #[tokio::test]
     async fn execute_batch_keeps_inter_row_constraints_on_sequential_execution() {
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -3695,6 +3843,130 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "old-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "old-b");
+    }
+
+    #[tokio::test]
+    async fn execute_batch_parameter_batch_indexes_parameter_count_errors() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_count_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let sql = "UPDATE parameter_batch_count_probe SET value = $1 WHERE id = $2";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-a".to_string()),
+                        Value::Text("a".to_string()),
+                        Value::Text("extra".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-b".to_string()),
+                        Value::Text("b".to_string()),
+                        Value::Text("extra".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("extra parameters must be rejected");
+
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_parameter_batch_emits_statement_telemetry() {
+        let spans = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let session = open_session_with_telemetry(Arc::clone(&spans)).await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_telemetry_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameter_batch_telemetry_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+        spans.lock().expect("telemetry span lock").clear();
+
+        let sql = "UPDATE parameter_batch_telemetry_probe SET value = $1 WHERE id = $2";
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-a".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-b".to_string()),
+                        Value::Text("b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        let spans = spans.lock().expect("telemetry span lock");
+        let query_spans = spans
+            .iter()
+            .filter(|span| span.start.kind == TelemetrySpanKind::SqlQuery)
+            .collect::<Vec<_>>();
+        assert_eq!(query_spans.len(), 2);
+        for (index, span) in query_spans.into_iter().enumerate() {
+            assert!(span.start.attributes.iter().any(|attribute| {
+                attribute.key == "lix.sql.fingerprint"
+                    && matches!(&attribute.value, TelemetryValue::String(value) if !value.is_empty())
+            }));
+            assert!(span.start.attributes.iter().any(|attribute| {
+                attribute.key == "lix.batch.index"
+                    && attribute.value == TelemetryValue::U64(index as u64)
+            }));
+            assert!(span.end.attributes.iter().any(|attribute| {
+                attribute.key == "lix.rows_affected" && attribute.value == TelemetryValue::U64(1)
+            }));
+        }
     }
 
     #[tokio::test]

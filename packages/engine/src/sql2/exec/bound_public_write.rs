@@ -28,12 +28,14 @@ use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use super::SqlWriteResult;
 
 #[cfg(test)]
-static ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+std::thread_local! {
+    static ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn take_entity_update_parameter_batch_executions() -> usize {
-    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.swap(0, std::sync::atomic::Ordering::Relaxed)
+    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -145,7 +147,9 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     #[cfg(test)]
-    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+        executions.set(executions.get() + 1);
+    });
     Ok(Some(
         affected_by_statement
             .into_iter()

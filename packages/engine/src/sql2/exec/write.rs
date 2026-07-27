@@ -133,14 +133,20 @@ pub(crate) fn parameter_record_batch(rows: &[&[Value]]) -> Result<Option<RecordB
     if rows.iter().any(|row| row.len() != first.len()) {
         return Ok(None);
     }
+    if first.is_empty() {
+        // An empty-schema RecordBatch has no array from which Arrow can infer
+        // row cardinality. Keep parameterless statements on sequential
+        // execution rather than silently turning a non-empty batch into zero
+        // rows.
+        return Ok(None);
+    }
 
     let mut fields = Vec::with_capacity(first.len());
     let mut columns = Vec::with_capacity(first.len());
     for column_index in 0..first.len() {
         let Some(kind) = rows
             .iter()
-            .filter_map(|row| ParameterKind::from_value(&row[column_index]))
-            .next()
+            .find_map(|row| ParameterKind::from_value(&row[column_index]))
         else {
             // Arrow's untyped Null column cannot retain the SQL parameter's
             // eventual type. Keep an all-null column on sequential execution.
