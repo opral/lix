@@ -10,8 +10,8 @@ use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch}
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
-    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
+    StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -699,6 +699,7 @@ where
             read_scope,
             |read_store| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let plugin_cache_snapshot = read_store.snapshot_cache_key();
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -719,6 +720,7 @@ where
                     blob_reader,
                     self.plugin_host.clone(),
                     Some(file_view_collector.clone()),
+                    plugin_cache_snapshot,
                     &paths,
                 )
                 .await?;
@@ -1751,6 +1753,7 @@ where
                         blob_reader,
                         self.plugin_host.clone(),
                         file_view_collector.clone(),
+                        None,
                         &paths,
                     )
                     .await?
@@ -1940,6 +1943,7 @@ async fn hydrate_lix_file_data_result(
         blob_reader,
         plugin_host,
         session_file_views,
+        None,
         &paths,
     )
     .await?;

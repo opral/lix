@@ -1073,6 +1073,14 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
 }
 
 impl StorageRead for SlateDBRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        let publication_id = self
+            .publication_view
+            .as_ref()
+            .map_or(0, |view| view.publication_id);
+        Some((u128::from(self.snapshot.seq()) << 64) | u128::from(publication_id))
+    }
+
     fn get_many(
         &self,
         space: SpaceId,
@@ -2844,6 +2852,9 @@ mod tests {
 
         let before_update =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin old snapshot");
+        let before_update_cache_key = before_update
+            .snapshot_cache_key()
+            .expect("SlateDB read should expose a snapshot cache key");
         assert_eq!(
             block_on(before_update.get_many(
                 space,
@@ -2875,6 +2886,12 @@ mod tests {
 
         let after_update =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin new snapshot");
+        assert_ne!(
+            before_update_cache_key,
+            after_update
+                .snapshot_cache_key()
+                .expect("updated SlateDB read should expose a snapshot cache key")
+        );
         assert_eq!(
             block_on(after_update.get_many(
                 space,

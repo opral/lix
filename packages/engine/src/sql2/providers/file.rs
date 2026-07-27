@@ -639,6 +639,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
+    plugin_cache_snapshot: Option<u128>,
     paths: &BTreeSet<String>,
 ) -> Result<SqlQueryResult, LixError> {
     let base_schema = lix_file_schema();
@@ -671,12 +672,13 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
-        plugin_render_context_for_lix_file_scan(
+        plugin_render_context_for_lix_file_scan_cached(
             Arc::clone(&live_state),
             &request,
             plugin_host,
             &prepared,
             acknowledge_plugin_data,
+            plugin_cache_snapshot,
         )
         .await?
         .map(|context| context.with_session_file_views(session_file_views))
@@ -1630,7 +1632,7 @@ impl UpsertSupport for LixFileSpec {
         let plugin_rewrite_file_ids = if update_columns.updates_path() && !update_columns.data {
             let plugin_host = self.plugin_host.clone();
             let branches =
-                load_plugin_render_branches(Arc::clone(&live_state), &request, &plugin_host)
+                load_plugin_render_branches(Arc::clone(&live_state), &request, &plugin_host, None)
                     .await
                     .map_err(|error| {
                         DataFusionError::Execution(format!(
@@ -4970,11 +4972,32 @@ async fn plugin_render_context_for_lix_file_scan(
     prepared: &PreparedLixFileRows,
     include_blob_backed_candidates: bool,
 ) -> Result<Option<PluginRenderContext>, LixError> {
+    plugin_render_context_for_lix_file_scan_cached(
+        live_state,
+        request,
+        host,
+        prepared,
+        include_blob_backed_candidates,
+        None,
+    )
+    .await
+}
+
+async fn plugin_render_context_for_lix_file_scan_cached(
+    live_state: Arc<dyn LiveStateReader>,
+    request: &LiveStateScanRequest,
+    host: PluginRuntimeHost,
+    prepared: &PreparedLixFileRows,
+    include_blob_backed_candidates: bool,
+    cache_snapshot: Option<u128>,
+) -> Result<Option<PluginRenderContext>, LixError> {
     let candidates = prepared.plugin_owner_candidates(include_blob_backed_candidates);
     if candidates.is_empty() {
         return Ok(None);
     }
-    let branches = load_plugin_render_branches(Arc::clone(&live_state), request, &host).await?;
+    let branches =
+        load_plugin_render_branches(Arc::clone(&live_state), request, &host, cache_snapshot)
+            .await?;
     plugin_render_context_with_branches(
         live_state,
         host,
@@ -4989,6 +5012,7 @@ async fn load_plugin_render_branches(
     live_state: Arc<dyn LiveStateReader>,
     request: &LiveStateScanRequest,
     host: &PluginRuntimeHost,
+    cache_snapshot: Option<u128>,
 ) -> Result<BTreeMap<String, BranchPluginRenderContext>, LixError> {
     let branch_ids = request
         .filter
@@ -4997,38 +5021,56 @@ async fn load_plugin_render_branches(
         .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
         .cloned()
         .collect::<BTreeSet<_>>();
-    let registry_reads = branch_ids.into_iter().map(|branch_id| {
-        let live_state = Arc::clone(&live_state);
-        async move {
-            let rows = live_state
-                .scan_tracked_rows(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec!["lix_key_value".to_string()],
-                        entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
-                        branch_ids: vec![branch_id.clone()],
-                        file_ids: vec![crate::NullableKeyFilter::Null],
-                        untracked: Some(false),
-                        ..LiveStateFilter::default()
-                    },
-                    projection: plugin_control_live_state_projection(),
-                    limit: Some(1),
-                })
-                .await?;
-            let row = rows.into_iter().find(|row| {
-                row.schema_key == "lix_key_value"
-                    && row.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
-                    && row.file_id.is_none()
-                    && row.branch_id.as_ref() == branch_id.as_str()
-                    && !row.global
-                    && !row.untracked
+    let cached = match cache_snapshot {
+        Some(snapshot) => host.cached_plugin_registries(snapshot, &branch_ids)?,
+        None => None,
+    };
+    let registries = match cached {
+        Some(registries) => registries,
+        None => {
+            let registry_reads = branch_ids.iter().cloned().map(|branch_id| {
+                let live_state = Arc::clone(&live_state);
+                async move {
+                    let rows = live_state
+                        .scan_tracked_rows(&LiveStateScanRequest {
+                            filter: LiveStateFilter {
+                                schema_keys: vec!["lix_key_value".to_string()],
+                                entity_pks: vec![EntityPk::single(PLUGIN_REGISTRY_KEY)],
+                                branch_ids: vec![branch_id.clone()],
+                                file_ids: vec![crate::NullableKeyFilter::Null],
+                                untracked: Some(false),
+                                ..LiveStateFilter::default()
+                            },
+                            projection: plugin_control_live_state_projection(),
+                            limit: Some(1),
+                        })
+                        .await?;
+                    let row = rows.into_iter().find(|row| {
+                        row.schema_key == "lix_key_value"
+                            && row.entity_pk.as_single_string().ok() == Some(PLUGIN_REGISTRY_KEY)
+                            && row.file_id.is_none()
+                            && row.branch_id.as_ref() == branch_id.as_str()
+                            && !row.global
+                            && !row.untracked
+                    });
+                    let registry =
+                        PluginRegistry::from_optional_live_state_row(row.as_ref(), &branch_id)?;
+                    Ok::<_, LixError>((branch_id, registry))
+                }
             });
-            let registry = PluginRegistry::from_optional_live_state_row(row.as_ref(), &branch_id)?;
-            Ok::<_, LixError>((branch_id, registry))
+            let registries = try_join_all(registry_reads)
+                .await?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            if let Some(snapshot) = cache_snapshot {
+                host.cache_plugin_registries(snapshot, &registries)?;
+            }
+            registries
         }
-    });
+    };
 
     let mut branches = BTreeMap::<String, BranchPluginRenderContext>::new();
-    for (branch_id, registry) in try_join_all(registry_reads).await? {
+    for (branch_id, registry) in registries {
         if registry.is_empty() {
             continue;
         }

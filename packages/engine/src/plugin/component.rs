@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
@@ -44,6 +44,12 @@ struct CachedPluginV2Factory {
     factory: Arc<dyn WasmComponentV2Factory>,
 }
 
+#[derive(Default)]
+struct PluginRegistryReadCache {
+    snapshot: Option<u128>,
+    registries: BTreeMap<String, PluginRegistry>,
+}
+
 #[derive(Clone)]
 pub(crate) struct PluginRuntimeHost {
     wasm_runtime: Arc<dyn WasmRuntime>,
@@ -52,6 +58,7 @@ pub(crate) struct PluginRuntimeHost {
     plugin_actor_cache: PluginActorCache,
     plugin_v2_transition_counters: Arc<Mutex<WasmTransitionCounters>>,
     plugin_catalog_cache: Arc<Mutex<PluginCatalogCache>>,
+    plugin_registry_read_cache: Arc<Mutex<PluginRegistryReadCache>>,
     /// Ordinary plugin writes share this gate; lifecycle replacements take it
     /// exclusively. The guards live on transactions through durable commit,
     /// closing the owner-preflight/registry-swap race without serializing
@@ -81,6 +88,7 @@ impl PluginRuntimeHost {
             plugin_actor_cache: PluginActorCache::new(max_live_file_actors)?,
             plugin_v2_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
             plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
+            plugin_registry_read_cache: Arc::new(Mutex::new(PluginRegistryReadCache::default())),
             plugin_generation_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
@@ -116,6 +124,52 @@ impl PluginRuntimeHost {
                 )
             })?
             .get_or_compile(registry)
+    }
+
+    pub(crate) fn cached_plugin_registries(
+        &self,
+        snapshot: u128,
+        branch_ids: &BTreeSet<String>,
+    ) -> Result<Option<BTreeMap<String, PluginRegistry>>, LixError> {
+        let cache = self.plugin_registry_read_cache.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin registry read cache lock poisoned",
+            )
+        })?;
+        if cache.snapshot != Some(snapshot) {
+            return Ok(None);
+        }
+        let registries = branch_ids
+            .iter()
+            .map(|branch_id| {
+                cache
+                    .registries
+                    .get(branch_id)
+                    .cloned()
+                    .map(|registry| (branch_id.clone(), registry))
+            })
+            .collect::<Option<BTreeMap<_, _>>>();
+        Ok(registries)
+    }
+
+    pub(crate) fn cache_plugin_registries(
+        &self,
+        snapshot: u128,
+        registries: &BTreeMap<String, PluginRegistry>,
+    ) -> Result<(), LixError> {
+        let mut cache = self.plugin_registry_read_cache.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin registry read cache lock poisoned",
+            )
+        })?;
+        if cache.snapshot != Some(snapshot) {
+            cache.snapshot = Some(snapshot);
+            cache.registries.clear();
+        }
+        cache.registries.extend(registries.clone());
+        Ok(())
     }
 
     pub(crate) fn actor_cache(&self) -> PluginActorCache {
@@ -222,6 +276,31 @@ mod tests {
                 .expect("custom limit should validate")
                 .max_memory_bytes,
             192 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn plugin_registry_read_cache_isolated_by_snapshot() {
+        let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
+        let branches = BTreeSet::from(["branch-a".to_string()]);
+        let registries = BTreeMap::from([("branch-a".to_string(), PluginRegistry::empty())]);
+
+        assert!(
+            host.cached_plugin_registries(7, &branches)
+                .expect("inspect empty cache")
+                .is_none()
+        );
+        host.cache_plugin_registries(7, &registries)
+            .expect("cache registry");
+        assert_eq!(
+            host.cached_plugin_registries(7, &branches)
+                .expect("read matching snapshot"),
+            Some(registries)
+        );
+        assert!(
+            host.cached_plugin_registries(8, &branches)
+                .expect("read different snapshot")
+                .is_none()
         );
     }
 
