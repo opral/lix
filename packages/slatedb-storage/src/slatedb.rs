@@ -95,6 +95,7 @@ pub struct SlateDBRead {
 pub struct SlateDBWrite {
     worker: SlateDBWorker,
     _writer_permit: OwnedMutexGuard<()>,
+    await_durable: bool,
     base: Option<Arc<DbSnapshot>>,
     overlay: BTreeMap<Key, Option<Bytes>>,
     stats: WriteStats,
@@ -322,6 +323,10 @@ impl Storage for SlateDB {
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 _writer_permit: writer_permit,
+                // The engine sets this only for the atomic mutation plus
+                // idempotency-receipt commit. Its replay contract requires a
+                // durable receipt before the request can be acknowledged.
+                await_durable: opts.idempotency_key.is_some(),
                 base: None,
                 overlay: BTreeMap::new(),
                 stats: WriteStats::default(),
@@ -655,6 +660,7 @@ impl StorageWrite for SlateDBWrite {
             let Self {
                 worker,
                 _writer_permit: writer_permit,
+                await_durable,
                 overlay,
                 stats,
                 ..
@@ -679,16 +685,16 @@ impl StorageWrite for SlateDBWrite {
                     db.write_with_options(
                         batch,
                         &SlateDBWriteOptions {
-                            await_durable: false,
+                            await_durable,
                             ..SlateDBWriteOptions::default()
                         },
                     )
                     .await
                     .map_err(slatedb_error)?;
-                    // SlateDB owns WAL durability. Returning here makes the
-                    // commit visible immediately while its background flusher
-                    // batches this write with nearby commits. `flush()` is
-                    // the explicit remote-durability barrier.
+                    // Ordinary commits return after local publication while
+                    // SlateDB batches their WAL upload. Receipt-bearing
+                    // idempotent commits instead wait for that upload so a
+                    // durable replay proof exists before acknowledgement.
                     Ok(CommitResult {
                         commit_id: None,
                         stats,

@@ -638,6 +638,11 @@ where
         }
         if let Some((key, value)) = transaction.idempotency_receipt.take() {
             writes.put(EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, key.clone(), value);
+            // The mutation and this receipt share one atomic storage commit.
+            // A protocol acknowledgement may replay only from a durable
+            // receipt, so ask the storage to cross its durability boundary
+            // before it reports this commit as successful.
+            write_options.idempotency_key = Some(key.0.clone());
             write_options
                 .preconditions
                 .push(StoragePrecondition::KeyAbsent {
