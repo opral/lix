@@ -275,9 +275,10 @@ impl LixFileSpec {
         }
         let index = self
             .filesystem_path_index
-            .path_index(&FilesystemPathIndexRequest::new(
-                request.filter.branch_ids.clone(),
-            ))
+            .path_index(
+                &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                    .with_blob_refs(true),
+            )
             .await
             .map_err(lix_error_to_datafusion_error)?;
         Ok(Some(match target_file_ids {
@@ -438,13 +439,7 @@ impl LixFileSpec {
                             scan_exact_file_blob_rows(live_state.clone(), &request, file_ids).await
                         }
                         FileIdConstraint::All | FileIdConstraint::None => {
-                            scan_indexed_file_rows(
-                                live_state.clone(),
-                                &request,
-                                indexed_matches,
-                                true,
-                            )
-                            .await
+                            scan_indexed_file_rows(indexed_matches, true)
                         }
                     }
                     .map_err(lix_error_to_datafusion_error)?;
@@ -567,9 +562,11 @@ pub(crate) async fn execute_exact_lix_file_read(
     .await?;
 
     let index = filesystem_path_index
-        .path_index(&FilesystemPathIndexRequest::new(
-            request.filter.branch_ids.clone(),
-        ))
+        .path_index(
+            &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_blob_refs(true)
+                .with_cached_blob_data(column == ExactLixFileReadColumn::Data),
+        )
         .await?;
     let matches = match selector {
         ExactLixFileReadSelector::Id(file_id) => indexed_file_id_matches(
@@ -585,7 +582,7 @@ pub(crate) async fn execute_exact_lix_file_read(
             },
         ),
     };
-    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let rows = scan_indexed_file_rows(&matches, true)?;
     let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let load_data = column == ExactLixFileReadColumn::Data;
     let acknowledge_plugin_data = load_data && session_file_views.is_some();
@@ -635,7 +632,6 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
-    branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
@@ -653,22 +649,16 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             .expect("lix_file schema should have data")
             .clone(),
     ]));
-    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
-    let branch_binding = BranchBinding::active(active_branch_id);
-    request.filter.branch_ids = resolve_provider_branch_ids(
-        branch_ref.as_ref(),
-        &branch_binding,
-        request.filter.branch_ids,
-    )
-    .await?;
+    let request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
 
     let index = filesystem_path_index
-        .path_index(&FilesystemPathIndexRequest::new(
-            request.filter.branch_ids.clone(),
-        ))
+        .path_index(
+            &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_cached_blob_data(true),
+        )
         .await?;
     let matches = indexed_file_matches(index, &FilePathPredicate::In(paths.clone()));
-    let rows = scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true).await?;
+    let rows = scan_indexed_file_rows(&matches, true)?;
     let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
     let acknowledge_plugin_data = session_file_views.is_some();
     let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
@@ -808,9 +798,11 @@ impl TableSpec for LixFileSpec {
         } else {
             let index = self
                 .filesystem_path_index
-                .path_index(&FilesystemPathIndexRequest::new(
-                    request.filter.branch_ids.clone(),
-                ))
+                .path_index(
+                    &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                        .with_blob_refs(needs_blob_rows)
+                        .with_cached_blob_data(needs_data),
+                )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matches = if root_directory_filter {
@@ -935,18 +927,12 @@ impl TableSpec for LixFileSpec {
                         );
                     }
                     let mut prepared = if let Some(indexed_matches) = indexed_matches.as_ref() {
-                        let rows = scan_indexed_file_rows(
-                            Arc::clone(&live_state),
-                            &request,
-                            indexed_matches,
-                            needs_blob_rows,
-                        )
-                        .await
-                        .map_err(|error| {
-                            DataFusionError::Execution(format!(
-                                "sql2 indexed lix_file scan failed: {error}"
-                            ))
-                        })?;
+                        let rows = scan_indexed_file_rows(indexed_matches, needs_blob_rows)
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "sql2 indexed lix_file scan failed: {error}"
+                                ))
+                            })?;
                         prepare_indexed_lix_file_rows(indexed_matches, rows)
                     } else {
                         let rows = scan_lix_file_live_rows(
@@ -1459,9 +1445,10 @@ impl UpsertSupport for LixFileSpec {
         let indexed_matches = if target.kind() == UpsertConflictKind::Path {
             let index = self
                 .filesystem_path_index
-                .path_index(&FilesystemPathIndexRequest::new(
-                    request.filter.branch_ids.clone(),
-                ))
+                .path_index(
+                    &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                        .with_blob_refs(true),
+                )
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             Some(indexed_file_matches(index, &path_predicate))
@@ -1481,8 +1468,7 @@ impl UpsertSupport for LixFileSpec {
                     scan_exact_file_blob_rows(live_state.clone(), &request, file_ids).await
                 }
                 FileIdConstraint::All | FileIdConstraint::None => {
-                    scan_indexed_file_rows(live_state.clone(), &request, indexed_matches, true)
-                        .await
+                    scan_indexed_file_rows(indexed_matches, true)
                 }
             }
             .map_err(lix_error_to_datafusion_error)?;
@@ -1991,6 +1977,7 @@ impl PluginRenderContext {
 #[derive(Debug, Clone)]
 struct BlobRefRecord {
     blob_hash: String,
+    inline_data: Option<Vec<u8>>,
     live: MaterializedLiveStateRow,
 }
 
@@ -2045,6 +2032,32 @@ struct FileDescriptorSnapshot {
 struct BlobRefSnapshot {
     id: String,
     blob_hash: String,
+}
+
+fn blob_ref_record_from_live_row(
+    row: MaterializedLiveStateRow,
+) -> Result<Option<(FilesystemBlobRefKey, BlobRefRecord)>, LixError> {
+    if row.schema_key != BLOB_REF_SCHEMA_KEY {
+        return Ok(None);
+    }
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Ok(None);
+    };
+    let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
+        )
+    })?;
+    let key = FilesystemBlobRefKey::from_live_row(&row, snapshot.id);
+    Ok(Some((
+        key,
+        BlobRefRecord {
+            blob_hash: snapshot.blob_hash,
+            inline_data: None,
+            live: row,
+        },
+    )))
 }
 
 #[derive(Debug, Deserialize)]
@@ -4023,23 +4036,9 @@ fn prepare_lix_file_rows(
                 );
             }
             BLOB_REF_SCHEMA_KEY => {
-                let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-                    continue;
-                };
-                let snapshot: BlobRefSnapshot =
-                    serde_json::from_str(snapshot_content).map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
-                        )
-                    })?;
-                blob_rows.insert(
-                    FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
-                    BlobRefRecord {
-                        blob_hash: snapshot.blob_hash,
-                        live: row,
-                    },
-                );
+                if let Some((key, record)) = blob_ref_record_from_live_row(row)? {
+                    blob_rows.insert(key, record);
+                }
             }
             DERIVED_FILE_REF_SCHEMA_KEY => {
                 if let Some((key, record)) = derived_file_ref_record_from_live_row(row)? {
@@ -4115,6 +4114,7 @@ fn prepare_indexed_lix_file_rows(
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<PreparedLixFileRows, LixError> {
     let mut file_rows = BTreeMap::<FilesystemDescriptorKey, FileDescriptorRecord>::new();
+    let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut file_paths = BTreeMap::<FilesystemDescriptorKey, String>::new();
     let mut path_ordered_file_keys = Vec::with_capacity(matches.len());
     for entry in matches.entries() {
@@ -4134,30 +4134,21 @@ fn prepare_indexed_lix_file_rows(
                 live: entry.live_row(),
             },
         );
+        if let Some(blob_ref) = entry.blob_ref_live_row()
+            && let Some((blob_key, mut record)) = blob_ref_record_from_live_row(blob_ref.clone())?
+        {
+            record.inline_data = entry.cached_blob_data().map(|data| data.as_ref().to_vec());
+            blob_rows.insert(blob_key, record);
+        }
     }
 
-    let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, BlobRefRecord>::new();
     let mut derived_rows = BTreeMap::<FilesystemBlobRefKey, DerivedFileRefRecord>::new();
     for row in rows {
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-            continue;
-        };
         match row.schema_key.as_str() {
             BLOB_REF_SCHEMA_KEY => {
-                let snapshot: BlobRefSnapshot =
-                    serde_json::from_str(snapshot_content).map_err(|error| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
-                        )
-                    })?;
-                blob_rows.insert(
-                    FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
-                    BlobRefRecord {
-                        blob_hash: snapshot.blob_hash,
-                        live: row,
-                    },
-                );
+                if let Some((key, record)) = blob_ref_record_from_live_row(row)? {
+                    blob_rows.entry(key).or_insert(record);
+                }
             }
             DERIVED_FILE_REF_SCHEMA_KEY => {
                 if let Some((key, record)) = derived_file_ref_record_from_live_row(row)? {
@@ -4642,34 +4633,39 @@ async fn load_blob_bytes_for_files(
     }
     let mut keys = Vec::new();
     let mut hashes = Vec::new();
+    let mut bytes_by_key = BTreeMap::new();
     let mut remaining_by_key = BTreeMap::<FilesystemBlobRefKey, usize>::new();
     for file in file_rows.values() {
         let key = file.blob_ref_key();
         if let Some(row) = blob_rows.get(&key) {
             let remaining = remaining_by_key.entry(key.clone()).or_insert(0);
             if *remaining == 0 {
-                keys.push(key);
-                hashes.push(BlobHash::from_hex(&row.blob_hash)?);
+                if let Some(data) = &row.inline_data {
+                    bytes_by_key.insert(key.clone(), Some(data.clone()));
+                } else {
+                    keys.push(key);
+                    hashes.push(BlobHash::from_hex(&row.blob_hash)?);
+                }
             }
             *remaining += 1;
         }
     }
-    if keys.is_empty() {
-        return Ok(LoadedBlobBytes::default());
-    }
-    let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
-    if values.len() != keys.len() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "blob reader returned {} values for {} requested hashes",
-                values.len(),
-                keys.len()
-            ),
-        ));
+    if !keys.is_empty() {
+        let values = blob_reader.load_bytes_many(&hashes).await?.into_vec();
+        if values.len() != keys.len() {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "blob reader returned {} values for {} requested hashes",
+                    values.len(),
+                    keys.len()
+                ),
+            ));
+        }
+        bytes_by_key.extend(keys.into_iter().zip(values));
     }
     Ok(LoadedBlobBytes {
-        bytes_by_key: keys.into_iter().zip(values).collect(),
+        bytes_by_key,
         remaining_by_key,
     })
 }
@@ -5438,24 +5434,19 @@ async fn scan_lix_file_live_rows(
     Ok(rows)
 }
 
-async fn scan_indexed_file_rows(
-    live_state: Arc<dyn LiveStateReader>,
-    request: &LiveStateScanRequest,
+fn scan_indexed_file_rows(
     matches: &FilesystemPathSelection,
     needs_blob_rows: bool,
 ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
     if matches.is_empty() || !needs_blob_rows {
         return Ok(Vec::new());
     }
-    let file_ids = matches
+    Ok(matches
         .entries()
         .filter(|entry| entry.kind == FilesystemPathKind::File)
-        .map(|entry| entry.id().to_string())
-        .collect::<BTreeSet<_>>();
-    if file_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    scan_exact_file_blob_rows(live_state, request, &file_ids).await
+        .filter_map(FilesystemPathEntry::blob_ref_live_row)
+        .cloned()
+        .collect())
 }
 
 /// The derived proof is private plugin state, not part of the hot filesystem
@@ -7391,29 +7382,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_id_data_scan_uses_indexed_descriptor_and_only_scans_blob_rows() {
+    async fn file_id_data_scan_uses_indexed_descriptor_and_blob_rows() {
         let data = b"readme contents".to_vec();
-        let blob_hash = BlobHash::from_content(&data).to_hex();
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
-            )])
+            FilesystemPathIndex::from_live_rows(vec![
+                live_file_row(
+                    "file-readme",
+                    "branch-b",
+                    r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                ),
+                live_blob_ref_row(
+                    "file-readme",
+                    "branch-b",
+                    "file-readme",
+                    &BlobHash::from_content(&data).to_hex(),
+                    data.len(),
+                ),
+            ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
             "branch-b",
             Arc::new(RecordingLiveStateReader {
-                rows: vec![live_blob_ref_row(
-                    "file-readme",
-                    "branch-b",
-                    "file-readme",
-                    &blob_hash,
-                    data.len(),
-                )],
+                rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
             }),
             Arc::new(StaticFilesystemPathIndexReader {
@@ -7446,11 +7439,7 @@ mod tests {
         let requests = live_state_requests
             .lock()
             .expect("live-state request mutex should not be poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
@@ -7464,6 +7453,14 @@ mod tests {
         let outside_blob_hash = BlobHash::from_content(&outside_data).to_hex();
         let selected_change_id = ChangeId::for_test_label("selected-search-blob");
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
+        let mut selected_blob = live_blob_ref_row(
+            "file-selected",
+            "branch-b",
+            "file-selected",
+            &selected_blob_hash,
+            selected_data.len(),
+        );
+        selected_blob.change_id = Some(selected_change_id);
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
@@ -7491,6 +7488,7 @@ mod tests {
                     "branch-b",
                     r#"{"id":"file-outside","directory_id":"dir-other","name":"README.md"}"#,
                 ),
+                selected_blob.clone(),
             ])
             .expect("filesystem path index should build"),
         );
@@ -7520,15 +7518,7 @@ mod tests {
             "the range and contains predicates should exclude both the local non-match and outside root",
         );
 
-        let mut selected_blob = live_blob_ref_row(
-            "file-selected",
-            "branch-b",
-            "file-selected",
-            &selected_blob_hash,
-            selected_data.len(),
-        );
-        selected_blob.change_id = Some(selected_change_id);
-        let live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
+        let _live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
             rows: vec![
                 selected_blob,
                 live_blob_ref_row(
@@ -7564,10 +7554,10 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&find_files_projection))
             .expect("findFiles projection should be valid");
-        let request = super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
-        let rows = super::scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true)
-            .await
-            .expect("matching blob rows should load");
+        let _request =
+            super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let rows =
+            super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
             .expect("indexed rows should prepare");
         let blob_reader: Arc<dyn BlobDataReader> =
@@ -7605,23 +7595,11 @@ mod tests {
         let requests = live_state_requests
             .lock()
             .expect("live-state request mutex should not be poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
-        assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("file-selected")]
-        );
-        assert_eq!(
-            requests[0].filter.file_ids,
-            vec![NullableKeyFilter::Value("file-selected".to_string())]
-        );
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
-    async fn file_directory_id_scan_uses_indexed_descriptors_and_only_scans_blob_rows() {
+    async fn file_directory_id_scan_uses_indexed_descriptors_and_blob_rows() {
         let data = b"docs contents".to_vec();
         let blob_hash = BlobHash::from_content(&data).to_hex();
         let other_data = b"other contents".to_vec();
@@ -7650,22 +7628,21 @@ mod tests {
                     "branch-b",
                     r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
                 ),
+                live_blob_ref_row("file-docs", "branch-b", "file-docs", &blob_hash, data.len()),
+                live_blob_ref_row(
+                    "file-other-doc",
+                    "branch-b",
+                    "file-other-doc",
+                    &other_blob_hash,
+                    other_data.len(),
+                ),
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
             "branch-b",
             Arc::new(RecordingLiveStateReader {
-                rows: vec![
-                    live_blob_ref_row("file-docs", "branch-b", "file-docs", &blob_hash, data.len()),
-                    live_blob_ref_row(
-                        "file-other-doc",
-                        "branch-b",
-                        "file-other-doc",
-                        &other_blob_hash,
-                        other_data.len(),
-                    ),
-                ],
+                rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
             }),
             Arc::new(StaticFilesystemPathIndexReader {
@@ -7714,25 +7691,7 @@ mod tests {
         let requests = live_state_requests
             .lock()
             .expect("live-state request mutex should not be poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
-        assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![
-                crate::entity_pk::EntityPk::single("file-docs"),
-                crate::entity_pk::EntityPk::single("file-other-doc"),
-            ]
-        );
-        assert_eq!(
-            requests[0].filter.file_ids,
-            vec![
-                NullableKeyFilter::Value("file-docs".to_string()),
-                NullableKeyFilter::Value("file-other-doc".to_string()),
-            ]
-        );
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
@@ -7792,13 +7751,6 @@ mod tests {
                 ),
             )
         }));
-        let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(index_rows)
-                .expect("filesystem path index should build"),
-        );
-        let matches =
-            super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
-
         let mut tracked_blob = live_blob_ref_row(
             "file-tracked",
             "branch-b",
@@ -7809,7 +7761,8 @@ mod tests {
         tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
         let mut global_blob = live_blob_ref_row(
             "file-global",
-            crate::GLOBAL_BRANCH_ID,
+            // Path-index rows are already projected into the requested branch.
+            "branch-b",
             "file-global",
             &BlobHash::from_content(&global_data).to_hex(),
             global_data.len(),
@@ -7835,9 +7788,21 @@ mod tests {
             misplaced_data.len(),
         );
         misplaced_blob.change_id = Some(ChangeId::for_test_label("misplaced-blob"));
+        index_rows.extend([
+            tracked_blob.clone(),
+            global_blob.clone(),
+            untracked_blob.clone(),
+            misplaced_blob.clone(),
+        ]);
+        let index = Arc::new(
+            FilesystemPathIndex::from_live_rows(index_rows)
+                .expect("filesystem path index should build"),
+        );
+        let matches =
+            super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
-        let live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
-            rows: vec![tracked_blob, global_blob, untracked_blob, misplaced_blob],
+        let _live_state: Arc<dyn LiveStateReader> = Arc::new(RecordingLiveStateReader {
+            rows: Vec::new(),
             scan_requests: Arc::clone(&live_state_requests),
         });
         let base_schema = super::lix_file_schema();
@@ -7849,10 +7814,10 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&projection))
             .expect("projection should be valid");
-        let request = super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
-        let rows = super::scan_indexed_file_rows(Arc::clone(&live_state), &request, &matches, true)
-            .await
-            .expect("matching blob rows should load");
+        let _request =
+            super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let rows =
+            super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
             .expect("indexed rows should prepare");
         let blob_reader: Arc<dyn BlobDataReader> =
@@ -7913,37 +7878,11 @@ mod tests {
         let requests = live_state_requests
             .lock()
             .expect("live-state request mutex should not be poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].filter.entity_pks.len(), 33);
-        assert!(
-            requests[0]
-                .filter
-                .entity_pks
-                .contains(&crate::entity_pk::EntityPk::single("file-global"))
-        );
-        assert!(
-            requests[0]
-                .filter
-                .entity_pks
-                .contains(&crate::entity_pk::EntityPk::single("file-tracked"))
-        );
-        assert!(
-            requests[0]
-                .filter
-                .entity_pks
-                .contains(&crate::entity_pk::EntityPk::single("file-untracked"))
-        );
-        assert_eq!(requests[0].filter.file_ids.len(), 33);
-        assert!(
-            requests[0]
-                .filter
-                .file_ids
-                .contains(&NullableKeyFilter::Value("file-tracked".to_string()))
-        );
+        assert!(requests.is_empty());
     }
 
     #[tokio::test]
-    async fn file_root_directory_scan_uses_indexed_descriptors_and_only_scans_root_blob_rows() {
+    async fn file_root_directory_scan_uses_indexed_descriptors_and_root_blob_rows() {
         let root_data = b"root contents".to_vec();
         let root_blob_hash = BlobHash::from_content(&root_data).to_hex();
         let nested_data = b"nested contents".to_vec();
@@ -7967,28 +7906,27 @@ mod tests {
                     "branch-b",
                     r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
                 ),
+                live_blob_ref_row(
+                    "file-root",
+                    "branch-b",
+                    "file-root",
+                    &root_blob_hash,
+                    root_data.len(),
+                ),
+                live_blob_ref_row(
+                    "file-nested",
+                    "branch-b",
+                    "file-nested",
+                    &nested_blob_hash,
+                    nested_data.len(),
+                ),
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
             "branch-b",
             Arc::new(RecordingLiveStateReader {
-                rows: vec![
-                    live_blob_ref_row(
-                        "file-root",
-                        "branch-b",
-                        "file-root",
-                        &root_blob_hash,
-                        root_data.len(),
-                    ),
-                    live_blob_ref_row(
-                        "file-nested",
-                        "branch-b",
-                        "file-nested",
-                        &nested_blob_hash,
-                        nested_data.len(),
-                    ),
-                ],
+                rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
             }),
             Arc::new(StaticFilesystemPathIndexReader {
@@ -8038,19 +7976,7 @@ mod tests {
         let requests = live_state_requests
             .lock()
             .expect("live-state request mutex should not be poisoned");
-        assert_eq!(requests.len(), 1);
-        assert_eq!(
-            requests[0].filter.schema_keys,
-            vec![super::BLOB_REF_SCHEMA_KEY.to_string()]
-        );
-        assert_eq!(
-            requests[0].filter.entity_pks,
-            vec![crate::entity_pk::EntityPk::single("file-root")]
-        );
-        assert_eq!(
-            requests[0].filter.file_ids,
-            vec![NullableKeyFilter::Value("file-root".to_string())]
-        );
+        assert!(requests.is_empty());
     }
 
     fn scalar_function_expr(name: &str, args: Vec<Expr>) -> Expr {

@@ -704,8 +704,6 @@ where
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                     Arc::new(self.live_state.reader(read_store.clone()));
-                let branch_ref: Arc<dyn BranchRefReader> =
-                    Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                 let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                     Arc::new(self.binary_cas.reader(read_store));
                 // A raw file download delivers the same bytes as a direct
@@ -716,7 +714,6 @@ where
                     &active_branch_id,
                     live_state,
                     filesystem_path_index,
-                    branch_ref,
                     blob_reader,
                     self.plugin_host.clone(),
                     Some(file_view_collector.clone()),
@@ -1759,7 +1756,6 @@ where
                         &active_branch_id,
                         live_state,
                         filesystem_path_index,
-                        branch_ref,
                         blob_reader,
                         self.plugin_host.clone(),
                         file_view_collector.clone(),
@@ -1816,15 +1812,12 @@ where
         if let Some(data_column_index) = late_file_data_column {
             let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
                 Arc::new(self.live_state.reader(read_store.clone()));
-            let branch_ref: Arc<dyn BranchRefReader> =
-                Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
             let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                 Arc::new(self.binary_cas.reader(read_store));
             hydrate_lix_file_data_result(
                 &active_branch_id,
                 Arc::clone(&live_state),
                 filesystem_path_index,
-                branch_ref,
                 blob_reader,
                 self.plugin_host.clone(),
                 file_view_collector.clone(),
@@ -1924,7 +1917,6 @@ async fn hydrate_lix_file_data_result(
     active_branch_id: &str,
     live_state: Arc<dyn crate::live_state::LiveStateReader>,
     filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader>,
-    branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn crate::binary_cas::BlobDataReader>,
     plugin_host: crate::plugin::PluginRuntimeHost,
     session_file_views: Option<sql2::SessionFileViews>,
@@ -1949,7 +1941,6 @@ async fn hydrate_lix_file_data_result(
         active_branch_id,
         live_state,
         filesystem_path_index,
-        branch_ref,
         blob_reader,
         plugin_host,
         session_file_views,
