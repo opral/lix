@@ -437,7 +437,6 @@ struct WritePipelineState {
     queued: VecDeque<QueuedWrite>,
     draining: bool,
     visible: VecDeque<Arc<PublishedWrite>>,
-    point_publications: HashMap<Key, VecDeque<PointPublication>>,
     active_views: BTreeMap<(u64, u64), usize>,
     next_publication_id: u64,
     terminal_error: Option<StorageError>,
@@ -455,12 +454,6 @@ struct PublishedWrite {
     publication_id: u64,
     overlay: Arc<BTreeMap<Key, Option<Bytes>>>,
     persisted_sequence: AtomicU64,
-}
-
-struct PointPublication {
-    publication_id: u64,
-    write: Arc<PublishedWrite>,
-    value: Option<Bytes>,
 }
 
 struct PublicationView {
@@ -592,18 +585,12 @@ impl WritePipeline {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.visible.front().is_some_and(|write| {
-            let persisted = write.persisted_sequence.load(Ordering::Acquire);
-            persisted != PENDING_WRITE_SEQUENCE && persisted <= snapshot_sequence
-        }) {
-            state.visible.pop_front();
-        }
+        cleanup_publications(&mut state, snapshot_sequence);
         let publication_id = state.next_publication_id;
         *state
             .active_views
             .entry((snapshot_sequence, publication_id))
             .or_default() += 1;
-        cleanup_point_publications(&mut state);
         PublicationView {
             pipeline: self.clone(),
             snapshot_sequence,
@@ -641,16 +628,14 @@ impl WritePipeline {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .point_publications
-            .get(key)?
+            .visible
             .iter()
             .rev()
-            .find(|publication| {
-                let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
-                publication.publication_id <= publication_id
-                    && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
+            .find_map(|write| {
+                publication_visible_to_view(write, snapshot_sequence, publication_id)
+                    .then(|| write.overlay.get(key).cloned())
+                    .flatten()
             })
-            .map(|publication| publication.value.clone())
     }
 }
 
@@ -669,22 +654,34 @@ impl Drop for PublicationView {
         if remove {
             state.active_views.remove(&key);
         }
-        cleanup_point_publications(&mut state);
+        cleanup_publications(&mut state, u64::MAX);
     }
 }
 
-fn cleanup_point_publications(state: &mut WritePipelineState) {
-    let active_views = state.active_views.keys().copied().collect::<Vec<_>>();
-    state.point_publications.retain(|_, publications| {
-        publications.retain(|publication| {
-            let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
-            persisted == PENDING_WRITE_SEQUENCE
-                || active_views.iter().any(|(snapshot, captured)| {
-                    publication.publication_id <= *captured && persisted > *snapshot
+fn publication_visible_to_view(
+    write: &PublishedWrite,
+    snapshot_sequence: u64,
+    publication_id: u64,
+) -> bool {
+    let persisted = write.persisted_sequence.load(Ordering::Acquire);
+    write.publication_id <= publication_id
+        && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
+}
+
+fn cleanup_publications(state: &mut WritePipelineState, newest_snapshot_sequence: u64) {
+    while state.visible.front().is_some_and(|write| {
+        let persisted = write.persisted_sequence.load(Ordering::Acquire);
+        persisted != PENDING_WRITE_SEQUENCE
+            && persisted <= newest_snapshot_sequence
+            && !state
+                .active_views
+                .keys()
+                .any(|(snapshot_sequence, publication_id)| {
+                    publication_visible_to_view(write, *snapshot_sequence, *publication_id)
                 })
-        });
-        !publications.is_empty()
-    });
+    }) {
+        state.visible.pop_front();
+    }
 }
 
 impl SnapshotPointCache {
@@ -1512,17 +1509,6 @@ impl StorageWrite for SlateDBWrite {
                 });
                 state.tail = Some(Arc::clone(&completion));
                 state.visible.push_back(Arc::clone(&published));
-                for (key, value) in &*overlay {
-                    state
-                        .point_publications
-                        .entry(key.clone())
-                        .or_default()
-                        .push_back(PointPublication {
-                            publication_id,
-                            write: Arc::clone(&published),
-                            value: value.clone(),
-                        });
-                }
                 state.queued.push_back(QueuedWrite {
                     overlay,
                     published,
@@ -3342,6 +3328,85 @@ mod tests {
 
         drop(blocked_write);
         block_on(storage.flush()).expect("flush visible value");
+    }
+
+    #[test]
+    fn persisted_publication_remains_visible_to_an_older_active_view() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let storage = SlateDB::open_object_store_with_options(
+            "test-active-publication-view",
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open active-publication storage");
+        let space = SpaceId(8);
+        let key = Key(Bytes::from_static(b"active-view"));
+        let value = Bytes::from_static(b"value");
+
+        let blocked_write = store.block_next_write();
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin blocked write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage blocked value");
+        block_on(write.commit()).expect("publish blocked value");
+        blocked_write.wait_for_entries(1, "SlateDB WAL write");
+
+        let older = block_on(storage.begin_read(ReadOptions::default()))
+            .expect("capture pre-persistence view");
+        drop(blocked_write);
+        block_on(storage.flush()).expect("persist publication");
+        let newer =
+            block_on(storage.begin_read(ReadOptions::default())).expect("capture persisted view");
+
+        assert_eq!(
+            block_on(older.get_many(&[GetManyRequest {
+                space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
+            .expect("read publication through older point view")
+            .values,
+            vec![Some(ProjectedValue::FullValue(value.clone()))]
+        );
+        assert_eq!(
+            block_on(older.scan(
+                space,
+                KeyRange {
+                    lower: Bound::Unbounded,
+                    upper: Bound::Unbounded,
+                },
+                ScanOptions::default(),
+            ))
+            .expect("read publication through older scan view")
+            .entries,
+            vec![ReadEntry {
+                key,
+                value: ProjectedValue::FullValue(value),
+            }]
+        );
+
+        drop(older);
+        assert!(
+            storage
+                .write_pipeline
+                .state
+                .lock()
+                .expect("lock publication state")
+                .visible
+                .is_empty(),
+            "publication is reclaimed after its last dependent view"
+        );
+        drop(newer);
     }
 
     #[test]
