@@ -2660,7 +2660,7 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
     let branch_ref = branch_ctx.ref_reader(read);
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
-        let head = branch_ref.load_head_commit_id(&branch_id).await?;
+        let head = branch_ref.load_head_commit_id(branch_id).await?;
         if require_existing_non_global_targets
             && branch_id != crate::GLOBAL_BRANCH_ID
             && head.is_none()
