@@ -101,7 +101,8 @@ use crate::transaction::types::{
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
 };
 use crate::transaction::validation::{
-    TransactionValidationInput, prepared_tracked_rows_have_row_local_certificates,
+    TransactionValidationInput, fresh_plugin_file_import_certificate,
+    prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
     validate_prepared_writes,
 };
 use crate::wasm::{
@@ -3897,6 +3898,20 @@ where
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
+            return Ok(());
+        }
+        if self.trust_filesystem_planner
+            && let Some(certificate) = fresh_plugin_file_import_certificate(prepared_writes)
+        {
+            // The certificate proves that every omitted file-scoped row has
+            // completed row-local validation, has no transaction-wide schema
+            // constraint, and is owned by this exact pending planner-created
+            // descriptor. Keep public INSERT absence validation against this
+            // coherent commit snapshot before skipping the O(rows) index.
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_validation_branch();
+            let live_state = self.live_state.reader(read);
+            validate_certified_fresh_plugin_file_import(&live_state, certificate).await?;
             return Ok(());
         }
         let validation_index = prepared_writes.validation_index();
