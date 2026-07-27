@@ -13,9 +13,9 @@ mod tests {
     use bytes::Bytes;
 
     use crate::storage::{
-        CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix, ProjectedValue,
-        ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StoredValue,
-        WriteOptions,
+        CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix,
+        ProjectedValue, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
+        StoredValue, WriteOptions,
     };
     use crate::storage_adapter::{
         PointReadPlan, ScanPlan, SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead,
@@ -50,12 +50,14 @@ mod tests {
     impl StorageRead for SpyRead {
         fn get_many(
             &self,
-            _space: SpaceId,
-            keys: &[Key],
-            _opts: GetOptions,
+            requests: &[GetManyRequest<'_>],
         ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
             async move {
-                *self.seen.lock().expect("spy lock") = keys.to_vec();
+                let keys = requests
+                    .iter()
+                    .flat_map(|request| request.keys.iter().cloned())
+                    .collect::<Vec<_>>();
+                *self.seen.lock().expect("spy lock") = keys.clone();
                 Ok(GetManyResult::new(
                     keys.iter()
                         .map(|key| Some(ProjectedValue::FullValue(key.0.clone())))
@@ -90,9 +92,7 @@ mod tests {
     impl StorageRead for OverlapRead {
         async fn get_many(
             &self,
-            _space: SpaceId,
-            _keys: &[Key],
-            _opts: GetOptions,
+            _requests: &[GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
             self.entered.wait().await;
             self.release
@@ -123,15 +123,24 @@ mod tests {
         }));
 
         let left = shared.clone();
-        let left_task =
-            tokio::spawn(
-                async move { left.get_many(SpaceId(1), &[], GetOptions::default()).await },
-            );
+        let left_task = tokio::spawn(async move {
+            left.get_many(&[GetManyRequest {
+                space: SpaceId(1),
+                keys: &[],
+                opts: GetOptions::default(),
+            }])
+            .await
+        });
         let right = shared.clone();
-        let right_task =
-            tokio::spawn(
-                async move { right.get_many(SpaceId(1), &[], GetOptions::default()).await },
-            );
+        let right_task = tokio::spawn(async move {
+            right
+                .get_many(&[GetManyRequest {
+                    space: SpaceId(1),
+                    keys: &[],
+                    opts: GetOptions::default(),
+                }])
+                .await
+        });
 
         tokio::time::timeout(Duration::from_secs(1), entered.wait())
             .await

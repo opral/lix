@@ -1,5 +1,5 @@
 use crate::storage::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
+    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, PutBatch, ReadOptions, ScanChunk,
     ScanOptions, SpaceId, StorageError, WriteOptions,
 };
 
@@ -60,13 +60,12 @@ pub trait StorageRead: Send + Sync {
         None
     }
 
-    /// Reads the requested keys of one space. The returned values have one
-    /// slot per requested key, in caller order, and preserve duplicates.
+    /// Reads one or more space-scoped point batches from this coherent view.
+    /// The flat result preserves request order, then key order within each
+    /// request, including duplicate keys.
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send;
 
     /// Reads one owned page of a space in ascending logical key order and

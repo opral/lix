@@ -6,8 +6,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use lix_engine::storage::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite, WriteOptions,
+    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite,
+    WriteOptions,
 };
 use lix_engine::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageCoreProjection, StorageGetOptions,
@@ -214,17 +215,22 @@ where
 {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.get_calls += 1;
-            stats.get_keys += keys.len();
-            stats.get_key_bytes += keys.iter().map(|key| key.0.len()).sum::<usize>();
+            stats.get_keys += requests
+                .iter()
+                .map(|request| request.keys.len())
+                .sum::<usize>();
+            stats.get_key_bytes += requests
+                .iter()
+                .flat_map(|request| request.keys)
+                .map(|key| key.0.len())
+                .sum::<usize>();
         }
-        let result = self.inner.get_many(space, keys, opts).await?;
+        let result = self.inner.get_many(requests).await?;
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             for value in result.values.iter().flatten() {

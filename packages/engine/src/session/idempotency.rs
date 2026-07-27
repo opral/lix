@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage_adapter::StorageSpaceId;
 use crate::storage_adapter::{
-    StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
-    StorageProjectedValue, StorageSpace,
+    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
+    StorageKey, StorageProjectedValue, StorageSpace,
 };
 use crate::{LixError, LixNotice, Value};
 
@@ -209,13 +209,13 @@ pub(crate) async fn load_receipt(
 ) -> Result<Option<ExecuteIdempotencyReceipt>, LixError> {
     let key = receipt_key(idempotency)?;
     let values = store
-        .get_many(
-            EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
-            &[key],
-            StorageGetOptions {
+        .get_many(&[StorageGetManyRequest {
+            space: EXECUTE_IDEMPOTENCY_RECEIPT_SPACE.id,
+            keys: &[key],
+            opts: StorageGetOptions {
                 projection: StorageCoreProjection::FullValue,
             },
-        )
+        }])
         .await?;
     let Some(value) = values.values.into_iter().next().flatten() else {
         return Ok(None);

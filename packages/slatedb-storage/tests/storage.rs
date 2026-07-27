@@ -7,9 +7,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream};
 use lix_engine::storage::{
-    CoreProjection, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry, ReadOptions,
-    ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
-    WriteOptions,
+    CoreProjection, GetManyRequest, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+    StoredValue, WriteOptions,
 };
 use lix_engine::{StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance};
 use lix_slatedb_storage::{
@@ -245,7 +245,11 @@ async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
         .await
         .expect("begin failure-test read");
     let result = read
-        .get_many(space, &[durable_key, rejected_key], GetOptions::default())
+        .get_many(&[GetManyRequest {
+            space,
+            keys: &[durable_key, rejected_key],
+            opts: GetOptions::default(),
+        }])
         .await
         .expect("read durable values after failed write");
 

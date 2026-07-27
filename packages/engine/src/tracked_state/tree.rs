@@ -2853,8 +2853,8 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
     use crate::storage::{
-        GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, ScanChunk, ScanOptions, SpaceId,
-        Storage, StorageError, StorageRead,
+        GetManyResult, KeyRange, ProjectedValue, ScanChunk, ScanOptions, SpaceId, Storage,
+        StorageError, StorageRead,
     };
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageAdapterReadScope};
@@ -2878,15 +2878,15 @@ mod tests {
     {
         fn get_many(
             &self,
-            space: SpaceId,
-            keys: &[Key],
-            opts: GetOptions,
+            requests: &[crate::storage::GetManyRequest<'_>],
         ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-            if space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id {
-                self.tree_chunk_reads
-                    .fetch_add(keys.len(), Ordering::Relaxed);
+            for request in requests {
+                if request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id {
+                    self.tree_chunk_reads
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
             }
-            self.read.get_many(space, keys, opts)
+            self.read.get_many(requests)
         }
 
         fn scan(
@@ -2902,12 +2902,14 @@ mod tests {
     impl StorageRead for CountingChunkRead {
         fn get_many(
             &self,
-            space: SpaceId,
-            keys: &[Key],
-            _opts: GetOptions,
+            requests: &[crate::storage::GetManyRequest<'_>],
         ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
             async move {
-                assert_eq!(space, storage::TRACKED_STATE_TREE_CHUNK_SPACE.id);
+                assert!(
+                    requests
+                        .iter()
+                        .all(|request| request.space == storage::TRACKED_STATE_TREE_CHUNK_SPACE.id)
+                );
                 let read_index = self.storage_reads.fetch_add(1, Ordering::Relaxed);
                 let bytes = if self.corrupt_first_read && read_index == 0 {
                     Bytes::from_static(b"corrupt tracked-state node")
@@ -2915,7 +2917,9 @@ mod tests {
                     Bytes::copy_from_slice(&self.bytes)
                 };
                 Ok(GetManyResult::new(
-                    keys.iter()
+                    requests
+                        .iter()
+                        .flat_map(|request| request.keys)
                         .map(|key| {
                             (key.0.as_ref() == self.hash)
                                 .then(|| ProjectedValue::FullValue(bytes.clone()))

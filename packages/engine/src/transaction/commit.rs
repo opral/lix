@@ -2683,8 +2683,8 @@ mod tests {
         LiveStateProjection, LiveStateRowRequest,
     };
     use crate::storage::{
-        CommitResult, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ScanChunk, ScanOptions,
-        SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+        CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
+        StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
@@ -2743,38 +2743,39 @@ mod tests {
     impl StorageRead for CountingTrackedHeadRead {
         async fn get_many(
             &self,
-            space: SpaceId,
-            keys: &[Key],
-            opts: GetOptions,
+            requests: &[crate::storage::GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
-            if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id {
-                self.counts
-                    .branch_control_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
+            for request in requests {
+                let space = request.space;
+                if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id {
+                    self.counts
+                        .branch_control_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == V10_TRACKED_HEAD_MARKER_SPACE_ID {
+                    self.counts
+                        .v10_marker_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == crate::live_state::HOT_ROW_SPACE.id
+                    || space == crate::live_state::HOT_FILE_SPACE.id
+                {
+                    self.counts
+                        .row_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+                    self.counts
+                        .tree_chunk_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                    self.counts
+                        .commit_root_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-            if space == V10_TRACKED_HEAD_MARKER_SPACE_ID {
-                self.counts
-                    .v10_marker_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == crate::live_state::HOT_ROW_SPACE.id
-                || space == crate::live_state::HOT_FILE_SPACE.id
-            {
-                self.counts
-                    .row_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
-                self.counts
-                    .tree_chunk_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
-                self.counts
-                    .commit_root_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.get_many(space, keys, opts).await
+            self.inner.get_many(requests).await
         }
 
         async fn scan(

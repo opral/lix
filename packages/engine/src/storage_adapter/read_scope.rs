@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::storage::{
-    GetManyResult, GetOptions, Key, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError,
+    GetManyRequest, GetManyResult, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError,
     StorageRead,
 };
 
@@ -16,9 +16,7 @@ pub trait StorageAdapterRead: Send + Sync {
 
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send;
 
     fn scan(
@@ -98,11 +96,9 @@ where
 
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        self.read.get_many(space, keys, opts)
+        self.read.get_many(requests)
     }
 
     fn scan(
@@ -125,11 +121,9 @@ where
 
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        self.read.get_many(space, keys, opts)
+        self.read.get_many(requests)
     }
 
     fn scan(
@@ -152,11 +146,9 @@ where
 
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        (*self).get_many(space, keys, opts)
+        (*self).get_many(requests)
     }
 
     fn scan(
@@ -173,13 +165,15 @@ impl<T> StorageAdapterRead for &mut T
 where
     T: StorageAdapterRead + ?Sized,
 {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        (**self).snapshot_cache_key()
+    }
+
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
-        (**self).get_many(space, keys, opts)
+        (**self).get_many(requests)
     }
 
     fn scan(

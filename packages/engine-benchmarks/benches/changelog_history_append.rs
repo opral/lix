@@ -6,8 +6,9 @@ use std::time::{Duration, Instant};
 use lix_engine::Storage;
 use lix_engine::changelog::bench as changelog_bench;
 use lix_engine::storage::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch, ReadOptions,
-    ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite, WriteOptions,
+    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, ProjectedValue, PutBatch,
+    ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite,
+    WriteOptions,
 };
 use lix_engine::storage_bench::StorageLayoutAccounting;
 use lix_rocksdb_storage::RocksDB;
@@ -266,16 +267,17 @@ where
 {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         {
             let mut stats = self.stats.lock().expect("io stats mutex");
             stats.get_many_calls += 1;
-            stats.get_many_keys += keys.len() as u64;
+            stats.get_many_keys += requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum::<u64>();
         }
-        self.inner.get_many(space, keys, opts).await
+        self.inner.get_many(requests).await
     }
 
     async fn scan(

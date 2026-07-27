@@ -16,9 +16,9 @@ use criterion::{
 };
 use lix_engine::Storage;
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Memory, Prefix,
-    ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError,
-    StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, Memory,
+    Prefix, ProjectedValue, PutBatch, PutEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId,
+    StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
 };
 use lix_engine::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterReadScope, StorageReadStats,
@@ -1382,11 +1382,11 @@ where
                 b.iter(|| {
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct point read");
-                    let result = block_on(read.get_many(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                    ))
+                    let result = block_on(read.get_many(&[GetManyRequest {
+                        space: SpaceId(1),
+                        keys: black_box(&point_keys),
+                        opts: GetOptions::default(),
+                    }]))
                     .expect("direct get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
@@ -1409,11 +1409,11 @@ where
                 b.iter(|| {
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
-                    let result = block_on(read.get_many(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                    ))
+                    let result = block_on(read.get_many(&[GetManyRequest {
+                        space: SpaceId(1),
+                        keys: black_box(&point_keys),
+                        opts: GetOptions::default(),
+                    }]))
                     .expect("direct unique get_many");
                     assert_eq!(result.values.len(), 100);
                     assert_eq!(
@@ -1444,11 +1444,11 @@ where
                 b.iter(|| {
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique large-value point read");
-                    let result = block_on(read.get_many(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                    ))
+                    let result = block_on(read.get_many(&[GetManyRequest {
+                        space: SpaceId(1),
+                        keys: black_box(&point_keys),
+                        opts: GetOptions::default(),
+                    }]))
                     .expect("direct unique large-value get_many");
                     assert_eq!(result.values.len(), rows as usize);
                     assert_eq!(
@@ -1475,11 +1475,11 @@ where
                     b.iter(|| {
                         let read = block_on(point_storage.begin_read(ReadOptions::default()))
                             .expect("begin direct missing-key point read");
-                        let result = block_on(read.get_many(
-                            SpaceId(1),
-                            black_box(&point_keys),
-                            GetOptions::default(),
-                        ))
+                        let result = block_on(read.get_many(&[GetManyRequest {
+                            space: SpaceId(1),
+                            keys: black_box(&point_keys),
+                            opts: GetOptions::default(),
+                        }]))
                         .expect("direct missing-key get_many");
                         assert_eq!(result.values.len(), requested_keys);
                         assert!(result.values.iter().all(Option::is_none));
@@ -1500,11 +1500,11 @@ where
                 b.iter(|| {
                     let read = block_on(point_storage.begin_read(ReadOptions::default()))
                         .expect("begin direct unique point read");
-                    let result = block_on(read.get_many(
-                        SpaceId(1),
-                        black_box(&point_keys),
-                        GetOptions::default(),
-                    ))
+                    let result = block_on(read.get_many(&[GetManyRequest {
+                        space: SpaceId(1),
+                        keys: black_box(&point_keys),
+                        opts: GetOptions::default(),
+                    }]))
                     .expect("direct unique get_many");
                     assert_eq!(result.values.len(), 1_000);
                     assert_eq!(
@@ -1679,9 +1679,7 @@ struct EmptyRead;
 impl StorageRead for EmptyRead {
     async fn get_many(
         &self,
-        _space: SpaceId,
-        _keys: &[Key],
-        _opts: GetOptions,
+        _requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         unreachable!("write-set benchmark does not point-read")
     }

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CoreProjection, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId,
-    Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, SpaceId, Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 use lix_rocksdb_storage::RocksDB;
 
@@ -64,8 +64,12 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
         Bytes::from_static(b"after-snapshot"),
     );
 
-    let full = block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
-        .expect("read full value");
+    let full = block_on(read.get_many(&[GetManyRequest {
+        space,
+        keys: std::slice::from_ref(&key),
+        opts: GetOptions::default(),
+    }]))
+    .expect("read full value");
     assert_eq!(
         full.values,
         vec![Some(ProjectedValue::FullValue(Bytes::from_static(
@@ -73,21 +77,21 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
         )))]
     );
 
-    let key_only = block_on(read.get_many(
+    let key_only = block_on(read.get_many(&[GetManyRequest {
         space,
-        std::slice::from_ref(&key),
-        GetOptions {
+        keys: std::slice::from_ref(&key),
+        opts: GetOptions {
             projection: CoreProjection::KeyOnly,
         },
-    ))
+    }]))
     .expect("read key-only value");
     assert_eq!(key_only.values, vec![Some(ProjectedValue::KeyOnly)]);
 
-    let missing = block_on(read.get_many(
+    let missing = block_on(read.get_many(&[GetManyRequest {
         space,
-        &[Key(Bytes::from_static(b"missing-key"))],
-        GetOptions::default(),
-    ))
+        keys: &[Key(Bytes::from_static(b"missing-key"))],
+        opts: GetOptions::default(),
+    }]))
     .expect("read missing value");
     assert_eq!(missing.values, vec![None]);
 }
@@ -207,8 +211,12 @@ fn put_one(storage: &RocksDB, space: SpaceId, key: Key, value: Bytes) {
 
 fn read_one(storage: &RocksDB, space: SpaceId, key: Key) -> Option<Bytes> {
     let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin read");
-    let result =
-        block_on(read.get_many(space, &[key], GetOptions::default())).expect("read one row");
+    let result = block_on(read.get_many(&[GetManyRequest {
+        space,
+        keys: &[key],
+        opts: GetOptions::default(),
+    }]))
+    .expect("read one row");
     result.values[0].clone().map(|value| match value {
         ProjectedValue::FullValue(bytes) => bytes,
         ProjectedValue::KeyOnly => Bytes::new(),
