@@ -628,27 +628,22 @@ impl FilesystemPathIndex {
         let mut next = self.clone();
         next.generation = generation.map(<[u8]>::to_vec);
         for row in rows.iter().filter(|row| {
-            (row.global
-                || request
-                    .branch_ids
-                    .iter()
-                    .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref()))
-                && matches!(
-                    row.schema_key.as_str(),
-                    FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-                )
+            matches!(
+                row.schema_key.as_str(),
+                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            )
         }) {
-            next.apply_committed_row(row)?;
+            for_each_committed_row_projection(request, row, |projected| {
+                next.apply_committed_row(projected)
+            })?;
         }
-        for row in rows.iter().filter(|row| {
-            (row.global
-                || request
-                    .branch_ids
-                    .iter()
-                    .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref()))
-                && row.schema_key == BLOB_REF_SCHEMA_KEY
-        }) {
-            next.apply_committed_blob_ref_row(row)?;
+        for row in rows
+            .iter()
+            .filter(|row| row.schema_key == BLOB_REF_SCHEMA_KEY)
+        {
+            for_each_committed_row_projection(request, row, |projected| {
+                next.apply_committed_blob_ref_row(projected)
+            })?;
         }
         Ok(next)
     }
@@ -713,7 +708,14 @@ impl FilesystemPathIndex {
             .into_iter()
             .filter(|entry| entry.kind == kind)
             .collect::<Vec<_>>();
-        if row.global && same_id.iter().any(|entry| !entry.key.global()) {
+        if row.global
+            && same_id.iter().any(|entry| {
+                !entry.key.global()
+                    && entry.key.branch_id() == row.branch_id.as_ref()
+                    && entry.key.is_untracked() == row.untracked
+                    && entry.key.file_id() == row.file_id.as_deref()
+            })
+        {
             return Ok(());
         }
 
@@ -948,6 +950,28 @@ impl FilesystemPathIndex {
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.estimated_heap_bytes
     }
+}
+
+fn for_each_committed_row_projection(
+    request: &FilesystemPathIndexRequest,
+    row: &MaterializedLiveStateRow,
+    mut apply: impl FnMut(&MaterializedLiveStateRow) -> Result<(), LixError>,
+) -> Result<(), LixError> {
+    if row.global && !request.branch_ids.is_empty() {
+        for branch_id in &request.branch_ids {
+            let mut projected = row.clone();
+            projected.branch_id = branch_id.clone().into();
+            apply(&projected)?;
+        }
+    } else if row.global
+        || request
+            .branch_ids
+            .iter()
+            .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
+    {
+        apply(row)?;
+    }
+    Ok(())
 }
 
 fn entry_identity(entry: &FilesystemPathEntry) -> FilesystemPathEntryIdentity {
@@ -1563,6 +1587,62 @@ mod tests {
                 .blob_ref_live_row()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn global_blob_delta_updates_its_projected_branch_entry() {
+        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let mut projected_blob = blob_row("global-file", "hash-before", "branch-a");
+        projected_blob.global = true;
+        let prior = FilesystemPathIndex::from_live_rows(vec![
+            file_row("global-file", None, "global.md", "branch-a", true),
+            projected_blob,
+        ])
+        .expect("projected global path index should build");
+
+        let mut committed_blob = blob_row("global-file", "hash-after", crate::GLOBAL_BRANCH_ID);
+        committed_blob.global = true;
+        let next = prior
+            .apply_committed_rows(&request, &[committed_blob], Some(&[2]))
+            .expect("global blob delta should project into the cached branch");
+
+        let entries = next.exact_entries("/global.md");
+        assert_eq!(entries.len(), 1);
+        let blob_ref = entries[0]
+            .blob_ref_live_row()
+            .expect("projected file should retain its updated blob ref");
+        assert_eq!(blob_ref.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            blob_ref.snapshot_content.as_deref(),
+            Some(r#"{"blob_hash":"hash-after","id":"global-file","size_bytes":7}"#)
+        );
+    }
+
+    #[test]
+    fn global_descriptor_delta_updates_only_unshadowed_branch_entries() {
+        let request =
+            FilesystemPathIndexRequest::new(vec!["branch-a".to_string(), "branch-b".to_string()]);
+        let prior = FilesystemPathIndex::from_live_rows(vec![
+            file_row("global-file", None, "local.md", "branch-a", false),
+            file_row("global-file", None, "global.md", "branch-b", true),
+        ])
+        .expect("mixed local and projected global path index should build");
+
+        let committed = file_row(
+            "global-file",
+            None,
+            "updated-global.md",
+            crate::GLOBAL_BRANCH_ID,
+            true,
+        );
+        let next = prior
+            .apply_committed_rows(&request, &[committed], Some(&[2]))
+            .expect("global descriptor delta should update each unshadowed projection");
+
+        assert_eq!(next.exact_entries("/local.md").len(), 1);
+        assert_eq!(next.exact_entries("/updated-global.md").len(), 1);
+        assert!(next.exact_entries("/global.md").is_empty());
+        assert_eq!(next.entries().len(), 2);
     }
 
     #[test]
