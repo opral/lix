@@ -38,6 +38,8 @@ pub(crate) enum PublicSurfaceKind {
     CheckpointByBranch,
     WorkingChange,
     WorkingChangeByBranch,
+    BranchDiff,
+    BranchMergeConflict,
     FileWorkingChange,
     FileWorkingChangeByBranch,
     DirectoryWorkingChange,

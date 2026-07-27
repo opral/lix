@@ -1,9 +1,10 @@
 use lix_engine::storage::Memory;
 use lix_engine::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, ExecuteResult,
-    InitReceipt, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions,
-    MergeBranchReceipt, SessionContext, SessionTransaction, SwitchBranchOptions,
-    SwitchBranchReceipt,
+    AcceptChangeProposalReceipt, BranchDiff, BranchDiffOptions, ChangeProposal, ChangeProposalDiff,
+    CreateBranchOptions, CreateBranchReceipt, CreateChangeProposalOptions, CreateCheckpointReceipt,
+    Engine, ExecuteResult, InitReceipt, MergeBranchOptions, MergeBranchPreview,
+    MergeBranchPreviewOptions, MergeBranchReceipt, SessionContext, SessionTransaction,
+    SwitchBranchOptions, SwitchBranchReceipt,
 };
 use lix_engine::{LixError, Value};
 
@@ -203,6 +204,57 @@ impl SimSession {
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
         self.session.merge_branch_preview(options).await
+    }
+
+    pub async fn branch_diff(&self, options: BranchDiffOptions) -> Result<BranchDiff, LixError> {
+        self.session.branch_diff(options).await
+    }
+
+    pub async fn create_change_proposal(
+        &self,
+        options: CreateChangeProposalOptions,
+    ) -> Result<ChangeProposal, LixError> {
+        let result = self.session.create_change_proposal(options).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn get_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<ChangeProposal>, LixError> {
+        self.session.get_change_proposal(proposal_id).await
+    }
+
+    pub async fn change_proposal_diff(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ChangeProposalDiff, LixError> {
+        self.session.change_proposal_diff(proposal_id).await
+    }
+
+    pub async fn accept_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<AcceptChangeProposalReceipt, LixError> {
+        let result = self.session.accept_change_proposal(proposal_id).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
+    }
+
+    pub async fn reject_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ChangeProposal, LixError> {
+        let result = self.session.reject_change_proposal(proposal_id).await;
+        if result.is_ok() {
+            self.sim.rebuild_tracked_state.after_successful_write();
+        }
+        result
     }
 
     pub async fn switch_branch(

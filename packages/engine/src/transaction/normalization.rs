@@ -47,7 +47,7 @@ pub(crate) fn normalize_transaction_write_row(
     functions: FunctionProviderHandle,
 ) -> Result<NormalizedTransactionWriteRow, LixError> {
     validate_transaction_write_row_schema_identity(&row)?;
-    ensure_internal_checkpoint_schema(&row, schema_catalog)?;
+    ensure_engine_owned_legacy_schema(&row, schema_catalog)?;
 
     let Some((schema_plan_id, schema_plan)) =
         schema_catalog.snapshot().plan_for_key(&row.schema_key)
@@ -156,17 +156,20 @@ fn validate_normalized_row_content(
     Ok(())
 }
 
-/// Checkpoint markers were introduced after repositories already existed.
-///
-/// Their schema is fixed and intentionally hidden from public entity
-/// surfaces, so legacy stores can validate this one engine-owned row from the
-/// compile-time definition without mutating their visible schema catalog.
-fn ensure_internal_checkpoint_schema(
+/// Some engine-owned schemas were introduced after repositories already
+/// existed. Their definitions are compile-time stable, so an older repository
+/// can validate an engine-authored row without first mutating its visible
+/// registered-schema catalog. New repositories still persist all seed schemas
+/// at initialization.
+fn ensure_engine_owned_legacy_schema(
     row: &TransactionWriteRow,
     schema_catalog: &mut TransactionCatalog,
 ) -> Result<(), LixError> {
-    if row.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
-        || schema_catalog.snapshot().schema(&row.schema_key).is_some()
+    if !matches!(
+        row.schema_key.as_str(),
+        crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+            | crate::proposal::CHANGE_PROPOSAL_SCHEMA_KEY
+    ) || schema_catalog.snapshot().schema(&row.schema_key).is_some()
     {
         return Ok(());
     }
@@ -174,7 +177,7 @@ fn ensure_internal_checkpoint_schema(
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "compile-time checkpoint marker schema is missing",
+                format!("compile-time engine schema '{}' is missing", row.schema_key),
             )
         })?
         .clone();
@@ -821,6 +824,43 @@ mod tests {
             catalog
                 .snapshot()
                 .schema(crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn normalization_supports_change_proposals_in_legacy_catalogs() {
+        let mut catalog = catalog_with(Vec::new());
+        let row = TransactionWriteRow {
+            entity_pk: None,
+            schema_key: crate::proposal::CHANGE_PROPOSAL_SCHEMA_KEY.to_string(),
+            snapshot: Some(transaction_json(json!({
+                "id": "proposal-1",
+                "source_branch_id": "source",
+                "target_branch_id": "target",
+                "base_commit_id": "base",
+                "source_head_commit_id": "source-head",
+                "target_head_commit_id": "target-head",
+                "state": "open",
+                "accepted_target_head_commit_id": null,
+            }))),
+            global: true,
+            untracked: false,
+            branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+            ..base_stage_row()
+        };
+
+        let normalized = normalize_transaction_write_row(row, &mut catalog, functions())
+            .expect("legacy catalog should use the fixed change-proposal schema");
+
+        assert_eq!(
+            normalized.row.entity_pk,
+            Some(EntityPk::single("proposal-1"))
+        );
+        assert!(
+            catalog
+                .snapshot()
+                .schema(crate::proposal::CHANGE_PROPOSAL_SCHEMA_KEY)
                 .is_some()
         );
     }

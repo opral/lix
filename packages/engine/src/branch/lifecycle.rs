@@ -11,6 +11,9 @@ pub(crate) enum BranchOperation {
     SwitchBranch,
     MergeBranch,
     MergeBranchPreview,
+    BranchDiff,
+    CreateChangeProposal,
+    AcceptChangeProposal,
     CreateCheckpoint,
     LoadWorkspaceSelector,
 }
@@ -22,6 +25,9 @@ impl BranchOperation {
             Self::SwitchBranch => "switch_branch",
             Self::MergeBranch => "merge_branch",
             Self::MergeBranchPreview => "merge_branch_preview",
+            Self::BranchDiff => "branch_diff",
+            Self::CreateChangeProposal => "create_change_proposal",
+            Self::AcceptChangeProposal => "accept_change_proposal",
             Self::CreateCheckpoint => "create_checkpoint",
             Self::LoadWorkspaceSelector => "load_workspace_branch_id",
         }

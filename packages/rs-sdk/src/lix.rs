@@ -2,11 +2,12 @@ use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::wasm::v2::WasmTransitionCounters;
 use lix_engine::{
-    Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
-    ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
-    ExecuteStatementMetadata, ExecutionDisposition, LixError, Memory, MergeBranchOptions,
-    MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt, ObserveEvents,
-    SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
+    AcceptChangeProposalReceipt, Blob, BranchDiff, BranchDiffOptions, ChangeProposal,
+    ChangeProposalDiff, CreateBranchOptions, CreateBranchReceipt, CreateChangeProposalOptions,
+    CreateCheckpointReceipt, Engine, EngineOptions, ExecuteBatchStatement, ExecuteIdempotency,
+    ExecuteOptions, ExecuteResult, ExecuteStatementMetadata, ExecutionDisposition, LixError,
+    Memory, MergeBranchOptions, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
+    ObserveEvents, SessionContext, Storage, SwitchBranchOptions, SwitchBranchReceipt, Value,
 };
 use std::sync::Arc;
 
@@ -411,6 +412,66 @@ where
         options: MergeBranchPreviewOptions,
     ) -> Result<MergeBranchPreview, LixError> {
         self.session.merge_branch_preview(options).await
+    }
+
+    /// Computes the review-oriented (merge-base to source) diff for any two
+    /// branches without changing this handle's active branch.
+    pub async fn branch_diff(&self, options: BranchDiffOptions) -> Result<BranchDiff, LixError> {
+        self.session.branch_diff(options).await
+    }
+
+    /// Creates a repository-global proposal from one branch into another.
+    pub async fn create_change_proposal(
+        &self,
+        options: CreateChangeProposalOptions,
+    ) -> Result<ChangeProposal, LixError> {
+        self.session.create_change_proposal(options).await
+    }
+
+    pub async fn get_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<Option<ChangeProposal>, LixError> {
+        self.session.get_change_proposal(proposal_id).await
+    }
+
+    pub async fn list_change_proposals(&self) -> Result<Vec<ChangeProposal>, LixError> {
+        self.session.list_change_proposals().await
+    }
+
+    pub async fn change_proposal_diff(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ChangeProposalDiff, LixError> {
+        self.session.change_proposal_diff(proposal_id).await
+    }
+
+    /// Accepts a proposal into its named target without changing the caller's
+    /// workspace selection. The engine performs the merge and lifecycle state
+    /// transition in one storage commit.
+    pub async fn accept_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<AcceptChangeProposalReceipt, LixError> {
+        let proposal = self
+            .session
+            .get_change_proposal(proposal_id)
+            .await?
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_CHANGE_PROPOSAL_NOT_FOUND,
+                    format!("change proposal '{proposal_id}' was not found"),
+                )
+            })?;
+        let target = self.open_session(proposal.target_branch_id).await?;
+        target.session.accept_change_proposal(proposal_id).await
+    }
+
+    pub async fn reject_change_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<ChangeProposal, LixError> {
+        self.session.reject_change_proposal(proposal_id).await
     }
 
     pub async fn close(&self) -> Result<(), LixError> {

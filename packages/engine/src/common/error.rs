@@ -197,6 +197,23 @@ impl LixError {
     /// such as merging a branch into itself.
     pub const CODE_INVALID_MERGE: &'static str = "LIX_INVALID_MERGE";
 
+    /// A requested repository-global change proposal is not present.
+    pub const CODE_CHANGE_PROPOSAL_NOT_FOUND: &'static str = "LIX_CHANGE_PROPOSAL_NOT_FOUND";
+
+    /// A proposal decision was requested after its open lifecycle ended.
+    pub const CODE_CHANGE_PROPOSAL_NOT_OPEN: &'static str = "LIX_CHANGE_PROPOSAL_NOT_OPEN";
+
+    /// A branch moved after a proposal pinned the snapshot a reviewer saw.
+    pub const CODE_CHANGE_PROPOSAL_STALE: &'static str = "LIX_CHANGE_PROPOSAL_STALE";
+
+    /// The ordered source/target pair already has an open proposal.
+    pub const CODE_CHANGE_PROPOSAL_ALREADY_OPEN: &'static str = "LIX_CHANGE_PROPOSAL_ALREADY_OPEN";
+
+    /// Acceptance was attempted from a session that is not pinned to the
+    /// proposal's target branch.
+    pub const CODE_CHANGE_PROPOSAL_TARGET_MISMATCH: &'static str =
+        "LIX_CHANGE_PROPOSAL_TARGET_MISMATCH";
+
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             code: code.into(),

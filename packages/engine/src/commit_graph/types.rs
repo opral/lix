@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
 use crate::common::LixTimestamp;
@@ -106,6 +108,70 @@ pub(crate) trait CommitGraphReader: Send + Sync {
         &mut self,
         head_commit_id: &CommitId,
     ) -> Result<Vec<ReachableCommitGraphCommit>, LixError>;
+
+    /// Resolves the single merge base used by Lix's three-way merge policy.
+    ///
+    /// This lives on the object-safe reader trait so SQL providers can apply
+    /// the same graph policy as session-owned merge operations. A criss-cross
+    /// history with multiple best bases remains deliberately unsupported.
+    async fn merge_base(
+        &mut self,
+        left_commit_id: &CommitId,
+        right_commit_id: &CommitId,
+    ) -> Result<CommitGraphCommit, LixError> {
+        let left_reachable = self.reachable_commits(left_commit_id).await?;
+        let right_reachable = self.reachable_commits(right_commit_id).await?;
+        let right_ids = right_reachable
+            .iter()
+            .map(|reachable| reachable.commit.commit_id)
+            .collect::<BTreeSet<_>>();
+        let common_ids = left_reachable
+            .iter()
+            .filter(|reachable| right_ids.contains(&reachable.commit.commit_id))
+            .map(|reachable| reachable.commit.commit_id)
+            .collect::<BTreeSet<_>>();
+
+        // A common ancestor is superseded if a common child points at it.
+        // Direct-parent inspection is sufficient because the shared ancestor
+        // set is ancestor-closed.
+        let mut superseded = BTreeSet::new();
+        for reachable in &left_reachable {
+            if !common_ids.contains(&reachable.commit.commit_id) {
+                continue;
+            }
+            for parent_commit_id in &reachable.commit.parent_commit_ids {
+                if common_ids.contains(parent_commit_id) {
+                    superseded.insert(*parent_commit_id);
+                }
+            }
+        }
+        let mut ancestors = left_reachable
+            .into_iter()
+            .filter(|reachable| {
+                common_ids.contains(&reachable.commit.commit_id)
+                    && !superseded.contains(&reachable.commit.commit_id)
+            })
+            .map(|reachable| reachable.commit)
+            .collect::<Vec<_>>();
+        ancestors.sort_by_key(|commit| commit.commit_id);
+        match ancestors.as_slice() {
+            [] => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "commit_graph found no common history between '{left_commit_id}' and '{right_commit_id}'"
+                ),
+            )),
+            [base] => Ok(base.clone()),
+            _ => Err(LixError::ambiguous_merge_base(
+                left_commit_id,
+                right_commit_id,
+                ancestors
+                    .iter()
+                    .map(|ancestor| ancestor.commit_id.to_string())
+                    .collect(),
+            )),
+        }
+    }
 
     async fn change_history_from_commit(
         &mut self,
