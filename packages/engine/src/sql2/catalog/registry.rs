@@ -14,7 +14,8 @@ use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapab
 use crate::sql2::catalog::entity_surface_schema;
 use crate::sql2::catalog::{
     EntitySurfaceShape, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
-    schema_exposed_as_entity_history_surface, schema_exposed_as_entity_surface,
+    schema_exposed_as_entity_by_branch_surface, schema_exposed_as_entity_history_surface,
+    schema_exposed_as_entity_surface,
 };
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
@@ -111,6 +112,8 @@ impl PublicCatalog {
             PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
             PublicSurfaceKind::WorkingChange => working_change_schema(false),
             PublicSurfaceKind::WorkingChangeByBranch => working_change_schema(true),
+            PublicSurfaceKind::BranchDiff => branch_diff_schema(),
+            PublicSurfaceKind::BranchMergeConflict => branch_merge_conflict_schema(),
             PublicSurfaceKind::FileWorkingChange | PublicSurfaceKind::DirectoryWorkingChange => {
                 filesystem_working_change_schema(false)
             }
@@ -254,6 +257,48 @@ impl PublicCatalog {
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
+        self.insert(surface(
+            "lix_branch_diff",
+            PublicSurfaceKind::BranchDiff,
+            public_columns([
+                ("source_branch_id", false),
+                ("target_branch_id", false),
+                ("base_commit_id", false),
+                ("source_head_commit_id", false),
+                ("target_head_commit_id", false),
+                ("merge_outcome", false),
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("change_kind", false),
+                ("before_change_id", true),
+                ("after_change_id", true),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
+        self.insert(surface(
+            "lix_branch_merge_conflict",
+            PublicSurfaceKind::BranchMergeConflict,
+            public_columns([
+                ("source_branch_id", false),
+                ("target_branch_id", false),
+                ("base_commit_id", false),
+                ("source_head_commit_id", false),
+                ("target_head_commit_id", false),
+                ("merge_outcome", false),
+                ("conflict_kind", false),
+                ("entity_pk", false),
+                ("schema_key", false),
+                ("file_id", true),
+                ("target_change_kind", false),
+                ("target_before_change_id", true),
+                ("target_after_change_id", true),
+                ("source_change_kind", false),
+                ("source_before_change_id", true),
+                ("source_after_change_id", true),
+            ]),
+            SurfaceCapabilities::read_only(),
+        ))?;
         for (name, kind, by_branch) in [
             (
                 "lix_file_working_change",
@@ -352,17 +397,19 @@ impl PublicCatalog {
             capabilities.clone(),
         ))?;
 
-        let mut by_branch_columns = entity_columns(&spec);
-        by_branch_columns.extend(entity_hidden_columns(&spec, true));
+        if schema_exposed_as_entity_by_branch_surface(&spec.schema_key) {
+            let mut by_branch_columns = entity_columns(&spec);
+            by_branch_columns.extend(entity_hidden_columns(&spec, true));
 
-        self.insert(surface(
-            format!("{}_by_branch", spec.schema_key),
-            PublicSurfaceKind::EntityByBranch {
-                schema_key: spec.schema_key.clone(),
-            },
-            by_branch_columns,
-            capabilities,
-        ))?;
+            self.insert(surface(
+                format!("{}_by_branch", spec.schema_key),
+                PublicSurfaceKind::EntityByBranch {
+                    schema_key: spec.schema_key.clone(),
+                },
+                by_branch_columns,
+                capabilities,
+            ))?;
+        }
 
         if schema_exposed_as_entity_history_surface(&spec.schema_key) {
             let history_identity_roots = primary_key_roots(&spec);
@@ -420,6 +467,46 @@ fn working_change_schema(by_branch: bool) -> SchemaRef {
         fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
     }
     Arc::new(Schema::new(fields))
+}
+
+#[cfg(test)]
+fn branch_diff_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("source_branch_id", DataType::Utf8, false),
+        Field::new("target_branch_id", DataType::Utf8, false),
+        Field::new("base_commit_id", DataType::Utf8, false),
+        Field::new("source_head_commit_id", DataType::Utf8, false),
+        Field::new("target_head_commit_id", DataType::Utf8, false),
+        Field::new("merge_outcome", DataType::Utf8, false),
+        json_field("entity_pk", false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("change_kind", DataType::Utf8, false),
+        Field::new("before_change_id", DataType::Utf8, true),
+        Field::new("after_change_id", DataType::Utf8, true),
+    ]))
+}
+
+#[cfg(test)]
+fn branch_merge_conflict_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("source_branch_id", DataType::Utf8, false),
+        Field::new("target_branch_id", DataType::Utf8, false),
+        Field::new("base_commit_id", DataType::Utf8, false),
+        Field::new("source_head_commit_id", DataType::Utf8, false),
+        Field::new("target_head_commit_id", DataType::Utf8, false),
+        Field::new("merge_outcome", DataType::Utf8, false),
+        Field::new("conflict_kind", DataType::Utf8, false),
+        json_field("entity_pk", false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("target_change_kind", DataType::Utf8, false),
+        Field::new("target_before_change_id", DataType::Utf8, true),
+        Field::new("target_after_change_id", DataType::Utf8, true),
+        Field::new("source_change_kind", DataType::Utf8, false),
+        Field::new("source_before_change_id", DataType::Utf8, true),
+        Field::new("source_after_change_id", DataType::Utf8, true),
+    ]))
 }
 
 #[cfg(test)]

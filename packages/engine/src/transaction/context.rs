@@ -21,8 +21,8 @@ use tracing::Instrument as _;
 use crate::GLOBAL_BRANCH_ID;
 use crate::binary_cas::{BinaryCasContext, BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{
-    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchRefReader,
-    branch_ref_stage_row,
+    BRANCH_REF_SCHEMA_KEY, BranchContext, BranchHeadControlContext, BranchHeadControlObservation,
+    BranchRefReader, branch_ref_stage_row,
 };
 use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision,
@@ -65,6 +65,10 @@ use crate::plugin::{
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
     transport_splice_preserves_utf8, validate_host_allocated_changes,
     validate_namespace_reservation,
+};
+use crate::proposal::{
+    CHANGE_PROPOSAL_SCHEMA_KEY, ChangeProposalControlReader, ChangeProposalMutation,
+    ChangeProposalRecord, stage_change_proposal_mutation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -237,6 +241,13 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     trust_filesystem_planner: bool,
     origin_key: Option<String>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
+    /// Small global control records that must publish atomically with a normal
+    /// tracked-state transaction (for example accepting a change proposal and
+    /// advancing its target branch).
+    change_proposal_mutations: Vec<ChangeProposalMutation>,
+    /// Exact-value guards collected by higher-level control-plane APIs. They
+    /// share the transaction's final storage commit with ordinary state rows.
+    extra_storage_preconditions: Vec<StoragePrecondition>,
     session_file_views: SessionFileViews,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
@@ -487,6 +498,8 @@ where
                 trust_filesystem_planner: false,
                 origin_key: None,
                 idempotency_receipt: None,
+                change_proposal_mutations: Vec::new(),
+                extra_storage_preconditions: Vec::new(),
                 session_file_views,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
@@ -645,6 +658,21 @@ where
                     key,
                 });
         }
+        for mutation in std::mem::take(&mut transaction.change_proposal_mutations) {
+            if let Err(error) = stage_change_proposal_mutation(
+                &mut writes,
+                &mut write_options.preconditions,
+                mutation,
+            ) {
+                transaction
+                    .discard_pending_plugin_actor_publications()
+                    .await;
+                return Err(error);
+            }
+        }
+        write_options
+            .preconditions
+            .extend(std::mem::take(&mut transaction.extra_storage_preconditions));
         // Keep the prepared commit's storage borrow independent from the
         // transaction so deterministic preparation failures can still drain
         // prospective plugin actor documents before returning.
@@ -3606,6 +3634,101 @@ where
         Ok(())
     }
 
+    /// Reads the tracked global proposal entity by id. Private proposal
+    /// controls are intentionally not a fallback data source.
+    pub(crate) async fn load_change_proposal(
+        &mut self,
+        id: &str,
+    ) -> Result<Option<ChangeProposalRecord>, LixError> {
+        let rows = self
+            .load_visible_exact_live_state_rows(&LiveStateExactBatchRequest {
+                rows: vec![LiveStateExactRowRequest {
+                    schema_key: CHANGE_PROPOSAL_SCHEMA_KEY.to_string(),
+                    branch_id: GLOBAL_BRANCH_ID.to_string(),
+                    entity_pk: EntityPk::single(id),
+                    file_id: None,
+                }],
+                projection: LiveStateProjection::default(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?;
+        let row = rows.into_iter().next().flatten();
+        row.map(|row| decode_tracked_change_proposal_row(row, Some(id)))
+            .transpose()
+    }
+
+    /// Checks the open-proposal uniqueness index under the same transaction
+    /// lifecycle as a potential creation. The final key-absent precondition is
+    /// still authoritative if another creator races this read.
+    pub(crate) async fn load_open_change_proposal_for_branch_pair(
+        &self,
+        source_branch_id: &str,
+        target_branch_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        let read = self
+            .storage
+            .begin_read(StorageReadOptions::default())
+            .await?;
+        ChangeProposalControlReader::new(SharedStorageAdapterRead::new(read))
+            .load_open_for_branch_pair(source_branch_id, target_branch_id)
+            .await
+    }
+
+    /// Lists tracked global proposal entities in stable id order.
+    pub(crate) async fn scan_change_proposals(
+        &mut self,
+    ) -> Result<Vec<ChangeProposalRecord>, LixError> {
+        let rows = self
+            .scan_visible_live_state(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![CHANGE_PROPOSAL_SCHEMA_KEY.to_string()],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..LiveStateFilter::default()
+                },
+                projection: LiveStateProjection::default(),
+                limit: None,
+            })
+            .await?;
+        let mut proposals = rows
+            .into_iter()
+            .map(|row| decode_tracked_change_proposal_row(row, None))
+            .collect::<Result<Vec<_>, _>>()?;
+        proposals.sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(proposals)
+    }
+
+    pub(crate) fn stage_change_proposal_mutation(&mut self, mutation: ChangeProposalMutation) {
+        self.change_proposal_mutations.push(mutation);
+    }
+
+    /// Adds an exact control-plane precondition to this transaction's final
+    /// durable write. Branch-head compare-and-swap guards use this to ensure a
+    /// reviewed proposal cannot accept a newer source or target head.
+    pub(crate) fn stage_storage_precondition(&mut self, precondition: StoragePrecondition) {
+        self.extra_storage_preconditions.push(precondition);
+    }
+
+    /// Returns branch-head control records and their exact persisted bytes
+    /// from one storage read. Callers must retain the bytes through commit
+    /// when a decision depends on the observed heads.
+    pub(crate) async fn observe_branch_head_controls(
+        &self,
+        branch_ids: &[String],
+    ) -> Result<Vec<BranchHeadControlObservation>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        BranchHeadControlContext::new()
+            .reader(read)
+            .load_observed(branch_ids)
+            .await
+    }
+
     /// Returns the content identity of the SQL schema catalog captured when
     /// this transaction opened.
     pub(crate) fn sql_catalog_fingerprint(&self) -> &CatalogFingerprint {
@@ -3844,6 +3967,39 @@ where
             .expect("open transaction read scope");
         CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
+}
+
+fn decode_tracked_change_proposal_row(
+    row: MaterializedLiveStateRow,
+    expected_id: Option<&str>,
+) -> Result<ChangeProposalRecord, LixError> {
+    if row.schema_key != CHANGE_PROPOSAL_SCHEMA_KEY
+        || row.branch_id.as_ref() != GLOBAL_BRANCH_ID
+        || !row.global
+        || row.untracked
+        || row.file_id.is_some()
+        || row.deleted
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "change-proposal lookup returned a row outside the tracked global entity scope",
+        ));
+    }
+    let entity_id = row.entity_pk.as_single_string()?;
+    if expected_id.is_some_and(|expected_id| expected_id != entity_id) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "change-proposal lookup returned a mismatched entity primary key",
+        ));
+    }
+    let record = ChangeProposalRecord::from_snapshot_content(row.snapshot_content.as_deref())?;
+    if record.id != entity_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked change-proposal entity primary key does not match its snapshot id",
+        ));
+    }
+    Ok(record)
 }
 
 fn incremental_filesystem_index_enabled() -> bool {

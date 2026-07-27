@@ -52,6 +52,9 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
         "lix_checkpoint_marker" => Some(
             "Checkpoint markers are internal; use the create_checkpoint API to create checkpoints.",
         ),
+        "lix_change_proposal" => Some(
+            "Change proposals are lifecycle-controlled; use the change-proposal API to create, accept, or reject them.",
+        ),
         _ => None,
     }
 }

@@ -36,6 +36,7 @@ pub(crate) mod live_state;
 pub(crate) mod observe_coordinator;
 pub(crate) mod observe_invalidation;
 pub(crate) mod plugin;
+pub(crate) mod proposal;
 mod schema;
 pub mod session;
 pub(crate) mod sql2;
@@ -72,15 +73,18 @@ pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_
 pub use engine::{Engine, EngineOptions};
 pub use init::InitReceipt;
 pub use session::{
+    AcceptChangeProposalReceipt, BranchDiff, BranchDiffChangeKind, BranchDiffEntry,
+    BranchDiffOptions, ChangeProposal, ChangeProposalDiff, ChangeProposalState,
+    CreateBranchOptions, CreateBranchReceipt, CreateChangeProposalOptions, CreateCheckpointReceipt,
+    MergeBranchOptions, MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions,
+    MergeBranchReceipt, MergeChangeStats, MergeConflict, MergeConflictChangeKind,
+    MergeConflictKind, MergeConflictSide, SessionContext, SessionTransaction, SwitchBranchOptions,
+    SwitchBranchReceipt,
+};
+pub use session::{
     CoherentReadBatch, ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
     ExecuteStatementMetadata, ExecutionDisposition, MutationIdentity, ObserveEvent, ObserveEvents,
     RequestBlobSpliceProvenance, Row, RowRef, TryFromValue, VerifiedRequestBlob,
-};
-pub use session::{
-    CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, MergeBranchOptions,
-    MergeBranchOutcome, MergeBranchPreview, MergeBranchPreviewOptions, MergeBranchReceipt,
-    MergeChangeStats, MergeConflict, MergeConflictChangeKind, MergeConflictKind, MergeConflictSide,
-    SessionContext, SessionTransaction, SwitchBranchOptions, SwitchBranchReceipt,
 };
 pub use sql2::{SqlScriptPlan, SqlScriptStatement, parse_sql_script};
 pub use storage::conformance::{

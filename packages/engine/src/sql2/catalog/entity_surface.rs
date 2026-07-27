@@ -149,7 +149,17 @@ pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
 
 pub(crate) fn schema_exposed_as_entity_history_surface(schema_key: &str) -> bool {
     schema_exposed_as_entity_surface(schema_key)
-        && !matches!(schema_key, "lix_commit" | "lix_commit_edge")
+        && !matches!(
+            schema_key,
+            "lix_commit" | "lix_commit_edge" | "lix_change_proposal"
+        )
+}
+
+/// Global entities have no meaningful branch ownership. In particular,
+/// projecting one into every branch would duplicate it and make
+/// `lixcol_branch_id` falsely imply that it belongs to the requested branch.
+pub(crate) fn schema_exposed_as_entity_by_branch_surface(schema_key: &str) -> bool {
+    schema_exposed_as_entity_surface(schema_key) && !matches!(schema_key, "lix_change_proposal")
 }
 
 pub(crate) fn entity_surface_schema(

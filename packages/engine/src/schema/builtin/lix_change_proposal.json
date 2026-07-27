@@ -1,0 +1,60 @@
+{
+  "x-lix-key": "lix_change_proposal",
+  "description": "Repository-global, tracked change-proposal record. A proposal freezes the source, target, and merge-base commits reviewed by a human; its lifecycle is changed only through the change-proposal API. Lix change history records when lifecycle writes occur and their provenance.",
+  "x-lix-primary-key": [
+    "/id"
+  ],
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable proposal identifier."
+    },
+    "source_branch_id": {
+      "type": "string",
+      "description": "Branch that authored the proposed change."
+    },
+    "target_branch_id": {
+      "type": "string",
+      "description": "Branch the proposal is intended to merge into."
+    },
+    "base_commit_id": {
+      "type": "string",
+      "description": "Merge base pinned when the proposal was opened."
+    },
+    "source_head_commit_id": {
+      "type": "string",
+      "description": "Source head pinned when the proposal was opened."
+    },
+    "target_head_commit_id": {
+      "type": "string",
+      "description": "Target head pinned when the proposal was opened."
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "open",
+        "accepted",
+        "rejected"
+      ],
+      "description": "Lifecycle state. The proposal API is the only mutation surface."
+    },
+    "accepted_target_head_commit_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Target head produced by acceptance; null for open or rejected proposals."
+    }
+  },
+  "required": [
+    "id",
+    "source_branch_id",
+    "target_branch_id",
+    "base_commit_id",
+    "source_head_commit_id",
+    "target_head_commit_id",
+    "state"
+  ],
+  "additionalProperties": false
+}

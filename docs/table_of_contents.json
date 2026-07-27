@@ -11,6 +11,7 @@
     { "path": "./versions.md", "label": "Versions & Merging" },
     { "path": "./checkpoints.md", "label": "Checkpoints" },
     { "path": "./history.md", "label": "Change History" },
+    { "path": "./change-proposals.md", "label": "Change Proposals" },
     { "path": "./surfaces.md", "label": "SQL Surfaces" }
   ],
   "Guides": [

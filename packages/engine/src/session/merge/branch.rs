@@ -6,18 +6,20 @@ use serde_json::{Value as JsonValue, json};
 use tracing::Instrument as _;
 
 use crate::LixError;
-use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
-use crate::changelog::ChangeRecordProjection;
+use crate::branch::{BranchLifecycle, BranchOperation, BranchRefReader, BranchReferenceRole};
+use crate::changelog::{ChangeRecordProjection, CommitId};
+use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     inferred_media_type_for_path,
 };
-use crate::storage_adapter::Storage;
+use crate::storage_adapter::{Storage, StorageAdapterRead};
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateKey, TrackedStateMergeConflict,
-    TrackedStateStoreReader,
+    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDiffKind, TrackedStateKey,
+    TrackedStateMergeConflict, TrackedStateStoreReader,
 };
+use crate::transaction::Transaction;
 use crate::transaction::types::{
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
 };
@@ -88,6 +90,50 @@ pub struct MergeBranchPreview {
     pub conflicts: Vec<MergeConflict>,
 }
 
+/// Options for comparing the authored work on one branch with the branch it
+/// targets. The result uses merge-base semantics: `diff(merge_base, source)`,
+/// plus merge/conflict information against `target`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDiffOptions {
+    pub source_branch_id: String,
+    pub target_branch_id: String,
+}
+
+/// Reusable review-oriented branch diff. This deliberately is not a raw
+/// `diff(target, source)` state comparison: `changes` are the source
+/// branch's contribution since its merge base with the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDiff {
+    pub target_branch_id: String,
+    pub source_branch_id: String,
+    pub base_commit_id: String,
+    pub target_head_commit_id: String,
+    pub source_head_commit_id: String,
+    pub outcome: MergeBranchOutcome,
+    pub changes: Vec<BranchDiffEntry>,
+    pub change_stats: MergeChangeStats,
+    pub conflicts: Vec<MergeConflict>,
+}
+
+/// One identity-level change in a [`BranchDiff`]. The shape intentionally
+/// mirrors `lix_working_change` so review clients can share renderers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchDiffEntry {
+    pub entity_pk: JsonValue,
+    pub schema_key: String,
+    pub file_id: Option<String>,
+    pub kind: BranchDiffChangeKind,
+    pub before_change_id: Option<String>,
+    pub after_change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BranchDiffChangeKind {
+    Added,
+    Modified,
+    Removed,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeConflict {
     pub kind: MergeConflictKind,
@@ -139,47 +185,13 @@ where
         self.with_write_transaction(|transaction| {
             Box::pin(async move {
                 let active_branch_id = transaction.active_branch_id().to_string();
-                if source_branch_id == active_branch_id {
-                    return Err(LixError::invalid_self_merge(active_branch_id));
-                }
-
-                let (target_head, source_head) = {
-                    let reader = transaction.branch_ref_reader().await;
-                    let lifecycle = BranchLifecycle::new(&reader);
-                    let target_head = lifecycle
-                        .require_existing_commit_id(
-                            &active_branch_id,
-                            BranchOperation::MergeBranchPreview,
-                            BranchReferenceRole::Target,
-                        )
-                        .await?;
-                    let source_head = lifecycle
-                        .require_existing_commit_id(
-                            &source_branch_id,
-                            BranchOperation::MergeBranchPreview,
-                            BranchReferenceRole::Source,
-                        )
-                        .await?;
-                    (target_head, source_head)
-                };
-
-                let merge_base = {
-                    let mut reader = transaction.commit_graph_reader().await;
-                    reader.merge_base(&target_head, &source_head).await?
-                };
-
-                let analysis = {
-                    let mut reader = transaction.tracked_state_reader().await;
-                    analyze(
-                        &mut reader,
-                        MergeCommits {
-                            base_commit_id: merge_base.commit_id,
-                            target_commit_id: target_head,
-                            source_commit_id: source_head,
-                        },
-                    )
-                    .await?
-                };
+                let analysis = analyze_branch_pair(
+                    transaction,
+                    &source_branch_id,
+                    &active_branch_id,
+                    BranchOperation::MergeBranchPreview,
+                )
+                .await?;
                 let derived_blob_files = {
                     let mut reader = transaction.tracked_state_reader().await;
                     derived_plugin_blob_conflicts(&mut reader, &analysis).await?
@@ -198,6 +210,32 @@ where
                     &derived_blob_files,
                     &resolvable_plugin_conflicts,
                 ))
+            })
+        })
+        .await
+    }
+
+    /// Computes the review diff for an explicit source/target branch pair.
+    /// It does not depend on, or change, this session's active branch.
+    pub async fn branch_diff(&self, options: BranchDiffOptions) -> Result<BranchDiff, LixError> {
+        let source_branch_id = options.source_branch_id;
+        let target_branch_id = options.target_branch_id;
+        self.with_write_transaction(|transaction| {
+            Box::pin(async move {
+                let analysis = analyze_branch_pair(
+                    transaction,
+                    &source_branch_id,
+                    &target_branch_id,
+                    BranchOperation::BranchDiff,
+                )
+                .await?;
+                branch_diff_from_analysis_with_derived(
+                    transaction,
+                    &source_branch_id,
+                    &target_branch_id,
+                    &analysis,
+                )
+                .await
             })
         })
         .await
@@ -446,6 +484,351 @@ where
     }
 }
 
+/// Computes the same review surface as [`SessionContext::branch_diff`] from
+/// an execution-scoped SQL read capability. The branch pair is mandatory and
+/// the result is always `diff(merge_base(source, target), source)`, never a
+/// raw target-to-source state comparison.
+pub(crate) async fn branch_diff_from_readers<S>(
+    branch_ref: &dyn BranchRefReader,
+    commit_graph: &mut dyn CommitGraphReader,
+    store: S,
+    source_branch_id: &str,
+    target_branch_id: &str,
+) -> Result<BranchDiff, LixError>
+where
+    S: StorageAdapterRead,
+{
+    if source_branch_id == target_branch_id {
+        return Err(LixError::invalid_self_merge(target_branch_id));
+    }
+    let lifecycle = BranchLifecycle::new(branch_ref);
+    let target_commit_id = lifecycle
+        .require_existing_commit_id(
+            target_branch_id,
+            BranchOperation::BranchDiff,
+            BranchReferenceRole::Target,
+        )
+        .await?;
+    let source_commit_id = lifecycle
+        .require_existing_commit_id(
+            source_branch_id,
+            BranchOperation::BranchDiff,
+            BranchReferenceRole::Source,
+        )
+        .await?;
+    let base_commit_id = commit_graph
+        .merge_base(&target_commit_id, &source_commit_id)
+        .await?
+        .commit_id;
+    let mut reader = TrackedStateContext::new().reader(store);
+    let analysis = analyze(
+        &mut reader,
+        MergeCommits {
+            base_commit_id,
+            target_commit_id,
+            source_commit_id,
+        },
+    )
+    .await?;
+    let derived_blob_files = derived_plugin_blob_conflicts(&mut reader, &analysis).await?;
+    branch_diff_from_analysis(
+        source_branch_id,
+        target_branch_id,
+        &analysis,
+        &derived_blob_files,
+    )
+}
+
+/// Analyses the current heads of an explicit source/target branch pair. The
+/// public merge API still targets the session's active branch, but proposal and
+/// review APIs need the same analysis without mutating session selection.
+pub(crate) async fn analyze_branch_pair<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    source_branch_id: &str,
+    target_branch_id: &str,
+    operation: BranchOperation,
+) -> Result<super::analysis::MergeAnalysis, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if source_branch_id == target_branch_id {
+        return Err(LixError::invalid_self_merge(target_branch_id));
+    }
+    let (target_head, source_head) = async {
+        let reader = transaction.branch_ref_reader().await;
+        let lifecycle = BranchLifecycle::new(&reader);
+        let target_head = lifecycle
+            .require_existing_commit_id(target_branch_id, operation, BranchReferenceRole::Target)
+            .await?;
+        let source_head = lifecycle
+            .require_existing_commit_id(source_branch_id, operation, BranchReferenceRole::Source)
+            .await?;
+        Ok::<_, LixError>((target_head, source_head))
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_branch_refs"
+    ))
+    .await?;
+    let merge_base = async {
+        let mut reader = transaction.commit_graph_reader().await;
+        reader.merge_base(&target_head, &source_head).await
+    }
+    .instrument(tracing::debug_span!(target: "lix_perf", "lix.perf.merge_base"))
+    .await?;
+    analyze_pinned_merge_commits(
+        transaction,
+        MergeCommits {
+            base_commit_id: merge_base.commit_id,
+            target_commit_id: target_head,
+            source_commit_id: source_head,
+        },
+    )
+    .await
+}
+
+/// Runs the semantic three-way analysis for already-pinned commit ids. This is
+/// the review primitive used by a frozen change proposal; it never consults
+/// moving branch refs.
+pub(crate) async fn analyze_pinned_merge_commits<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    commits: MergeCommits,
+) -> Result<super::analysis::MergeAnalysis, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    async {
+        let mut reader = transaction.tracked_state_reader().await;
+        analyze(&mut reader, commits).await
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_analysis"
+    ))
+    .await
+}
+
+/// Analyses an already-pinned source/target/base triple without consulting
+/// moving branch refs. Change proposals use this to render and accept the
+/// exact snapshot that was reviewed.
+pub(crate) async fn analyze_pinned_branch_pair<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    base_commit_id: CommitId,
+    source_commit_id: CommitId,
+    target_commit_id: CommitId,
+) -> Result<super::analysis::MergeAnalysis, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    analyze_pinned_merge_commits(
+        transaction,
+        MergeCommits {
+            base_commit_id,
+            target_commit_id,
+            source_commit_id,
+        },
+    )
+    .await
+}
+
+/// Renders a review diff for immutable commit pins. This is intentionally
+/// separate from [`analyze_pinned_branch_pair`] so proposal callers do not
+/// need access to merge-analysis internals.
+pub(crate) async fn pinned_branch_diff<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    source_branch_id: &str,
+    target_branch_id: &str,
+    base_commit_id: CommitId,
+    source_commit_id: CommitId,
+    target_commit_id: CommitId,
+) -> Result<BranchDiff, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let analysis = analyze_pinned_branch_pair(
+        transaction,
+        base_commit_id,
+        source_commit_id,
+        target_commit_id,
+    )
+    .await?;
+    branch_diff_from_analysis_with_derived(
+        transaction,
+        source_branch_id,
+        target_branch_id,
+        &analysis,
+    )
+    .await
+}
+
+/// Stages a merge that has already been analysed against exact commit ids.
+///
+/// This is deliberately lower than branch-ref lookup so a proposal can apply
+/// the immutable snapshot it showed the reviewer. The caller remains
+/// responsible for guarding the source and target controls through commit.
+pub(crate) async fn merge_analysis_in_transaction<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    source_branch_id: &str,
+    analysis: super::analysis::MergeAnalysis,
+) -> Result<MergeBranchReceipt, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let active_branch_id = transaction.active_branch_id().to_string();
+    let derived_blob_files = async {
+        let mut reader = transaction.tracked_state_reader().await;
+        derived_plugin_blob_conflicts(&mut reader, &analysis).await
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_derived_blob_detection"
+    ))
+    .await?;
+
+    if analysis.outcome == MergeOutcome::AlreadyUpToDate {
+        return Ok(MergeBranchReceipt {
+            outcome: MergeBranchOutcome::AlreadyUpToDate,
+            target_branch_id: active_branch_id,
+            source_branch_id: source_branch_id.to_string(),
+            base_commit_id: analysis.commits.base_commit_id.to_string(),
+            target_head_after_commit_id: analysis.commits.target_commit_id.to_string(),
+            target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+            source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+            created_merge_commit_id: None,
+            change_stats: merge_change_stats_from_analysis(&analysis.stats),
+        });
+    }
+
+    if analysis.outcome == MergeOutcome::FastForward {
+        transaction
+            .advance_branch_ref(&active_branch_id, analysis.commits.source_commit_id)
+            .await?;
+        return Ok(MergeBranchReceipt {
+            outcome: MergeBranchOutcome::FastForward,
+            target_branch_id: active_branch_id,
+            source_branch_id: source_branch_id.to_string(),
+            base_commit_id: analysis.commits.base_commit_id.to_string(),
+            target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+            source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+            target_head_after_commit_id: analysis.commits.source_commit_id.to_string(),
+            created_merge_commit_id: None,
+            change_stats: merge_change_stats_from_analysis(&analysis.stats),
+        });
+    }
+
+    let merge_plan = analysis
+        .merge_plan()
+        .expect("merge analysis should include a plan for mergeCommitted");
+    let resolvable_plugin_conflicts = async {
+        let mut reader = transaction.tracked_state_reader().await;
+        resolvable_plugin_conflict_keys(&mut reader, &analysis, &derived_blob_files).await
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_plugin_conflict_preflight"
+    ))
+    .await?;
+    let effective_conflicts = analysis
+        .conflicts
+        .iter()
+        .filter(|conflict| {
+            !is_derived_blob_conflict(conflict, &derived_blob_files)
+                && !is_resolvable_plugin_semantic_conflict(conflict, &resolvable_plugin_conflicts)
+        })
+        .collect::<Vec<_>>();
+    if !effective_conflicts.is_empty() {
+        return Err(merge_conflict_error(
+            &effective_conflicts
+                .into_iter()
+                .map(merge_conflict_from_analysis)
+                .collect::<Vec<_>>(),
+        )?);
+    }
+
+    let plugin_conflict_groups = async {
+        let mut reader = transaction.tracked_state_reader().await;
+        plugin_merge_conflict_groups(
+            &mut reader,
+            &analysis,
+            &derived_blob_files,
+            &resolvable_plugin_conflicts,
+        )
+        .await
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_plugin_conflict_inputs"
+    ))
+    .await?;
+    let resolved_plugin_rows = resolve_plugin_merge_conflict_groups(
+        transaction,
+        plugin_conflict_groups,
+        &active_branch_id,
+    )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_plugin_conflict_resolve"
+    ))
+    .await?;
+
+    let semantic_rows = async {
+        let mut reader = transaction.tracked_state_reader().await;
+        materialized_plugin_merge_rows(
+            &mut reader,
+            &analysis,
+            &derived_blob_files,
+            &active_branch_id,
+            resolved_plugin_rows,
+        )
+        .await
+    }
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_materialized_rows"
+    ))
+    .await?;
+    if !semantic_rows.is_empty() {
+        transaction
+            .stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: semantic_rows,
+            })
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.merge_stage_semantic_rows"
+            ))
+            .await?;
+    }
+    let created_merge_commit_id = tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.merge_stage_commit"
+    )
+    .in_scope(|| {
+        let selected_changes = merge_plan
+            .picks
+            .iter()
+            .filter(|pick| !pick_is_derived_plugin_state(pick, &derived_blob_files))
+            .map(selected_change_from_merge_pick)
+            .collect::<Vec<_>>();
+        transaction.stage_merge_commit(
+            active_branch_id.clone(),
+            analysis.commits.source_commit_id,
+            selected_changes,
+        )
+    })?;
+    Ok(MergeBranchReceipt {
+        outcome: MergeBranchOutcome::MergeCommitted,
+        target_branch_id: active_branch_id,
+        source_branch_id: source_branch_id.to_string(),
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_head_after_commit_id: created_merge_commit_id.clone(),
+        target_head_before_commit_id: analysis.commits.target_commit_id.to_string(),
+        source_head_before_commit_id: analysis.commits.source_commit_id.to_string(),
+        created_merge_commit_id: Some(created_merge_commit_id),
+        change_stats: merge_change_stats_from_analysis(&analysis.stats),
+    })
+}
+
 fn selected_change_from_merge_pick(pick: &TrackedStateMergePick) -> StagedCommitChangeRef {
     StagedCommitChangeRef {
         schema_key: pick.selected_row.schema_key.clone(),
@@ -467,7 +850,7 @@ async fn derived_plugin_blob_conflicts<S>(
     analysis: &super::analysis::MergeAnalysis,
 ) -> Result<BTreeMap<String, PluginFileOwner>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     // A derived blob conflict is the common signal, but it is not the
     // authority for plugin ownership. Start from every conflicted file and
@@ -707,7 +1090,7 @@ async fn resolvable_plugin_conflict_keys<S>(
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
 ) -> Result<BTreeSet<TrackedStateKey>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     let Some(merge_plan) = analysis.merge_plan() else {
         return Ok(BTreeSet::new());
@@ -791,7 +1174,7 @@ async fn plugin_merge_conflict_groups<S>(
     resolvable_plugin_conflicts: &BTreeSet<TrackedStateKey>,
 ) -> Result<Vec<PluginMergeConflictGroup>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     let merge_plan = analysis
         .merge_plan()
@@ -978,7 +1361,7 @@ async fn historical_conflict_file_descriptors<S>(
     file_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, (Option<String>, Option<String>)>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     if file_ids.is_empty() {
         return Ok(BTreeMap::new());
@@ -1091,7 +1474,7 @@ async fn historical_file_path<S>(
     descriptor: &HistoricalFileDescriptor,
 ) -> Result<Option<String>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     let mut ancestor_names = Vec::new();
     let mut directory_id = descriptor.directory_id.clone();
@@ -1147,7 +1530,7 @@ async fn load_historical_plugin_registry<S>(
     registry_key: &TrackedStateKey,
 ) -> Result<PluginRegistry, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     let rows = reader
         .load_projected_rows_at_commit(
@@ -1378,7 +1761,7 @@ impl WasmByteSource for TrackedRowSnapshotSource {
 }
 
 async fn resolve_plugin_merge_conflict_groups<StorageImpl>(
-    transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    transaction: &mut Transaction<StorageImpl>,
     groups: Vec<PluginMergeConflictGroup>,
     target_branch_id: &str,
 ) -> Result<Vec<TransactionWriteRow>, LixError>
@@ -1557,7 +1940,7 @@ async fn materialized_plugin_merge_rows<S>(
     resolved_plugin_rows: Vec<TransactionWriteRow>,
 ) -> Result<Vec<TransactionWriteRow>, LixError>
 where
-    S: crate::storage_adapter::StorageAdapterRead,
+    S: StorageAdapterRead,
 {
     let merge_plan = analysis
         .merge_plan()
@@ -1654,6 +2037,70 @@ fn preview_from_analysis(
             .map(merge_conflict_from_analysis)
             .collect(),
     }
+}
+
+async fn branch_diff_from_analysis_with_derived<StorageImpl>(
+    transaction: &mut Transaction<StorageImpl>,
+    source_branch_id: &str,
+    target_branch_id: &str,
+    analysis: &super::analysis::MergeAnalysis,
+) -> Result<BranchDiff, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let derived_blob_files = {
+        let mut reader = transaction.tracked_state_reader().await;
+        derived_plugin_blob_conflicts(&mut reader, analysis).await?
+    };
+    branch_diff_from_analysis(
+        source_branch_id,
+        target_branch_id,
+        analysis,
+        &derived_blob_files,
+    )
+}
+
+fn branch_diff_from_analysis(
+    source_branch_id: &str,
+    target_branch_id: &str,
+    analysis: &super::analysis::MergeAnalysis,
+    derived_blob_files: &BTreeMap<String, PluginFileOwner>,
+) -> Result<BranchDiff, LixError> {
+    let changes = analysis
+        .source_diff
+        .entries
+        .iter()
+        .map(|entry| {
+            Ok(BranchDiffEntry {
+                entity_pk: entry.identity.entity_pk.as_json_array_value()?,
+                schema_key: entry.identity.schema_key.clone(),
+                file_id: entry.identity.file_id.clone(),
+                kind: match entry.kind {
+                    TrackedStateDiffKind::Added => BranchDiffChangeKind::Added,
+                    TrackedStateDiffKind::Modified => BranchDiffChangeKind::Modified,
+                    TrackedStateDiffKind::Removed => BranchDiffChangeKind::Removed,
+                },
+                before_change_id: entry.before.as_ref().map(|row| row.change_id.to_string()),
+                after_change_id: entry.after.as_ref().map(|row| row.change_id.to_string()),
+            })
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(BranchDiff {
+        target_branch_id: target_branch_id.to_string(),
+        source_branch_id: source_branch_id.to_string(),
+        base_commit_id: analysis.commits.base_commit_id.to_string(),
+        target_head_commit_id: analysis.commits.target_commit_id.to_string(),
+        source_head_commit_id: analysis.commits.source_commit_id.to_string(),
+        outcome: merge_branch_outcome_from_analysis(analysis.outcome),
+        changes,
+        change_stats: merge_change_stats_from_analysis(&analysis.stats),
+        conflicts: analysis
+            .conflicts
+            .iter()
+            .filter(|conflict| !is_derived_blob_conflict(conflict, derived_blob_files))
+            .map(merge_conflict_from_analysis)
+            .collect(),
+    })
 }
 
 fn merge_branch_outcome_from_analysis(outcome: MergeOutcome) -> MergeBranchOutcome {

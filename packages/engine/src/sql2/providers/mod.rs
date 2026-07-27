@@ -10,6 +10,7 @@ use crate::LixError;
 use crate::branch::BranchRefReader;
 
 mod branch;
+mod branch_diff;
 mod change;
 mod checkpoint;
 mod columns;
@@ -377,6 +378,26 @@ where
                 )
                 .await?;
             }
+            PublicSurfaceKind::BranchDiff => {
+                branch_diff::register_branch_diff_provider(
+                    session,
+                    &surface.name,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::BranchMergeConflict => {
+                branch_diff::register_branch_merge_conflict_provider(
+                    session,
+                    &surface.name,
+                    Arc::clone(&branch_ref),
+                    ctx.commit_graph(),
+                    ctx.changelog_query_source(),
+                )
+                .await?;
+            }
             PublicSurfaceKind::FileWorkingChange => {
                 filesystem_working_change::register_filesystem_working_change_provider(
                     session,
@@ -652,6 +673,8 @@ async fn register_write_from_catalog(
             | PublicSurfaceKind::CheckpointByBranch
             | PublicSurfaceKind::WorkingChange
             | PublicSurfaceKind::WorkingChangeByBranch
+            | PublicSurfaceKind::BranchDiff
+            | PublicSurfaceKind::BranchMergeConflict
             | PublicSurfaceKind::FileWorkingChange
             | PublicSurfaceKind::FileWorkingChangeByBranch
             | PublicSurfaceKind::DirectoryWorkingChange

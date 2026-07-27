@@ -14,12 +14,18 @@ use crate::branch::BranchHeadControlContext;
 use crate::changelog::{ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot};
 use crate::json_store::{JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate};
 use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
+use crate::proposal::{
+    CHANGE_PROPOSAL_SCHEMA_KEY, ChangeProposalRecord, ChangeProposalStateRecord,
+};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
     StorageProjectedValue, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
     StorageWriteSet,
 };
-use crate::{LixError, storage_codec};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest,
+};
+use crate::{GLOBAL_BRANCH_ID, LixError, NullableKeyFilter, storage_codec};
 
 pub(crate) const CHECKPOINT_RECOVERY_REF_NAMESPACE: &str = "checkpoint.recovery_ref.v3";
 pub(crate) const CHECKPOINT_RECOVERY_REF_SPACE: StorageSpace = StorageSpace::new(
@@ -400,6 +406,54 @@ where
     }
     for recovery in load_recovery_refs(&store).await? {
         roots.push(GcRoot::BranchHead(recovery.recovered_head_commit_id));
+    }
+    // An open proposal is a durable review snapshot. Its source branch can
+    // be advanced (or eventually archived) while a human is still reviewing
+    // the pinned commits, so retain both snapshot heads independently of the
+    // current branch controls. The merge base is an ancestor of those heads
+    // and is consequently retained by normal commit reachability.
+    let global_head = controls
+        .iter()
+        .find(|(branch_id, _)| branch_id == GLOBAL_BRANCH_ID)
+        .map(|(_, control)| control.head_commit_id)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "repository GC could not find the global branch head",
+            )
+        })?;
+    let global_head = global_head.to_string();
+    let proposal_rows = TrackedStateContext::new()
+        .reader(store.clone())
+        .scan_rows_at_commit(
+            &global_head,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![CHANGE_PROPOSAL_SCHEMA_KEY.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: TrackedStateReadColumns {
+                    columns: vec!["snapshot_content".to_string()],
+                },
+                limit: None,
+            },
+        )
+        .await?;
+    for row in proposal_rows {
+        let entity_id = row.entity_pk.as_single_string()?;
+        let proposal =
+            ChangeProposalRecord::from_snapshot_content(row.snapshot_content.as_deref())?;
+        if proposal.id != entity_id || row.file_id.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked change-proposal GC row has an invalid identity",
+            ));
+        }
+        if proposal.state == ChangeProposalStateRecord::Open {
+            roots.push(GcRoot::BranchHead(proposal.source_head_commit_id));
+            roots.push(GcRoot::BranchHead(proposal.target_head_commit_id));
+        }
     }
     let root_discovery_us = elapsed_micros(phase_started);
 

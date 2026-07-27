@@ -1268,6 +1268,8 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
         | PublicSurfaceKind::CheckpointByBranch
         | PublicSurfaceKind::WorkingChange
         | PublicSurfaceKind::WorkingChangeByBranch
+        | PublicSurfaceKind::BranchDiff
+        | PublicSurfaceKind::BranchMergeConflict
         | PublicSurfaceKind::FileWorkingChange
         | PublicSurfaceKind::FileWorkingChangeByBranch
         | PublicSurfaceKind::DirectoryWorkingChange
