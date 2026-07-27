@@ -153,6 +153,34 @@ fn writes_large_values_to_blob_files() {
 }
 
 #[test]
+fn uses_fast_zstd_compression_for_sst_files() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("storage.rocksdb");
+    let storage = RocksDB::open(&path).expect("open storage");
+    put_one(
+        &storage,
+        SpaceId(0x0005_0003),
+        Key(Bytes::from_static(b"compressed-value")),
+        Bytes::from(vec![b'a'; 64 * 1024]),
+    );
+    storage.flush().expect("flush storage");
+    drop(storage);
+
+    let options = std::fs::read_to_string(latest_options_file(&path))
+        .expect("read persisted RocksDB options");
+    assert!(
+        options.contains("compression=kZSTD"),
+        "SST compression should use Zstd"
+    );
+    assert!(
+        options.contains("compression_opts={")
+            && options.contains("level=1;")
+            && options.contains("window_bits=-14;"),
+        "Zstd should use the fast level-1 configuration"
+    );
+}
+
+#[test]
 fn cross_process_open_reports_locked_database() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");
@@ -234,6 +262,20 @@ fn rocksdb_blob_file_count(path: &std::path::Path) -> usize {
                 .is_some_and(|extension| extension == "blob")
         })
         .count()
+}
+
+fn latest_options_file(path: &std::path::Path) -> std::path::PathBuf {
+    std::fs::read_dir(path)
+        .expect("read rocksdb directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("OPTIONS-"))
+        })
+        .max()
+        .expect("rocksdb should persist an options file")
 }
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {

@@ -3222,6 +3222,7 @@ dependencies = [
  "cc",
  "libc",
  "libz-sys",
+ "zstd-sys",
 ]
 
 [[package]]
