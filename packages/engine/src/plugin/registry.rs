@@ -22,8 +22,8 @@ use crate::{GLOBAL_BRANCH_ID, LixError};
 
 use super::InstalledPlugin;
 use super::manifest::{
-    PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
-    validate_runtime_api_version,
+    PluginContentType, PluginManifest, PluginMaterialization, PluginRuntime,
+    parse_plugin_manifest_json, validate_runtime_api_version,
 };
 use super::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
 
@@ -32,7 +32,8 @@ pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const REGISTRY_FORMAT_VERSION: u32 = 2;
+const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 3;
+const PLUGIN_FILE_OWNER_FORMAT_VERSION: u32 = 2;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
 
@@ -68,6 +69,7 @@ pub(crate) struct PluginRegistryEntry {
     path_glob: String,
     #[serde(deserialize_with = "deserialize_required_content_type")]
     content_type: Option<PluginContentType>,
+    materialization: PluginMaterialization,
     entry: String,
     schema_keys: Vec<String>,
     host_allocated_schema_keys: Vec<String>,
@@ -89,19 +91,20 @@ where
 
 impl PluginRegistryEntry {
     pub(crate) fn new(input: PluginRegistryEntryInput) -> Result<Self, LixError> {
+        let manifest_json =
+            canonicalize_json_text(&input.manifest_json, "plugin registry manifest_json")?;
+        let parsed_manifest = parse_plugin_manifest_json(&manifest_json)?;
         let mut entry = Self {
             key: input.key,
             runtime: input.runtime,
             api_version: input.api_version,
             path_glob: input.path_glob,
             content_type: input.content_type,
+            materialization: parsed_manifest.manifest.materialization,
             entry: input.entry,
             schema_keys: input.schema_keys,
             host_allocated_schema_keys: input.host_allocated_schema_keys,
-            manifest_json: canonicalize_json_text(
-                &input.manifest_json,
-                "plugin registry manifest_json",
-            )?,
+            manifest_json,
             archive_file_id: input.archive_file_id,
             archive_path: input.archive_path,
             archive_blob_hash: input.archive_blob_hash,
@@ -113,7 +116,6 @@ impl PluginRegistryEntry {
         // checks once. Durable reads below use the already-validated compact
         // fields and generation integrity, so warm transactions do not
         // recompile one glob per plugin before consulting the catalog cache.
-        parse_plugin_manifest_json(&entry.manifest_json)?;
         validate_entry(&entry)?;
         Ok(entry)
     }
@@ -124,6 +126,10 @@ impl PluginRegistryEntry {
 
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
+    }
+
+    pub(crate) fn materialization(&self) -> PluginMaterialization {
+        self.materialization
     }
 
     pub(crate) fn schema_keys(&self) -> &[String] {
@@ -156,13 +162,14 @@ impl PluginRegistryEntry {
             || self.api_version != replacement.api_version
             || self.path_glob != replacement.path_glob
             || self.content_type != replacement.content_type
+            || self.materialization != replacement.materialization
             || self.schema_keys != replacement.schema_keys
             || self.host_allocated_schema_keys != replacement.host_allocated_schema_keys;
         if incompatible {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!(
-                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, content type, schema keys, and ID-allocation contract",
+                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, materialization, content type, schema keys, and ID-allocation contract",
                     self.key
                 ),
             )
@@ -364,7 +371,7 @@ impl PluginRegistry {
     pub(crate) fn to_value(&self) -> Result<JsonValue, LixError> {
         self.validate()?;
         serde_json::to_value(PluginRegistryWire {
-            version: REGISTRY_FORMAT_VERSION,
+            version: PLUGIN_REGISTRY_FORMAT_VERSION,
             plugin_count: self.plugin_count,
             generation: self.generation.clone(),
             plugins: self.plugins.clone(),
@@ -394,9 +401,9 @@ impl PluginRegistry {
     }
 
     fn from_wire(wire: PluginRegistryWire) -> Result<Self, LixError> {
-        if wire.version != REGISTRY_FORMAT_VERSION {
+        if wire.version != PLUGIN_REGISTRY_FORMAT_VERSION {
             return Err(invalid_registry(format!(
-                "unsupported version {}; expected {REGISTRY_FORMAT_VERSION}",
+                "unsupported version {}; expected {PLUGIN_REGISTRY_FORMAT_VERSION}",
                 wire.version
             )));
         }
@@ -435,7 +442,7 @@ impl PluginRegistry {
 
     fn validate(&self) -> Result<(), LixError> {
         let wire = PluginRegistryWire {
-            version: REGISTRY_FORMAT_VERSION,
+            version: PLUGIN_REGISTRY_FORMAT_VERSION,
             plugin_count: self.plugin_count,
             generation: self.generation.clone(),
             plugins: self.plugins.clone(),
@@ -501,7 +508,7 @@ impl PluginFileOwner {
         Ok(json!({
             "key": PLUGIN_OWNER_KEY,
             "value": PluginFileOwnerValue {
-                version: REGISTRY_FORMAT_VERSION,
+                version: PLUGIN_FILE_OWNER_FORMAT_VERSION,
                 plugin_key: self.plugin_key.clone(),
                 schema_keys: self.schema_keys.clone(),
             },
@@ -562,9 +569,9 @@ impl PluginFileOwner {
                     "plugin owner payload has an invalid shape: {error}"
                 ))
             })?;
-        if owner_value.version != REGISTRY_FORMAT_VERSION {
+        if owner_value.version != PLUGIN_FILE_OWNER_FORMAT_VERSION {
             return Err(invalid_registry(format!(
-                "plugin owner version {} is unsupported; expected {REGISTRY_FORMAT_VERSION}",
+                "plugin owner version {} is unsupported; expected {PLUGIN_FILE_OWNER_FORMAT_VERSION}",
                 owner_value.version
             )));
         }
@@ -864,6 +871,7 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
         || manifest.api_version != entry.api_version
         || manifest.file_match.path_glob != entry.path_glob
         || manifest.file_match.content_type != entry.content_type
+        || manifest.materialization != entry.materialization
         || manifest.entry != entry.entry
     {
         return Err(invalid_registry(format!(
@@ -922,7 +930,7 @@ fn valid_plugin_key(plugin_key: &str) -> bool {
 
 fn calculate_generation(plugins: &[PluginRegistryEntry]) -> Result<String, LixError> {
     let payload = serde_json::to_value(PluginRegistryGenerationPayload {
-        version: REGISTRY_FORMAT_VERSION,
+        version: PLUGIN_REGISTRY_FORMAT_VERSION,
         plugins,
     })
     .map_err(|error| {
@@ -1128,6 +1136,7 @@ mod tests {
                 "entry":"plugin.wasm",
                 "match":{{"path_glob":{path_glob:?}{content_type}}},
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "runtime":"wasm-component-v2",
                 "key":{key:?}
             }}"#
@@ -1175,7 +1184,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
-                r#"{{"api_version":"2.1.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
+                r#"{{"api_version":"2.1.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
             ),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1192,7 +1201,7 @@ mod tests {
         legacy.manifest_json = legacy.manifest_json.replacen("2.1.0", "2.0.0", 1);
         let plugins = vec![legacy];
         let wire = PluginRegistryWire {
-            version: REGISTRY_FORMAT_VERSION,
+            version: PLUGIN_REGISTRY_FORMAT_VERSION,
             plugin_count: 1,
             generation: calculate_generation(&plugins).unwrap(),
             plugins,

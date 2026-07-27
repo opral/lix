@@ -39,7 +39,7 @@ impl FileBytesSha256 {
         Self(Sha256::digest(bytes).into())
     }
 
-    fn from_lower_hex(value: &str) -> Option<Self> {
+    pub(crate) fn from_lower_hex(value: &str) -> Option<Self> {
         if value.len() != 64 {
             return None;
         }
@@ -54,6 +54,16 @@ impl FileBytesSha256 {
 
     pub(crate) fn matches_lower_hex(self, value: &str) -> bool {
         Self::from_lower_hex(value) == Some(self)
+    }
+
+    pub(crate) fn to_lower_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(64);
+        for byte in self.0 {
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        output
     }
 }
 

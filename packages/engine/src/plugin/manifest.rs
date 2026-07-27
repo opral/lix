@@ -17,11 +17,24 @@ pub enum PluginRuntime {
     WasmComponentV2,
 }
 
+/// Durable byte-materialization contract for a Component-v2 plugin.
+///
+/// `Blob` retains rendered bytes in the binary CAS. `Derived` makes durable
+/// semantic rows authoritative and retains only a byte fingerprint; readers
+/// must re-render and verify it before serving bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginMaterialization {
+    Blob,
+    Derived,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     pub key: String,
     pub runtime: PluginRuntime,
     pub api_version: String,
+    pub materialization: PluginMaterialization,
     #[serde(rename = "match")]
     pub file_match: PluginMatch,
     pub entry: String,
@@ -241,6 +254,7 @@ mod tests {
                 "key":"plugin_json",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -260,6 +274,7 @@ mod tests {
                 "key":"plugin_csv_v2",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.0.0",
+                "materialization":"blob",
                 "match":{"path_glob":"*.csv"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/csv_row.json"]
@@ -278,6 +293,7 @@ mod tests {
             r#"{
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{"path_glob":"*.json"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -297,6 +313,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -353,6 +370,7 @@ mod tests {
                 "key":"plugin_text",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{"path_glob":"**/*", "content_type":"text"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"]
@@ -373,6 +391,7 @@ mod tests {
                 "key":"plugin_markdown",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{"path_glob":"*.{md,mdx}"},
                 "entry":"plugin.wasm",
                 "schemas":["schema/default.json"],
@@ -395,6 +414,7 @@ mod tests {
             "key": "plugin_bounds",
             "runtime": "wasm-component-v2",
             "api_version": "2.1.0",
+            "materialization": "blob",
             "match": { "path_glob": path_glob },
             "entry": "plugin.wasm",
             "schemas": schemas,

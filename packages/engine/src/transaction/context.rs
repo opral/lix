@@ -34,9 +34,10 @@ use crate::common::LixTimestamp;
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
-    BlobRefRowInput, FilesystemPathIndex, FilesystemPathIndexCache, FilesystemPathIndexReader,
-    FilesystemPathIndexRequest, FilesystemPathKind, FilesystemRowContext, blob_ref_row,
-    load_path_index_revision,
+    BlobRefRowInput, DERIVED_FILE_REF_SCHEMA_KEY, DerivedFileRefRowInput, FilesystemPathIndex,
+    FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
+    FilesystemPathKind, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
+    derived_file_ref_row, derived_file_ref_tombstone_row, load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
@@ -50,11 +51,12 @@ use crate::live_state::{
     overlay_scan_rows,
 };
 use crate::plugin::{
-    ArcByteSource, BoundIdNamespace, CompiledPluginCatalog, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY,
-    PluginActorCache, PluginActorColdInstall, PluginActorColdOpen, PluginActorKey,
-    PluginActorLease, PluginActorStore, PluginArchiveInstallPlan, PluginContentType,
-    PluginDetectedChange, PluginFileOwner, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ArcByteSource, BoundIdNamespace, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
+    PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
+    PluginActorKey, PluginActorLease, PluginActorStore, PluginArchiveInstallPlan,
+    PluginContentType, PluginDetectedChange, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
     ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
     VecEntitySource, build_file_update_splices, drain_conflict_transition_resolutions,
     drain_entity_transition_edits, drain_file_transition_changes,
@@ -90,7 +92,9 @@ use crate::transaction::normalization::{
     remember_pending_registered_schema,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
-use crate::transaction::staging::{PreparedWriteSet, TransactionWriteBuffer};
+use crate::transaction::staging::{
+    PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
+};
 use crate::transaction::types::{
     PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
     TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
@@ -113,14 +117,26 @@ pub(crate) struct TransactionCommitOutcome {
     pub(crate) storage_stats: StorageWriteSetStats,
 }
 
-/// The durable identity and binary base of one plugin materialization.
+/// The durable identity and byte proof of one plugin materialization.
 ///
-/// The semantic root fences actor state, while the blob hash proves the exact
-/// binary base from which a private CAS acceleration may retain chunks.
+/// The semantic root fences actor state. Blob-backed plugins retain a CAS
+/// reference; derived plugins retain only the exact rendered byte fingerprint.
 #[derive(Debug, Clone)]
 struct VisibleV2Materialization {
     semantic_root: String,
-    blob_hash: BlobHash,
+    bytes: VisibleV2MaterializationBytes,
+}
+
+#[derive(Debug, Clone)]
+enum VisibleV2MaterializationBytes {
+    Blob {
+        hash: BlobHash,
+    },
+    Derived {
+        path: String,
+        sha256: FileBytesSha256,
+        size_bytes: u64,
+    },
 }
 
 fn decode_visible_v2_materialization(
@@ -137,28 +153,76 @@ fn decode_visible_v2_materialization(
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
-                "owned v2 plugin file '{file_id}' materialization is missing its blob reference"
+                "owned v2 plugin file '{file_id}' materialization is missing its durable proof"
             ),
         )
     })?;
-    let snapshot: PluginUpgradeBlobRefSnapshot =
-        serde_json::from_str(snapshot).map_err(|error| {
-            LixError::new(
+    let bytes = match row.schema_key.as_str() {
+        BLOB_REF_SCHEMA_KEY => {
+            let snapshot: PluginUpgradeBlobRefSnapshot =
+                serde_json::from_str(snapshot).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "owned v2 plugin file '{file_id}' has an invalid blob reference: {error}"
+                        ),
+                    )
+                })?;
+            if snapshot.id != file_id {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
+                    ),
+                ));
+            }
+            VisibleV2MaterializationBytes::Blob {
+                hash: BlobHash::from_hex(&snapshot.blob_hash)?,
+            }
+        }
+        DERIVED_FILE_REF_SCHEMA_KEY => {
+            let snapshot: DerivedFileRefSnapshot = serde_json::from_str(snapshot).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v2 plugin file '{file_id}' has an invalid derived materialization: {error}"
+                    ),
+                )
+            })?;
+            if snapshot.id != file_id {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
+                    ),
+                ));
+            }
+            let sha256 = FileBytesSha256::from_lower_hex(&snapshot.sha256).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v2 plugin file '{file_id}' has an invalid derived SHA-256 proof"
+                    ),
+                )
+            })?;
+            VisibleV2MaterializationBytes::Derived {
+                path: snapshot.path,
+                sha256,
+                size_bytes: snapshot.size_bytes,
+            }
+        }
+        schema_key => {
+            return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
-                format!("owned v2 plugin file '{file_id}' has an invalid blob reference: {error}"),
-            )
-        })?;
-    if snapshot.id != file_id {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "owned v2 plugin file '{file_id}' materialization identity does not match its file scope"
-            ),
-        ));
-    }
+                format!(
+                    "owned v2 plugin file '{file_id}' materialization uses unsupported schema '{schema_key}'"
+                ),
+            ));
+        }
+    };
     Ok(VisibleV2Materialization {
         semantic_root,
-        blob_hash: BlobHash::from_hex(&snapshot.blob_hash)?,
+        bytes,
     })
 }
 
@@ -793,6 +857,13 @@ where
                 return Err(error);
             }
         };
+        if let Err(error) = self
+            .preflight_derived_path_stability_before_stage(&write)
+            .await
+        {
+            discard_plugin_actor_publications(actor_publications).await;
+            return Err(error);
+        }
         if prepared_transaction_write_affects_filesystem_path_index(&write) {
             // TransactionWriteBuffer may retain an earlier row from this batch even
             // when a later row makes staging fail, so invalidate before staging.
@@ -810,6 +881,41 @@ where
         self.pending_plugin_actor_publications
             .extend(actor_publications);
         Ok(outcome)
+    }
+
+    /// Validates descriptor-path changes against the current batch before it
+    /// enters the transaction overlay. The prospective overlay is deliberately
+    /// ephemeral: a rejected move must not leave a partial staged row behind.
+    async fn preflight_derived_path_stability_before_stage(
+        &mut self,
+        write: &PreparedTransactionWrite,
+    ) -> Result<(), LixError> {
+        let prospective_rows = prepared_transaction_write_rows(write)
+            .iter()
+            .map(MaterializedLiveStateRow::from)
+            .collect::<Vec<_>>();
+        if !prospective_rows.iter().any(|row| {
+            !row.global
+                && !row.untracked
+                && matches!(
+                    row.schema_key.as_str(),
+                    FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                )
+        }) {
+            return Ok(());
+        }
+        let staged = self.staged_writes.staging_overlay()?;
+        let prospective = ProspectiveStagedRows {
+            staged: staged.clone(),
+            rows: prospective_rows,
+        };
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let base = self.live_state.reader(read);
+        preflight_derived_path_stability(&base, &staged, &prospective, &prospective.rows).await
     }
 
     /// Runs the stateless conflict resolver for one pinned v2 plugin
@@ -945,7 +1051,10 @@ where
         let rows = self
             .scan_visible_live_state(&LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
+                    schema_keys: vec![
+                        BLOB_REF_SCHEMA_KEY.to_string(),
+                        DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
+                    ],
                     entity_pks: vec![EntityPk::single(key.file_id.clone())],
                     branch_ids: vec![key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
@@ -960,7 +1069,7 @@ where
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "v2 materialization root lookup returned duplicate rows for file '{}'",
+                    "v2 materialization lookup returned duplicate rows for file '{}'",
                     key.file_id
                 ),
             ));
@@ -998,7 +1107,10 @@ where
             &staged,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
+                    schema_keys: vec![
+                        BLOB_REF_SCHEMA_KEY.to_string(),
+                        DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
+                    ],
                     entity_pks: vec![EntityPk::single(actor_key.file_id.clone())],
                     branch_ids: vec![actor_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
@@ -1021,33 +1133,32 @@ where
             ));
         };
         let materialization = decode_visible_v2_materialization(blob_row, &actor_key.file_id)?;
-        let semantic_root = materialization.semantic_root;
+        if !matches!(
+            (plugin.materialization(), &materialization.bytes),
+            (
+                PluginMaterialization::Blob,
+                &VisibleV2MaterializationBytes::Blob { .. }
+            ) | (
+                PluginMaterialization::Derived,
+                &VisibleV2MaterializationBytes::Derived { .. }
+            )
+        ) {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v2 plugin file '{}' materialization does not match plugin '{}' contract",
+                    actor_key.file_id,
+                    plugin.key()
+                ),
+            ));
+        }
+        let semantic_root = materialization.semantic_root.clone();
         let cold_open = cache.prepare_cold_open(actor_key, &semantic_root).await?;
         let mut cold_install: PluginActorColdInstall = match cold_open {
             PluginActorColdOpen::Ready(observation) => return Ok(observation),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
         let store_permit = cache.admit_cold_store(&mut cold_install)?;
-        let hash = materialization.blob_hash;
-        let base_blob_reader = self.binary_cas.reader(read);
-        let materialized_bytes: crate::Blob =
-            load_transaction_blob_bytes(&base_blob_reader, &self.staged_writes, &[hash])
-                .await?
-                .into_vec()
-                .into_iter()
-                .next()
-                .flatten()
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        format!(
-                            "owned v2 plugin file '{}' references missing materialized blob '{}'",
-                            actor_key.file_id,
-                            hash.to_hex()
-                        ),
-                    )
-                })?
-                .into();
         let rows = overlay_scan_rows(
             &base,
             &staged,
@@ -1077,39 +1188,143 @@ where
             .collect::<Vec<_>>();
         let entity_count = rows.len();
         let limits = WasmTransitionLimits::default();
-        let source = VecEntitySource::new(v2_host_entities_from_live_rows(rows, limits)?, limits)?;
         let mut actor = factory.instantiate_actor().await?;
-        let transition = match actor
-            .open_entities(
-                limits,
-                WasmOpenEntitiesInput {
-                    descriptor,
-                    entities: Box::new(source),
-                    accepted: Some(Arc::new(ArcByteSource::new(materialized_bytes.clone()))),
-                },
-            )
-            .await
+        if let VisibleV2MaterializationBytes::Derived { path, .. } = &materialization.bytes
+            && descriptor.path.as_deref() != Some(path.as_str())
         {
-            Ok(transition) => transition,
-            Err(error) => {
-                let _ = actor.retire().await;
-                return Err(error);
+            let _ = actor.retire().await;
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v2 plugin file '{}' derived materialization was rendered at '{}' but now resolves to '{}'",
+                    actor_key.file_id,
+                    path,
+                    descriptor.path.as_deref().unwrap_or_default(),
+                ),
+            ));
+        }
+        let materialization_bytes = materialization.bytes.clone();
+        let validated = match materialization_bytes {
+            VisibleV2MaterializationBytes::Blob { hash } => {
+                let base_blob_reader = self.binary_cas.reader(read);
+                let materialized_bytes: crate::Blob = load_transaction_blob_bytes(
+                    &base_blob_reader,
+                    &self.staged_writes,
+                    &[hash],
+                )
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "owned v2 plugin file '{}' references missing materialized blob '{}'",
+                            actor_key.file_id,
+                            hash.to_hex()
+                        ),
+                    )
+                })?
+                .into();
+                let source =
+                    VecEntitySource::new(v2_host_entities_from_live_rows(rows, limits)?, limits)?;
+                let transition = match actor
+                    .open_entities(
+                        limits,
+                        WasmOpenEntitiesInput {
+                            descriptor,
+                            entities: Box::new(source),
+                            accepted: Some(Arc::new(ArcByteSource::new(
+                                materialized_bytes.clone(),
+                            ))),
+                        },
+                    )
+                    .await
+                {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        let _ = actor.retire().await;
+                        return Err(error);
+                    }
+                };
+                match drain_entity_transition_edits(
+                    actor.as_mut(),
+                    transition,
+                    materialized_bytes.as_ref(),
+                    Some(materialized_bytes.clone()),
+                    None,
+                    limits,
+                )
+                .await
+                {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        let _ = actor.retire().await;
+                        return Err(error);
+                    }
+                }
+            }
+            VisibleV2MaterializationBytes::Derived {
+                sha256, size_bytes, ..
+            } => {
+                let source =
+                    VecEntitySource::new(v2_host_entities_from_live_rows(rows, limits)?, limits)?;
+                let transition = match actor
+                    .open_entities(
+                        limits,
+                        WasmOpenEntitiesInput {
+                            descriptor,
+                            entities: Box::new(source),
+                            accepted: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(transition) => transition,
+                    Err(error) => {
+                        let _ = actor.retire().await;
+                        return Err(error);
+                    }
+                };
+                let empty: crate::Blob = Vec::new().into();
+                let validated = match drain_entity_transition_edits(
+                    actor.as_mut(),
+                    transition,
+                    empty.as_ref(),
+                    None,
+                    None,
+                    limits,
+                )
+                .await
+                {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        let _ = actor.retire().await;
+                        return Err(error);
+                    }
+                };
+                if validated.bytes.len() as u64 != size_bytes
+                    || FileBytesSha256::compute(&validated.bytes) != sha256
+                {
+                    let _ = actor.retire().await;
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "owned v2 plugin file '{}' derived materialization does not reproduce its durable proof",
+                            actor_key.file_id
+                        ),
+                    ));
+                }
+                validated
             }
         };
-        let validated = match drain_entity_transition_edits(
-            actor.as_mut(),
-            transition,
-            materialized_bytes.as_ref(),
-            Some(materialized_bytes.clone()),
-            None,
-            limits,
-        )
-        .await
-        {
-            Ok(validated) => validated,
-            Err(error) => {
-                let _ = actor.retire().await;
-                return Err(error);
+        let materialized_bytes = validated.bytes.clone();
+        let materialized_bytes_sha256 = match materialization.bytes {
+            VisibleV2MaterializationBytes::Blob { .. } => validated.bytes_sha256,
+            VisibleV2MaterializationBytes::Derived { .. } => {
+                Some(FileBytesSha256::compute(&materialized_bytes))
             }
         };
         let mut counters = validated.counters;
@@ -1125,7 +1340,7 @@ where
                 PluginActorStore::new(actor, store_permit),
                 validated.document,
                 materialized_bytes,
-                validated.bytes_sha256,
+                materialized_bytes_sha256,
                 Arc::<str>::from(semantic_root),
             )
             .await
@@ -1327,6 +1542,36 @@ where
             .collect()
     }
 
+    /// Replacing one materialization representation must retire the other
+    /// schema explicitly. A raw blob can predate plugin ownership, so inspect
+    /// the visible row rather than inferring that fact from the incoming write.
+    async fn opposite_materialization_tombstone(
+        &mut self,
+        file_key: &PluginFileWriteKey,
+        target: PluginMaterialization,
+    ) -> Result<Option<TransactionWriteRow>, LixError> {
+        let Some(visible) = self.visible_v2_materialization(file_key).await? else {
+            return Ok(None);
+        };
+        let context = FilesystemRowContext {
+            branch_id: file_key.branch_id.clone(),
+            global: file_key.global,
+            untracked: file_key.untracked,
+            file_id: None,
+            metadata: None,
+        };
+        let row = match (target, visible.bytes) {
+            (PluginMaterialization::Derived, VisibleV2MaterializationBytes::Blob { .. }) => {
+                Some(blob_ref_tombstone_row(file_key.file_id.clone(), context))
+            }
+            (PluginMaterialization::Blob, VisibleV2MaterializationBytes::Derived { .. }) => Some(
+                derived_file_ref_tombstone_row(file_key.file_id.clone(), context),
+            ),
+            _ => None,
+        };
+        Ok(row)
+    }
+
     async fn reconcile_plugin_write(
         &mut self,
         write: TransactionWrite,
@@ -1349,8 +1594,39 @@ where
                     .await?;
                 mark_plugin_reconciliation_rows(&mut reconciliation.rows);
                 rows.extend(reconciliation.rows);
-                if !file_data.is_empty() {
-                    for (file_key, version) in &reconciliation.materialization_versions {
+                for (file_key, version) in &reconciliation.materialization_versions {
+                    let target = if reconciliation
+                        .derived_materializations
+                        .contains_key(file_key)
+                    {
+                        PluginMaterialization::Derived
+                    } else {
+                        PluginMaterialization::Blob
+                    };
+                    let tombstone = self
+                        .opposite_materialization_tombstone(file_key, target)
+                        .await?;
+                    if let Some(mut tombstone) = tombstone {
+                        mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
+                        rows.push(tombstone);
+                    }
+                    let mut materialized_row = if let Some(proof) =
+                        reconciliation.derived_materializations.get(file_key)
+                    {
+                        derived_file_ref_row(DerivedFileRefRowInput {
+                            file_id: file_key.file_id.clone(),
+                            path: proof.path.clone(),
+                            sha256: proof.sha256.to_lower_hex(),
+                            size_bytes: proof.size_bytes,
+                            context: FilesystemRowContext {
+                                branch_id: file_key.branch_id.clone(),
+                                global: file_key.global,
+                                untracked: file_key.untracked,
+                                file_id: None,
+                                metadata: None,
+                            },
+                        })?
+                    } else {
                         let payload = file_data
                             .iter()
                             .find(|write| PluginFileWriteKey::from(*write) == *file_key)
@@ -1363,7 +1639,7 @@ where
                                     ),
                                 )
                             })?;
-                        let mut materialized_row = blob_ref_row(BlobRefRowInput {
+                        blob_ref_row(BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
                             blob_hash: payload
                                 .blob_hash()
@@ -1376,13 +1652,11 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        })?;
-                        materialized_row.change_id = Some(version.clone());
-                        mark_plugin_reconciliation_rows(std::slice::from_mut(
-                            &mut materialized_row,
-                        ));
-                        rows.push(materialized_row);
-                    }
+                        })?
+                    };
+                    materialized_row.change_id = Some(version.clone());
+                    mark_plugin_reconciliation_rows(std::slice::from_mut(&mut materialized_row));
+                    rows.push(materialized_row);
                 }
                 let write = if file_data.is_empty() {
                     TransactionWrite::Rows { mode, rows }
@@ -1413,6 +1687,7 @@ where
                     file_keys,
                     materialized_file_keys,
                     materialization_versions,
+                    derived_materializations,
                     rows: mut plugin_rows,
                     file_view_mutations,
                     actor_publications,
@@ -1425,66 +1700,80 @@ where
                     ))
                     .await?;
                 mark_plugin_reconciliation_rows(&mut plugin_rows);
+                rows.retain(|row| {
+                    !materialization_versions
+                        .keys()
+                        .any(|key| key.matches_materialization_row(row))
+                        && !file_keys
+                            .iter()
+                            .any(|key| key.matches_materialization_row(row))
+                });
                 for (file_key, version) in &materialization_versions {
-                    let matching_indexes = rows
-                        .iter_mut()
-                        .enumerate()
-                        .filter_map(|(index, row)| {
-                            file_key.matches_blob_ref_row(row).then_some(index)
-                        })
-                        .collect::<Vec<_>>();
-                    if matching_indexes.len() > 1 {
-                        discard_plugin_actor_publications(actor_publications).await;
-                        return Err(LixError::new(
-                            LixError::CODE_INTERNAL_ERROR,
-                            format!(
-                                "v2 plugin materialization expected at most one blob-ref row for file '{}', found {}",
-                                file_key.file_id,
-                                matching_indexes.len()
-                            ),
-                        ));
-                    }
-                    let payload = file_data
-                        .iter()
-                        .find(|write| PluginFileWriteKey::from(*write) == *file_key)
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INTERNAL_ERROR,
-                                format!(
-                                    "v2 materialization payload for file '{}' is missing",
-                                    file_key.file_id
-                                ),
-                            )
-                        })?;
-                    let mut materialized_row = blob_ref_row(BlobRefRowInput {
-                        file_id: file_key.file_id.clone(),
-                        blob_hash: payload
-                            .blob_hash()
-                            .unwrap_or_else(|| BlobHash::from_content(payload.data())),
-                        size_bytes: payload.len(),
-                        context: FilesystemRowContext {
-                            branch_id: file_key.branch_id.clone(),
-                            global: file_key.global,
-                            untracked: file_key.untracked,
-                            file_id: None,
-                            metadata: None,
-                        },
-                    })?;
-                    materialized_row.change_id = Some(version.clone());
-                    if let Some(index) = matching_indexes.into_iter().next() {
-                        rows[index].snapshot = materialized_row.snapshot;
-                        rows[index].change_id = materialized_row.change_id;
+                    let target = if derived_materializations.contains_key(file_key) {
+                        PluginMaterialization::Derived
                     } else {
-                        rows.push(materialized_row);
+                        PluginMaterialization::Blob
+                    };
+                    let tombstone = self
+                        .opposite_materialization_tombstone(file_key, target)
+                        .await?;
+                    if let Some(mut tombstone) = tombstone {
+                        mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
+                        rows.push(tombstone);
                     }
+                    let mut materialized_row =
+                        if let Some(proof) = derived_materializations.get(file_key) {
+                            derived_file_ref_row(DerivedFileRefRowInput {
+                                file_id: file_key.file_id.clone(),
+                                path: proof.path.clone(),
+                                sha256: proof.sha256.to_lower_hex(),
+                                size_bytes: proof.size_bytes,
+                                context: FilesystemRowContext {
+                                    branch_id: file_key.branch_id.clone(),
+                                    global: file_key.global,
+                                    untracked: file_key.untracked,
+                                    file_id: None,
+                                    metadata: None,
+                                },
+                            })?
+                        } else {
+                            let payload = file_data
+                                .iter()
+                                .find(|write| PluginFileWriteKey::from(*write) == *file_key)
+                                .ok_or_else(|| {
+                                    LixError::new(
+                                        LixError::CODE_INTERNAL_ERROR,
+                                        format!(
+                                            "v2 materialization payload for file '{}' is missing",
+                                            file_key.file_id
+                                        ),
+                                    )
+                                })?;
+                            blob_ref_row(BlobRefRowInput {
+                                file_id: file_key.file_id.clone(),
+                                blob_hash: payload
+                                    .blob_hash()
+                                    .unwrap_or_else(|| BlobHash::from_content(payload.data())),
+                                size_bytes: payload.len(),
+                                context: FilesystemRowContext {
+                                    branch_id: file_key.branch_id.clone(),
+                                    global: file_key.global,
+                                    untracked: file_key.untracked,
+                                    file_id: None,
+                                    metadata: None,
+                                },
+                            })?
+                        };
+                    materialized_row.change_id = Some(version.clone());
+                    rows.push(materialized_row);
                 }
-                rows.retain(|row| !file_keys.iter().any(|key| key.matches_blob_ref_row(row)));
                 rows.extend(plugin_rows);
                 let file_data = file_data
                     .into_iter()
                     .filter(|write| {
                         let key = PluginFileWriteKey::from(write);
                         !file_keys.contains(&key)
+                            && !derived_materializations.contains_key(&key)
                             && (!write.is_empty() || materialized_file_keys.contains(&key))
                     })
                     .collect();
@@ -1925,6 +2214,7 @@ where
         let mut registries = BTreeMap::<String, PluginRegistry>::new();
         let mut changed_registry_branches = BTreeSet::<String>::new();
         let mut generation_upgrades = Vec::<PluginGenerationUpgrade>::new();
+        let mut derived_plugin_uninstalls = BTreeMap::<String, BTreeSet<String>>::new();
         for branch_id in &branch_ids {
             registries.insert(
                 branch_id.clone(),
@@ -1952,7 +2242,14 @@ where
                     }
                 }
                 None => {
-                    registry.remove(&key.plugin_key)?;
+                    if let Some(removed) = registry.remove(&key.plugin_key)?
+                        && removed.materialization() == PluginMaterialization::Derived
+                    {
+                        derived_plugin_uninstalls
+                            .entry(key.branch_id.clone())
+                            .or_default()
+                            .insert(removed.key().to_string());
+                    }
                 }
             }
             changed_registry_branches.insert(key.branch_id);
@@ -1995,6 +2292,15 @@ where
                 &generation_upgrades,
                 &current_install_wasm,
                 &current_install_schema_definitions,
+            )
+            .await?;
+        }
+        if !derived_plugin_uninstalls.is_empty() {
+            preflight_derived_plugin_uninstalls(
+                &base,
+                &staged,
+                &derived_plugin_uninstalls,
+                &deleted_file_keys,
             )
             .await?;
         }
@@ -2847,10 +3153,11 @@ where
                         // validated file successor is therefore already the
                         // exact merge result; rendering the same sparse change
                         // onto the same base would only repeat guest work.
-                        verified_same_length_blob_splice =
-                            same_length_blob_splice.map(|(offset, length)| {
-                                (visible_materialization.blob_hash, offset, length)
-                            });
+                        verified_same_length_blob_splice = match visible_materialization.bytes {
+                            VisibleV2MaterializationBytes::Blob { hash } => same_length_blob_splice
+                                .map(|(offset, length)| (hash, offset, length)),
+                            VisibleV2MaterializationBytes::Derived { .. } => None,
+                        };
                         (
                             detection_document,
                             submitted_bytes.clone(),
@@ -3060,16 +3367,30 @@ where
             };
             reconciliation.rows.extend(namespace_rows);
             reconciliation.rows.extend(change_rows);
-            if materialized_bytes.as_ref() != write.data() {
-                write.replace_data(materialized_bytes);
-            } else if let Some((visible_base_blob_hash, offset, length)) =
-                verified_same_length_blob_splice
-            {
-                write.set_verified_same_length_blob_splice(visible_base_blob_hash, offset, length);
+            match selected.materialization() {
+                PluginMaterialization::Blob => {
+                    if materialized_bytes.as_ref() != write.data() {
+                        write.replace_data(materialized_bytes);
+                    } else if let Some((visible_base_blob_hash, offset, length)) =
+                        verified_same_length_blob_splice
+                    {
+                        write.set_verified_same_length_blob_splice(
+                            visible_base_blob_hash,
+                            offset,
+                            length,
+                        );
+                    }
+                    reconciliation
+                        .materialized_file_keys
+                        .insert(file_key.clone());
+                }
+                PluginMaterialization::Derived => {
+                    reconciliation.derived_materializations.insert(
+                        file_key.clone(),
+                        DerivedMaterializationProof::from_bytes(&materialized_bytes, path.clone()),
+                    );
+                }
             }
-            reconciliation
-                .materialized_file_keys
-                .insert(file_key.clone());
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
@@ -3321,19 +3642,48 @@ where
                     }
                 };
             self.plugin_host.record_v2_transition_counters(counters);
-            let rendered_file = semantic_rendered_file_data(
-                file_key.file_id.clone(),
-                group.path,
-                group.filename,
-                file_key.branch_id.clone(),
-                &visible_materialization,
-                rendered_bytes,
-                same_length_output_splice,
-            );
-            file_data.push(rendered_file);
-            reconciliation
-                .materialized_file_keys
-                .insert(file_key.clone());
+            match group.plugin.materialization() {
+                PluginMaterialization::Blob => {
+                    let VisibleV2MaterializationBytes::Blob { hash } =
+                        visible_materialization.bytes
+                    else {
+                        publication.discard().await;
+                        discard_plugin_actor_publications(std::mem::take(
+                            &mut reconciliation.actor_publications,
+                        ))
+                        .await;
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!(
+                                "owned v2 plugin file '{}' blob contract has no visible CAS materialization",
+                                file_key.file_id
+                            ),
+                        ));
+                    };
+                    let rendered_file = semantic_rendered_file_data(
+                        file_key.file_id.clone(),
+                        group.path,
+                        group.filename,
+                        file_key.branch_id.clone(),
+                        hash,
+                        rendered_bytes,
+                        same_length_output_splice,
+                    );
+                    file_data.push(rendered_file);
+                    reconciliation
+                        .materialized_file_keys
+                        .insert(file_key.clone());
+                }
+                PluginMaterialization::Derived => {
+                    reconciliation.derived_materializations.insert(
+                        file_key.clone(),
+                        DerivedMaterializationProof::from_bytes(
+                            &rendered_bytes,
+                            group.path.clone(),
+                        ),
+                    );
+                }
+            }
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
@@ -3873,7 +4223,7 @@ pub(crate) struct TransactionSqlReadExecutionContext<R: crate::storage_adapter::
     branch_ctx: Arc<BranchContext>,
     visible_schemas: Vec<JsonValue>,
     functions: FunctionProviderHandle,
-    staged: crate::transaction::staging::PreparedStateRowOverlay,
+    staged: PreparedStateRowOverlay,
     staged_writes: Arc<TransactionWriteBuffer>,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
@@ -4009,7 +4359,7 @@ async fn load_transaction_blob_bytes(
 struct TransactionReadLiveStateReader<R: crate::storage_adapter::StorageRead> {
     base: crate::live_state::LiveStateStoreReader<SharedStorageAdapterRead<R>>,
     read_store: SharedStorageAdapterRead<R>,
-    staged: crate::transaction::staging::PreparedStateRowOverlay,
+    staged: PreparedStateRowOverlay,
     filesystem_path_index_cache: Arc<FilesystemPathIndexCache>,
     filesystem_path_index_epoch: Arc<AtomicUsize>,
 }
@@ -4403,16 +4753,19 @@ where
 fn prepared_transaction_write_affects_filesystem_path_index(
     write: &PreparedTransactionWrite,
 ) -> bool {
-    let rows = match write {
-        PreparedTransactionWrite::Rows { rows, .. }
-        | PreparedTransactionWrite::RowsWithFileData { rows, .. } => rows,
-    };
-    rows.iter().any(|row| {
+    prepared_transaction_write_rows(write).iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
             "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
         )
     })
+}
+
+fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &[PreparedStateRow] {
+    match write {
+        PreparedTransactionWrite::Rows { rows, .. }
+        | PreparedTransactionWrite::RowsWithFileData { rows, .. } => rows,
+    }
 }
 
 fn transaction_path_index_cache_revision(
@@ -4433,6 +4786,7 @@ fn transaction_path_index_cache_revision(
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
@@ -4701,6 +5055,18 @@ impl PluginFileWriteKey {
             && row.untracked == self.untracked
             && row.file_id.as_deref() == Some(self.file_id.as_str())
     }
+
+    fn matches_derived_file_ref_row(&self, row: &TransactionWriteRow) -> bool {
+        row.schema_key == DERIVED_FILE_REF_SCHEMA_KEY
+            && row.branch_id == self.branch_id
+            && row.global == self.global
+            && row.untracked == self.untracked
+            && row.file_id.as_deref() == Some(self.file_id.as_str())
+    }
+
+    fn matches_materialization_row(&self, row: &TransactionWriteRow) -> bool {
+        self.matches_blob_ref_row(row) || self.matches_derived_file_ref_row(row)
+    }
 }
 
 impl From<&TransactionFileData> for PluginFileWriteKey {
@@ -4714,11 +5080,29 @@ impl From<&TransactionFileData> for PluginFileWriteKey {
     }
 }
 
+#[derive(Debug, Clone)]
+struct DerivedMaterializationProof {
+    path: String,
+    sha256: FileBytesSha256,
+    size_bytes: usize,
+}
+
+impl DerivedMaterializationProof {
+    fn from_bytes(bytes: &[u8], path: String) -> Self {
+        Self {
+            path,
+            sha256: FileBytesSha256::compute(bytes),
+            size_bytes: bytes.len(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct PluginWriteReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     materialized_file_keys: BTreeSet<PluginFileWriteKey>,
     materialization_versions: BTreeMap<PluginFileWriteKey, String>,
+    derived_materializations: BTreeMap<PluginFileWriteKey, DerivedMaterializationProof>,
     rows: Vec<TransactionWriteRow>,
     file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     actor_publications: Vec<PendingPluginActorPublication>,
@@ -4898,18 +5282,15 @@ impl PendingPluginActorPublication {
 
 /// Builds the file write for an accepted semantic renderer transition.
 ///
-/// The visible materialization was loaded from the same durable blob-ref row
-/// whose semantic root fenced the actor call. `same_length_output_splice` is
-/// host-validated renderer metadata, never a guest assertion. Pairing the two
-/// lets the private CAS writer reuse only chunks from that exact base blob;
-/// unavailable, malformed, or mismatched state still follows canonical full
-/// staging.
+/// Builds the blob-backed file write for an accepted semantic renderer
+/// transition. Derived materializations deliberately bypass this path: they
+/// retain only their rendered-byte proof and never stage a CAS payload.
 fn semantic_rendered_file_data(
     file_id: String,
     path: String,
     filename: String,
     branch_id: String,
-    visible_materialization: &VisibleV2Materialization,
+    base_blob_hash: BlobHash,
     rendered_bytes: crate::Blob,
     same_length_output_splice: Option<ValidatedSameLengthOutputSplice>,
 ) -> TransactionFileData {
@@ -4923,10 +5304,10 @@ fn semantic_rendered_file_data(
         rendered_bytes,
     )
     .with_had_blob_ref(true)
-    .with_base_blob_hash(Some(visible_materialization.blob_hash));
+    .with_base_blob_hash(Some(base_blob_hash));
     if let Some(splice) = same_length_output_splice {
         rendered_file.set_verified_same_length_blob_splice(
-            visible_materialization.blob_hash,
+            base_blob_hash,
             splice.offset,
             splice.length,
         );
@@ -5077,6 +5458,448 @@ struct PluginGenerationUpgrade {
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DerivedFileRefSnapshot {
+    id: String,
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
+/// A derived file has no raw-CAS fallback: its durable semantic rows and proof
+/// can be rendered only through the generation named by its owner. Refuse to
+/// remove that generation while any live owner still names it. Descriptor
+/// deletes in this same transaction are allowed because their regular cleanup
+/// removes the owner and semantic state before commit.
+async fn preflight_derived_plugin_uninstalls(
+    base: &dyn crate::live_state::LiveStateReader,
+    staged: &impl StagedLiveStateRows,
+    uninstalls: &BTreeMap<String, BTreeSet<String>>,
+    deleted_file_keys: &BTreeMap<PluginFileWriteKey, Option<TransactionJson>>,
+) -> Result<(), LixError> {
+    let owner_rows = overlay_scan_rows(
+        base,
+        staged,
+        &LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
+                entity_pks: vec![EntityPk::single(PLUGIN_OWNER_KEY)],
+                branch_ids: uninstalls.keys().cloned().collect(),
+                untracked: Some(false),
+                ..Default::default()
+            },
+            projection: plugin_registry_live_state_projection(),
+            ..Default::default()
+        },
+    )
+    .await?;
+
+    for row in owner_rows {
+        let branch_id = row.branch_id.to_string();
+        let Some(uninstalled_plugins) = uninstalls.get(&branch_id) else {
+            continue;
+        };
+        let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+            continue;
+        };
+        if !uninstalled_plugins.contains(owner.plugin_key()) {
+            continue;
+        }
+        let file_key = PluginFileWriteKey {
+            branch_id: branch_id.clone(),
+            global: false,
+            untracked: false,
+            file_id: owner.file_id().to_string(),
+        };
+        if deleted_file_keys.contains_key(&file_key) {
+            continue;
+        }
+        return Err(LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!(
+                "cannot uninstall derived-materialization plugin '{}' while file '{}' remains owned",
+                owner.plugin_key(),
+                owner.file_id(),
+            ),
+        )
+        .with_hint(
+            "Delete every owned file before uninstalling this plugin; its semantic rows require the plugin to render their bytes.",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Derived bytes are a function of both durable semantic rows and the file
+/// descriptor supplied to the component. A path-only descriptor rewrite has
+/// no semantic transition with which to update the proof, so reject it rather
+/// than silently serving a changed (or absent) rendering. Relocation is a
+/// delete-and-recreate operation, which gives the component a new explicit
+/// semantic transition and proof.
+async fn preflight_derived_path_stability(
+    base: &dyn crate::live_state::LiveStateReader,
+    staged: &impl StagedLiveStateRows,
+    prospective: &impl StagedLiveStateRows,
+    prospective_rows: &[MaterializedLiveStateRow],
+) -> Result<(), LixError> {
+    let mut final_descriptor_rows =
+        BTreeMap::<(String, String, EntityPk, Option<String>), &MaterializedLiveStateRow>::new();
+    for row in prospective_rows.iter().filter(|row| {
+        !row.global
+            && !row.untracked
+            && matches!(
+                row.schema_key.as_str(),
+                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+            )
+    }) {
+        final_descriptor_rows.insert(
+            (
+                row.branch_id.to_string(),
+                row.schema_key.clone(),
+                row.entity_pk.clone(),
+                row.file_id.clone(),
+            ),
+            row,
+        );
+    }
+    if final_descriptor_rows.is_empty() {
+        return Ok(());
+    }
+    let final_descriptor_rows = final_descriptor_rows.into_values().collect::<Vec<_>>();
+    let prior_descriptors = overlay_load_exact_rows(
+        base,
+        staged,
+        &LiveStateExactBatchRequest {
+            rows: final_descriptor_rows
+                .iter()
+                .map(|row| LiveStateExactRowRequest {
+                    schema_key: row.schema_key.clone(),
+                    branch_id: row.branch_id.to_string(),
+                    entity_pk: row.entity_pk.clone(),
+                    file_id: row.file_id.clone(),
+                })
+                .collect(),
+            projection: plugin_registry_live_state_projection(),
+            untracked: Some(false),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+    let mut moved_files = BTreeSet::<(String, String)>::new();
+    let mut moved_directory_branches = BTreeSet::<String>::new();
+    for (next, previous) in final_descriptor_rows.iter().zip(prior_descriptors) {
+        let Some(previous) = previous else {
+            continue;
+        };
+        if previous.deleted
+            || previous.snapshot_content.is_none()
+            || next.deleted
+            || next.snapshot_content.is_none()
+            || descriptor_parent_and_name(&previous)? == descriptor_parent_and_name(next)?
+        {
+            continue;
+        }
+        let branch_id = next.branch_id.to_string();
+        match next.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let file_id = next.entity_pk.as_single_string_owned().map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("file descriptor path update has an invalid identity: {error}"),
+                    )
+                })?;
+                moved_files.insert((branch_id, file_id));
+            }
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                moved_directory_branches.insert(branch_id);
+            }
+            _ => unreachable!("descriptor filter above is exhaustive"),
+        }
+    }
+    preflight_derived_file_path_moves(base, staged, &moved_files).await?;
+    if !moved_directory_branches.is_empty() {
+        preflight_derived_directory_path_moves(
+            base,
+            staged,
+            prospective,
+            &moved_directory_branches,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn preflight_derived_file_path_moves(
+    base: &dyn crate::live_state::LiveStateReader,
+    staged: &impl StagedLiveStateRows,
+    moved_files: &BTreeSet<(String, String)>,
+) -> Result<(), LixError> {
+    if moved_files.is_empty() {
+        return Ok(());
+    }
+    let proofs = overlay_load_exact_rows(
+        base,
+        staged,
+        &LiveStateExactBatchRequest {
+            rows: moved_files
+                .iter()
+                .map(|(branch_id, file_id)| LiveStateExactRowRequest {
+                    schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
+                    branch_id: branch_id.clone(),
+                    entity_pk: EntityPk::single(file_id),
+                    file_id: Some(file_id.clone()),
+                })
+                .collect(),
+            projection: plugin_registry_live_state_projection(),
+            untracked: Some(false),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+    for ((branch_id, file_id), proof) in moved_files.iter().zip(proofs) {
+        let Some(proof) = proof else {
+            continue;
+        };
+        let VisibleV2MaterializationBytes::Derived { .. } =
+            decode_visible_v2_materialization(&proof, file_id)?.bytes
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "derived materialization row for file '{file_id}' did not decode as a derived proof"
+                ),
+            ));
+        };
+        return Err(derived_path_move_error(file_id, branch_id, None, None));
+    }
+    Ok(())
+}
+
+async fn preflight_derived_directory_path_moves(
+    base: &dyn crate::live_state::LiveStateReader,
+    staged: &impl StagedLiveStateRows,
+    prospective: &impl StagedLiveStateRows,
+    branch_ids: &BTreeSet<String>,
+) -> Result<(), LixError> {
+    let request = FilesystemPathIndexRequest::new(branch_ids.iter().cloned().collect());
+    let before = FilesystemPathIndex::from_live_rows(
+        overlay_scan_rows(base, staged, &request.live_state_request()).await?,
+    )?;
+    let after = FilesystemPathIndex::from_live_rows(
+        overlay_scan_rows(base, prospective, &request.live_state_request()).await?,
+    )?;
+    let proof_rows = overlay_scan_rows(
+        base,
+        staged,
+        &LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![DERIVED_FILE_REF_SCHEMA_KEY.to_string()],
+                branch_ids: branch_ids.iter().cloned().collect(),
+                untracked: Some(false),
+                ..Default::default()
+            },
+            projection: plugin_registry_live_state_projection(),
+            ..Default::default()
+        },
+    )
+    .await?;
+    for row in proof_rows {
+        if row.global || row.untracked || row.deleted || row.snapshot_content.is_none() {
+            continue;
+        }
+        let branch_id = row.branch_id.to_string();
+        let file_id = row
+            .file_id
+            .clone()
+            .or_else(|| row.entity_pk.as_single_string_owned().ok())
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "derived materialization proof is missing its file identity",
+                )
+            })?;
+        let VisibleV2MaterializationBytes::Derived { .. } =
+            decode_visible_v2_materialization(&row, &file_id)?.bytes
+        else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "derived materialization row for file '{file_id}' did not decode as a derived proof"
+                ),
+            ));
+        };
+        let before_path = derived_file_path_for_branch(&before, &branch_id, &file_id)?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "derived-materialization file '{file_id}' has no tracked descriptor before its path update"
+                ),
+            )
+        })?;
+        let Some(after_path) = derived_file_path_for_branch(&after, &branch_id, &file_id)? else {
+            continue;
+        };
+        if before_path != after_path {
+            return Err(derived_path_move_error(
+                &file_id,
+                &branch_id,
+                Some(&before_path),
+                Some(&after_path),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn descriptor_parent_and_name(
+    row: &MaterializedLiveStateRow,
+) -> Result<(Option<String>, String), LixError> {
+    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "path descriptor is missing its snapshot",
+        )
+    })?;
+    match row.schema_key.as_str() {
+        FILE_DESCRIPTOR_SCHEMA_KEY => {
+            let snapshot: PathFileDescriptorSnapshot =
+                serde_json::from_str(snapshot).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("invalid lix_file_descriptor path snapshot: {error}"),
+                    )
+                })?;
+            Ok((snapshot.directory_id, snapshot.name))
+        }
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+            let snapshot: PathDirectoryDescriptorSnapshot = serde_json::from_str(snapshot)
+                .map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!("invalid lix_directory_descriptor path snapshot: {error}"),
+                    )
+                })?;
+            Ok((snapshot.parent_id, snapshot.name))
+        }
+        schema_key => Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("path comparison received non-descriptor schema '{schema_key}'"),
+        )),
+    }
+}
+
+fn derived_path_move_error(
+    file_id: &str,
+    branch_id: &str,
+    before_path: Option<&str>,
+    after_path: Option<&str>,
+) -> LixError {
+    let message = match (before_path, after_path) {
+        (Some(before_path), Some(after_path)) => format!(
+            "cannot move derived-materialization file '{file_id}' from '{before_path}' to '{after_path}' without a semantic relocation transition"
+        ),
+        _ => format!(
+            "cannot move derived-materialization file '{file_id}' on branch '{branch_id}' without a semantic relocation transition"
+        ),
+    };
+    LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message).with_hint(
+        "Delete the file, then recreate it at its destination so the plugin can publish a new derived proof.",
+    )
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PathFileDescriptorSnapshot {
+    directory_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PathDirectoryDescriptorSnapshot {
+    parent_id: Option<String>,
+    name: String,
+}
+
+fn derived_file_path_for_branch(
+    index: &FilesystemPathIndex,
+    branch_id: &str,
+    file_id: &str,
+) -> Result<Option<String>, LixError> {
+    let matches = index
+        .exact_file_id_entries(file_id)
+        .into_iter()
+        .filter(|entry| {
+            entry.kind == FilesystemPathKind::File
+                && entry.key.branch_id() == branch_id
+                && !entry.key.global()
+                && !entry.key.is_untracked()
+        })
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => Ok(None),
+        [entry] => Ok(Some(entry.path.clone())),
+        _ => Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "derived-materialization file '{file_id}' resolves to {} tracked descriptors on branch '{branch_id}'",
+                matches.len()
+            ),
+        )),
+    }
+}
+
+/// Read-only composition of the already-staged transaction overlay and one
+/// prepared batch that has not yet been admitted to it. The current batch is
+/// appended last so its identities win exactly as they would in
+/// `TransactionWriteBuffer::stage_write`, without making an error irreversible.
+struct ProspectiveStagedRows {
+    staged: PreparedStateRowOverlay,
+    rows: Vec<MaterializedLiveStateRow>,
+}
+
+impl StagedLiveStateRows for ProspectiveStagedRows {
+    fn staged_rows(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        let mut rows = self.staged.staged_rows(request)?;
+        rows.extend(
+            self.rows
+                .iter()
+                .filter(|row| prospective_row_matches_scan(row, request))
+                .cloned(),
+        );
+        Ok(rows)
+    }
+}
+
+fn prospective_row_matches_scan(
+    row: &MaterializedLiveStateRow,
+    request: &LiveStateScanRequest,
+) -> bool {
+    let filter = &request.filter;
+    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.entity_pk))
+        && (filter.branch_ids.is_empty()
+            || filter
+                .branch_ids
+                .iter()
+                .any(|branch_id| branch_id == row.branch_id.as_ref())
+            || (row.branch_id.as_ref() == GLOBAL_BRANCH_ID
+                && filter
+                    .branch_ids
+                    .iter()
+                    .any(|branch_id| branch_id != GLOBAL_BRANCH_ID)))
+        && filter
+            .untracked
+            .is_none_or(|untracked| row.untracked == untracked)
+        && (filter.file_ids.is_empty()
+            || filter.file_ids.iter().any(|file_id| match file_id {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => row.file_id.is_none(),
+                NullableKeyFilter::Value(file_id) => row.file_id.as_ref() == Some(file_id),
+            }))
 }
 
 /// Proves that replacing a component generation cannot reinterpret any
@@ -5246,6 +6069,19 @@ async fn preflight_owned_v2_generation_upgrades(
         upgrade
             .previous
             .validate_owned_v2_upgrade_contract(&upgrade.replacement)?;
+        if upgrade.previous.materialization() == PluginMaterialization::Derived {
+            return Err(plugin_upgrade_error(
+                upgrade,
+                owners[0].file_id(),
+                LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "generation upgrades for derived-materialization plugins are not supported yet",
+                )
+                .with_hint(
+                    "Move or delete every owned file before replacing this plugin generation.",
+                ),
+            ));
+        }
         owners.sort_by(|left, right| left.file_id().cmp(right.file_id()));
         let lifecycle_key = PluginLifecycleKey {
             branch_id: upgrade.branch_id.clone(),
@@ -5914,7 +6750,10 @@ mod tests {
 
         let visible = decode_visible_v2_materialization(&row("file-a"), "file-a")
             .expect("matching materialization should decode");
-        assert_eq!(visible.blob_hash, blob_hash);
+        assert!(matches!(
+            visible.bytes,
+            VisibleV2MaterializationBytes::Blob { hash } if hash == blob_hash
+        ));
         let error = decode_visible_v2_materialization(&row("other-file"), "file-a")
             .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
@@ -5923,16 +6762,12 @@ mod tests {
     #[test]
     fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
         let base_blob_hash = BlobHash::from_content(b"abcdef");
-        let materialization = VisibleV2Materialization {
-            semantic_root: "semantic-root".to_string(),
-            blob_hash: base_blob_hash,
-        };
         let rendered = semantic_rendered_file_data(
             "file-a".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
-            &materialization,
+            base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
                 offset: 2,
@@ -5955,7 +6790,7 @@ mod tests {
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
-            &materialization,
+            base_blob_hash,
             b"abXYef".as_slice().into(),
             Some(ValidatedSameLengthOutputSplice {
                 offset: 6,
@@ -6326,7 +7161,7 @@ mod tests {
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: "lix_plugin_archive::plugin_csv_v2".to_string(),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),

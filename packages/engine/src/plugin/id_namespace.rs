@@ -490,7 +490,7 @@ mod tests {
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"key":"plugin_csv_v2","runtime":"wasm-component-v2","api_version":"2.1.0","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"key":"plugin_csv_v2","runtime":"wasm-component-v2","api_version":"2.1.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: "lix_plugin_archive::plugin_csv_v2".to_string(),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),

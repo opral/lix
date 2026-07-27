@@ -11,9 +11,11 @@ host-allocated IDs and fractional order keys: a localized line update changes
 that row only, an insertion adds one row, and a reorder updates only the rows
 whose order must move.
 
-The host also retains exact materialized bytes in its normal
-`lix_binary_blob_ref`/CAS path. NUL-bearing input inside Git's first-8-KiB
-window never selects this plugin and remains an ordinary raw binary file.
+For selected Git-text files, Lix makes the line rows authoritative and stores
+only a renderer-path/SHA-256/length proof of their rendered bytes; it does not
+retain a second raw source blob in binary CAS. Reads re-render the rows and
+verify that proof. NUL-bearing input inside Git's first-8-KiB window never selects this
+plugin and remains an ordinary raw binary file.
 
 Build it with:
 

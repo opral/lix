@@ -17,7 +17,7 @@ use crate::changelog::{
     CommitProjection as ChangelogCommitProjection, CommitRecord, TransactionChangeRecordRef,
     TransactionChangelogAppend, materialize_change_payloads,
 };
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::filesystem::stage_path_index_revision;
 use crate::functions::FunctionContext;
@@ -36,6 +36,7 @@ use crate::transaction::staging::{
     PreparedInsertIdentity, PreparedStateRowIdentity, PreparedWriteSet,
 };
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRef, StagedCommitChangeRefs};
+use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tracing::Instrument as _;
 
@@ -947,6 +948,7 @@ async fn build_lifecycle_tracked_snapshots(
                 lifecycle_selected_tracked_row(change_ref, root.commit_id, source, payload)?;
             apply_lifecycle_tracked_snapshot_row(&mut rows, tracked, false)?;
         }
+        validate_lifecycle_derived_materialization_paths(&rows, &root.branch_id, root.commit_id)?;
         snapshots.insert(root.commit_id, rows);
     }
 
@@ -965,6 +967,191 @@ async fn build_lifecycle_tracked_snapshots(
             ))
         })
         .collect()
+}
+
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const DERIVED_FILE_REF_SCHEMA_KEY: &str = "lix_derived_file_ref";
+
+/// A derived materialization is valid only for the exact descriptor path that
+/// was supplied to its renderer. Normal transactions reject path-only moves
+/// before staging; lifecycle snapshots additionally cover selected historical
+/// refs, such as merge picks, which bypass ordinary write reconciliation.
+///
+/// Keep this at the complete-snapshot seam rather than teaching every caller
+/// that can select historical refs about plugin semantics. It makes the
+/// invariant hold for all future lifecycle publications without adding a
+/// full-state scan to ordinary O(changed-rows) commits.
+fn validate_lifecycle_derived_materialization_paths(
+    rows: &BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>,
+    branch_id: &str,
+    commit_id: CommitId,
+) -> Result<(), LixError> {
+    let mut directories = BTreeMap::<String, LifecycleDirectoryDescriptor>::new();
+    let mut files = BTreeMap::<String, LifecycleFileDescriptor>::new();
+    let mut proofs = Vec::<LifecycleDerivedFileRef>::new();
+
+    for row in rows.values().filter(|row| !row.deleted) {
+        let Some(snapshot) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        match row.schema_key.as_str() {
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                let descriptor: LifecycleDirectoryDescriptor = serde_json::from_str(snapshot)
+                    .map_err(|error| {
+                        lifecycle_derived_materialization_error(format!(
+                            "branch '{branch_id}' commit '{commit_id}' has an invalid directory descriptor: {error}"
+                        ))
+                    })?;
+                if row.entity_pk.as_single_string().ok() != Some(descriptor.id.as_str()) {
+                    return Err(lifecycle_derived_materialization_error(format!(
+                        "branch '{branch_id}' commit '{commit_id}' has a directory descriptor whose id does not match its primary key"
+                    )));
+                }
+                if directories
+                    .insert(descriptor.id.clone(), descriptor)
+                    .is_some()
+                {
+                    return Err(lifecycle_derived_materialization_error(format!(
+                        "branch '{branch_id}' commit '{commit_id}' has duplicate directory descriptor ids"
+                    )));
+                }
+            }
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let descriptor: LifecycleFileDescriptor = serde_json::from_str(snapshot).map_err(
+                    |error| {
+                        lifecycle_derived_materialization_error(format!(
+                            "branch '{branch_id}' commit '{commit_id}' has an invalid file descriptor: {error}"
+                        ))
+                    },
+                )?;
+                if row.entity_pk.as_single_string().ok() != Some(descriptor.id.as_str()) {
+                    return Err(lifecycle_derived_materialization_error(format!(
+                        "branch '{branch_id}' commit '{commit_id}' has a file descriptor whose id does not match its primary key"
+                    )));
+                }
+                if files.insert(descriptor.id.clone(), descriptor).is_some() {
+                    return Err(lifecycle_derived_materialization_error(format!(
+                        "branch '{branch_id}' commit '{commit_id}' has duplicate file descriptor ids"
+                    )));
+                }
+            }
+            DERIVED_FILE_REF_SCHEMA_KEY => {
+                let proof: LifecycleDerivedFileRef = serde_json::from_str(snapshot).map_err(
+                    |error| {
+                        lifecycle_derived_materialization_error(format!(
+                            "branch '{branch_id}' commit '{commit_id}' has an invalid derived materialization proof: {error}"
+                        ))
+                    },
+                )?;
+                if row.entity_pk.as_single_string().ok() != Some(proof.id.as_str())
+                    || row.file_id.as_deref() != Some(proof.id.as_str())
+                {
+                    return Err(lifecycle_derived_materialization_error(format!(
+                        "branch '{branch_id}' commit '{commit_id}' has a derived materialization proof whose id does not match its row identity"
+                    )));
+                }
+                proofs.push(proof);
+            }
+            _ => {}
+        }
+    }
+
+    if proofs.is_empty() {
+        return Ok(());
+    }
+    let mut directory_paths = BTreeMap::new();
+    for proof in proofs {
+        let file = files.get(&proof.id).ok_or_else(|| {
+            lifecycle_derived_materialization_error(format!(
+                "derived-materialization file '{}' on branch '{branch_id}' commit '{commit_id}' has no live descriptor",
+                proof.id,
+            ))
+        })?;
+        let parent_path = match file.directory_id.as_deref() {
+            Some(directory_id) => Some(lifecycle_directory_path(
+                directory_id,
+                &directories,
+                &mut directory_paths,
+                &mut BTreeSet::new(),
+                branch_id,
+                commit_id,
+            )?),
+            None => None,
+        };
+        let path = compose_file_path(parent_path.as_deref(), &file.name)?;
+        if proof.path != path {
+            return Err(lifecycle_derived_materialization_error(format!(
+                "derived-materialization file '{}' on branch '{branch_id}' commit '{commit_id}' was rendered at '{}' but its final descriptor resolves to '{}'",
+                proof.id, proof.path, path,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_directory_path(
+    id: &str,
+    directories: &BTreeMap<String, LifecycleDirectoryDescriptor>,
+    paths: &mut BTreeMap<String, String>,
+    visiting: &mut BTreeSet<String>,
+    branch_id: &str,
+    commit_id: CommitId,
+) -> Result<String, LixError> {
+    if let Some(path) = paths.get(id) {
+        return Ok(path.clone());
+    }
+    if !visiting.insert(id.to_string()) {
+        return Err(lifecycle_derived_materialization_error(format!(
+            "derived-materialization validation found a directory cycle at '{id}' on branch '{branch_id}' commit '{commit_id}'"
+        )));
+    }
+    let directory = directories.get(id).ok_or_else(|| {
+        lifecycle_derived_materialization_error(format!(
+            "derived-materialization validation found missing directory '{id}' on branch '{branch_id}' commit '{commit_id}'"
+        ))
+    })?;
+    let parent_path = match directory.parent_id.as_deref() {
+        Some(parent_id) => Some(lifecycle_directory_path(
+            parent_id,
+            directories,
+            paths,
+            visiting,
+            branch_id,
+            commit_id,
+        )?),
+        None => None,
+    };
+    let path = compose_directory_path(parent_path.as_deref(), &directory.name)?;
+    visiting.remove(id);
+    paths.insert(id.to_string(), path.clone());
+    Ok(path)
+}
+
+fn lifecycle_derived_materialization_error(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_CONSTRAINT_VIOLATION, message).with_hint(
+        "Keep a derived file at the path recorded by its proof, or recreate it at the destination so its plugin can publish a new proof.",
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct LifecycleDirectoryDescriptor {
+    id: String,
+    parent_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LifecycleFileDescriptor {
+    id: String,
+    directory_id: Option<String>,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LifecycleDerivedFileRef {
+    id: String,
+    path: String,
 }
 
 async fn load_persisted_lifecycle_tracked_snapshot(

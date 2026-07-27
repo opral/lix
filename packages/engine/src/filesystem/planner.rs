@@ -16,7 +16,8 @@ use crate::live_state::{
 };
 
 use super::keys::{
-    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+    BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+    FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
@@ -223,6 +224,20 @@ pub(crate) struct BlobRefRowInput {
     pub(crate) context: FilesystemRowContext,
 }
 
+/// Durable proof for a plugin-owned file whose bytes are reconstructed from
+/// semantic rows instead of retained in the binary CAS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DerivedFileRefRowInput {
+    pub(crate) file_id: String,
+    /// Exact filesystem path supplied to the renderer that produced the
+    /// proof. A component may make rendering decisions from its descriptor,
+    /// so the byte digest alone is not sufficient to validate a relocation.
+    pub(crate) path: String,
+    pub(crate) sha256: String,
+    pub(crate) size_bytes: usize,
+    pub(crate) context: FilesystemRowContext,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileDescriptorWriteInput {
     pub(crate) id: Option<String>,
@@ -236,6 +251,7 @@ pub(crate) struct FileDescriptorWriteInput {
 pub(crate) struct FileDeleteInput {
     pub(crate) file_id: String,
     pub(crate) has_blob_ref: bool,
+    pub(crate) has_derived_file_ref: bool,
     pub(crate) context: FilesystemRowContext,
 }
 
@@ -883,6 +899,74 @@ pub(crate) fn blob_ref_tombstone_row(
     )
 }
 
+pub(crate) fn derived_file_ref_row(
+    input: DerivedFileRefRowInput,
+) -> Result<TransactionWriteRow, LixError> {
+    let size_bytes = u64::try_from(input.size_bytes).map_err(|_| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "derived file size exceeds supported range for file '{}' branch '{}'",
+                input.file_id, input.context.branch_id
+            ),
+        )
+    })?;
+    if input.sha256.len() != 64
+        || !input
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "derived file materialization for '{}' must carry a lowercase SHA-256",
+                input.file_id
+            ),
+        ));
+    }
+    if !input.path.starts_with('/') {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!(
+                "derived file materialization for '{}' must carry an absolute renderer path",
+                input.file_id
+            ),
+        ));
+    }
+    let snapshot = json!({
+        "id": input.file_id,
+        "path": input.path,
+        "sha256": input.sha256,
+        "size_bytes": size_bytes,
+    });
+
+    Ok(state_row(
+        input.file_id.clone(),
+        DERIVED_FILE_REF_SCHEMA_KEY,
+        Some(snapshot),
+        FilesystemRowContext {
+            file_id: Some(input.file_id),
+            ..input.context
+        },
+    ))
+}
+
+pub(crate) fn derived_file_ref_tombstone_row(
+    file_id: String,
+    context: FilesystemRowContext,
+) -> TransactionWriteRow {
+    tombstone_row(
+        file_id.clone(),
+        DERIVED_FILE_REF_SCHEMA_KEY,
+        FilesystemRowContext {
+            file_id: Some(file_id),
+            metadata: None,
+            ..context
+        },
+    )
+}
+
 pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     parsed: LixPath,
@@ -1232,7 +1316,16 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
     )];
 
     if input.has_blob_ref {
-        rows.push(blob_ref_tombstone_row(input.file_id.clone(), input.context));
+        rows.push(blob_ref_tombstone_row(
+            input.file_id.clone(),
+            input.context.clone(),
+        ));
+    }
+    if input.has_derived_file_ref {
+        rows.push(derived_file_ref_tombstone_row(
+            input.file_id.clone(),
+            input.context,
+        ));
     }
 
     FilesystemDeletePlan { rows, count: 1 }
@@ -1533,6 +1626,7 @@ fn collect_recursive_directory_delete(
             let plan = plan_file_delete(FileDeleteInput {
                 file_id: file_id.clone(),
                 has_blob_ref: visible_filesystem.has_blob_ref(context, file_id),
+                has_derived_file_ref: visible_filesystem.has_derived_file_ref(context, file_id),
                 context: context.clone(),
             });
             rows.extend(plan.rows);
@@ -1562,10 +1656,10 @@ mod tests {
     use crate::transaction::types::TransactionJson;
 
     use super::{
-        BlobRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
+        BlobRefRowInput, DerivedFileRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
         DirectoryDescriptorWriteIntent, DirectoryPathResolver, FileDeleteInput,
         FileDescriptorRowInput, FileDescriptorWriteInput, FileDescriptorWriteIntent,
-        FilesystemRowContext, blob_ref_row, directory_descriptor_row,
+        FilesystemRowContext, blob_ref_row, derived_file_ref_row, directory_descriptor_row,
         directory_descriptor_write_row, file_descriptor_row, file_descriptor_write_row,
         plan_file_descriptor_write,
     };
@@ -1714,6 +1808,24 @@ mod tests {
             snapshot["blob_hash"].as_str(),
             Some(BlobHash::from_content(b"Hello").to_hex().as_str())
         );
+    }
+
+    #[test]
+    fn derived_file_ref_row_binds_renderer_path() {
+        let row = derived_file_ref_row(DerivedFileRefRowInput {
+            file_id: "file-readme".to_string(),
+            path: "/docs/readme.txt".to_string(),
+            sha256: "a".repeat(64),
+            size_bytes: 5,
+            context: FilesystemRowContext::active_branch("branch-a"),
+        })
+        .expect("derived ref row should build");
+
+        let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["path"], "/docs/readme.txt");
+        assert_eq!(snapshot["sha256"], JsonValue::String("a".repeat(64)));
+        assert_eq!(snapshot["size_bytes"], 5);
     }
 
     #[test]
@@ -2450,6 +2562,7 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "file-readme".to_string(),
             has_blob_ref: true,
+            has_derived_file_ref: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -2485,6 +2598,7 @@ mod tests {
         let plan = super::plan_file_delete(FileDeleteInput {
             file_id: "file-readme".to_string(),
             has_blob_ref: false,
+            has_derived_file_ref: false,
             context: FilesystemRowContext::active_branch("branch-a"),
         });
 
@@ -2559,6 +2673,7 @@ mod tests {
                 &context,
                 "file-readme",
             )]),
+            derived_file_refs_by_key: BTreeSet::new(),
         };
 
         let plan = super::plan_recursive_directory_delete("dir-docs", &visible_filesystem, context);

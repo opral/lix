@@ -9,6 +9,7 @@ use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::changelog::ChangeRecordProjection;
 use crate::entity_pk::EntityPk;
+use crate::filesystem::DERIVED_FILE_REF_SCHEMA_KEY;
 use crate::plugin::{
     PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry, PluginRegistryEntry,
     inferred_media_type_for_path,
@@ -630,11 +631,13 @@ fn is_derived_blob_conflict(
     conflict: &AnalysisMergeConflict,
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
 ) -> bool {
-    conflict.schema_key == BLOB_REF_SCHEMA_KEY
-        && conflict
-            .file_id
-            .as_ref()
-            .is_some_and(|file_id| derived_blob_files.contains_key(file_id))
+    matches!(
+        conflict.schema_key.as_str(),
+        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+    ) && conflict
+        .file_id
+        .as_ref()
+        .is_some_and(|file_id| derived_blob_files.contains_key(file_id))
 }
 
 fn pick_is_derived_plugin_state(
@@ -647,11 +650,13 @@ fn pick_is_derived_plugin_state(
     let Some(owner) = derived_blob_files.get(file_id) else {
         return false;
     };
-    pick.selected_row.schema_key == BLOB_REF_SCHEMA_KEY
-        || owner
-            .schema_keys()
-            .iter()
-            .any(|schema_key| schema_key == &pick.selected_row.schema_key)
+    matches!(
+        pick.selected_row.schema_key.as_str(),
+        BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY
+    ) || owner
+        .schema_keys()
+        .iter()
+        .any(|schema_key| schema_key == &pick.selected_row.schema_key)
 }
 
 /// One historical triple for a plugin-owned semantic entity. The row identity
@@ -1742,6 +1747,7 @@ fn merge_conflict_side_details(side: &MergeConflictSide) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
+    use crate::tracked_state::{TrackedStateDiffIdentity, TrackedStateDiffRow};
 
     fn descriptor_row(
         file_id: &str,
@@ -1788,6 +1794,65 @@ mod tests {
             change_id: ChangeId::for_test_label(incarnation),
             commit_id: CommitId::for_test_label("owner-commit"),
         }
+    }
+
+    fn derived_file_ref_conflict(file_id: &str) -> AnalysisMergeConflict {
+        AnalysisMergeConflict {
+            kind: AnalysisMergeConflictKind::SameEntityChanged,
+            schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_owned(),
+            entity_pk: json!([file_id]),
+            file_id: Some(file_id.to_owned()),
+            target: AnalysisMergeConflictSide {
+                kind: AnalysisMergeConflictChangeKind::Modified,
+                before_change_id: Some("target-before".to_owned()),
+                after_change_id: Some("target-after".to_owned()),
+            },
+            source: AnalysisMergeConflictSide {
+                kind: AnalysisMergeConflictChangeKind::Modified,
+                before_change_id: Some("source-before".to_owned()),
+                after_change_id: Some("source-after".to_owned()),
+            },
+        }
+    }
+
+    fn derived_file_ref_pick(file_id: &str) -> TrackedStateMergePick {
+        let change_id = ChangeId::for_test_label("derived-ref-change");
+        TrackedStateMergePick {
+            identity: TrackedStateDiffIdentity {
+                schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_owned(),
+                entity_pk: EntityPk::single(file_id),
+                file_id: Some(file_id.to_owned()),
+            },
+            change_id,
+            selected_row: TrackedStateDiffRow {
+                entity_pk: EntityPk::single(file_id),
+                schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_owned(),
+                file_id: Some(file_id.to_owned()),
+                deleted: false,
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    "2026-01-01T00:00:00Z",
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    "2026-01-01T00:00:00Z",
+                ),
+                change_id,
+                commit_id: CommitId::for_test_label("derived-ref-commit"),
+            },
+        }
+    }
+
+    fn derived_file_owner(file_id: &str) -> BTreeMap<String, PluginFileOwner> {
+        BTreeMap::from([(
+            file_id.to_owned(),
+            PluginFileOwner::new(
+                file_id,
+                "plugin_git_text_v2",
+                vec!["git_text_line".to_owned()],
+            )
+            .unwrap(),
+        )])
     }
 
     #[test]
@@ -1910,5 +1975,33 @@ mod tests {
             ),
             Some("/docs/readme.md".to_owned())
         );
+    }
+
+    #[test]
+    fn derived_file_ref_conflicts_are_reconciled_with_plugin_semantic_state() {
+        let owners = derived_file_owner("file-a");
+
+        assert!(is_derived_blob_conflict(
+            &derived_file_ref_conflict("file-a"),
+            &owners,
+        ));
+        assert!(!is_derived_blob_conflict(
+            &derived_file_ref_conflict("file-other"),
+            &owners,
+        ));
+    }
+
+    #[test]
+    fn derived_file_ref_picks_are_not_copied_over_semantic_merge_results() {
+        let owners = derived_file_owner("file-a");
+
+        assert!(pick_is_derived_plugin_state(
+            &derived_file_ref_pick("file-a"),
+            &owners,
+        ));
+        assert!(!pick_is_derived_plugin_state(
+            &derived_file_ref_pick("file-other"),
+            &owners,
+        ));
     }
 }
