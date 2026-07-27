@@ -705,9 +705,36 @@ impl SlateDBWorker {
     /// Writes and flushes deliberately continue through [`Self::call`]: after
     /// a caller drops its future, letting a mutating operation finish preserves
     /// a single, well-defined publication and durability outcome. Reads have
-    /// no such side effects, so canceling them also releases the in-flight
-    /// guard that manager shutdown waits on.
+    /// no such side effects, so run them on the caller's multithreaded
+    /// executor. That keeps SlateDB's own async work local to the request and
+    /// avoids a manager-task spawn plus oneshot round trip for every snapshot,
+    /// point read, and scan page. A current-thread runtime keeps using the
+    /// manager: an ObjectStore is allowed to perform synchronous work before
+    /// its first yield, and that must not monopolize its only executor thread.
+    /// Canceling either path drops the read future and the in-flight guard that
+    /// manager shutdown waits on.
     async fn call_read<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<R, StorageError>> + Send + 'static,
+    {
+        if !matches!(
+            Handle::try_current(),
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return self.call_read_on_manager(operation).await;
+        }
+        // Manager shutdown waits for this guard. The guard is deliberately
+        // independent of `SlateDBWorkerInner`: the operation may retain only
+        // the database Arc while the last storage handle is being dropped.
+        // Keeping the guard in this caller future prevents the synchronous
+        // manager close from racing that operation.
+        let _in_flight = self.inner.in_flight.enter();
+        operation(Arc::clone(&self.inner.db)).await
+    }
+
+    async fn call_read_on_manager<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
@@ -1200,6 +1227,10 @@ mod tests {
     use std::ops::Range;
     use std::sync::atomic::AtomicBool;
     use std::time::{Duration, Instant};
+
+    tokio::task_local! {
+        static CALLER_READ_MARKER: ();
+    }
 
     #[test]
     fn uses_lz4_compression_by_default() {
@@ -1891,6 +1922,32 @@ mod tests {
             panic!("storage close should wait only for the cancelled read to drain: {error:?}");
         }
         closer.join().expect("join storage closer");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_operation_stays_on_the_callers_executor() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-caller-runtime-read",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open caller-runtime read storage");
+
+        CALLER_READ_MARKER
+            .scope((), async {
+                storage
+                    .worker
+                    .call_read(|_db| async move {
+                        assert!(
+                            CALLER_READ_MARKER.try_with(|()| ()).is_ok(),
+                            "read work must retain the caller task context"
+                        );
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+                    .expect("run read on caller executor");
+            })
+            .await;
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {

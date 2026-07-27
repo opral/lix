@@ -25,6 +25,19 @@ const CORPUS_FILE_DATA_HEX: &str = "43434343434343434343434343434343";
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual performance probe; run with --ignored --nocapture"]
 async fn exact_file_read_benchmark_probe() {
+    run_exact_file_read_benchmark_probe().await;
+}
+
+/// Matches the multithreaded executor used by the service, which lets the
+/// SlateDB adapter keep request reads on the request runtime instead of
+/// crossing into its lifecycle manager runtime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "manual performance probe; run with --ignored --nocapture"]
+async fn exact_file_read_multithread_benchmark_probe() {
+    run_exact_file_read_benchmark_probe().await;
+}
+
+async fn run_exact_file_read_benchmark_probe() {
     let file_count = file_count_from_env();
     run_backend("memory", Memory::new(), file_count).await;
 
