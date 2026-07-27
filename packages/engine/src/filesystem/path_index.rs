@@ -37,6 +37,13 @@ const FILESYSTEM_PATH_REVISION_SPACE: StorageSpace = StorageSpace::new(
 const FILESYSTEM_PATH_REVISION_KEY: &[u8] = b"global";
 const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_EAGER_BLOB_BYTES: usize = 32 * 1024;
+const MAX_EAGER_BLOB_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+fn reserve_eager_blob_cache_bytes(reserved: usize, size: usize) -> Option<usize> {
+    reserved
+        .checked_add(size)
+        .filter(|total| *total <= MAX_EAGER_BLOB_CACHE_BYTES)
+}
 
 #[cfg(test)]
 static FULL_REBUILD_BUILDS: AtomicUsize = AtomicUsize::new(0);
@@ -556,6 +563,7 @@ impl FilesystemPathIndex {
     ) -> Result<Self, LixError> {
         let mut requests =
             BTreeMap::<String, (BlobHash, usize, Vec<Arc<FilesystemPathEntry>>)>::new();
+        let mut reserved_cache_bytes = 0usize;
         for entry in self.entries() {
             let Some(row) = entry.blob_ref.as_ref() else {
                 continue;
@@ -574,12 +582,21 @@ impl FilesystemPathIndex {
             if size_bytes > MAX_EAGER_BLOB_BYTES {
                 continue;
             }
+            let Some(next_reserved_cache_bytes) =
+                reserve_eager_blob_cache_bytes(reserved_cache_bytes, size_bytes)
+            else {
+                continue;
+            };
             let hash = BlobHash::from_hex(&snapshot.blob_hash)?;
             requests
                 .entry(snapshot.blob_hash)
                 .or_insert_with(|| (hash, size_bytes, Vec::new()))
                 .2
                 .push(entry);
+            // Count each projected entry even when several entries share a
+            // blob. This matches estimated_heap_bytes and bounds the complete
+            // cached view rather than only the unique CAS payloads.
+            reserved_cache_bytes = next_reserved_cache_bytes;
         }
         if requests.is_empty() {
             return Ok(self);
@@ -1398,6 +1415,19 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
+
+    #[test]
+    fn eager_blob_hydration_has_an_aggregate_cache_budget() {
+        assert_eq!(
+            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES - 1, 1),
+            Some(MAX_EAGER_BLOB_CACHE_BYTES)
+        );
+        assert_eq!(
+            reserve_eager_blob_cache_bytes(MAX_EAGER_BLOB_CACHE_BYTES, 1),
+            None
+        );
+        assert_eq!(reserve_eager_blob_cache_bytes(usize::MAX, 1), None);
+    }
 
     #[test]
     fn exact_range_and_order_preserve_path_buckets() {
