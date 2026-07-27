@@ -143,4 +143,4 @@ required-features = ["storage-benches", "slatedb"]
 name = "uuid_v7_physical_keys"
 path = "benches/uuid_v7_physical_keys.rs"
 harness = false
-required-features = ["storage-benches"]
+required-features = ["lix_engine/storage-benches", "rocksdb", "slatedb"]
