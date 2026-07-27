@@ -37,7 +37,7 @@
         },
         "content_type": {
           "type": "string",
-          "enum": ["text", "binary"]
+          "enum": ["text", "binary", "git_text"]
         }
       }
     },

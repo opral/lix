@@ -126,10 +126,12 @@ pub struct WasmTransitionCounters {
     /// Bytes examined by the host-only full-blob diff fallback. Validated
     /// transport splice provenance keeps this zero.
     pub host_full_diff_bytes_compared: u64,
-    /// Bytes examined by a host-only full-payload content-type classification.
-    /// Warm, provenance-backed text edits validate only their bounded splice
-    /// window and keep this zero.
-    pub host_full_content_classification_bytes: u64,
+    /// Bytes examined by host-only content-type classification. A matcher may
+    /// deliberately use a bounded predicate (for example Git's 8 KiB NUL
+    /// window), while a UTF-8 parser examines the complete payload. Warm,
+    /// provenance-backed edits keep this zero when their invariant proof is
+    /// sufficient.
+    pub host_content_classification_bytes: u64,
     pub full_state_semantic_rows_materialized: u64,
     pub change_payload_requests: u64,
     pub returned_change_payloads: u64,
@@ -180,9 +182,9 @@ impl WasmTransitionCounters {
         self.host_full_diff_bytes_compared = self
             .host_full_diff_bytes_compared
             .saturating_add(other.host_full_diff_bytes_compared);
-        self.host_full_content_classification_bytes = self
-            .host_full_content_classification_bytes
-            .saturating_add(other.host_full_content_classification_bytes);
+        self.host_content_classification_bytes = self
+            .host_content_classification_bytes
+            .saturating_add(other.host_content_classification_bytes);
         self.full_state_semantic_rows_materialized = self
             .full_state_semantic_rows_materialized
             .saturating_add(other.full_state_semantic_rows_materialized);

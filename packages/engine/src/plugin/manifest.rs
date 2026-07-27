@@ -38,19 +38,39 @@ pub struct PluginMatch {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginContentType {
+    /// A complete UTF-8 payload. Existing format plugins use this stricter
+    /// contract because their parsers consume Unicode text.
     Text,
+    /// A payload that is not valid UTF-8.
     Binary,
+    /// Git's text heuristic: no NUL byte in the first 8 KiB.
+    ///
+    /// This is intentionally separate from [`Self::Text`]. Git accepts
+    /// non-UTF-8, NUL-free payloads as text, while parsers such as JSON and
+    /// Markdown require valid UTF-8.
+    GitText,
 }
 
 impl PluginContentType {
-    /// Classifies file bytes only when a caller already has the payload.
-    /// Empty bytes are valid UTF-8 and therefore text, matching the bundled
-    /// text plugins' treatment of a newly-created empty file.
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
-        if std::str::from_utf8(bytes).is_ok() {
-            Self::Text
-        } else {
-            Self::Binary
+    /// The byte window Git uses to distinguish binary data for its text
+    /// operations. Keep this value local to the Git-compatible matcher so
+    /// UTF-8 format plugins retain their complete-payload contract.
+    pub(crate) const GIT_TEXT_SCAN_BYTES: usize = 8_000;
+
+    /// Returns whether a payload satisfies this matcher contract.
+    ///
+    /// `Text` and `GitText` are intentionally overlapping predicates: valid
+    /// UTF-8 without a NUL byte matches both. The registry resolves that overlap
+    /// by matcher specificity, so a format-specific UTF-8 plugin wins over the
+    /// catch-all Git-compatible passthrough.
+    pub(crate) fn matches_bytes(self, bytes: &[u8]) -> bool {
+        match self {
+            Self::Text => std::str::from_utf8(bytes).is_ok(),
+            Self::Binary => std::str::from_utf8(bytes).is_err(),
+            Self::GitText => !bytes
+                .iter()
+                .take(Self::GIT_TEXT_SCAN_BYTES)
+                .any(|byte| *byte == 0),
         }
     }
 }
