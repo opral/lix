@@ -629,6 +629,8 @@ fn open_rocksdb(path: &Path) -> Result<DB, StorageError> {
     options.create_if_missing(true);
     options.set_use_fsync(false);
     options.set_write_buffer_size(64 * 1024 * 1024);
+    options.set_compression_type(rocksdb::DBCompressionType::Zstd);
+    options.set_compression_options(-14, 1, 0, 0);
     let mut table_options = BlockBasedOptions::default();
     // Full whole-key filters let missing point reads skip unrelated SST data.
     table_options.set_bloom_filter(8.0, false);
