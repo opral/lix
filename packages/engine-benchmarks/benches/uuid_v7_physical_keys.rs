@@ -61,7 +61,6 @@ fn rows(count: usize) -> Vec<BenchTransactionRow> {
 
 async fn measure_storage<StorageImpl>(
     storage: StorageImpl,
-    storage_path: &Path,
     rows: &[BenchTransactionRow],
 ) -> (Measurement, Vec<(String, u64, u64, u64)>)
 where
@@ -91,7 +90,7 @@ where
         Measurement {
             elapsed_ns,
             written_bytes: accounting.written_bytes,
-            backend_bytes: directory_bytes(storage_path),
+            backend_bytes: 0,
         },
         layout,
     )
@@ -106,11 +105,20 @@ async fn measure(
     match backend {
         Backend::RocksDB => {
             let storage = RocksDB::open(&storage_path).expect("open RocksDB benchmark storage");
-            measure_storage(storage, &storage_path, rows).await
+            let (mut measurement, layout) = measure_storage(storage.clone(), rows).await;
+            storage.flush().expect("flush RocksDB benchmark storage");
+            measurement.backend_bytes = directory_bytes(&storage_path);
+            (measurement, layout)
         }
         Backend::SlateDB => {
             let storage = SlateDB::open(&storage_path).expect("open SlateDB benchmark storage");
-            measure_storage(storage, &storage_path, rows).await
+            let (mut measurement, layout) = measure_storage(storage.clone(), rows).await;
+            storage
+                .flush()
+                .await
+                .expect("flush SlateDB benchmark storage");
+            measurement.backend_bytes = directory_bytes(&storage_path);
+            (measurement, layout)
         }
     }
 }
