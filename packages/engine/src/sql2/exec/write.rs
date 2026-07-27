@@ -1,9 +1,13 @@
 //! Write execution for bound sql2 plans.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use serde_json::json;
 
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::ScalarValue;
 use datafusion::sql::parser::Statement as DataFusionStatement;
 
 use super::{SqlLogicalPlan, SqlWriteResult};
@@ -115,6 +119,191 @@ pub(crate) async fn execute_write_logical_plan_result_with_metadata(
     )
     .await
     .map(|(result, _path)| result)
+}
+
+/// Transposes row-oriented public `executeBatch` parameters into the
+/// column-oriented carrier used by the physical batch executor.
+///
+/// A mixed-type column is deliberately not coerced: its statements retain the
+/// ordinary sequential path and therefore the exact per-statement type errors.
+pub(crate) fn parameter_record_batch(rows: &[&[Value]]) -> Result<Option<RecordBatch>, LixError> {
+    let Some(first) = rows.first() else {
+        return Ok(None);
+    };
+    if rows.iter().any(|row| row.len() != first.len()) {
+        return Ok(None);
+    }
+
+    let mut fields = Vec::with_capacity(first.len());
+    let mut columns = Vec::with_capacity(first.len());
+    for column_index in 0..first.len() {
+        let Some(kind) = rows
+            .iter()
+            .filter_map(|row| ParameterKind::from_value(&row[column_index]))
+            .next()
+        else {
+            // Arrow's untyped Null column cannot retain the SQL parameter's
+            // eventual type. Keep an all-null column on sequential execution.
+            return Ok(None);
+        };
+        if rows.iter().any(|row| {
+            ParameterKind::from_value(&row[column_index]).is_some_and(|candidate| candidate != kind)
+        }) {
+            return Ok(None);
+        }
+        let scalars = rows
+            .iter()
+            .map(|row| kind.scalar(&row[column_index]))
+            .collect::<Result<Vec<_>, _>>()?;
+        let array = ScalarValue::iter_to_array(scalars).map_err(|error| {
+            LixError::unknown(format!("failed to lower SQL parameter column: {error}"))
+        })?;
+        let field = Field::new(
+            format!("${}", column_index + 1),
+            kind.data_type(),
+            rows.iter()
+                .any(|row| matches!(row[column_index], Value::Null)),
+        );
+        fields.push(if kind == ParameterKind::Json {
+            crate::sql2::result_metadata::mark_json_field(field)
+        } else {
+            field
+        });
+        columns.push(array);
+    }
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map(Some)
+        .map_err(|error| {
+            LixError::unknown(format!("failed to construct SQL parameter batch: {error}"))
+        })
+}
+
+pub(super) fn parameter_row(batch: &RecordBatch, row_index: usize) -> Result<Vec<Value>, LixError> {
+    if row_index >= batch.num_rows() {
+        return Err(LixError::unknown(format!(
+            "SQL parameter row {row_index} is outside a {} row batch",
+            batch.num_rows()
+        )));
+    }
+    batch
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(column_index, array)| {
+            let scalar = ScalarValue::try_from_array(array, row_index).map_err(|error| {
+                LixError::unknown(format!(
+                    "failed to read SQL parameter ${} from Arrow batch: {error}",
+                    column_index + 1
+                ))
+            })?;
+            scalar_parameter_value(
+                scalar,
+                crate::sql2::result_metadata::field_is_json(batch.schema().field(column_index)),
+            )
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParameterKind {
+    Boolean,
+    Integer,
+    Real,
+    Text,
+    Json,
+    Blob,
+}
+
+impl ParameterKind {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Null => None,
+            Value::Boolean(_) => Some(Self::Boolean),
+            Value::Integer(_) => Some(Self::Integer),
+            Value::Real(_) => Some(Self::Real),
+            Value::Text(_) => Some(Self::Text),
+            Value::Json(_) => Some(Self::Json),
+            Value::Blob(_) => Some(Self::Blob),
+        }
+    }
+
+    fn data_type(self) -> DataType {
+        match self {
+            Self::Boolean => DataType::Boolean,
+            Self::Integer => DataType::Int64,
+            Self::Real => DataType::Float64,
+            Self::Text | Self::Json => DataType::Utf8,
+            Self::Blob => DataType::LargeBinary,
+        }
+    }
+
+    fn scalar(self, value: &Value) -> Result<ScalarValue, LixError> {
+        match (self, value) {
+            (Self::Boolean, Value::Boolean(value)) => Ok(ScalarValue::Boolean(Some(*value))),
+            (Self::Integer, Value::Integer(value)) => Ok(ScalarValue::Int64(Some(*value))),
+            (Self::Real, Value::Real(value)) => Ok(ScalarValue::Float64(Some(*value))),
+            (Self::Text, Value::Text(value)) => Ok(ScalarValue::Utf8(Some(value.clone()))),
+            (Self::Json, Value::Json(value)) => Ok(ScalarValue::Utf8(Some(value.to_string()))),
+            (Self::Blob, Value::Blob(value)) => Ok(ScalarValue::LargeBinary(Some(value.to_vec()))),
+            (Self::Boolean, Value::Null) => Ok(ScalarValue::Boolean(None)),
+            (Self::Integer, Value::Null) => Ok(ScalarValue::Int64(None)),
+            (Self::Real, Value::Null) => Ok(ScalarValue::Float64(None)),
+            (Self::Text | Self::Json, Value::Null) => Ok(ScalarValue::Utf8(None)),
+            (Self::Blob, Value::Null) => Ok(ScalarValue::LargeBinary(None)),
+            _ => Err(LixError::unknown(
+                "heterogeneous SQL parameter column reached Arrow lowering",
+            )),
+        }
+    }
+}
+
+fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, LixError> {
+    match scalar {
+        ScalarValue::Boolean(Some(value)) => Ok(Value::Boolean(value)),
+        ScalarValue::Int64(Some(value)) => Ok(Value::Integer(value)),
+        ScalarValue::Float64(Some(value)) => Ok(Value::Real(value)),
+        ScalarValue::Utf8(Some(value)) if is_json => serde_json::from_str(&value)
+            .map(Value::Json)
+            .map_err(|error| {
+                LixError::unknown(format!(
+                    "invalid JSON value in SQL parameter batch: {error}"
+                ))
+            }),
+        ScalarValue::Utf8(Some(value)) => Ok(Value::Text(value)),
+        ScalarValue::LargeBinary(Some(value)) => Ok(Value::Blob(value.into())),
+        ScalarValue::Boolean(None)
+        | ScalarValue::Int64(None)
+        | ScalarValue::Float64(None)
+        | ScalarValue::Utf8(None)
+        | ScalarValue::LargeBinary(None)
+        | ScalarValue::Null => Ok(Value::Null),
+        value => Err(LixError::unknown(format!(
+            "unsupported Arrow SQL parameter value {value:?}"
+        ))),
+    }
+}
+
+/// Attempts the one currently certified physical parameter-batch route.
+///
+/// `None` means the logical statements are not independent and must retain
+/// public `executeBatch`'s sequential execution semantics.
+pub(crate) async fn execute_write_logical_plan_parameter_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: SqlLogicalPlan,
+    parameter_batch: &RecordBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let SqlLogicalPlan::Write(write_plan) = plan else {
+        return Ok(None);
+    };
+    validate_write_parameter_count(&write_plan.plan, parameter_batch.num_columns())?;
+    super::bound_public_write::try_execute_entity_update_parameter_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_batch,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)
 }
 
 #[cfg(test)]

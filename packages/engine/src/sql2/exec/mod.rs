@@ -45,10 +45,14 @@ pub(crate) use write::{
 };
 pub(crate) use write::{
     WriteLogicalPlan as SqlWriteLogicalPlan, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, execute_write_logical_plan_result_with_metadata,
+    create_write_plan_template_from_parsed, execute_write_logical_plan_parameter_batch,
+    execute_write_logical_plan_result_with_metadata, parameter_record_batch,
 };
 
 pub(crate) enum SqlLogicalPlan {
     DataFusion(SqlDataFusionLogicalPlan),
     Write(SqlWriteLogicalPlan),
 }
+
+#[cfg(test)]
+pub(crate) use bound_public_write::take_entity_update_parameter_batch_executions;

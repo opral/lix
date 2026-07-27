@@ -1,4 +1,5 @@
 use datafusion::arrow::datatypes::DataType;
+use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
 
@@ -27,6 +28,15 @@ use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 use super::SqlWriteResult;
 
 #[cfg(test)]
+static ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn take_entity_update_parameter_batch_executions() -> usize {
+    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
@@ -41,6 +51,125 @@ pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
 pub(crate) enum BoundPublicWriteExecution {
     Executed(SqlWriteResult),
     Unsupported,
+}
+
+/// Executes a certified run of independent point updates as one physical
+/// scan/stage operation.
+///
+/// `executeBatch` remains sequential at its public boundary. This route is
+/// narrower: every logical statement must target a distinct primary key in
+/// the same unconstrained entity surface, so evaluating them together is
+/// observationally equivalent to evaluating them one at a time.
+pub(crate) async fn try_execute_entity_update_parameter_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: &RecordBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    else {
+        return Ok(None);
+    };
+    if plan.bound.op != BoundWriteOp::Update
+        || !matches!(plan.bound.input, BoundWriteInput::None)
+        || plan.bound.conflict.is_some()
+        || plan.bound.returning.is_some()
+        || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+        || !matches!(plan.filters.rows, FilterSet::All)
+        || plan_references_active_branch_commit_id(plan)
+    {
+        return Ok(None);
+    }
+
+    let spec = entity_spec(ctx, schema_key)?;
+    if spec.has_inter_row_constraints
+        || plan.bound.assignments.iter().any(|assignment| {
+            spec.primary_key_paths
+                .iter()
+                .any(|path| path.as_slice() == [assignment.column.name.as_str()])
+        })
+    {
+        return Ok(None);
+    }
+    validate_bound_write_supported(plan, &spec)?;
+
+    let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
+    let mut entity_pks = Vec::with_capacity(parameter_batch.num_rows());
+    let mut unique_entity_pks = std::collections::BTreeSet::new();
+    for row_index in 0..parameter_batch.num_rows() {
+        let params = super::write::parameter_row(parameter_batch, row_index)
+            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+        let Some(mut row_entity_pks) =
+            bound_entity_pks_from_primary_key_predicate(&spec, &plan.bound.predicate, &params)
+        else {
+            return Ok(None);
+        };
+        if row_entity_pks.len() != 1 {
+            return Ok(None);
+        }
+        let entity_pk = row_entity_pks.pop().expect("one point-update identity");
+        if !unique_entity_pks.insert(entity_pk.clone()) {
+            // Repeated identities observe earlier staged writes and are not
+            // independent statements.
+            return Ok(None);
+        }
+        parameter_rows.push(params);
+        entity_pks.push(entity_pk);
+    }
+
+    let candidates =
+        scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.into_iter().collect())
+            .await?;
+    let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
+    for candidate in candidates {
+        candidates_by_pk
+            .entry(candidate.entity_pk.clone())
+            .or_default()
+            .push(candidate);
+    }
+
+    let mut affected_by_statement = Vec::with_capacity(parameter_rows.len());
+    let mut write_rows = Vec::with_capacity(parameter_rows.len());
+    for (row_index, (entity_pk, params)) in entity_pks.into_iter().zip(&parameter_rows).enumerate()
+    {
+        let mut affected = 0;
+        for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
+            if let Some(write_row) =
+                entity_update_row(ctx, plan, &spec, &candidate, params, None)
+                    .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
+            {
+                write_rows.push(write_row);
+                affected += 1;
+            }
+        }
+        affected_by_statement.push(affected);
+    }
+    stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
+    #[cfg(test)]
+    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(Some(
+        affected_by_statement
+            .into_iter()
+            .map(SqlWriteResult::affected)
+            .collect(),
+    ))
+}
+
+fn with_parameter_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
+    let mut details = match error.details.take() {
+        Some(JsonValue::Object(details)) => details,
+        Some(details) => {
+            let mut wrapped = serde_json::Map::new();
+            wrapped.insert("cause".to_string(), details);
+            wrapped
+        }
+        None => serde_json::Map::new(),
+    };
+    details.insert(
+        "statementIndex".to_string(),
+        JsonValue::from(statement_index),
+    );
+    error.details = Some(JsonValue::Object(details));
+    error
 }
 
 pub(crate) async fn try_execute_bound_public_write(
@@ -826,69 +955,85 @@ async fn entity_update(
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
     let mut write_rows = Vec::new();
     for candidate in candidates {
-        let Some(snapshot) = candidate_snapshot(&candidate)? else {
-            continue;
-        };
-        let original_context = EntityEvalContext::live(&snapshot, &candidate, spec);
-        if !predicate_matches(
-            &plan.bound.predicate,
-            &original_context,
-            spec,
-            ctx,
-            params,
-            active_branch_commit_id,
-        )? {
-            continue;
+        if let Some(write_row) =
+            entity_update_row(ctx, plan, spec, &candidate, params, active_branch_commit_id)?
+        {
+            write_rows.push(write_row);
         }
-        reject_projected_global_write(plan, &candidate, "UPDATE")?;
-        let mut updated = snapshot.clone();
-        let mut visible_assignments = Vec::new();
-        for assignment in &plan.bound.assignments {
-            if let Some(column) = spec.visible_column(&assignment.column.name) {
-                reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
-                let value = eval_expr_value(
-                    &assignment.value,
-                    &original_context,
-                    ctx,
-                    params,
-                    active_branch_commit_id,
-                )?;
-                visible_assignments.push((
-                    column.name.clone(),
-                    entity_json_value(
-                        &assignment.value,
-                        value,
-                        column.column_type,
-                        &spec.schema_key,
-                        &column.name,
-                    )?,
-                ));
-            } else if assignment.column.name == "lixcol_metadata" {
-                // handled below from the assignment list
-            } else {
-                return Err(LixError::new(
-                    LixError::CODE_UNSUPPORTED_SQL,
-                    format!(
-                        "bound entity UPDATE does not support assignment to '{}'",
-                        assignment.column.name
-                    ),
-                ));
-            }
-        }
-        for (column_name, value) in visible_assignments {
-            updated[&column_name] = value;
-        }
-        write_rows.push(entity_replace_row_from_live(
-            ctx,
-            spec,
-            &candidate,
-            Some(updated),
-            plan.bound.assignments.as_slice(),
-            params,
-            active_branch_commit_id,
-        )?);
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
+}
+
+fn entity_update_row(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<Option<TransactionWriteRow>, LixError> {
+    let Some(snapshot) = candidate_snapshot(candidate)? else {
+        return Ok(None);
+    };
+    let original_context = EntityEvalContext::live(&snapshot, candidate, spec);
+    if !predicate_matches(
+        &plan.bound.predicate,
+        &original_context,
+        spec,
+        ctx,
+        params,
+        active_branch_commit_id,
+    )? {
+        return Ok(None);
+    }
+    reject_projected_global_write(plan, candidate, "UPDATE")?;
+    let mut updated = snapshot.clone();
+    let mut visible_assignments = Vec::new();
+    for assignment in &plan.bound.assignments {
+        if let Some(column) = spec.visible_column(&assignment.column.name) {
+            reject_direct_blob_json_value(&assignment.value, column.column_type, params)?;
+            let value = eval_expr_value(
+                &assignment.value,
+                &original_context,
+                ctx,
+                params,
+                active_branch_commit_id,
+            )?;
+            visible_assignments.push((
+                column.name.clone(),
+                entity_json_value(
+                    &assignment.value,
+                    value,
+                    column.column_type,
+                    &spec.schema_key,
+                    &column.name,
+                )?,
+            ));
+        } else if assignment.column.name == "lixcol_metadata" {
+            // handled below from the assignment list
+        } else {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                format!(
+                    "bound entity UPDATE does not support assignment to '{}'",
+                    assignment.column.name
+                ),
+            ));
+        }
+    }
+    for (column_name, value) in visible_assignments {
+        updated[&column_name] = value;
+    }
+    entity_replace_row_from_live(
+        ctx,
+        spec,
+        candidate,
+        Some(updated),
+        plan.bound.assignments.as_slice(),
+        params,
+        active_branch_commit_id,
+    )
+    .map(Some)
 }
 
 async fn entity_delete(
@@ -1324,6 +1469,25 @@ async fn scan_entity_candidates(
         request.filter.entity_pks = entity_pks;
     }
     ctx.scan_live_state(&request).await
+}
+
+async fn scan_entity_candidates_for_pks(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    entity_pks: Vec<EntityPk>,
+) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+    ctx.scan_live_state(&LiveStateScanRequest {
+        filter: LiveStateFilter {
+            schema_keys: vec![spec.schema_key.clone()],
+            entity_pks,
+            branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
+            include_tombstones: false,
+            ..LiveStateFilter::default()
+        },
+        ..LiveStateScanRequest::default()
+    })
+    .await
 }
 
 fn bound_entity_pks_from_primary_key_predicate(

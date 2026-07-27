@@ -1348,6 +1348,21 @@ where
         self.with_write_transaction(move |transaction| {
             Box::pin(async move {
                 transaction.set_retain_plugin_actor_publications(retain_plugin_actor_publications);
+                if let Some(results) = try_execute_transaction_parameter_batch(
+                    transaction,
+                    &statements,
+                    &parsed,
+                    &options,
+                    &statement_metadata,
+                )
+                .await?
+                {
+                    if let Some(idempotency) = &idempotency {
+                        let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
+                        transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+                    }
+                    return Ok(results);
+                }
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, ((statement, parsed), metadata)) in statements
                     .iter()
@@ -2166,6 +2181,61 @@ where
         )
         .await
     }
+}
+
+async fn try_execute_transaction_parameter_batch<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    statements: &[ExecuteBatchStatement],
+    parsed: &[DataFusionStatement],
+    options: &ExecuteOptions,
+    statement_metadata: &[ExecuteStatementMetadata],
+) -> Result<Option<Vec<ExecuteResult>>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let Some(first_statement) = statements.first() else {
+        return Ok(None);
+    };
+    if statements.len() < 2
+        || parsed.len() != statements.len()
+        || statement_metadata.len() != statements.len()
+        || statements
+            .iter()
+            .any(|statement| statement.sql != first_statement.sql)
+        || statement_metadata
+            .iter()
+            .any(|metadata| metadata != &ExecuteStatementMetadata::default())
+        || sql2::bind_statement_route(&parsed[0])? != sql2::BoundStatementRoute::Write
+    {
+        return Ok(None);
+    }
+
+    let parameter_rows = statements
+        .iter()
+        .map(|statement| statement.params.as_slice())
+        .collect::<Vec<_>>();
+    let Some(parameter_batch) = sql2::parameter_record_batch(&parameter_rows)? else {
+        return Ok(None);
+    };
+
+    let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
+    let execution = async {
+        let plan = transaction.prepare_sql_write_logical_plan(&first_statement.sql, &parsed[0])?;
+        sql2::execute_write_logical_plan_parameter_batch(transaction, plan, &parameter_batch).await
+    }
+    .await;
+    transaction.replace_origin_key(previous_origin_key);
+
+    execution
+        .map(|results| {
+            results.map(|results| {
+                results
+                    .into_iter()
+                    .map(ExecuteResult::from_sql_write_result)
+                    .collect()
+            })
+        })
+        .map_err(|error| normalize_sql_surface_error(error, &first_statement.sql))
 }
 
 async fn execute_transaction_write_auto<StorageImpl>(
@@ -3367,6 +3437,264 @@ mod tests {
 
         assert_eq!(results[0].rows()[0].get::<i64>("value").unwrap(), 11);
         assert_eq!(results[1].rows()[0].get::<i64>("value").unwrap(), 22);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameter_batch_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let sql = "UPDATE parameter_batch_probe SET value = $1 WHERE id = $2";
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-a".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-b".to_string()),
+                        Value::Text("b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let rows = session
+            .execute(
+                "SELECT id, value FROM parameter_batch_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "new-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "new-b");
+    }
+
+    #[tokio::test]
+    async fn execute_batch_keeps_repeated_entity_identity_sequential() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_repeat_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameter_batch_repeat_probe (id, value) VALUES ('a', 'old')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let sql = "UPDATE parameter_batch_repeat_probe SET value = $1 WHERE id = $2";
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("first".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("second".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        let row = session
+            .execute(
+                "SELECT value FROM parameter_batch_repeat_probe WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.rows()[0].get::<String>("value").unwrap(), "second");
+    }
+
+    #[tokio::test]
+    async fn execute_batch_keeps_inter_row_constraints_on_sequential_execution() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_constraint_probe",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/value"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameter_batch_constraint_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let sql = "UPDATE parameter_batch_constraint_probe SET value = $1 WHERE id = $2";
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-a".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("new-b".to_string()),
+                        Value::Text("b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+    }
+
+    #[tokio::test]
+    async fn execute_batch_parameter_batch_preserves_failing_statement_index() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_batch_error_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO parameter_batch_error_probe (id, value) VALUES \
+                 ('a', 'old-a'), ('b', 'old-b')",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_entity_update_parameter_batch_executions();
+        let sql = "UPDATE parameter_batch_error_probe SET value = lix_json($1) WHERE id = $2";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("\"new-a\"".to_string()),
+                        Value::Text("a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("not-json".to_string()),
+                        Value::Text("b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the second statement has invalid JSON");
+
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        assert_eq!(sql2::take_entity_update_parameter_batch_executions(), 0);
+        let rows = session
+            .execute(
+                "SELECT id, value FROM parameter_batch_error_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "old-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "old-b");
     }
 
     #[tokio::test]
