@@ -186,7 +186,7 @@ pub(crate) enum DomainFileScope {
     Exact(Option<String>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct DomainRowIdentity {
     domain: Domain,
     schema_key: String,
