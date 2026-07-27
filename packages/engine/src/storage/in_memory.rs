@@ -6,7 +6,7 @@ use bytes::Bytes;
 
 use crate::storage::conformance::{StorageFactory, StorageFixture, StorageTestConfig};
 use crate::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
     WriteOptions, WriteStats,
@@ -329,16 +329,16 @@ impl Storage for Memory {
 impl StorageRead for MemoryRead {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
-        let values = keys
+        let values = requests
             .iter()
-            .map(|key| {
-                self.entries
-                    .get(&physical_key(space, key))
-                    .map(|value| project_value(value, opts.projection))
+            .flat_map(|request| {
+                request.keys.iter().map(|key| {
+                    self.entries
+                        .get(&physical_key(request.space, key))
+                        .map(|value| project_value(value, request.opts.projection))
+                })
             })
             .collect();
         Ok(GetManyResult::new(values))
@@ -739,9 +739,9 @@ mod tests {
 
     use crate::storage::conformance::{ConformanceStatus, run_storage_conformance};
     use crate::storage::{
-        GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory, ProjectedValue, PutBatch, PutEntry,
-        ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
-        StoredValue, WriteOptions,
+        GetManyRequest, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS, Memory, ProjectedValue,
+        PutBatch, PutEntry, ReadOptions, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
+        StorageWrite, StoredValue, WriteOptions,
     };
 
     #[tokio::test]
@@ -881,7 +881,11 @@ mod tests {
             .await
             .expect("begin restored read");
         let values = read
-            .get_many(space, &[key_a, key_b], GetOptions::default())
+            .get_many(&[GetManyRequest {
+                space,
+                keys: &[key_a, key_b],
+                opts: GetOptions::default(),
+            }])
             .await
             .expect("read restored rows");
         assert_eq!(

@@ -36,8 +36,8 @@ use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection,
-    StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions,
-    StorageScanOptions, StorageSpace, StorageWriteSet,
+    StorageGetManyRequest, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
+    StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -107,6 +107,11 @@ pub(crate) trait ChangelogStorageRead {
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError>;
 
+    async fn changelog_get_many_batch(
+        &mut self,
+        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError>;
+
     async fn changelog_scan(
         &mut self,
         space: StorageSpace,
@@ -128,6 +133,13 @@ where
         keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
         native_get_many(self, space, keys).await
+    }
+
+    async fn changelog_get_many_batch(
+        &mut self,
+        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError> {
+        native_get_many_batch(self, requests).await
     }
 
     async fn changelog_scan(
@@ -154,6 +166,14 @@ where
     ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
         let mut read = self.begin_read(StorageReadOptions::default()).await?;
         native_get_many(&mut read, space, keys).await
+    }
+
+    async fn changelog_get_many_batch(
+        &mut self,
+        requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+    ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError> {
+        let mut read = self.begin_read(StorageReadOptions::default()).await?;
+        native_get_many_batch(&mut read, requests).await
     }
 
     async fn changelog_scan(
@@ -580,11 +600,8 @@ where
             )));
         }
 
-        self.reject_existing_commits(&append_commit_ids).await?;
-        self.reject_existing_changes(append_changes.keys().copied())
-            .await?;
         let stage_commit_change_id_index_format = self
-            .reject_commit_change_id_collisions(append, &append_changes)
+            .reject_existing_id_collisions(append, &append_commit_ids, &append_changes)
             .await?;
         self.validate_parent_commits(append, &append_commit_ids)
             .await?;
@@ -615,29 +632,84 @@ where
         Ok(stage_commit_change_id_index_format)
     }
 
-    async fn reject_commit_change_id_collisions(
+    async fn reject_existing_id_collisions(
         &mut self,
         append: &ChangelogAppend,
+        append_commit_ids: &HashSet<CommitId>,
         append_changes: &HashMap<ChangeId, &ChangeRecord>,
     ) -> Result<bool, LixError> {
-        if append.commits.is_empty() {
-            return Ok(false);
-        }
+        let commit_ids = append_commit_ids.iter().copied().collect::<Vec<_>>();
+        let commit_keys = commit_ids
+            .iter()
+            .map(|commit_id| commit_key(*commit_id))
+            .collect::<Vec<_>>();
         let commit_change_ids = append
             .commits
             .iter()
             .map(|commit| commit.change_id)
             .collect::<Vec<_>>();
-        let change_keys = commit_change_ids
+        let append_change_ids = append_changes.keys().copied().collect::<Vec<_>>();
+        let change_keys = append_change_ids
             .iter()
+            .chain(&commit_change_ids)
             .map(|change_id| change_key(*change_id))
             .collect::<Vec<_>>();
-        let existing_changes = get_many(self.store, CHANGE_SPACE, change_keys).await?;
+        let index_format_key = commit_change_id_index_format_key();
+        let index_format_is_staged = self
+            .writes
+            .contains_put(COMMIT_CHANGE_ID_SPACE, &index_format_key);
+        let mut index_keys = Vec::with_capacity(commit_change_ids.len() + 1);
+        index_keys.push(index_format_key);
+        index_keys.extend(
+            commit_change_ids
+                .iter()
+                .map(|change_id| commit_change_id_key(*change_id)),
+        );
+        let mut batches = self
+            .store
+            .changelog_get_many_batch(vec![
+                (COMMIT_SPACE, commit_keys),
+                (CHANGE_SPACE, change_keys),
+                (COMMIT_CHANGE_ID_SPACE, index_keys),
+            ])
+            .await?
+            .into_iter();
+        let existing_commits = batches
+            .next()
+            .expect("commit validation batch was requested");
+        let existing_changes = batches
+            .next()
+            .expect("change validation batch was requested");
+        let mut index_values = batches
+            .next()
+            .expect("commit change-id validation batch was requested")
+            .into_iter();
+        let unexpected_batch = batches.next();
+        debug_assert!(unexpected_batch.is_none());
+        for (commit_id, found) in commit_ids.iter().zip(existing_commits) {
+            if found.is_some() || self.staged_commits.contains_key(commit_id) {
+                return Err(LixError::unknown(format!(
+                    "changelog commit '{commit_id}' already exists"
+                )));
+            }
+        }
+        let (existing_append_changes, existing_commit_changes) =
+            existing_changes.split_at(append_change_ids.len());
+        for (change_id, found) in append_change_ids.iter().zip(existing_append_changes) {
+            if found.is_some() || self.staged_changes.contains_key(change_id) {
+                return Err(LixError::unknown(format!(
+                    "changelog change '{change_id}' already exists"
+                )));
+            }
+        }
+        if append.commits.is_empty() {
+            return Ok(false);
+        }
         for ((commit, change_id), existing_change) in append
             .commits
             .iter()
             .zip(commit_change_ids.iter())
-            .zip(existing_changes)
+            .zip(existing_commit_changes)
         {
             if append_changes.contains_key(change_id)
                 || existing_change.is_some()
@@ -653,20 +725,6 @@ where
                 )));
             }
         }
-        let index_format_key = commit_change_id_index_format_key();
-        let index_format_is_staged = self
-            .writes
-            .contains_put(COMMIT_CHANGE_ID_SPACE, &index_format_key);
-        let mut index_keys = Vec::with_capacity(commit_change_ids.len() + 1);
-        index_keys.push(index_format_key);
-        index_keys.extend(
-            commit_change_ids
-                .iter()
-                .map(|change_id| commit_change_id_key(*change_id)),
-        );
-        let mut index_values = get_many(self.store, COMMIT_CHANGE_ID_SPACE, index_keys)
-            .await?
-            .into_iter();
         let stored_format = index_values
             .next()
             .expect("commit change-id index format key was requested");
@@ -705,49 +763,6 @@ where
             }
         }
         Ok(stage_commit_change_id_index_format)
-    }
-
-    async fn reject_existing_commits(
-        &mut self,
-        commit_ids: &HashSet<CommitId>,
-    ) -> Result<(), LixError> {
-        let keys = commit_ids
-            .iter()
-            .map(|id| commit_key(*id))
-            .collect::<Vec<_>>();
-        for (commit_id, found) in commit_ids
-            .iter()
-            .zip(get_many(self.store, COMMIT_SPACE, keys).await?)
-        {
-            if found.is_some() || self.staged_commits.contains_key(commit_id) {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{commit_id}' already exists"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    async fn reject_existing_changes(
-        &mut self,
-        change_ids: impl IntoIterator<Item = ChangeId>,
-    ) -> Result<(), LixError> {
-        let change_ids = change_ids.into_iter().collect::<Vec<_>>();
-        let keys = change_ids
-            .iter()
-            .map(|id| change_key(*id))
-            .collect::<Vec<_>>();
-        for (change_id, found) in change_ids
-            .iter()
-            .zip(get_many(self.store, CHANGE_SPACE, keys).await?)
-        {
-            if found.is_some() || self.staged_changes.contains_key(change_id) {
-                return Err(LixError::unknown(format!(
-                    "changelog change '{change_id}' already exists"
-                )));
-            }
-        }
-        Ok(())
     }
 
     async fn validate_parent_commits(
@@ -1434,6 +1449,49 @@ where
         .collect())
 }
 
+async fn native_get_many_batch<R>(
+    read: &mut R,
+    requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError>
+where
+    R: StorageAdapterRead + ?Sized,
+{
+    let owned_requests = requests
+        .into_iter()
+        .map(|(space, keys)| {
+            (
+                space.id,
+                keys.into_iter()
+                    .map(|key| StorageKey(Bytes::from(key)))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let requests = owned_requests
+        .iter()
+        .map(|(space, keys)| StorageGetManyRequest {
+            space: *space,
+            keys,
+            opts: StorageGetOptions::default(),
+        })
+        .collect::<Vec<_>>();
+    let mut values = read.get_many(&requests).await?.values.into_iter();
+    Ok(requests
+        .iter()
+        .map(|request| {
+            values
+                .by_ref()
+                .take(request.keys.len())
+                .map(|value| match value {
+                    Some(StorageProjectedValue::FullValue(bytes)) => Some(bytes.to_vec()),
+                    Some(StorageProjectedValue::KeyOnly) => Some(Vec::new()),
+                    None => None,
+                })
+                .collect()
+        })
+        .collect())
+}
+
 async fn native_scan<R>(
     read: &mut R,
     space: StorageSpace,
@@ -1565,6 +1623,13 @@ mod tests {
             keys: Vec<Vec<u8>>,
         ) -> Result<Vec<Option<Vec<u8>>>, LixError> {
             self.inner.changelog_get_many(space, keys).await
+        }
+
+        async fn changelog_get_many_batch(
+            &mut self,
+            requests: Vec<(StorageSpace, Vec<Vec<u8>>)>,
+        ) -> Result<Vec<Vec<Option<Vec<u8>>>>, LixError> {
+            self.inner.changelog_get_many_batch(requests).await
         }
 
         async fn changelog_scan(

@@ -5,9 +5,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::{
-    Engine, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
-    ObserveEvent, ReadOptions, ScanChunk, ScanOptions, SessionContext, SpaceId, Storage,
-    StorageError, StorageRead, Value, WriteOptions,
+    Engine, GetManyRequest, GetManyResult, KeyRange, Memory, MemoryRead, MemoryWrite, ObserveEvent,
+    ReadOptions, ScanChunk, ScanOptions, SessionContext, SpaceId, Storage, StorageError,
+    StorageRead, Value, WriteOptions,
 };
 use serde_json::json;
 use support::simulation_test::engine::{SimSession, Simulation};
@@ -995,12 +995,12 @@ impl Storage for CountingReadStorage {
 impl StorageRead for CountingRead {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
-        self.count_user_read(space);
-        self.inner.get_many(space, keys, opts).await
+        for request in requests {
+            self.count_user_read(request.space);
+        }
+        self.inner.get_many(requests).await
     }
 
     async fn scan(

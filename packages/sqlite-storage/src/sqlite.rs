@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, PutEntry, ReadDurability, ReadEntry,
     ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
     WriteOptions, WriteStats,
@@ -315,12 +315,11 @@ fn precondition_range_is_empty(
 impl StorageRead for SQLiteRead {
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
-            if keys.is_empty() {
+            let key_count = requests.iter().map(|request| request.keys.len()).sum();
+            if key_count == 0 {
                 return Ok(GetManyResult::new(Vec::new()));
             }
             let conn = self.conn.lock().map_err(|error| {
@@ -329,19 +328,23 @@ impl StorageRead for SQLiteRead {
             let conn = conn
                 .as_ref()
                 .ok_or_else(|| StorageError::Io("sqlite read is closed".to_string()))?;
-            let mut values = vec![None; keys.len()];
-            if !space_table_exists(conn, space)? {
-                return Ok(GetManyResult::new(values));
-            }
-            for (chunk_index, chunk) in keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
-                read_points_chunk(
-                    conn,
-                    space,
-                    chunk_index * POINT_READ_CHUNK_KEYS,
-                    chunk,
-                    opts.projection,
-                    &mut values,
-                )?;
+            let mut values = Vec::with_capacity(key_count);
+            for request in requests {
+                let offset = values.len();
+                values.resize(offset + request.keys.len(), None);
+                if !space_table_exists(conn, request.space)? {
+                    continue;
+                }
+                for (chunk_index, chunk) in request.keys.chunks(POINT_READ_CHUNK_KEYS).enumerate() {
+                    read_points_chunk(
+                        conn,
+                        request.space,
+                        offset + chunk_index * POINT_READ_CHUNK_KEYS,
+                        chunk,
+                        request.opts.projection,
+                        &mut values,
+                    )?;
+                }
             }
             Ok(GetManyResult::new(values))
         }

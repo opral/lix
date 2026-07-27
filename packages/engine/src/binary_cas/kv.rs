@@ -1294,19 +1294,19 @@ mod tests {
     {
         async fn get_many(
             &self,
-            space: StorageSpaceId,
-            keys: &[StorageKey],
-            opts: StorageGetOptions,
+            requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, StorageError> {
-            if space == BINARY_CAS_CHUNK_SPACE.id {
-                self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
-                self.chunk_keys_requested
-                    .fetch_add(keys.len(), Ordering::Relaxed);
+            for request in requests {
+                if request.space == BINARY_CAS_CHUNK_SPACE.id {
+                    self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
+                    self.chunk_keys_requested
+                        .fetch_add(request.keys.len(), Ordering::Relaxed);
+                }
+                if request.space == BINARY_CAS_CHUNK_PRESENCE_SPACE.id {
+                    self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            if space == BINARY_CAS_CHUNK_PRESENCE_SPACE.id {
-                self.presence_get_many_calls.fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.get_many(space, keys, opts).await
+            self.inner.get_many(requests).await
         }
 
         async fn scan(

@@ -66,10 +66,18 @@ pub struct ScanChunk {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GetManyResult {
-    /// One slot per key passed to `get_many`, in caller order.
+    /// One slot per key passed to `get_many`, flattened in request order and
+    /// then key order within each request.
     ///
     /// Duplicates are preserved. `None` means the requested key was missing.
     pub values: Vec<Option<ProjectedValue>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GetManyRequest<'a> {
+    pub space: SpaceId,
+    pub keys: &'a [Key],
+    pub opts: GetOptions,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

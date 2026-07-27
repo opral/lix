@@ -460,8 +460,7 @@ mod tests {
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
     };
     use crate::storage::{
-        GetManyResult, GetOptions, Key, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError,
-        StorageRead,
+        GetManyResult, KeyRange, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
@@ -477,14 +476,15 @@ mod tests {
     impl StorageRead for CountingMemoryRead {
         async fn get_many(
             &self,
-            space: SpaceId,
-            keys: &[Key],
-            opts: GetOptions,
+            requests: &[crate::storage::GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
-            if space == crate::changelog::CHANGE_SPACE.id {
+            if requests
+                .iter()
+                .any(|request| request.space == crate::changelog::CHANGE_SPACE.id)
+            {
                 self.change_get_many_calls.fetch_add(1, Ordering::Relaxed);
             }
-            self.inner.get_many(space, keys, opts).await
+            self.inner.get_many(requests).await
         }
 
         async fn scan(

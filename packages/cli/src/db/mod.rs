@@ -8,7 +8,7 @@ use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
 use lix_sdk::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Lix, LixError,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Lix, LixError,
     ProjectedValue, PutBatch, ReadEntry, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage,
     StorageError, StorageRead, StorageWrite, StoredValue, WriteOptions, WriteStats,
     open_lix_with_storage,
@@ -329,17 +329,18 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 impl StorageRead for FileStorageRead {
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
             Ok(GetManyResult::new(
-                keys.iter()
-                    .map(|key| {
-                        self.kv
-                            .get(physical_key(space, key).as_slice())
-                            .map(|value| project_value(value, opts.projection))
+                requests
+                    .iter()
+                    .flat_map(|request| {
+                        request.keys.iter().map(|key| {
+                            self.kv
+                                .get(physical_key(request.space, key).as_slice())
+                                .map(|value| project_value(value, request.opts.projection))
+                        })
                     })
                     .collect(),
             ))

@@ -4,7 +4,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use lix_engine::storage::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
+    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
     PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
     StorageWrite, WriteOptions,
 };
@@ -1283,12 +1283,12 @@ struct RecordingWrite {
 impl StorageRead for RecordingRead {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
-        self.fail_if_space_matches(space)?;
-        self.inner.get_many(space, keys, opts).await
+        for request in requests {
+            self.fail_if_space_matches(request.space)?;
+        }
+        self.inner.get_many(requests).await
     }
 
     async fn scan(

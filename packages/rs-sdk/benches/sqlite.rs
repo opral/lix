@@ -7,9 +7,9 @@ use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lix_engine::storage::PutEntry;
 use lix_sdk::{
-    CoreProjection, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue, PutBatch,
-    ReadOptions, SQLite, ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead,
-    StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange, ProjectedValue,
+    PutBatch, ReadOptions, SQLite, ScanChunk, ScanOptions, SpaceId, Storage, StorageError,
+    StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 use tempfile::TempDir;
 
@@ -334,13 +334,13 @@ fn bench_point_reads(c: &mut Criterion, fixture: &SQLiteFixture) {
             let read =
                 block_on(fixture.storage.begin_read(ReadOptions::default())).expect("begin read");
             let keys = black_box(existing_keys.as_slice());
-            let result = block_on(read.get_many(
-                BENCH_SPACE,
+            let result = block_on(read.get_many(&[GetManyRequest {
+                space: BENCH_SPACE,
                 keys,
-                GetOptions {
+                opts: GetOptions {
                     projection: CoreProjection::FullValue,
                 },
-            ))
+            }]))
             .expect("get keys");
             let count = CountingPointRead::observe(keys, &result);
             drop(read);
@@ -354,13 +354,13 @@ fn bench_point_reads(c: &mut Criterion, fixture: &SQLiteFixture) {
             let read =
                 block_on(fixture.storage.begin_read(ReadOptions::default())).expect("begin read");
             let keys = black_box(missing_keys.as_slice());
-            let result = block_on(read.get_many(
-                BENCH_SPACE,
+            let result = block_on(read.get_many(&[GetManyRequest {
+                space: BENCH_SPACE,
                 keys,
-                GetOptions {
+                opts: GetOptions {
                     projection: CoreProjection::KeyOnly,
                 },
-            ))
+            }]))
             .expect("get keys");
             let count = CountingPointRead::observe(keys, &result);
             drop(read);

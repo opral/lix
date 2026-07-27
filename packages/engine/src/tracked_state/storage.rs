@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::changelog::CommitId;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyResult,
-    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyRequest,
+    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
+    StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
+    StorageWriteSet,
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkWrite, decode_key,
@@ -848,28 +849,33 @@ where
 {
     async fn get_many(
         &self,
-        space: StorageSpaceId,
-        keys: &[StorageKey],
-        opts: StorageGetOptions,
+        requests: &[StorageGetManyRequest<'_>],
     ) -> Result<StorageGetManyResult, StorageError> {
-        let mut result = self.store.get_many(space, keys, opts).await?;
-        if result.values.len() != keys.len() {
+        let mut result = self.store.get_many(requests).await?;
+        let requested = requests
+            .iter()
+            .map(|request| request.keys.len())
+            .sum::<usize>();
+        if result.values.len() != requested {
             return Err(StorageError::Corruption(format!(
                 "tracked-state staged audit requested {} point reads but storage returned {} slots",
-                keys.len(),
+                requested,
                 result.values.len()
             )));
         }
-        for (key, slot) in keys.iter().zip(&mut result.values) {
-            let Some(bytes) = self.staged_bytes(space, key) else {
-                continue;
-            };
-            *slot = Some(match opts.projection {
-                StorageCoreProjection::KeyOnly => StorageProjectedValue::KeyOnly,
-                StorageCoreProjection::FullValue => {
-                    StorageProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
-                }
-            });
+        let mut slots = result.values.iter_mut();
+        for request in requests {
+            for (key, slot) in request.keys.iter().zip(slots.by_ref()) {
+                let Some(bytes) = self.staged_bytes(request.space, key) else {
+                    continue;
+                };
+                *slot = Some(match request.opts.projection {
+                    StorageCoreProjection::KeyOnly => StorageProjectedValue::KeyOnly,
+                    StorageCoreProjection::FullValue => {
+                        StorageProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
+                    }
+                });
+            }
         }
         Ok(result)
     }
