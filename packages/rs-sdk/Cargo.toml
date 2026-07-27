@@ -47,6 +47,9 @@ tokio = { version = "1", features = ["rt", "macros"] }
 wasm-encoder = "0.248"
 zip = { version = "8", default-features = false }
 
+[target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
+mimalloc.workspace = true
+
 [features]
 default = ["default_wasm_runtime"]
 checkpoint_backends = [

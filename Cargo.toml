@@ -34,6 +34,7 @@ lix_order_key = { path = "plugins/order-key", version = "0.8.4" }
 lix_plugin_api_v2 = { path = "packages/plugin-api", version = "0.8.4" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.8.4" }
 lix_server_protocol = { path = "packages/server-protocol", version = "0.8.4" }
+mimalloc = { version = "0.1.52", features = ["local_dynamic_tls"] }
 
 [workspace.lints.rust]
 missing_copy_implementations = "warn"

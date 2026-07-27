@@ -27,6 +27,9 @@ lix_sqlite_storage = { workspace = true, optional = true }
 object_store = { version = "0.14", default-features = false, optional = true }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc.workspace = true
+
 [dev-dependencies]
 ahash = "0.8"
 async-trait = "0.1"
