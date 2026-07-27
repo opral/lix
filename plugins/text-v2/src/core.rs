@@ -174,7 +174,15 @@ impl Document {
             });
         }
 
-        let document = Self::from_lines(lines)?;
+        // The splice result and each constructed line were validated above.
+        // Reconciled order keys follow successor byte order, while reused and
+        // host-allocated IDs are already collision checked. Preserve that
+        // exact owned state instead of sorting, rendering, and validating the
+        // complete document a second time.
+        let document = Self(Arc::new(DocumentInner {
+            bytes: Arc::new(bytes),
+            lines,
+        }));
         let changes = self.changes_to(&document)?;
         Ok((document, changes))
     }
