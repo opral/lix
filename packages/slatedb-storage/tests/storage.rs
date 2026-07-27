@@ -188,7 +188,7 @@ async fn cached_slatedb_rebuilds_after_local_cache_is_deleted() {
 }
 
 #[tokio::test]
-async fn cached_slatedb_reports_write_failure_from_commit() {
+async fn cached_slatedb_reports_failed_flush_after_accepting_write() {
     let object_store = Arc::new(InMemory::new());
     let db_path = "cached-slatedb-write-failure";
     let cache_parent = tempfile::tempdir().expect("create SlateDB failure cache parent");
@@ -222,9 +222,14 @@ async fn cached_slatedb_reports_write_failure_from_commit() {
         .expect("open cached failure-test storage");
         fault_store.fail_writes.store(true, Ordering::Relaxed);
 
-        let error = write_one(&storage, space, rejected_key.clone(), b"not-persisted")
+        write_one(&storage, space, rejected_key.clone(), b"not-persisted")
             .await
-            .expect_err("remote write failure must fail the commit");
+            .expect("commit should accept the visible write");
+
+        let error = storage
+            .flush()
+            .await
+            .expect_err("remote write failure must fail the explicit flush");
         assert!(format!("{error}").contains("not supported"));
     }
 
@@ -242,7 +247,7 @@ async fn cached_slatedb_reports_write_failure_from_commit() {
     let result = read
         .get_many(space, &[durable_key, rejected_key], GetOptions::default())
         .await
-        .expect("read durable values after rejected write");
+        .expect("read durable values after failed write");
 
     assert_eq!(
         result.values,
@@ -254,7 +259,7 @@ async fn cached_slatedb_reports_write_failure_from_commit() {
 }
 
 #[tokio::test]
-async fn slatedb_commit_makes_visible_value_durable() {
+async fn slatedb_explicit_flush_makes_visible_commit_durable() {
     let object_store = Arc::new(InMemory::new());
     let counting_store = Arc::new(FaultStore::new(object_store));
     let storage = SlateDB::open_object_store_with_options(
@@ -272,12 +277,13 @@ async fn slatedb_commit_makes_visible_value_durable() {
         b"value",
     )
     .await
-    .expect("commit durable value");
+    .expect("publish visible value");
 
+    storage.flush().await.expect("flush visible value");
     assert_eq!(
         counting_store.write_count(),
         1,
-        "the durable commit should require one WAL write"
+        "the visible commit should require one WAL write"
     );
     storage
         .flush()

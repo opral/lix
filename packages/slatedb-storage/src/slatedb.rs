@@ -679,15 +679,16 @@ impl StorageWrite for SlateDBWrite {
                     db.write_with_options(
                         batch,
                         &SlateDBWriteOptions {
-                            await_durable: true,
+                            await_durable: false,
                             ..SlateDBWriteOptions::default()
                         },
                     )
                     .await
                     .map_err(slatedb_error)?;
-                    // The configured SlateDB write contract waits for WAL
-                    // durability, so a successful Lix commit is not merely
-                    // visible in the local write pipeline.
+                    // SlateDB owns WAL durability. Returning here makes the
+                    // commit visible immediately while its background flusher
+                    // batches this write with nearby commits. `flush()` is
+                    // the explicit remote-durability barrier.
                     Ok(CommitResult {
                         commit_id: None,
                         stats,
@@ -1756,7 +1757,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_waits_for_wal_durability_before_success() {
+    fn commit_is_visible_while_background_wal_flush_is_blocked() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let storage = SlateDB::open_object_store_with_options(
             "test-commit-visibility",
@@ -1768,39 +1769,40 @@ mod tests {
         let key = Key(Bytes::from_static(b"visible-before-durable"));
 
         let blocked_write = store.block_next_write();
-        let (commit_tx, commit_rx) = mpsc::channel();
-        let committer = std::thread::spawn(move || {
-            let mut write = block_on(storage.begin_write(WriteOptions::default()))
-                .expect("begin visibility write");
-            block_on(write.put_many(
-                space,
-                PutBatch {
-                    entries: vec![PutEntry {
-                        key,
-                        value: StoredValue {
-                            bytes: Bytes::from_static(b"value"),
-                        },
-                    }],
-                },
-            ))
-            .expect("stage visibility write");
-            commit_tx
-                .send(block_on(write.commit()))
-                .expect("send commit result");
-        });
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin visibility write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"value"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage visibility write");
+        block_on(write.commit()).expect("publish visibility value");
+
+        // The request has returned, but SlateDB's first background WAL upload
+        // is still in flight.
         blocked_write.wait_for_entries(1, "SlateDB WAL write");
+
+        let read = block_on(storage.begin_read(ReadOptions::default()))
+            .expect("begin visible in-memory read");
+        let values = block_on(read.get_many(space, &[key], GetOptions::default()))
+            .expect("read visible in-memory value")
+            .values;
         assert_eq!(
-            commit_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "commit must not acknowledge before SlateDB makes its WAL durable"
+            values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"value"
+            )))]
         );
 
         drop(blocked_write);
-        commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("commit should finish after WAL durability")
-            .expect("commit visibility value");
-        committer.join().expect("join visibility committer");
+        block_on(storage.flush()).expect("flush visible value");
     }
 
     #[test]
@@ -1842,6 +1844,11 @@ mod tests {
         });
 
         blocked_write.wait_for_entries(1, "SlateDB WAL write");
+        commit_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("commit should complete after local publication")
+            .expect("commit visible durable read row");
+        committer.join().expect("join durable read committer");
         let visible =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin visible read");
         assert_eq!(
@@ -1865,11 +1872,7 @@ mod tests {
         );
 
         drop(blocked_write);
-        commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("commit should complete after WAL durability")
-            .expect("commit durable read row");
-        committer.join().expect("join durable read committer");
+        block_on(storage.flush()).expect("flush published durable read row");
 
         let durable = block_on(storage.begin_read(ReadOptions {
             durability: ReadDurability::Durable,
@@ -1885,7 +1888,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_failure_is_not_advertised_as_a_definite_abort() {
+    fn explicit_flush_reports_background_durability_failure() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let storage = SlateDB::open_object_store_with_options(
             "test-failed-commit",
@@ -1897,42 +1900,93 @@ mod tests {
         let key = Key(Bytes::from_static(b"rejected"));
 
         let blocked_write = store.block_next_write();
-        let (commit_tx, commit_rx) = mpsc::channel();
-        let committer = std::thread::spawn(move || {
-            let mut write = block_on(storage.begin_write(WriteOptions::default()))
-                .expect("begin failed commit write");
-            block_on(write.put_many(
-                space,
-                PutBatch {
-                    entries: vec![PutEntry {
-                        key,
-                        value: StoredValue {
-                            bytes: Bytes::from_static(b"not-durable"),
-                        },
-                    }],
-                },
-            ))
-            .expect("stage failed commit write");
-            commit_tx
-                .send(block_on(write.commit()))
-                .expect("send commit result");
-        });
-        blocked_write.wait_for_entries(1, "failing SlateDB WAL write");
-        assert_eq!(
-            commit_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "commit must wait for the WAL upload result"
-        );
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin buffered write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key,
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"not-durable"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage buffered write");
+        block_on(write.commit()).expect("publish buffered write");
+
+        blocked_write.wait_for_entries(1, "failing background WAL write");
         store.fail_writes();
         drop(blocked_write);
-        let commit_error = commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("failed commit should finish after its WAL upload");
+        let flush_error = block_on(storage.flush()).expect_err("WAL flush must fail");
         assert!(
-            matches!(commit_error, Err(StorageError::CommitOutcomeUnknown(message)) if message.contains("injected write failure")),
-            "an attempted SlateDB commit failure must not claim that the write aborted"
+            matches!(flush_error, StorageError::Io(message) if message.contains("injected write failure")),
+            "flush should preserve the SlateDB write error"
         );
-        committer.join().expect("join failed committer");
+    }
+
+    #[test]
+    fn dropping_last_handle_waits_for_background_flush() {
+        let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
+        let db_path = "test-close-background-durability";
+        let space = SpaceId(8);
+        let key = Key(Bytes::from_static(b"background-commit"));
+        let value = Bytes::from_static(b"durable");
+        let storage = SlateDB::open_object_store_with_options(
+            db_path,
+            store.clone(),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open close-test storage");
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin close-test write");
+        block_on(write.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage close-test value");
+
+        let blocked_write = store.block_next_write();
+        block_on(write.commit()).expect("publish close-test value");
+        blocked_write.wait_for_entries(1, "background commit WAL write");
+
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            drop(storage);
+            let _ = closed_tx.send(());
+        });
+        assert!(
+            matches!(
+                closed_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "close must wait for the background WAL flush"
+        );
+        drop(blocked_write);
+        closed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("close should finish after WAL durability");
+        closer.join().expect("join close-test closer");
+
+        let reopened = SlateDB::open_object_store_with_options(
+            db_path,
+            store,
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("reopen close-test storage");
+        let read =
+            block_on(reopened.begin_read(ReadOptions::default())).expect("begin close-test read");
+        let result = block_on(read.get_many(space, &[key], GetOptions::default()))
+            .expect("read close-test value");
+        assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
     }
 
     #[test]
