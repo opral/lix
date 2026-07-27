@@ -2910,6 +2910,93 @@ mod tests {
         fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
     }
 
+    #[test]
+    fn rocksdb_replay_reconciles_duplicate_text_lines_across_commits() {
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        let output = fixture.join("replay.rocksdb");
+        let profile = fixture.join("profile.json");
+        fs::create_dir_all(repo.join("src")).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+
+        fs::write(repo.join("src/index.ts"), b"a\n").expect("root text fixture should write");
+        git_ok(&repo, &["add", "src/index.ts"]);
+        git_ok(&repo, &["commit", "-qm", "root text file"]);
+
+        fs::write(repo.join("src/index.ts"), b"a\na\n")
+            .expect("duplicate-line text fixture should write");
+        git_ok(&repo, &["add", "src/index.ts"]);
+        git_ok(&repo, &["commit", "-qm", "add duplicate line"]);
+
+        run(ExpGitReplayArgs {
+            repo_path: repo,
+            output_rocksdb_path: output.clone(),
+            branch: "main".to_string(),
+            from_commit: None,
+            num_commits: Some(2),
+            verify_state: true,
+            force: false,
+            profile_json: Some(profile.clone()),
+        })
+        .expect("duplicate-line text replay should complete");
+
+        let profile_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&profile).expect("replay profile should be written"))
+                .expect("replay profile should be valid JSON");
+        assert_eq!(
+            profile_json
+                .get("commits_replayed")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            profile_json
+                .get("commits_applied")
+                .and_then(serde_json::Value::as_u64),
+            Some(2)
+        );
+        let commits = profile_json
+            .get("commits")
+            .and_then(serde_json::Value::as_array)
+            .expect("profile commits should be an array");
+        assert_eq!(
+            commits[1]
+                .get("updates")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+
+        let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
+        let lix = db::block_on(open_lix_with_storage(storage))
+            .expect("replay Lix should reopen with installed plugin");
+        let file_rows = db::block_on(lix.execute(
+            "SELECT data FROM lix_file WHERE path = ?",
+            &[Value::Text("/src/index.ts".to_string())],
+        ))
+        .expect("replayed text file should query");
+        assert_eq!(file_rows.rows().len(), 1);
+        let rendered = value_to_optional_blob(
+            file_rows.rows()[0]
+                .get_index(0)
+                .expect("replayed text row should contain data"),
+            "replayed duplicate-line text data",
+        )
+        .expect("replayed text data should be a blob");
+        assert_eq!(rendered, Some(b"a\na\n".as_slice()));
+
+        let semantic_rows = db::block_on(lix.execute(
+            "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
+            &[Value::Text("/src/index.ts".to_string())],
+        ))
+        .expect("replayed Git-text rows should query");
+        assert_eq!(semantic_rows.rows().len(), 2);
+        db::block_on(lix.close()).expect("reopened Lix should close");
+
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
     fn git_path(bytes: &[u8]) -> GitPath {
         GitPath::from_diff_token(bytes).expect("test Git path should be valid")
     }

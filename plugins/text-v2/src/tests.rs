@@ -121,6 +121,28 @@ fn localized_line_edit_preserves_that_lines_id_and_leaves_unrelated_rows_untouch
 }
 
 #[test]
+fn adding_a_duplicate_line_allocates_a_new_identity() {
+    let (document, _) = open(b"a\n");
+    let before_ids = ids(&document);
+    let (after, changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: 2,
+                delete_len: 0,
+                insert: b"a\n".to_vec(),
+            }],
+            |ordinal| format!("new-{ordinal}"),
+        )
+        .expect("a duplicate successor line should reconcile");
+
+    assert_eq!(after.bytes(), b"a\na\n");
+    assert_eq!(ids(&after), [before_ids[0].clone(), "new-0".to_owned()]);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entity_pk, ["new-0"]);
+    assert!(changes[0].snapshot.is_some());
+}
+
+#[test]
 fn line_insertion_adds_one_row_without_rewriting_existing_line_entities() {
     let (document, _) = open(b"alpha\nomega\n");
     let before_ids = ids(&document);
