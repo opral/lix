@@ -269,20 +269,13 @@ where
                 bytes: None,
                 expected_hash: Some(self.stable_hash.clone()),
             },
-            Operation::DurableSingletonRead => PreparedOperation {
+            Operation::DurableSingletonRead
+            | Operation::VisibleHotBatchRead
+            | Operation::VisiblePreconditionBatch
+            | Operation::VisibleIdempotentPreconditionBatch => PreparedOperation {
                 bytes: None,
                 expected_hash: None,
             },
-            Operation::VisibleHotBatchRead => PreparedOperation {
-                bytes: None,
-                expected_hash: None,
-            },
-            Operation::VisiblePreconditionBatch | Operation::VisibleIdempotentPreconditionBatch => {
-                PreparedOperation {
-                    bytes: None,
-                    expected_hash: None,
-                }
-            }
         }
     }
 
