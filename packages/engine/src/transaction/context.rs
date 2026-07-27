@@ -302,6 +302,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     origin_key: Option<String>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
     session_file_views: SessionFileViews,
+    retain_plugin_actor_publications: bool,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -552,6 +553,7 @@ where
                 origin_key: None,
                 idempotency_receipt: None,
                 session_file_views,
+                retain_plugin_actor_publications: true,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
                 plugin_generation_read_guard: None,
@@ -782,6 +784,14 @@ where
 
     pub(crate) fn trust_serialized_filesystem_planner(&mut self) {
         self.trust_filesystem_planner = true;
+    }
+
+    /// Bulk import only needs the durable rows produced by a plugin, not a
+    /// warm private Wasm document for every imported file. Retaining those
+    /// documents through one atomic commit can exceed the engine-wide actor
+    /// bound before the transaction is allowed to publish them.
+    pub(crate) fn set_retain_plugin_actor_publications(&mut self, retain: bool) {
+        self.retain_plugin_actor_publications = retain;
     }
 
     /// Rolls back the storage transaction.
@@ -3394,6 +3404,11 @@ where
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
+            let publication = if self.retain_plugin_actor_publications {
+                publication
+            } else {
+                publication.into_uncached().await
+            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -3692,6 +3707,11 @@ where
                     .prepared_semantic_rows
                     .insert(source, prepared)?;
             }
+            let publication = if self.retain_plugin_actor_publications {
+                publication
+            } else {
+                publication.into_uncached().await
+            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -5215,9 +5235,49 @@ enum PendingPluginActorPublication {
         semantic_root: Arc<str>,
         view: PendingPluginActorView,
     },
+    /// The plugin transition has already produced its durable rows, but bulk
+    /// ingestion deliberately does not keep its private Wasm Store alive.
+    /// Keeping this marker preserves the normal one-transition-per-file
+    /// validation and gives the session a non-authoritative file view after
+    /// commit, forcing a cold open before any later edit.
+    Uncached {
+        path: String,
+        view: PendingPluginActorView,
+    },
 }
 
 impl PendingPluginActorPublication {
+    async fn into_uncached(self) -> Self {
+        match self {
+            Self::Existing {
+                lease,
+                successor_key,
+                view,
+            } => {
+                let _ = lease.discard_successor().await;
+                Self::Uncached {
+                    path: successor_key.path,
+                    view,
+                }
+            }
+            Self::New {
+                mut store,
+                key,
+                document,
+                view,
+                ..
+            } => {
+                let _ = store.actor_mut().drop_document(document).await;
+                let _ = store.actor_mut().retire().await;
+                Self::Uncached {
+                    path: key.path,
+                    view,
+                }
+            }
+            publication @ Self::Uncached { .. } => publication,
+        }
+    }
+
     async fn discard(self) {
         match self {
             Self::Existing { lease, .. } => {
@@ -5231,6 +5291,7 @@ impl PendingPluginActorPublication {
                 let _ = store.actor_mut().drop_document(document).await;
                 let _ = store.actor_mut().retire().await;
             }
+            Self::Uncached { .. } => {}
         }
     }
 
@@ -5242,7 +5303,11 @@ impl PendingPluginActorPublication {
                 view,
             } => {
                 let path = successor_key.path.clone();
-                (lease.commit_successor_as(successor_key).await?, view, path)
+                (
+                    Some(lease.commit_successor_as(successor_key).await?),
+                    view,
+                    path,
+                )
             }
             Self::New {
                 cache,
@@ -5255,11 +5320,12 @@ impl PendingPluginActorPublication {
             } => {
                 let path = key.path.clone();
                 (
-                    cache.install(key, store, document, bytes, semantic_root),
+                    Some(cache.install(key, store, document, bytes, semantic_root)),
                     view,
                     path,
                 )
             }
+            Self::Uncached { path, view } => (None, view, path),
         };
         Ok((
             view.session_key,
@@ -5268,14 +5334,16 @@ impl PendingPluginActorPublication {
                 plugin_key: view.plugin_key,
                 plugin_generation: view.plugin_generation,
                 owner_change_id: view.owner_change_id,
-                observation: Some(observation),
+                observation,
             },
         ))
     }
 
     fn session_key(&self) -> &SessionFileViewKey {
         match self {
-            Self::Existing { view, .. } | Self::New { view, .. } => &view.session_key,
+            Self::Existing { view, .. } | Self::New { view, .. } | Self::Uncached { view, .. } => {
+                &view.session_key
+            }
         }
     }
 }

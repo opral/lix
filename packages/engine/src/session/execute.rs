@@ -1096,12 +1096,57 @@ where
         .await
     }
 
+    /// Executes one atomic import batch whose caller serializes every writer
+    /// that could transition the same plugin-owned files.
+    ///
+    /// Unlike ordinary execution, this deliberately retires each plugin actor
+    /// after its durable rows and materialization proof have been staged. It
+    /// bounds a one-shot import's private Wasm Stores independently of the
+    /// number of files in the batch. Do not use it for concurrent mutation
+    /// workloads: ordinary execution retains file actor leases through commit
+    /// to compose concurrent semantic transitions.
+    #[doc(hidden)]
+    pub async fn execute_batch_for_single_writer_ingest(
+        &self,
+        statements: &[ExecuteBatchStatement],
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.execute_batch_with_options_and_metadata_inner(
+            statements,
+            ExecuteOptions::default(),
+            vec![ExecuteStatementMetadata::default(); statements.len()],
+            None,
+            false,
+            false,
+        )
+        .await
+    }
+
     #[doc(hidden)]
     pub async fn execute_batch_with_options_and_metadata(
         &self,
         statements: &[ExecuteBatchStatement],
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
+    ) -> Result<Vec<ExecuteResult>, LixError> {
+        self.execute_batch_with_options_and_metadata_inner(
+            statements,
+            options,
+            statement_metadata,
+            None,
+            false,
+            true,
+        )
+        .await
+    }
+
+    async fn execute_batch_with_options_and_metadata_inner(
+        &self,
+        statements: &[ExecuteBatchStatement],
+        options: ExecuteOptions,
+        statement_metadata: Vec<ExecuteStatementMetadata>,
+        idempotency: Option<ExecuteIdempotency>,
+        require_idempotency_for_writes: bool,
+        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
@@ -1112,8 +1157,9 @@ where
             statements,
             options,
             statement_metadata,
-            None,
-            false,
+            idempotency,
+            require_idempotency_for_writes,
+            retain_plugin_actor_publications,
         );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
@@ -1136,26 +1182,15 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        let telemetry = start_batch(
-            self.telemetry.as_ref(),
-            TelemetrySpanKind::SqlBatch,
-            statements.len(),
-        );
-        let operation = self.execute_batch_with_options_inner(
+        self.execute_batch_with_options_and_metadata_inner(
             statements,
             options,
             statement_metadata,
             idempotency,
             true,
-        );
-        let result = match telemetry.as_ref() {
-            Some(telemetry) => telemetry.instrument(operation).await,
-            None => operation.await,
-        };
-        if let Some(telemetry) = telemetry {
-            finish_operation(telemetry, &result);
-        }
-        result
+            true,
+        )
+        .await
     }
 
     async fn execute_batch_with_options_inner(
@@ -1165,6 +1200,7 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
+        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
@@ -1221,6 +1257,7 @@ where
                             options,
                             statement_metadata,
                             None,
+                            retain_plugin_actor_publications,
                         )
                         .await;
                 }
@@ -1238,6 +1275,7 @@ where
                             options,
                             statement_metadata,
                             None,
+                            retain_plugin_actor_publications,
                         )
                         .await;
                 };
@@ -1253,6 +1291,7 @@ where
                         options,
                         statement_metadata,
                         Some(idempotency.clone()),
+                        retain_plugin_actor_publications,
                     )
                     .await;
                 match result {
@@ -1291,10 +1330,12 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
+        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
         self.with_write_transaction(move |transaction| {
             Box::pin(async move {
+                transaction.set_retain_plugin_actor_publications(retain_plugin_actor_publications);
                 let mut results = Vec::with_capacity(statements.len());
                 for (statement_index, ((statement, parsed), metadata)) in statements
                     .iter()
