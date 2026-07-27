@@ -6,7 +6,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +41,9 @@ use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
 
+#[cfg(not(unix))]
+use std::io::{Read, Seek, SeekFrom};
+
 const DB_PATH: &str = "db";
 const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
 const SPACE_PREFIX_LEN: usize = 4;
@@ -59,6 +61,9 @@ const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
 const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
 const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
+const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
+const LOCAL_SST_CONTENT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct SlateDBFactory {
@@ -105,6 +110,23 @@ pub struct SlateDBCacheOptions {
 #[derive(Debug)]
 struct DirectLocalReads {
     inner: LocalFileSystem,
+    files: Mutex<DirectLocalFileCache>,
+}
+
+#[derive(Debug, Default)]
+struct DirectLocalFileCache {
+    entries: HashMap<ObjectPath, DirectLocalFile>,
+    eviction_order: VecDeque<ObjectPath>,
+    content_bytes: usize,
+}
+
+#[derive(Clone, Debug)]
+struct DirectLocalFile {
+    file: Arc<std::fs::File>,
+    size: u64,
+    modified: SystemTime,
+    e_tag: String,
+    contents: Option<Bytes>,
 }
 
 impl fmt::Display for DirectLocalReads {
@@ -137,27 +159,13 @@ impl ObjectStore for DirectLocalReads {
         location: &ObjectPath,
         options: ObjectStoreGetOptions,
     ) -> object_store::Result<GetResult> {
-        let filesystem_path = self.inner.path_to_filesystem(location)?;
-        let mut file = std::fs::File::open(&filesystem_path)
-            .map_err(|source| direct_local_io_error(location, source))?;
-        let metadata = file
-            .metadata()
-            .map_err(|source| direct_local_io_error(location, source))?;
-        if metadata.is_dir() {
-            return Err(object_store::Error::NotFound {
-                path: location.to_string(),
-                source: "object is a directory".into(),
-            });
-        }
-        let size = metadata.len();
-        let modified = metadata
-            .modified()
-            .map_err(|source| direct_local_io_error(location, source))?;
+        let local_file = self.local_file(location)?;
+        let size = local_file.size;
         let meta = ObjectMeta {
             location: location.clone(),
-            last_modified: modified.into(),
+            last_modified: local_file.modified.into(),
             size,
-            e_tag: Some(direct_local_etag(&metadata, modified)),
+            e_tag: Some(local_file.e_tag.clone()),
             version: None,
         };
         options.check_preconditions(&meta)?;
@@ -172,9 +180,19 @@ impl ObjectStore for DirectLocalReads {
         };
         let bytes = if options.head || range.is_empty() {
             Bytes::new()
+        } else if let Some(contents) = &local_file.contents {
+            let start =
+                usize::try_from(range.start).map_err(|source| object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })?;
+            let end =
+                usize::try_from(range.end).map_err(|source| object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })?;
+            contents.slice(start..end)
         } else {
-            file.seek(SeekFrom::Start(range.start))
-                .map_err(|source| direct_local_io_error(location, source))?;
             let length = usize::try_from(range.end - range.start).map_err(|source| {
                 object_store::Error::Generic {
                     store: "LocalFileSystem",
@@ -182,7 +200,7 @@ impl ObjectStore for DirectLocalReads {
                 }
             })?;
             let mut bytes = vec![0; length];
-            file.read_exact(&mut bytes)
+            direct_local_read_exact_at(&local_file.file, &mut bytes, range.start)
                 .map_err(|source| direct_local_io_error(location, source))?;
             Bytes::from(bytes)
         };
@@ -226,6 +244,87 @@ impl ObjectStore for DirectLocalReads {
     }
 }
 
+impl DirectLocalReads {
+    fn local_file(&self, location: &ObjectPath) -> object_store::Result<DirectLocalFile> {
+        let cacheable = Path::new(location.as_ref())
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("sst"));
+        if cacheable
+            && let Some(file) = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entries
+                .get(location)
+                .cloned()
+        {
+            return Ok(file);
+        }
+
+        let filesystem_path = self.inner.path_to_filesystem(location)?;
+        let file = std::fs::File::open(&filesystem_path)
+            .map_err(|source| direct_local_io_error(location, source))?;
+        let metadata = file
+            .metadata()
+            .map_err(|source| direct_local_io_error(location, source))?;
+        if metadata.is_dir() {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "object is a directory".into(),
+            });
+        }
+        let modified = metadata
+            .modified()
+            .map_err(|source| direct_local_io_error(location, source))?;
+        let contents = if cacheable && metadata.len() <= LOCAL_SST_CONTENT_MAX_FILE_BYTES {
+            let length =
+                usize::try_from(metadata.len()).map_err(|source| object_store::Error::Generic {
+                    store: "LocalFileSystem",
+                    source: Box::new(source),
+                })?;
+            let mut bytes = vec![0; length];
+            direct_local_read_exact_at(&file, &mut bytes, 0)
+                .map_err(|source| direct_local_io_error(location, source))?;
+            Some(Bytes::from(bytes))
+        } else {
+            None
+        };
+        let file = DirectLocalFile {
+            file: Arc::new(file),
+            size: metadata.len(),
+            modified,
+            e_tag: direct_local_etag(&metadata, modified),
+            contents,
+        };
+        if cacheable {
+            let mut cache = self
+                .files
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(existing) = cache.entries.get(location) {
+                return Ok(existing.clone());
+            }
+            let content_bytes = file.contents.as_ref().map_or(0, Bytes::len);
+            while cache.entries.len() >= LOCAL_SST_FILE_CACHE_ENTRIES
+                || cache.content_bytes.saturating_add(content_bytes) > LOCAL_SST_CONTENT_CACHE_BYTES
+            {
+                let Some(evicted) = cache.eviction_order.pop_front() else {
+                    break;
+                };
+                if let Some(evicted) = cache.entries.remove(&evicted) {
+                    cache.content_bytes = cache
+                        .content_bytes
+                        .saturating_sub(evicted.contents.as_ref().map_or(0, Bytes::len));
+                }
+            }
+            cache.eviction_order.push_back(location.clone());
+            cache.content_bytes = cache.content_bytes.saturating_add(content_bytes);
+            cache.entries.insert(location.clone(), file.clone());
+        }
+        Ok(file)
+    }
+}
+
 fn direct_local_io_error(location: &ObjectPath, source: std::io::Error) -> object_store::Error {
     if source.kind() == std::io::ErrorKind::NotFound {
         object_store::Error::NotFound {
@@ -238,6 +337,27 @@ fn direct_local_io_error(location: &ObjectPath, source: std::io::Error) -> objec
             source: Box::new(source),
         }
     }
+}
+
+#[cfg(unix)]
+fn direct_local_read_exact_at(
+    file: &std::fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    file.read_exact_at(bytes, offset)
+}
+
+#[cfg(not(unix))]
+fn direct_local_read_exact_at(
+    file: &std::fs::File,
+    bytes: &mut [u8],
+    offset: u64,
+) -> std::io::Result<()> {
+    let mut file = file.try_clone()?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.read_exact(bytes)
 }
 
 fn direct_local_etag(metadata: &std::fs::Metadata, modified: SystemTime) -> String {
@@ -659,6 +779,7 @@ impl SlateDB {
         })?;
         let object_store: Arc<dyn ObjectStore> = Arc::new(DirectLocalReads {
             inner: LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?,
+            files: Mutex::new(DirectLocalFileCache::default()),
         });
         Self::open_object_store_with_read_dispatch(
             DB_PATH,
