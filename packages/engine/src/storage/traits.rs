@@ -53,6 +53,13 @@ pub trait Storage: Send + Sync {
 /// Read handles must release snapshots and other resources from `Drop`;
 /// callers are not required to run asynchronous cleanup when a scope ends.
 pub trait StorageRead: Send + Sync {
+    /// Stable identity for this immutable read view within one open storage
+    /// instance. Adapters may expose this to key process-local derived caches;
+    /// `None` disables such caching.
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        None
+    }
+
     /// Reads the requested keys of one space. The returned values have one
     /// slot per requested key, in caller order, and preserve duplicates.
     fn get_many(
