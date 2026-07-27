@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 lix_engine = { workspace = true }
 
+async-trait = "0.1"
 bytes = "1"
 blake3 = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -26,6 +27,3 @@ object_store = { version = "0.14", default-features = false, features = ["fs"] }
 slatedb = { version = "0.14.1", default-features = false, features = ["lz4", "moka"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
-
-[dev-dependencies]
-async-trait = "0.1"
