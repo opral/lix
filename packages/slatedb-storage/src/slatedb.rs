@@ -116,7 +116,7 @@ struct SnapshotPointCache {
 
 #[derive(Default)]
 struct SnapshotPointCacheState {
-    entries: HashMap<SnapshotPointCacheKey, SnapshotPointCacheValue>,
+    entries: HashMap<u64, HashMap<Key, SnapshotPointCacheValue>>,
     eviction_order: VecDeque<SnapshotPointCacheKey>,
     used_bytes: usize,
 }
@@ -142,16 +142,32 @@ impl SnapshotPointCache {
 
     /// `Some(None)` is a cached missing point; outer `None` is a cache miss.
     fn get(&self, sequence: u64, key: &Key) -> Option<Option<Bytes>> {
-        let cache_key = SnapshotPointCacheKey {
-            sequence,
-            key: key.clone(),
-        };
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .entries
-            .get(&cache_key)
+            .get(&sequence)
+            .and_then(|entries| entries.get(key))
             .map(|entry| entry.value.clone())
+    }
+
+    /// `Some(None)` is a cached missing point; outer `None` is a cache miss.
+    ///
+    /// A multi-key read does not mutate recency on hits, so inspect its whole
+    /// snapshot-key set under one lock instead of acquiring the cache mutex
+    /// once for every requested key.
+    fn get_many(&self, sequence: u64, keys: &[Key], values: &mut [Option<Option<Bytes>>]) {
+        debug_assert_eq!(keys.len(), values.len());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries = state.entries.get(&sequence);
+        for (key, value) in keys.iter().zip(values) {
+            *value = entries
+                .and_then(|entries| entries.get(key))
+                .map(|entry| entry.value.clone());
+        }
     }
 
     fn insert(&self, sequence: u64, key: Key, value: Option<Bytes>) {
@@ -162,8 +178,7 @@ impl SnapshotPointCache {
         if value_bytes > SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES {
             return;
         }
-        let cache_key = SnapshotPointCacheKey { sequence, key };
-        let weight = cache_key.key.0.len().saturating_add(value_bytes);
+        let weight = key.0.len().saturating_add(value_bytes);
         if weight > SNAPSHOT_POINT_CACHE_BYTES {
             return;
         }
@@ -172,24 +187,43 @@ impl SnapshotPointCache {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state.entries.contains_key(&cache_key) {
+        if state
+            .entries
+            .get(&sequence)
+            .is_some_and(|entries| entries.contains_key(&key))
+        {
             return;
         }
         while state.used_bytes.saturating_add(weight) > SNAPSHOT_POINT_CACHE_BYTES
-            || state.entries.len() >= SNAPSHOT_POINT_CACHE_ENTRIES
+            || state.eviction_order.len() >= SNAPSHOT_POINT_CACHE_ENTRIES
         {
             let Some(evicted_key) = state.eviction_order.pop_front() else {
                 break;
             };
-            if let Some(evicted) = state.entries.remove(&evicted_key) {
-                state.used_bytes = state.used_bytes.saturating_sub(evicted.weight);
+            let (evicted_weight, remove_sequence) = state
+                .entries
+                .get_mut(&evicted_key.sequence)
+                .map_or((None, false), |entries| {
+                    let evicted_weight = entries.remove(&evicted_key.key).map(|entry| entry.weight);
+                    (evicted_weight, entries.is_empty())
+                });
+            if let Some(weight) = evicted_weight {
+                state.used_bytes = state.used_bytes.saturating_sub(weight);
+            }
+            if remove_sequence {
+                state.entries.remove(&evicted_key.sequence);
             }
         }
         state.used_bytes = state.used_bytes.saturating_add(weight);
-        state.eviction_order.push_back(cache_key.clone());
+        state.eviction_order.push_back(SnapshotPointCacheKey {
+            sequence,
+            key: key.clone(),
+        });
         state
             .entries
-            .insert(cache_key, SnapshotPointCacheValue { value, weight });
+            .entry(sequence)
+            .or_default()
+            .insert(key, SnapshotPointCacheValue { value, weight });
     }
 }
 
@@ -491,10 +525,9 @@ impl StorageRead for SlateDBRead {
                 let cache = self.point_cache.clone();
                 let mut values = vec![None; physical_keys.len()];
                 let mut missing = Vec::new();
+                cache.get_many(sequence, &physical_keys, &mut values);
                 for (index, key) in physical_keys.iter().enumerate() {
-                    if let Some(value) = cache.get(sequence, key) {
-                        values[index] = Some(value);
-                    } else {
+                    if values[index].is_none() {
                         missing.push((index, key.clone()));
                     }
                 }
@@ -1853,6 +1886,58 @@ mod tests {
                 b"first"
             )))],
             "an old snapshot must not observe the value cached for a newer sequence"
+        );
+    }
+
+    #[test]
+    fn snapshot_point_cache_batch_preserves_hits_misses_and_duplicates() {
+        let cache = SnapshotPointCache::new();
+        let present = Key(Bytes::from_static(b"present"));
+        let missing = Key(Bytes::from_static(b"cached-missing"));
+        let unseen = Key(Bytes::from_static(b"unseen"));
+        let value = Bytes::from_static(b"value");
+        cache.insert(7, present.clone(), Some(value.clone()));
+        cache.insert(7, missing.clone(), None);
+
+        let keys = [present.clone(), missing.clone(), unseen, present.clone()];
+        let mut values = vec![None; keys.len()];
+        cache.get_many(7, &keys, &mut values);
+        assert_eq!(
+            values,
+            vec![
+                Some(Some(value.clone())),
+                Some(None),
+                None,
+                Some(Some(value))
+            ]
+        );
+        let keys = [present, missing];
+        let mut values = vec![None; keys.len()];
+        cache.get_many(8, &keys, &mut values);
+        assert_eq!(values, vec![None, None]);
+    }
+
+    #[test]
+    fn snapshot_point_cache_limits_entries_with_one_snapshot_bucket() {
+        let cache = SnapshotPointCache::new();
+        let first = Key(Bytes::from_static(b"cache-entry-0000"));
+        for index in 0..=SNAPSHOT_POINT_CACHE_ENTRIES {
+            cache.insert(
+                7,
+                Key(Bytes::from(format!("cache-entry-{index:04}"))),
+                Some(Bytes::from_static(b"value")),
+            );
+        }
+
+        assert_eq!(cache.get(7, &first), None);
+        assert_eq!(
+            cache.get(
+                7,
+                &Key(Bytes::from(format!(
+                    "cache-entry-{SNAPSHOT_POINT_CACHE_ENTRIES:04}"
+                )))
+            ),
+            Some(Some(Bytes::from_static(b"value")))
         );
     }
 
