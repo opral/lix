@@ -3,7 +3,7 @@
     reason = "explicit future signatures mirror Storage traits and keep Send guarantees visible"
 )]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -40,6 +40,9 @@ const SPACE_PREFIX_LEN: usize = 4;
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
 const POINT_READ_CONCURRENCY: usize = 64;
+const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
+const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
+const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
@@ -64,6 +67,7 @@ pub struct SlateDB {
     path: PathBuf,
     worker: SlateDBWorker,
     write_gate: WriteGate,
+    point_cache: SnapshotPointCache,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -84,6 +88,7 @@ pub struct SlateDBRead {
     worker: SlateDBWorker,
     snapshot: Arc<DbSnapshot>,
     durability: ReadDurability,
+    point_cache: SnapshotPointCache,
 }
 
 #[allow(missing_debug_implementations)]
@@ -93,6 +98,96 @@ pub struct SlateDBWrite {
     base: Option<Arc<DbSnapshot>>,
     overlay: BTreeMap<Key, Option<Bytes>>,
     stats: WriteStats,
+}
+
+/// Bounded values from immutable visible snapshots.
+///
+/// SlateDB's snapshot sequence is the last committed sequence it exposes, so
+/// the pair `(sequence, key)` identifies one point-read view even after newer
+/// writes become visible. Keeping values under that key lets independently
+/// opened reads reuse hot points without weakening snapshot isolation.
+#[derive(Clone)]
+struct SnapshotPointCache {
+    state: Arc<Mutex<SnapshotPointCacheState>>,
+}
+
+#[derive(Default)]
+struct SnapshotPointCacheState {
+    entries: HashMap<SnapshotPointCacheKey, SnapshotPointCacheValue>,
+    eviction_order: VecDeque<SnapshotPointCacheKey>,
+    used_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SnapshotPointCacheKey {
+    sequence: u64,
+    key: Key,
+}
+
+#[derive(Clone)]
+struct SnapshotPointCacheValue {
+    value: Option<Bytes>,
+    weight: usize,
+}
+
+impl SnapshotPointCache {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(SnapshotPointCacheState::default())),
+        }
+    }
+
+    /// `Some(None)` is a cached missing point; outer `None` is a cache miss.
+    fn get(&self, sequence: u64, key: &Key) -> Option<Option<Bytes>> {
+        let cache_key = SnapshotPointCacheKey {
+            sequence,
+            key: key.clone(),
+        };
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entries
+            .get(&cache_key)
+            .map(|entry| entry.value.clone())
+    }
+
+    fn insert(&self, sequence: u64, key: Key, value: Option<Bytes>) {
+        // SlateDB values can retain an entire backing block. Copy cacheable
+        // values so the cache's byte bound reflects the memory it owns.
+        let value = value.map(|value| Bytes::copy_from_slice(&value));
+        let value_bytes = value.as_ref().map_or(0, Bytes::len);
+        if value_bytes > SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES {
+            return;
+        }
+        let cache_key = SnapshotPointCacheKey { sequence, key };
+        let weight = cache_key.key.0.len().saturating_add(value_bytes);
+        if weight > SNAPSHOT_POINT_CACHE_BYTES {
+            return;
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.entries.contains_key(&cache_key) {
+            return;
+        }
+        while state.used_bytes.saturating_add(weight) > SNAPSHOT_POINT_CACHE_BYTES
+            || state.entries.len() >= SNAPSHOT_POINT_CACHE_ENTRIES
+        {
+            let Some(evicted_key) = state.eviction_order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = state.entries.remove(&evicted_key) {
+                state.used_bytes = state.used_bytes.saturating_sub(evicted.weight);
+            }
+        }
+        state.used_bytes = state.used_bytes.saturating_add(weight);
+        state.eviction_order.push_back(cache_key.clone());
+        state
+            .entries
+            .insert(cache_key, SnapshotPointCacheValue { value, weight });
+    }
 }
 
 impl Default for SlateDBFactory {
@@ -173,6 +268,7 @@ impl SlateDB {
             worker: SlateDBWorker::start(db_path.clone(), object_store, options)?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
+            point_cache: SnapshotPointCache::new(),
         })
     }
 
@@ -211,6 +307,7 @@ impl Storage for SlateDB {
                 worker: self.worker.clone(),
                 snapshot,
                 durability: opts.durability,
+                point_cache: self.point_cache.clone(),
             })
         }
     }
@@ -322,10 +419,55 @@ impl StorageRead for SlateDBRead {
                 .collect::<Result<Vec<_>, _>>()?;
             let snapshot = Arc::clone(&self.snapshot);
             let durability = self.durability;
-            let values = self
-                .worker
-                .call_read(move |_db| get_snapshot_values(snapshot, physical_keys, durability))
-                .await?;
+            let values = if durability == ReadDurability::Visible {
+                let sequence = snapshot.seq();
+                let cache = self.point_cache.clone();
+                let mut values = vec![None; physical_keys.len()];
+                let mut missing = Vec::new();
+                for (index, key) in physical_keys.iter().enumerate() {
+                    if let Some(value) = cache.get(sequence, key) {
+                        values[index] = Some(value);
+                    } else {
+                        missing.push((index, key.clone()));
+                    }
+                }
+
+                if missing.is_empty() {
+                    // A cached value must still obey SlateDB's terminal close
+                    // boundary. This has no object-store I/O, but makes the
+                    // hit linearize at the same closed-state check as a real
+                    // snapshot read.
+                    self.worker
+                        .call_read(|db| async move {
+                            db.snapshot().await.map(|_| ()).map_err(slatedb_error)
+                        })
+                        .await?;
+                } else {
+                    let missing_keys = missing
+                        .iter()
+                        .map(|(_, key)| key.clone())
+                        .collect::<Vec<_>>();
+                    let fetched = self
+                        .worker
+                        .call_read(move |_db| {
+                            get_snapshot_values(snapshot, missing_keys, durability)
+                        })
+                        .await?;
+                    for ((index, key), value) in missing.into_iter().zip(fetched) {
+                        cache.insert(sequence, key, value.clone());
+                        values[index] = Some(value);
+                    }
+                }
+
+                values
+                    .into_iter()
+                    .map(|value| value.expect("all SlateDB point-read cache misses are filled"))
+                    .collect()
+            } else {
+                self.worker
+                    .call_read(move |_db| get_snapshot_values(snapshot, physical_keys, durability))
+                    .await?
+            };
             Ok(GetManyResult::new(
                 values
                     .into_iter()
@@ -1442,6 +1584,93 @@ mod tests {
             block_on(read.get_many(space, &[key], GetOptions::default())).expect("read row");
 
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
+    }
+
+    #[test]
+    fn visible_point_cache_isolated_by_snapshot_sequence() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-snapshot-point-cache",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open snapshot cache storage");
+        let space = SpaceId(7);
+        let key = Key(Bytes::from_static(b"versioned-key"));
+
+        let mut initial =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin initial write");
+        block_on(initial.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"first"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage initial value");
+        block_on(initial.commit()).expect("commit initial value");
+
+        let before_update =
+            block_on(storage.begin_read(ReadOptions::default())).expect("begin old snapshot");
+        assert_eq!(
+            block_on(before_update.get_many(
+                space,
+                std::slice::from_ref(&key),
+                GetOptions::default()
+            ))
+            .expect("read old snapshot")
+            .values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"first"
+            )))]
+        );
+
+        let mut update =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin update write");
+        block_on(update.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: key.clone(),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"second"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage updated value");
+        block_on(update.commit()).expect("commit updated value");
+
+        let after_update =
+            block_on(storage.begin_read(ReadOptions::default())).expect("begin new snapshot");
+        assert_eq!(
+            block_on(after_update.get_many(
+                space,
+                std::slice::from_ref(&key),
+                GetOptions::default()
+            ))
+            .expect("read new snapshot")
+            .values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"second"
+            )))]
+        );
+        assert_eq!(
+            block_on(before_update.get_many(
+                space,
+                std::slice::from_ref(&key),
+                GetOptions::default()
+            ))
+            .expect("reread old snapshot")
+            .values,
+            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
+                b"first"
+            )))],
+            "an old snapshot must not observe the value cached for a newer sequence"
+        );
     }
 
     #[test]
