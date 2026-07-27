@@ -156,9 +156,27 @@ Treat `x-lix-key` like a package name: lowercase, stable, namespaced. Once data 
 
 ## Best practices
 
-### Don't store lifecycle timestamps
+### Keep Lix lifecycle and provenance out of entity schemas
 
-You don't need `created_at` or `updated_at` on app schemas. Lix already records lifecycle in [`lix_change`](./history.md). Add timestamp fields only when they're domain data, like `due_at` or `published_at`.
+Entity schemas describe domain state, not the mechanics of the Lix write that
+produced that state. Do not add `created_at`, `updated_at`, change or commit
+IDs, `origin_key`, or generic audit metadata solely to describe a Lix write.
+Those facts already belong to the change:
+
+- [`lix_change`](./history.md) records the change ID, timestamp, metadata, and
+  origin key for workspace-wide activity.
+- `<schema>_history` records branch-reachable revisions and exposes the source
+  change and commit provenance through `lixcol_change_*` and `lixcol_commit_*`
+  columns.
+- The current entity relation exposes `lixcol_created_at`,
+  `lixcol_updated_at`, `lixcol_change_id`, and `lixcol_commit_id` for its
+  current revision.
+
+Derive a lifecycle or audit view from those surfaces when you need one; do not
+make the entity carry a second, mutable copy of the same facts. Add timestamp
+or metadata fields only when they are domain data with independent meaning,
+such as `due_at`, `published_at`, `external_system_updated_at`, or a business
+event's own payload.
 
 ### Inspecting registered schemas
 
