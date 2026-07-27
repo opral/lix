@@ -12,7 +12,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
 
-use crate::LixError;
 use crate::branch::{BRANCH_DESCRIPTOR_SCHEMA_KEY, BRANCH_REF_SCHEMA_KEY};
 use crate::catalog::{
     CatalogSnapshot, ForeignKeyPlan, SchemaCatalogKey, SchemaPlan, StateDeleteReferencePlan,
@@ -45,6 +44,7 @@ use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidation
 use crate::transaction::types::{
     PreparedStateRow, TransactionWriteOperation, TransactionWriteOrigin,
 };
+use crate::{LixError, NullableKeyFilter};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -2056,6 +2056,7 @@ async fn validate_file_descriptor_delete_restrictions(
     input: &TransactionValidationInput<'_>,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let mut batches = BTreeMap::<Domain, BTreeMap<String, DomainRowIdentity>>::new();
     for tombstone in &pending_constraints.tombstones {
         if tombstone.identity.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY {
             continue;
@@ -2069,30 +2070,57 @@ async fn validate_file_descriptor_delete_restrictions(
             .domain()
             .file_scoped_row_domains_for_file_descriptor_delete()
         {
-            let rows = scan_committed_constraint_rows(
-                input.live_state,
-                &source_domain.with_exact_file_scope(Some(file_id.clone())),
-                Vec::new(),
-                Vec::new(),
-                false,
-            )
-            .await?;
+            batches
+                .entry(source_domain.with_file_scope(DomainFileScope::Any))
+                .or_default()
+                .insert(file_id.clone(), tombstone.identity.clone());
+        }
+    }
 
-            for row in rows {
-                if pending_constraints.tombstones_identity(&row) || row.snapshot_content.is_none() {
-                    continue;
-                }
-                return Err(LixError::new(
-                    LixError::CODE_FOREIGN_KEY,
-                    format!(
-                        "cannot delete file descriptor '{}' in branch '{}' because committed row '{}' in schema '{}' is still scoped to that file",
-                        file_id,
-                        tombstone.identity.domain().branch_id(),
-                        row.entity_pk.as_json_array_text()?,
-                        row.schema_key,
-                    ),
-                ));
+    for (source_domain, targets) in batches {
+        let file_ids = targets
+            .keys()
+            .cloned()
+            .map(NullableKeyFilter::Value)
+            .collect::<Vec<_>>();
+        let request = LiveStateScanRequest {
+            filter: LiveStateFilter {
+                branch_ids: vec![source_domain.branch_id().to_string()],
+                file_ids,
+                untracked: Some(source_domain.untracked()),
+                include_tombstones: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rows = if source_domain.untracked() {
+            input.live_state.scan_rows(&request).await?
+        } else {
+            input.live_state.scan_tracked_rows(&request).await?
+        };
+        for row in rows {
+            if !source_domain.contains(&row)
+                || pending_constraints.tombstones_identity(&row)
+                || row.snapshot_content.is_none()
+            {
+                continue;
             }
+            let Some(file_id) = row.file_id.as_ref() else {
+                continue;
+            };
+            let Some(descriptor) = targets.get(file_id) else {
+                continue;
+            };
+            return Err(LixError::new(
+                LixError::CODE_FOREIGN_KEY,
+                format!(
+                    "cannot delete file descriptor '{}' in branch '{}' because committed row '{}' in schema '{}' is still scoped to that file",
+                    file_id,
+                    descriptor.domain().branch_id(),
+                    row.entity_pk.as_json_array_text()?,
+                    row.schema_key,
+                ),
+            ));
         }
     }
     Ok(())
@@ -4589,6 +4617,43 @@ mod tests {
             .expect_err("tracked file descriptor delete must be blocked by untracked rows");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[tokio::test]
+    async fn file_descriptor_delete_validation_batches_files_by_visibility_domain() {
+        let mut file_a_delete = staged_file_descriptor_row("file-a", "branch-a");
+        file_a_delete.snapshot = None;
+        let mut file_b_delete = staged_file_descriptor_row("file-b", "branch-a");
+        file_b_delete.snapshot = None;
+        let staged_writes = PreparedWriteSet {
+            state_rows: vec![file_a_delete, file_b_delete],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&[
+            file_descriptor_schema(),
+            directory_descriptor_schema(),
+        ])
+        .expect("catalog should build");
+        let live_state = CountingStaticLiveStateReader {
+            rows: Vec::new(),
+            scan_count: AtomicUsize::new(0),
+        };
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            pending_constraints.remember_tombstone(row);
+        }
+
+        validate_file_descriptor_delete_restrictions(&input, &pending_constraints)
+            .await
+            .expect("unreferenced file descriptors should be deletable");
+
+        assert_eq!(
+            live_state.scan_count.load(Ordering::Relaxed),
+            2,
+            "tracked and untracked visibility each require one scan, independent of file count"
+        );
     }
 
     #[tokio::test]

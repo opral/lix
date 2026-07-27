@@ -109,9 +109,12 @@ impl Document {
             let Some(candidates) = exact.get_mut(bytes.as_slice()) else {
                 continue;
             };
-            let old_index = candidates
-                .pop_front()
-                .expect("a nonempty candidate queue was checked");
+            // A candidate entry remains in the map after its queue is
+            // exhausted. Further equal successor lines are new lines, not an
+            // invariant violation.
+            let Some(old_index) = candidates.pop_front() else {
+                continue;
+            };
             old_for_new[new_index] = Some(old_index);
             old_used[old_index] = true;
         }
