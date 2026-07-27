@@ -91,7 +91,7 @@ pub struct SlateDBRead {
     worker: SlateDBWorker,
     write_pipeline: WritePipeline,
     snapshot: Arc<DbSnapshot>,
-    visible_writes: Vec<Arc<PublishedWrite>>,
+    publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
 }
@@ -146,12 +146,28 @@ struct WritePipeline {
 struct WritePipelineState {
     tail: Option<Arc<WriteCompletion>>,
     visible: VecDeque<Arc<PublishedWrite>>,
+    point_publications: HashMap<Key, VecDeque<PointPublication>>,
+    active_views: BTreeMap<(u64, u64), usize>,
+    next_publication_id: u64,
     terminal_error: Option<StorageError>,
 }
 
 struct PublishedWrite {
+    publication_id: u64,
     overlay: Arc<BTreeMap<Key, Option<Bytes>>>,
     persisted_sequence: AtomicU64,
+}
+
+struct PointPublication {
+    publication_id: u64,
+    write: Arc<PublishedWrite>,
+    value: Option<Bytes>,
+}
+
+struct PublicationView {
+    pipeline: WritePipeline,
+    snapshot_sequence: u64,
+    publication_id: u64,
 }
 
 struct WriteCompletion {
@@ -224,7 +240,7 @@ impl WritePipeline {
         error.map_or(Ok(()), Err)
     }
 
-    fn visible_writes(&self, snapshot_sequence: u64) -> Vec<Arc<PublishedWrite>> {
+    fn capture(&self, snapshot_sequence: u64) -> PublicationView {
         let mut state = self
             .state
             .lock()
@@ -235,16 +251,93 @@ impl WritePipeline {
         }) {
             state.visible.pop_front();
         }
+        let publication_id = state.next_publication_id;
+        *state
+            .active_views
+            .entry((snapshot_sequence, publication_id))
+            .or_default() += 1;
+        cleanup_point_publications(&mut state);
+        PublicationView {
+            pipeline: self.clone(),
+            snapshot_sequence,
+            publication_id,
+        }
+    }
+
+    fn visible_writes(
+        &self,
+        snapshot_sequence: u64,
+        publication_id: u64,
+    ) -> Vec<Arc<PublishedWrite>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state
             .visible
             .iter()
             .filter(|write| {
                 let persisted = write.persisted_sequence.load(Ordering::Acquire);
-                persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence
+                write.publication_id <= publication_id
+                    && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
             })
             .cloned()
             .collect()
     }
+
+    fn point_value(
+        &self,
+        snapshot_sequence: u64,
+        publication_id: u64,
+        key: &Key,
+    ) -> Option<Option<Bytes>> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .point_publications
+            .get(key)?
+            .iter()
+            .rev()
+            .find(|publication| {
+                let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
+                publication.publication_id <= publication_id
+                    && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
+            })
+            .map(|publication| publication.value.clone())
+    }
+}
+
+impl Drop for PublicationView {
+    fn drop(&mut self) {
+        let mut state = self
+            .pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (self.snapshot_sequence, self.publication_id);
+        let remove = state.active_views.get_mut(&key).is_some_and(|count| {
+            *count -= 1;
+            *count == 0
+        });
+        if remove {
+            state.active_views.remove(&key);
+        }
+        cleanup_point_publications(&mut state);
+    }
+}
+
+fn cleanup_point_publications(state: &mut WritePipelineState) {
+    let active_views = state.active_views.keys().copied().collect::<Vec<_>>();
+    state.point_publications.retain(|_, publications| {
+        publications.retain(|publication| {
+            let persisted = publication.write.persisted_sequence.load(Ordering::Acquire);
+            persisted == PENDING_WRITE_SEQUENCE
+                || active_views.iter().any(|(snapshot, captured)| {
+                    publication.publication_id <= *captured && persisted > *snapshot
+                })
+        });
+        !publications.is_empty()
+    });
 }
 
 impl SnapshotPointCache {
@@ -478,17 +571,17 @@ impl Storage for SlateDB {
                 .worker
                 .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
                 .await?;
-            let visible_writes = if opts.durability == ReadDurability::Visible {
-                self.write_pipeline.visible_writes(snapshot.seq())
+            let publication_view = if opts.durability == ReadDurability::Visible {
+                Some(self.write_pipeline.capture(snapshot.seq()))
             } else {
-                Vec::new()
+                None
             };
             self.write_pipeline.terminal_error()?;
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
                 write_pipeline: self.write_pipeline.clone(),
                 snapshot,
-                visible_writes,
+                publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
             })
@@ -540,7 +633,9 @@ async fn check_preconditions(
     let matches = worker
         .call_read(move |db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-            let visible_writes = read_pipeline.visible_writes(snapshot.seq());
+            let snapshot_sequence = snapshot.seq();
+            let publication_view = read_pipeline.capture(snapshot_sequence);
+            let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
             let mut index = 0;
             while index < preconditions.len() {
@@ -566,13 +661,11 @@ async fn check_preconditions(
                         &point_cache,
                     )
                     .await?;
-                    for write in &visible_writes {
-                        for (key, value) in &*write.overlay {
-                            for (index, candidate) in point_keys.iter().enumerate() {
-                                if candidate == key {
-                                    values[index].clone_from(value);
-                                }
-                            }
+                    for (index, key) in point_keys.iter().enumerate() {
+                        if let Some(value) =
+                            read_pipeline.point_value(snapshot_sequence, publication_id, key)
+                        {
+                            values[index] = value;
                         }
                     }
                     matches.extend(values.iter().enumerate().map(|(offset, value)| {
@@ -586,6 +679,8 @@ async fn check_preconditions(
                         let range = physical_range(*space, range.clone())?;
                         let bounds = EncodedBounds::new(range.clone(), None);
                         let mut keys = collect_snapshot_keys(Arc::clone(&snapshot), bounds).await?;
+                        let visible_writes =
+                            read_pipeline.visible_writes(snapshot_sequence, publication_id);
                         for write in &visible_writes {
                             for (key, value) in &*write.overlay {
                                 if range_contains_key(&range, key) {
@@ -686,13 +781,6 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
     }
 }
 
-fn published_value(visible_writes: &[Arc<PublishedWrite>], key: &Key) -> Option<Option<Bytes>> {
-    visible_writes
-        .iter()
-        .rev()
-        .find_map(|write| write.overlay.get(key).cloned())
-}
-
 impl StorageRead for SlateDBRead {
     fn get_many(
         &self,
@@ -741,7 +829,13 @@ impl StorageRead for SlateDBRead {
                         .call_read(move |_db| get_snapshot_value(snapshot, read_key, durability))
                         .await?
                 };
-                if let Some(published) = published_value(&self.visible_writes, &key) {
+                if let Some(view) = &self.publication_view
+                    && let Some(published) = self.write_pipeline.point_value(
+                        view.snapshot_sequence,
+                        view.publication_id,
+                        &key,
+                    )
+                {
                     value = published;
                 }
                 return Ok(GetManyResult::new(vec![
@@ -805,7 +899,13 @@ impl StorageRead for SlateDBRead {
                     .await?
             };
             for (key, value) in physical_keys.iter().zip(&mut values) {
-                if let Some(published) = published_value(&self.visible_writes, key) {
+                if let Some(view) = &self.publication_view
+                    && let Some(published) = self.write_pipeline.point_value(
+                        view.snapshot_sequence,
+                        view.publication_id,
+                        key,
+                    )
+                {
                     *value = published;
                 }
             }
@@ -849,8 +949,14 @@ impl StorageRead for SlateDBRead {
 
             let snapshot = Arc::clone(&self.snapshot);
             let durability = self.durability;
-            if !self.visible_writes.is_empty() {
-                let visible_writes = self.visible_writes.clone();
+            let visible_writes = self
+                .publication_view
+                .as_ref()
+                .map_or_else(Vec::new, |view| {
+                    self.write_pipeline
+                        .visible_writes(view.snapshot_sequence, view.publication_id)
+                });
+            if !visible_writes.is_empty() {
                 let page_size = opts.page_size();
                 let projection = opts.projection;
                 return self
@@ -1032,19 +1138,36 @@ impl StorageWrite for SlateDBWrite {
             worker.check_open()?;
             write_pipeline.terminal_error()?;
             let overlay = Arc::new(overlay);
-            let published = Arc::new(PublishedWrite {
-                overlay: Arc::clone(&overlay),
-                persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
-            });
             let completion = Arc::new(WriteCompletion::new());
-            let previous = {
+            let (previous, published) = {
                 let mut state = write_pipeline
                     .state
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.next_publication_id = state
+                    .next_publication_id
+                    .checked_add(1)
+                    .expect("SlateDB publication id overflow");
+                let publication_id = state.next_publication_id;
+                let published = Arc::new(PublishedWrite {
+                    publication_id,
+                    overlay: Arc::clone(&overlay),
+                    persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
+                });
                 let previous = state.tail.replace(Arc::clone(&completion));
                 state.visible.push_back(Arc::clone(&published));
-                previous
+                for (key, value) in &*overlay {
+                    state
+                        .point_publications
+                        .entry(key.clone())
+                        .or_default()
+                        .push_back(PointPublication {
+                            publication_id,
+                            write: Arc::clone(&published),
+                            value: value.clone(),
+                        });
+                }
+                (previous, published)
             };
 
             let task_pipeline = write_pipeline.clone();
