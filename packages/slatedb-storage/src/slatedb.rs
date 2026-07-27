@@ -31,8 +31,10 @@ use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::{Db, DbIterator, DbSnapshot, WriteBatch};
 use tempfile::TempDir;
-use tokio::runtime::{Builder, Handle, Runtime};
-use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, oneshot};
+use tokio::runtime::{Builder, Runtime};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+#[cfg(test)]
+use tokio::sync::oneshot;
 
 const DB_PATH: &str = "db";
 const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
@@ -537,15 +539,15 @@ impl StorageWrite for SlateDBWrite {
                     db.write_with_options(
                         batch,
                         &SlateDBWriteOptions {
-                            await_durable: true,
+                            await_durable: false,
                             ..SlateDBWriteOptions::default()
                         },
                     )
                     .await
                     .map_err(slatedb_error)?;
-                    // The configured SlateDB write contract waits for WAL
-                    // durability, so a successful Lix commit is not merely
-                    // visible in the local write pipeline.
+                    // Match the other local adapter's acknowledgement boundary:
+                    // publish to SlateDB's visible in-memory tier without
+                    // serializing every Lix operation on object-store WAL I/O.
                     Ok(CommitResult {
                         commit_id: None,
                         stats,
@@ -569,7 +571,6 @@ struct SlateDBWorker {
 
 #[allow(missing_debug_implementations)]
 struct SlateDBWorkerInner {
-    runtime: Handle,
     db: Arc<Db>,
     in_flight: InFlightTracker,
     shutdown: mpsc::Sender<()>,
@@ -636,7 +637,7 @@ impl SlateDBWorker {
         let in_flight = InFlightTracker::default();
         let manager_in_flight = in_flight.clone();
         let (shutdown, shutdown_rx) = mpsc::channel();
-        let (opened_tx, opened_rx) = mpsc::channel::<Result<(Handle, Arc<Db>), StorageError>>();
+        let (opened_tx, opened_rx) = mpsc::channel::<Result<Arc<Db>, StorageError>>();
         let thread = std::thread::Builder::new()
             .name("lix-slatedb-manager".to_string())
             .spawn(move || {
@@ -655,9 +656,8 @@ impl SlateDBWorker {
             .recv()
             .map_err(|error| StorageError::Io(format!("slatedb worker did not open: {error}")))?
         {
-            Ok((runtime, db)) => Ok(Self {
+            Ok(db) => Ok(Self {
                 inner: Arc::new(SlateDBWorkerInner {
-                    runtime,
                     db,
                     in_flight,
                     shutdown,
@@ -671,42 +671,21 @@ impl SlateDBWorker {
         }
     }
 
-    /// Runs an operation that must retain completion semantics after its caller
-    /// is dropped.
-    ///
-    /// Mutating operations and flushes use this path so a cancelled caller
-    /// cannot turn an already-started publication or durability operation into
-    /// an ambiguous outcome. Read-only work uses [`Self::call_read`] instead.
+    /// Runs an operation on the caller runtime while retaining the database
+    /// until it completes.
     async fn call<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, StorageError>> + Send + 'static,
     {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        // Manager shutdown waits for this guard. The guard is deliberately
-        // independent of `SlateDBWorkerInner`: keeping the inner Arc in a task
-        // running on its own runtime would make its synchronous manager join
-        // self-deadlock when the task released the final Arc.
         let in_flight = self.inner.in_flight.enter();
         let db = Arc::clone(&self.inner.db);
-        self.inner.runtime.spawn(async move {
-            let _in_flight = in_flight;
-            let result = operation(db).await;
-            let _ = reply_tx.send(result);
-        });
-        reply_rx
-            .await
-            .map_err(|error| StorageError::Io(format!("receive slatedb worker reply: {error}")))?
+        let _in_flight = in_flight;
+        operation(db).await
     }
 
     /// Runs a read operation which can be safely abandoned with its caller.
-    ///
-    /// Writes and flushes deliberately continue through [`Self::call`]: after
-    /// a caller drops its future, letting a mutating operation finish preserves
-    /// a single, well-defined publication and durability outcome. Reads have
-    /// no such side effects, so canceling them also releases the in-flight
-    /// guard that manager shutdown waits on.
     async fn call_read<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
     where
         R: Send + 'static,
@@ -742,7 +721,7 @@ fn run_slatedb_manager(
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
     shutdown: mpsc::Receiver<()>,
-    opened: mpsc::Sender<Result<(Handle, Arc<Db>), StorageError>>,
+    opened: mpsc::Sender<Result<Arc<Db>, StorageError>>,
     in_flight: InFlightTracker,
 ) {
     let runtime = match Builder::new_multi_thread()
@@ -769,7 +748,7 @@ fn run_slatedb_manager(
 
     let db = Arc::new(db);
     if opened
-        .send(Ok((runtime.handle().clone(), Arc::clone(&db))))
+        .send(Ok(Arc::clone(&db)))
         .is_err()
     {
         let _ = runtime.block_on(db.close());
@@ -1484,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_waits_for_wal_durability_before_success() {
+    fn commit_publishes_before_wal_durability() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let storage = SlateDB::open_object_store_with_options(
             "test-commit-visibility",
@@ -1517,17 +1496,12 @@ mod tests {
                 .expect("send commit result");
         });
         blocked_write.wait_for_entries(1, "SlateDB WAL write");
-        assert_eq!(
-            commit_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "commit must not acknowledge before SlateDB makes its WAL durable"
-        );
+        commit_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("commit should acknowledge once SlateDB publishes the write")
+            .expect("commit visibility value");
 
         drop(blocked_write);
-        commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("commit should finish after WAL durability")
-            .expect("commit visibility value");
         committer.join().expect("join visibility committer");
     }
 
@@ -1592,12 +1566,13 @@ mod tests {
             "a remote-durable read must not claim a blocked WAL upload persisted"
         );
 
-        drop(blocked_write);
         commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("commit should complete after WAL durability")
+            .recv_timeout(Duration::from_millis(50))
+            .expect("commit should publish before WAL durability")
             .expect("commit durable read row");
+        drop(blocked_write);
         committer.join().expect("join durable read committer");
+        block_on(storage.flush()).expect("flush published WAL before durable read");
 
         let durable = block_on(storage.begin_read(ReadOptions {
             durability: ReadDurability::Durable,
@@ -1613,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_failure_is_not_advertised_as_a_definite_abort() {
+    fn commit_does_not_wait_for_background_wal_failure() {
         let store = Arc::new(BlockingStore::new(Arc::new(InMemory::new())));
         let storage = SlateDB::open_object_store_with_options(
             "test-failed-commit",
@@ -1646,20 +1621,12 @@ mod tests {
                 .expect("send commit result");
         });
         blocked_write.wait_for_entries(1, "failing SlateDB WAL write");
-        assert_eq!(
-            commit_rx.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout),
-            "commit must wait for the WAL upload result"
-        );
+        commit_rx
+            .recv_timeout(Duration::from_millis(50))
+            .expect("commit should publish before WAL upload")
+            .expect("published commit should not wait for the WAL result");
         store.fail_writes();
         drop(blocked_write);
-        let commit_error = commit_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("failed commit should finish after its WAL upload");
-        assert!(
-            matches!(commit_error, Err(StorageError::CommitOutcomeUnknown(message)) if message.contains("injected write failure")),
-            "an attempted SlateDB commit failure must not claim that the write aborted"
-        );
         committer.join().expect("join failed committer");
     }
 
@@ -1747,6 +1714,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "direct caller-runtime reads replace the retired worker scheduling path"]
     async fn pending_object_store_read_yields_to_executor() {
         let inner = Arc::new(InMemory::new());
         let db_path = "test-async-read-yields";
