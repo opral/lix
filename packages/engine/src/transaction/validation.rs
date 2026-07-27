@@ -31,16 +31,18 @@ use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
     MaterializedLiveStateRow,
 };
+use crate::plugin::PLUGIN_OWNER_KEY;
 #[cfg(test)]
 use crate::schema::{SchemaKey, validate_lix_schema, validate_lix_schema_definition};
 use crate::schema::{
     format_lix_schema_validation_errors, schema_from_registered_snapshot, validate_schema_amendment,
 };
 use crate::transaction::normalization::reject_reserved_schema_namespace;
-#[cfg(test)]
-use crate::transaction::staging::PreparedWriteSet;
 use crate::transaction::staging::duplicate_insert_identity_message;
-use crate::transaction::staging::{PreparedValidationRow, PreparedWriteValidationSet};
+use crate::transaction::staging::{
+    PreparedInsertIdentity, PreparedStateRowIdentity, PreparedValidationRow, PreparedWriteSet,
+    PreparedWriteValidationSet,
+};
 use crate::transaction::types::{
     PreparedStateRow, TransactionWriteOperation, TransactionWriteOrigin,
 };
@@ -49,6 +51,7 @@ use crate::{LixError, NullableKeyFilter};
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 const MAX_DIRECTORY_PARENT_DEPTH: usize = 1024;
 
@@ -375,6 +378,139 @@ pub(crate) fn tracked_row_local_certificates_cover_validation(
     let staged_rows = staged_writes.rows().collect::<Vec<_>>();
     row_local_certificates_cover_validation(&staged_rows)
         && staged_rows.iter().all(|row| !row.untracked())
+}
+
+/// A narrow post-drain proof for the common first import of a plugin-owned
+/// file.
+///
+/// Semantic rows have already passed schema, metadata, and primary-key
+/// normalization. The proof adds the only relationship that normally keeps
+/// file-scoped rows on the expensive transaction validator: one pending,
+/// planner-owned file descriptor and its engine-created blob materialization
+/// for their exact file incarnation. It rejects every transaction-wide schema
+/// constraint and every lifecycle shape that needs the ordinary validator.
+///
+/// This is intentionally derived from the immutable drained write set rather
+/// than stored during staging. Later writes and overlay coalescing therefore
+/// cannot leave a stale certificate behind.
+pub(crate) struct FreshPluginFileImportCertificate<'a> {
+    insert_identities: &'a BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
+}
+
+pub(crate) fn fresh_plugin_file_import_certificate(
+    prepared_writes: &PreparedWriteSet,
+) -> Option<FreshPluginFileImportCertificate<'_>> {
+    let [file_data] = prepared_writes.file_data_writes.as_slice() else {
+        return None;
+    };
+    if file_data.global || file_data.untracked || file_data.had_blob_ref {
+        return None;
+    }
+    if prepared_writes.commit_change_refs_by_branch.len() != 1
+        || !prepared_writes
+            .commit_change_refs_by_branch
+            .contains_key(&file_data.branch_id)
+        || !prepared_writes
+            .first_commit_parent_override_by_branch
+            .is_empty()
+        || !prepared_writes.extra_commit_parents_by_branch.is_empty()
+        || !prepared_writes.checkpoint_publications.is_empty()
+        || prepared_writes.insert_identities.len() != 2
+    {
+        return None;
+    }
+
+    let mut descriptor = None;
+    let mut blob_ref = None;
+    let mut plugin_owner_count = 0_usize;
+    for row in &prepared_writes.state_rows {
+        if row.global
+            || row.untracked
+            || row.branch_id != file_data.branch_id
+            || row.snapshot.is_none()
+            || !row.facts.row_content_validated
+            || row.change_id.is_none()
+            || row.commit_id.is_none()
+        {
+            return None;
+        }
+
+        match row.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY => {
+                if row.file_id.is_some()
+                    || row.entity_pk.as_single_string().ok() != Some(file_data.file_id.as_str())
+                    || !filesystem_planner_validated_insert(&PreparedValidationRow::State(row))
+                    || descriptor.replace(row).is_some()
+                {
+                    return None;
+                }
+            }
+            BLOB_REF_SCHEMA_KEY => {
+                // Reconciliation replaces the planner's provisional blob ref
+                // with the exact post-plugin materialization. That internal
+                // replacement deliberately has no public SQL origin, but it
+                // remains a public INSERT under the outer file INSERT mode.
+                if row.file_id.as_deref() != Some(file_data.file_id.as_str())
+                    || row.entity_pk.as_single_string().ok() != Some(file_data.file_id.as_str())
+                    || row.origin.is_some()
+                    || row.facts.requires_transaction_validation
+                    || blob_ref.replace(row).is_some()
+                {
+                    return None;
+                }
+            }
+            REGISTERED_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY => {
+                return None;
+            }
+            _ => {
+                if row.file_id.as_deref() != Some(file_data.file_id.as_str())
+                    || row.facts.requires_transaction_validation
+                    || !plugin_reconciliation_update(row)
+                {
+                    return None;
+                }
+                if row.schema_key == "lix_key_value"
+                    && row
+                        .entity_pk
+                        .as_single_string()
+                        .is_ok_and(|key| key == PLUGIN_OWNER_KEY)
+                {
+                    plugin_owner_count += 1;
+                }
+            }
+        }
+    }
+
+    let (Some(descriptor), Some(blob_ref)) = (descriptor, blob_ref) else {
+        return None;
+    };
+    if plugin_owner_count != 1
+        || !prepared_insert_identity_matches_row(&prepared_writes.insert_identities, descriptor)
+        || !prepared_insert_identity_matches_row(&prepared_writes.insert_identities, blob_ref)
+    {
+        return None;
+    }
+
+    Some(FreshPluginFileImportCertificate {
+        insert_identities: &prepared_writes.insert_identities,
+    })
+}
+
+fn plugin_reconciliation_update(row: &PreparedStateRow) -> bool {
+    row.origin.as_ref().is_some_and(|origin| {
+        origin.surface == "plugin_reconciliation"
+            && origin.operation == TransactionWriteOperation::Update
+            && origin.primary_key.is_none()
+    })
+}
+
+fn prepared_insert_identity_matches_row(
+    insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
+    row: &PreparedStateRow,
+) -> bool {
+    insert_identities
+        .get(&PreparedStateRowIdentity::from(row))
+        .is_some_and(|insert| !insert.untracked() && insert.origin() == row.origin.as_ref())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -1103,20 +1239,65 @@ async fn validate_committed_insert_identities(
             .map(|target| target.identity.clone())
             .collect::<BTreeSet<_>>()
     });
+    validate_committed_insert_identity_entries(
+        input.live_state,
+        input
+            .staged_writes
+            .insert_identities()
+            .filter(|(identity, untracked, _)| {
+                let pending_identity = DomainRowIdentity::in_domain(
+                    identity.domain(*untracked),
+                    identity.schema_key().to_string(),
+                    identity.entity_pk().clone(),
+                );
+                pending_identity_targets
+                    .as_ref()
+                    .is_none_or(|targets| targets.contains(&pending_identity))
+            }),
+        pending_constraints,
+    )
+    .await
+}
+
+/// Retains public INSERT absence semantics for a structural fresh-file import
+/// without rebuilding its full transaction validation index.
+pub(crate) async fn validate_certified_fresh_plugin_file_import(
+    live_state: &dyn LiveStateReader,
+    certificate: FreshPluginFileImportCertificate<'_>,
+) -> Result<(), LixError> {
+    validate_committed_insert_identity_entries(
+        live_state,
+        certificate
+            .insert_identities
+            .iter()
+            .map(|(identity, insert)| (identity, insert.untracked(), insert.origin())),
+        None,
+    )
+    .await
+}
+
+async fn validate_committed_insert_identity_entries<'a, I>(
+    live_state: &dyn LiveStateReader,
+    entries: I,
+    pending_constraints: Option<&PendingConstraintIndexes>,
+) -> Result<(), LixError>
+where
+    I: IntoIterator<
+        Item = (
+            &'a PreparedStateRowIdentity,
+            bool,
+            Option<&'a TransactionWriteOrigin>,
+        ),
+    >,
+{
     let mut checks_by_domain_schema =
         BTreeMap::<(Domain, String), Vec<(EntityPk, Option<TransactionWriteOrigin>)>>::new();
-    for (identity, untracked, origin) in input.staged_writes.insert_identities() {
+    for (identity, untracked, origin) in entries {
         let pending_identity = DomainRowIdentity::in_domain(
             identity.domain(untracked),
             identity.schema_key().to_string(),
             identity.entity_pk().clone(),
         );
-        if pending_identity_targets
-            .as_ref()
-            .is_some_and(|targets| !targets.contains(&pending_identity))
-        {
-            continue;
-        }
         checks_by_domain_schema
             .entry((
                 pending_identity.domain().clone(),
@@ -1132,8 +1313,7 @@ async fn validate_committed_insert_identities(
             .map(|(entity_pk, _)| entity_pk.clone())
             .collect::<Vec<_>>();
         let committed_rows =
-            scan_committed_canonical_rows(input.live_state, &domain, &schema_key, entity_pks)
-                .await?;
+            scan_committed_canonical_rows(live_state, &domain, &schema_key, entity_pks).await?;
         let committed_rows_by_entity_pk = committed_rows
             .into_iter()
             .filter(|row| {
@@ -6900,6 +7080,96 @@ mod tests {
         }
     }
 
+    fn plugin_reconciliation_update_origin() -> TransactionWriteOrigin {
+        TransactionWriteOrigin {
+            surface: "plugin_reconciliation".to_string(),
+            operation: TransactionWriteOperation::Update,
+            primary_key: None,
+        }
+    }
+
+    fn fresh_plugin_file_import_write_set() -> PreparedWriteSet {
+        let mut descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        descriptor.facts.row_content_validated = true;
+        // File descriptors intentionally retain the ordinary FK/namespace
+        // fact. The certificate admits this exact trusted-planner shape and
+        // keeps its public INSERT absence check below.
+        descriptor.facts.requires_transaction_validation = true;
+        descriptor.origin = Some(filesystem_insert_origin("lix_file", "file-a"));
+
+        let mut blob_ref = staged_row(
+            BLOB_REF_SCHEMA_KEY,
+            Some(
+                json!({
+                    "id": "file-a",
+                    "blob_hash": "a".repeat(64),
+                    "size_bytes": 2,
+                })
+                .to_string(),
+            ),
+        );
+        blob_ref.entity_pk = EntityPk::single("file-a");
+        blob_ref.file_id = Some("file-a".to_string());
+        blob_ref.branch_id = "branch-a".to_string();
+        blob_ref.global = false;
+        blob_ref.facts.row_content_validated = true;
+        // Reconciliation replaces the provisional planner blob ref with this
+        // exact materialization and intentionally leaves its public origin
+        // empty; stage_write still records it as an INSERT under the outer
+        // lix_file INSERT mode.
+        blob_ref.origin = None;
+
+        let mut owner = staged_row(
+            "lix_key_value",
+            Some(
+                json!({
+                    "key": PLUGIN_OWNER_KEY,
+                    "value": {
+                        "version": 1,
+                        "plugin_key": "plugin_json_incremental_v2",
+                        "schema_keys": ["json_root"],
+                    },
+                })
+                .to_string(),
+            ),
+        );
+        owner.entity_pk = EntityPk::single(PLUGIN_OWNER_KEY);
+        owner.file_id = Some("file-a".to_string());
+        owner.branch_id = "branch-a".to_string();
+        owner.global = false;
+        owner.facts.row_content_validated = true;
+        owner.origin = Some(plugin_reconciliation_update_origin());
+
+        let mut semantic = staged_row("json_root", Some(json!({ "kind": "object" }).to_string()));
+        semantic.entity_pk = EntityPk::single("root");
+        semantic.file_id = Some("file-a".to_string());
+        semantic.branch_id = "branch-a".to_string();
+        semantic.global = false;
+        semantic.facts.row_content_validated = true;
+        semantic.origin = Some(plugin_reconciliation_update_origin());
+
+        let mut writes = PreparedWriteSet {
+            state_rows: vec![descriptor.clone(), blob_ref.clone(), owner, semantic],
+            file_data_writes: vec![crate::transaction::types::TransactionFileData::new(
+                "file-a".to_string(),
+                Some("/a.json".to_string()),
+                Some("a.json".to_string()),
+                "branch-a".to_string(),
+                false,
+                false,
+                b"{}".to_vec(),
+            )],
+            ..empty_staged_write_set()
+        };
+        writes.commit_change_refs_by_branch.insert(
+            "branch-a".to_string(),
+            crate::transaction::types::StagedCommitChangeRefs::default(),
+        );
+        writes.remember_insert_identity_for_tests(&descriptor);
+        writes.remember_insert_identity_for_tests(&blob_ref);
+        writes
+    }
+
     #[test]
     fn prepared_tracked_row_certificates_match_the_commit_skip_contract() {
         let mut row = staged_row("normal_schema", Some(r#"{"id":"row"}"#.to_string()));
@@ -6933,5 +7203,62 @@ mod tests {
         assert!(!prepared_tracked_rows_have_row_local_certificates(&[
             reserved
         ]));
+    }
+
+    #[test]
+    fn fresh_plugin_file_import_certificate_matches_the_real_blob_materialization_shape() {
+        let writes = fresh_plugin_file_import_write_set();
+
+        assert!(
+            fresh_plugin_file_import_certificate(&writes).is_some(),
+            "a fresh trusted lix_file INSERT plus v2 blob materialization should certify"
+        );
+    }
+
+    #[test]
+    fn fresh_plugin_file_import_certificate_rejects_missing_descriptor_or_cross_row_schema() {
+        let mut missing_descriptor = fresh_plugin_file_import_write_set();
+        missing_descriptor
+            .state_rows
+            .retain(|row| row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY);
+        assert!(fresh_plugin_file_import_certificate(&missing_descriptor).is_none());
+
+        let mut cross_row_schema = fresh_plugin_file_import_write_set();
+        cross_row_schema
+            .state_rows
+            .iter_mut()
+            .find(|row| row.schema_key == "json_root")
+            .expect("fixture should include a semantic row")
+            .facts
+            .requires_transaction_validation = true;
+        assert!(fresh_plugin_file_import_certificate(&cross_row_schema).is_none());
+    }
+
+    #[tokio::test]
+    async fn fresh_plugin_file_import_certificate_retains_public_insert_absence_checks() {
+        let writes = fresh_plugin_file_import_write_set();
+        let certificate = fresh_plugin_file_import_certificate(&writes)
+            .expect("fixture should satisfy the structural certificate");
+        validate_certified_fresh_plugin_file_import(&StrictEmptyLiveStateReader, certificate)
+            .await
+            .expect("new descriptor and blob identities should be absent");
+
+        let duplicate_descriptor = writes
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .cloned()
+            .expect("fixture should include descriptor");
+        let certificate = fresh_plugin_file_import_certificate(&writes)
+            .expect("certificate remains valid before committed lookup");
+        let error = validate_certified_fresh_plugin_file_import(
+            &StrictStaticLiveStateReader {
+                rows: vec![MaterializedLiveStateRow::from(duplicate_descriptor)],
+            },
+            certificate,
+        )
+        .await
+        .expect_err("a committed descriptor must still reject the public INSERT");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
     }
 }

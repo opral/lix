@@ -101,7 +101,8 @@ use crate::transaction::types::{
     TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
 };
 use crate::transaction::validation::{
-    TransactionValidationInput, prepared_tracked_rows_have_row_local_certificates,
+    TransactionValidationInput, fresh_plugin_file_import_certificate,
+    prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
     validate_prepared_writes,
 };
 use crate::wasm::{
@@ -859,6 +860,10 @@ where
         }
         let write = match self
             .prepare_transaction_write(write, prepared_semantic_rows)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_prepare_rows"
+            ))
             .await
         {
             Ok(write) => write,
@@ -869,6 +874,10 @@ where
         };
         if let Err(error) = self
             .preflight_derived_path_stability_before_stage(&write)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_path_preflight"
+            ))
             .await
         {
             discard_plugin_actor_publications(actor_publications).await;
@@ -880,7 +889,12 @@ where
             self.filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
         }
-        let outcome = match self.staged_writes.stage_write(write) {
+        let outcome = match tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_buffer_stage"
+        )
+        .in_scope(|| self.staged_writes.stage_write(write))
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 discard_plugin_actor_publications(actor_publications).await;
@@ -3898,6 +3912,20 @@ where
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
+            return Ok(());
+        }
+        if self.trust_filesystem_planner
+            && let Some(certificate) = fresh_plugin_file_import_certificate(prepared_writes)
+        {
+            // The certificate proves that every omitted file-scoped row has
+            // completed row-local validation, has no transaction-wide schema
+            // constraint, and is owned by this exact pending planner-created
+            // descriptor. Keep public INSERT absence validation against this
+            // coherent commit snapshot before skipping the O(rows) index.
+            #[cfg(feature = "storage-benches")]
+            crate::storage_bench::record_transaction_validation_branch();
+            let live_state = self.live_state.reader(read);
+            validate_certified_fresh_plugin_file_import(&live_state, certificate).await?;
             return Ok(());
         }
         let validation_index = prepared_writes.validation_index();

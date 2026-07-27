@@ -1248,6 +1248,10 @@ impl PreparedInsertIdentity {
     pub(crate) fn untracked(&self) -> bool {
         self.untracked
     }
+
+    pub(crate) fn origin(&self) -> Option<&TransactionWriteOrigin> {
+        self.origin.as_ref()
+    }
 }
 
 impl From<&PreparedStateRow> for PreparedStateRowIdentity {

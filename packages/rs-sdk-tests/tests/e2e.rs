@@ -8,12 +8,120 @@ use lix_sdk::{
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::Subscriber;
+use tracing::span::{Attributes, Id};
+use tracing::subscriber::Interest;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+
+#[derive(Clone, Default)]
+struct PerfSpanCollector {
+    samples: Arc<Mutex<Vec<PerfSpanSample>>>,
+}
+
+#[derive(Debug)]
+struct PerfSpanSample {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct StartedPerfSpan {
+    name: &'static str,
+    started: Instant,
+}
+
+fn is_import_perf_span(name: &str) -> bool {
+    matches!(
+        name,
+        "lix.perf.transaction_plan_and_stage"
+            | "lix.perf.plugin_reconciliation"
+            | "lix.perf.plugin_factory_compile"
+            | "lix.perf.plugin_open_file"
+            | "lix.perf.plugin_open_file_drain"
+            | "lix.perf.plugin_change_rows"
+            | "lix.perf.plugin_semantic_prepare_rows"
+            | "lix.perf.transaction_validation"
+            | "lix.perf.transaction_materialization"
+            | "lix.perf.storage_lowering"
+            | "lix.perf.transaction_prepare_rows"
+            | "lix.perf.transaction_path_preflight"
+            | "lix.perf.transaction_buffer_stage"
+    )
+}
+
+impl PerfSpanCollector {
+    fn clear(&self) {
+        self.samples
+            .lock()
+            .expect("performance span collector should not poison")
+            .clear();
+    }
+
+    fn take_aggregate_millis(&self) -> BTreeMap<&'static str, f64> {
+        let samples = std::mem::take(
+            &mut *self
+                .samples
+                .lock()
+                .expect("performance span collector should not poison"),
+        );
+        let mut aggregate = BTreeMap::new();
+        for sample in samples {
+            *aggregate.entry(sample.name).or_insert(0.0) += sample.elapsed.as_secs_f64() * 1_000.0;
+        }
+        aggregate
+    }
+}
+
+impl<S> Layer<S> for PerfSpanCollector
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if metadata.target() == "lix_perf" && is_import_perf_span(metadata.name()) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: TracingContext<'_, S>) {
+        let name = attributes.metadata().name();
+        if !is_import_perf_span(name) {
+            return;
+        }
+        if let Some(span) = context.span(id) {
+            span.extensions_mut().insert(StartedPerfSpan {
+                name,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    fn on_close(&self, id: Id, context: TracingContext<'_, S>) {
+        let Some(span) = context.span(&id) else {
+            return;
+        };
+        let Some(started) = span.extensions_mut().remove::<StartedPerfSpan>() else {
+            return;
+        };
+        self.samples
+            .lock()
+            .expect("performance span collector should not poison")
+            .push(PerfSpanSample {
+                name: started.name,
+                elapsed: started.started.elapsed(),
+            });
+    }
+}
 
 #[derive(Default)]
 struct HistoryRejectingRuntime {
@@ -1760,6 +1868,391 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     lix.close()
         .await
         .expect("JSON conflict benchmark should close");
+}
+
+/// Compares an ordinary v2 file import with the same semantic rows supplied
+/// directly through the public typed-SQL surface.
+///
+/// The no-file lane is the semantic-row durability floor. The file-scoped
+/// lane is the meaningful parity comparison: it stages the same 10 MiB
+/// `lix_file` payload, the root plus 39,870 member rows, and commits them in
+/// one ordinary transaction. Parsing the fixture and constructing SQL happen
+/// outside each timed lane, just as the caller has already constructed the
+/// input blob before `write_file` begins.
+#[tokio::test]
+#[ignore = "10 MiB JSON plugin versus direct semantic-row import parity benchmark"]
+async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
+    init_perf_tracing();
+    const SAMPLES: usize = 7;
+    const SQL_CHUNK_ROWS: usize = 500;
+    const FILE_ID: &str = "native-json-semantic-control";
+    const FILE_PATH: &str = "/native-json-semantic-control.json";
+
+    let archive = build_json_v2_plugin_archive();
+    let (source, _, _) = json_ten_mib_flat_fixture();
+    let members = native_json_control_members(&source);
+    assert_eq!(members.len(), JSON_TEN_MIB_PROPERTY_COUNT);
+
+    let no_file_root_statement = native_json_control_root_insert(None);
+    let no_file_member_statements =
+        native_json_control_member_insert_chunks(&members, None, SQL_CHUNK_ROWS);
+    let file_scoped_root_statement = native_json_control_root_insert(Some(FILE_ID));
+    let file_scoped_member_statements =
+        native_json_control_member_insert_chunks(&members, Some(FILE_ID), SQL_CHUNK_ROWS);
+
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let mut plugin_ms = Vec::with_capacity(SAMPLES);
+    for sample in 0..SAMPLES {
+        let root = tempfile::tempdir().expect("create plugin import benchmark directory");
+        let lix = open_lix_with_rocksdb(root.path()).await;
+        install_reference_plugin_in_blank_registry(
+            &lix,
+            "plugin_json_incremental_v2",
+            &archive,
+            &["json_root", "json_object_member", "json_array_item"],
+        )
+        .await;
+
+        // Plugin installation and the caller's input clone are deliberately
+        // outside the timer. The timed operation is one normal public file
+        // write on an otherwise fresh RocksDB database.
+        let input = source.clone();
+        lix.reset_plugin_v2_transition_counters();
+        collector.clear();
+        let started = Instant::now();
+        let inserted = lix
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(FILE_ID.to_owned()),
+                    Value::Text(FILE_PATH.to_owned()),
+                    Value::Blob(input.into()),
+                ],
+            )
+            .await
+            .expect("real JSON v2 plugin import should succeed");
+        assert_eq!(inserted.rows_affected(), 1, "plugin sample {sample}");
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        plugin_ms.push(elapsed_ms);
+        eprintln!(
+            "v2_json_import_phases sample={sample} elapsed_ms={elapsed_ms:.3} phases_ms={:?}",
+            collector.take_aggregate_millis()
+        );
+
+        let counters = lix.plugin_v2_transition_counters();
+        assert_eq!(
+            counters.durable_semantic_changes,
+            (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64,
+            "plugin sample {sample} must commit one root plus every member"
+        );
+        assert_eq!(
+            read_file(&lix, FILE_PATH)
+                .await
+                .expect("plugin file should read"),
+            Some(source.clone()),
+            "plugin sample {sample} must preserve exact materialized bytes"
+        );
+        lix.close().await.expect("close plugin import benchmark");
+    }
+
+    let mut direct_no_file_ms = Vec::with_capacity(SAMPLES);
+    let mut direct_file_scoped_ms = Vec::with_capacity(SAMPLES);
+    for (label, file_scoped, root_statement, member_statements, samples) in [
+        (
+            "direct_no_file",
+            false,
+            &no_file_root_statement,
+            &no_file_member_statements,
+            &mut direct_no_file_ms,
+        ),
+        (
+            "direct_file_scoped",
+            true,
+            &file_scoped_root_statement,
+            &file_scoped_member_statements,
+            &mut direct_file_scoped_ms,
+        ),
+    ] {
+        for sample in 0..SAMPLES {
+            let root = tempfile::tempdir().expect("create direct import benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            register_native_json_control_schemas(&lix).await;
+
+            // Both the full file payload and every exact semantic snapshot
+            // have been prebuilt before timing. The transaction below stays
+            // exclusively on the public typed entity surface.
+            let file_input = file_scoped.then(|| source.clone());
+            let started = Instant::now();
+            let mut transaction = lix
+                .begin_transaction()
+                .await
+                .expect("open direct semantic-row transaction");
+            if let Some(file_input) = file_input {
+                let inserted = transaction
+                    .execute(
+                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        &[
+                            Value::Text(FILE_ID.to_owned()),
+                            Value::Text(FILE_PATH.to_owned()),
+                            Value::Blob(file_input.into()),
+                        ],
+                    )
+                    .await
+                    .expect("stage direct file payload");
+                assert_eq!(inserted.rows_affected(), 1, "{label} sample {sample}");
+            }
+            let inserted_root = transaction
+                .execute(&root_statement.sql, &root_statement.params)
+                .await
+                .expect("stage direct root row");
+            assert_eq!(inserted_root.rows_affected(), 1, "{label} sample {sample}");
+            let mut inserted_members = 0_u64;
+            for statement in member_statements {
+                inserted_members += transaction
+                    .execute(&statement.sql, &statement.params)
+                    .await
+                    .expect("stage direct member rows")
+                    .rows_affected();
+            }
+            assert_eq!(
+                inserted_members, JSON_TEN_MIB_PROPERTY_COUNT as u64,
+                "{label} sample {sample}"
+            );
+            transaction
+                .commit()
+                .await
+                .expect("commit direct semantic rows");
+            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+            let member_count = lix
+                .execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+                .await
+                .expect("count direct member rows")
+                .rows()[0]
+                .get::<i64>("count")
+                .expect("member count must be an integer");
+            assert_eq!(
+                member_count, JSON_TEN_MIB_PROPERTY_COUNT as i64,
+                "{label} sample {sample} must retain every member"
+            );
+            if file_scoped {
+                assert_eq!(
+                    read_file(&lix, FILE_PATH)
+                        .await
+                        .expect("direct file should read"),
+                    Some(source.clone()),
+                    "{label} sample {sample} must retain the same payload"
+                );
+            }
+            lix.close().await.expect("close direct import benchmark");
+        }
+    }
+
+    for samples in [
+        &mut plugin_ms,
+        &mut direct_no_file_ms,
+        &mut direct_file_scoped_ms,
+    ] {
+        samples.sort_by(f64::total_cmp);
+    }
+    let plugin_p50_ms = p50_ms(&plugin_ms);
+    let direct_no_file_p50_ms = p50_ms(&direct_no_file_ms);
+    let direct_file_scoped_p50_ms = p50_ms(&direct_file_scoped_ms);
+    eprintln!(
+        "v2_json_ten_mib_import_parity bytes={JSON_TEN_MIB_BYTES} rows={} samples={SAMPLES} \\
+         plugin_raw_ms={plugin_ms:?} plugin_p50_ms={plugin_p50_ms:.3} plugin_p95_ms={:.3} \\
+         direct_no_file_raw_ms={direct_no_file_ms:?} direct_no_file_p50_ms={direct_no_file_p50_ms:.3} \\
+         direct_file_scoped_raw_ms={direct_file_scoped_ms:?} direct_file_scoped_p50_ms={direct_file_scoped_p50_ms:.3} \\
+         plugin_to_direct_file_scoped_ratio={:.3}",
+        JSON_TEN_MIB_PROPERTY_COUNT + 1,
+        p95_ms(&plugin_ms),
+        plugin_p50_ms / direct_file_scoped_p50_ms,
+    );
+    assert!(
+        plugin_p50_ms <= direct_file_scoped_p50_ms * 1.5,
+        "10 MiB JSON plugin import p50 {plugin_p50_ms:.3} ms exceeds the 1.5x direct file-scoped semantic-row gate ({direct_file_scoped_p50_ms:.3} ms)"
+    );
+}
+
+/// Compares the 10.68 MiB / 220,000-row CSV v2 file import with the same
+/// table and row entities written directly through typed SQL. Each pair
+/// alternates lane order so machine drift cannot systematically favor either
+/// path. Plugin installation, schema registration, fixture construction, and
+/// SQL construction remain outside the measured transaction.
+#[tokio::test]
+#[ignore = "10 MiB CSV plugin versus direct semantic-row import parity benchmark"]
+async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
+    const PAIRS: usize = 5;
+    const SQL_CHUNK_ROWS: usize = 500;
+    const CSV_ROW_COUNT: usize = 220_000;
+    const FILE_ID: &str = "native-csv-semantic-control";
+    const FILE_PATH: &str = "/native-csv-semantic-control.csv";
+
+    let archive = build_csv_v2_plugin_archive();
+    let source = csv_ten_mib_fixture();
+    let table_statement = native_csv_control_table_insert(FILE_ID);
+    let row_statements =
+        native_csv_control_row_insert_chunks(FILE_ID, CSV_ROW_COUNT, SQL_CHUNK_ROWS);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let mut plugin_ms = Vec::with_capacity(PAIRS);
+    let mut direct_ms = Vec::with_capacity(PAIRS);
+    let mut paired_samples_ms = Vec::with_capacity(PAIRS);
+    let mut paired_ratios = Vec::with_capacity(PAIRS);
+
+    for sample in 0..PAIRS {
+        let lanes = if sample % 2 == 0 {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        let mut plugin_sample_ms = None;
+        let mut direct_sample_ms = None;
+        for plugin_lane in lanes {
+            let root = tempfile::tempdir().expect("create CSV import benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            if plugin_lane {
+                install_reference_plugin_in_blank_registry(
+                    &lix,
+                    "plugin_csv_v2",
+                    &archive,
+                    &["csv_v2_table", "csv_v2_row"],
+                )
+                .await;
+            } else {
+                register_native_csv_control_schemas(&lix).await;
+            }
+
+            let file_input = source.clone();
+            lix.reset_plugin_v2_transition_counters();
+            collector.clear();
+            let started = Instant::now();
+            if plugin_lane {
+                let inserted = lix
+                    .execute(
+                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        &[
+                            Value::Text(FILE_ID.to_owned()),
+                            Value::Text(FILE_PATH.to_owned()),
+                            Value::Blob(file_input.into()),
+                        ],
+                    )
+                    .await
+                    .expect("real CSV v2 plugin import should succeed");
+                assert_eq!(inserted.rows_affected(), 1, "plugin sample {sample}");
+            } else {
+                let mut transaction = lix
+                    .begin_transaction()
+                    .await
+                    .expect("open direct CSV semantic-row transaction");
+                let inserted = transaction
+                    .execute(
+                        "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                        &[
+                            Value::Text(FILE_ID.to_owned()),
+                            Value::Text(FILE_PATH.to_owned()),
+                            Value::Blob(file_input.into()),
+                        ],
+                    )
+                    .await
+                    .expect("stage direct CSV file payload");
+                assert_eq!(inserted.rows_affected(), 1, "direct sample {sample}");
+                assert_eq!(
+                    transaction
+                        .execute(&table_statement.sql, &table_statement.params)
+                        .await
+                        .expect("stage direct CSV table row")
+                        .rows_affected(),
+                    1,
+                    "direct sample {sample}"
+                );
+                let mut inserted_rows = 0_u64;
+                for statement in &row_statements {
+                    inserted_rows += transaction
+                        .execute(&statement.sql, &statement.params)
+                        .await
+                        .expect("stage direct CSV rows")
+                        .rows_affected();
+                }
+                assert_eq!(
+                    inserted_rows, CSV_ROW_COUNT as u64,
+                    "direct sample {sample}"
+                );
+                transaction
+                    .commit()
+                    .await
+                    .expect("commit direct CSV semantic rows");
+            }
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let phases_ms = collector.take_aggregate_millis();
+            eprintln!(
+                "v2_csv_import_phases sample={sample} lane={} elapsed_ms={elapsed_ms:.3} phases_ms={phases_ms:?}",
+                if plugin_lane { "plugin" } else { "direct" },
+            );
+
+            if plugin_lane {
+                assert_eq!(
+                    lix.plugin_v2_transition_counters().durable_semantic_changes,
+                    (CSV_ROW_COUNT + 1) as u64,
+                    "plugin sample {sample} must commit one table plus every row"
+                );
+                plugin_ms.push(elapsed_ms);
+                plugin_sample_ms = Some(elapsed_ms);
+            } else {
+                let row_count = lix
+                    .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+                    .await
+                    .expect("count direct CSV rows")
+                    .rows()[0]
+                    .get::<i64>("count")
+                    .expect("CSV row count must be an integer");
+                assert_eq!(row_count, CSV_ROW_COUNT as i64, "direct sample {sample}");
+                direct_ms.push(elapsed_ms);
+                direct_sample_ms = Some(elapsed_ms);
+            }
+            assert_eq!(
+                read_file(&lix, FILE_PATH)
+                    .await
+                    .expect("CSV benchmark file should read"),
+                Some(source.clone()),
+                "sample {sample} must preserve exact CSV bytes"
+            );
+            lix.close().await.expect("close CSV import benchmark");
+        }
+
+        let plugin_sample_ms = plugin_sample_ms.expect("plugin lane must run once per pair");
+        let direct_sample_ms = direct_sample_ms.expect("direct lane must run once per pair");
+        paired_samples_ms.push((plugin_sample_ms, direct_sample_ms));
+        paired_ratios.push(plugin_sample_ms / direct_sample_ms);
+    }
+
+    let mut plugin_sorted_ms = plugin_ms.clone();
+    let mut direct_sorted_ms = direct_ms.clone();
+    let mut paired_ratios_sorted = paired_ratios.clone();
+    plugin_sorted_ms.sort_by(f64::total_cmp);
+    direct_sorted_ms.sort_by(f64::total_cmp);
+    paired_ratios_sorted.sort_by(f64::total_cmp);
+    let plugin_p50_ms = p50_ms(&plugin_sorted_ms);
+    let direct_p50_ms = p50_ms(&direct_sorted_ms);
+    let paired_p50_ratio = p50_ms(&paired_ratios_sorted);
+    eprintln!(
+        "v2_csv_ten_mib_import_parity bytes={} rows={} pairs={PAIRS} \
+         paired_plugin_direct_ms={paired_samples_ms:?} \
+         plugin_raw_ms={plugin_ms:?} plugin_p50_ms={plugin_p50_ms:.3} \
+         direct_raw_ms={direct_ms:?} direct_p50_ms={direct_p50_ms:.3} \
+         aggregate_ratio={:.3} paired_ratios={paired_ratios:?} \
+         paired_p50_ratio={paired_p50_ratio:.3}",
+        source.len(),
+        CSV_ROW_COUNT + 1,
+        plugin_p50_ms / direct_p50_ms,
+    );
+    assert!(
+        paired_p50_ratio <= 1.5,
+        "10 MiB CSV plugin import paired p50 ratio {paired_p50_ratio:.3} exceeds the 1.5x direct semantic-row gate"
+    );
 }
 
 #[tokio::test]
@@ -3546,6 +4039,254 @@ fn init_perf_tracing() {
 const JSON_TEN_MIB_BYTES: usize = 10 * 1024 * 1024;
 const JSON_TEN_MIB_PROPERTY_COUNT: usize = 39_870;
 const JSON_V2_GUEST_MEMORY_LIMIT_BYTES: u64 = 128 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct NativeJsonControlMember {
+    key: String,
+    order_key: String,
+    scalar_json: String,
+}
+
+/// A prebuilt public-SQL statement. SQL text and bound values are assembled
+/// before timing so the control measures planning, row staging, and commit;
+/// it does not charge the direct lane for serializing the caller's rows.
+#[derive(Debug)]
+struct NativeJsonControlStatement {
+    sql: String,
+    params: Vec<Value>,
+}
+
+async fn register_native_json_control_schemas<StorageImpl>(lix: &Lix<StorageImpl>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    // Deliberately register only the public JSON entity surfaces. The direct
+    // control must exercise normal SQL/transaction/RocksDB work without
+    // installing a component that would reconcile or render the rows.
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("open JSON control schema transaction");
+    for schema in [
+        include_str!("../../../plugins/json-v2/schema/json_root.json"),
+        include_str!("../../../plugins/json-v2/schema/json_object_member.json"),
+        include_str!("../../../plugins/json-v2/schema/json_array_item.json"),
+    ] {
+        let inserted = transaction
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json($1), false, false)",
+                &[Value::Text(schema.to_owned())],
+            )
+            .await
+            .expect("register JSON control schema");
+        assert_eq!(inserted.rows_affected(), 1);
+    }
+    transaction
+        .commit()
+        .await
+        .expect("commit JSON control schemas");
+}
+
+async fn register_native_csv_control_schemas<StorageImpl>(lix: &Lix<StorageImpl>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("open CSV control schema transaction");
+    for schema in [
+        include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json"),
+        include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json"),
+    ] {
+        assert_eq!(
+            transaction
+                .execute(
+                    "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                     VALUES (lix_json($1), false, false)",
+                    &[Value::Text(schema.to_owned())],
+                )
+                .await
+                .expect("register CSV control schema")
+                .rows_affected(),
+            1
+        );
+    }
+    transaction
+        .commit()
+        .await
+        .expect("commit CSV control schemas");
+}
+
+fn native_csv_control_table_insert(file_id: &str) -> NativeJsonControlStatement {
+    NativeJsonControlStatement {
+        sql: "INSERT INTO csv_v2_table (id, dialect, lixcol_file_id) VALUES ('root', $1, $2)"
+            .to_owned(),
+        params: vec![
+            Value::Json(serde_json::json!({
+                "delimiter": ",",
+                "quote": "\"",
+                "terminator": "\n",
+            })),
+            Value::Text(file_id.to_owned()),
+        ],
+    }
+}
+
+fn native_csv_control_row_insert_chunks(
+    file_id: &str,
+    row_count: usize,
+    chunk_rows: usize,
+) -> Vec<NativeJsonControlStatement> {
+    const LONG_ROW_COUNT: usize = 120_000;
+    assert!(chunk_rows > 0, "native CSV SQL chunk size must be positive");
+    let denominator = u128::try_from(row_count + 1).expect("CSV row count fits u128");
+    (0..row_count)
+        .collect::<Vec<_>>()
+        .chunks(chunk_rows)
+        .map(|chunk| {
+            let mut params = Vec::with_capacity(chunk.len() * 4);
+            let values = chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, index)| {
+                    let first = offset * 4 + 1;
+                    let numerator = u128::try_from(*index + 1).expect("CSV row index fits u128")
+                        * u128::from(u64::MAX);
+                    let order_rank = u64::try_from(numerator / denominator)
+                        .expect("CSV order rank fits u64")
+                        | 1;
+                    params.push(Value::Text(format!("{index:032x}")));
+                    params.push(Value::Text(format!("{order_rank:016x}")));
+                    params.push(Value::Json(serde_json::json!([
+                        if *index < LONG_ROW_COUNT {
+                            "000000000000000"
+                        } else {
+                            "00000000000000"
+                        },
+                        "1111111111",
+                        "2222222222",
+                        "3333333333",
+                    ])));
+                    params.push(Value::Text(file_id.to_owned()));
+                    format!("(${first}, ${}, ${}, ${})", first + 1, first + 2, first + 3)
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            NativeJsonControlStatement {
+                sql: format!(
+                    "INSERT INTO csv_v2_row (id, order_key, cells, lixcol_file_id) VALUES {values}"
+                ),
+                params,
+            }
+        })
+        .collect()
+}
+
+fn native_json_control_members(source: &[u8]) -> Vec<NativeJsonControlMember> {
+    let object = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(source)
+        .expect("flat JSON fixture must parse as an object");
+    assert_eq!(object.len(), JSON_TEN_MIB_PROPERTY_COUNT);
+    let denominator =
+        u128::try_from(JSON_TEN_MIB_PROPERTY_COUNT + 1).expect("property count fits u128");
+
+    (0..JSON_TEN_MIB_PROPERTY_COUNT)
+        .map(|index| {
+            let key = format!("property_{index:06}");
+            let scalar = object
+                .get(&key)
+                .and_then(serde_json::Value::as_str)
+                .expect("flat JSON fixture values must be strings");
+            let scalar_json =
+                serde_json::to_string(scalar).expect("flat JSON fixture scalar must serialize");
+            let numerator =
+                u128::try_from(index + 1).expect("property index fits u128") * u128::from(u64::MAX);
+            let order_rank =
+                u64::try_from(numerator / denominator).expect("fractional rank fits u64") | 1;
+            NativeJsonControlMember {
+                key,
+                order_key: format!("{order_rank:016x}"),
+                scalar_json,
+            }
+        })
+        .collect()
+}
+
+fn native_json_control_root_insert(file_id: Option<&str>) -> NativeJsonControlStatement {
+    match file_id {
+        None => NativeJsonControlStatement {
+            sql: "INSERT INTO json_root (id, kind) VALUES ($1, $2)".to_owned(),
+            params: vec![
+                Value::Text("root".to_owned()),
+                Value::Text("object".to_owned()),
+            ],
+        },
+        Some(file_id) => NativeJsonControlStatement {
+            sql: "INSERT INTO json_root (id, kind, lixcol_file_id) VALUES ($1, $2, $3)".to_owned(),
+            params: vec![
+                Value::Text("root".to_owned()),
+                Value::Text("object".to_owned()),
+                Value::Text(file_id.to_owned()),
+            ],
+        },
+    }
+}
+
+fn native_json_control_member_insert_chunks(
+    members: &[NativeJsonControlMember],
+    file_id: Option<&str>,
+    chunk_rows: usize,
+) -> Vec<NativeJsonControlStatement> {
+    assert!(
+        chunk_rows > 0,
+        "native JSON SQL chunk size must be positive"
+    );
+    members
+        .chunks(chunk_rows)
+        .map(|chunk| {
+            let columns = match file_id {
+                None => String::from(
+                    "INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json) VALUES ",
+                ),
+                Some(_) => String::from(
+                    "INSERT INTO json_object_member (parent_id, key, order_key, kind, scalar_json, lixcol_file_id) VALUES ",
+                ),
+            };
+            let params_per_member = if file_id.is_some() { 4 } else { 3 };
+            let mut params = Vec::with_capacity(chunk.len() * params_per_member);
+            let values = chunk
+                .iter()
+                .enumerate()
+                .map(|(index, member)| {
+                    let first = index * params_per_member + 1;
+                    params.push(Value::Text(member.key.clone()));
+                    params.push(Value::Text(member.order_key.clone()));
+                    params.push(Value::Text(member.scalar_json.clone()));
+                    match file_id {
+                        None => {
+                            format!("('root', ${first}, ${}, 'string', ${})", first + 1, first + 2)
+                        }
+                        Some(file_id) => {
+                            params.push(Value::Text(file_id.to_owned()));
+                            format!(
+                                "('root', ${first}, ${}, 'string', ${}, ${})",
+                                first + 1,
+                                first + 2,
+                                first + 3
+                            )
+                        }
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            NativeJsonControlStatement {
+                sql: format!("{columns}{values}"),
+                params,
+            }
+        })
+        .collect()
+}
 
 fn csv_ten_mib_fixture() -> Vec<u8> {
     const LONG_ROW_COUNT: usize = 120_000;
