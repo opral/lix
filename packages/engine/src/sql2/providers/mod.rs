@@ -38,7 +38,8 @@ use datafusion::logical_expr::TableSource;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
     execute_exact_lix_file_batch_read, execute_exact_lix_file_read,
-    execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_data_update_by_id_with_metadata,
+    execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_id_path_writes,
+    execute_fast_lix_file_data_update_by_id_with_metadata,
     execute_fast_lix_file_path_writes,
 };
 #[cfg(test)]

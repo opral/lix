@@ -458,6 +458,7 @@ async fn load_active_branch_commit_id(
 
 #[derive(Clone, Copy)]
 struct FastFilePathWriteShape {
+    id_index: Option<usize>,
     path_index: usize,
     data_index: usize,
     metadata_index: Option<usize>,
@@ -481,6 +482,10 @@ async fn execute_file_path_write(
     for row in &values.rows {
         let data_expr = &row[shape.data_index];
         writes.push((
+            shape
+                .id_index
+                .map(|index| eval_fast_file_text(&row[index], params, "id"))
+                .transpose()?,
             eval_fast_file_text(&row[shape.path_index], params, "path")?,
             eval_fast_file_blob(data_expr, params, "data")?,
             shape
@@ -491,7 +496,7 @@ async fn execute_file_path_write(
             fast_file_blob_expr_splice_provenance(data_expr, metadata),
         ));
     }
-    crate::sql2::providers::execute_fast_lix_file_path_writes(
+    crate::sql2::providers::execute_fast_lix_file_id_path_writes(
         ctx,
         writes,
         shape.conflict,
@@ -520,19 +525,23 @@ fn fast_file_path_write_shape(
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return None;
     };
-    if values.rows.is_empty() || !matches!(values.columns.len(), 2 | 3) {
+    if values.rows.is_empty() || !(2..=4).contains(&values.columns.len()) {
         return None;
     }
+    let id_index = values.column_index("id");
     let path_index = values.column_index("path")?;
     let data_index = values.column_index("data")?;
     let metadata_index = values.column_index("lixcol_metadata");
-    if values.columns.len() == 3 && metadata_index.is_none() {
+    if values.columns.len()
+        != 2 + usize::from(id_index.is_some()) + usize::from(metadata_index.is_some())
+    {
         return None;
     }
     if values.rows.iter().any(|row| {
         row.len() != values.columns.len()
             || !fast_file_text_expr_supported(&row[path_index])
             || !fast_file_blob_expr_supported(&row[data_index])
+            || id_index.is_some_and(|index| !fast_file_text_expr_supported(&row[index]))
             || metadata_index.is_some_and(|index| !fast_file_metadata_expr_supported(&row[index]))
     }) {
         return None;
@@ -560,6 +569,7 @@ fn fast_file_path_write_shape(
         return None;
     }
     Some(FastFilePathWriteShape {
+        id_index,
         path_index,
         data_index,
         metadata_index,

@@ -2151,6 +2151,30 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
     conflict: FastLixFilePathWriteConflict,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<Option<u64>, LixError> {
+    execute_fast_lix_file_id_path_writes(
+        ctx,
+        writes
+            .into_iter()
+            .map(|(path, data, metadata, splice)| (None, path, data, metadata, splice))
+            .collect(),
+        conflict,
+        mutation_identity,
+    )
+    .await
+}
+
+pub(crate) async fn execute_fast_lix_file_id_path_writes(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    writes: Vec<(
+        Option<String>,
+        String,
+        crate::Blob,
+        Option<TransactionJson>,
+        Option<RequestBlobSpliceProvenance>,
+    )>,
+    conflict: FastLixFilePathWriteConflict,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<Option<u64>, LixError> {
     if writes.is_empty() {
         return Ok(Some(0));
     }
@@ -2216,6 +2240,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
             }
             match conflict {
                 FastLixFilePathWriteConflict::None => {
+                    let file_id = fast_file_write_id(&write, ctx);
                     let context = FilesystemRowContext {
                         branch_id: active_branch_id.clone(),
                         global: false,
@@ -2226,14 +2251,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                     let plan = plan_parsed_file_path_write_with_resolvers(
                         &mut path_resolvers,
                         write.parsed.parsed_path,
-                        Some(
-                            write
-                                .parsed
-                                .plugin_key
-                                .as_deref()
-                                .map(plugin_storage_archive_file_id)
-                                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string()),
-                        ),
+                        Some(file_id),
                         Some(write.data),
                         context,
                         &mut || ctx.functions().call_uuid_v7().to_string(),
@@ -2304,6 +2322,7 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                 }
             }
         } else {
+            let file_id = fast_file_write_id(&write, ctx);
             let context = FilesystemRowContext {
                 branch_id: active_branch_id.clone(),
                 global: false,
@@ -2311,12 +2330,6 @@ pub(crate) async fn execute_fast_lix_file_path_writes(
                 file_id: None,
                 metadata: write.metadata,
             };
-            let file_id = write
-                .parsed
-                .plugin_key
-                .as_deref()
-                .map(plugin_storage_archive_file_id)
-                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
             let mut plan = plan_parsed_file_path_write_with_resolvers(
                 &mut path_resolvers,
                 write.parsed.parsed_path,
@@ -2494,6 +2507,7 @@ async fn stage_indexed_file_path_writes(
             );
             staged.add_count(1)?;
         } else {
+            let file_id = fast_file_write_id(&write, ctx);
             let context = FilesystemRowContext {
                 branch_id: active_branch_id.to_string(),
                 global: false,
@@ -2501,12 +2515,6 @@ async fn stage_indexed_file_path_writes(
                 file_id: None,
                 metadata: write.metadata,
             };
-            let file_id = write
-                .parsed
-                .plugin_key
-                .as_deref()
-                .map(plugin_storage_archive_file_id)
-                .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string());
             let mut plan = plan_parsed_file_path_write_with_resolvers(
                 indexed
                     .path_resolvers
@@ -2816,6 +2824,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
 }
 
 struct FastLixFilePathWrite {
+    id: Option<String>,
     parsed: ParsedFileWritePath,
     data: crate::Blob,
     metadata: Option<TransactionJson>,
@@ -2824,6 +2833,7 @@ struct FastLixFilePathWrite {
 
 fn parse_fast_lix_file_path_writes(
     writes: Vec<(
+        Option<String>,
         String,
         crate::Blob,
         Option<TransactionJson>,
@@ -2832,16 +2842,40 @@ fn parse_fast_lix_file_path_writes(
 ) -> std::result::Result<Vec<FastLixFilePathWrite>, LixError> {
     writes
         .into_iter()
-        .map(|(path, data, metadata, splice_provenance)| {
+        .map(|(id, path, data, metadata, splice_provenance)| {
+            let parsed = parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
+                .map_err(crate::sql2::error::datafusion_error_to_lix_error)?;
+            if let (Some(id), Some(plugin_key)) = (id.as_deref(), parsed.plugin_key.as_deref())
+                && id != plugin_storage_archive_file_id(plugin_key)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "plugin archive file id must match its reserved storage identity",
+                ));
+            }
             Ok(FastLixFilePathWrite {
-                parsed: parse_file_upsert_path(&path, TransactionWriteOperation::Insert)
-                    .map_err(crate::sql2::error::datafusion_error_to_lix_error)?,
+                id,
+                parsed,
                 data,
                 metadata,
                 splice_provenance,
             })
         })
         .collect()
+}
+
+fn fast_file_write_id(write: &FastLixFilePathWrite, ctx: &dyn SqlWriteExecutionContext) -> String {
+    write
+        .id
+        .clone()
+        .or_else(|| {
+            write
+                .parsed
+                .plugin_key
+                .as_deref()
+                .map(plugin_storage_archive_file_id)
+        })
+        .unwrap_or_else(|| ctx.functions().call_uuid_v7().to_string())
 }
 
 fn attach_fast_file_write_metadata(

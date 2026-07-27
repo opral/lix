@@ -5034,10 +5034,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_multi_row_lix_file_id_path_data_is_not_path_data_fast_shape() {
+    async fn execute_sql_multi_row_lix_file_id_path_data_uses_fast_shape() {
         let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
 
-        let error = execute_write_sql_trace(
+        let (result, path) = execute_write_sql_trace(
             &mut ctx,
             "INSERT INTO lix_file (id, path, data) \
              VALUES ('file-a', '/a.md', X'61'), ('file-b', '/b.md', X'62')",
@@ -5045,16 +5045,53 @@ mod tests {
             WriteExecutorMode::ForceFast,
         )
         .await
-        .expect_err("id/path/data is outside the narrow path/data fast shape");
+        .expect("id/path/data should use the capability-based file fast path");
 
-        assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
-        assert_eq!(scans.load(Ordering::SeqCst), 0);
-        assert!(
-            staged_writes
-                .lock()
-                .expect("staged writes lock")
-                .deltas
-                .is_empty()
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let mut ids = overlay
+            .visible_semantic_rows(false, "lix_file_descriptor")
+            .into_iter()
+            .map(|row| row.entity_pk)
+            .collect::<Vec<_>>();
+        ids.sort();
+        assert_eq!(ids, vec!["[\"file-a\"]", "[\"file-b\"]"]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_lix_file_id_path_data_metadata_uses_fast_shape() {
+        let (mut ctx, staged_writes, scans) = counting_write_context(vec![]);
+
+        let (result, path) = execute_write_sql_trace(
+            &mut ctx,
+            "INSERT INTO lix_file (id, path, data, lixcol_metadata) \
+             VALUES ('file-a', '/a.md', X'61', '{\"source\":\"test\"}')",
+            &[],
+            WriteExecutorMode::ForceFast,
+        )
+        .await
+        .expect("id/path/data/metadata should use the capability-based file fast path");
+
+        assert_eq!(path, WriteExecutorPath::Fast);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(scans.load(Ordering::SeqCst), 1);
+        let staged_writes = staged_writes.lock().expect("staged writes lock");
+        assert_eq!(staged_writes.deltas.len(), 1);
+        let overlay = staged_writes.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_rows.len(), 1);
+        assert_eq!(descriptor_rows[0].entity_pk, "[\"file-a\"]");
+        assert_eq!(
+            descriptor_rows[0].metadata.as_deref(),
+            Some(r#"{"source":"test"}"#)
         );
     }
 
