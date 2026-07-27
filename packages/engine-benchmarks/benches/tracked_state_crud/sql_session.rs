@@ -82,6 +82,10 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
             untracked_fixture,
             dir,
         )),
+        #[cfg(feature = "slatedb")]
+        ProfileStorage::SlateDB { .. } => {
+            unreachable!("SlateDB is currently profiled through the transaction CRUD layer")
+        }
     }
 }
 

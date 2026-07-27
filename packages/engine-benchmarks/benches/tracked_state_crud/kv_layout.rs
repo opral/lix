@@ -228,6 +228,10 @@ fn profile_storage(profile: StorageProfile) -> ProfileStorage {
             storage: StorageAdapter::new(storage),
             _dir: dir,
         },
+        #[cfg(feature = "slatedb")]
+        RawProfileStorage::SlateDB { .. } => {
+            unreachable!("SlateDB is currently profiled through the transaction CRUD layer")
+        }
     }
 }
 
