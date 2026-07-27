@@ -46,6 +46,11 @@ struct TrackedStateIdentity {
     entity_pk: EntityPk,
 }
 
+struct TrackedStateRowWinner {
+    identity: TrackedStateIdentity,
+    file_delete_cascade: bool,
+}
+
 /// Factory for tracked-state readers, root writers, and commit-root rebuilders.
 ///
 /// Tracked state is stored as content-addressed roots. Branch refs
@@ -257,19 +262,19 @@ where
         let changes = self.load_and_validate_diff_row_changes(&row_refs).await?;
         let mut validation_cache = DiffCommitRootValidationCache::new();
         for (row, expected_commit_id) in rows {
-            let change_created_at = changes
-                .get(&row.change_id)
-                .map(|change| change.created_at)
-                .ok_or_else(|| {
-                    LixError::unknown(format!(
-                        "tracked-state diff row references missing changelog change '{}'",
-                        row.change_id
-                    ))
-                })?;
+            let change = changes.get(&row.change_id).ok_or_else(|| {
+                LixError::unknown(format!(
+                    "tracked-state diff row references missing changelog change '{}'",
+                    row.change_id
+                ))
+            })?;
+            let winner_identity = tracked_state_winner_identity_for_diff_row(row, change)?;
             self.validate_diff_row_commit_root_membership(
                 row,
                 expected_commit_id,
-                change_created_at,
+                &winner_identity.identity,
+                winner_identity.file_delete_cascade,
+                change.created_at,
                 &mut validation_cache,
             )
             .await?;
@@ -328,10 +333,11 @@ where
         &mut self,
         row: &TrackedStateDiffRow,
         root_commit_id: &str,
+        winner_identity: &TrackedStateIdentity,
+        file_delete_cascade: bool,
         change_created_at: crate::common::LixTimestamp,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
-        let identity = tracked_state_identity_from_diff_row(row)?;
         let key = TrackedStateKey {
             schema_key: row.schema_key.clone(),
             file_id: row.file_id.clone(),
@@ -353,18 +359,25 @@ where
             }
 
             let winner_change_id = self
-                .load_cached_commit_ref_winner(&current_commit_id, &identity, cache)
+                .load_cached_commit_ref_winner(&current_commit_id, winner_identity, cache)
                 .await?;
             if let Some(winner_change_id) = winner_change_id {
-                if winner_change_id != row.change_id {
+                if winner_change_id == row.change_id {
+                    self.validate_diff_row_created_at(
+                        row,
+                        &key,
+                        &current_commit_id,
+                        change_created_at,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                if !file_delete_cascade {
                     return Err(LixError::unknown(format!(
                         "tracked-state diff row references changelog change '{}' that is not the first-parent winner for commit '{}' and identity {:?}",
-                        row.change_id, root_commit_id, identity
+                        row.change_id, root_commit_id, winner_identity
                     )));
                 }
-                self.validate_diff_row_created_at(row, &key, &current_commit_id, change_created_at)
-                    .await?;
-                return Ok(());
             }
 
             let metadata = self
@@ -379,7 +392,7 @@ where
             let Some(parent) = metadata.parent_roots.first() else {
                 return Err(LixError::unknown(format!(
                     "tracked-state diff row references changelog change '{}' that is not the first-parent winner for commit '{}' and identity {:?}",
-                    row.change_id, root_commit_id, identity
+                    row.change_id, root_commit_id, winner_identity
                 )));
             };
             let parent_value = self
@@ -388,7 +401,9 @@ where
             if parent_value.as_ref() != Some(&row_value) {
                 return Err(LixError::unknown(format!(
                     "tracked-state commit-root row for commit '{}' does not match parent root '{}' for inherited identity {:?}",
-                    root_commit_id, parent.commit_id, identity
+                    root_commit_id,
+                    parent.commit_id,
+                    tracked_state_identity_from_key(&key)
                 )));
             }
             current_commit_id = parent.commit_id.to_string();
@@ -824,6 +839,7 @@ where
         let winners = self
             .load_cached_commit_ref_winners(commit_id, &mut cache)
             .await?;
+        let file_delete_cascades = self.load_file_delete_cascade_winners(&winners).await?;
         for (identity, change_id) in &winners {
             if !tracked_state_identity_matches_tree_request(identity, request) {
                 continue;
@@ -862,6 +878,16 @@ where
                     identity, parent.commit_id
                 )));
             };
+            if let Some(file_id) = parent_key.file_id.as_ref()
+                && let Some(cascade_change_id) = file_delete_cascades.get(file_id)
+            {
+                if value.deleted && &value.change_id == cascade_change_id {
+                    continue;
+                }
+                return Err(LixError::unknown(format!(
+                    "tracked-state commit-root for commit '{commit_id}' does not apply file descriptor cascade change '{cascade_change_id}' to inherited identity {identity:?}"
+                )));
+            }
             if *value != &parent_value {
                 return Err(LixError::unknown(format!(
                     "tracked-state commit-root for commit '{commit_id}' does not preserve inherited identity {:?} from parent '{}'",
@@ -870,6 +896,48 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn load_file_delete_cascade_winners(
+        &mut self,
+        winners: &HashMap<TrackedStateIdentity, ChangeId>,
+    ) -> Result<HashMap<String, ChangeId>, LixError> {
+        let mut candidates = winners
+            .iter()
+            .filter_map(|(identity, change_id)| {
+                if identity.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || identity.file_id.is_some() {
+                    return None;
+                }
+                Some((identity.entity_pk.as_single_string_owned(), *change_id))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return Ok(HashMap::new());
+        }
+        candidates.sort_by_key(|(_, change_id)| *change_id);
+        let change_ids = candidates
+            .iter()
+            .map(|(_, change_id)| *change_id)
+            .collect::<Vec<_>>();
+        let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
+        let changes = changelog_reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &change_ids,
+            })
+            .await?;
+        let mut cascades = HashMap::new();
+        for ((file_id, change_id), change) in candidates.into_iter().zip(changes.entries) {
+            let file_id = file_id?;
+            let Some(change) = change else {
+                return Err(LixError::unknown(format!(
+                    "file descriptor winner references missing changelog change '{change_id}'"
+                )));
+            };
+            if change.snapshot.is_none() {
+                cascades.insert(file_id, change_id);
+            }
+        }
+        Ok(cascades)
     }
 
     /// Batched payload-slot load for diff's cross-change equality fallback.
@@ -2051,15 +2119,7 @@ fn validate_diff_row_against_changelog(
             row.change_id
         )));
     };
-    if change.schema_key != row.schema_key
-        || change.file_id != row.file_id
-        || change.entity_pk != row.entity_pk
-    {
-        return Err(LixError::unknown(format!(
-            "tracked-state diff row for change '{}' does not match changelog change identity",
-            row.change_id
-        )));
-    }
+    tracked_state_winner_identity_for_diff_row(row, change)?;
     if row.deleted != change.snapshot.is_none() {
         return Err(LixError::unknown(format!(
             "tracked-state diff row for change '{}' deleted flag does not match changelog snapshot",
@@ -2075,14 +2135,49 @@ fn validate_diff_row_against_changelog(
     Ok(())
 }
 
-fn tracked_state_identity_from_diff_row(
+fn tracked_state_winner_identity_for_diff_row(
     row: &TrackedStateDiffRow,
-) -> Result<TrackedStateIdentity, LixError> {
-    Ok(TrackedStateIdentity {
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        entity_pk: row.entity_pk.clone(),
-    })
+    change: &ChangeRecord,
+) -> Result<TrackedStateRowWinner, LixError> {
+    if change.schema_key == row.schema_key
+        && change.file_id == row.file_id
+        && change.entity_pk == row.entity_pk
+    {
+        return Ok(TrackedStateRowWinner {
+            identity: TrackedStateIdentity {
+                schema_key: row.schema_key.clone(),
+                file_id: row.file_id.clone(),
+                entity_pk: row.entity_pk.clone(),
+            },
+            file_delete_cascade: false,
+        });
+    }
+    if change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+        && change.file_id.is_none()
+        && change.snapshot.is_none()
+        && row.deleted
+    {
+        let file_id = change.entity_pk.as_single_string().map_err(|error| {
+            LixError::unknown(format!(
+                "tracked-state cascade change '{}' has invalid file descriptor identity: {error}",
+                row.change_id
+            ))
+        })?;
+        if row.file_id.as_deref() == Some(file_id) {
+            return Ok(TrackedStateRowWinner {
+                identity: TrackedStateIdentity {
+                    schema_key: change.schema_key.clone(),
+                    file_id: None,
+                    entity_pk: change.entity_pk.clone(),
+                },
+                file_delete_cascade: true,
+            });
+        }
+    }
+    Err(LixError::unknown(format!(
+        "tracked-state diff row for change '{}' does not match changelog change identity",
+        row.change_id
+    )))
 }
 
 fn tracked_state_identity_from_key(key: &TrackedStateKey) -> TrackedStateIdentity {
@@ -4249,12 +4344,56 @@ mod tests {
         .await
         .expect("recreate root should write");
 
+        for commit_id in ["delete", "recreate"] {
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("rebuild read should open");
+            let mut writes = storage.new_write_set();
+            tracked_state
+                .root_rebuilder(&read, &mut writes)
+                .rebuild_commit_root_at(commit_id)
+                .await
+                .expect("descriptor cascade root should rebuild and pass its staged audit");
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("rebuilt descriptor cascade root should commit");
+        }
+
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("verification read should open");
-        let rows = tracked_state
-            .reader(read)
+        let mut reader = tracked_state.reader(read);
+        reader
+            .validate_commit_root_against_changelog("delete")
+            .await
+            .expect("delete root cascade should pass the full changelog audit");
+        reader
+            .validate_commit_root_against_changelog("recreate")
+            .await
+            .expect("inherited cascade should pass the full changelog audit");
+        let diff = reader
+            .diff_commits(
+                "initial",
+                "delete",
+                &TrackedStateDiffRequest {
+                    filter: crate::tracked_state::TrackedStateFilter {
+                        schema_keys: vec!["test_schema".to_string()],
+                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .expect("diff should recognize descriptor-driven semantic tombstones");
+        assert_eq!(diff.entries.len(), 1);
+        assert_eq!(
+            diff.entries[0].kind,
+            crate::tracked_state::TrackedStateDiffKind::Removed
+        );
+        let rows = reader
             .scan_rows_at_commit(
                 "recreate",
                 &TrackedStateScanRequest {
