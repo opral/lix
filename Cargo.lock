@@ -3272,11 +3272,14 @@ dependencies = [
  "bytes",
  "clap",
  "comfy-table",
+ "lix_rocksdb_storage",
  "lix_sdk",
+ "plugin_git_text_v2",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
+ "zip",
 ]
 
 [[package]]

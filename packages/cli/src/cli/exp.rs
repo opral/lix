@@ -9,7 +9,7 @@ pub struct ExpCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ExpSubcommand {
-    /// Replay git history into a Lix artifact.
+    /// Replay Git history into a RocksDB-backed Lix database.
     GitReplay(ExpGitReplayArgs),
 }
 
@@ -19,15 +19,15 @@ pub struct ExpGitReplayArgs {
     #[arg(long, value_hint = ValueHint::DirPath)]
     pub repo_path: PathBuf,
 
-    /// Output .lix path.
-    #[arg(long, value_hint = ValueHint::FilePath)]
-    pub output_lix_path: PathBuf,
+    /// Empty output directory for the replayed RocksDB database.
+    #[arg(long, value_hint = ValueHint::DirPath)]
+    pub output_rocksdb_path: PathBuf,
 
-    /// Branch/ref to replay from (use '*' to replay commits reachable from all refs).
+    /// One branch or ref whose first-parent history will be replayed.
     #[arg(long, default_value = "main")]
     pub branch: String,
 
-    /// Start replay from this commit (inclusive).
+    /// Start replay from this commit (inclusive). Its parent tree is seeded before timed replay.
     #[arg(long)]
     pub from_commit: Option<String>,
 
@@ -39,19 +39,11 @@ pub struct ExpGitReplayArgs {
     #[arg(long, default_value_t = false)]
     pub verify_state: bool,
 
-    /// Overwrite output files if they already exist.
+    /// Replace an existing RocksDB output directory and output files.
     #[arg(long, default_value_t = false)]
     pub force: bool,
 
     /// Write per-commit replay profiling data as JSON.
     #[arg(long, value_hint = ValueHint::FilePath)]
     pub profile_json: Option<PathBuf>,
-
-    /// Write SQL tracing data as JSON.
-    #[arg(long, value_hint = ValueHint::FilePath)]
-    pub trace_sql_json: Option<PathBuf>,
-
-    /// Trace only the replayed commit matching this full SHA or unique SHA prefix.
-    #[arg(long)]
-    pub trace_commit: Option<String>,
 }

@@ -22,6 +22,8 @@ path = "src/main.rs"
 
 [dependencies]
 lix_sdk = { workspace = true }
+lix_rocksdb_storage = { workspace = true }
+plugin_git_text_v2 = { path = "../../plugins/text-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 clap = { version = "4.5.31", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
@@ -31,3 +33,4 @@ base64 = "0.22"
 bytes = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt"] }
+zip = { version = "8", default-features = false }
