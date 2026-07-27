@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest as _, Sha256};
+use tracing::Instrument as _;
 
 use crate::common::RequestBlobSpliceProvenance;
 use crate::wasm::{
@@ -1317,49 +1318,73 @@ async fn drain_file_transition_changes_inner(
                 transition.changes,
                 limits.max_page_bytes,
             )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_drain_next_page"
+            ))
             .await?
         else {
             validator.accept_eof();
             break;
         };
-        validator.accept_page(&page).map_err(|error| {
-            invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
+        tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_drain_prevalidate_page"
+        )
+        .in_scope(|| {
+            validator.accept_page(&page).map_err(|error| {
+                invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
+            })?;
+            prevalidate_change_page(&page, schemas, &mut budget)
         })?;
-        prevalidate_change_page(&page, schemas, &mut budget)?;
         local_counters.packet_pages = local_counters.packet_pages.saturating_add(1);
         local_counters.packet_records = local_counters
             .packet_records
             .saturating_add(page.changes.changes.len() as u64);
 
         let outputs = page.outputs;
-        for change in page.changes.changes {
-            let resolved = match change {
-                WasmEntityChange::Delete(key) => WasmEntityChange::Delete(key),
-                WasmEntityChange::Upsert { entity, effect } => {
-                    let snapshot = resolve_guest_bytes(
-                        actor,
-                        transition.transition,
-                        outputs,
-                        entity.snapshot_content,
-                        &mut budget,
-                        &mut local_counters,
-                    )
-                    .await?;
-                    let snapshot = canonicalize_v2_snapshot(&snapshot)?;
-                    WasmEntityChange::Upsert {
-                        entity: WasmEntity {
-                            key: entity.key,
-                            snapshot_content: WasmHostBytes::Inline(snapshot),
-                        },
-                        effect,
+        async {
+            for change in page.changes.changes {
+                let resolved = match change {
+                    WasmEntityChange::Delete(key) => WasmEntityChange::Delete(key),
+                    WasmEntityChange::Upsert { entity, effect } => {
+                        let snapshot = resolve_guest_bytes(
+                            actor,
+                            transition.transition,
+                            outputs,
+                            entity.snapshot_content,
+                            &mut budget,
+                            &mut local_counters,
+                        )
+                        .await?;
+                        let snapshot = canonicalize_v2_snapshot(&snapshot)?;
+                        WasmEntityChange::Upsert {
+                            entity: WasmEntity {
+                                key: entity.key,
+                                snapshot_content: WasmHostBytes::Inline(snapshot),
+                            },
+                            effect,
+                        }
                     }
-                }
-            };
-            changes.push(resolved);
+                };
+                changes.push(resolved);
+            }
+            Ok::<(), LixError>(())
         }
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_drain_resolve_page"
+        ))
+        .await?;
     }
 
-    let runtime_counters = actor.finish_transition(transition.transition).await?;
+    let runtime_counters = actor
+        .finish_transition(transition.transition)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_drain_finish"
+        ))
+        .await?;
     Ok(ValidatedFileTransition {
         document: transition.document,
         changes: WasmEntityChanges { changes },
@@ -2874,6 +2899,39 @@ mod tests {
         assert!(drained.counters.attachment_reads > 1);
         assert_eq!(drained.counters.source_read_calls, 2);
         assert!(actor.finished);
+    }
+
+    #[tokio::test]
+    async fn change_drain_rejects_duplicate_keys_across_pages() {
+        let duplicate = WasmChangePage {
+            format_version: PACKET_FORMAT_V1,
+            changes: WasmEntityChanges {
+                changes: vec![WasmEntityChange::Delete(key("row"))],
+            },
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            change_pages: [duplicate.clone(), duplicate].into(),
+            ..FakeActor::default()
+        };
+        let transition = WasmFileTransition {
+            transition: WasmTransitionHandle(1),
+            document: WasmDocumentHandle(2),
+            changes: WasmChangeCursorHandle(3),
+        };
+
+        let error = drain_file_transition_changes(
+            &mut actor,
+            transition,
+            &V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap(),
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect_err("the engine drain must remain the transition-wide uniqueness authority");
+
+        assert!(error.message.contains("only once"), "{error:?}");
+        assert_eq!(actor.discarded_transitions, vec![transition.transition]);
+        assert!(!actor.finished);
     }
 
     #[tokio::test]

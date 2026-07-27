@@ -773,7 +773,8 @@ impl WasmChangeDrainValidator {
         if page.changes.changes.is_empty() {
             return Err(invalid_param("a v2 change page must not be empty"));
         }
-        page.changes.validate()?;
+        // The transition-wide `seen` set below also catches duplicates within
+        // this page. Do not build a second page-local tree for the same keys.
         self.pages = self
             .pages
             .checked_add(1)

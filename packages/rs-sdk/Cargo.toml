@@ -55,7 +55,13 @@ checkpoint_backends = [
   "dep:tracing",
   "dep:tracing-subscriber",
 ]
-default_wasm_runtime = ["dep:blake3", "dep:lru", "dep:wasmtime", "dep:wasmtime-wasi"]
+default_wasm_runtime = [
+  "dep:blake3",
+  "dep:lru",
+  "dep:tracing",
+  "dep:wasmtime",
+  "dep:wasmtime-wasi",
+]
 local_filesystem = ["dep:lix_local_filesystem", "lix_local_filesystem/rocksdb"]
 sqlite = ["dep:lix_sqlite_storage", "dep:rusqlite", "dep:tempfile"]
 
