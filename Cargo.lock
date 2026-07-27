@@ -3370,6 +3370,13 @@ name = "lix_order_key"
 version = "0.8.4"
 
 [[package]]
+name = "lix_plugin_api_v2"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "lix_rocksdb_storage"
 version = "0.8.4"
 dependencies = [
@@ -4221,17 +4228,18 @@ name = "plugin_csv_v2"
 version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
+ "lix_plugin_api_v2",
  "serde_json",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "plugin_excalidraw_v2"
 version = "0.8.4"
 dependencies = [
+ "base64 0.22.1",
  "lix_order_key",
+ "lix_plugin_api_v2",
  "serde_json",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -4240,8 +4248,8 @@ version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "lix_plugin_api_v2",
  "serde_json",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]
@@ -4252,12 +4260,12 @@ dependencies = [
  "chardetng",
  "encoding_rs",
  "lix_order_key",
+ "lix_plugin_api_v2",
  "markdown",
  "markdown-syntax",
  "serde",
  "serde_json",
  "uuid",
- "wit-bindgen 0.57.1",
 ]
 
 [[package]]

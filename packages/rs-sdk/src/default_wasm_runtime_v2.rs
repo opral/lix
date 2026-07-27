@@ -212,7 +212,10 @@ struct WasmtimeV2Actor {
 
 pub(super) mod bindings {
     wasmtime::component::bindgen!({
-        path: "../engine/wit/v2",
+        // This package-local WIT mirror is deliberately kept inside the
+        // `lix_sdk` crate archive. CI checks it against the public author API
+        // contract and the engine's host-binding mirror.
+        path: "wit/v2",
         world: "plugin",
         with: {
             "lix:plugin/host.transition-budget": super::TransitionBudgetResource,

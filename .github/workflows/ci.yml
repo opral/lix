@@ -92,6 +92,40 @@ jobs:
         if: matrix.task == 'test'
         run: cargo test --profile test --workspace --all-features
 
+      - name: Verify the packaged plugin API contract
+        if: matrix.task == 'test'
+        run: |
+          cmp -s \
+            packages/plugin-api/wit/lix-plugin-v2.wit \
+            packages/engine/wit/v2/lix-plugin-v2.wit \
+            || {
+              diff -u \
+                packages/plugin-api/wit/lix-plugin-v2.wit \
+                packages/engine/wit/v2/lix-plugin-v2.wit || :
+              exit 1
+            }
+          cmp -s \
+            packages/plugin-api/wit/lix-plugin-v2.wit \
+            packages/rs-sdk/wit/v2/lix-plugin-v2.wit \
+            || {
+              diff -u \
+                packages/plugin-api/wit/lix-plugin-v2.wit \
+                packages/rs-sdk/wit/v2/lix-plugin-v2.wit || :
+              exit 1
+            }
+          cargo package --locked -p lix_plugin_api_v2
+          # `lix_sdk` keeps Component-plugin artifact tests and unpublished
+          # workspace dependencies. Inspect its archive file list instead of
+          # preparing it for crates.io; this proves the local WIT input ships.
+          cargo package --locked --no-verify -p lix_sdk --list |
+            rg '^wit/v2/lix-plugin-v2\.wit$'
+
+      - name: Build a downstream Component plugin through the public API
+        if: matrix.task == 'test'
+        run: |
+          rustup target add wasm32-wasip2
+          cargo build --release -p plugin_csv_v2 --target wasm32-wasip2
+
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test
     runs-on: blacksmith-32vcpu-ubuntu-2404

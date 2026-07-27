@@ -1890,9 +1890,10 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
     .expect("JSON v2 plugin should install");
 
     let csv = csv_ten_mib_fixture();
-    let (json_flat, _, _) = json_ten_mib_flat_fixture();
+    let (json_flat, json_edit_offset, _) = json_ten_mib_flat_fixture();
+    let nested_prefix = br#"{"outer":"#;
     let mut json_nested = Vec::with_capacity(json_flat.len() + 10);
-    json_nested.extend_from_slice(br#"{"outer":"#);
+    json_nested.extend_from_slice(nested_prefix);
     json_nested.extend_from_slice(&json_flat);
     json_nested.push(b'}');
 
@@ -1907,35 +1908,47 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
     }
     seed.close().await.expect("seed workspace should close");
 
-    for (label, path, expected) in [
-        ("csv-220k-rows", "/cold-materialized.csv", csv.as_slice()),
+    // An exact file read deliberately returns durable materialized bytes without
+    // waking Wasm. Measure the operation that genuinely needs a cold actor:
+    // hydrate the materialized semantic base, then apply one localized ordinary
+    // byte write. Each sample toggles the same valid scalar byte, so every
+    // reopen has a new accepted base and cannot become a no-op.
+    for (label, path, initial, edit_offset) in [
+        ("csv-220k-rows", "/cold-materialized.csv", csv.as_slice(), 0),
         (
             "json-flat-39870-properties",
             "/cold-materialized-flat.json",
             json_flat.as_slice(),
+            json_edit_offset,
         ),
         (
             "json-nested-39870-properties",
             "/cold-materialized-nested.json",
             json_nested.as_slice(),
+            nested_prefix.len() + json_edit_offset,
         ),
     ] {
         let mut samples = Vec::with_capacity(SAMPLES);
+        let mut accepted = initial.to_vec();
         for _ in 0..SAMPLES {
             let lix = open_lix(OpenLixOptions::new(storage.clone()))
                 .await
                 .expect("cold benchmark workspace should reopen");
             lix.reset_plugin_v2_transition_counters();
+            let mut after = accepted.clone();
+            after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
             let started = Instant::now();
-            // The file bytes are already the durable materialized view. A
-            // cold workspace read must use that blob directly rather than
-            // instantiate a plugin actor and reconstruct it from entities.
+            write_file(&lix, path, after.clone())
+                .await
+                .unwrap_or_else(|error| panic!("cold write for {path} should succeed: {error:?}"));
+            let elapsed = started.elapsed();
             let actual = read_file(&lix, path)
                 .await
-                .unwrap_or_else(|error| panic!("cold read for {path} should succeed: {error:?}"))
-                .unwrap_or_else(|| panic!("cold read for {path} should return materialized bytes"));
-            let elapsed = started.elapsed();
-            assert_eq!(actual, expected, "cold read must remain byte-exact");
+                .unwrap_or_else(|error| {
+                    panic!("cold write result for {path} should read: {error:?}")
+                })
+                .unwrap_or_else(|| panic!("cold write result for {path} should exist"));
+            assert_eq!(actual, after, "cold write must remain byte-exact");
             samples.push(ColdMaterializedOpenSample {
                 elapsed,
                 counters: lix.plugin_v2_transition_counters(),
@@ -1943,8 +1956,9 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
             lix.close()
                 .await
                 .expect("cold benchmark workspace should close");
+            accepted = after;
         }
-        report_cold_materialized_open(label, expected.len(), &samples);
+        report_cold_materialized_open(label, accepted.len(), &samples);
     }
 }
 

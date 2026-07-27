@@ -1,672 +1,181 @@
-#![allow(clippy::same_length_and_capacity)]
+#![allow(dead_code, unused_qualifications)]
 
-wit_bindgen::generate!({
-    path: "../../packages/engine/wit/v2",
-    world: "plugin",
-});
+//! Markdown's author-facing Component-v2 implementation.
+//!
+//! Markdown keeps its GFM parser, lexical representation, and persistent tree.
+//! The shared API package lowers its semantic transitions and deterministic
+//! entity conflict resolver to Component v2.
 
 use crate::core::{
-    ByteEdit as CoreByteEdit, Document as CoreDocument, EntityChange as CoreEntityChange,
-    EntityRecord as CoreEntityRecord, IdNamespace as CoreIdNamespace,
-    InputSplice as CoreInputSplice, PluginError as CorePluginError,
+    ByteEdit as CoreByteEdit, ChangeEffect as CoreChangeEffect, Document as CoreDocument,
+    EntityChange as CoreEntityChange, EntityRecord as CoreEntityRecord,
+    IdNamespace as CoreIdNamespace, InputSplice as CoreInputSplice, PluginError as CorePluginError,
 };
-use crate::packet::{
-    ChangeStream, ConflictResolution, ConflictSnapshot, EntityConflict, FORMAT_VERSION,
-    ResolutionStream, decode_change_page, decode_conflict_page, decode_entity_page,
-};
-use exports::lix::plugin::api::{
-    ByteOutputs, ChangeCursor, ChangePage, Document, EditCursor, EditPage, EntityTransition,
-    EntityUpdate, FileTransition, FileUpdate, Guest, GuestByteOutputs, GuestChangeCursor,
-    GuestDocument, GuestEditCursor, GuestResolutionCursor, InputBytes, OpenEntitiesInput,
-    OpenFileInput, OutputBytes, OutputRange, OutputSplice, PluginError, ResolutionCursor,
-    ResolutionPage,
-};
-use lix::plugin::host::{ByteSource, ByteSources, PacketSource, SourceError, TransitionBudget};
-use std::cell::RefCell;
-use std::collections::VecDeque;
-use std::sync::Arc;
+use lix_plugin_api_v2 as sdk;
 
-struct MarkdownGuest;
+struct MarkdownPlugin;
 
-#[derive(Debug)]
-struct MarkdownDocument(CoreDocument);
+impl sdk::FormatPlugin for MarkdownPlugin {
+    type Document = CoreDocument;
 
-#[derive(Debug)]
-struct MarkdownChangeCursor {
-    state: RefCell<ChangeCursorState>,
-}
+    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+        const MAX_HEURISTIC_SNAPSHOT_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug)]
-struct ChangeCursorState {
-    stream: ChangeStream,
-    pending: Option<CoreEntityChange>,
-    eof: bool,
-}
-
-#[derive(Debug)]
-struct MarkdownEditCursor {
-    state: RefCell<EditCursorState>,
-}
-
-#[derive(Debug)]
-struct EditCursorState {
-    edits: VecDeque<CoreByteEdit>,
-    eof: bool,
-}
-
-/// The static resolver owns its lazy conflict source. It reads at most one
-/// bounded host page when its result cursor is drained, rather than collecting
-/// every conflict in a large Markdown file before returning the cursor.
-struct MarkdownResolutionCursor {
-    state: RefCell<ResolutionCursorState>,
-}
-
-struct ResolutionCursorState {
-    source: PacketSource,
-    pending: ResolutionStream,
-    source_eof: bool,
-    eof: bool,
-}
-
-#[derive(Debug)]
-struct MarkdownByteOutputs {
-    values: Vec<Arc<Vec<u8>>>,
-}
-
-fn plugin_error(message: impl Into<String>) -> PluginError {
-    PluginError::InvalidInput(message.into())
-}
-
-fn core_error(error: CorePluginError) -> PluginError {
-    match error {
-        CorePluginError::InvalidInput(message) => PluginError::InvalidInput(message),
-        CorePluginError::Internal(message) => PluginError::Internal(message),
-    }
-}
-
-fn source_error(error: SourceError) -> PluginError {
-    match error {
-        SourceError::InvalidRange => plugin_error("invalid byte-source range"),
-        SourceError::RecordTooLarge(size) => PluginError::RecordTooLarge(size),
-        SourceError::LimitExceeded(message) => PluginError::LimitExceeded(message),
-        SourceError::DeadlineExceeded => PluginError::DeadlineExceeded,
-        SourceError::Unavailable(message) => PluginError::Internal(message),
-    }
-}
-
-fn read_source(source: &ByteSource, budget: &TransitionBudget) -> Result<Vec<u8>, PluginError> {
-    read_source_range(source, budget, 0, source.len())
-}
-
-fn read_source_range(
-    source: &ByteSource,
-    budget: &TransitionBudget,
-    offset: u64,
-    length: u64,
-) -> Result<Vec<u8>, PluginError> {
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| plugin_error("byte-source range overflow"))?;
-    if end > source.len() {
-        return Err(plugin_error("byte-source range exceeds source"));
-    }
-    let mut output = Vec::with_capacity(
-        usize::try_from(length)
-            .map_err(|_| PluginError::LimitExceeded("source is too large".to_owned()))?,
-    );
-    let mut cursor = offset;
-    let page_cap = budget.limits().max_page_bytes.max(1);
-    while cursor < end {
-        let request =
-            u32::try_from((end - cursor).min(u64::from(page_cap))).expect("bounded by u32");
-        let page = source.read(budget, cursor, request).map_err(source_error)?;
-        if page.is_empty() {
-            return Err(PluginError::Internal(
-                "byte source returned an empty page before EOF".to_owned(),
-            ));
-        }
-        if page.len() > usize::try_from(request).expect("u32 fits usize") {
-            return Err(PluginError::Internal(
-                "byte source returned more bytes than requested".to_owned(),
-            ));
-        }
-        cursor += u64::try_from(page.len()).expect("usize fits u64");
-        output.extend_from_slice(&page);
-    }
-    Ok(output)
-}
-
-fn read_attachment(
-    attachments: Option<&ByteSources>,
-    budget: &TransitionBudget,
-    index: u32,
-    offset: u64,
-    length: u64,
-) -> Result<Vec<u8>, PluginError> {
-    let attachments =
-        attachments.ok_or_else(|| plugin_error("packet attachment table is missing"))?;
-    let source_len = attachments.len(index).map_err(source_error)?;
-    let end = offset
-        .checked_add(length)
-        .ok_or_else(|| plugin_error("attachment range overflow"))?;
-    if end > source_len {
-        return Err(plugin_error("attachment range exceeds source"));
-    }
-    let mut output = Vec::with_capacity(
-        usize::try_from(length)
-            .map_err(|_| PluginError::LimitExceeded("attachment is too large".to_owned()))?,
-    );
-    let mut cursor = offset;
-    let page_cap = budget.limits().max_page_bytes.max(1);
-    while cursor < end {
-        let request =
-            u32::try_from((end - cursor).min(u64::from(page_cap))).expect("bounded by u32");
-        let page = attachments
-            .read(budget, index, cursor, request)
-            .map_err(source_error)?;
-        if page.is_empty() {
-            return Err(PluginError::Internal(
-                "attachment returned an empty page before EOF".to_owned(),
-            ));
-        }
-        if page.len() > usize::try_from(request).expect("u32 fits usize") {
-            return Err(PluginError::Internal(
-                "attachment returned more bytes than requested".to_owned(),
-            ));
-        }
-        cursor += u64::try_from(page.len()).expect("usize fits u64");
-        output.extend_from_slice(&page);
-    }
-    Ok(output)
-}
-
-fn drain_entities(
-    source: &PacketSource,
-    budget: &TransitionBudget,
-) -> Result<Vec<CoreEntityRecord>, PluginError> {
-    let mut output = Vec::new();
-    let max_bytes = budget.limits().max_page_bytes.max(1);
-    loop {
-        let Some(page) = source.next(budget, max_bytes).map_err(source_error)? else {
-            break;
+        let Some(b) = conflict.b.as_ref() else {
+            return Ok(sdk::ConflictResolution::Delete);
         };
-        if page.format_version != FORMAT_VERSION {
-            return Err(plugin_error(format!(
-                "unsupported packet version {}",
-                page.format_version
-            )));
+        if conflict.schema_key != crate::NODE_SCHEMA_KEY {
+            return Ok(sdk::ConflictResolution::TakeB);
         }
-        let mut attachment_error = None;
-        let records =
-            decode_entity_page(&page.payload, page.record_count, |index, offset, length| {
-                read_attachment(page.attachments.as_ref(), budget, index, offset, length).map_err(
-                    |error| {
-                        attachment_error = Some(error);
-                        "attachment read failed".to_owned()
-                    },
-                )
-            })
-            .map_err(|error| attachment_error.unwrap_or_else(|| plugin_error(error)))?;
-        output.extend(records);
-    }
-    Ok(output)
-}
-
-fn drain_changes(
-    source: &PacketSource,
-    budget: &TransitionBudget,
-) -> Result<Vec<CoreEntityChange>, PluginError> {
-    let mut output = Vec::new();
-    let max_bytes = budget.limits().max_page_bytes.max(1);
-    loop {
-        let Some(page) = source.next(budget, max_bytes).map_err(source_error)? else {
-            break;
+        let (Some(base), Some(a)) = (&conflict.base, &conflict.a) else {
+            return Ok(sdk::ConflictResolution::TakeB);
         };
-        if page.format_version != FORMAT_VERSION {
-            return Err(plugin_error(format!(
-                "unsupported packet version {}",
-                page.format_version
-            )));
+        if [base, a, b]
+            .into_iter()
+            .any(|snapshot| snapshot.len() > MAX_HEURISTIC_SNAPSHOT_BYTES)
+        {
+            return Ok(sdk::ConflictResolution::TakeB);
         }
-        let mut attachment_error = None;
-        let changes =
-            decode_change_page(&page.payload, page.record_count, |index, offset, length| {
-                read_attachment(page.attachments.as_ref(), budget, index, offset, length).map_err(
-                    |error| {
-                        attachment_error = Some(error);
-                        "attachment read failed".to_owned()
-                    },
-                )
-            })
-            .map_err(|error| attachment_error.unwrap_or_else(|| plugin_error(error)))?;
-        output.extend(changes);
-    }
-    Ok(output)
-}
-
-/// Keep the semantic heuristic deliberately bounded. Plain paragraph snapshots
-/// are normally only a few hundred bytes; a large value should stay on the
-/// zero-copy deterministic `TakeB` path rather than allocating three
-/// arbitrary attachments in guest linear memory.
-const MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES: u64 = 64 * 1024;
-
-fn read_conflict_snapshot(
-    snapshot: &ConflictSnapshot,
-    attachments: Option<&ByteSources>,
-    budget: &TransitionBudget,
-) -> Result<Vec<u8>, PluginError> {
-    match snapshot {
-        ConflictSnapshot::Inline(bytes) => Ok(bytes.clone()),
-        ConflictSnapshot::Attachment {
-            index,
-            offset,
-            length,
-        } => read_attachment(attachments, budget, *index, *offset, *length),
-    }
-}
-
-fn resolve_conflict(
-    conflict: EntityConflict,
-    attachments: Option<&ByteSources>,
-    budget: &TransitionBudget,
-) -> Result<ConflictResolution, PluginError> {
-    // A canonical b tombstone wins without consulting any stale side.
-    // This is deliberately before the schema guard so malformed packets never
-    // emit `TakeB` for an absent value.
-    let Some(b) = conflict.b.as_ref() else {
-        return Ok(ConflictResolution::Delete);
-    };
-
-    // The host will invoke Markdown only for the plugin's own schema. Keeping
-    // this guard makes a malformed/mixed packet converge deterministically
-    // without asking the Markdown parser to interpret a foreign snapshot.
-    if conflict.schema_key != crate::NODE_SCHEMA_KEY {
-        return Ok(ConflictResolution::TakeB);
+        let base = base.read()?;
+        let a = a.read()?;
+        let b = b.read()?;
+        let resolved = CoreDocument::resolve_entity_conflict(
+            Some(base.clone()),
+            Some(a.clone()),
+            Some(b.clone()),
+        );
+        Ok(match resolved {
+            None => sdk::ConflictResolution::Delete,
+            Some(resolved) if resolved == b => sdk::ConflictResolution::TakeB,
+            Some(resolved) if resolved == a => sdk::ConflictResolution::TakeA,
+            Some(resolved) if resolved == base => sdk::ConflictResolution::TakeBase,
+            Some(resolved) => sdk::ConflictResolution::Replace(resolved),
+        })
     }
 
-    let Some(base) = conflict.base.as_ref() else {
-        return Ok(ConflictResolution::TakeB);
-    };
-    let Some(a) = conflict.a.as_ref() else {
-        return Ok(ConflictResolution::TakeB);
-    };
-    if [base, a, b]
-        .into_iter()
-        .any(|snapshot| snapshot.len() > MAX_HEURISTIC_CONFLICT_SNAPSHOT_BYTES)
-    {
-        return Ok(ConflictResolution::TakeB);
-    }
-
-    let base = read_conflict_snapshot(base, attachments, budget)?;
-    let a = read_conflict_snapshot(a, attachments, budget)?;
-    let b = read_conflict_snapshot(b, attachments, budget)?;
-    let resolved =
-        CoreDocument::resolve_entity_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
-    match resolved {
-        None => Ok(ConflictResolution::Delete),
-        // Prefer b for semantically equal snapshots: b is the canonical
-        // fallback and retains its metadata. a and base remain typed choices
-        // for a future Markdown heuristic that selects either exact input.
-        Some(resolved) if resolved == b => Ok(ConflictResolution::TakeB),
-        Some(resolved) if resolved == a => Ok(ConflictResolution::TakeA),
-        Some(resolved) if resolved == base => Ok(ConflictResolution::TakeBase),
-        Some(resolved) => Ok(ConflictResolution::Replace(Arc::new(resolved))),
-    }
-}
-
-fn file_transition(document: CoreDocument, changes: Vec<CoreEntityChange>) -> FileTransition {
-    FileTransition {
-        document: Document::new(MarkdownDocument(document)),
-        changes: ChangeCursor::new(MarkdownChangeCursor {
-            state: RefCell::new(ChangeCursorState {
-                stream: ChangeStream::new(changes),
-                pending: None,
-                eof: false,
-            }),
-        }),
-    }
-}
-
-fn entity_transition(document: CoreDocument, edits: Vec<CoreByteEdit>) -> EntityTransition {
-    EntityTransition {
-        document: Document::new(MarkdownDocument(document)),
-        edits: EditCursor::new(MarkdownEditCursor {
-            state: RefCell::new(EditCursorState {
-                edits: edits.into(),
-                eof: false,
-            }),
-        }),
-    }
-}
-
-impl Guest for MarkdownGuest {
-    type ByteOutputs = MarkdownByteOutputs;
-    type ChangeCursor = MarkdownChangeCursor;
-    type EditCursor = MarkdownEditCursor;
-    type Document = MarkdownDocument;
-    type ResolutionCursor = MarkdownResolutionCursor;
-
-    fn open_file(
-        budget: &TransitionBudget,
-        input: OpenFileInput,
-    ) -> Result<FileTransition, PluginError> {
-        let bytes = read_source(&input.file, budget)?;
-        let namespace = CoreIdNamespace::from_halves(input.ids.high, input.ids.low);
+    fn open_file(input: sdk::OpenFile<'_>) -> sdk::Result<(Self::Document, sdk::Changes)> {
+        let bytes = input.source.read_all()?;
+        let namespace = core_namespace(input.ids)?;
         let (document, changes) =
-            CoreDocument::open_file(bytes, input.descriptor.path.as_deref(), namespace)
+            CoreDocument::open_file(bytes, input.file.path.as_deref(), namespace)
                 .map_err(core_error)?;
-        Ok(file_transition(document, changes))
+        Ok((document, core_changes(changes)))
     }
 
     fn open_entities(
-        budget: &TransitionBudget,
-        input: OpenEntitiesInput,
-    ) -> Result<EntityTransition, PluginError> {
+        mut input: sdk::OpenEntities<'_>,
+    ) -> sdk::Result<(Self::Document, sdk::Edits)> {
         let accepted = input
             .accepted
             .as_ref()
-            .map(|source| read_source(source, budget))
+            .map(sdk::Source::read_all)
             .transpose()?;
-        let records = drain_entities(&input.entities, budget)?;
+        let mut records = Vec::new();
+        while let Some(record) = input.entities.next()? {
+            records.push(core_record(record));
+        }
         let (document, edits) =
             CoreDocument::open_entities(records, accepted).map_err(core_error)?;
-        Ok(entity_transition(document, edits))
-    }
-
-    fn resolve_conflicts(
-        _budget: &TransitionBudget,
-        input: exports::lix::plugin::api::ConflictUpdate,
-    ) -> Result<ResolutionCursor, PluginError> {
-        // Keep the host packet source in the returned cursor. The transition
-        // budget covers this call and all cursor pages, allowing a large file
-        // to resolve one bounded input page at a time.
-        Ok(ResolutionCursor::new(MarkdownResolutionCursor {
-            state: RefCell::new(ResolutionCursorState {
-                source: input.conflicts,
-                pending: ResolutionStream::default(),
-                source_eof: false,
-                eof: false,
-            }),
-        }))
-    }
-}
-
-impl GuestDocument for MarkdownDocument {
-    fn fork(&self) -> Document {
-        Document::new(Self(self.0.fork()))
+        Ok((document, core_edits(edits)))
     }
 
     fn file_changed(
-        &self,
-        budget: &TransitionBudget,
-        update: FileUpdate,
-    ) -> Result<FileTransition, PluginError> {
-        let mut owned = Vec::with_capacity(update.edits.len());
-        for edit in update.edits {
-            let insert = match edit.insert {
-                InputBytes::Inline(bytes) => bytes,
-                InputBytes::AfterRange(range) => {
-                    read_source_range(&update.after, budget, range.offset, range.length)?
-                }
-            };
-            owned.push((edit.offset, edit.delete_len, insert));
-        }
-        let splices = owned
+        document: &Self::Document,
+        update: sdk::FileUpdate<'_>,
+    ) -> sdk::Result<(Self::Document, sdk::Changes)> {
+        let inserts = update
+            .edits
             .iter()
-            .map(|(offset, delete_len, insert)| CoreInputSplice {
-                offset: *offset,
-                delete_len: *delete_len,
-                insert,
-            })
-            .collect::<Vec<_>>();
-        let namespace = CoreIdNamespace::from_halves(update.ids.high, update.ids.low);
-        let (document, changes) = self
-            .0
-            .file_changed(&splices, namespace)
-            .map_err(core_error)?;
-        Ok(file_transition(document, changes))
-    }
-
-    fn entities_changed(
-        &self,
-        budget: &TransitionBudget,
-        update: EntityUpdate,
-    ) -> Result<EntityTransition, PluginError> {
-        let changes = drain_changes(&update.changes, budget)?;
-        let (document, edits) = self.0.entities_changed(changes).map_err(core_error)?;
-        Ok(entity_transition(document, edits))
-    }
-}
-
-impl GuestChangeCursor for MarkdownChangeCursor {
-    fn next(
-        &self,
-        budget: &TransitionBudget,
-        max_bytes: u32,
-    ) -> Result<Option<ChangePage>, PluginError> {
-        let max_record_bytes = budget.limits().max_record_bytes;
-        let mut state = self.state.borrow_mut();
-        if state.eof {
-            return Ok(None);
-        }
-        let page = {
-            let ChangeCursorState {
-                stream, pending, ..
-            } = &mut *state;
-            stream.next_page(pending, max_bytes, max_record_bytes)
-        }
-        .map_err(|error| {
-            if error.contains("record cap") {
-                PluginError::RecordTooLarge(u64::from(max_record_bytes) + 1)
-            } else if error.contains("page cap") {
-                PluginError::RecordTooLarge(u64::from(max_bytes) + 1)
-            } else {
-                plugin_error(error)
-            }
-        })?;
-        let Some(page) = page else {
-            state.eof = true;
-            return Ok(None);
-        };
-        let attachments = if page.attachments.is_empty() {
-            None
-        } else {
-            Some(ByteOutputs::new(MarkdownByteOutputs {
-                values: page.attachments,
-            }))
-        };
-        Ok(Some(ChangePage {
-            format_version: FORMAT_VERSION,
-            record_count: page.record_count,
-            payload: page.payload,
-            attachments,
-        }))
-    }
-}
-
-impl GuestResolutionCursor for MarkdownResolutionCursor {
-    fn next(
-        &self,
-        budget: &TransitionBudget,
-        max_bytes: u32,
-    ) -> Result<Option<ResolutionPage>, PluginError> {
-        let max_record_bytes = budget.limits().max_record_bytes;
-        let mut state = self.state.borrow_mut();
-        if state.eof {
-            return Ok(None);
-        }
-        loop {
-            if let Some(page) = state
-                .pending
-                .next_page(max_bytes, max_record_bytes)
-                .map_err(|error| {
-                    if error.contains("record cap") {
-                        PluginError::RecordTooLarge(u64::from(max_record_bytes) + 1)
-                    } else if error.contains("page cap") {
-                        PluginError::RecordTooLarge(u64::from(max_bytes) + 1)
-                    } else {
-                        plugin_error(error)
-                    }
-                })?
-            {
-                let attachments = if page.attachments.is_empty() {
-                    None
-                } else {
-                    Some(ByteOutputs::new(MarkdownByteOutputs {
-                        values: page.attachments,
-                    }))
-                };
-                return Ok(Some(ResolutionPage {
-                    format_version: FORMAT_VERSION,
-                    record_count: page.record_count,
-                    payload: page.payload,
-                    attachments,
-                }));
-            }
-            if state.source_eof {
-                state.eof = true;
-                return Ok(None);
-            }
-
-            let source_page_cap = budget.limits().max_page_bytes.max(1);
-            let Some(page) = state
-                .source
-                .next(budget, source_page_cap)
-                .map_err(source_error)?
-            else {
-                state.source_eof = true;
-                continue;
-            };
-            if page.format_version != FORMAT_VERSION {
-                return Err(plugin_error(format!(
-                    "unsupported packet version {}",
-                    page.format_version
-                )));
-            }
-            let conflicts =
-                decode_conflict_page(&page.payload, page.record_count).map_err(plugin_error)?;
-            let mut resolutions = Vec::with_capacity(conflicts.len());
-            for conflict in conflicts {
-                let ordinal = conflict.ordinal;
-                let resolution = resolve_conflict(conflict, page.attachments.as_ref(), budget)?;
-                resolutions.push((ordinal, resolution));
-            }
-            state.pending.extend(resolutions);
-        }
-    }
-}
-
-impl GuestEditCursor for MarkdownEditCursor {
-    fn next(
-        &self,
-        budget: &TransitionBudget,
-        max_edits: u32,
-        max_inline_bytes: u32,
-    ) -> Result<Option<EditPage>, PluginError> {
-        const EDIT_METADATA_BYTES: usize = 24;
-        let mut state = self.state.borrow_mut();
-        if state.eof {
-            return Ok(None);
-        }
-        if max_edits == 0 {
-            return Err(PluginError::LimitExceeded(
-                "edit cursor max-edits must be positive".to_owned(),
-            ));
-        }
-        let limits = budget.limits();
-        let record_limit = usize::try_from(limits.max_record_bytes).expect("u32 fits usize");
-        let page_limit = usize::try_from(limits.max_page_bytes).expect("u32 fits usize");
-        if record_limit < EDIT_METADATA_BYTES || page_limit < EDIT_METADATA_BYTES {
-            return Err(PluginError::RecordTooLarge(EDIT_METADATA_BYTES as u64));
-        }
-        let mut edits = Vec::new();
-        let mut outputs = Vec::<Arc<Vec<u8>>>::new();
-        let inline_limit = usize::try_from(max_inline_bytes).expect("u32 fits usize");
-        let mut inline_used = 0usize;
-        let mut page_used = 0usize;
-        for _ in 0..max_edits {
-            let Some(edit) = state.edits.pop_front() else {
-                break;
-            };
-            if page_used + EDIT_METADATA_BYTES > page_limit {
-                state.edits.push_front(edit);
-                break;
-            }
-            let inline_record_len = EDIT_METADATA_BYTES
-                .checked_add(edit.insert.len())
-                .ok_or_else(|| {
-                    PluginError::LimitExceeded("edit record length overflow".to_owned())
-                })?;
-            let next_inline_used = inline_used.checked_add(edit.insert.len()).ok_or_else(|| {
-                PluginError::LimitExceeded("edit inline-byte counter overflow".to_owned())
-            })?;
-            let inline = next_inline_used <= inline_limit
-                && inline_record_len <= record_limit
-                && page_used + inline_record_len <= page_limit;
-            let insert = if inline {
-                inline_used = next_inline_used;
-                page_used += inline_record_len;
-                OutputBytes::Inline(edit.insert.as_ref().clone())
-            } else {
-                page_used += EDIT_METADATA_BYTES;
-                let index = u32::try_from(outputs.len())
-                    .map_err(|_| PluginError::LimitExceeded("too many edit outputs".to_owned()))?;
-                let length = u64::try_from(edit.insert.len()).expect("usize fits u64");
-                outputs.push(edit.insert);
-                OutputBytes::Output(OutputRange {
-                    index,
-                    offset: 0,
-                    length,
-                })
-            };
-            edits.push(OutputSplice {
+            .map(|edit| update.read_insert(edit))
+            .collect::<sdk::Result<Vec<_>>>()?;
+        let splices = update
+            .edits
+            .iter()
+            .zip(&inserts)
+            .map(|(edit, insert)| CoreInputSplice {
                 offset: edit.offset,
                 delete_len: edit.delete_len,
                 insert,
-            });
+            })
+            .collect::<Vec<_>>();
+        let namespace = core_namespace(update.ids)?;
+        let (document, changes) = document
+            .file_changed(&splices, namespace)
+            .map_err(core_error)?;
+        Ok((document, core_changes(changes)))
+    }
+
+    fn entities_changed(
+        document: &Self::Document,
+        mut update: sdk::EntityUpdate<'_>,
+    ) -> sdk::Result<(Self::Document, sdk::Edits)> {
+        let mut changes = Vec::new();
+        while let Some(change) = update.changes.next()? {
+            changes.push(core_change(change));
         }
-        if edits.is_empty() {
-            state.eof = true;
-            return Ok(None);
-        }
-        let outputs = if outputs.is_empty() {
-            None
-        } else {
-            Some(ByteOutputs::new(MarkdownByteOutputs { values: outputs }))
-        };
-        Ok(Some(EditPage { edits, outputs }))
+        let (document, edits) = document.entities_changed(changes).map_err(core_error)?;
+        Ok((document, core_edits(edits)))
     }
 }
 
-impl GuestByteOutputs for MarkdownByteOutputs {
-    fn len(&self, index: u32) -> Result<u64, PluginError> {
-        self.values
-            .get(usize::try_from(index).expect("u32 fits usize"))
-            .map(|value| u64::try_from(value.len()).expect("usize fits u64"))
-            .ok_or_else(|| plugin_error("invalid byte-output index"))
-    }
+fn core_namespace(ids: sdk::IdNamespace) -> sdk::Result<CoreIdNamespace> {
+    CoreIdNamespace::from_generated_id(&ids.id(0)).map_err(sdk::Error::internal)
+}
 
-    fn read(
-        &self,
-        _budget: &TransitionBudget,
-        index: u32,
-        offset: u64,
-        length: u32,
-    ) -> Result<Vec<u8>, PluginError> {
-        let value = self
-            .values
-            .get(usize::try_from(index).expect("u32 fits usize"))
-            .ok_or_else(|| plugin_error("invalid byte-output index"))?;
-        let start = usize::try_from(offset).map_err(|_| plugin_error("output offset overflow"))?;
-        let end = start
-            .checked_add(usize::try_from(length).expect("u32 fits usize"))
-            .ok_or_else(|| plugin_error("output range overflow"))?;
-        value
-            .get(start..end)
-            .map(ToOwned::to_owned)
-            .ok_or_else(|| plugin_error("output range exceeds value"))
+fn core_error(error: CorePluginError) -> sdk::Error {
+    match error {
+        CorePluginError::InvalidInput(message) => sdk::Error::invalid_input(message),
+        CorePluginError::Internal(message) => sdk::Error::internal(message),
     }
+}
+
+fn core_record(record: sdk::EntityRecord) -> CoreEntityRecord {
+    CoreEntityRecord {
+        schema_key: record.schema_key,
+        entity_pk: record.entity_pk,
+        snapshot: record.snapshot,
+    }
+}
+
+fn sdk_change(change: CoreEntityChange) -> sdk::EntityChange {
+    sdk::EntityChange {
+        schema_key: change.schema_key,
+        entity_pk: change.entity_pk,
+        snapshot: change.snapshot,
+        effect: match change.effect {
+            CoreChangeEffect::Content => sdk::ChangeEffect::Content,
+            CoreChangeEffect::FormatOnly => sdk::ChangeEffect::FormatOnly,
+        },
+    }
+}
+
+fn core_change(change: sdk::EntityChange) -> CoreEntityChange {
+    CoreEntityChange {
+        schema_key: change.schema_key,
+        entity_pk: change.entity_pk,
+        snapshot: change.snapshot,
+        effect: match change.effect {
+            sdk::ChangeEffect::Content => CoreChangeEffect::Content,
+            sdk::ChangeEffect::FormatOnly => CoreChangeEffect::FormatOnly,
+        },
+    }
+}
+
+fn sdk_edit(edit: CoreByteEdit) -> sdk::ByteEdit {
+    sdk::ByteEdit {
+        offset: edit.offset,
+        delete_len: edit.delete_len,
+        insert: edit.insert,
+    }
+}
+
+fn core_changes(changes: Vec<CoreEntityChange>) -> sdk::Changes {
+    sdk::changes(changes.into_iter().map(sdk_change))
+}
+
+fn core_edits(edits: Vec<CoreByteEdit>) -> sdk::Edits {
+    sdk::edits(edits.into_iter().map(sdk_edit))
 }
 
 #[cfg(target_family = "wasm")]
-export!(MarkdownGuest);
+lix_plugin_api_v2::export_v2!(MarkdownPlugin);

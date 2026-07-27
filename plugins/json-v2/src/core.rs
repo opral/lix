@@ -31,6 +31,23 @@ impl IdNamespace {
         bytes[16..].copy_from_slice(&ordinal.to_be_bytes());
         URL_SAFE_NO_PAD.encode(bytes)
     }
+
+    /// Converts one API-generated ID back into the namespace retained by the
+    /// JSON parser. The public author API intentionally keeps that namespace
+    /// opaque.
+    pub fn from_generated_id(id: &str) -> Result<Self, String> {
+        let mut decoded = [0_u8; 24];
+        let decoded_len = URL_SAFE_NO_PAD
+            .decode_slice(id.as_bytes(), &mut decoded)
+            .map_err(|_| "plugin API generated an invalid JSON identity".to_owned())?;
+        if decoded_len != decoded.len() {
+            return Err("plugin API generated an invalid JSON identity".to_owned());
+        }
+        let namespace = decoded[..16]
+            .try_into()
+            .map_err(|_| "plugin API generated an invalid JSON identity".to_owned())?;
+        Ok(Self(namespace))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

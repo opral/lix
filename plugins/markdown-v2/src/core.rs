@@ -58,6 +58,29 @@ impl IdNamespace {
     pub const fn from_halves(high: u64, low: u64) -> Self {
         Self { high, low }
     }
+
+    /// Reconstructs the core's compact namespace from one canonical ID minted
+    /// by the opaque public API namespace.
+    pub fn from_generated_id(id: &str) -> Result<Self, String> {
+        let mut decoded = [0_u8; 24];
+        let decoded_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode_slice(id.as_bytes(), &mut decoded)
+            .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?;
+        if decoded_len != decoded.len() {
+            return Err("plugin API generated an invalid Markdown identity".to_owned());
+        }
+        let high = u64::from_be_bytes(
+            decoded[..8]
+                .try_into()
+                .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?,
+        );
+        let low = u64::from_be_bytes(
+            decoded[8..16]
+                .try_into()
+                .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?,
+        );
+        Ok(Self::from_halves(high, low))
+    }
 }
 
 #[derive(Debug)]

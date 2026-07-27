@@ -2,7 +2,6 @@
 
 mod bindings;
 mod core;
-mod packet;
 
 pub use core::{
     ARRAY_ITEM_SCHEMA_KEY, ByteEdit, ChangeEffect, Document, EntityChange, EntityRecord,

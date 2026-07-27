@@ -2,7 +2,6 @@
 
 mod bindings;
 mod core;
-mod packet;
 
 pub use core::{
     ByteEdit, ChangeEffect, Dialect, Document, EntityChange, EntityRecord, IdNamespace,

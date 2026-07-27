@@ -1,3 +1,5 @@
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lix_order_key::OrderKey;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -21,6 +23,23 @@ impl IdNamespace {
         bytes[..8].copy_from_slice(&high.to_be_bytes());
         bytes[8..].copy_from_slice(&low.to_be_bytes());
         Self(bytes)
+    }
+
+    /// Reconstructs this reference core's namespace from a canonical public
+    /// API ID. Excalidraw does not currently mint entities after import, but
+    /// preserving the exact namespace keeps that future path correct.
+    pub fn from_generated_id(id: &str) -> Result<Self, String> {
+        let mut decoded = [0_u8; 24];
+        let decoded_len = URL_SAFE_NO_PAD
+            .decode_slice(id.as_bytes(), &mut decoded)
+            .map_err(|_| "plugin API generated an invalid Excalidraw identity".to_owned())?;
+        if decoded_len != decoded.len() {
+            return Err("plugin API generated an invalid Excalidraw identity".to_owned());
+        }
+        let namespace = decoded[..16]
+            .try_into()
+            .map_err(|_| "plugin API generated an invalid Excalidraw identity".to_owned())?;
+        Ok(Self(namespace))
     }
 }
 

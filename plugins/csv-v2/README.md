@@ -50,11 +50,8 @@ big-endian ordinal, encoded as 32 unpadded base64url characters. Supplied
 durable IDs are kept byte-for-byte.
 
 For a new production v2 plugin, start with the
-[authoring quickstart](../../packages/engine/wit/v2/README.md), then read the
-[WIT contract](../../packages/engine/wit/v2/lix-plugin-v2.wit) and the
-[packet-v1 rules](../../packages/engine/wit/v2/packet-v1.md). This crate's
-`bindings.rs` and `packet.rs` are currently reference glue, not a published
-generic SDK. Its [manifest](manifest.json),
+[lix-plugin-api](../../packages/plugin-api/README.md). It owns WIT and packet
+glue; this crate's `bindings.rs` is a format-specific adapter. Its [manifest](manifest.json),
 [host-allocated row schema](schema/csv_v2_row.json), and
 [tests](src/tests.rs) are the executable production examples.
 
