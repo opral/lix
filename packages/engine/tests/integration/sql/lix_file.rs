@@ -99,6 +99,30 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_exact_data_batch_rejects_a_missing_pinned_branch,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let missing = sim.wrap_session(
+            engine
+                .open_session("missing-file-branch")
+                .await
+                .expect("a pinned session may open before its branch is resolved"),
+            &engine,
+        );
+
+        let error = missing
+            .execute(
+                "SELECT data FROM lix_file WHERE path IN ('/missing-a.txt', '/missing-b.txt')",
+                &[],
+            )
+            .await
+            .expect_err("the exact data batch must validate its pinned branch");
+
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+    }
+);
+
+simulation_test!(
     lix_file_lower_path_like_keeps_the_blob_revision_for_guarded_updates,
     |sim| async move {
         let engine = sim.boot_engine().await;

@@ -632,6 +632,7 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     active_branch_id: &str,
     live_state: Arc<dyn LiveStateReader>,
     filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
     blob_reader: Arc<dyn BlobDataReader>,
     plugin_host: PluginRuntimeHost,
     session_file_views: Option<SessionFileViews>,
@@ -649,7 +650,14 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
             .expect("lix_file schema should have data")
             .clone(),
     ]));
-    let request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
 
     let index = filesystem_path_index
         .path_index(

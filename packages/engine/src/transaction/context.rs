@@ -639,26 +639,25 @@ where
                 .await;
             return Err(error);
         }
-        let filesystem_delta_rows = if prepared_writes
-            .state_rows
-            .iter()
-            .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        {
-            Vec::new()
-        } else {
-            prepared_writes
-                .state_rows
-                .iter()
-                .filter(|row| {
-                    matches!(
-                        row.schema_key.as_str(),
-                        "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                    )
-                })
-                .cloned()
-                .map(MaterializedLiveStateRow::from)
-                .collect::<Vec<_>>()
-        };
+        let filesystem_delta_rows =
+            if prepared_writes_require_filesystem_index_rebuild(&prepared_writes) {
+                Vec::new()
+            } else {
+                prepared_writes
+                    .state_rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.schema_key.as_str(),
+                            "lix_file_descriptor"
+                                | "lix_directory_descriptor"
+                                | BLOB_REF_SCHEMA_KEY
+                        )
+                    })
+                    .cloned()
+                    .map(MaterializedLiveStateRow::from)
+                    .collect::<Vec<_>>()
+            };
         let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
             None
         } else {
@@ -4646,6 +4645,23 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .any(|change_ref| change_ref.schema_key == REGISTERED_SCHEMA_KEY)
 }
 
+fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
+    prepared_writes
+        .state_rows
+        .iter()
+        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(|change_refs| change_refs.selected_change_refs.iter())
+            .any(|change_ref| {
+                matches!(
+                    change_ref.schema_key.as_str(),
+                    "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+                )
+            })
+}
+
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
     pub(crate) transaction: Transaction<StorageImpl>,
     pub(crate) runtime_functions: FunctionContext,
@@ -6814,7 +6830,7 @@ mod tests {
     use crate::changelog::ChangelogReader;
     use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
-    use crate::transaction::types::TransactionJson;
+    use crate::transaction::types::{StagedCommitChangeRefs, TransactionJson};
     use crate::wasm::WasmEntity;
 
     fn live_state_context() -> LiveStateContext {
@@ -6822,6 +6838,33 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn selected_blob_ref_change_requires_filesystem_index_rebuild() {
+        let mut selected_changes = StagedCommitChangeRefs::default();
+        selected_changes.add_selected_change_ref(StagedCommitChangeRef {
+            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+            file_id: Some("file-a".to_string()),
+            entity_pk: EntityPk::single("file-a"),
+            change_id: ChangeId::default(),
+            deleted: false,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        });
+        let prepared_writes = PreparedWriteSet {
+            state_rows: Vec::new(),
+            insert_identities: BTreeMap::new(),
+            commit_change_refs_by_branch: BTreeMap::from([("main".to_string(), selected_changes)]),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            file_data_writes: Vec::new(),
+        };
+
+        assert!(prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
 
     #[test]
     fn visible_materialization_requires_a_matching_blob_ref_identity() {
