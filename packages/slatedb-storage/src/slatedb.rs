@@ -399,48 +399,68 @@ async fn check_preconditions(
     if preconditions.is_empty() {
         return Ok(());
     }
-    let snapshot = worker
-        .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
+    let preconditions = preconditions.to_vec();
+    let matches = worker
+        .call_read(move |db| async move {
+            let snapshot = db.snapshot().await.map_err(slatedb_error)?;
+            let mut matches = Vec::with_capacity(preconditions.len());
+            let mut index = 0;
+            while index < preconditions.len() {
+                let start = index;
+                let mut point_keys = Vec::new();
+                while index < preconditions.len() {
+                    let Some(key) = point_precondition_physical_key(&preconditions[index])? else {
+                        break;
+                    };
+                    point_keys.push(key);
+                    index += 1;
+                }
+
+                if !point_keys.is_empty() {
+                    // A tracked mutation normally supplies a branch-head and a
+                    // revision predicate (and idempotent mutations add a
+                    // receipt predicate). Evaluate each contiguous point run
+                    // against this snapshot in one read operation rather than
+                    // serializing a worker entry for every predicate.
+                    let values = get_snapshot_values(
+                        Arc::clone(&snapshot),
+                        point_keys,
+                        ReadDurability::Visible,
+                    )
+                    .await?;
+                    matches.extend(values.iter().enumerate().map(|(offset, value)| {
+                        point_precondition_matches(&preconditions[start + offset], value.as_ref())
+                    }));
+                    continue;
+                }
+
+                let matches_precondition = match &preconditions[index] {
+                    Precondition::RangeEmpty { space, range } => {
+                        let bounds =
+                            EncodedBounds::new(physical_range(*space, range.clone())?, None);
+                        collect_snapshot_keys(Arc::clone(&snapshot), bounds)
+                            .await?
+                            .is_empty()
+                    }
+                    Precondition::BranchEquals { .. } => false,
+                    Precondition::KeyAbsent { .. }
+                    | Precondition::KeyPresent { .. }
+                    | Precondition::KeyValueHashEquals { .. }
+                    | Precondition::KeyValueEquals { .. } => {
+                        unreachable!("point preconditions are collected above")
+                    }
+                };
+                matches.push(matches_precondition);
+                index += 1;
+            }
+            Ok(matches)
+        })
         .await?;
-    let mut failures = Vec::new();
-    for (index, precondition) in preconditions.iter().enumerate() {
-        let matches = match precondition {
-            Precondition::KeyAbsent { space, key } => {
-                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
-                    .await?
-                    .is_none()
-            }
-            Precondition::KeyPresent { space, key } => {
-                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
-                    .await?
-                    .is_some()
-            }
-            Precondition::KeyValueHashEquals { space, key, hash } => {
-                snapshot_value(worker, Arc::clone(&snapshot), *space, key)
-                    .await?
-                    .is_some_and(|value| blake3::hash(&value).as_bytes() == hash)
-            }
-            Precondition::KeyValueEquals {
-                space,
-                key,
-                expected,
-            } => snapshot_value(worker, Arc::clone(&snapshot), *space, key)
-                .await?
-                .is_some_and(|value| value == *expected),
-            Precondition::RangeEmpty { space, range } => {
-                let bounds = EncodedBounds::new(physical_range(*space, range.clone())?, None);
-                let snapshot = Arc::clone(&snapshot);
-                worker
-                    .call_read(move |_db| collect_snapshot_keys(snapshot, bounds))
-                    .await?
-                    .is_empty()
-            }
-            Precondition::BranchEquals { .. } => false,
-        };
-        if !matches {
-            failures.push(PreconditionFailure { index });
-        }
-    }
+    let failures = matches
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, matches)| (!matches).then_some(PreconditionFailure { index }))
+        .collect::<Vec<_>>();
     if failures.is_empty() {
         Ok(())
     } else {
@@ -448,19 +468,32 @@ async fn check_preconditions(
     }
 }
 
-async fn snapshot_value(
-    worker: &SlateDBWorker,
-    snapshot: Arc<DbSnapshot>,
-    space: SpaceId,
-    key: &Key,
-) -> Result<Option<Bytes>, StorageError> {
-    let key = physical_key(space, key)?;
-    Ok(worker
-        .call_read(move |_db| get_snapshot_values(snapshot, vec![key], ReadDurability::Visible))
-        .await?
-        .into_iter()
-        .next()
-        .flatten())
+fn point_precondition_physical_key(
+    precondition: &Precondition,
+) -> Result<Option<Key>, StorageError> {
+    match precondition {
+        Precondition::KeyAbsent { space, key }
+        | Precondition::KeyPresent { space, key }
+        | Precondition::KeyValueHashEquals { space, key, .. }
+        | Precondition::KeyValueEquals { space, key, .. } => physical_key(*space, key).map(Some),
+        Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => Ok(None),
+    }
+}
+
+fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>) -> bool {
+    match precondition {
+        Precondition::KeyAbsent { .. } => value.is_none(),
+        Precondition::KeyPresent { .. } => value.is_some(),
+        Precondition::KeyValueHashEquals { hash, .. } => {
+            value.is_some_and(|value| blake3::hash(value.as_ref()).as_bytes() == hash)
+        }
+        Precondition::KeyValueEquals { expected, .. } => {
+            value.is_some_and(|value| value == expected)
+        }
+        Precondition::RangeEmpty { .. } | Precondition::BranchEquals { .. } => {
+            unreachable!("only point preconditions have batched snapshot values")
+        }
+    }
 }
 
 impl StorageRead for SlateDBRead {
@@ -1799,6 +1832,110 @@ mod tests {
             .expect("read singleton missing key")
             .values,
             vec![None]
+        );
+    }
+
+    #[test]
+    fn batched_point_preconditions_preserve_duplicate_and_mixed_failure_indexes() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-batched-point-preconditions",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open memory object-store slatedb storage");
+        let space = SpaceId(7);
+        let present = Key(Bytes::from_static(b"present"));
+        let missing = Key(Bytes::from_static(b"missing"));
+        let value = Bytes::from_static(b"value");
+        let value_hash = *blake3::hash(&value).as_bytes();
+
+        let mut seed =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin seed write");
+        block_on(seed.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: present.clone(),
+                    value: StoredValue {
+                        bytes: value.clone(),
+                    },
+                }],
+            },
+        ))
+        .expect("stage seed value");
+        block_on(seed.commit()).expect("commit seed value");
+
+        let passing = block_on(storage.begin_write(WriteOptions {
+            preconditions: vec![
+                Precondition::KeyValueEquals {
+                    space,
+                    key: present.clone(),
+                    expected: value.clone(),
+                },
+                Precondition::KeyPresent {
+                    space,
+                    key: present.clone(),
+                },
+                Precondition::KeyAbsent {
+                    space,
+                    key: missing.clone(),
+                },
+            ],
+            ..WriteOptions::default()
+        }))
+        .expect("all batched point preconditions pass");
+        drop(passing);
+
+        let error = block_on(storage.begin_write(WriteOptions {
+            preconditions: vec![
+                Precondition::KeyValueEquals {
+                    space,
+                    key: present.clone(),
+                    expected: value,
+                },
+                Precondition::KeyAbsent {
+                    space,
+                    key: present.clone(),
+                },
+                Precondition::RangeEmpty {
+                    space,
+                    range: KeyRange {
+                        lower: Bound::Included(present.clone()),
+                        upper: Bound::Included(present.clone()),
+                    },
+                },
+                Precondition::KeyPresent {
+                    space,
+                    key: missing,
+                },
+                Precondition::KeyAbsent {
+                    space,
+                    key: present.clone(),
+                },
+                Precondition::BranchEquals {
+                    ref_key: Key(Bytes::from_static(b"branch-ref")),
+                    expected: Bytes::from_static(b"ignored"),
+                },
+                Precondition::KeyValueHashEquals {
+                    space,
+                    key: present,
+                    hash: value_hash,
+                },
+            ],
+            ..WriteOptions::default()
+        }))
+        .err()
+        .expect("mixed failed preconditions report every original index");
+
+        assert_eq!(
+            error,
+            StorageError::PreconditionFailed(vec![
+                PreconditionFailure { index: 1 },
+                PreconditionFailure { index: 2 },
+                PreconditionFailure { index: 3 },
+                PreconditionFailure { index: 4 },
+                PreconditionFailure { index: 5 },
+            ])
         );
     }
 
