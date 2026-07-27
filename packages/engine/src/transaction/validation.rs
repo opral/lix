@@ -7,7 +7,7 @@
     clippy::unnecessary_wraps
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde_json::Value as JsonValue;
 use tracing::Instrument as _;
@@ -1595,13 +1595,14 @@ struct PendingConstraintIndexes {
     fk_targets: BTreeMap<PendingForeignKeyTargetKey, Vec<PendingForeignKeyTarget>>,
     fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
     tombstones: Vec<PendingTombstone>,
+    tombstone_identities: HashSet<DomainRowIdentity>,
 }
 
 impl PendingConstraintIndexes {
     fn remember_tombstone(&mut self, row: PreparedValidationRow<'_>) {
-        self.tombstones.push(PendingTombstone {
-            identity: row.domain_row_identity(),
-        });
+        let identity = row.domain_row_identity();
+        self.tombstone_identities.insert(identity.clone());
+        self.tombstones.push(PendingTombstone { identity });
     }
 
     fn remember_row(
@@ -1737,9 +1738,7 @@ impl PendingConstraintIndexes {
 
     fn tombstones_identity(&self, row: &MaterializedLiveStateRow) -> bool {
         let identity = DomainRowIdentity::from_live_row(row);
-        self.tombstones
-            .iter()
-            .any(|tombstone| tombstone.identity == identity)
+        self.tombstone_identities.contains(&identity)
     }
 
     fn has_identity_target(&self, identity: &DomainRowIdentity) -> bool {
@@ -1756,9 +1755,7 @@ impl PendingConstraintIndexes {
     }
 
     fn tombstones_target_identity(&self, identity: &DomainRowIdentity) -> bool {
-        self.tombstones
-            .iter()
-            .any(|tombstone| tombstone.identity == *identity)
+        self.tombstone_identities.contains(identity)
     }
 
     fn has_fk_target_key(&self, key: &PendingForeignKeyTargetKey) -> bool {
