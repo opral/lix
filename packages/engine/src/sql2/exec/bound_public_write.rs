@@ -78,6 +78,7 @@ pub(crate) async fn try_execute_bound_public_write(
 struct FastFileDataUpdateShape {
     id: BoundExpr,
     data: BoundExpr,
+    metadata: Option<BoundExpr>,
     data_parameter_index: Option<usize>,
 }
 
@@ -90,14 +91,27 @@ async fn execute_file_data_update(
     let id = eval_fast_file_nullable_text(&shape.id, params, "id")?;
     let data = eval_fast_file_blob(&shape.data, params, "data")?;
     let splice_provenance = fast_file_data_update_splice_provenance(shape, metadata);
-    crate::sql2::providers::execute_fast_lix_file_data_update_by_id(
-        ctx,
-        id,
-        data,
-        splice_provenance,
-        metadata.mutation_identity(),
-    )
-    .await
+    if let Some(metadata_expr) = &shape.metadata {
+        let row_metadata = eval_fast_file_metadata(metadata_expr, params)?;
+        crate::sql2::providers::execute_fast_lix_file_data_update_by_id_with_metadata(
+            ctx,
+            id,
+            data,
+            row_metadata,
+            splice_provenance,
+            metadata.mutation_identity(),
+        )
+        .await
+    } else {
+        crate::sql2::providers::execute_fast_lix_file_data_update_by_id(
+            ctx,
+            id,
+            data,
+            splice_provenance,
+            metadata.mutation_identity(),
+        )
+        .await
+    }
 }
 
 fn fast_file_data_update_splice_provenance(
@@ -119,18 +133,36 @@ fn fast_file_data_update_shape(
         || !matches!(plan.bound.input, BoundWriteInput::None)
         || plan.bound.conflict.is_some()
         || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
-        || plan.bound.assignments.len() != 1
+        || !(1..=2).contains(&plan.bound.assignments.len())
     {
         return None;
     }
-    let assignment = &plan.bound.assignments[0];
-    if assignment.column.name != "data" || !fast_file_blob_expr_supported(&assignment.value) {
+    let assignment = plan
+        .bound
+        .assignments
+        .iter()
+        .find(|assignment| assignment.column.name == "data")?;
+    let metadata = plan
+        .bound
+        .assignments
+        .iter()
+        .find(|assignment| assignment.column.name == "lixcol_metadata")
+        .map(|assignment| assignment.value.clone());
+    if !fast_file_blob_expr_supported(&assignment.value)
+        || metadata
+            .as_ref()
+            .is_some_and(|expr| !fast_file_metadata_expr_supported(expr))
+        || plan.bound.assignments.iter().any(|assignment| {
+            assignment.column.name != "data" && assignment.column.name != "lixcol_metadata"
+        })
+    {
         return None;
     }
     let id = fast_file_id_predicate_value(&plan.bound.predicate)?;
     Some(FastFileDataUpdateShape {
         id: id.clone(),
         data: assignment.value.clone(),
+        metadata,
         data_parameter_index: match &assignment.value {
             BoundExpr::Param(param) => Some(param.index),
             BoundExpr::Literal(_) => None,
@@ -3380,6 +3412,7 @@ mod splice_provenance_tests {
         let shape = FastFileDataUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 2 }),
             data: BoundExpr::Param(BoundParamRef { index: 3 }),
+            metadata: None,
             data_parameter_index: Some(3),
         };
 
@@ -3398,6 +3431,7 @@ mod splice_provenance_tests {
         let parameter_shape = FastFileDataUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Param(BoundParamRef { index: 2 }),
+            metadata: None,
             data_parameter_index: Some(2),
         };
         assert_eq!(
@@ -3408,6 +3442,7 @@ mod splice_provenance_tests {
         let literal_shape = FastFileDataUpdateShape {
             id: BoundExpr::Param(BoundParamRef { index: 1 }),
             data: BoundExpr::Literal(crate::sql2::bind::expr::BoundLiteral::Blob(vec![1])),
+            metadata: None,
             data_parameter_index: None,
         };
         assert_eq!(
