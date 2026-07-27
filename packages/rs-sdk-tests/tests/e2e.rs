@@ -8,12 +8,120 @@ use lix_sdk::{
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeMap;
 use std::hint::black_box;
 use std::io::{Cursor, Read, Write};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tracing::Subscriber;
+use tracing::span::{Attributes, Id};
+use tracing::subscriber::Interest;
+use tracing_subscriber::Layer;
+use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
+
+#[derive(Clone, Default)]
+struct PerfSpanCollector {
+    samples: Arc<Mutex<Vec<PerfSpanSample>>>,
+}
+
+#[derive(Debug)]
+struct PerfSpanSample {
+    name: &'static str,
+    elapsed: Duration,
+}
+
+#[derive(Debug)]
+struct StartedPerfSpan {
+    name: &'static str,
+    started: Instant,
+}
+
+fn is_import_perf_span(name: &str) -> bool {
+    matches!(
+        name,
+        "lix.perf.transaction_plan_and_stage"
+            | "lix.perf.plugin_reconciliation"
+            | "lix.perf.plugin_factory_compile"
+            | "lix.perf.plugin_open_file"
+            | "lix.perf.plugin_open_file_drain"
+            | "lix.perf.plugin_change_rows"
+            | "lix.perf.plugin_semantic_prepare_rows"
+            | "lix.perf.transaction_validation"
+            | "lix.perf.transaction_materialization"
+            | "lix.perf.storage_lowering"
+            | "lix.perf.transaction_prepare_rows"
+            | "lix.perf.transaction_path_preflight"
+            | "lix.perf.transaction_buffer_stage"
+    )
+}
+
+impl PerfSpanCollector {
+    fn clear(&self) {
+        self.samples
+            .lock()
+            .expect("performance span collector should not poison")
+            .clear();
+    }
+
+    fn take_aggregate_millis(&self) -> BTreeMap<&'static str, f64> {
+        let samples = std::mem::take(
+            &mut *self
+                .samples
+                .lock()
+                .expect("performance span collector should not poison"),
+        );
+        let mut aggregate = BTreeMap::new();
+        for sample in samples {
+            *aggregate.entry(sample.name).or_insert(0.0) += sample.elapsed.as_secs_f64() * 1_000.0;
+        }
+        aggregate
+    }
+}
+
+impl<S> Layer<S> for PerfSpanCollector
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> Interest {
+        if metadata.target() == "lix_perf" && is_import_perf_span(metadata.name()) {
+            Interest::always()
+        } else {
+            Interest::never()
+        }
+    }
+
+    fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: TracingContext<'_, S>) {
+        let name = attributes.metadata().name();
+        if !is_import_perf_span(name) {
+            return;
+        }
+        if let Some(span) = context.span(id) {
+            span.extensions_mut().insert(StartedPerfSpan {
+                name,
+                started: Instant::now(),
+            });
+        }
+    }
+
+    fn on_close(&self, id: Id, context: TracingContext<'_, S>) {
+        let Some(span) = context.span(&id) else {
+            return;
+        };
+        let Some(started) = span.extensions_mut().remove::<StartedPerfSpan>() else {
+            return;
+        };
+        self.samples
+            .lock()
+            .expect("performance span collector should not poison")
+            .push(PerfSpanSample {
+                name: started.name,
+                elapsed: started.started.elapsed(),
+            });
+    }
+}
 
 #[derive(Default)]
 struct HistoryRejectingRuntime {
@@ -1792,6 +1900,9 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     let file_scoped_member_statements =
         native_json_control_member_insert_chunks(&members, Some(FILE_ID), SQL_CHUNK_ROWS);
 
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
     let mut plugin_ms = Vec::with_capacity(SAMPLES);
     for sample in 0..SAMPLES {
         let root = tempfile::tempdir().expect("create plugin import benchmark directory");
@@ -1809,6 +1920,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         // write on an otherwise fresh RocksDB database.
         let input = source.clone();
         lix.reset_plugin_v2_transition_counters();
+        collector.clear();
         let started = Instant::now();
         let inserted = lix
             .execute(
@@ -1822,7 +1934,12 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             .await
             .expect("real JSON v2 plugin import should succeed");
         assert_eq!(inserted.rows_affected(), 1, "plugin sample {sample}");
-        plugin_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        plugin_ms.push(elapsed_ms);
+        eprintln!(
+            "v2_json_import_phases sample={sample} elapsed_ms={elapsed_ms:.3} phases_ms={:?}",
+            collector.take_aggregate_millis()
+        );
 
         let counters = lix.plugin_v2_transition_counters();
         assert_eq!(
@@ -1978,6 +2095,9 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     let table_statement = native_csv_control_table_insert(FILE_ID);
     let row_statements =
         native_csv_control_row_insert_chunks(FILE_ID, CSV_ROW_COUNT, SQL_CHUNK_ROWS);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
     let mut plugin_ms = Vec::with_capacity(PAIRS);
     let mut direct_ms = Vec::with_capacity(PAIRS);
     let mut paired_samples_ms = Vec::with_capacity(PAIRS);
@@ -2008,6 +2128,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
 
             let file_input = source.clone();
             lix.reset_plugin_v2_transition_counters();
+            collector.clear();
             let started = Instant::now();
             if plugin_lane {
                 let inserted = lix
@@ -2066,6 +2187,11 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     .expect("commit direct CSV semantic rows");
             }
             let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let phases_ms = collector.take_aggregate_millis();
+            eprintln!(
+                "v2_csv_import_phases sample={sample} lane={} elapsed_ms={elapsed_ms:.3} phases_ms={phases_ms:?}",
+                if plugin_lane { "plugin" } else { "direct" },
+            );
 
             if plugin_lane {
                 assert_eq!(

@@ -860,6 +860,10 @@ where
         }
         let write = match self
             .prepare_transaction_write(write, prepared_semantic_rows)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_prepare_rows"
+            ))
             .await
         {
             Ok(write) => write,
@@ -870,6 +874,10 @@ where
         };
         if let Err(error) = self
             .preflight_derived_path_stability_before_stage(&write)
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.transaction_path_preflight"
+            ))
             .await
         {
             discard_plugin_actor_publications(actor_publications).await;
@@ -881,7 +889,12 @@ where
             self.filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
         }
-        let outcome = match self.staged_writes.stage_write(write) {
+        let outcome = match tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.transaction_buffer_stage"
+        )
+        .in_scope(|| self.staged_writes.stage_write(write))
+        {
             Ok(outcome) => outcome,
             Err(error) => {
                 discard_plugin_actor_publications(actor_publications).await;
