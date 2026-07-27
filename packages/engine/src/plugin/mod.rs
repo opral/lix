@@ -27,16 +27,17 @@ pub(crate) use id_namespace::{
     validate_namespace_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, V2SchemaAllowlist, ValidatedConflictTransition, ValidatedSameLengthOutputSplice,
-    VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
-    drain_conflict_transition_resolutions, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
-    host_entity_with_lazy_snapshot, transport_splice_preserves_git_text,
-    transport_splice_preserves_utf8,
+    ArcByteSource, FileBytesSha256, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, drain_conflict_transition_resolutions,
+    drain_entity_transition_edits, drain_file_transition_changes,
+    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
+    transport_splice_preserves_git_text, transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{
-    PluginContentType, PluginManifest, PluginRuntime, parse_plugin_manifest_json,
+    PluginContentType, PluginManifest, PluginMaterialization, PluginRuntime,
+    parse_plugin_manifest_json,
 };
 pub(crate) use materializer::{PluginDetectedChange, plugin_state_live_state_projection};
 pub(crate) use registry::{

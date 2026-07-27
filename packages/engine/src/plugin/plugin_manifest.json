@@ -6,6 +6,7 @@
     "key",
     "runtime",
     "api_version",
+    "materialization",
     "match",
     "entry",
     "schemas"
@@ -24,6 +25,10 @@
     "api_version": {
       "type": "string",
       "const": "2.1.0"
+    },
+    "materialization": {
+      "type": "string",
+      "enum": ["blob", "derived"]
     },
     "match": {
       "type": "object",

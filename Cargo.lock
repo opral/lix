@@ -3423,6 +3423,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "codspeed-criterion-compat",
+ "lix_engine",
  "lix_rocksdb_storage",
  "lix_sdk",
  "plugin_csv_v2",

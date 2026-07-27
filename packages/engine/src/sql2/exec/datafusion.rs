@@ -5344,7 +5344,11 @@ mod tests {
 
         assert_eq!(path, WriteExecutorPath::Fast);
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
-        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            3,
+            "a blob-less file performs one exact derived-proof disambiguation"
+        );
         let staged_writes = staged_writes.lock().expect("staged writes lock");
         let overlay = staged_writes.deltas[0]
             .pending_write_overlay()
@@ -5461,7 +5465,11 @@ mod tests {
         .expect_err("nested plugin archive path should remain invalid");
 
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
-        assert_eq!(scans.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            3,
+            "a blob-less file performs one exact derived-proof disambiguation"
+        );
         assert!(
             staged_writes
                 .lock()

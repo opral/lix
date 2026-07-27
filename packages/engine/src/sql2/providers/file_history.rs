@@ -18,7 +18,11 @@ use crate::binary_cas::{BlobDataReader, BlobHash};
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_file_path;
 use crate::entity_pk::EntityPk;
-use crate::plugin::{PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginFileOwner, PluginRegistry};
+use crate::plugin::{
+    FileBytesSha256, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorStore, PluginFileOwner,
+    PluginMaterialization, PluginRegistry, PluginRuntimeHost, VecEntitySource,
+    drain_entity_transition_edits, host_entity_with_lazy_snapshot, inferred_media_type_for_path,
+};
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateReadColumns,
     TrackedStateScanRequest, TrackedStateStoreReader,
@@ -41,6 +45,10 @@ use crate::sql2::providers::filesystem_history_path::{
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
+use crate::wasm::{
+    WasmFileDescriptor, WasmHostEntity, WasmOpenEntitiesInput, WasmPluginSelection,
+    WasmTransitionLimits,
+};
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::history_util::entity_pk_json_array;
@@ -49,6 +57,7 @@ use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table,
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const DERIVED_FILE_REF_SCHEMA_KEY: &str = "lix_derived_file_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 
 pub(super) async fn register_lix_file_history_surface<S>(
@@ -57,6 +66,7 @@ pub(super) async fn register_lix_file_history_surface<S>(
     commit_graph: Box<dyn CommitGraphReader>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
 ) -> Result<(), LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
@@ -68,6 +78,7 @@ where
             commit_graph: Arc::new(Mutex::new(commit_graph)),
             query_source,
             blob_reader,
+            plugin_host,
         }),
         WriteAccess::read_only(),
     )
@@ -82,6 +93,7 @@ struct LixFileHistorySpec<S> {
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
 }
 
 #[async_trait]
@@ -155,6 +167,7 @@ where
                     Arc::clone(&self.commit_graph),
                     self.query_source.clone(),
                     Arc::clone(&self.blob_reader),
+                    self.plugin_host.clone(),
                     route,
                     public_predicate,
                     lookup_ids,
@@ -165,6 +178,7 @@ where
                     commit_graph,
                     query_source,
                     blob_reader,
+                    plugin_host,
                     route,
                     public_predicate,
                     lookup_ids,
@@ -175,6 +189,7 @@ where
                         commit_graph,
                         query_source,
                         &blob_reader,
+                        &plugin_host,
                         &route,
                         &public_predicate,
                         lookup_ids.as_ref(),
@@ -238,6 +253,15 @@ struct FileHistoryBlobRecord {
 }
 
 #[derive(Debug, Clone)]
+struct FileHistoryDerivedFileRefRecord {
+    file_id: String,
+    path: Option<String>,
+    sha256: Option<String>,
+    size_bytes: Option<u64>,
+    entry: HistoryEntry,
+}
+
+#[derive(Debug, Clone)]
 struct FileHistoryPluginStateRecord {
     file_id: String,
     entry: HistoryEntry,
@@ -278,6 +302,7 @@ struct PreparedFileHistoryRow {
     path: Option<String>,
     descriptor: FileHistoryDescriptorRecord,
     blob_hash: Option<String>,
+    derived_file_ref: Option<FileHistoryDerivedFileRefRecord>,
     event: FileHistoryEvent,
 }
 
@@ -452,10 +477,19 @@ struct BlobRefSnapshot {
     blob_hash: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DerivedFileRefSnapshot {
+    id: String,
+    path: String,
+    sha256: String,
+    size_bytes: u64,
+}
+
 struct FileHistoryFilesystemContext {
     event_descriptors: Vec<FileHistoryDescriptorRecord>,
     event_directories: Vec<FileHistoryDirectoryRecord>,
     event_blobs: Vec<FileHistoryBlobRecord>,
+    event_derived_file_refs: Vec<FileHistoryDerivedFileRefRecord>,
     descriptors: Vec<FileHistoryDescriptorRecord>,
 }
 
@@ -463,6 +497,11 @@ struct FileHistoryObservedState {
     descriptors: Vec<FileHistoryDescriptorRecord>,
     directories: Vec<FileHistoryDirectoryRecord>,
     blobs: Vec<FileHistoryBlobRecord>,
+    derived_file_refs: Vec<FileHistoryDerivedFileRefRecord>,
+    /// Semantic rows are only rendered with their owning file. Index once at
+    /// observed-state construction so a bulk history read does not rescan all
+    /// plugin rows for every derived file.
+    plugin_states_by_file: BTreeMap<String, Vec<FileHistoryPluginStateRecord>>,
     plugin_owners: Vec<FileHistoryPluginOwnerRecord>,
     plugin_registry: PluginRegistry,
 }
@@ -521,6 +560,7 @@ async fn load_file_history_rows<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
     blob_reader: &Arc<dyn BlobDataReader>,
+    plugin_host: &PluginRuntimeHost,
     route: &HistoryRoute,
     public_predicate: &FileHistoryPublicPredicate,
     lookup_ids: Option<&FileHistoryLookupIds>,
@@ -605,6 +645,12 @@ where
                 .map(|record| record.entry.observed_commit_id.clone()),
         )
         .chain(
+            filesystem_context
+                .event_derived_file_refs
+                .iter()
+                .map(|record| record.entry.observed_commit_id.clone()),
+        )
+        .chain(
             event_plugin_state
                 .iter()
                 .map(|record| record.entry.observed_commit_id.clone()),
@@ -651,6 +697,7 @@ where
         &filesystem_context.event_descriptors,
         &filesystem_context.event_directories,
         &filesystem_context.event_blobs,
+        &filesystem_context.event_derived_file_refs,
         &filesystem_context.descriptors,
         &observed_states,
         &parent_commit_ids_by_commit,
@@ -687,14 +734,24 @@ where
     let mut output = Vec::with_capacity(prepared.len());
     for prepared_row in prepared {
         let data = if needs_data && prepared_row.descriptor.name.is_some() {
-            prepared_row.blob_hash.as_deref().map_or_else(
-                // V2 plugin files persist their materialized bytes. A missing
-                // blob therefore has the same empty-file representation as a
-                // non-plugin file; history never invokes a semantic renderer
-                // while replaying durable materialized bytes.
-                || Some(Vec::new()),
-                |blob_hash| blob_bytes.get(blob_hash).cloned().flatten(),
-            )
+            validate_file_history_materialization(&prepared_row, &observed_states)?;
+            if let Some(derived) = &prepared_row.derived_file_ref {
+                Some(
+                    render_derived_file_history_bytes(
+                        plugin_host,
+                        blob_reader,
+                        &prepared_row,
+                        derived,
+                        &observed_states,
+                    )
+                    .await?,
+                )
+            } else {
+                prepared_row.blob_hash.as_deref().map_or_else(
+                    || Some(Vec::new()),
+                    |blob_hash| blob_bytes.get(blob_hash).cloned().flatten(),
+                )
+            }
         } else {
             None
         };
@@ -784,15 +841,36 @@ fn prepare_file_history_rows(
         ) {
             continue;
         }
+        let blob_hash = state
+            .blobs
+            .iter()
+            .find(|blob| blob.file_id == event.file_id)
+            .and_then(|blob| blob.blob_hash.clone());
+        let derived_file_ref = state
+            .derived_file_refs
+            .iter()
+            .find(|proof| {
+                proof.file_id == event.file_id
+                    && proof.path.is_some()
+                    && proof.sha256.is_some()
+                    && proof.size_bytes.is_some()
+            })
+            .cloned();
+        if blob_hash.is_some() && derived_file_ref.is_some() {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "lix_file_history observed file '{}' with both blob and derived materializations",
+                    event.file_id
+                ),
+            ));
+        }
         prepared.push(PreparedFileHistoryRow {
             id,
             path,
             descriptor: descriptor.clone(),
-            blob_hash: state
-                .blobs
-                .iter()
-                .find(|blob| blob.file_id == event.file_id)
-                .and_then(|blob| blob.blob_hash.clone()),
+            blob_hash,
+            derived_file_ref,
             event,
         });
     }
@@ -838,6 +916,279 @@ async fn load_file_history_blob_bytes(
     Ok(by_encoded_hash)
 }
 
+/// Reconstructs a historical derived file from the exact semantic snapshot at
+/// its observed commit. The proof is deliberately verified before the bytes
+/// reach SQL so a changed, unavailable, or non-deterministic plugin cannot
+/// silently reinterpret history.
+async fn render_derived_file_history_bytes(
+    plugin_host: &PluginRuntimeHost,
+    blob_reader: &Arc<dyn BlobDataReader>,
+    prepared: &PreparedFileHistoryRow,
+    derived: &FileHistoryDerivedFileRefRecord,
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
+) -> Result<Vec<u8>, LixError> {
+    let observed_commit_id = prepared.event.observed_commit_id.as_str();
+    let state = observed_states.get(observed_commit_id).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "lix_file_history did not load observed commit '{observed_commit_id}' for derived file '{}'",
+                prepared.descriptor.id,
+            ),
+        )
+    })?;
+    let owner =
+        live_file_history_plugin_owner(state, &prepared.descriptor.id).ok_or_else(|| {
+            invalid_derived_file_history_state(format!(
+                "derived file '{}' at commit '{observed_commit_id}' has no live plugin owner",
+                prepared.descriptor.id,
+            ))
+        })?;
+    let plugin = state
+        .plugin_registry
+        .get(owner.plugin_key())
+        .ok_or_else(|| {
+            invalid_derived_file_history_state(format!(
+                "derived file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
+                prepared.descriptor.id,
+                owner.plugin_key(),
+            ))
+        })?;
+    if plugin.materialization() != PluginMaterialization::Derived {
+        return Err(invalid_derived_file_history_state(format!(
+            "derived file '{}' at commit '{observed_commit_id}' is owned by blob-materialization plugin '{}'",
+            prepared.descriptor.id,
+            plugin.key(),
+        )));
+    }
+    let path = prepared.path.as_deref().ok_or_else(|| {
+        invalid_derived_file_history_state(format!(
+            "derived file '{}' at commit '{observed_commit_id}' has no live path",
+            prepared.descriptor.id,
+        ))
+    })?;
+    if derived.path.as_deref() != Some(path) {
+        return Err(invalid_derived_file_history_state(format!(
+            "derived file '{}' at commit '{observed_commit_id}' was rendered at '{}' but now resolves to '{}'",
+            prepared.descriptor.id,
+            derived.path.as_deref().unwrap_or_default(),
+            path,
+        )));
+    }
+    let catalog = plugin_host.compiled_plugin_catalog(&state.plugin_registry)?;
+    if !catalog.matches_plugin(plugin.key(), path) {
+        return Err(invalid_derived_file_history_state(format!(
+            "derived file '{}' at commit '{observed_commit_id}' no longer matches plugin '{}' path contract",
+            prepared.descriptor.id,
+            plugin.key(),
+        )));
+    }
+    let expected_sha256 = derived
+        .sha256
+        .as_deref()
+        .and_then(FileBytesSha256::from_lower_hex)
+        .ok_or_else(|| {
+            invalid_derived_file_history_state(format!(
+                "derived file '{}' at commit '{observed_commit_id}' has an invalid SHA-256 proof",
+                prepared.descriptor.id,
+            ))
+        })?;
+    let expected_size = derived.size_bytes.ok_or_else(|| {
+        invalid_derived_file_history_state(format!(
+            "derived file '{}' at commit '{observed_commit_id}' has no byte-size proof",
+            prepared.descriptor.id,
+        ))
+    })?;
+    let limits = WasmTransitionLimits::default();
+    let entities = historical_v2_host_entities(
+        state
+            .plugin_states_by_file
+            .get(&prepared.descriptor.id)
+            .into_iter()
+            .flatten()
+            .filter(|record| {
+                record.file_id == prepared.descriptor.id
+                    && plugin
+                        .schema_keys()
+                        .binary_search(&record.entry.change.schema_key)
+                        .is_ok()
+                    && record.entry.change.snapshot_content.is_some()
+            }),
+        limits,
+    )?;
+    let source = VecEntitySource::new(entities, limits)?;
+    let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+    let factory = match plugin_host.cached_plugin_v2_factory(plugin.key(), wasm_hash)? {
+        Some(factory) => factory,
+        None => {
+            let wasm = blob_reader
+                .load_bytes_many(&[wasm_hash])
+                .await?
+                .into_vec()
+                .into_iter()
+                .next()
+                .flatten()
+                .ok_or_else(|| {
+                    invalid_derived_file_history_state(format!(
+                        "derived file '{}' at commit '{observed_commit_id}' references missing plugin WASM blob '{}'",
+                        prepared.descriptor.id,
+                        wasm_hash.to_hex(),
+                    ))
+                })?;
+            let installed = plugin.to_installed_plugin(wasm)?;
+            plugin_host.load_or_compile_v2_factory(&installed).await?
+        }
+    };
+    let store_permit = plugin_host.actor_cache().admit_store()?;
+    let actor = factory.instantiate_actor().await?;
+    let mut store = PluginActorStore::new(actor, store_permit);
+    let transition = match store
+        .actor_mut()
+        .open_entities(
+            limits,
+            WasmOpenEntitiesInput {
+                descriptor: WasmFileDescriptor {
+                    path: Some(path.to_owned()),
+                    media_type: inferred_media_type_for_path(Some(path)).map(str::to_owned),
+                    plugin: WasmPluginSelection {
+                        plugin_key: plugin.key().to_owned(),
+                        generation: plugin.archive_blob_hash().to_owned(),
+                    },
+                },
+                entities: Box::new(source),
+                accepted: None,
+            },
+        )
+        .await
+    {
+        Ok(transition) => transition,
+        Err(error) => {
+            let _ = store.actor_mut().retire().await;
+            return Err(error);
+        }
+    };
+    let empty: crate::Blob = Vec::new().into();
+    let validated = match drain_entity_transition_edits(
+        store.actor_mut(),
+        transition,
+        empty.as_ref(),
+        None,
+        None,
+        limits,
+    )
+    .await
+    {
+        Ok(validated) => validated,
+        Err(error) => {
+            let _ = store.actor_mut().retire().await;
+            return Err(error);
+        }
+    };
+    if validated.bytes.len() as u64 != expected_size
+        || FileBytesSha256::compute(validated.bytes.as_ref()) != expected_sha256
+    {
+        let _ = store.actor_mut().retire().await;
+        return Err(invalid_derived_file_history_state(format!(
+            "derived file '{}' does not reproduce its proof at commit '{observed_commit_id}'",
+            prepared.descriptor.id,
+        )));
+    }
+    let bytes = validated.bytes.to_vec();
+    let counters = validated.counters;
+    let drop_result = store.actor_mut().drop_document(validated.document).await;
+    let retire_result = store.actor_mut().retire().await;
+    plugin_host.record_v2_transition_counters(counters);
+    drop_result?;
+    retire_result?;
+    Ok(bytes)
+}
+
+fn historical_v2_host_entities<'a>(
+    rows: impl Iterator<Item = &'a FileHistoryPluginStateRecord>,
+    limits: WasmTransitionLimits,
+) -> Result<Vec<WasmHostEntity>, LixError> {
+    let mut entities = rows
+        .map(|record| {
+            host_entity_with_lazy_snapshot(
+                crate::wasm::WasmEntityKey {
+                    schema_key: record.entry.change.schema_key.clone(),
+                    entity_pk: record.entry.change.entity_pk.clone().into_parts(),
+                },
+                record
+                    .entry
+                    .change
+                    .snapshot_content
+                    .as_ref()
+                    .expect("historical v2 rows retain only live snapshots")
+                    .as_bytes()
+                    .to_vec(),
+                limits,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    entities.sort_by(|left, right| left.key.cmp(&right.key));
+    Ok(entities)
+}
+
+fn invalid_derived_file_history_state(message: impl Into<String>) -> LixError {
+    LixError::new(LixError::CODE_INVALID_PLUGIN, message)
+}
+
+/// A plugin owner commits a materialization contract alongside semantic
+/// state. Never silently serve an owned historical file from an absent or
+/// opposite representation: that would turn a damaged history root into empty
+/// bytes instead of surfacing the corruption to the caller.
+fn validate_file_history_materialization(
+    prepared: &PreparedFileHistoryRow,
+    observed_states: &BTreeMap<String, FileHistoryObservedState>,
+) -> Result<(), LixError> {
+    let observed_commit_id = prepared.event.observed_commit_id.as_str();
+    let state = observed_states.get(observed_commit_id).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "lix_file_history did not load observed commit '{observed_commit_id}' for file '{}'",
+                prepared.descriptor.id,
+            ),
+        )
+    })?;
+    let has_blob = prepared.blob_hash.is_some();
+    let has_derived = prepared.derived_file_ref.is_some();
+    let Some(owner) = live_file_history_plugin_owner(state, &prepared.descriptor.id) else {
+        if has_derived {
+            return Err(invalid_derived_file_history_state(format!(
+                "derived file '{}' at commit '{observed_commit_id}' has no live plugin owner",
+                prepared.descriptor.id,
+            )));
+        }
+        return Ok(());
+    };
+    let plugin = state
+        .plugin_registry
+        .get(owner.plugin_key())
+        .ok_or_else(|| {
+            invalid_derived_file_history_state(format!(
+                "plugin-owned file '{}' at commit '{observed_commit_id}' names unavailable plugin '{}'",
+                prepared.descriptor.id,
+                owner.plugin_key(),
+            ))
+        })?;
+    match (plugin.materialization(), has_blob, has_derived) {
+        (PluginMaterialization::Blob, true, false)
+        | (PluginMaterialization::Derived, false, true) => Ok(()),
+        (PluginMaterialization::Blob, _, _) => Err(invalid_derived_file_history_state(format!(
+            "blob-materialization plugin '{}' owns file '{}' at commit '{observed_commit_id}' without exactly one blob materialization",
+            plugin.key(),
+            prepared.descriptor.id,
+        ))),
+        (PluginMaterialization::Derived, _, _) => Err(invalid_derived_file_history_state(format!(
+            "derived-materialization plugin '{}' owns file '{}' at commit '{observed_commit_id}' without exactly one derived proof",
+            plugin.key(),
+            prepared.descriptor.id,
+        ))),
+    }
+}
+
 async fn load_file_history_filesystem_context<S>(
     commit_graph: Arc<Mutex<Box<dyn CommitGraphReader>>>,
     query_source: SqlHistoryQuerySource<S>,
@@ -872,6 +1223,7 @@ where
         event_descriptors: parse_file_history_descriptors(&event_entries)?,
         event_directories: parse_file_history_directories(&event_entries)?,
         event_blobs: parse_file_history_blobs(&event_entries)?,
+        event_derived_file_refs: parse_file_history_derived_file_refs(&event_entries)?,
         descriptors: parse_file_history_descriptors(&context_entries)?,
     })
 }
@@ -947,9 +1299,26 @@ where
         descriptors: parse_file_history_descriptors(&entries)?,
         directories: parse_file_history_directories(&entries)?,
         blobs: parse_file_history_blobs(&entries)?,
+        derived_file_refs: parse_file_history_derived_file_refs(&entries)?,
+        plugin_states_by_file: index_file_history_plugin_states(parse_file_history_plugin_state(
+            &entries,
+        )),
         plugin_owners: parse_file_history_plugin_owners(&plugin_owner_entries)?,
         plugin_registry,
     })
+}
+
+fn index_file_history_plugin_states(
+    rows: Vec<FileHistoryPluginStateRecord>,
+) -> BTreeMap<String, Vec<FileHistoryPluginStateRecord>> {
+    let mut by_file = BTreeMap::new();
+    for row in rows {
+        by_file
+            .entry(row.file_id.clone())
+            .or_insert_with(Vec::new)
+            .push(row);
+    }
+    by_file
 }
 
 async fn load_file_history_plugin_owner_entries_at_observed_commit<S>(
@@ -1004,6 +1373,7 @@ where
             schema_keys: vec![
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
+                DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
             ],
             entity_pks,
             file_ids: file_ids.clone(),
@@ -1219,6 +1589,7 @@ where
         vec![
             FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             BLOB_REF_SCHEMA_KEY.to_string(),
+            DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
         ],
         metadata_projection,
     )
@@ -1359,6 +1730,7 @@ fn file_history_filesystem_schema_keys() -> Vec<String> {
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
+        DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
     ]
 }
 
@@ -1366,6 +1738,7 @@ fn file_history_events(
     event_descriptors: &[FileHistoryDescriptorRecord],
     event_directories: &[FileHistoryDirectoryRecord],
     event_blobs: &[FileHistoryBlobRecord],
+    event_derived_file_refs: &[FileHistoryDerivedFileRefRecord],
     context_descriptors: &[FileHistoryDescriptorRecord],
     observed_states: &BTreeMap<String, FileHistoryObservedState>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
@@ -1421,6 +1794,16 @@ fn file_history_events(
             candidates.push(file_history_event_from_entry(
                 blob.file_id.clone(),
                 &blob.entry,
+            ));
+        }
+    }
+    for proof in event_derived_file_refs {
+        if descriptor_ids_by_as_of
+            .contains(&(proof.file_id.clone(), proof.entry.as_of_commit_id.clone()))
+        {
+            candidates.push(file_history_event_from_entry(
+                proof.file_id.clone(),
+                &proof.entry,
             ));
         }
     }
@@ -1784,13 +2167,59 @@ fn parse_file_history_blobs(
         .collect()
 }
 
+fn parse_file_history_derived_file_refs(
+    entries: &[HistoryEntry],
+) -> Result<Vec<FileHistoryDerivedFileRefRecord>, LixError> {
+    entries
+        .iter()
+        .filter(|entry| entry.change.schema_key == DERIVED_FILE_REF_SCHEMA_KEY)
+        .map(|entry| {
+            let fallback_file_id = || {
+                entry.change.file_id.clone().unwrap_or_else(|| {
+                    entry
+                        .change
+                        .entity_pk
+                        .as_single_string_owned()
+                        .expect("canonical change entity primary key should project")
+                })
+            };
+            let Some(snapshot_content) = entry.change.snapshot_content.as_deref() else {
+                return Ok(FileHistoryDerivedFileRefRecord {
+                    file_id: fallback_file_id(),
+                    path: None,
+                    sha256: None,
+                    size_bytes: None,
+                    entry: entry.clone(),
+                });
+            };
+            let snapshot: DerivedFileRefSnapshot =
+                serde_json::from_str(snapshot_content).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("invalid lix_derived_file_ref history snapshot JSON: {error}"),
+                    )
+                })?;
+            Ok(FileHistoryDerivedFileRefRecord {
+                file_id: entry.change.file_id.clone().unwrap_or(snapshot.id),
+                path: Some(snapshot.path),
+                sha256: Some(snapshot.sha256),
+                size_bytes: Some(snapshot.size_bytes),
+                entry: entry.clone(),
+            })
+        })
+        .collect()
+}
+
 fn parse_file_history_plugin_state(entries: &[HistoryEntry]) -> Vec<FileHistoryPluginStateRecord> {
     entries
         .iter()
         .filter(|entry| {
             !matches!(
                 entry.change.schema_key.as_str(),
-                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY
+                FILE_DESCRIPTOR_SCHEMA_KEY
+                    | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                    | BLOB_REF_SCHEMA_KEY
+                    | DERIVED_FILE_REF_SCHEMA_KEY
             )
         })
         .filter_map(|entry| {
@@ -1853,7 +2282,7 @@ fn file_history_event_affects_observed_file(
         .source_changes
         .iter()
         .any(|change| match change.schema_key.as_str() {
-            FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
+            FILE_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY | DERIVED_FILE_REF_SCHEMA_KEY => {
                 change
                     .file_id
                     .as_deref()
@@ -2005,12 +2434,13 @@ mod tests {
     use crate::sql2::history_route::HistoryEntry;
 
     use super::{
-        FileHistoryBlobRecord, FileHistoryDescriptorRecord, FileHistoryDirectoryIndex,
-        FileHistoryDirectoryRecord, FileHistoryFilesystemContext, FileHistoryLookupIds,
-        FileHistoryObservedState, FileHistoryPluginOwnerRecord, FileHistoryPluginStateRecord,
-        FileHistoryPublicPredicate, HistoryRoute, PluginRegistry, PreparedFileHistoryRow,
-        file_history_descriptor_blob_route, file_history_event_from_entry, file_history_events,
-        file_history_plugin_events, load_file_history_blob_bytes, load_file_history_entry_sets,
+        FileHistoryBlobRecord, FileHistoryDerivedFileRefRecord, FileHistoryDescriptorRecord,
+        FileHistoryDirectoryIndex, FileHistoryDirectoryRecord, FileHistoryFilesystemContext,
+        FileHistoryLookupIds, FileHistoryObservedState, FileHistoryPluginOwnerRecord,
+        FileHistoryPluginStateRecord, FileHistoryPublicPredicate, HistoryRoute, PluginRegistry,
+        PreparedFileHistoryRow, file_history_descriptor_blob_route, file_history_event_from_entry,
+        file_history_events, file_history_plugin_events, load_file_history_blob_bytes,
+        load_file_history_entry_sets, parse_file_history_derived_file_refs,
         prepare_file_history_rows, sorted_grouped_file_history_events,
     };
 
@@ -2096,6 +2526,33 @@ mod tests {
         }
     }
 
+    fn derived_file_ref_record(
+        file_id: &str,
+        sha256: &str,
+        size_bytes: u64,
+        depth: u32,
+    ) -> FileHistoryDerivedFileRefRecord {
+        let mut entry = history_entry(file_id, depth, None);
+        entry.change.id = format!("derived-{file_id}-{depth}");
+        entry.change.schema_key = super::DERIVED_FILE_REF_SCHEMA_KEY.to_string();
+        entry.change.snapshot_content = Some(
+            serde_json::json!({
+                "id": file_id,
+                "path": format!("/{file_id}"),
+                "sha256": sha256,
+                "size_bytes": size_bytes,
+            })
+            .to_string(),
+        );
+        FileHistoryDerivedFileRefRecord {
+            file_id: file_id.to_string(),
+            path: Some(format!("/{file_id}")),
+            sha256: Some(sha256.to_string()),
+            size_bytes: Some(size_bytes),
+            entry,
+        }
+    }
+
     fn filesystem_context(
         descriptors: Vec<FileHistoryDescriptorRecord>,
         blobs: Vec<FileHistoryBlobRecord>,
@@ -2104,6 +2561,7 @@ mod tests {
             event_descriptors: descriptors.clone(),
             event_directories: Vec::new(),
             event_blobs: blobs,
+            event_derived_file_refs: Vec::new(),
             descriptors,
         }
     }
@@ -2117,6 +2575,8 @@ mod tests {
                 descriptors: context.descriptors.clone(),
                 directories: context.event_directories.clone(),
                 blobs: context.event_blobs.clone(),
+                derived_file_refs: context.event_derived_file_refs.clone(),
+                plugin_states_by_file: BTreeMap::new(),
                 plugin_owners: Vec::new(),
                 plugin_registry: PluginRegistry::empty(),
             },
@@ -2167,6 +2627,8 @@ mod tests {
             descriptors: Vec::new(),
             directories: Vec::new(),
             blobs: Vec::new(),
+            derived_file_refs: Vec::new(),
+            plugin_states_by_file: BTreeMap::new(),
             plugin_owners: vec![owner_record],
             plugin_registry: PluginRegistry::empty(),
         }
@@ -2179,6 +2641,7 @@ mod tests {
             "entry": "plugin.wasm",
             "key": plugin_key,
             "match": { "path_glob": "*.plugin-test" },
+            "materialization": "blob",
             "runtime": "wasm-component-v2",
             "schemas": ["schema/plugin.json"],
         })
@@ -2385,6 +2848,147 @@ mod tests {
     }
 
     #[test]
+    fn derived_file_ref_snapshots_and_tombstones_parse_as_history_records() {
+        let sha256 = "a".repeat(64);
+        let live = derived_file_ref_record("file-a", &sha256, 42, 0);
+        let mut tombstone = history_entry("file-a", 1, None);
+        tombstone.change.id = "derived-file-a-tombstone".to_string();
+        tombstone.change.schema_key = super::DERIVED_FILE_REF_SCHEMA_KEY.to_string();
+
+        let refs = parse_file_history_derived_file_refs(&[live.entry.clone(), tombstone]).unwrap();
+
+        assert_eq!(refs.len(), 2);
+        assert_eq!(refs[0].file_id, "file-a");
+        assert_eq!(refs[0].sha256.as_deref(), Some(sha256.as_str()));
+        assert_eq!(refs[0].size_bytes, Some(42));
+        assert_eq!(refs[1].file_id, "file-a");
+        assert_eq!(refs[1].sha256, None);
+        assert_eq!(refs[1].size_bytes, None);
+    }
+
+    #[test]
+    fn derived_materializations_produce_history_rows_without_binary_blob_refs() {
+        let sha256 = "b".repeat(64);
+        let descriptor = descriptor("file-a", Some("a.txt"), 0);
+        let proof = derived_file_ref_record("file-a", &sha256, 42, 0);
+        let context = FileHistoryFilesystemContext {
+            event_descriptors: Vec::new(),
+            event_directories: Vec::new(),
+            event_blobs: Vec::new(),
+            event_derived_file_refs: vec![proof.clone()],
+            descriptors: vec![descriptor],
+        };
+        let states = observed_states(&context);
+
+        let events = file_history_events(
+            &context.event_descriptors,
+            &context.event_directories,
+            &context.event_blobs,
+            &context.event_derived_file_refs,
+            &context.descriptors,
+            &states,
+            &BTreeMap::new(),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].file_id, "file-a");
+        assert_eq!(
+            events[0]
+                .source_changes
+                .iter()
+                .map(|change| change.schema_key.as_str())
+                .collect::<Vec<_>>(),
+            vec![super::DERIVED_FILE_REF_SCHEMA_KEY]
+        );
+
+        let prepared = prepare_file_history_rows(
+            &states,
+            events,
+            &HistoryRoute::default(),
+            &FileHistoryPublicPredicate::All,
+        )
+        .unwrap();
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].blob_hash, None);
+        let prepared_proof = prepared[0]
+            .derived_file_ref
+            .as_ref()
+            .expect("derived proof should remain attached to the prepared history row");
+        assert_eq!(prepared_proof.sha256.as_deref(), Some(sha256.as_str()));
+        assert_eq!(prepared_proof.size_bytes, Some(42));
+    }
+
+    #[test]
+    fn history_rejects_simultaneous_binary_and_derived_materializations() {
+        let sha256 = "c".repeat(64);
+        let descriptor = descriptor("file-a", Some("a.txt"), 0);
+        let blob = blob_record("file-a", BlobHash::from_content(b"raw"), 0);
+        let proof = derived_file_ref_record("file-a", &sha256, 3, 0);
+        let states = BTreeMap::from([(
+            "commit-0".to_string(),
+            FileHistoryObservedState {
+                descriptors: vec![descriptor.clone()],
+                directories: Vec::new(),
+                blobs: vec![blob],
+                derived_file_refs: vec![proof],
+                plugin_states_by_file: BTreeMap::new(),
+                plugin_owners: Vec::new(),
+                plugin_registry: PluginRegistry::empty(),
+            },
+        )]);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+
+        let error = prepare_file_history_rows(
+            &states,
+            vec![event],
+            &HistoryRoute::default(),
+            &FileHistoryPublicPredicate::All,
+        )
+        .expect_err("mixed materializations violate the durable file contract");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert!(
+            error
+                .message
+                .contains("both blob and derived materializations")
+        );
+    }
+
+    #[test]
+    fn derived_proof_tombstone_does_not_conflict_with_successor_blob_history() {
+        let descriptor = descriptor("file-a", Some("a.txt"), 0);
+        let blob = blob_record("file-a", BlobHash::from_content(b"raw"), 0);
+        let mut proof_tombstone = derived_file_ref_record("file-a", &"d".repeat(64), 3, 0);
+        proof_tombstone.sha256 = None;
+        proof_tombstone.size_bytes = None;
+        proof_tombstone.entry.change.snapshot_content = None;
+        let states = BTreeMap::from([(
+            "commit-0".to_string(),
+            FileHistoryObservedState {
+                descriptors: vec![descriptor.clone()],
+                directories: Vec::new(),
+                blobs: vec![blob],
+                derived_file_refs: vec![proof_tombstone],
+                plugin_states_by_file: BTreeMap::new(),
+                plugin_owners: Vec::new(),
+                plugin_registry: PluginRegistry::empty(),
+            },
+        )]);
+        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+
+        let prepared = prepare_file_history_rows(
+            &states,
+            vec![event],
+            &HistoryRoute::default(),
+            &FileHistoryPublicPredicate::All,
+        )
+        .expect("a raw successor must supersede the tombstoned derived proof");
+
+        assert_eq!(prepared.len(), 1);
+        assert!(prepared[0].blob_hash.is_some());
+        assert!(prepared[0].derived_file_ref.is_none());
+    }
+
+    #[test]
     fn unfiltered_sibling_directory_fanout_uses_directory_file_buckets() {
         const SIBLING_COUNT: usize = 512;
 
@@ -2403,6 +3007,8 @@ mod tests {
             descriptors: descriptors.clone(),
             directories: directories.clone(),
             blobs: Vec::new(),
+            derived_file_refs: Vec::new(),
+            plugin_states_by_file: BTreeMap::new(),
             plugin_owners: Vec::new(),
             plugin_registry: PluginRegistry::empty(),
         };
@@ -2412,6 +3018,7 @@ mod tests {
         let events = file_history_events(
             &[],
             &directories,
+            &[],
             &[],
             &descriptors,
             &observed_states,
@@ -2619,6 +3226,7 @@ mod tests {
                 ..descriptor.clone()
             },
             blob_hash: Some(hash.to_hex()),
+            derived_file_ref: None,
             event: event.clone(),
         };
         let rows = vec![
@@ -2658,6 +3266,7 @@ mod tests {
                 ..descriptor.clone()
             },
             blob_hash: Some(hash.to_hex()),
+            derived_file_ref: None,
             event: event.clone(),
         };
         let rows = vec![

@@ -8,7 +8,8 @@ use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
 
 use super::keys::{
-    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+    BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+    FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 
@@ -23,6 +24,7 @@ pub(crate) struct VisibleFilesystem {
         BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
     pub(crate) files_by_directory_id: BTreeMap<Option<FilesystemDescriptorKey>, BTreeSet<String>>,
     pub(crate) blob_refs_by_key: BTreeSet<FilesystemBlobRefKey>,
+    pub(crate) derived_file_refs_by_key: BTreeSet<FilesystemBlobRefKey>,
 }
 
 impl VisibleFilesystem {
@@ -39,6 +41,7 @@ impl VisibleFilesystem {
                         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                         BLOB_REF_SCHEMA_KEY.to_string(),
+                        DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
                     ],
                     branch_ids: vec![branch_id.to_string()],
                     ..LiveStateFilter::default()
@@ -101,6 +104,18 @@ impl VisibleFilesystem {
                         .blob_refs_by_key
                         .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
                 }
+                DERIVED_FILE_REF_SCHEMA_KEY => {
+                    let snapshot: DerivedFileRefSnapshot = serde_json::from_str(snapshot_content)
+                        .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("invalid lix_derived_file_ref snapshot JSON: {error}"),
+                        )
+                    })?;
+                    visible
+                        .derived_file_refs_by_key
+                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
+                }
                 _ => {}
             }
         }
@@ -112,6 +127,15 @@ impl VisibleFilesystem {
 impl VisibleFilesystem {
     pub(crate) fn has_blob_ref(&self, context: &FilesystemRowContext, file_id: &str) -> bool {
         self.blob_refs_by_key
+            .contains(&FilesystemBlobRefKey::from_context(context, file_id))
+    }
+
+    pub(crate) fn has_derived_file_ref(
+        &self,
+        context: &FilesystemRowContext,
+        file_id: &str,
+    ) -> bool {
+        self.derived_file_refs_by_key
             .contains(&FilesystemBlobRefKey::from_context(context, file_id))
     }
 }
@@ -133,6 +157,13 @@ struct BlobRefSnapshot {
     id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct DerivedFileRefSnapshot {
+    id: String,
+    #[serde(rename = "path")]
+    _path: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -147,8 +178,8 @@ mod tests {
     use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
 
     use super::{
-        BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
-        VisibleFilesystem,
+        BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        FILE_DESCRIPTOR_SCHEMA_KEY, VisibleFilesystem,
     };
 
     #[tokio::test]
@@ -193,6 +224,7 @@ mod tests {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 BLOB_REF_SCHEMA_KEY.to_string(),
+                DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
             ]
         );
         assert_eq!(request.filter.branch_ids, vec!["branch-a".to_string()]);

@@ -265,6 +265,7 @@ mod tests {
                 "key":"{plugin_key}",
                 "runtime":"wasm-component-v2",
                 "api_version":"2.1.0",
+                "materialization":"blob",
                 "match":{{"path_glob":"{path_glob}"{content_type}}},
                 "entry":"plugin.wasm",
                 "schemas":["schema/plugin_test_note.json"]

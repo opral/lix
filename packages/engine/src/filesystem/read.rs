@@ -6,7 +6,8 @@ use crate::LixError;
 use crate::common::compose_file_path;
 
 use super::keys::{
-    BLOB_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY, FILE_DESCRIPTOR_SCHEMA_KEY,
+    BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+    FILE_DESCRIPTOR_SCHEMA_KEY,
 };
 use super::planner::{FilesystemBlobRefKey, FilesystemDescriptorKey, FilesystemRowContext};
 use super::{DirectoryPathRecord, derive_directory_paths};
@@ -23,6 +24,7 @@ impl FilesystemIndex {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectorySnapshot>::new();
         let mut file_rows = Vec::<(FileSnapshot, RowScope)>::new();
         let mut blob_hashes_by_key = BTreeMap::<FilesystemBlobRefKey, String>::new();
+        let mut derived_refs_by_key = BTreeMap::<FilesystemBlobRefKey, ()>::new();
 
         for row in rows {
             let scope = RowScope {
@@ -67,6 +69,16 @@ impl FilesystemIndex {
                         FilesystemBlobRefKey::from_live_row(&row, snapshot.id),
                         snapshot.blob_hash,
                     );
+                }
+                DERIVED_FILE_REF_SCHEMA_KEY => {
+                    let snapshot: DerivedFileRefSnapshot = serde_json::from_str(snapshot_content)
+                        .map_err(|error| {
+                        LixError::unknown(format!(
+                            "invalid lix_derived_file_ref snapshot JSON: {error}"
+                        ))
+                    })?;
+                    derived_refs_by_key
+                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id), ());
                 }
                 _ => {}
             }
@@ -118,16 +130,16 @@ impl FilesystemIndex {
                 }
                 None => compose_file_path(None, &snapshot.name)?,
             };
+            let materialization_key = FilesystemBlobRefKey::from_context(
+                &scope.context(Some(snapshot.id.clone())),
+                &snapshot.id,
+            );
             let file = FilesystemFileEntry {
                 id: snapshot.id.clone(),
                 directory_id: snapshot.directory_id,
                 name: snapshot.name,
-                blob_hash: blob_hashes_by_key
-                    .get(&FilesystemBlobRefKey::from_context(
-                        &scope.context(Some(snapshot.id.clone())),
-                        &snapshot.id,
-                    ))
-                    .cloned(),
+                blob_hash: blob_hashes_by_key.get(&materialization_key).cloned(),
+                has_derived_file_ref: derived_refs_by_key.contains_key(&materialization_key),
                 scope,
             };
             insert_entry(
@@ -163,6 +175,7 @@ pub(crate) fn filesystem_schema_keys() -> Vec<String> {
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
         FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
         BLOB_REF_SCHEMA_KEY.to_string(),
+        DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
     ]
 }
 
@@ -178,6 +191,7 @@ pub(crate) struct FilesystemFileEntry {
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
     pub(crate) blob_hash: Option<String>,
+    pub(crate) has_derived_file_ref: bool,
     pub(crate) scope: RowScope,
 }
 
@@ -265,6 +279,13 @@ struct FileSnapshot {
 struct BlobRefSnapshot {
     id: String,
     blob_hash: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DerivedFileRefSnapshot {
+    id: String,
+    #[serde(rename = "path")]
+    _path: String,
 }
 
 fn insert_entry(
@@ -504,6 +525,7 @@ mod tests {
             directory_id: None,
             name: "foo".to_string(),
             blob_hash: None,
+            has_derived_file_ref: false,
             scope: row_scope(),
         }
     }
