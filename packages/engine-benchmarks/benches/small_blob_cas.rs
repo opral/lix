@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CoreProjection, GetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadDurability,
-    ReadOptions, SpaceId, Storage, StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetOptions, Key, Precondition, ProjectedValue, PutBatch, PutEntry,
+    ReadDurability, ReadOptions, SpaceId, Storage, StorageWrite, StoredValue, WriteOptions,
 };
 use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix_engine::storage_bench::{
@@ -24,6 +24,8 @@ const OPERATIONS: &[Operation] = &[
     Operation::HotRead,
     Operation::DurableSingletonRead,
     Operation::VisibleHotBatchRead,
+    Operation::VisiblePreconditionBatch,
+    Operation::VisibleIdempotentPreconditionBatch,
 ];
 const DEFAULT_WARMUPS: usize = 20;
 const DEFAULT_SAMPLES: usize = 200;
@@ -31,6 +33,9 @@ const DIRECT_SINGLETON_SPACE: SpaceId = SpaceId(0x00ff_0002);
 const DIRECT_BATCH_SPACE: SpaceId = SpaceId(0x00ff_0004);
 const DIRECT_BATCH_KEYS: usize = 1024;
 const DIRECT_BATCH_KEY_SUFFIX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef";
+const DIRECT_PRECONDITION_SPACE: SpaceId = SpaceId(0x00ff_0005);
+const DIRECT_PRECONDITION_VALUE: &[u8] = b"precondition-value";
+const DIRECT_IDEMPOTENCY_RECEIPT_KEY: &[u8] = b"idempotency-receipt";
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -54,6 +59,8 @@ enum Operation {
     HotRead,
     DurableSingletonRead,
     VisibleHotBatchRead,
+    VisiblePreconditionBatch,
+    VisibleIdempotentPreconditionBatch,
 }
 
 impl Display for Operation {
@@ -64,6 +71,10 @@ impl Display for Operation {
             Self::HotRead => formatter.write_str("hot_read"),
             Self::DurableSingletonRead => formatter.write_str("durable_singleton_read"),
             Self::VisibleHotBatchRead => formatter.write_str("visible_hot_batch_read"),
+            Self::VisiblePreconditionBatch => formatter.write_str("visible_precondition_batch"),
+            Self::VisibleIdempotentPreconditionBatch => {
+                formatter.write_str("visible_idempotent_precondition_batch")
+            }
         }
     }
 }
@@ -200,6 +211,7 @@ struct BackendFixture<S: Storage> {
     direct_key: Key,
     direct_value_len: usize,
     direct_batch_keys: Vec<Key>,
+    direct_precondition_keys: Vec<Key>,
 }
 
 impl<S> BackendFixture<S>
@@ -214,6 +226,7 @@ where
         direct_key: Key,
         direct_value_len: usize,
         direct_batch_keys: Vec<Key>,
+        direct_precondition_keys: Vec<Key>,
     ) -> Self {
         let storage = StorageAdapter::new(storage);
         let stable_bytes = deterministic_bytes(size, 0x5a17);
@@ -236,6 +249,7 @@ where
             direct_key,
             direct_value_len,
             direct_batch_keys,
+            direct_precondition_keys,
         }
     }
 
@@ -263,6 +277,12 @@ where
                 bytes: None,
                 expected_hash: None,
             },
+            Operation::VisiblePreconditionBatch | Operation::VisibleIdempotentPreconditionBatch => {
+                PreparedOperation {
+                    bytes: None,
+                    expected_hash: None,
+                }
+            }
         }
     }
 
@@ -272,6 +292,12 @@ where
         }
         if matches!(self.operation, Operation::VisibleHotBatchRead) {
             return self.read_visible_hot_batch().await;
+        }
+        if matches!(
+            self.operation,
+            Operation::VisiblePreconditionBatch | Operation::VisibleIdempotentPreconditionBatch
+        ) {
+            return self.check_visible_preconditions().await;
         }
         match prepared.bytes {
             Some(bytes) => {
@@ -353,6 +379,45 @@ where
         values.len()
     }
 
+    async fn check_visible_preconditions(&self) -> usize {
+        let idempotent = matches!(
+            self.operation,
+            Operation::VisibleIdempotentPreconditionBatch
+        );
+        let mut preconditions = self
+            .direct_precondition_keys
+            .iter()
+            .cloned()
+            .map(|key| Precondition::KeyValueEquals {
+                space: DIRECT_PRECONDITION_SPACE,
+                key,
+                expected: Bytes::from_static(DIRECT_PRECONDITION_VALUE),
+            })
+            .collect::<Vec<_>>();
+        if idempotent {
+            preconditions.push(Precondition::KeyAbsent {
+                space: DIRECT_PRECONDITION_SPACE,
+                key: Key(Bytes::from_static(DIRECT_IDEMPOTENCY_RECEIPT_KEY)),
+            });
+        }
+        let checked = preconditions.len();
+        let write = self
+            .storage
+            .prepare_write_set(
+                self.storage.new_write_set(),
+                WriteOptions {
+                    idempotency_key: idempotent
+                        .then(|| Bytes::from_static(DIRECT_IDEMPOTENCY_RECEIPT_KEY)),
+                    preconditions,
+                    ..WriteOptions::default()
+                },
+            )
+            .await
+            .expect("check direct visible preconditions");
+        drop(write);
+        checked
+    }
+
     async fn layout(&self) -> Layout {
         let read = self
             .storage
@@ -386,6 +451,12 @@ impl Fixture {
         let direct_batch_keys = matches!(operation, Operation::VisibleHotBatchRead)
             .then(direct_batch_keys)
             .unwrap_or_default();
+        let direct_precondition_keys = matches!(
+            operation,
+            Operation::VisiblePreconditionBatch | Operation::VisibleIdempotentPreconditionBatch
+        )
+        .then(direct_precondition_keys)
+        .unwrap_or_default();
         match backend {
             Backend::Rocks => {
                 let storage = RocksDB::open(&database_path).expect("open benchmark RocksDB");
@@ -398,6 +469,13 @@ impl Fixture {
                 if matches!(operation, Operation::VisibleHotBatchRead) {
                     seed_direct_batch_values(&storage, &direct_batch_keys).await;
                 }
+                if matches!(
+                    operation,
+                    Operation::VisiblePreconditionBatch
+                        | Operation::VisibleIdempotentPreconditionBatch
+                ) {
+                    seed_direct_precondition_values(&storage, &direct_precondition_keys).await;
+                }
                 Self::Rocks(
                     BackendFixture::create(
                         storage,
@@ -407,6 +485,7 @@ impl Fixture {
                         direct_key,
                         direct_value_len,
                         direct_batch_keys,
+                        direct_precondition_keys,
                     )
                     .await,
                 )
@@ -423,6 +502,13 @@ impl Fixture {
                 if matches!(operation, Operation::VisibleHotBatchRead) {
                     seed_direct_batch_values(&storage, &direct_batch_keys).await;
                 }
+                if matches!(
+                    operation,
+                    Operation::VisiblePreconditionBatch
+                        | Operation::VisibleIdempotentPreconditionBatch
+                ) {
+                    seed_direct_precondition_values(&storage, &direct_precondition_keys).await;
+                }
                 Self::Slate(
                     BackendFixture::create(
                         storage,
@@ -432,6 +518,7 @@ impl Fixture {
                         direct_key,
                         direct_value_len,
                         direct_batch_keys,
+                        direct_precondition_keys,
                     )
                     .await,
                 )
@@ -534,6 +621,45 @@ fn direct_batch_keys() -> Vec<Key> {
             )))
         })
         .collect()
+}
+
+fn direct_precondition_keys() -> Vec<Key> {
+    ["branch-head", "tracked-mutation-revision"]
+        .into_iter()
+        .map(|key| Key(Bytes::from_static(key.as_bytes())))
+        .collect()
+}
+
+async fn seed_direct_precondition_values<S>(storage: &S, keys: &[Key])
+where
+    S: Storage,
+{
+    let mut write = storage
+        .begin_write(WriteOptions::default())
+        .await
+        .expect("begin direct precondition seed write");
+    write
+        .put_many(
+            DIRECT_PRECONDITION_SPACE,
+            PutBatch {
+                entries: keys
+                    .iter()
+                    .cloned()
+                    .map(|key| PutEntry {
+                        key,
+                        value: StoredValue {
+                            bytes: Bytes::from_static(DIRECT_PRECONDITION_VALUE),
+                        },
+                    })
+                    .collect(),
+            },
+        )
+        .await
+        .expect("stage direct precondition seed values");
+    write
+        .commit()
+        .await
+        .expect("commit direct precondition seed values");
 }
 
 #[derive(Default)]
