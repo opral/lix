@@ -589,7 +589,7 @@ impl FilesystemPathIndex {
             .values()
             .map(|(hash, _, _)| *hash)
             .collect::<Vec<_>>();
-        let Ok(values) = crate::binary_cas::kv::load_bytes_many(store, &hashes).await else {
+        let Ok(values) = crate::binary_cas::load_bytes_many(store, &hashes).await else {
             return Ok(self);
         };
         let values = values.into_vec();

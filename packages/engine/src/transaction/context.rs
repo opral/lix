@@ -652,7 +652,7 @@ where
                 .filter(|row| {
                     matches!(
                         row.schema_key.as_str(),
-                        "lix_file_descriptor" | "lix_directory_descriptor"
+                        "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
                     )
                 })
                 .cloned()
@@ -4805,7 +4805,10 @@ fn prepared_transaction_write_affects_filesystem_path_index(
     prepared_transaction_write_rows(write).iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
+            "lix_file_descriptor"
+                | "lix_directory_descriptor"
+                | BLOB_REF_SCHEMA_KEY
+                | BRANCH_REF_SCHEMA_KEY
         )
     })
 }

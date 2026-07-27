@@ -105,7 +105,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     let filesystem_view_changed = prepared_writes.state_rows.iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
+            "lix_file_descriptor"
+                | "lix_directory_descriptor"
+                | "lix_binary_blob_ref"
+                | BRANCH_REF_SCHEMA_KEY
         )
     }) || prepared_writes
         .commit_change_refs_by_branch
@@ -114,7 +117,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .any(|change_ref| {
             matches!(
                 change_ref.schema_key.as_str(),
-                "lix_file_descriptor" | "lix_directory_descriptor"
+                "lix_file_descriptor" | "lix_directory_descriptor" | "lix_binary_blob_ref"
             )
         });
     let mut state_rows = prepared_writes.state_rows;
