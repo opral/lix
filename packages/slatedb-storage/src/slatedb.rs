@@ -713,27 +713,15 @@ impl SlateDBWorker {
         F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, StorageError>> + Send + 'static,
     {
-        let (mut reply_tx, reply_rx) = oneshot::channel();
-        // Manager shutdown waits for this guard. The guard is deliberately
-        // independent of `SlateDBWorkerInner`: keeping the inner Arc in a task
-        // running on its own runtime would make its synchronous manager join
-        // self-deadlock when the task released the final Arc.
+        // Reads are independent of the manager runtime. Running them on the
+        // caller's runtime removes a cross-thread spawn and oneshot round trip
+        // from every point read and scan batch. The guard still prevents the
+        // manager from closing the database while an active read is borrowing
+        // it; cancellation simply drops the read and releases that guard.
         let in_flight = self.inner.in_flight.enter();
         let db = Arc::clone(&self.inner.db);
-        self.inner.runtime.spawn(async move {
-            let _in_flight = in_flight;
-            let result = tokio::select! {
-                biased;
-                () = reply_tx.closed() => None,
-                result = operation(db) => Some(result),
-            };
-            if let Some(result) = result {
-                let _ = reply_tx.send(result);
-            }
-        });
-        reply_rx
-            .await
-            .map_err(|error| StorageError::Io(format!("receive slatedb worker reply: {error}")))?
+        let _in_flight = in_flight;
+        operation(db).await
     }
 }
 
