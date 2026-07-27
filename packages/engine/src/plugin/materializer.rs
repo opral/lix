@@ -1,5 +1,6 @@
 use crate::entity_pk::EntityPk;
 use crate::live_state::LiveStateProjection;
+use crate::transaction::types::TransactionJson;
 
 /// A validated plugin-owned semantic mutation ready for durable staging.
 ///
@@ -9,7 +10,7 @@ use crate::live_state::LiveStateProjection;
 pub(crate) struct PluginDetectedChange {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
-    pub(crate) snapshot_content: Option<String>,
+    pub(crate) snapshot_content: Option<TransactionJson>,
     pub(crate) metadata: Option<String>,
 }
 

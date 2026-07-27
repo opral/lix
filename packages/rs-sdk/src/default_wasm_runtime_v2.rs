@@ -411,6 +411,14 @@ fn encode_host_blob(
             push_u32(output, checked_u32(bytes.len(), "inline snapshot length")?);
             output.extend_from_slice(&bytes);
         }
+        WasmHostBytes::CanonicalJson { normalized, .. } => {
+            output.push(0);
+            push_u32(
+                output,
+                checked_u32(normalized.len(), "inline snapshot length")?,
+            );
+            output.extend_from_slice(normalized.as_bytes());
+        }
         WasmHostBytes::Source(slice) => {
             slice.validate()?;
             output.push(1);
