@@ -2658,6 +2658,44 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
     splice_provenance: Option<RequestBlobSpliceProvenance>,
     mutation_identity: Option<MutationIdentity>,
 ) -> Result<u64, LixError> {
+    execute_fast_lix_file_data_update_by_id_impl(
+        ctx,
+        file_id,
+        data,
+        None,
+        splice_provenance,
+        mutation_identity,
+    )
+    .await
+}
+
+pub(crate) async fn execute_fast_lix_file_data_update_by_id_with_metadata(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    file_id: Option<String>,
+    data: crate::Blob,
+    metadata: Option<TransactionJson>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<u64, LixError> {
+    execute_fast_lix_file_data_update_by_id_impl(
+        ctx,
+        file_id,
+        data,
+        Some(metadata),
+        splice_provenance,
+        mutation_identity,
+    )
+    .await
+}
+
+async fn execute_fast_lix_file_data_update_by_id_impl(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    file_id: Option<String>,
+    data: crate::Blob,
+    metadata_update: Option<Option<TransactionJson>>,
+    splice_provenance: Option<RequestBlobSpliceProvenance>,
+    mutation_identity: Option<MutationIdentity>,
+) -> Result<u64, LixError> {
     let active_branch_id = ctx.active_branch_id().to_string();
     ctx.load_branch_head(&active_branch_id)
         .await?
@@ -2743,6 +2781,17 @@ pub(crate) async fn execute_fast_lix_file_data_update_by_id(
         let mut context = existing.row_context();
         if context.global {
             context.branch_id = GLOBAL_BRANCH_ID.to_string();
+        }
+        if let Some(metadata) = &metadata_update {
+            context.metadata.clone_from(metadata);
+            staged
+                .state_rows
+                .push(file_descriptor_row(FileDescriptorRowInput {
+                    id: existing.id.clone(),
+                    directory_id: existing.directory_id.clone(),
+                    name: existing.name.clone(),
+                    context: context.clone(),
+                }));
         }
         stage_lix_file_data_update_write(
             &mut staged,

@@ -5366,6 +5366,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_file_data_and_metadata_update_by_id_uses_fast_path() {
+        let rows = vec![
+            live_file_row("file-readme", "branch-a", None, "readme.md"),
+            live_blob_ref_row("file-readme", "branch-a", b"old"),
+        ];
+        let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
+        let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);
+        let sql = "UPDATE lix_file SET data = $1, lixcol_metadata = $2 WHERE id = $3";
+        let params = [
+            Value::Blob(b"parameterized".to_vec().into()),
+            Value::Json(serde_json::json!({"source": "git"})),
+            Value::Text("file-readme".to_string()),
+        ];
+
+        let (fast_result, fast_path) =
+            execute_write_sql_trace(&mut fast_ctx, sql, &params, WriteExecutorMode::ForceFast)
+                .await
+                .expect("data and metadata update should use the fast path");
+        let (datafusion_result, datafusion_path) = execute_write_sql_trace(
+            &mut datafusion_ctx,
+            sql,
+            &params,
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("reference data and metadata update should succeed");
+
+        assert_eq!(fast_path, WriteExecutorPath::Fast);
+        assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
+        assert_eq!(fast_result.rows, vec![vec![Value::Integer(1)]]);
+        assert_eq!(fast_result.rows, datafusion_result.rows);
+        let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
+            .pending_write_overlay()
+            .expect("fast staged delta should project")
+            .visible_all_semantic_rows();
+        let datafusion_rows = datafusion_staged
+            .lock()
+            .expect("DataFusion writes lock")
+            .deltas[0]
+            .pending_write_overlay()
+            .expect("DataFusion staged delta should project")
+            .visible_all_semantic_rows();
+        assert_eq!(fast_rows, datafusion_rows);
+    }
+
+    #[tokio::test]
     async fn execute_sql_file_data_update_by_id_treats_null_id_as_no_match() {
         let rows = vec![live_file_row("file-readme", "branch-a", None, "readme.md")];
         let (mut fast_ctx, fast_staged, fast_scans) = counting_write_context(rows);
