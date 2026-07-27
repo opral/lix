@@ -1598,10 +1598,10 @@ where
                     } else {
                         PluginMaterialization::Blob
                     };
-                    if let Some(mut tombstone) = self
+                    let tombstone = self
                         .opposite_materialization_tombstone(file_key, target)
-                        .await?
-                    {
+                        .await?;
+                    if let Some(mut tombstone) = tombstone {
                         mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
                         rows.push(tombstone);
                     }
@@ -1709,10 +1709,10 @@ where
                     } else {
                         PluginMaterialization::Blob
                     };
-                    if let Some(mut tombstone) = self
+                    let tombstone = self
                         .opposite_materialization_tombstone(file_key, target)
-                        .await?
-                    {
+                        .await?;
+                    if let Some(mut tombstone) = tombstone {
                         mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
                         rows.push(tombstone);
                     }
@@ -3382,10 +3382,7 @@ where
                 PluginMaterialization::Derived => {
                     reconciliation.derived_materializations.insert(
                         file_key.clone(),
-                        DerivedMaterializationProof::from_bytes(
-                            &materialized_bytes,
-                            path.to_owned(),
-                        ),
+                        DerivedMaterializationProof::from_bytes(&materialized_bytes, path.clone()),
                     );
                 }
             }

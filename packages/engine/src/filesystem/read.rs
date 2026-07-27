@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 
@@ -24,7 +24,7 @@ impl FilesystemIndex {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectorySnapshot>::new();
         let mut file_rows = Vec::<(FileSnapshot, RowScope)>::new();
         let mut blob_hashes_by_key = BTreeMap::<FilesystemBlobRefKey, String>::new();
-        let mut derived_refs_by_key = BTreeMap::<FilesystemBlobRefKey, ()>::new();
+        let mut derived_refs_by_key = BTreeSet::<FilesystemBlobRefKey>::new();
 
         for row in rows {
             let scope = RowScope {
@@ -78,7 +78,7 @@ impl FilesystemIndex {
                         ))
                     })?;
                     derived_refs_by_key
-                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id), ());
+                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
                 }
                 _ => {}
             }
@@ -139,7 +139,7 @@ impl FilesystemIndex {
                 directory_id: snapshot.directory_id,
                 name: snapshot.name,
                 blob_hash: blob_hashes_by_key.get(&materialization_key).cloned(),
-                has_derived_file_ref: derived_refs_by_key.contains_key(&materialization_key),
+                has_derived_file_ref: derived_refs_by_key.contains(&materialization_key),
                 scope,
             };
             insert_entry(

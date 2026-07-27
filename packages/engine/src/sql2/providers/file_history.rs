@@ -2855,7 +2855,7 @@ mod tests {
         tombstone.change.id = "derived-file-a-tombstone".to_string();
         tombstone.change.schema_key = super::DERIVED_FILE_REF_SCHEMA_KEY.to_string();
 
-        let refs = parse_file_history_derived_file_refs(&[live.entry.clone(), tombstone]).unwrap();
+        let refs = parse_file_history_derived_file_refs(&[live.entry, tombstone]).unwrap();
 
         assert_eq!(refs.len(), 2);
         assert_eq!(refs[0].file_id, "file-a");
@@ -2875,7 +2875,7 @@ mod tests {
             event_descriptors: Vec::new(),
             event_directories: Vec::new(),
             event_blobs: Vec::new(),
-            event_derived_file_refs: vec![proof.clone()],
+            event_derived_file_refs: vec![proof],
             descriptors: vec![descriptor],
         };
         let states = observed_states(&context);

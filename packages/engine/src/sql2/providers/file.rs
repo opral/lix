@@ -228,6 +228,13 @@ struct LixFileDmlSourceState {
     path_index: Option<FilesystemPathSelection>,
 }
 
+#[derive(Clone, Copy)]
+struct LixFileDmlSourceOptions {
+    needs_data: bool,
+    needs_plugin_ownership: bool,
+    capture_path_resolver_rows: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExactLixFileReadColumn {
     Data,
@@ -390,10 +397,7 @@ impl LixFileSpec {
         request: LiveStateScanRequest,
         target_file_ids: FileIdConstraint,
         indexed_matches: Option<FilesystemPathSelection>,
-        needs_data: bool,
-        needs_materialization_refs: bool,
-        needs_plugin_ownership: bool,
-        capture_path_resolver_rows: bool,
+        options: LixFileDmlSourceOptions,
         captured: SharedLixFileDmlSourceState,
     ) -> RowSource {
         row_source(
@@ -405,10 +409,7 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 indexed_matches,
-                needs_data,
-                needs_materialization_refs,
-                needs_plugin_ownership,
-                capture_path_resolver_rows,
+                options,
                 self.session_file_views.clone(),
                 captured,
             ),
@@ -420,10 +421,7 @@ impl LixFileSpec {
                 request,
                 target_file_ids,
                 indexed_matches,
-                needs_data,
-                needs_materialization_refs,
-                needs_plugin_ownership,
-                capture_path_resolver_rows,
+                options,
                 session_file_views,
                 captured,
             )| async move {
@@ -453,14 +451,17 @@ impl LixFileSpec {
                     (
                         prepare_indexed_lix_file_rows(indexed_matches, rows),
                         None,
-                        capture_path_resolver_rows.then(|| indexed_matches.clone()),
+                        options
+                            .capture_path_resolver_rows
+                            .then(|| indexed_matches.clone()),
                     )
                 } else {
                     let rows =
                         scan_lix_file_live_rows(live_state.clone(), &request, &target_file_ids)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
-                    let path_resolver_rows = capture_path_resolver_rows.then(|| rows.clone());
+                    let path_resolver_rows =
+                        options.capture_path_resolver_rows.then(|| rows.clone());
                     (
                         prepare_lix_file_rows(rows, &FilePathPredicate::All),
                         path_resolver_rows,
@@ -468,26 +469,24 @@ impl LixFileSpec {
                     )
                 };
                 let mut prepared = prepared.map_err(lix_error_to_datafusion_error)?;
-                if needs_materialization_refs {
-                    let file_keys = prepared.blobless_plugin_file_keys();
-                    hydrate_derived_file_ref_rows(
-                        Arc::clone(&live_state),
-                        &request,
-                        file_keys,
-                        &mut prepared,
-                    )
-                    .await
-                    .map_err(lix_error_to_datafusion_error)?;
-                }
-                let plugin_render = if prepared.needs_plugin_render(needs_data)
-                    || (needs_plugin_ownership && !prepared.file_rows.is_empty())
+                let file_keys = prepared.blobless_plugin_file_keys();
+                hydrate_derived_file_ref_rows(
+                    Arc::clone(&live_state),
+                    &request,
+                    file_keys,
+                    &mut prepared,
+                )
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+                let plugin_render = if prepared.needs_plugin_render(options.needs_data)
+                    || (options.needs_plugin_ownership && !prepared.file_rows.is_empty())
                 {
                     plugin_render_context_for_lix_file_scan(
                         Arc::clone(&live_state),
                         &request,
                         plugin_host,
                         &prepared,
-                        needs_plugin_ownership,
+                        options.needs_plugin_ownership,
                     )
                     .await
                     .map_err(|error| {
@@ -513,7 +512,7 @@ impl LixFileSpec {
                     &table_schema,
                     &blob_reader,
                     plugin_render.clone(),
-                    needs_data,
+                    options.needs_data,
                     prepared,
                 )
                 .await
@@ -1101,10 +1100,11 @@ impl TableSpec for LixFileSpec {
             request,
             target_file_ids,
             indexed_matches,
-            needs_data,
-            true,
-            false,
-            false,
+            LixFileDmlSourceOptions {
+                needs_data,
+                needs_plugin_ownership: false,
+                capture_path_resolver_rows: false,
+            },
             Arc::clone(&captured),
         );
         let branch_binding = self.branch_binding.clone();
@@ -1177,10 +1177,11 @@ impl TableSpec for LixFileSpec {
             request,
             target_file_ids,
             indexed_matches,
-            needs_data,
-            true,
-            update_columns.updates_path() && !update_columns.data,
-            capture_path_resolver_rows,
+            LixFileDmlSourceOptions {
+                needs_data,
+                needs_plugin_ownership: update_columns.updates_path() && !update_columns.data,
+                capture_path_resolver_rows,
+            },
             Arc::clone(&captured),
         );
         let branch_binding = self.branch_binding.clone();
@@ -3668,7 +3669,7 @@ fn stage_lix_file_data_update_write(
     if file_payload.is_empty() {
         if has_blob_ref {
             let mut row = blob_ref_tombstone_row(file_id, context.clone());
-            row.origin = origin.clone();
+            row.origin.clone_from(&origin);
             staged.state_rows.push(row);
         }
         if has_derived_file_ref {
