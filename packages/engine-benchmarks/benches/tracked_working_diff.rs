@@ -1,4 +1,4 @@
-//! Two-phase populated tracked-working-diff benchmark for RocksDB.
+//! Two-phase populated tracked-working-diff benchmark for storage adapters.
 //!
 //! The fixture deliberately remains *between* checkpoints. The old checkpoint
 //! scale harness only measured `lix_working_change` after a checkpoint, when
@@ -8,9 +8,9 @@
 //!
 //! ```text
 //! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
-//!   setup /tmp/lix-working-diff-repeated repeated 10000 1000 10
+//!   setup rocksdb /tmp/lix-working-diff-repeated repeated 10000 1000 10
 //! cargo bench -p lix_engine_benchmarks --features storage-benches --bench tracked_working_diff -- \
-//!   measure /tmp/lix-working-diff-repeated 11
+//!   measure rocksdb /tmp/lix-working-diff-repeated 11
 //! ```
 //!
 //! `setup` refuses to overwrite an existing directory. `measure` is read-only
@@ -22,8 +22,12 @@ use std::time::{Duration, Instant};
 
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::storage_bench::diff_tracked_commits_for_bench;
-use lix_engine::{Engine, ExecuteBatchStatement, Storage, Value};
+use lix_engine::{
+    CreateBranchOptions, Engine, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
+    MergeBranchPreviewOptions, Storage, Value,
+};
 use lix_rocksdb_storage::RocksDB;
+use lix_slatedb_storage::SlateDB;
 
 const DEFAULT_ROW_COUNT: usize = 10_000;
 const DEFAULT_COMMIT_COUNT: usize = 1_000;
@@ -37,6 +41,29 @@ const WORKING_DIFF_SQL: &str = "SELECT entity_pk, schema_key, change_kind, befor
 enum Shape {
     Repeated,
     Disjoint,
+}
+
+#[derive(Clone, Copy)]
+enum Backend {
+    Rocks,
+    Slate,
+}
+
+impl Backend {
+    fn parse(value: &str) -> Self {
+        match value {
+            "rocksdb" => Self::Rocks,
+            "slatedb" => Self::Slate,
+            _ => panic!("backend must be 'rocksdb' or 'slatedb', got '{value}'"),
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Rocks => "rocksdb",
+            Self::Slate => "slatedb",
+        }
+    }
 }
 
 impl Shape {
@@ -62,12 +89,17 @@ impl Shape {
 }
 
 fn main() {
+    init_perf_tracing();
     let args = std::env::args().collect::<Vec<_>>();
     let Some(mode) = args.get(1).map(String::as_str) else {
         print_usage();
         return;
     };
-    let Some(path) = args.get(2).map(String::as_str) else {
+    let Some(backend) = args.get(2).map(|value| Backend::parse(value)) else {
+        print_usage();
+        return;
+    };
+    let Some(path) = args.get(3).map(String::as_str) else {
         print_usage();
         return;
     };
@@ -78,10 +110,132 @@ fn main() {
 
     match mode {
         "setup" => {
-            let Some(shape) = args.get(3).map(|value| Shape::parse(value)) else {
+            assert!(
+                !Path::new(path).exists(),
+                "refusing to overwrite existing fixture {path}"
+            );
+            let Some(shape) = args.get(4).map(|value| Shape::parse(value)) else {
                 print_usage();
                 return;
             };
+            let row_count = parse_usize(args.get(5), DEFAULT_ROW_COUNT, "row count");
+            let commit_count = parse_usize(args.get(6), DEFAULT_COMMIT_COUNT, "commit count");
+            let changes_per_commit = parse_usize(
+                args.get(7),
+                DEFAULT_CHANGES_PER_COMMIT,
+                "changes per commit",
+            );
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        let storage =
+                            RocksDB::open(path).expect("open tracked-working-diff RocksDB");
+                        setup(
+                            storage.clone(),
+                            backend,
+                            shape,
+                            row_count,
+                            commit_count,
+                            changes_per_commit,
+                        )
+                        .await;
+                        storage.flush().expect("flush tracked-working-diff RocksDB");
+                    }
+                    Backend::Slate => {
+                        let storage =
+                            SlateDB::open(path).expect("open tracked-working-diff SlateDB");
+                        setup(
+                            storage.clone(),
+                            backend,
+                            shape,
+                            row_count,
+                            commit_count,
+                            changes_per_commit,
+                        )
+                        .await;
+                        storage
+                            .flush()
+                            .await
+                            .expect("flush tracked-working-diff SlateDB");
+                    }
+                }
+            });
+        }
+        "measure" => {
+            let repetitions = parse_usize(
+                args.get(4),
+                DEFAULT_MEASURE_REPETITIONS,
+                "measurement repetitions",
+            );
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure(
+                            RocksDB::open(path).expect("open tracked-working-diff RocksDB"),
+                            backend,
+                            Path::new(path),
+                            repetitions,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure(
+                            SlateDB::open(path).expect("open tracked-working-diff SlateDB"),
+                            backend,
+                            Path::new(path),
+                            repetitions,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        "measure-history" => {
+            let Some(base_commit_id) = args.get(4) else {
+                print_usage();
+                return;
+            };
+            let Some(head_commit_id) = args.get(5) else {
+                print_usage();
+                return;
+            };
+            let repetitions = parse_usize(
+                args.get(6),
+                DEFAULT_MEASURE_REPETITIONS,
+                "measurement repetitions",
+            );
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure_history(
+                            RocksDB::open(path).expect("open tracked-working-diff RocksDB"),
+                            backend,
+                            Path::new(path),
+                            base_commit_id,
+                            head_commit_id,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure_history(
+                            SlateDB::open(path).expect("open tracked-working-diff SlateDB"),
+                            backend,
+                            Path::new(path),
+                            base_commit_id,
+                            head_commit_id,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                }
+            });
+        }
+        "merge-preview" => {
+            assert!(
+                !Path::new(path).exists(),
+                "refusing to overwrite existing fixture {path}"
+            );
             let row_count = parse_usize(args.get(4), DEFAULT_ROW_COUNT, "row count");
             let commit_count = parse_usize(args.get(5), DEFAULT_COMMIT_COUNT, "commit count");
             let changes_per_commit = parse_usize(
@@ -89,55 +243,116 @@ fn main() {
                 DEFAULT_CHANGES_PER_COMMIT,
                 "changes per commit",
             );
-            runtime.block_on(setup(
-                Path::new(path),
-                shape,
-                row_count,
-                commit_count,
-                changes_per_commit,
-            ));
-        }
-        "measure" => {
             let repetitions = parse_usize(
-                args.get(3),
+                args.get(7),
                 DEFAULT_MEASURE_REPETITIONS,
                 "measurement repetitions",
             );
-            runtime.block_on(measure(Path::new(path), repetitions));
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure_merge_preview(
+                            RocksDB::open(path).expect("open merge-preview RocksDB"),
+                            backend,
+                            row_count,
+                            commit_count,
+                            changes_per_commit,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure_merge_preview(
+                            SlateDB::open(path).expect("open merge-preview SlateDB"),
+                            backend,
+                            row_count,
+                            commit_count,
+                            changes_per_commit,
+                            repetitions,
+                        )
+                        .await;
+                    }
+                }
+            });
         }
-        "measure-history" => {
-            let Some(base_commit_id) = args.get(3) else {
-                print_usage();
-                return;
-            };
-            let Some(head_commit_id) = args.get(4) else {
-                print_usage();
-                return;
-            };
+        "merge-commit" => {
+            assert!(
+                !Path::new(path).exists(),
+                "refusing to overwrite existing fixture {path}"
+            );
             let repetitions = parse_usize(
-                args.get(5),
+                args.get(4),
                 DEFAULT_MEASURE_REPETITIONS,
                 "measurement repetitions",
             );
-            runtime.block_on(measure_history(
-                Path::new(path),
-                base_commit_id,
-                head_commit_id,
-                repetitions,
-            ));
+            let changes_per_side =
+                parse_usize(args.get(5), DEFAULT_CHANGES_PER_COMMIT, "changes per side");
+            runtime.block_on(async {
+                match backend {
+                    Backend::Rocks => {
+                        measure_merge_commit(
+                            RocksDB::open(path).expect("open merge-commit RocksDB"),
+                            backend,
+                            repetitions,
+                            changes_per_side,
+                        )
+                        .await;
+                    }
+                    Backend::Slate => {
+                        measure_merge_commit(
+                            SlateDB::open(path).expect("open merge-commit SlateDB"),
+                            backend,
+                            repetitions,
+                            changes_per_side,
+                        )
+                        .await;
+                    }
+                }
+            });
         }
-        "checkpoint" => runtime.block_on(checkpoint(Path::new(path))),
+        "checkpoint" => runtime.block_on(async {
+            match backend {
+                Backend::Rocks => {
+                    checkpoint(
+                        RocksDB::open(path).expect("open tracked-working-diff RocksDB"),
+                        backend,
+                        Path::new(path),
+                    )
+                    .await;
+                }
+                Backend::Slate => {
+                    checkpoint(
+                        SlateDB::open(path).expect("open tracked-working-diff SlateDB"),
+                        backend,
+                        Path::new(path),
+                    )
+                    .await;
+                }
+            }
+        }),
         _ => print_usage(),
+    }
+}
+
+fn init_perf_tracing() {
+    if std::env::var_os("LIX_WORKING_DIFF_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(false)
+            .try_init();
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "usage:\n  tracked_working_diff setup <directory> <repeated|disjoint> \
+        "usage:\n  tracked_working_diff setup <rocksdb|slatedb> <directory> <repeated|disjoint> \
          [rows] [commits] [changes-per-commit]\n  \
-         tracked_working_diff measure <directory> [repetitions]\n  \
-         tracked_working_diff measure-history <directory> <base-commit-id> <head-commit-id> [repetitions]\n  \
-         tracked_working_diff checkpoint <directory>"
+         tracked_working_diff measure <rocksdb|slatedb> <directory> [repetitions]\n  \
+         tracked_working_diff measure-history <rocksdb|slatedb> <directory> <base-commit-id> <head-commit-id> [repetitions]\n  \
+         tracked_working_diff merge-preview <rocksdb|slatedb> <directory> [rows] [commits-per-side] [changes-per-commit] [repetitions]\n  \
+         tracked_working_diff merge-commit <rocksdb|slatedb> <directory> [repetitions] [changes-per-side]\n  \
+         tracked_working_diff checkpoint <rocksdb|slatedb> <directory>"
     );
 }
 
@@ -151,24 +366,21 @@ fn parse_usize(value: Option<&String>, default: usize, label: &str) -> usize {
     value
 }
 
-async fn setup(
-    path: &Path,
+async fn setup<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
     shape: Shape,
     row_count: usize,
     commit_count: usize,
     changes_per_commit: usize,
-) {
-    assert!(
-        !path.exists(),
-        "refusing to overwrite existing fixture {}",
-        path.display()
-    );
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     assert!(
         changes_per_commit <= row_count,
         "changes per commit must not exceed row count"
     );
 
-    let storage = RocksDB::open(path).expect("open tracked-working-diff RocksDB");
     Engine::initialize(storage.clone())
         .await
         .expect("initialize tracked-working-diff storage");
@@ -213,11 +425,11 @@ async fn setup(
         .expect("tracked-working-diff fixture must have a branch head");
     drop(session);
     drop(engine);
-    storage.flush().expect("flush tracked-working-diff RocksDB");
     println!(
-        "tracked_working_diff setup backend=rocksdb shape={} rows={row_count} commits={commit_count} \
+        "tracked_working_diff setup backend={} shape={} rows={row_count} commits={commit_count} \
          changes_per_commit={changes_per_commit} working_changes={working_changes} \
          base_commit_id={} head_commit_id={} seed_ms={:.3} initial_checkpoint_ms={:.3} writes_ms={:.3}",
+        backend.name(),
         shape_name(shape),
         initial_checkpoint.commit_id,
         head_commit_id,
@@ -227,9 +439,15 @@ async fn setup(
     );
 }
 
-async fn measure(path: &Path, repetitions: usize) {
+async fn measure<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    path: &Path,
+    repetitions: usize,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     assert!(path.exists(), "fixture {} does not exist", path.display());
-    let storage = RocksDB::open(path).expect("open tracked-working-diff RocksDB");
     let engine = Engine::new(storage.clone())
         .await
         .expect("open tracked-working-diff engine");
@@ -256,8 +474,9 @@ async fn measure(path: &Path, repetitions: usize) {
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
     println!(
-        "tracked_working_diff measure backend=rocksdb working_changes={expected_changes} \
+        "tracked_working_diff measure backend={} working_changes={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        backend.name(),
         millis(sorted[sorted.len() / 2]),
         mean_millis(&latencies),
         millis(sorted[0]),
@@ -269,14 +488,17 @@ async fn measure(path: &Path, repetitions: usize) {
 /// serving-head accelerator. The setup checkpoint is a durable root and the
 /// later ordinary commits are rootless, which makes this a populated
 /// first-parent replay interval.
-async fn measure_history(
+async fn measure_history<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
     path: &Path,
     base_commit_id: &str,
     head_commit_id: &str,
     repetitions: usize,
-) {
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     assert!(path.exists(), "fixture {} does not exist", path.display());
-    let storage = RocksDB::open(path).expect("open tracked-working-diff RocksDB");
     let adapter = StorageAdapter::new(storage.clone());
     let engine = Engine::new(storage)
         .await
@@ -316,8 +538,9 @@ async fn measure_history(
     let mut sorted = latencies.clone();
     sorted.sort_unstable();
     println!(
-        "tracked_working_diff measure-history backend=rocksdb working_changes={expected_changes} \
+        "tracked_working_diff measure-history backend={} working_changes={expected_changes} \
          repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        backend.name(),
         millis(sorted[sorted.len() / 2]),
         mean_millis(&latencies),
         millis(sorted[0]),
@@ -325,9 +548,11 @@ async fn measure_history(
     );
 }
 
-async fn checkpoint(path: &Path) {
+async fn checkpoint<StorageImpl>(storage: StorageImpl, backend: Backend, path: &Path)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     assert!(path.exists(), "fixture {} does not exist", path.display());
-    let storage = RocksDB::open(path).expect("open tracked-working-diff RocksDB");
     let engine = Engine::new(storage.clone())
         .await
         .expect("open tracked-working-diff engine");
@@ -345,9 +570,186 @@ async fn checkpoint(path: &Path) {
     let elapsed = start.elapsed();
     assert_eq!(working_change_count(&session).await, 0);
     println!(
-        "tracked_working_diff checkpoint backend=rocksdb working_changes_before={before} \
+        "tracked_working_diff checkpoint backend={} working_changes_before={before} \
          checkpoint_ms={:.3}",
+        backend.name(),
         millis(elapsed),
+    );
+}
+
+async fn measure_merge_preview<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    row_count: usize,
+    commit_count: usize,
+    changes_per_commit: usize,
+    repetitions: usize,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let changes_per_side = commit_count * changes_per_commit;
+    assert!(
+        row_count >= changes_per_side * 2,
+        "merge preview needs disjoint target and source rows"
+    );
+    Engine::initialize(storage.clone())
+        .await
+        .expect("initialize merge-preview storage");
+    let engine = Engine::new(storage)
+        .await
+        .expect("open merge-preview engine");
+    let target = engine
+        .open_workspace_session()
+        .await
+        .expect("open merge-preview target session");
+    register_schema(&target).await;
+    seed_rows(&target, row_count).await;
+    target
+        .create_checkpoint()
+        .await
+        .expect("checkpoint merge-preview base");
+    target
+        .create_branch(CreateBranchOptions {
+            id: Some("merge-source".to_string()),
+            name: "Merge source".to_string(),
+            from_commit_id: None,
+        })
+        .await
+        .expect("create merge-preview source branch");
+    let source = engine
+        .open_session("merge-source")
+        .await
+        .expect("open merge-preview source session");
+
+    for commit_index in 0..commit_count {
+        update_commit_range(&target, 0, commit_index, changes_per_commit, "target").await;
+        update_commit_range(
+            &source,
+            changes_per_side,
+            commit_index,
+            changes_per_commit,
+            "source",
+        )
+        .await;
+    }
+
+    let options = MergeBranchPreviewOptions {
+        source_branch_id: "merge-source".to_string(),
+    };
+    let warm = target
+        .merge_branch_preview(options.clone())
+        .await
+        .expect("warm merge preview");
+    assert_eq!(warm.outcome, MergeBranchOutcome::MergeCommitted);
+    assert_eq!(warm.change_stats.total, changes_per_side);
+    assert!(warm.conflicts.is_empty());
+
+    let mut latencies = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        let start = Instant::now();
+        let preview = target
+            .merge_branch_preview(options.clone())
+            .await
+            .expect("measure merge preview");
+        latencies.push(start.elapsed());
+        assert_eq!(preview.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_eq!(preview.change_stats.total, changes_per_side);
+        assert!(preview.conflicts.is_empty());
+    }
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    println!(
+        "tracked_working_diff merge-preview backend={} rows={row_count} commits_per_side={commit_count} \
+         changes_per_commit={changes_per_commit} source_changes={changes_per_side} repetitions={repetitions} \
+         p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        backend.name(),
+        millis(sorted[sorted.len() / 2]),
+        mean_millis(&latencies),
+        millis(sorted[0]),
+        millis(*sorted.last().expect("measurement samples are non-empty")),
+    );
+}
+
+async fn measure_merge_commit<StorageImpl>(
+    storage: StorageImpl,
+    backend: Backend,
+    repetitions: usize,
+    changes_per_side: usize,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let row_count = repetitions * changes_per_side * 2;
+    Engine::initialize(storage.clone())
+        .await
+        .expect("initialize merge-commit storage");
+    let engine = Engine::new(storage)
+        .await
+        .expect("open merge-commit engine");
+    let target = engine
+        .open_workspace_session()
+        .await
+        .expect("open merge-commit target session");
+    register_schema(&target).await;
+    seed_rows(&target, row_count).await;
+    target
+        .create_checkpoint()
+        .await
+        .expect("checkpoint merge-commit base");
+
+    let mut latencies = Vec::with_capacity(repetitions);
+    for sample in 0..repetitions {
+        let source_branch_id = format!("merge-source-{sample:04}");
+        target
+            .create_branch(CreateBranchOptions {
+                id: Some(source_branch_id.clone()),
+                name: format!("Merge source {sample}"),
+                from_commit_id: None,
+            })
+            .await
+            .expect("create merge-commit source branch");
+        let source = engine
+            .open_session(&source_branch_id)
+            .await
+            .expect("open merge-commit source session");
+        update_commit_range(
+            &target,
+            sample * changes_per_side,
+            0,
+            changes_per_side,
+            "target",
+        )
+        .await;
+        update_commit_range(
+            &source,
+            repetitions * changes_per_side + sample * changes_per_side,
+            0,
+            changes_per_side,
+            "source",
+        )
+        .await;
+
+        let start = Instant::now();
+        let receipt = target
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: source_branch_id.clone(),
+            })
+            .await
+            .expect("measure committed merge");
+        latencies.push(start.elapsed());
+        assert_eq!(receipt.outcome, MergeBranchOutcome::MergeCommitted);
+        assert_eq!(receipt.change_stats.total, changes_per_side);
+        assert!(receipt.created_merge_commit_id.is_some());
+    }
+    let mut sorted = latencies.clone();
+    sorted.sort_unstable();
+    println!(
+        "tracked_working_diff merge-commit backend={} changes_per_side={changes_per_side} \
+         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+        backend.name(),
+        millis(sorted[sorted.len() / 2]),
+        mean_millis(&latencies),
+        millis(sorted[0]),
+        millis(*sorted.last().expect("measurement samples are non-empty")),
     );
 }
 
@@ -445,6 +847,37 @@ async fn update_commit<StorageImpl>(
     assert!(
         results.iter().all(|result| result.rows_affected() == 1),
         "every working-diff update must affect exactly one row"
+    );
+}
+
+async fn update_commit_range<StorageImpl>(
+    session: &lix_engine::SessionContext<StorageImpl>,
+    row_offset: usize,
+    commit_index: usize,
+    changes_per_commit: usize,
+    value_prefix: &str,
+) where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let statements = (0..changes_per_commit)
+        .map(|offset| {
+            let row_index = row_offset + commit_index * changes_per_commit + offset;
+            ExecuteBatchStatement {
+                sql: "UPDATE working_diff_row SET value = $1 WHERE id = $2".to_string(),
+                params: vec![
+                    Value::Text(format!("{value_prefix}-{commit_index:05}")),
+                    Value::Text(row_id(row_index)),
+                ],
+            }
+        })
+        .collect::<Vec<_>>();
+    let results = session
+        .execute_batch(&statements)
+        .await
+        .expect("update merge-preview rows");
+    assert!(
+        results.iter().all(|result| result.rows_affected() == 1),
+        "every merge-preview update must affect exactly one row"
     );
 }
 

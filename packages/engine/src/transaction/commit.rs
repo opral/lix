@@ -761,10 +761,11 @@ struct StagedHotHeads {
 }
 
 /// Returns the commit snapshots that must be materialized before publication.
-/// Normal serial commits stay on the O(changed-rows) hot mutation path.  A
-/// discontinuity (merge/selected refs, checkpoint, staged parent, or branch
-/// creation) instead needs a complete tracked snapshot so the serving control
-/// never points at a partially reconstructed view.
+/// Normal serial commits and entity-only selected refs stay on the
+/// O(changed-rows) hot mutation path. A lifecycle discontinuity (checkpoint,
+/// staged parent, or branch creation) and selected refs whose filesystem
+/// invariants span rows need a complete tracked snapshot so the serving
+/// control never points at a partially reconstructed view.
 fn lifecycle_snapshot_commit_ids(
     state_rows: &[PreparedStateRow],
     tracked_roots: &[PendingTrackedRoot],
@@ -796,7 +797,7 @@ fn lifecycle_snapshot_commit_ids(
                 if control.head_commit_id == parent_commit_id
         );
         if !parent_is_published
-            || !staged.selected_change_refs.is_empty()
+            || selected_refs_require_complete_snapshot(&staged.selected_change_refs)
             || checkpoint_epochs.get(&root.branch_id) == Some(&root.commit_id)
         {
             required.insert(root.commit_id);
@@ -832,6 +833,17 @@ fn lifecycle_snapshot_commit_ids(
         }
     }
     Ok(required)
+}
+
+fn selected_refs_require_complete_snapshot(selected_change_refs: &[StagedCommitChangeRef]) -> bool {
+    selected_change_refs.iter().any(|change_ref| {
+        matches!(
+            change_ref.schema_key.as_str(),
+            FILE_DESCRIPTOR_SCHEMA_KEY
+                | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                | DERIVED_FILE_REF_SCHEMA_KEY
+        )
+    })
 }
 
 /// Resolves the full tracked view for only the rare lifecycle commits selected
@@ -1367,10 +1379,83 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let tracked_deltas = state_row_indices
+        let mut tracked_deltas = state_row_indices
             .iter()
             .map(|&row_index| current_state_delta_from_state_row(&state_rows[row_index]))
             .collect::<Result<Vec<_>, _>>()?;
+        let selected_materialization = if !staged.selected_change_refs.is_empty()
+            && !tracked_snapshots.contains_key(&root.commit_id)
+        {
+            let payloads = materialize_change_payloads(
+                read,
+                staged
+                    .selected_change_refs
+                    .iter()
+                    .map(|change_ref| change_ref.change_id),
+                ChangeRecordProjection::full(),
+                "selected current-state delta",
+            )
+            .await?;
+            let selected_rows = staged
+                .selected_change_refs
+                .iter()
+                .map(|change_ref| {
+                    lifecycle_selected_tracked_row(
+                        change_ref,
+                        root.commit_id,
+                        None,
+                        payloads.get(&change_ref.change_id),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let selected_snapshots = selected_rows
+                .iter()
+                .map(|row| {
+                    row.snapshot_content.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<crate::json_store::JsonSlot>>();
+            let selected_metadata = selected_rows
+                .iter()
+                .map(|row| {
+                    row.metadata.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<crate::json_store::JsonSlot>>();
+            Some((selected_rows, selected_snapshots, selected_metadata))
+        } else {
+            None
+        };
+        if let Some((selected_rows, selected_snapshots, selected_metadata)) =
+            &selected_materialization
+        {
+            tracked_deltas.extend(
+                staged
+                    .selected_change_refs
+                    .iter()
+                    .zip(selected_rows)
+                    .zip(selected_snapshots.iter().zip(selected_metadata))
+                    .map(|((change_ref, row), (snapshot, metadata))| {
+                        crate::live_state::CurrentStateDeltaRef {
+                            schema_key: &row.schema_key,
+                            file_id: row.file_id.as_deref(),
+                            entity_pk: &row.entity_pk,
+                            change_id: Some(change_ref.change_id),
+                            commit_id: Some(root.commit_id),
+                            untracked: false,
+                            deleted: change_ref.deleted,
+                            created_at: change_ref.created_at,
+                            updated_at: change_ref.updated_at,
+                            snapshot: snapshot.as_ref_slot(),
+                            metadata: metadata.as_ref_slot(),
+                        }
+                    }),
+            );
+        }
         let mut untracked_deltas = state_rows
             .iter()
             .filter(|row| {
@@ -1410,18 +1495,19 @@ async fn stage_tracked_head(
         };
         let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
 
+        if !staged.selected_change_refs.is_empty() {
+            reject_selected_tracked_refs_with_untracked_rows(
+                read,
+                &root.branch_id,
+                parent_control,
+                &staged.selected_change_refs,
+                state_rows,
+                engine_rows,
+            )
+            .await?;
+        }
+
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
-            if !staged.selected_change_refs.is_empty() {
-                reject_selected_tracked_refs_with_untracked_rows(
-                    read,
-                    &root.branch_id,
-                    parent_control,
-                    &staged.selected_change_refs,
-                    state_rows,
-                    engine_rows,
-                )
-                .await?;
-            }
             let generation =
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
