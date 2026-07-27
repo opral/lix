@@ -247,10 +247,11 @@ impl SlateDB {
         })?;
         let object_store: Arc<dyn ObjectStore> =
             Arc::new(LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?);
-        Self::open_object_store_with_options(
+        Self::open_object_store_with_read_dispatch(
             DB_PATH,
             object_store,
             SlateDBObjectStoreOptions::default(),
+            true,
         )
         .map(|mut storage| {
             storage.path = path;
@@ -263,10 +264,30 @@ impl SlateDB {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
     ) -> Result<Self, StorageError> {
+        Self::open_object_store_with_read_dispatch(db_path, object_store, options, false)
+    }
+
+    /// Opens SlateDB with a private current-thread read-dispatch choice.
+    ///
+    /// `SlateDB::open` is the only caller that enables it: LocalFileSystem
+    /// moves filesystem work to Tokio's blocking pool before it can block a
+    /// current-thread runtime. Generic ObjectStore implementations do not
+    /// promise that property.
+    fn open_object_store_with_read_dispatch(
+        db_path: impl Into<String>,
+        object_store: Arc<dyn ObjectStore>,
+        options: SlateDBObjectStoreOptions,
+        read_on_caller_current_thread: bool,
+    ) -> Result<Self, StorageError> {
         validate_object_store_options(&options)?;
         let db_path = db_path.into();
         Ok(Self {
-            worker: SlateDBWorker::start(db_path.clone(), object_store, options)?,
+            worker: SlateDBWorker::start(
+                db_path.clone(),
+                object_store,
+                options,
+                read_on_caller_current_thread,
+            )?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
             point_cache: SnapshotPointCache::new(),
@@ -720,6 +741,7 @@ struct SlateDBWorker {
 struct SlateDBWorkerInner {
     runtime: Handle,
     db: Arc<Db>,
+    read_on_caller_current_thread: bool,
     in_flight: InFlightTracker,
     shutdown: mpsc::Sender<()>,
     manager: Mutex<Option<JoinHandle<()>>>,
@@ -781,6 +803,7 @@ impl SlateDBWorker {
         db_path: String,
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
+        read_on_caller_current_thread: bool,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
         let manager_in_flight = in_flight.clone();
@@ -808,6 +831,7 @@ impl SlateDBWorker {
                 inner: Arc::new(SlateDBWorkerInner {
                     runtime,
                     db,
+                    read_on_caller_current_thread,
                     in_flight,
                     shutdown,
                     manager: Mutex::new(Some(thread)),
@@ -857,9 +881,11 @@ impl SlateDBWorker {
     /// no such side effects, so run them on the caller's multithreaded
     /// executor. That keeps SlateDB's own async work local to the request and
     /// avoids a manager-task spawn plus oneshot round trip for every snapshot,
-    /// point read, and scan page. A current-thread runtime keeps using the
-    /// manager: an ObjectStore is allowed to perform synchronous work before
-    /// its first yield, and that must not monopolize its only executor thread.
+    /// point read, and scan page. A current-thread runtime uses the same path
+    /// only for [`SlateDB::open`]'s LocalFileSystem, which moves filesystem
+    /// work to Tokio's blocking pool before it can block the executor. Generic
+    /// ObjectStores may synchronously work before their first yield, so they
+    /// keep using the manager there.
     /// Canceling either path drops the read future and the in-flight guard that
     /// manager shutdown waits on.
     async fn call_read<R, F, Fut>(&self, operation: F) -> Result<R, StorageError>
@@ -868,10 +894,13 @@ impl SlateDBWorker {
         F: FnOnce(Arc<Db>) -> Fut + Send + 'static,
         Fut: Future<Output = Result<R, StorageError>> + Send + 'static,
     {
-        if !matches!(
+        let caller_can_run_read = matches!(
             Handle::try_current(),
-            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
+            Ok(handle)
+                if self.inner.read_on_caller_current_thread
+                    || handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+        );
+        if !caller_can_run_read {
             return self.call_read_on_manager(operation).await;
         }
         // Manager shutdown waits for this guard. The guard is deliberately
@@ -2166,6 +2195,17 @@ mod tests {
             SlateDBObjectStoreOptions::default(),
         )
         .expect("open cancellable read storage");
+        assert_dropping_pending_read_cancels_before_storage_close(storage).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_pending_local_filesystem_read_cancels_before_storage_close() {
+        let directory = tempfile::tempdir().expect("create local cancellable read storage");
+        let storage = SlateDB::open(directory.path()).expect("open local cancellable read storage");
+        assert_dropping_pending_read_cancels_before_storage_close(storage).await;
+    }
+
+    async fn assert_dropping_pending_read_cancels_before_storage_close(storage: SlateDB) {
         let release = Arc::new(tokio::sync::Notify::new());
         let release_for_read = Arc::clone(&release);
         let (started_tx, started_rx) = oneshot::channel();
@@ -2235,6 +2275,29 @@ mod tests {
                     })
                     .await
                     .expect("run read on caller executor");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_filesystem_read_operation_stays_on_the_callers_executor() {
+        let directory = tempfile::tempdir().expect("create local caller-runtime storage");
+        let storage = SlateDB::open(directory.path()).expect("open local caller-runtime storage");
+
+        CALLER_READ_MARKER
+            .scope((), async {
+                storage
+                    .worker
+                    .call_read(|db| async move {
+                        assert!(
+                            CALLER_READ_MARKER.try_with(|()| ()).is_ok(),
+                            "local filesystem read work must retain the caller task context"
+                        );
+                        db.snapshot().await.map_err(slatedb_error)?;
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+                    .expect("run local read on caller executor");
             })
             .await;
     }
