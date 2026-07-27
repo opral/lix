@@ -761,10 +761,11 @@ struct StagedHotHeads {
 }
 
 /// Returns the commit snapshots that must be materialized before publication.
-/// Normal serial commits stay on the O(changed-rows) hot mutation path.  A
-/// discontinuity (merge/selected refs, checkpoint, staged parent, or branch
-/// creation) instead needs a complete tracked snapshot so the serving control
-/// never points at a partially reconstructed view.
+/// Normal serial commits and entity-only selected refs stay on the
+/// O(changed-rows) hot mutation path. A lifecycle discontinuity (checkpoint,
+/// staged parent, or branch creation) and selected refs whose filesystem
+/// invariants span rows need a complete tracked snapshot so the serving
+/// control never points at a partially reconstructed view.
 fn lifecycle_snapshot_commit_ids(
     state_rows: &[PreparedStateRow],
     tracked_roots: &[PendingTrackedRoot],
@@ -796,7 +797,7 @@ fn lifecycle_snapshot_commit_ids(
                 if control.head_commit_id == parent_commit_id
         );
         if !parent_is_published
-            || !staged.selected_change_refs.is_empty()
+            || selected_refs_require_complete_snapshot(&staged.selected_change_refs)
             || checkpoint_epochs.get(&root.branch_id) == Some(&root.commit_id)
         {
             required.insert(root.commit_id);
@@ -832,6 +833,17 @@ fn lifecycle_snapshot_commit_ids(
         }
     }
     Ok(required)
+}
+
+fn selected_refs_require_complete_snapshot(selected_change_refs: &[StagedCommitChangeRef]) -> bool {
+    selected_change_refs.iter().any(|change_ref| {
+        matches!(
+            change_ref.schema_key.as_str(),
+            FILE_DESCRIPTOR_SCHEMA_KEY
+                | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                | DERIVED_FILE_REF_SCHEMA_KEY
+        )
+    })
 }
 
 /// Resolves the full tracked view for only the rare lifecycle commits selected
@@ -1367,10 +1379,83 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let tracked_deltas = state_row_indices
+        let mut tracked_deltas = state_row_indices
             .iter()
             .map(|&row_index| current_state_delta_from_state_row(&state_rows[row_index]))
             .collect::<Result<Vec<_>, _>>()?;
+        let selected_materialization = if !staged.selected_change_refs.is_empty()
+            && !tracked_snapshots.contains_key(&root.commit_id)
+        {
+            let payloads = materialize_change_payloads(
+                read,
+                staged
+                    .selected_change_refs
+                    .iter()
+                    .map(|change_ref| change_ref.change_id),
+                ChangeRecordProjection::full(),
+                "selected current-state delta",
+            )
+            .await?;
+            let selected_rows = staged
+                .selected_change_refs
+                .iter()
+                .map(|change_ref| {
+                    lifecycle_selected_tracked_row(
+                        change_ref,
+                        root.commit_id,
+                        None,
+                        payloads.get(&change_ref.change_id),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let selected_snapshots = selected_rows
+                .iter()
+                .map(|row| {
+                    row.snapshot_content.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<crate::json_store::JsonSlot>>();
+            let selected_metadata = selected_rows
+                .iter()
+                .map(|row| {
+                    row.metadata.as_deref().map_or(
+                        crate::json_store::JsonSlot::None,
+                        crate::json_store::JsonSlot::from_json,
+                    )
+                })
+                .collect::<Vec<crate::json_store::JsonSlot>>();
+            Some((selected_rows, selected_snapshots, selected_metadata))
+        } else {
+            None
+        };
+        if let Some((selected_rows, selected_snapshots, selected_metadata)) =
+            &selected_materialization
+        {
+            tracked_deltas.extend(
+                staged
+                    .selected_change_refs
+                    .iter()
+                    .zip(selected_rows)
+                    .zip(selected_snapshots.iter().zip(selected_metadata))
+                    .map(|((change_ref, row), (snapshot, metadata))| {
+                        crate::live_state::CurrentStateDeltaRef {
+                            schema_key: &row.schema_key,
+                            file_id: row.file_id.as_deref(),
+                            entity_pk: &row.entity_pk,
+                            change_id: Some(change_ref.change_id),
+                            commit_id: Some(root.commit_id),
+                            untracked: false,
+                            deleted: change_ref.deleted,
+                            created_at: change_ref.created_at,
+                            updated_at: change_ref.updated_at,
+                            snapshot: snapshot.as_ref_slot(),
+                            metadata: metadata.as_ref_slot(),
+                        }
+                    }),
+            );
+        }
         let mut untracked_deltas = state_rows
             .iter()
             .filter(|row| {
@@ -1386,20 +1471,24 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == root.branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = state_rows
-            .iter()
-            .filter(|row| {
-                row.branch_id == root.branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.snapshot.is_some()
-                    && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-            })
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                entity_pk: row.entity_pk.clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .filter(|row| {
+                    row.branch_id == root.branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
+                })
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
@@ -1410,18 +1499,19 @@ async fn stage_tracked_head(
         };
         let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
 
+        if !staged.selected_change_refs.is_empty() {
+            reject_selected_tracked_refs_with_untracked_rows(
+                read,
+                &root.branch_id,
+                parent_control,
+                &staged.selected_change_refs,
+                state_rows,
+                engine_rows,
+            )
+            .await?;
+        }
+
         if let Some(final_tracked) = tracked_snapshots.get(&root.commit_id).cloned() {
-            if !staged.selected_change_refs.is_empty() {
-                reject_selected_tracked_refs_with_untracked_rows(
-                    read,
-                    &root.branch_id,
-                    parent_control,
-                    &staged.selected_change_refs,
-                    state_rows,
-                    engine_rows,
-                )
-                .await?;
-            }
             let generation =
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
@@ -1572,21 +1662,25 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = state_rows
-            .iter()
-            .filter(|row| {
-                row.untracked
-                    && row.branch_id == branch_id
-                    && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                    && row.snapshot.is_some()
-                    && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-            })
-            .map(|row| TrackedStateKey {
-                schema_key: row.schema_key.clone(),
-                file_id: row.file_id.clone(),
-                entity_pk: row.entity_pk.clone(),
-            })
-            .collect::<BTreeSet<_>>();
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_rows
+                .iter()
+                .filter(|row| {
+                    row.untracked
+                        && row.branch_id == branch_id
+                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                        && row.snapshot.is_some()
+                        && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
+                })
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key.clone(),
+                    file_id: row.file_id.clone(),
+                    entity_pk: row.entity_pk.clone(),
+                })
+                .collect()
+        };
         let mut coverage = WorkingDiffIndexCoverage::default();
         tracked_head
             .writer(read, writes)
@@ -1918,21 +2012,26 @@ async fn stage_branch_head_control_publications(
                         .filter(|row| row.branch_id == branch_id)
                         .map(current_state_delta_from_engine_row),
                 );
-                let absence_guards = state_rows
-                    .iter()
-                    .filter(|row| {
-                        row.untracked
-                            && row.branch_id == branch_id
-                            && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                            && row.snapshot.is_some()
-                            && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-                    })
-                    .map(|row| TrackedStateKey {
-                        schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
-                        entity_pk: row.entity_pk.clone(),
-                    })
-                    .collect::<BTreeSet<_>>();
+                let absence_guards = if insert_identities.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    state_rows
+                        .iter()
+                        .filter(|row| {
+                            row.untracked
+                                && row.branch_id == branch_id
+                                && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                                && row.snapshot.is_some()
+                                && insert_identities
+                                    .contains_key(&PreparedStateRowIdentity::from(*row))
+                        })
+                        .map(|row| TrackedStateKey {
+                            schema_key: row.schema_key.clone(),
+                            file_id: row.file_id.clone(),
+                            entity_pk: row.entity_pk.clone(),
+                        })
+                        .collect()
+                };
                 let generation =
                     lifecycle_generation(&branch_id, head_commit_id, target.ref_change_id);
                 let mut coverage = WorkingDiffIndexCoverage::default();
@@ -2360,24 +2459,28 @@ async fn stage_tracked_roots(
                 tracked_delta_from_selected_change_ref(change_ref, root.commit_id)
             }))
             .collect::<Result<Vec<_>, _>>()?;
-        let absence_guards = state_row_indices
-            .iter()
-            .filter_map(|&row_index| {
-                let row = &state_rows[row_index];
-                if row.snapshot.is_none() || row.untracked {
-                    return None;
-                }
-                let insert = insert_identities.get(&PreparedStateRowIdentity::from(row))?;
-                if insert.untracked() {
-                    return None;
-                }
-                Some(TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
+        let absence_guards = if insert_identities.is_empty() {
+            BTreeSet::new()
+        } else {
+            state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = &state_rows[row_index];
+                    if row.snapshot.is_none() || row.untracked {
+                        return None;
+                    }
+                    let insert = insert_identities.get(&PreparedStateRowIdentity::from(row))?;
+                    if insert.untracked() {
+                        return None;
+                    }
+                    Some(TrackedStateKey {
+                        schema_key: row.schema_key.clone(),
+                        file_id: row.file_id.clone(),
+                        entity_pk: row.entity_pk.clone(),
+                    })
                 })
-            })
-            .collect::<BTreeSet<_>>();
+                .collect()
+        };
         // Commit facts are canonical in changelog.commit and live-state derives
         // lix_commit rows from the commit graph. Keeping them out of this tree
         // also preserves the one-mutation path for ordinary singleton writes.
@@ -2613,45 +2716,49 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
     let commit_parent_branch_ids = prepared_writes
         .commit_change_refs_by_branch
         .keys()
-        .cloned()
+        .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let mut required_branch_ids = prepared_writes
         .state_rows
         .iter()
-        .map(|row| row.branch_id.clone())
+        .map(|row| row.branch_id.as_str())
         .chain(
             prepared_writes
                 .file_data_writes
                 .iter()
-                .map(|write| write.branch_id.clone()),
+                .map(|write| write.branch_id.as_str()),
         )
         .chain(
             prepared_writes
                 .first_commit_parent_override_by_branch
                 .keys()
-                .cloned(),
+                .map(String::as_str),
         )
         .chain(
             prepared_writes
                 .extra_commit_parents_by_branch
                 .keys()
-                .cloned(),
+                .map(String::as_str),
         )
         .collect::<BTreeSet<_>>();
-    required_branch_ids.extend(commit_parent_branch_ids.iter().cloned());
+    required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
 
     let branch_ref = branch_ctx.ref_reader(read);
     let mut parent_heads = BTreeMap::new();
     for branch_id in required_branch_ids {
-        let head = branch_ref.load_head_commit_id(&branch_id).await?;
+        let head = branch_ref.load_head_commit_id(branch_id).await?;
         if require_existing_non_global_targets
             && branch_id != crate::GLOBAL_BRANCH_ID
             && head.is_none()
         {
-            return Err(LixError::branch_not_found(branch_id, "commit", "target"));
+            return Err(LixError::branch_not_found(
+                branch_id.to_string(),
+                "commit",
+                "target",
+            ));
         }
         if commit_parent_branch_ids.contains(&branch_id) {
-            parent_heads.insert(branch_id, head);
+            parent_heads.insert(branch_id.to_string(), head);
         }
     }
     Ok(parent_heads)
@@ -2683,8 +2790,8 @@ mod tests {
         LiveStateProjection, LiveStateRowRequest,
     };
     use crate::storage::{
-        CommitResult, GetManyResult, GetOptions, Key, KeyRange, PutBatch, ScanChunk, ScanOptions,
-        SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+        CommitResult, GetManyResult, KeyRange, PutBatch, ScanChunk, ScanOptions, SpaceId, Storage,
+        StorageError, StorageRead, StorageWrite,
     };
     use crate::storage_adapter::{
         Memory, MemoryRead, MemoryWrite, StorageAdapter, StorageAdapterReadScope, StorageKey,
@@ -2743,38 +2850,39 @@ mod tests {
     impl StorageRead for CountingTrackedHeadRead {
         async fn get_many(
             &self,
-            space: SpaceId,
-            keys: &[Key],
-            opts: GetOptions,
+            requests: &[crate::storage::GetManyRequest<'_>],
         ) -> Result<GetManyResult, StorageError> {
-            if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id {
-                self.counts
-                    .branch_control_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
+            for request in requests {
+                let space = request.space;
+                if space == crate::branch::BRANCH_HEAD_CONTROL_SPACE.id {
+                    self.counts
+                        .branch_control_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == V10_TRACKED_HEAD_MARKER_SPACE_ID {
+                    self.counts
+                        .v10_marker_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == crate::live_state::HOT_ROW_SPACE.id
+                    || space == crate::live_state::HOT_FILE_SPACE.id
+                {
+                    self.counts
+                        .row_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
+                    self.counts
+                        .tree_chunk_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
+                    self.counts
+                        .commit_root_get_many_calls
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
-            if space == V10_TRACKED_HEAD_MARKER_SPACE_ID {
-                self.counts
-                    .v10_marker_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == crate::live_state::HOT_ROW_SPACE.id
-                || space == crate::live_state::HOT_FILE_SPACE.id
-            {
-                self.counts
-                    .row_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == TRACKED_STATE_TREE_CHUNK_SPACE_ID {
-                self.counts
-                    .tree_chunk_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            if space == TRACKED_STATE_COMMIT_ROOT_SPACE_ID {
-                self.counts
-                    .commit_root_get_many_calls
-                    .fetch_add(1, Ordering::Relaxed);
-            }
-            self.inner.get_many(space, keys, opts).await
+            self.inner.get_many(requests).await
         }
 
         async fn scan(

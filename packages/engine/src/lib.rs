@@ -89,10 +89,10 @@ pub use storage::conformance::{
     StorageFactory, StorageFixture, StorageTestConfig, run_storage_conformance,
 };
 pub use storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, MAX_SCAN_PAGE_ROWS,
-    Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix, ProjectedValue,
-    PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry, ReadOptions, ScanChunk,
-    ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, GetOptions, Key, KeyRange,
+    MAX_SCAN_PAGE_ROWS, Memory, MemoryFactory, MemoryFixture, MemoryRead, MemoryWrite, Prefix,
+    ProjectedValue, PutBatch, PutEntry, ReadConsistency, ReadDurability, ReadEntry, ReadOptions,
+    ScanChunk, ScanOptions, SnapshotRef, SpaceId, Storage, StorageError, StorageRead, StorageWrite,
     StoredValue, WriteOptions, WriteStats,
 };
 

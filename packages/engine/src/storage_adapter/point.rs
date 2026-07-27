@@ -92,7 +92,11 @@ impl PointReadPlan {
         R: StorageAdapterRead + ?Sized,
     {
         let unique_values = read
-            .get_many(self.space, &self.logical_unique_keys, opts)
+            .get_many(&[crate::storage::GetManyRequest {
+                space: self.space,
+                keys: &self.logical_unique_keys,
+                opts,
+            }])
             .await?
             .values;
         Ok(StorageReadResult::new(

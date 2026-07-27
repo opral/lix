@@ -21,28 +21,7 @@ where
     S: StorageAdapterRead,
 {
     let mut loader = CommitTraversalLoader::new(reader);
-    let mut visiting = BTreeSet::new();
-    let mut nearest_depths = BTreeMap::new();
-    loader
-        .walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
-        .await?;
-
-    let mut commits = nearest_depths
-        .into_iter()
-        .map(|(commit_id, depth)| {
-            let commit = loader
-                .loaded
-                .remove(&commit_id)
-                .expect("visited commit should be cached");
-            ReachableCommitGraphCommit { commit, depth }
-        })
-        .collect::<Vec<_>>();
-    commits.sort_by(|left, right| {
-        left.depth
-            .cmp(&right.depth)
-            .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
-    });
-    Ok(commits)
+    loader.walk(head_commit_id).await
 }
 
 /// Returns the best common ancestors shared by two commit heads.
@@ -72,8 +51,12 @@ pub(crate) async fn best_common_ancestors<S>(
 where
     S: StorageAdapterRead,
 {
-    let left_reachable = walk_reachable_commits(reader, left_commit_id).await?;
-    let right_reachable = walk_reachable_commits(reader, right_commit_id).await?;
+    // Both walks share almost all commits in ordinary diverged history. Keep
+    // one loader so the second side reuses the first side's immutable parsed
+    // commit facts instead of crossing the storage boundary again.
+    let mut loader = CommitTraversalLoader::new(reader);
+    let left_reachable = loader.walk(left_commit_id).await?;
+    let right_reachable = loader.walk(right_commit_id).await?;
     let right_ids = right_reachable
         .iter()
         .map(|reachable| reachable.commit.commit_id)
@@ -131,6 +114,33 @@ where
             reader,
             loaded: BTreeMap::new(),
         }
+    }
+
+    async fn walk(
+        &mut self,
+        head_commit_id: &CommitId,
+    ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
+        let mut visiting = BTreeSet::new();
+        let mut nearest_depths = BTreeMap::new();
+        self.walk_commit(head_commit_id, 0, &mut visiting, &mut nearest_depths)
+            .await?;
+        let mut commits = nearest_depths
+            .into_iter()
+            .map(|(commit_id, depth)| {
+                let commit = self
+                    .loaded
+                    .get(&commit_id)
+                    .expect("visited commit should be cached")
+                    .clone();
+                ReachableCommitGraphCommit { commit, depth }
+            })
+            .collect::<Vec<_>>();
+        commits.sort_by(|left, right| {
+            left.depth
+                .cmp(&right.depth)
+                .then_with(|| left.commit.commit_id.cmp(&right.commit.commit_id))
+        });
+        Ok(commits)
     }
 
     async fn walk_commit(
@@ -689,7 +699,7 @@ mod tests {
             .await
             .expect("single merge base should resolve");
 
-        assert_eq!(base.commit_id, commit_id("commit-b"));
+        assert_eq!(base, commit_id("commit-b"));
     }
 
     #[tokio::test]

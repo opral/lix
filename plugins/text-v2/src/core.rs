@@ -60,7 +60,16 @@ impl Document {
                 bytes: Arc::new(bytes),
             });
         }
-        let document = Self::from_lines(lines)?;
+        // A cold open constructs lines in strict order from one already
+        // validated byte stream. Host ordinal IDs and evenly-spaced order
+        // keys are unique by construction, so routing this through
+        // `from_lines` would only revalidate every line, populate two trees,
+        // sort the already-sorted vector, render the original file again, and
+        // validate that duplicate byte buffer a second time.
+        let document = Self(Arc::new(DocumentInner {
+            bytes: Arc::new(bytes),
+            lines,
+        }));
         let changes = document.all_upserts()?;
         Ok((document, changes))
     }
@@ -165,7 +174,15 @@ impl Document {
             });
         }
 
-        let document = Self::from_lines(lines)?;
+        // The splice result and each constructed line were validated above.
+        // Reconciled order keys follow successor byte order, while reused and
+        // host-allocated IDs are already collision checked. Preserve that
+        // exact owned state instead of sorting, rendering, and validating the
+        // complete document a second time.
+        let document = Self(Arc::new(DocumentInner {
+            bytes: Arc::new(bytes),
+            lines,
+        }));
         let changes = self.changes_to(&document)?;
         Ok((document, changes))
     }

@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use bytes::{Buf, Bytes};
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
     WriteOptions, WriteStats,
@@ -260,35 +260,50 @@ fn physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 impl StorageRead for RocksDBRead<'_> {
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
-            if let [key] = keys {
-                let physical_key = physical_key(space, key);
+            if let [request] = requests
+                && let [key] = request.keys
+            {
+                let physical_key = physical_key(request.space, key);
                 let value = self
                     .snapshot
                     .get(physical_key.0.as_ref())
                     .map_err(rocksdb_error)?;
-                return Ok(GetManyResult::new(vec![
-                    value.map(|value| project_owned_value(value, opts.projection)),
-                ]));
+                return Ok(GetManyResult::new(vec![value.map(|value| {
+                    project_owned_value(value, request.opts.projection)
+                })]));
             }
-
-            let physical_keys = keys
+            let physical_keys = requests
                 .iter()
-                .map(|key| physical_key(space, key))
+                .flat_map(|request| {
+                    request
+                        .keys
+                        .iter()
+                        .map(|key| physical_key(request.space, key))
+                })
                 .collect::<Vec<_>>();
-            let mut values = Vec::with_capacity(keys.len());
-            for value in self
+            let mut values = self
                 .snapshot
                 .multi_get(physical_keys.iter().map(|key| key.0.as_ref()))
-            {
-                let value = value.map_err(rocksdb_error)?;
-                values.push(value.map(|value| project_owned_value(value, opts.projection)));
+                .into_iter();
+            let mut results = Vec::with_capacity(physical_keys.len());
+            for request in requests {
+                let request_values = values
+                    .by_ref()
+                    .take(request.keys.len())
+                    .map(|value| {
+                        value.map_err(rocksdb_error).map(|value| {
+                            value.map(|value| project_owned_value(value, request.opts.projection))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                results.extend(request_values);
             }
-            Ok(GetManyResult::new(values))
+            let unexpected_value = values.next();
+            debug_assert!(unexpected_value.is_none());
+            Ok(GetManyResult::new(results))
         }
     }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use lix_engine::Storage;
 use lix_engine::storage::{
-    CommitResult, GetManyResult, GetOptions, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
+    CommitResult, GetManyRequest, GetManyResult, Key, KeyRange, Memory, MemoryRead, MemoryWrite,
     PutBatch, ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead,
     StorageWrite, WriteOptions,
 };
@@ -111,14 +111,12 @@ impl Storage for ChangelogScoreStorage {
 impl StorageRead for ChangelogScoreRead<'_> {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
         match self {
-            Self::Unit(read) => read.get_many(space, keys, opts).await,
-            Self::SQLite(read) => read.get_many(space, keys, opts).await,
-            Self::RocksDB(read) => read.get_many(space, keys, opts).await,
+            Self::Unit(read) => read.get_many(requests).await,
+            Self::SQLite(read) => read.get_many(requests).await,
+            Self::RocksDB(read) => read.get_many(requests).await,
         }
     }
 

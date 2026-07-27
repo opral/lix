@@ -1,10 +1,9 @@
 use crate::storage::conformance::{
-    ConformanceReport, ConformanceResult, StorageFactory, StorageFixture,
+    ConformanceReport, ConformanceResult, SingleSpaceStorageRead, StorageFactory, StorageFixture,
     fixtures::{full_put, key, put_batch, space},
 };
 use crate::storage::{
-    GetOptions, ProjectedValue, ReadOptions, SpaceId, Storage, StorageRead, StorageWrite,
-    WriteOptions,
+    GetOptions, ProjectedValue, ReadOptions, SpaceId, Storage, StorageWrite, WriteOptions,
 };
 
 /// Single space used by these fixtures; cross-space isolation is pinned
@@ -189,7 +188,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = read
-        .get_many(TEST_SPACE, &keys, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &keys, GetOptions::default())
         .await
         .map_err(|error| format!("get_many failed: {error}"))?;
 

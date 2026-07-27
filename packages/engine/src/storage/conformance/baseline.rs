@@ -9,7 +9,7 @@ const OTHER_SPACE: SpaceId = SpaceId(8);
 use bytes::Bytes;
 
 use crate::storage::conformance::{
-    ConformanceReport, ConformanceResult, StorageFactory,
+    ConformanceReport, ConformanceResult, SingleSpaceStorageRead, StorageFactory,
     fixtures::{full_put, key, put_batch, space},
     open_storage,
 };
@@ -203,7 +203,7 @@ where
         .await
         .map_err(|error| error.to_string())?;
     let value = read
-        .get_many(
+        .get_many_in_space(
             test_space,
             std::slice::from_ref(&target),
             GetOptions::default(),
@@ -233,7 +233,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = read
-        .get_many(TEST_SPACE, &requested, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &requested, GetOptions::default())
         .await
         .map_err(|error| format!("get_many failed: {error}"))?;
 
@@ -277,7 +277,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = read
-        .get_many(TEST_SPACE, &[], GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &[], GetOptions::default())
         .await
         .map_err(|error| format!("get_many failed: {error}"))?;
     if result.entries_for_requested_keys(&[]).is_empty() {
@@ -1026,7 +1026,7 @@ where
         .await
         .map_err(|error| format!("begin_read before commit failed: {error}"))?;
     let before_commit = read_before_commit
-        .get_many(
+        .get_many_in_space(
             TEST_SPACE,
             &[key_a.clone(), key_b.clone()],
             GetOptions::default(),
@@ -1115,7 +1115,7 @@ where
 
     let old_keys = [key("a")];
     let old_result = old_read
-        .get_many(TEST_SPACE, &old_keys, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &old_keys, GetOptions::default())
         .await
         .map_err(|error| format!("old read get_many failed: {error}"))?;
     assert_read_entries(
@@ -1153,7 +1153,7 @@ where
 
     let full_keys = [key("a")];
     let full = read
-        .get_many(
+        .get_many_in_space(
             TEST_SPACE,
             &full_keys,
             GetOptions {
@@ -1166,7 +1166,7 @@ where
 
     let key_only_keys = [key("a")];
     let key_only = read
-        .get_many(
+        .get_many_in_space(
             TEST_SPACE,
             &key_only_keys,
             GetOptions {
@@ -1240,7 +1240,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = read
-        .get_many(TEST_SPACE, &requested, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &requested, GetOptions::default())
         .await
         .map_err(|error| format!("opaque get_many failed: {error}"))?;
     assert_read_entries_bytes(
@@ -1284,11 +1284,11 @@ where
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
     let a = read
-        .get_many(TEST_SPACE, &[key("k")], GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &[key("k")], GetOptions::default())
         .await
         .map_err(|error| format!("get space A failed: {error}"))?;
     let b = read
-        .get_many(OTHER_SPACE, &[key("k")], GetOptions::default())
+        .get_many_in_space(OTHER_SPACE, &[key("k")], GetOptions::default())
         .await
         .map_err(|error| format!("get space B failed: {error}"))?;
     if a.values[0].as_ref() != Some(&ProjectedValue::FullValue(Bytes::from_static(b"A")))
@@ -1315,11 +1315,11 @@ where
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
     let a = read
-        .get_many(TEST_SPACE, &[key("k")], GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &[key("k")], GetOptions::default())
         .await
         .map_err(|error| format!("get after delete failed: {error}"))?;
     let b = read
-        .get_many(OTHER_SPACE, &[key("k")], GetOptions::default())
+        .get_many_in_space(OTHER_SPACE, &[key("k")], GetOptions::default())
         .await
         .map_err(|error| format!("get other after delete failed: {error}"))?;
     if a.values[0].as_ref().is_some() {
@@ -1495,7 +1495,7 @@ where
         .await
         .map_err(|error| format!("begin read failed: {error}"))?;
     let result = read
-        .get_many(empty, &[key("a")], GetOptions::default())
+        .get_many_in_space(empty, &[key("a")], GetOptions::default())
         .await
         .map_err(|error| format!("get failed: {error}"))?;
     if result.values[0].as_ref().is_some() {
@@ -1620,7 +1620,7 @@ where
         .await
         .map_err(|error| format!("begin_read failed: {error}"))?;
     let result = read
-        .get_many(TEST_SPACE, &keys, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &keys, GetOptions::default())
         .await
         .map_err(|error| format!("get_many failed: {error}"))?;
     assert_optional_entry_map(&result.entries_for_requested_keys(&keys), expected)

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use lix_engine::Value;
 use lix_engine::{
-    CreateBranchOptions, Engine, GetManyResult, GetOptions, Key, KeyRange, LixError, Memory,
+    CreateBranchOptions, Engine, GetManyRequest, GetManyResult, KeyRange, LixError, Memory,
     MemoryRead, MemoryWrite, MergeBranchOptions, ReadOptions, ScanChunk, ScanOptions, SpaceId,
     Storage, StorageError, StorageRead, WriteOptions,
 };
@@ -70,13 +70,16 @@ impl Storage for CountingStorage {
 impl StorageRead for CountingRead {
     async fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        options: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> Result<GetManyResult, StorageError> {
-        self.get_many_requested_keys
-            .fetch_add(keys.len() as u64, Ordering::Relaxed);
-        self.inner.get_many(space, keys, options).await
+        self.get_many_requested_keys.fetch_add(
+            requests
+                .iter()
+                .map(|request| request.keys.len() as u64)
+                .sum(),
+            Ordering::Relaxed,
+        );
+        self.inner.get_many(requests).await
     }
 
     async fn scan(

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lix_engine::storage::{
-    CommitResult, CoreProjection, GetManyResult, GetOptions, Key, KeyRange, Precondition,
+    CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
     PreconditionFailure, ProjectedValue, PutBatch, ReadDurability, ReadEntry, ReadOptions,
     ScanChunk, ScanOptions, SpaceId, Storage, StorageError, StorageRead, StorageWrite, StoredValue,
     WriteOptions, WriteStats,
@@ -36,7 +36,7 @@ use slatedb::config::{
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
-use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, WriteBatch};
+use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
@@ -434,11 +434,20 @@ struct WritePipeline {
 #[derive(Default)]
 struct WritePipelineState {
     tail: Option<Arc<WriteCompletion>>,
+    queued: VecDeque<QueuedWrite>,
+    draining: bool,
     visible: VecDeque<Arc<PublishedWrite>>,
     point_publications: HashMap<Key, VecDeque<PointPublication>>,
     active_views: BTreeMap<(u64, u64), usize>,
     next_publication_id: u64,
     terminal_error: Option<StorageError>,
+}
+
+struct QueuedWrite {
+    overlay: Arc<BTreeMap<Key, Option<Bytes>>>,
+    published: Arc<PublishedWrite>,
+    completion: Arc<WriteCompletion>,
+    await_durable: bool,
 }
 
 struct PublishedWrite {
@@ -1073,35 +1082,31 @@ fn point_precondition_matches(precondition: &Precondition, value: Option<&Bytes>
 }
 
 impl StorageRead for SlateDBRead {
+    fn snapshot_cache_key(&self) -> Option<u128> {
+        let publication_id = self
+            .publication_view
+            .as_ref()
+            .map_or(0, |view| view.publication_id);
+        Some((u128::from(self.snapshot.seq()) << 64) | u128::from(publication_id))
+    }
+
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
             self.write_pipeline.terminal_error()?;
-            if keys.is_empty() {
-                return Ok(GetManyResult::new(Vec::new()));
-            }
-
-            if let [key] = keys {
-                let key = physical_key(space, key)?;
+            if let [request] = requests
+                && let [key] = request.keys
+            {
+                let key = physical_key(request.space, key)?;
                 let snapshot = Arc::clone(&self.snapshot);
                 let durability = self.durability;
                 let mut value = if durability == ReadDurability::Visible {
                     let sequence = snapshot.seq();
                     let cache = self.point_cache.clone();
                     if let Some(value) = cache.get(sequence, &key) {
-                        // A cached value must still obey SlateDB's terminal close
-                        // boundary. This has no object-store I/O, but makes the
-                        // hit linearize at the same closed-state check as a real
-                        // snapshot read.
-                        self.worker
-                            .call_read(|db| async move {
-                                db.snapshot().await.map(|_| ()).map_err(slatedb_error)
-                            })
-                            .await?;
+                        self.worker.check_open_fast()?;
                         value
                     } else {
                         let fetched_key = key.clone();
@@ -1130,14 +1135,25 @@ impl StorageRead for SlateDBRead {
                     value = published;
                 }
                 return Ok(GetManyResult::new(vec![
-                    value.map(|value| project_value(value, opts.projection)),
+                    value.map(|value| project_value(value, request.opts.projection)),
                 ]));
             }
 
-            let physical_keys = keys
-                .iter()
-                .map(|key| physical_key(space, key))
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut physical_keys = Vec::with_capacity(
+                requests
+                    .iter()
+                    .map(|request| request.keys.len())
+                    .sum::<usize>(),
+            );
+            for request in requests {
+                for key in request.keys {
+                    physical_keys.push(physical_key(request.space, key)?);
+                }
+            }
+            if physical_keys.is_empty() {
+                return Ok(GetManyResult::new(Vec::new()));
+            }
+
             let snapshot = Arc::clone(&self.snapshot);
             let durability = self.durability;
             let mut values = if durability == ReadDurability::Visible {
@@ -1151,17 +1167,8 @@ impl StorageRead for SlateDBRead {
                         missing.push((index, key.clone()));
                     }
                 }
-
                 if missing.is_empty() {
-                    // A cached value must still obey SlateDB's terminal close
-                    // boundary. This has no object-store I/O, but makes the
-                    // hit linearize at the same closed-state check as a real
-                    // snapshot read.
-                    self.worker
-                        .call_read(|db| async move {
-                            db.snapshot().await.map(|_| ()).map_err(slatedb_error)
-                        })
-                        .await?;
+                    self.worker.check_open_fast()?;
                 } else {
                     let missing_keys = missing
                         .iter()
@@ -1178,11 +1185,10 @@ impl StorageRead for SlateDBRead {
                         values[index] = Some(value);
                     }
                 }
-
                 values
                     .into_iter()
-                    .map(|value| value.expect("all SlateDB point-read cache misses are filled"))
-                    .collect()
+                    .map(|value| value.expect("all SlateDB batch point-cache misses are filled"))
+                    .collect::<Vec<_>>()
             } else {
                 let read_keys = physical_keys.clone();
                 self.worker
@@ -1200,12 +1206,19 @@ impl StorageRead for SlateDBRead {
                     *value = published;
                 }
             }
-            Ok(GetManyResult::new(
-                values
-                    .into_iter()
-                    .map(|value| value.map(|value| project_value(value, opts.projection)))
-                    .collect(),
-            ))
+
+            let mut values = values.into_iter();
+            let mut results = Vec::with_capacity(physical_keys.len());
+            for request in requests {
+                results.extend(
+                    values.by_ref().take(request.keys.len()).map(|value| {
+                        value.map(|value| project_value(value, request.opts.projection))
+                    }),
+                );
+            }
+            let unexpected_value = values.next();
+            debug_assert!(unexpected_value.is_none());
+            Ok(GetManyResult::new(results))
         }
     }
 
@@ -1430,7 +1443,7 @@ impl StorageWrite for SlateDBWrite {
             write_pipeline.terminal_error()?;
             let overlay = Arc::new(overlay);
             let completion = Arc::new(WriteCompletion::new());
-            let (previous, published) = {
+            let start_drainer = {
                 let mut state = write_pipeline
                     .state
                     .lock()
@@ -1445,7 +1458,7 @@ impl StorageWrite for SlateDBWrite {
                     overlay: Arc::clone(&overlay),
                     persisted_sequence: AtomicU64::new(PENDING_WRITE_SEQUENCE),
                 });
-                let previous = state.tail.replace(Arc::clone(&completion));
+                state.tail = Some(Arc::clone(&completion));
                 state.visible.push_back(Arc::clone(&published));
                 for (key, value) in &*overlay {
                     state
@@ -1458,53 +1471,22 @@ impl StorageWrite for SlateDBWrite {
                             value: value.clone(),
                         });
                 }
-                (previous, published)
+                state.queued.push_back(QueuedWrite {
+                    overlay,
+                    published,
+                    completion: Arc::clone(&completion),
+                    await_durable,
+                });
+                let start_drainer = !state.draining;
+                state.draining = true;
+                start_drainer
             };
 
-            let task_pipeline = write_pipeline.clone();
-            let task_completion = Arc::clone(&completion);
             drop(writer_permit);
-            worker.spawn(move |db| async move {
-                if let Some(previous) = previous {
-                    let _ = previous.wait().await;
-                }
-                let prior_error = task_pipeline.terminal_error();
-                let result = if let Err(error) = prior_error {
-                    Err(error)
-                } else {
-                    let mut batch = WriteBatch::new();
-                    for (key, value) in &*overlay {
-                        match value {
-                            Some(value) => batch.put_bytes(key.0.clone(), value.clone()),
-                            None => batch.delete(key.0.clone()),
-                        }
-                    }
-                    db.write_with_options(
-                        batch,
-                        &SlateDBWriteOptions {
-                            await_durable,
-                            ..SlateDBWriteOptions::default()
-                        },
-                    )
-                    .await
-                    .map(|handle| handle.seqnum())
-                    .map_err(slatedb_error)
-                    .map_err(commit_outcome_unknown)
-                };
-                match &result {
-                    Ok(sequence) => published
-                        .persisted_sequence
-                        .store(*sequence, Ordering::Release),
-                    Err(error) => {
-                        task_pipeline
-                            .state
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .terminal_error = Some(error.clone());
-                    }
-                }
-                task_completion.complete(result);
-            });
+            if start_drainer {
+                let task_pipeline = write_pipeline.clone();
+                worker.spawn(move |db| drain_write_queue(db, task_pipeline));
+            }
 
             // The writer gate protects precondition evaluation plus publication
             // into the ordered adapter pipeline. Once published, later writers
@@ -1524,6 +1506,68 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
+async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline) {
+    loop {
+        let writes = {
+            let mut state = pipeline
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.queued.is_empty() {
+                state.draining = false;
+                return;
+            }
+            state.queued.drain(..).collect::<Vec<_>>()
+        };
+
+        let prior_error = pipeline.terminal_error();
+        let result = if let Err(error) = prior_error {
+            Err(error)
+        } else {
+            let mut batch = WriteBatch::new();
+            let await_durable = writes.iter().any(|write| write.await_durable);
+            for write in &writes {
+                for (key, value) in &*write.overlay {
+                    match value {
+                        Some(value) => batch.put_bytes(key.0.clone(), value.clone()),
+                        None => batch.delete(key.0.clone()),
+                    }
+                }
+            }
+            db.write_with_options(
+                batch,
+                &SlateDBWriteOptions {
+                    await_durable,
+                    ..SlateDBWriteOptions::default()
+                },
+            )
+            .await
+            .map(|handle| handle.seqnum())
+            .map_err(slatedb_error)
+            .map_err(commit_outcome_unknown)
+        };
+
+        if let Err(error) = &result {
+            pipeline
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .terminal_error = Some(error.clone());
+        }
+        for write in writes {
+            if let Ok(sequence) = &result {
+                write
+                    .published
+                    .persisted_sequence
+                    .store(*sequence, Ordering::Release);
+                write.completion.complete(Ok(*sequence));
+            } else {
+                write.completion.complete(result.clone());
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 #[allow(missing_debug_implementations)]
 struct SlateDBWorker {
@@ -1534,6 +1578,7 @@ struct SlateDBWorker {
 struct SlateDBWorkerInner {
     runtime: Handle,
     db: Arc<Db>,
+    status: tokio::sync::watch::Receiver<DbStatus>,
     read_on_caller_current_thread: bool,
     in_flight: InFlightTracker,
     shutdown: mpsc::Sender<()>,
@@ -1620,16 +1665,20 @@ impl SlateDBWorker {
             .recv()
             .map_err(|error| StorageError::Io(format!("slatedb worker did not open: {error}")))?
         {
-            Ok((runtime, db)) => Ok(Self {
-                inner: Arc::new(SlateDBWorkerInner {
-                    runtime,
-                    db,
-                    read_on_caller_current_thread,
-                    in_flight,
-                    shutdown,
-                    manager: Mutex::new(Some(thread)),
-                }),
-            }),
+            Ok((runtime, db)) => {
+                let status = db.subscribe();
+                Ok(Self {
+                    inner: Arc::new(SlateDBWorkerInner {
+                        runtime,
+                        db,
+                        status,
+                        read_on_caller_current_thread,
+                        in_flight,
+                        shutdown,
+                        manager: Mutex::new(Some(thread)),
+                    }),
+                })
+            }
             Err(error) => {
                 let _ = thread.join();
                 Err(error)
@@ -1654,6 +1703,15 @@ impl SlateDBWorker {
         match self.inner.db.status().close_reason {
             None => Ok(()),
             Some(CloseReason::Fenced) => Err(StorageError::Fenced),
+            Some(reason) => Err(StorageError::Closed(format!("slatedb closed: {reason:?}"))),
+        }
+    }
+
+    fn check_open_fast(&self) -> Result<(), StorageError> {
+        let status = self.inner.status.borrow();
+        match status.close_reason.as_ref() {
+            None => Ok(()),
+            Some(&CloseReason::Fenced) => Err(StorageError::Fenced),
             Some(reason) => Err(StorageError::Closed(format!("slatedb closed: {reason:?}"))),
         }
     }
@@ -2607,29 +2665,32 @@ mod tests {
         block_on(write.commit()).expect("commit row");
 
         let read = block_on(storage.begin_read(ReadOptions::default())).expect("begin read");
-        let result =
-            block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
-                .expect("read row");
+        let result = block_on(read.get_many(&[GetManyRequest {
+            space,
+            keys: std::slice::from_ref(&key),
+            opts: GetOptions::default(),
+        }]))
+        .expect("read row");
 
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
         assert_eq!(
-            block_on(read.get_many(
+            block_on(read.get_many(&[GetManyRequest {
                 space,
-                std::slice::from_ref(&key),
-                GetOptions {
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions {
                     projection: CoreProjection::KeyOnly,
                 },
-            ))
+            }]))
             .expect("read singleton key only")
             .values,
             vec![Some(ProjectedValue::KeyOnly)]
         );
         assert_eq!(
-            block_on(read.get_many(
+            block_on(read.get_many(&[GetManyRequest {
                 space,
-                &[Key(Bytes::from_static(b"missing"))],
-                GetOptions::default(),
-            ))
+                keys: &[Key(Bytes::from_static(b"missing"))],
+                opts: GetOptions::default(),
+            }]))
             .expect("read singleton missing key")
             .values,
             vec![None]
@@ -2778,9 +2839,13 @@ mod tests {
         let read =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin overlay read");
         assert_eq!(
-            block_on(read.get_many(space, std::slice::from_ref(&key), GetOptions::default(),))
-                .expect("read pending point")
-                .values,
+            block_on(read.get_many(&[GetManyRequest {
+                space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
+            .expect("read pending point")
+            .values,
             vec![Some(ProjectedValue::FullValue(value.clone()))]
         );
         assert_eq!(
@@ -2844,12 +2909,15 @@ mod tests {
 
         let before_update =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin old snapshot");
+        let before_update_cache_key = before_update
+            .snapshot_cache_key()
+            .expect("SlateDB read should expose a snapshot cache key");
         assert_eq!(
-            block_on(before_update.get_many(
+            block_on(before_update.get_many(&[GetManyRequest {
                 space,
-                std::slice::from_ref(&key),
-                GetOptions::default()
-            ))
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
             .expect("read old snapshot")
             .values,
             vec![Some(ProjectedValue::FullValue(Bytes::from_static(
@@ -2875,12 +2943,18 @@ mod tests {
 
         let after_update =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin new snapshot");
+        assert_ne!(
+            before_update_cache_key,
+            after_update
+                .snapshot_cache_key()
+                .expect("updated SlateDB read should expose a snapshot cache key")
+        );
         assert_eq!(
-            block_on(after_update.get_many(
+            block_on(after_update.get_many(&[GetManyRequest {
                 space,
-                std::slice::from_ref(&key),
-                GetOptions::default()
-            ))
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
             .expect("read new snapshot")
             .values,
             vec![Some(ProjectedValue::FullValue(Bytes::from_static(
@@ -2888,11 +2962,11 @@ mod tests {
             )))]
         );
         assert_eq!(
-            block_on(before_update.get_many(
+            block_on(before_update.get_many(&[GetManyRequest {
                 space,
-                std::slice::from_ref(&key),
-                GetOptions::default()
-            ))
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
             .expect("reread old snapshot")
             .values,
             vec![Some(ProjectedValue::FullValue(Bytes::from_static(
@@ -2942,16 +3016,16 @@ mod tests {
             );
         }
 
-        assert_eq!(cache.get(7, &first), None);
-        assert_eq!(
-            cache.get(
-                7,
-                &Key(Bytes::from(format!(
-                    "cache-entry-{SNAPSHOT_POINT_CACHE_ENTRIES:04}"
-                )))
-            ),
-            Some(Some(Bytes::from_static(b"value")))
-        );
+        let keys = [first];
+        let mut values = [None];
+        cache.get_many(7, &keys, &mut values);
+        assert_eq!(values, [None]);
+        let keys = [Key(Bytes::from(format!(
+            "cache-entry-{SNAPSHOT_POINT_CACHE_ENTRIES:04}"
+        )))];
+        let mut values = [None];
+        cache.get_many(7, &keys, &mut values);
+        assert_eq!(values, [Some(Some(Bytes::from_static(b"value")))]);
     }
 
     #[test]
@@ -3045,6 +3119,7 @@ mod tests {
         .expect("open commit visibility storage");
         let space = SpaceId(8);
         let key = Key(Bytes::from_static(b"visible-before-durable"));
+        let queued_key = Key(Bytes::from_static(b"visible-while-draining"));
 
         let blocked_write = store.block_next_write();
         let mut write =
@@ -3067,16 +3142,37 @@ mod tests {
         // is still in flight.
         blocked_write.wait_for_entries(1, "SlateDB WAL write");
 
+        let mut queued =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin queued write");
+        block_on(queued.put_many(
+            space,
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: queued_key.clone(),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"queued"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage queued write");
+        block_on(queued.commit()).expect("publish queued value");
+
         let read = block_on(storage.begin_read(ReadOptions::default()))
             .expect("begin visible in-memory read");
-        let values = block_on(read.get_many(space, &[key], GetOptions::default()))
-            .expect("read visible in-memory value")
-            .values;
+        let values = block_on(read.get_many(&[GetManyRequest {
+            space,
+            keys: &[key, queued_key],
+            opts: GetOptions::default(),
+        }]))
+        .expect("read visible in-memory value")
+        .values;
         assert_eq!(
             values,
-            vec![Some(ProjectedValue::FullValue(Bytes::from_static(
-                b"value"
-            )))]
+            vec![
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"value"))),
+                Some(ProjectedValue::FullValue(Bytes::from_static(b"queued"))),
+            ]
         );
 
         drop(blocked_write);
@@ -3130,9 +3226,13 @@ mod tests {
         let visible =
             block_on(storage.begin_read(ReadOptions::default())).expect("begin visible read");
         assert_eq!(
-            block_on(visible.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
-                .expect("read visible value")
-                .values,
+            block_on(visible.get_many(&[GetManyRequest {
+                space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
+            .expect("read visible value")
+            .values,
             vec![Some(ProjectedValue::FullValue(value.clone()))],
             "the ordinary read tier may include published in-memory state"
         );
@@ -3142,9 +3242,13 @@ mod tests {
         }))
         .expect("begin remote-durable read");
         assert_eq!(
-            block_on(durable.get_many(space, std::slice::from_ref(&key), GetOptions::default()))
-                .expect("read remote-durable value")
-                .values,
+            block_on(durable.get_many(&[GetManyRequest {
+                space,
+                keys: std::slice::from_ref(&key),
+                opts: GetOptions::default(),
+            }]))
+            .expect("read remote-durable value")
+            .values,
             vec![None],
             "a remote-durable read must not claim a blocked WAL upload persisted"
         );
@@ -3158,9 +3262,13 @@ mod tests {
         }))
         .expect("begin completed remote-durable read");
         assert_eq!(
-            block_on(durable.get_many(space, &[key], GetOptions::default()))
-                .expect("read completed remote-durable value")
-                .values,
+            block_on(durable.get_many(&[GetManyRequest {
+                space,
+                keys: &[key],
+                opts: GetOptions::default(),
+            }]))
+            .expect("read completed remote-durable value")
+            .values,
             vec![Some(ProjectedValue::FullValue(value))]
         );
     }
@@ -3262,8 +3370,12 @@ mod tests {
         .expect("reopen close-test storage");
         let read =
             block_on(reopened.begin_read(ReadOptions::default())).expect("begin close-test read");
-        let result = block_on(read.get_many(space, &[key], GetOptions::default()))
-            .expect("read close-test value");
+        let result = block_on(read.get_many(&[GetManyRequest {
+            space,
+            keys: &[key],
+            opts: GetOptions::default(),
+        }]))
+        .expect("read close-test value");
         assert_eq!(result.values, vec![Some(ProjectedValue::FullValue(value))]);
     }
 
@@ -3324,11 +3436,19 @@ mod tests {
         let blocked_reads = store.block_sst_reads();
 
         let left = std::thread::spawn(move || {
-            block_on(left_read.get_many(space, &[left_key], GetOptions::default()))
+            block_on(left_read.get_many(&[GetManyRequest {
+                space,
+                keys: &[left_key],
+                opts: GetOptions::default(),
+            }]))
         });
         blocked_reads.wait_for_entries(1, "first SST read");
         let right = std::thread::spawn(move || {
-            block_on(right_read.get_many(space, &[right_key], GetOptions::default()))
+            block_on(right_read.get_many(&[GetManyRequest {
+                space,
+                keys: &[right_key],
+                opts: GetOptions::default(),
+            }]))
         });
         blocked_reads.wait_for_entries(2, "second concurrent SST read");
         drop(blocked_reads);
@@ -3412,7 +3532,12 @@ mod tests {
         });
 
         let keys = [key];
-        let point_read = read.get_many(space, &keys, GetOptions::default());
+        let requests = [GetManyRequest {
+            space,
+            keys: &keys,
+            opts: GetOptions::default(),
+        }];
+        let point_read = read.get_many(&requests);
         tokio::pin!(point_read);
         tokio::select! {
             biased;

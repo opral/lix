@@ -748,6 +748,9 @@ simulation_test!(
     merge_branch_advances_target_with_two_parent_commit,
     |sim| async move {
         let (engine, main, draft) = create_draft_from_main(&sim).await;
+        main.create_checkpoint()
+            .await
+            .expect("target checkpoint should succeed");
         main.execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('main-merge-target', 'main')",
             &[],
@@ -819,6 +822,37 @@ simulation_test!(
 
         assert_key_value(&main, "draft-merge-source", Some("\"draft\"")).await;
         assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
+        let working_changes = main
+            .execute(
+                "SELECT entity_pk, change_kind \
+                 FROM lix_working_change \
+                 WHERE schema_key = 'lix_key_value' \
+                 ORDER BY entity_pk",
+                &[],
+            )
+            .await
+            .expect("post-merge working changes should load");
+        assert_eq!(working_changes.len(), 2);
+        assert_eq!(
+            working_changes.rows()[0].values(),
+            &[
+                Value::Json(JsonValue::Array(vec![JsonValue::String(
+                    "draft-merge-source".to_string()
+                )])),
+                Value::Text("added".to_string()),
+            ],
+            "the selected source delta must remain visible against the target checkpoint"
+        );
+        assert_eq!(
+            working_changes.rows()[1].values(),
+            &[
+                Value::Json(JsonValue::Array(vec![JsonValue::String(
+                    "main-merge-target".to_string()
+                )])),
+                Value::Text("added".to_string()),
+            ],
+            "the target delta must remain visible against the target checkpoint"
+        );
 
         let global = sim.wrap_session(
             engine

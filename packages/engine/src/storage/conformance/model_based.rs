@@ -8,7 +8,7 @@ const TEST_SPACE: SpaceId = SpaceId(7);
 use bytes::Bytes;
 
 use crate::storage::conformance::{
-    ConformanceReport, ConformanceResult, StorageFactory,
+    ConformanceReport, ConformanceResult, SingleSpaceStorageRead, StorageFactory,
     fixtures::{full_put, key, put_batch},
     model::ReferenceModel,
     open_storage,
@@ -137,7 +137,7 @@ where
         keys[rng.usize(keys.len())].clone(),
     ];
     let result = read
-        .get_many(TEST_SPACE, &point_keys, GetOptions::default())
+        .get_many_in_space(TEST_SPACE, &point_keys, GetOptions::default())
         .await
         .map_err(|error| format!("{label}: get_many failed: {error}"))?;
     let actual = entries_to_map(&result.entries_for_requested_keys(&point_keys));

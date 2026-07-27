@@ -174,7 +174,7 @@ where
                     analyze(
                         &mut reader,
                         MergeCommits {
-                            base_commit_id: merge_base.commit_id,
+                            base_commit_id: merge_base,
                             target_commit_id: target_head,
                             source_commit_id: source_head,
                         },
@@ -257,7 +257,7 @@ where
                     "lix.perf.merge_base"
                 ))
                 .await?;
-                let base_commit_id = merge_base.commit_id;
+                let base_commit_id = merge_base;
                 let analysis = async {
                     let mut reader = transaction.tracked_state_reader().await;
                     analyze(

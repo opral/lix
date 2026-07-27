@@ -154,13 +154,13 @@ where
         R: StorageAdapterRead + ?Sized,
     {
         let values = read
-            .get_many(
-                MUTATION_REVISION_SPACE.id,
-                &[mutation_revision_key()],
-                GetOptions {
+            .get_many(&[crate::storage::GetManyRequest {
+                space: MUTATION_REVISION_SPACE.id,
+                keys: &[mutation_revision_key()],
+                opts: GetOptions {
                     projection: CoreProjection::FullValue,
                 },
-            )
+            }])
             .await?;
         Ok(values
             .values
@@ -180,13 +180,13 @@ where
         R: StorageAdapterRead + ?Sized,
     {
         let values = read
-            .get_many(
-                TRACKED_MUTATION_REVISION_SPACE.id,
-                &[mutation_revision_key()],
-                GetOptions {
+            .get_many(&[crate::storage::GetManyRequest {
+                space: TRACKED_MUTATION_REVISION_SPACE.id,
+                keys: &[mutation_revision_key()],
+                opts: GetOptions {
                     projection: CoreProjection::FullValue,
                 },
-            )
+            }])
             .await?;
         Ok(values
             .values
@@ -314,11 +314,9 @@ where
 {
     fn get_many(
         &self,
-        space: crate::storage::SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[crate::storage::GetManyRequest<'_>],
     ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
-        self.read.get_many(space, keys, opts)
+        self.read.get_many(requests)
     }
 
     fn scan(
@@ -373,11 +371,9 @@ where
 {
     fn get_many(
         &self,
-        space: crate::storage::SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[crate::storage::GetManyRequest<'_>],
     ) -> impl Future<Output = Result<crate::storage::GetManyResult, StorageError>> + Send {
-        self.read.get_many(space, keys, opts)
+        self.read.get_many(requests)
     }
 
     fn scan(

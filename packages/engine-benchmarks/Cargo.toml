@@ -39,6 +39,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [[test]]
@@ -91,7 +92,7 @@ required-features = ["storage-benches"]
 name = "tracked_working_diff"
 path = "benches/tracked_working_diff.rs"
 harness = false
-required-features = ["storage-benches"]
+required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
 name = "slatedb_file_api"
@@ -126,5 +127,11 @@ required-features = ["storage-benches", "slatedb"]
 [[bench]]
 name = "changelog_history_append"
 path = "benches/changelog_history_append.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
+name = "multi_space_point_read"
+path = "benches/multi_space_point_read.rs"
 harness = false
 required-features = ["storage-benches", "slatedb"]

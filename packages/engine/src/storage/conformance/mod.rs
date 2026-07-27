@@ -17,6 +17,33 @@ pub use runner::{
     run_storage_conformance,
 };
 
+pub(crate) trait SingleSpaceStorageRead {
+    async fn get_many_in_space(
+        &self,
+        space: crate::storage::SpaceId,
+        keys: &[crate::storage::Key],
+        opts: crate::storage::GetOptions,
+    ) -> Result<crate::storage::GetManyResult, crate::storage::StorageError>;
+}
+
+impl<R> SingleSpaceStorageRead for R
+where
+    R: crate::storage::StorageRead,
+{
+    async fn get_many_in_space(
+        &self,
+        space: crate::storage::SpaceId,
+        keys: &[crate::storage::Key],
+        opts: crate::storage::GetOptions,
+    ) -> Result<crate::storage::GetManyResult, crate::storage::StorageError> {
+        crate::storage::StorageRead::get_many(
+            self,
+            &[crate::storage::GetManyRequest { space, keys, opts }],
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConformanceStatus, run_storage_conformance};

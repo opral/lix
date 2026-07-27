@@ -10,8 +10,8 @@ use crate::sql_telemetry::{SqlStatementTelemetry, finish_operation, start_batch}
 use crate::sql2;
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    SharedStorageAdapterRead, StorageAdapter, StorageAdapterReadScope, StorageReadDurability,
-    StorageReadOptions, StorageWriteOptions, StorageWriteSet,
+    SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
+    StorageReadDurability, StorageReadOptions, StorageWriteOptions, StorageWriteSet,
 };
 use crate::telemetry::TelemetrySpanKind;
 use crate::transaction::{begin_commit_boundary, commit_at_boundary};
@@ -699,6 +699,7 @@ where
             read_scope,
             |read_store| async move {
                 let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
+                let plugin_cache_snapshot = read_store.snapshot_cache_key();
                 let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                     Arc::new(self.live_state.reader(read_store.clone()));
                 let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
@@ -719,6 +720,7 @@ where
                     blob_reader,
                     self.plugin_host.clone(),
                     Some(file_view_collector.clone()),
+                    plugin_cache_snapshot,
                     &paths,
                 )
                 .await?;
@@ -1099,26 +1101,36 @@ where
     /// Executes one atomic import batch whose caller serializes every writer
     /// that could transition the same plugin-owned files.
     ///
-    /// Unlike ordinary execution, this deliberately retires each plugin actor
-    /// after its durable rows and materialization proof have been staged. It
-    /// bounds a one-shot import's private Wasm Stores independently of the
-    /// number of files in the batch. Do not use it for concurrent mutation
-    /// workloads: ordinary execution retains file actor leases through commit
-    /// to compose concurrent semantic transitions.
+    /// The caller may retain actors when the batch fits the configured live
+    /// Store bound, or retire them for a broad one-shot import. Retained actors
+    /// remain bounded cache candidates but are not session acknowledgements
+    /// across batches. Do not use this for concurrent mutation workloads:
+    /// ordinary execution retains acknowledged actor leases through commit to
+    /// compose concurrent semantic transitions.
     #[doc(hidden)]
     pub async fn execute_batch_for_single_writer_ingest(
         &self,
         statements: &[ExecuteBatchStatement],
+        retain_plugin_actors: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.execute_batch_with_options_and_metadata_inner(
-            statements,
-            ExecuteOptions::default(),
-            vec![ExecuteStatementMetadata::default(); statements.len()],
-            None,
-            false,
-            false,
-        )
-        .await
+        let result = self
+            .execute_batch_with_options_and_metadata_inner(
+                statements,
+                ExecuteOptions::default(),
+                vec![ExecuteStatementMetadata::default(); statements.len()],
+                None,
+                false,
+                retain_plugin_actors,
+            )
+            .await;
+        // A serialized importer submits authoritative successor bytes rather
+        // than edits based on a session acknowledgement. Keep any bounded
+        // private actors as reusable cold-open candidates, but never expose
+        // their observations as acknowledgement authority across batches:
+        // normal cache eviction would otherwise turn a later import into a
+        // stale-observation error instead of a safe cold open.
+        self.file_views.clear();
+        result
     }
 
     #[doc(hidden)]
@@ -1751,6 +1763,7 @@ where
                         blob_reader,
                         self.plugin_host.clone(),
                         file_view_collector.clone(),
+                        None,
                         &paths,
                     )
                     .await?
@@ -1940,6 +1953,7 @@ async fn hydrate_lix_file_data_result(
         blob_reader,
         plugin_host,
         session_file_views,
+        None,
         &paths,
     )
     .await?;
@@ -3028,6 +3042,46 @@ mod tests {
             sql: sql.to_string(),
             params: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn single_writer_ingest_never_carries_acknowledgement_authority_across_batches() {
+        let session = open_session().await;
+        let view_key = sql2::SessionFileViewKey::new("branch", "file");
+        session.file_views.remember_plugin_file_view(
+            view_key.clone(),
+            sql2::SessionPluginFileView {
+                path: "/file.txt".to_string(),
+                plugin_key: "plugin".to_string(),
+                plugin_generation: "generation".to_string(),
+                owner_change_id: "owner".to_string(),
+                observation: None,
+            },
+        );
+        assert!(
+            session
+                .file_views
+                .has_plugin_file_at_path("branch", "/file.txt")
+        );
+
+        session
+            .execute_batch_for_single_writer_ingest(
+                &[batch_statement(
+                    "INSERT INTO lix_key_value (key, value) \
+                     VALUES ('single-writer-ingest', lix_json('{}'))",
+                )],
+                true,
+            )
+            .await
+            .expect("serialized ingest should commit");
+
+        assert!(
+            session
+                .file_views
+                .plugin_file_view(&view_key, "plugin", "generation", "owner")
+                .is_none(),
+            "serialized ingestion may cache actors but must clear session acknowledgement authority"
+        );
     }
 
     #[test]

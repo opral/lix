@@ -331,15 +331,9 @@ fn broken_physical_range(space: SpaceId, range: KeyRange) -> KeyRange {
 impl StorageRead for BrokenRead {
     fn get_many(
         &self,
-        space: SpaceId,
-        keys: &[Key],
-        opts: GetOptions,
+        requests: &[crate::storage::GetManyRequest<'_>],
     ) -> impl Future<Output = Result<GetManyResult, StorageError>> + Send {
         async move {
-            let physical_keys = keys
-                .iter()
-                .map(|key| broken_physical_key(space, key))
-                .collect::<Vec<_>>();
             let live_entries;
             let current_commit_count = *self
                 .commit_count
@@ -358,7 +352,18 @@ impl StorageRead for BrokenRead {
             } else {
                 &self.snapshot
             };
-            Ok(get_many_from_map(entries, self.mode, &physical_keys, opts))
+            let mut values = Vec::new();
+            for request in requests {
+                let physical_keys = request
+                    .keys
+                    .iter()
+                    .map(|key| broken_physical_key(request.space, key))
+                    .collect::<Vec<_>>();
+                values.extend(
+                    get_many_from_map(entries, self.mode, &physical_keys, request.opts).values,
+                );
+            }
+            Ok(GetManyResult::new(values))
         }
     }
 

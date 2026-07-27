@@ -11,8 +11,8 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use futures_util::StreamExt;
 use futures_util::stream::{self, BoxStream};
 use lix_engine::storage::{
-    GetOptions as StorageGetOptions, Key, ProjectedValue, PutBatch, PutEntry, ReadOptions, SpaceId,
-    StorageRead, StorageWrite, StoredValue, WriteOptions,
+    GetManyRequest, GetOptions as StorageGetOptions, Key, ProjectedValue, PutBatch, PutEntry,
+    ReadOptions, SpaceId, StorageRead, StorageWrite, StoredValue, WriteOptions,
 };
 #[cfg(feature = "storage-benches")]
 use lix_engine::storage_adapter::StorageAdapter;
@@ -1391,11 +1391,11 @@ async fn read_storage_key(storage: &SlateDB, key: &Key) -> usize {
         .await
         .expect("begin SlateDB concurrency read");
     let result = read
-        .get_many(
-            CONCURRENCY_SPACE,
-            std::slice::from_ref(key),
-            StorageGetOptions::default(),
-        )
+        .get_many(&[GetManyRequest {
+            space: CONCURRENCY_SPACE,
+            keys: std::slice::from_ref(key),
+            opts: StorageGetOptions::default(),
+        }])
         .await
         .expect("read SlateDB concurrency key");
     match result.values.into_iter().next().flatten() {

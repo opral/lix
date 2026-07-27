@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use lix_engine::storage::{
-    CoreProjection, GetOptions, Key, Precondition, ProjectedValue, PutBatch, PutEntry,
-    ReadDurability, ReadOptions, SpaceId, Storage, StorageWrite, StoredValue, WriteOptions,
+    CoreProjection, GetManyRequest, GetOptions, Key, Precondition, ProjectedValue, PutBatch,
+    PutEntry, ReadDurability, ReadOptions, SpaceId, Storage, StorageWrite, StoredValue,
+    WriteOptions,
 };
 use lix_engine::storage_adapter::{StorageAdapter, StorageAdapterRead};
 use lix_engine::storage_bench::{
@@ -325,11 +326,11 @@ where
             .await
             .expect("open durable singleton read");
         let value = read
-            .get_many(
-                DIRECT_SINGLETON_SPACE,
-                std::slice::from_ref(&self.direct_key),
-                GetOptions::default(),
-            )
+            .get_many(&[GetManyRequest {
+                space: DIRECT_SINGLETON_SPACE,
+                keys: std::slice::from_ref(&self.direct_key),
+                opts: GetOptions::default(),
+            }])
             .await
             .expect("read durable singleton value")
             .values
@@ -353,13 +354,13 @@ where
             .await
             .expect("open visible hot batch read");
         let values = read
-            .get_many(
-                DIRECT_BATCH_SPACE,
-                &self.direct_batch_keys,
-                GetOptions {
+            .get_many(&[GetManyRequest {
+                space: DIRECT_BATCH_SPACE,
+                keys: &self.direct_batch_keys,
+                opts: GetOptions {
                     projection: CoreProjection::KeyOnly,
                 },
-            )
+            }])
             .await
             .expect("read visible hot batch values")
             .values;

@@ -161,8 +161,8 @@ async fn sqlite_put_many_handles_multi_chunk_batches() {
     use bytes::Bytes;
     use lix_engine::storage::PutEntry;
     use lix_sdk::{
-        CoreProjection, GetOptions, Key, ProjectedValue, PutBatch, ReadOptions, SpaceId, Storage,
-        StorageRead, StorageWrite, StoredValue, WriteOptions,
+        CoreProjection, GetManyRequest, GetOptions, Key, ProjectedValue, PutBatch, ReadOptions,
+        SpaceId, Storage, StorageRead, StorageWrite, StoredValue, WriteOptions,
     };
     const TEST_SPACE: SpaceId = SpaceId(0x0001_0001);
 
@@ -217,13 +217,13 @@ async fn sqlite_put_many_handles_multi_chunk_batches() {
         .await
         .expect("begin read");
     let result = read
-        .get_many(
-            TEST_SPACE,
-            &keys,
-            GetOptions {
+        .get_many(&[GetManyRequest {
+            space: TEST_SPACE,
+            keys: &keys,
+            opts: GetOptions {
                 projection: CoreProjection::FullValue,
             },
-        )
+        }])
         .await
         .expect("read keys");
     drop(read);
