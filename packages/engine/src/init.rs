@@ -39,7 +39,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V12 makes the packed current-state generation authoritative for both
+/// V15 makes the complete hot current-state generation authoritative for both
 /// tracked and untracked rows. Untracked values have no separate index,
 /// presence marker, or standalone changelog record. Opening an older store
 /// must fail closed rather than mixing its former visibility rules with the
@@ -47,7 +47,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"unified-current-state.v12";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v15";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -91,7 +91,7 @@ pub(crate) async fn repository_protocol_status(
 pub(crate) fn unsupported_repository_protocol_error() -> LixError {
     LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
-        "repository uses an unsupported unified current-state storage protocol; recreate the repository",
+        "repository uses an unsupported live-state hot-index storage protocol; recreate the repository",
     )
 }
 
@@ -232,7 +232,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             generation: initial_commit_id,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -252,7 +251,6 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
         control: BranchHeadControl {
             head_commit_id: initial_commit_id,
             generation: initial_commit_id,
-            tracked_head_is_current: true,
             current_state_revision: 0,
             working_diff_checkpoint_commit_id: Some(initial_commit_id),
             created_at: timestamp,
@@ -358,10 +356,10 @@ where
             .stage_commit_root(&receipt.initial_commit_id, None, deltas)
             .await?;
 
-        // Seed both visible branches with a complete V12 current-state generation.
+        // Seed both visible branches with a complete hot current-state generation.
         // The initial commit is shared, but the branch-scoped marker and
         // groups are intentionally independent so normal reads never need a
-        // historical fallback immediately after initialization.
+        // reconstruction path immediately after initialization.
         let tracked_head_deltas = authored_changes
             .iter()
             .map(|change| CurrentStateDeltaRef {
@@ -408,7 +406,7 @@ where
                     &absence_guards,
                     None,
                     None,
-                    None,
+                    Some(plan.commit.id),
                     &mut working_diff_coverage,
                 )
                 .await?;
@@ -417,7 +415,7 @@ where
                 &branch.branch_id,
                 TrackedWorkingDiffEpoch {
                     checkpoint_commit_id: plan.commit.id,
-                    generation: Some(plan.commit.id),
+                    generation: plan.commit.id,
                     coverage: working_diff_coverage,
                 },
             )?;

@@ -952,8 +952,7 @@ mod tests {
     use crate::init::REPOSITORY_PROTOCOL_SPACE;
     use crate::json_store::{UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, store::JSON_SPACE};
     use crate::live_state::{
-        TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MEMBER_SPACE, TRACKED_WORKING_DIFF_GROUP_SPACE,
-        TRACKED_WORKING_DIFF_MARKER_SPACE,
+        HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::{EncodedLeafEntry, encode_key_ref, encode_value_ref};
@@ -1378,9 +1377,9 @@ mod tests {
         let spaces = [
             REPOSITORY_PROTOCOL_SPACE,
             BRANCH_HEAD_CONTROL_SPACE,
-            TRACKED_HEAD_GROUP_SPACE,
-            TRACKED_HEAD_MEMBER_SPACE,
-            TRACKED_WORKING_DIFF_GROUP_SPACE,
+            HOT_ROW_SPACE,
+            HOT_FILE_SPACE,
+            HOT_DIFF_SPACE,
             TRACKED_WORKING_DIFF_MARKER_SPACE,
             JSON_SPACE,
             UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,

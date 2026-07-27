@@ -141,9 +141,9 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             match operation {
                 TransactionBenchOp::UpdateAll => {
                     if let Some(repeats) = hot_repeats {
-                        profile_hot_raw_sqlite_literal_updates(rows, repeats);
+                        profile_hot_raw_sqlite_literal_updates(rows, read_many_pk_count, repeats);
                     } else {
-                        profile_raw_sqlite_literal_updates(rows, sample_count);
+                        profile_raw_sqlite_literal_updates(rows, read_many_pk_count, sample_count);
                     }
                 }
                 TransactionBenchOp::ReadManyByPk => {
@@ -189,9 +189,21 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
             );
             let profile = profile_sql_session_storage();
             if let Some(repeats) = hot_repeats {
-                profile_hot_sql_session_bound_updates(runtime, rows, repeats, profile);
+                profile_hot_sql_session_bound_updates(
+                    runtime,
+                    rows,
+                    read_many_pk_count,
+                    repeats,
+                    profile,
+                );
             } else {
-                profile_sql_session_bound_updates(runtime, rows, sample_count, profile);
+                profile_sql_session_bound_updates(
+                    runtime,
+                    rows,
+                    read_many_pk_count,
+                    sample_count,
+                    profile,
+                );
             }
         }
         Ok("transaction") | Err(_) => {
@@ -221,7 +233,7 @@ fn profile_operation(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow]) {
 
 fn profile_read_many_pk_count(operation: TransactionBenchOp, row_count: usize) -> usize {
     let Ok(value) = std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_READ_MANY_PK_COUNT") else {
-        return READ_MANY_PK_COUNT;
+        return READ_MANY_PK_COUNT.min(row_count);
     };
     assert!(
         matches!(operation, TransactionBenchOp::ReadManyByPk),
@@ -354,12 +366,17 @@ fn profile_hot_sql_session_operations(
 fn profile_hot_sql_session_bound_updates(
     runtime: &tokio::runtime::Runtime,
     rows: &[WorkloadRow],
+    read_many_pk_count: usize,
     repeats: usize,
     profile: StorageProfile,
 ) {
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
-    let fixture = runtime.block_on(sql_session::seeded_fixture(profile, rows));
+    let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
+        profile,
+        rows,
+        read_many_pk_count,
+    ));
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
@@ -402,10 +419,14 @@ fn profile_hot_raw_sqlite_operations(
     black_box(row_count);
 }
 
-fn profile_hot_raw_sqlite_literal_updates(rows: &[WorkloadRow], repeats: usize) {
+fn profile_hot_raw_sqlite_literal_updates(
+    rows: &[WorkloadRow],
+    read_many_pk_count: usize,
+    repeats: usize,
+) {
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
-    let mut fixture = raw_sqlite::seeded_fixture(rows);
+    let mut fixture = raw_sqlite::seeded_fixture_with_read_many_pk_count(rows, read_many_pk_count);
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
@@ -549,10 +570,15 @@ fn profile_raw_sqlite_operation(
     print_profile_samples(output.layer(), operation, read_many_pk_count, samples);
 }
 
-fn profile_raw_sqlite_literal_updates(rows: &[WorkloadRow], sample_count: usize) {
+fn profile_raw_sqlite_literal_updates(
+    rows: &[WorkloadRow],
+    read_many_pk_count: usize,
+    sample_count: usize,
+) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
-        let mut fixture = raw_sqlite::seeded_fixture(rows);
+        let mut fixture =
+            raw_sqlite::seeded_fixture_with_read_many_pk_count(rows, read_many_pk_count);
         let start = Instant::now();
         let result = fixture.update_all_literal();
         samples.push(start.elapsed());
@@ -561,7 +587,7 @@ fn profile_raw_sqlite_literal_updates(rows: &[WorkloadRow], sample_count: usize)
     print_profile_samples(
         "raw_sqlite/literal",
         TransactionBenchOp::UpdateAll,
-        READ_MANY_PK_COUNT,
+        read_many_pk_count,
         samples,
     );
 }
@@ -626,12 +652,17 @@ fn profile_sql_session_operation(
 fn profile_sql_session_bound_updates(
     runtime: &tokio::runtime::Runtime,
     rows: &[WorkloadRow],
+    read_many_pk_count: usize,
     sample_count: usize,
     profile: StorageProfile,
 ) {
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
-        let fixture = runtime.block_on(sql_session::seeded_fixture(profile, rows));
+        let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
+            profile,
+            rows,
+            read_many_pk_count,
+        ));
         let start = Instant::now();
         let result = runtime.block_on(fixture.update_all_bound());
         samples.push(start.elapsed());
@@ -640,7 +671,7 @@ fn profile_sql_session_bound_updates(
     print_profile_samples(
         &format!("sql_session_bound/{}", profile.name()),
         TransactionBenchOp::UpdateAll,
-        READ_MANY_PK_COUNT,
+        read_many_pk_count,
         samples,
     );
 }

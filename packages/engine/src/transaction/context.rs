@@ -3709,7 +3709,7 @@ where
         }
         TrackedHeadContext::new()
             .reader(read)
-            .working_diff_if_control_current(branch_id, control, request)
+            .working_diff_for_control(branch_id, control, request)
             .await
     }
 

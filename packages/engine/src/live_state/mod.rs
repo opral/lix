@@ -14,10 +14,10 @@ pub(crate) use reader::load_exact_rows_via_scan_for_test;
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    CurrentStateDeltaRef, TRACKED_HEAD_GROUP_SPACE, TRACKED_HEAD_MEMBER_SPACE,
-    TRACKED_WORKING_DIFF_GROUP_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext,
-    TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
-    stage_collect_stale_working_diff_indexes, stage_tracked_working_diff_epoch,
+    CurrentStateDeltaRef, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot,
+    TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
+    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, stage_collect_stale_working_diff_indexes,
+    stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
