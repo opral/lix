@@ -1332,7 +1332,7 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     assert_eq!(cold.source_read_calls, 10);
     assert_eq!(cold.component_import_calls, 10);
     assert_eq!(
-        cold.host_full_content_classification_bytes,
+        cold.host_content_classification_bytes,
         JSON_TEN_MIB_BYTES as u64,
     );
     assert_eq!(
@@ -1396,7 +1396,7 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
     let warm = lix.plugin_v2_transition_counters();
 
     assert_eq!(warm.host_full_diff_bytes_compared, 0);
-    assert_eq!(warm.host_full_content_classification_bytes, 0);
+    assert_eq!(warm.host_content_classification_bytes, 0);
     assert_eq!(warm.source_read_calls, 0);
     assert_eq!(warm.source_bytes_read, 0);
     assert_eq!(warm.component_import_calls, 0);

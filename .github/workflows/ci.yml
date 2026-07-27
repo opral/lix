@@ -125,6 +125,7 @@ jobs:
         run: |
           rustup target add wasm32-wasip2
           cargo build --release -p plugin_csv_v2 --target wasm32-wasip2
+          cargo build --release -p plugin_git_text_v2 --target wasm32-wasip2
 
   js-sdk-test:
     name: JS SDK ${{ matrix.name }} Test

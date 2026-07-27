@@ -63,8 +63,8 @@ use crate::plugin::{
     local_mutation_identity, plugin_install_plan_from_archive_path,
     plugin_key_from_archive_file_id, plugin_state_live_state_projection,
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
-    transport_splice_preserves_utf8, validate_host_allocated_changes,
-    validate_namespace_reservation,
+    transport_splice_preserves_git_text, transport_splice_preserves_utf8,
+    validate_host_allocated_changes, validate_namespace_reservation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -2288,7 +2288,7 @@ where
         }
 
         let mut selected_plugins = BTreeMap::<PluginFileWriteKey, PluginRegistryEntry>::new();
-        let mut full_content_classification_bytes = BTreeMap::<PluginFileWriteKey, u64>::new();
+        let mut content_classification_bytes = BTreeMap::<PluginFileWriteKey, u64>::new();
         let selection_span = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.plugin_selection"
@@ -2315,10 +2315,9 @@ where
 
             // A warm v2 actor already carries an exact, generation-bound
             // selection. Reuse it only while every matcher-relevant identity
-            // is unchanged. Text content constraints can be preserved by
-            // validating the trusted splice's bounded UTF-8 window; all
-            // inconclusive, binary, blind, cold, or path-reselected writes use
-            // the ordinary full-payload classifier below.
+            // is unchanged. UTF-8 and Git-text constraints have separate
+            // bounded trusted-splice proofs; all inconclusive, binary, blind,
+            // cold, or path-reselected writes use the ordinary classifier below.
             let warm_owned_plugin = owners.get(&file_key).and_then(|owner| {
                 let plugin = registry.plugin(owner.plugin_key())?;
                 if !catalog.matches_plugin(plugin.key(), path) {
@@ -2343,6 +2342,13 @@ where
                             }) && transport_splice_preserves_utf8(write.data(), provenance)
                         })
                     }
+                    Some(PluginContentType::GitText) => {
+                        write.splice_provenance().is_some_and(|provenance| {
+                            observation.bytes_sha256().is_some_and(|digest| {
+                                digest.matches_lower_hex(provenance.base_sha256())
+                            }) && transport_splice_preserves_git_text(write.data(), provenance)
+                        })
+                    }
                     Some(PluginContentType::Binary) => false,
                 };
                 content_type_still_matches.then_some(plugin)
@@ -2353,7 +2359,7 @@ where
                 |plugin| (Some(plugin), 0),
             );
             if classified_bytes != 0 {
-                full_content_classification_bytes.insert(file_key.clone(), classified_bytes);
+                content_classification_bytes.insert(file_key.clone(), classified_bytes);
             }
             let Some(plugin) = plugin else {
                 continue;
@@ -2912,7 +2918,7 @@ where
                         )
                     };
                 counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
-                counters.host_full_content_classification_bytes = full_content_classification_bytes
+                counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
                     .copied()
                     .unwrap_or(0);
@@ -2975,7 +2981,7 @@ where
                 .await?;
                 let changes = validated.changes;
                 let mut counters = validated.counters;
-                counters.host_full_content_classification_bytes = full_content_classification_bytes
+                counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
                     .copied()
                     .unwrap_or(0);

@@ -416,6 +416,42 @@ pub(crate) fn transport_splice_preserves_utf8(
     std::str::from_utf8(&after[window_start..window_end]).is_ok()
 }
 
+/// Proves that a trusted transport splice preserves Git's text predicate
+/// without rescanning the full materialized file.
+///
+/// A file already owned by a `git_text` plugin is known to have no NUL byte
+/// in its first 8 KiB. The submitted result is bound to the transport splice,
+/// so checking only the same bounded prefix of the result is sufficient after
+/// a mutation. Unlike UTF-8 validity, Git's predicate has no code-point
+/// boundary context.
+pub(crate) fn transport_splice_preserves_git_text(
+    after: &[u8],
+    provenance: &RequestBlobSpliceProvenance,
+) -> bool {
+    const GIT_TEXT_SCAN_BYTES: usize = 8_000;
+
+    if !provenance.matches_result(after) {
+        return false;
+    }
+    let prefix = provenance.prefix_bytes();
+    let suffix = provenance.suffix_bytes();
+    let Some(insert_end) = prefix.checked_add(provenance.insert().len()) else {
+        return false;
+    };
+    let Some(expected_after_len) = insert_end.checked_add(suffix) else {
+        return false;
+    };
+    if expected_after_len != after.len()
+        || prefix > after.len()
+        || insert_end > after.len()
+        || provenance.insert() != &after[prefix..insert_end]
+    {
+        return false;
+    }
+
+    !after[..after.len().min(GIT_TEXT_SCAN_BYTES)].contains(&0)
+}
+
 fn validate_transport_splice(
     before: &[u8],
     after: &[u8],
@@ -2085,9 +2121,9 @@ fn merge_counter_snapshots(
         host_full_diff_bytes_compared: local
             .host_full_diff_bytes_compared
             .max(runtime.host_full_diff_bytes_compared),
-        host_full_content_classification_bytes: local
-            .host_full_content_classification_bytes
-            .max(runtime.host_full_content_classification_bytes),
+        host_content_classification_bytes: local
+            .host_content_classification_bytes
+            .max(runtime.host_content_classification_bytes),
         full_state_semantic_rows_materialized: local
             .full_state_semantic_rows_materialized
             .max(runtime.full_state_semantic_rows_materialized),
@@ -2372,6 +2408,35 @@ mod tests {
 
         let copied_after: Blob = after.to_vec().into();
         assert!(!transport_splice_preserves_utf8(&copied_after, &valid));
+    }
+
+    #[test]
+    fn git_text_splice_proof_checks_only_gits_bounded_nul_window() {
+        let before = vec![b'a'; 16_000];
+        let after: Blob = before.clone().into();
+        let valid = RequestBlobSpliceProvenance::new_validated_for_test(
+            &before,
+            &after,
+            16_000,
+            0,
+            Vec::new(),
+        );
+        assert!(transport_splice_preserves_git_text(&after, &valid));
+
+        let mut nul_in_window = after.to_vec();
+        nul_in_window[7_999] = 0;
+        let nul_in_window: Blob = nul_in_window.into();
+        let nul_provenance = RequestBlobSpliceProvenance::new_validated_for_test(
+            &before,
+            &nul_in_window,
+            7_999,
+            8_000,
+            vec![0],
+        );
+        assert!(!transport_splice_preserves_git_text(
+            &nul_in_window,
+            &nul_provenance
+        ));
     }
 
     #[test]

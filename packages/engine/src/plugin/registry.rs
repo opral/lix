@@ -695,18 +695,39 @@ impl CompiledPluginCatalog {
         path: &str,
         bytes: &[u8],
     ) -> (Option<&PluginRegistryEntry>, u64) {
-        let mut classified = None;
-        let selected = self.select_with_content_type(path, || {
-            Some(*classified.get_or_insert_with(|| PluginContentType::from_bytes(bytes)))
+        let mut utf8 = None;
+        let mut git_text = None;
+        let mut classified_bytes = 0u64;
+        let selected = self.select_with_content_type(path, |required| {
+            let matches = match required {
+                PluginContentType::Text | PluginContentType::Binary => {
+                    let is_utf8 = *utf8.get_or_insert_with(|| {
+                        classified_bytes = classified_bytes.saturating_add(bytes.len() as u64);
+                        std::str::from_utf8(bytes).is_ok()
+                    });
+                    match required {
+                        PluginContentType::Text => is_utf8,
+                        PluginContentType::Binary => !is_utf8,
+                        PluginContentType::GitText => {
+                            unreachable!("GitText is handled by its bounded classifier branch")
+                        }
+                    }
+                }
+                PluginContentType::GitText => *git_text.get_or_insert_with(|| {
+                    let scan_len = bytes.len().min(PluginContentType::GIT_TEXT_SCAN_BYTES);
+                    classified_bytes = classified_bytes.saturating_add(scan_len as u64);
+                    PluginContentType::GitText.matches_bytes(bytes)
+                }),
+            };
+            Some(matches)
         });
-        let classified_bytes = classified.map_or(0, |_| bytes.len() as u64);
         (selected, classified_bytes)
     }
 
     fn select_with_content_type(
         &self,
         path: &str,
-        mut file_content_type: impl FnMut() -> Option<PluginContentType>,
+        mut content_type_matches: impl FnMut(PluginContentType) -> Option<bool>,
     ) -> Option<&PluginRegistryEntry> {
         if path.is_empty() {
             return None;
@@ -720,7 +741,7 @@ impl CompiledPluginCatalog {
                 continue;
             }
             if let Some(required) = self.plugins[index].content_type()
-                && file_content_type().is_some_and(|actual| actual != required)
+                && !content_type_matches(required).unwrap_or(false)
             {
                 continue;
             }
@@ -1450,15 +1471,15 @@ mod tests {
 
     #[test]
     fn compiled_catalog_applies_content_type_only_when_known() {
-        assert_eq!(PluginContentType::from_bytes(b""), PluginContentType::Text);
-        assert_eq!(
-            PluginContentType::from_bytes(b"hello"),
-            PluginContentType::Text
-        );
-        assert_eq!(
-            PluginContentType::from_bytes(&[0xff, 0xfe]),
-            PluginContentType::Binary
-        );
+        assert!(PluginContentType::Text.matches_bytes(b""));
+        assert!(PluginContentType::Text.matches_bytes(b"hello"));
+        assert!(!PluginContentType::Text.matches_bytes(&[0xff, 0xfe]));
+        assert!(PluginContentType::Binary.matches_bytes(&[0xff, 0xfe]));
+        assert!(PluginContentType::GitText.matches_bytes(&[0xff, 0xfe]));
+        assert!(!PluginContentType::GitText.matches_bytes(b"text\0data"));
+        let mut nul_outside_git_window = vec![b'x'; PluginContentType::GIT_TEXT_SCAN_BYTES];
+        nul_outside_git_window.push(0);
+        assert!(PluginContentType::GitText.matches_bytes(&nul_outside_git_window));
 
         let text =
             entry_with_content_type("plugin_text", "*.data", Some(PluginContentType::Text), 'a');
@@ -1474,22 +1495,26 @@ mod tests {
         let classification_calls = Cell::new(0);
         assert!(
             text_only
-                .select_with_content_type("document.other", || {
+                .select_with_content_type("document.other", |required| {
                     classification_calls.set(classification_calls.get() + 1);
-                    Some(PluginContentType::Text)
+                    Some(required == PluginContentType::Text)
                 })
                 .is_none()
         );
         assert_eq!(classification_calls.get(), 0);
         assert_eq!(
             text_only
-                .select_with_content_type("document.data", || Some(PluginContentType::Text))
+                .select_with_content_type("document.data", |required| {
+                    Some(required == PluginContentType::Text)
+                })
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert!(
             text_only
-                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", |required| {
+                    Some(required == PluginContentType::Binary)
+                })
                 .is_none()
         );
 
@@ -1498,13 +1523,17 @@ mod tests {
                 .unwrap();
         assert_eq!(
             catalog
-                .select_with_content_type("document.data", || Some(PluginContentType::Text))
+                .select_with_content_type("document.data", |required| {
+                    Some(required == PluginContentType::Text)
+                })
                 .map(PluginRegistryEntry::key),
             Some("plugin_text")
         );
         assert_eq!(
             catalog
-                .select_with_content_type("document.data", || Some(PluginContentType::Binary))
+                .select_with_content_type("document.data", |required| {
+                    Some(required == PluginContentType::Binary)
+                })
                 .map(PluginRegistryEntry::key),
             Some("plugin_binary")
         );
@@ -1530,6 +1559,58 @@ mod tests {
         assert_eq!(classified_bytes, 0);
         assert!(catalog.matches_plugin("plugin_text", "document.data"));
         assert!(catalog.matches_plugin("plugin_binary", "document.data"));
+    }
+
+    #[test]
+    fn git_text_matcher_uses_git_nul_window_and_is_bounded() {
+        let git_text = entry_with_content_type(
+            "plugin_git_text",
+            "*",
+            Some(PluginContentType::GitText),
+            'a',
+        );
+        let utf8_specific = entry_with_content_type(
+            "plugin_utf8_specific",
+            "*.data",
+            Some(PluginContentType::Text),
+            'b',
+        );
+        let catalog = CompiledPluginCatalog::compile(
+            &PluginRegistry::new(vec![git_text, utf8_specific]).unwrap(),
+        )
+        .unwrap();
+
+        let large_non_utf8_text = std::iter::repeat_n(0xff, 1_048_576).collect::<Vec<_>>();
+        let (selected, classified_bytes) =
+            catalog.select_for_bytes_with_classification_work("asset.bin", &large_non_utf8_text);
+        assert_eq!(
+            selected.map(PluginRegistryEntry::key),
+            Some("plugin_git_text")
+        );
+        assert_eq!(
+            classified_bytes,
+            PluginContentType::GIT_TEXT_SCAN_BYTES as u64,
+            "Git classification must inspect only its fixed NUL window"
+        );
+        assert!(
+            classified_bytes * 100 < large_non_utf8_text.len() as u64,
+            "the Git-compatible matcher should inspect under 1% of this 1 MiB payload"
+        );
+
+        let (selected, _) =
+            catalog.select_for_bytes_with_classification_work("document.data", b"valid UTF-8 text");
+        assert_eq!(
+            selected.map(PluginRegistryEntry::key),
+            Some("plugin_utf8_specific"),
+            "a more-specific UTF-8 parser must win when both predicates match"
+        );
+
+        let (selected, _) =
+            catalog.select_for_bytes_with_classification_work("asset.bin", b"raw\0bytes");
+        assert!(
+            selected.is_none(),
+            "NUL-bearing data must remain a raw binary file"
+        );
     }
 
     #[test]

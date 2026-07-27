@@ -287,14 +287,14 @@ mod tests {
             packet_pages: 2,
             durable_semantic_changes: 1,
             guest_linear_memory_high_water_bytes: 128,
-            host_full_content_classification_bytes: 10,
+            host_content_classification_bytes: 10,
             ..WasmTransitionCounters::default()
         });
         host.record_v2_transition_counters(WasmTransitionCounters {
             packet_pages: 3,
             private_document_cache_hits: 1,
             guest_linear_memory_high_water_bytes: 64,
-            host_full_content_classification_bytes: 7,
+            host_content_classification_bytes: 7,
             ..WasmTransitionCounters::default()
         });
 
@@ -303,7 +303,7 @@ mod tests {
         assert_eq!(counters.durable_semantic_changes, 1);
         assert_eq!(counters.private_document_cache_hits, 1);
         assert_eq!(counters.guest_linear_memory_high_water_bytes, 128);
-        assert_eq!(counters.host_full_content_classification_bytes, 17);
+        assert_eq!(counters.host_content_classification_bytes, 17);
 
         host.reset_v2_transition_counters();
         assert_eq!(
