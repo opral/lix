@@ -1186,59 +1186,32 @@ fn next_change_page(
         let Some(mut change) = change else {
             break;
         };
-        let needs_attachment = change.snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.len() > record_limit
-                || snapshot
-                    .len()
-                    .checked_add(4)
-                    .is_none_or(|framed_len| framed_len > limit)
-        });
-        let inline_record = if needs_attachment {
-            None
-        } else {
-            Some(encode_change(&change, None)?)
-        };
-        let inline_record_len = inline_record.as_ref().map(Vec::len);
-        let inline_framed_len = inline_record
-            .as_ref()
-            .map(|record| {
-                record
-                    .len()
-                    .checked_add(4)
-                    .ok_or_else(|| Error::internal("change record length overflow"))
-            })
-            .transpose()?;
-        let inline_fits =
-            inline_record
-                .as_ref()
-                .zip(inline_framed_len)
-                .is_some_and(|(record, framed_len)| {
-                    record.len() <= record_limit && framed_len <= limit
-                });
-        let (record, attach_snapshot) = if inline_fits {
-            let record = inline_record.expect("checked inline record");
-            let framed_len = inline_framed_len.expect("checked inline frame");
+        let inline_record_len = encoded_change_len(&change, None)?;
+        let inline_framed_len = inline_record_len
+            .checked_add(4)
+            .ok_or_else(|| Error::internal("change record length overflow"))?;
+        let inline_fits = inline_record_len <= record_limit && inline_framed_len <= limit;
+        let (record_len, attach_snapshot) = if inline_fits {
             if payload
                 .len()
-                .checked_add(framed_len)
+                .checked_add(inline_framed_len)
                 .is_none_or(|next_len| next_len > limit)
             {
                 *pending = Some(change);
                 break;
             }
-            (record, false)
+            (inline_record_len, false)
         } else if change.snapshot.is_some() {
             let attachment_index = u32::try_from(attachments.len()).map_err(|_| {
                 Error::LimitExceeded("change page has too many attachments".to_owned())
             })?;
-            let record = encode_change(&change, Some(attachment_index))?;
-            let framed_len = record
-                .len()
+            let record_len = encoded_change_len(&change, Some(attachment_index))?;
+            let framed_len = record_len
                 .checked_add(4)
                 .ok_or_else(|| Error::internal("change record length overflow"))?;
-            if record.len() > record_limit {
+            if record_len > record_limit {
                 return Err(Error::RecordTooLarge(
-                    u64::try_from(record.len()).expect("usize fits u64"),
+                    u64::try_from(record_len).expect("usize fits u64"),
                 ));
             }
             if framed_len > limit {
@@ -1254,19 +1227,24 @@ fn next_change_page(
                 *pending = Some(change);
                 break;
             }
-            (record, true)
+            (record_len, true)
         } else {
             return Err(Error::RecordTooLarge(
-                u64::try_from(inline_record_len.expect("snapshot-free inline record"))
-                    .expect("usize fits u64"),
+                u64::try_from(inline_record_len).expect("usize fits u64"),
             ));
         };
         put_u32(
             &mut payload,
-            u32::try_from(record.len())
+            u32::try_from(record_len)
                 .map_err(|_| Error::LimitExceeded("change record exceeds 4GiB".to_owned()))?,
         );
-        payload.extend_from_slice(&record);
+        let record_start = payload.len();
+        encode_change_into(
+            &mut payload,
+            &change,
+            attach_snapshot.then(|| u32::try_from(attachments.len()).expect("checked above")),
+        )?;
+        debug_assert_eq!(payload.len() - record_start, record_len);
         if attach_snapshot {
             attachments.push(Arc::new(
                 change
@@ -1512,10 +1490,61 @@ fn next_edit_page(
     }
 }
 
-fn encode_change(change: &EntityChange, attachment_index: Option<u32>) -> Result<Vec<u8>> {
-    let mut output = Vec::new();
+fn encoded_change_len(change: &EntityChange, attachment_index: Option<u32>) -> Result<usize> {
+    let key_len = encoded_key_len(&change.schema_key, &change.entity_pk)?;
+    let mut len = 1usize
+        .checked_add(key_len)
+        .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?;
+    if let Some(snapshot) = &change.snapshot {
+        let snapshot_len = if attachment_index.is_some() {
+            1 + 4 + 8 + 8
+        } else {
+            let _ = u32::try_from(snapshot.len())
+                .map_err(|_| Error::LimitExceeded("snapshot exceeds 4GiB".to_owned()))?;
+            1usize
+                .checked_add(4)
+                .and_then(|len| len.checked_add(snapshot.len()))
+                .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?
+        };
+        len = len
+            .checked_add(1)
+            .and_then(|len| len.checked_add(snapshot_len))
+            .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?;
+    }
+    Ok(len)
+}
+
+fn encoded_key_len(schema_key: &str, pk: &[String]) -> Result<usize> {
+    let _ = u32::try_from(pk.len()).map_err(|_| {
+        Error::LimitExceeded("entity primary key has too many components".to_owned())
+    })?;
+    let mut len = encoded_text_len(schema_key)?
+        .checked_add(4)
+        .ok_or_else(|| Error::LimitExceeded("entity key length overflow".to_owned()))?;
+    for component in pk {
+        len = len
+            .checked_add(encoded_text_len(component)?)
+            .ok_or_else(|| Error::LimitExceeded("entity key length overflow".to_owned()))?;
+    }
+    Ok(len)
+}
+
+fn encoded_text_len(value: &str) -> Result<usize> {
+    let _ = u32::try_from(value.len())
+        .map_err(|_| Error::LimitExceeded("packet text exceeds 4GiB".to_owned()))?;
+    value
+        .len()
+        .checked_add(4)
+        .ok_or_else(|| Error::LimitExceeded("packet text length overflow".to_owned()))
+}
+
+fn encode_change_into(
+    output: &mut Vec<u8>,
+    change: &EntityChange,
+    attachment_index: Option<u32>,
+) -> Result<()> {
     output.push(u8::from(change.snapshot.is_none()));
-    encode_key(&mut output, &change.schema_key, &change.entity_pk)?;
+    encode_key(output, &change.schema_key, &change.entity_pk)?;
     if let Some(snapshot) = &change.snapshot {
         output.push(match change.effect {
             ChangeEffect::Content => 0,
@@ -1524,7 +1553,7 @@ fn encode_change(change: &EntityChange, attachment_index: Option<u32>) -> Result
         match attachment_index {
             Some(index) => {
                 output.push(1);
-                put_u32(&mut output, index);
+                put_u32(output, index);
                 output.extend_from_slice(&0_u64.to_le_bytes());
                 output.extend_from_slice(
                     &u64::try_from(snapshot.len())
@@ -1535,7 +1564,7 @@ fn encode_change(change: &EntityChange, attachment_index: Option<u32>) -> Result
             None => {
                 output.push(0);
                 put_u32(
-                    &mut output,
+                    output,
                     u32::try_from(snapshot.len())
                         .map_err(|_| Error::LimitExceeded("snapshot exceeds 4GiB".to_owned()))?,
                 );
@@ -1543,7 +1572,7 @@ fn encode_change(change: &EntityChange, attachment_index: Option<u32>) -> Result
             }
         }
     }
-    Ok(output)
+    Ok(())
 }
 
 fn encode_resolution(

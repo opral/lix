@@ -5,17 +5,16 @@ use std::time::Instant;
 
 use lix_engine::wasm::v2::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmChangeCursorHandle, WasmChangeDrainValidator, WasmChangeEffect, WasmChangePage,
-    WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictResolution,
-    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTake,
-    WasmConflictTransition, WasmConflictUpdate, WasmDocumentHandle, WasmEditCursorHandle,
-    WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource,
-    WasmEntityChanges, WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityKey,
-    WasmEntityPage, WasmEntitySource, WasmEntityTransition, WasmEntityUpdate, WasmFileDescriptor,
-    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmHostBytes, WasmIdNamespace,
-    WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
-    WasmResolutionCursorHandle, WasmSourceSlice, WasmTransitionCounters, WasmTransitionHandle,
-    WasmTransitionLimits,
+    WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmComponentV2Actor,
+    WasmComponentV2Factory, WasmConflictResolution, WasmConflictResolutionDrainValidator,
+    WasmConflictResolutionPage, WasmConflictTake, WasmConflictTransition, WasmConflictUpdate,
+    WasmDocumentHandle, WasmEditCursorHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity,
+    WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflictPage,
+    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
+    WasmEntityTransition, WasmEntityUpdate, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate,
+    WasmGuestBytes, WasmHostBytes, WasmIdNamespace, WasmInputBytes, WasmOpenEntitiesInput,
+    WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
+    WasmSourceSlice, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
 use wasmtime::component::{Resource, ResourceAny};
 
@@ -172,7 +171,9 @@ struct ActiveTransition {
 struct ChangeCursorState {
     resource: ResourceAny,
     transition: u64,
-    validator: WasmChangeDrainValidator,
+    // The engine drainer is the single authority for page, uniqueness,
+    // attachment, and permanent-EOF validation. This binding only decodes the
+    // bounded packet and accounts for Component boundary resources.
     eof: bool,
 }
 
@@ -501,10 +502,8 @@ fn decode_change_packet(
         changes.push(change);
     }
     framed.finish()?;
-    let changes = WasmEntityChanges { changes };
-    changes.validate()?;
     Ok(DecodedChangePacket {
-        changes,
+        changes: WasmEntityChanges { changes },
         output_ranges,
     })
 }
@@ -1678,11 +1677,6 @@ impl WasmtimeV2Actor {
         transition: u64,
         value: bindings::exports::lix::plugin::api::FileTransition,
     ) -> Result<WasmFileTransition, LixError> {
-        let limits = self
-            .transition_budget(transition)?
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .limits;
         let document = self.allocate_handle()?;
         let cursor = self.allocate_handle()?;
         self.documents.insert(document, value.document);
@@ -1695,7 +1689,6 @@ impl WasmtimeV2Actor {
             ChangeCursorState {
                 resource: value.changes,
                 transition,
-                validator: WasmChangeDrainValidator::new(limits)?,
                 eof: false,
             },
         );
@@ -3250,12 +3243,18 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
-        let result = guest.change_cursor().call_next(
-            self.store_mut()?,
-            resource,
-            Resource::new_borrow(budget_rep),
-            max_bytes,
-        );
+        let result = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_drain_guest_next"
+        )
+        .in_scope(|| {
+            guest.change_cursor().call_next(
+                self.store_mut()?,
+                resource,
+                Resource::new_borrow(budget_rep),
+                max_bytes,
+            )
+        });
         let page = match result {
             Ok(Ok(Some(page))) => page,
             Ok(Ok(None)) => {
@@ -3264,7 +3263,6 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                     .get_mut(&cursor.0)
                     .expect("cursor was checked above");
                 cursor.eof = true;
-                cursor.validator.accept_eof();
                 return Ok(None);
             }
             Ok(Err(error)) => {
@@ -3287,7 +3285,11 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .limits;
-        let decoded = decode_change_packet(page.record_count, &page.payload, max_bytes, limits)?;
+        let decoded = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_drain_decode_packet"
+        )
+        .in_scope(|| decode_change_packet(page.record_count, &page.payload, max_bytes, limits))?;
         let reference_count = checked_u32(decoded.output_ranges.len(), "output reference count")?;
         if (reference_count == 0) == page.attachments.is_some() {
             self.retire_now();
@@ -3329,16 +3331,6 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             changes: decoded.changes,
             outputs,
         };
-        if let Err(error) = self
-            .change_cursors
-            .get_mut(&cursor.0)
-            .expect("cursor was checked above")
-            .validator
-            .accept_page(&result)
-        {
-            self.retire_now();
-            return Err(error);
-        }
         Ok(Some(result))
     }
 
