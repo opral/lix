@@ -1185,12 +1185,13 @@ where
             })?,
         };
         let row = reader
-            .load_projected_rows_at_commit(
+            .load_projected_batch_at_commit(
                 commit_id,
                 std::slice::from_ref(&key),
                 &ChangeRecordProjection::full(),
             )
             .await?
+            .into_rows()
             .into_iter()
             .next()
             .flatten();
@@ -1229,12 +1230,13 @@ where
     S: crate::storage_adapter::StorageAdapterRead,
 {
     let rows = reader
-        .load_projected_rows_at_commit(
+        .load_projected_batch_at_commit(
             commit_id,
             std::slice::from_ref(registry_key),
             &ChangeRecordProjection::full(),
         )
-        .await?;
+        .await?
+        .into_rows();
     let row = rows.into_iter().next().flatten();
     let snapshot = match row {
         None => None,

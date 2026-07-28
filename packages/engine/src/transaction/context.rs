@@ -8685,7 +8685,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .load_rows_at_commit(
+            .load_batch_at_commit(
                 &head_commit_id.to_string(),
                 &[TrackedStateKey {
                     schema_key: "lix_key_value".to_string(),
@@ -8695,6 +8695,7 @@ mod tests {
             )
             .await
             .expect("tracked state should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("tracked row should be present in tracked state");
@@ -8743,12 +8744,13 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 &head_commit_id.to_string(),
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("tracked state should scan");
+            .expect("tracked state should scan")
+            .into_rows();
         assert!(
             tracked_rows
                 .iter()

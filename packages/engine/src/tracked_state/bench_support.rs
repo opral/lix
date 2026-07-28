@@ -167,7 +167,7 @@ where
         );
         let mut reader = self.context.reader(read);
         let rows = reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 self.current_commit_id(),
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter::default(),
@@ -176,7 +176,8 @@ where
                 },
             )
             .await
-            .expect("scan tracked-state rows");
+            .expect("scan tracked-state rows")
+            .into_rows();
         assert_eq!(rows.len(), self.rows.len());
         rows.len()
     }
@@ -200,9 +201,10 @@ where
         );
         let mut reader = self.context.reader(read);
         let rows = reader
-            .load_rows_at_commit(self.current_commit_id(), keys)
+            .load_batch_at_commit(self.current_commit_id(), keys)
             .await
-            .expect("load tracked-state rows");
+            .expect("load tracked-state rows")
+            .into_rows();
         assert!(rows.iter().all(Option::is_some));
         rows.len()
     }

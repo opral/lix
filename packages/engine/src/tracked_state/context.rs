@@ -20,6 +20,8 @@ use crate::changelog::{
 use crate::common::SharedStr;
 use crate::entity_pk::{EntityPk, EntityPkComponent};
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
+#[cfg(test)]
+use crate::tracked_state::MaterializedTrackedStateRow;
 use crate::tracked_state::codec::{
     EncodedTrackedStateKeyBatch, TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder,
     decode_key_shared, encode_key, encode_key_ref_into, encode_value_ref,
@@ -45,8 +47,7 @@ use crate::tracked_state::{
     materialize_batch_from_index_entries, materialize_batch_from_index_entry_refs,
 };
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateRootMutationRef,
-    TrackedStateScanRequest,
+    TrackedStateDeltaRef, TrackedStateRootMutationRef, TrackedStateScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 use base64::Engine as _;
@@ -990,16 +991,6 @@ impl<S> TrackedStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    pub(crate) async fn scan_rows_at_commit(
-        &mut self,
-        commit_id: &str,
-        request: &TrackedStateScanRequest,
-    ) -> Result<Vec<MaterializedTrackedStateRow>, LixError> {
-        self.scan_batch_at_commit(commit_id, request)
-            .await
-            .map(MaterializedTrackedStateBatch::into_rows)
-    }
-
     pub(crate) async fn scan_batch_at_commit(
         &mut self,
         commit_id: &str,
@@ -1055,17 +1046,6 @@ where
             .map(|(key, value)| (key.as_ref(), value))
             .collect();
         materialize_batch_from_index_entry_refs(&self.store, entries, &materialization).await
-    }
-
-    pub(crate) async fn load_projected_rows_at_commit(
-        &mut self,
-        commit_id: &str,
-        keys: &[TrackedStateKey],
-        projection: &ChangeRecordProjection,
-    ) -> Result<Vec<Option<MaterializedTrackedStateRow>>, LixError> {
-        self.load_projected_batch_at_commit(commit_id, keys, projection)
-            .await
-            .map(MaterializedTrackedStateExactBatch::into_rows)
     }
 
     pub(crate) async fn load_projected_batch_at_commit(
@@ -1195,12 +1175,12 @@ where
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
-    pub(crate) async fn load_rows_at_commit(
+    pub(crate) async fn load_batch_at_commit(
         &mut self,
         commit_id: &str,
         keys: &[TrackedStateKey],
-    ) -> Result<Vec<Option<MaterializedTrackedStateRow>>, LixError> {
-        self.load_projected_rows_at_commit(commit_id, keys, &ChangeRecordProjection::full())
+    ) -> Result<MaterializedTrackedStateExactBatch, LixError> {
+        self.load_projected_batch_at_commit(commit_id, keys, &ChangeRecordProjection::full())
             .await
     }
 
@@ -5583,9 +5563,10 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit("child", &test_schema_scan_request())
+            .scan_batch_at_commit("child", &test_schema_scan_request())
             .await
-            .expect("repaired child root should scan");
+            .expect("repaired child root should scan")
+            .into_rows();
         assert_eq!(
             rows.iter()
                 .map(|row| row.change_id.to_string())
@@ -5619,7 +5600,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5632,7 +5613,8 @@ mod tests {
                 },
             )
             .await
-            .expect("file scan should use primary root");
+            .expect("file scan should use primary root")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -5672,7 +5654,7 @@ mod tests {
                 .expect("read should open"),
         );
         let header_rows = reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5688,9 +5670,10 @@ mod tests {
                 },
             )
             .await
-            .expect("header scan should use primary root");
+            .expect("header scan should use primary root")
+            .into_rows();
         let full_rows = reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5703,7 +5686,8 @@ mod tests {
                 },
             )
             .await
-            .expect("full scan should fetch primary payload");
+            .expect("full scan should fetch primary payload")
+            .into_rows();
 
         assert_eq!(header_rows[0].snapshot_content, None);
         assert_eq!(full_rows[0].snapshot_content, expected_snapshot);
@@ -5731,7 +5715,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5743,7 +5727,8 @@ mod tests {
                 },
             )
             .await
-            .expect("null file scan should use primary tree");
+            .expect("null file scan should use primary tree")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -5788,7 +5773,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-2",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5805,7 +5790,8 @@ mod tests {
                 },
             )
             .await
-            .expect("mixed scan should use primary tree");
+            .expect("mixed scan should use primary tree")
+            .into_rows();
 
         let mut entity_pks = rows
             .iter()
@@ -5834,7 +5820,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -5850,7 +5836,8 @@ mod tests {
                 },
             )
             .await
-            .expect("file scan should use primary root");
+            .expect("file scan should use primary root")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -5908,9 +5895,10 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit("child", &test_schema_scan_request())
+            .scan_batch_at_commit("child", &test_schema_scan_request())
             .await
-            .expect("child scan should apply tombstone over base root");
+            .expect("child scan should apply tombstone over base root")
+            .into_rows();
 
         assert!(rows.is_empty(), "pending tombstone must hide base row");
     }
@@ -5941,9 +5929,10 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
-            .expect("root should scan");
+            .expect("root should scan")
+            .into_rows();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -5990,7 +5979,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -6002,7 +5991,8 @@ mod tests {
                 },
             )
             .await
-            .expect("limited scan should apply visibility before limit");
+            .expect("limited scan should apply visibility before limit")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -6033,7 +6023,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -6049,7 +6039,8 @@ mod tests {
                 },
             )
             .await
-            .expect("limited file scan should apply visibility before limit");
+            .expect("limited file scan should apply visibility before limit")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -6084,7 +6075,7 @@ mod tests {
                 .expect("read should open"),
         );
         let loaded = reader
-            .load_rows_at_commit(
+            .load_batch_at_commit(
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
@@ -6094,13 +6085,15 @@ mod tests {
             )
             .await
             .expect("row should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("row should exist");
         let scanned = reader
-            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
-            .expect("rows should scan");
+            .expect("rows should scan")
+            .into_rows();
 
         assert_eq!(loaded.snapshot_content, row.snapshot_content);
         assert_eq!(scanned[0].snapshot_content, row.snapshot_content);
@@ -6142,7 +6135,7 @@ mod tests {
                 .expect("read should open"),
         );
         let error = reader
-            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
             .expect_err("materialization must reject a dangling change id");
         assert!(
@@ -6184,9 +6177,10 @@ mod tests {
                 .expect("read should open"),
         );
         let scanned = reader
-            .scan_rows_at_commit("commit-1", &test_schema_scan_request())
+            .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
-            .expect("rows should scan");
+            .expect("rows should scan")
+            .into_rows();
         let by_pk = |pk: &str| {
             scanned
                 .iter()
@@ -6226,7 +6220,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .load_rows_at_commit(
+            .load_batch_at_commit(
                 "commit-1",
                 &[TrackedStateKey {
                     schema_key: row.schema_key.clone(),
@@ -6236,6 +6230,7 @@ mod tests {
             )
             .await
             .expect("row should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("row should exist");
@@ -6286,9 +6281,10 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .load_rows_at_commit("child", std::slice::from_ref(&key))
+            .load_batch_at_commit("child", std::slice::from_ref(&key))
             .await
             .expect("child row should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("child row should exist");
@@ -6330,9 +6326,10 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .load_rows_at_commit("child", &[key])
+            .load_batch_at_commit("child", &[key])
             .await
             .expect("rebuilt child row should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("rebuilt child row should exist");
@@ -6363,7 +6360,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -6377,7 +6374,8 @@ mod tests {
                 },
             )
             .await
-            .expect("rows should scan");
+            .expect("rows should scan")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].snapshot_content, None);
@@ -6859,9 +6857,10 @@ mod tests {
                 .expect("rootless read should open"),
         );
         let point = reader
-            .load_rows_at_commit("delete", std::slice::from_ref(&semantic_key))
+            .load_batch_at_commit("delete", std::slice::from_ref(&semantic_key))
             .await
             .expect("rootless cascade point read should succeed")
+            .into_rows()
             .pop()
             .flatten()
             .expect("cascaded semantic row should remain addressable");
@@ -6870,7 +6869,7 @@ mod tests {
         assert_eq!(point.created_at, "2026-01-01T00:00:00.000Z");
 
         let scan = reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "delete",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -6883,7 +6882,8 @@ mod tests {
                 },
             )
             .await
-            .expect("rootless cascade scan should succeed");
+            .expect("rootless cascade scan should succeed")
+            .into_rows();
         assert_eq!(scan.len(), 1);
         assert!(scan[0].deleted);
         assert_eq!(scan[0].change_id, descriptor_delete.change_id);
@@ -7060,7 +7060,7 @@ mod tests {
             crate::tracked_state::TrackedStateDiffKind::Removed
         );
         let rows = reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 "recreate",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -7073,7 +7073,8 @@ mod tests {
                 },
             )
             .await
-            .expect("recreated root should scan");
+            .expect("recreated root should scan")
+            .into_rows();
         assert_eq!(rows.len(), 1);
         assert!(rows[0].deleted);
         assert_eq!(

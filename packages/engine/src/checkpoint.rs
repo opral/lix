@@ -116,7 +116,7 @@ where
     S: StorageAdapterRead,
 {
     let rows = tracked
-        .load_projected_rows_at_commit(
+        .load_projected_batch_at_commit(
             &head.to_string(),
             &[TrackedStateKey {
                 schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
@@ -130,7 +130,8 @@ where
             }],
             &ChangeRecordProjection::from_columns(&["commit_id".to_string()]),
         )
-        .await?;
+        .await?
+        .into_rows();
     Ok(rows
         .into_iter()
         .next()
