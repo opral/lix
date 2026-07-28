@@ -888,7 +888,7 @@ mod tests {
                 .expect("read should open"),
         );
         let rows = tracked_reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 &receipt.initial_commit_id,
                 &crate::tracked_state::TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
@@ -899,7 +899,8 @@ mod tests {
                 },
             )
             .await
-            .expect("tracked initial root should scan");
+            .expect("tracked initial root should scan")
+            .into_rows();
         assert!(
             rows.is_empty(),
             "initial commit rows are derived from changelog.commit, not stored in tracked roots"

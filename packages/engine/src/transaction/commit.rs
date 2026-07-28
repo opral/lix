@@ -1226,7 +1226,7 @@ async fn load_persisted_lifecycle_tracked_snapshot(
 ) -> Result<BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>, LixError> {
     let rows = TrackedStateContext::new()
         .reader(read)
-        .scan_rows_at_commit(
+        .scan_batch_at_commit(
             &commit_id.to_string(),
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
@@ -1237,7 +1237,8 @@ async fn load_persisted_lifecycle_tracked_snapshot(
                 limit: None,
             },
         )
-        .await?;
+        .await?
+        .into_rows();
     Ok(rows
         .into_iter()
         .map(|row| {
@@ -3388,7 +3389,7 @@ mod tests {
         );
         let commit_id_text = commit_id_text("test-uuid-1");
         let commit_rows = tracked_reader
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 &commit_id_text,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
@@ -3399,7 +3400,8 @@ mod tests {
                 },
             )
             .await
-            .expect("rootless commit history should replay");
+            .expect("rootless commit history should replay")
+            .into_rows();
         assert!(
             commit_rows.is_empty(),
             "commit rows are derived from changelog.commit, not stored in tracked roots"
@@ -4123,18 +4125,20 @@ mod tests {
         );
         let request = TrackedStateScanRequest::default();
         let first_rows = reader
-            .scan_rows_at_commit(&commit_id_text("rootless-first-commit"), &request)
+            .scan_batch_at_commit(&commit_id_text("rootless-first-commit"), &request)
             .await
-            .expect("first rootless commit should replay");
+            .expect("first rootless commit should replay")
+            .into_rows();
         assert!(matches!(
             first_rows.as_slice(),
             [row] if row.change_id == change_id("rootless-first-change")
                 && row.snapshot_content.as_deref() == Some("{\"value\":1}")
         ));
         let second_rows = reader
-            .scan_rows_at_commit(&commit_id_text("rootless-second-commit"), &request)
+            .scan_batch_at_commit(&commit_id_text("rootless-second-commit"), &request)
             .await
-            .expect("second rootless commit should replay");
+            .expect("second rootless commit should replay")
+            .into_rows();
         assert!(matches!(
             second_rows.as_slice(),
             [row] if row.change_id == change_id("rootless-second-change")
@@ -4142,9 +4146,10 @@ mod tests {
                 && row.snapshot_content.as_deref() == Some("{\"value\":2}")
         ));
         let third_rows = reader
-            .scan_rows_at_commit(&commit_id_text("rootless-third-commit"), &request)
+            .scan_batch_at_commit(&commit_id_text("rootless-third-commit"), &request)
             .await
-            .expect("third rootless commit should replay");
+            .expect("third rootless commit should replay")
+            .into_rows();
         assert!(matches!(
             third_rows.as_slice(),
             [row] if row.change_id == change_id("rootless-third-change")
@@ -4182,9 +4187,10 @@ mod tests {
                     == Some(change_id("rootless-first-change"))
         ));
         let deleted_rows = reader
-            .scan_rows_at_commit(&commit_id_text("rootless-delete-commit"), &request)
+            .scan_batch_at_commit(&commit_id_text("rootless-delete-commit"), &request)
             .await
-            .expect("delete rootless commit should replay");
+            .expect("delete rootless commit should replay")
+            .into_rows();
         assert!(deleted_rows.is_empty());
         let delete_diff = reader
             .diff_commits(
@@ -4320,12 +4326,13 @@ mod tests {
                     .await
                     .expect("fence read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 &commit_id_text("fence-commit"),
                 &TrackedStateScanRequest::default(),
             )
             .await
-            .expect("rootless selected-reference commit should replay history");
+            .expect("rootless selected-reference commit should replay history")
+            .into_rows();
         assert!(matches!(
             rows.as_slice(),
             [row] if row.change_id == change_id("fence-normal-change")

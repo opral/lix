@@ -2025,7 +2025,7 @@ mod tests {
                 .expect("test branch root should inspect")
             {
                 tracked_reader
-                    .scan_rows_at_commit(
+                    .scan_batch_at_commit(
                         &head_commit_id_text,
                         &TrackedStateScanRequest {
                             filter: TrackedStateFilter {
@@ -2038,6 +2038,7 @@ mod tests {
                     )
                     .await
                     .expect("test branch root should load")
+                    .into_rows()
             } else {
                 Vec::new()
             };
@@ -3528,7 +3529,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows_at_commit(
+            .scan_batch_at_commit(
                 commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
@@ -3540,6 +3541,7 @@ mod tests {
             )
             .await
             .expect("tracked root should scan")
+            .into_rows()
     }
 
     fn tracked_row_with_commit(
