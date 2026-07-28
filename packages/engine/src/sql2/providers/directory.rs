@@ -47,7 +47,10 @@ use crate::transaction::types::{
     LogicalPrimaryKey, TransactionJson, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteRow,
 };
-use crate::{GLOBAL_BRANCH_ID, LixError, parse_row_metadata_value, serialize_row_metadata};
+use crate::{
+    GLOBAL_BRANCH_ID, LixError, SqlQueryResult, Value, parse_row_metadata_value,
+    serialize_row_metadata,
+};
 
 use crate::filesystem::{
     DirectoryDescriptorWriteIntent, DirectoryPathRecord, DirectoryPathResolver,
@@ -83,6 +86,61 @@ const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const LIX_DIRECTORY_IDENTITY: &[&str] = &["id"];
 const LIX_DIRECTORY_PATH_IDENTITY: &[&str] = &["path"];
 const LIX_DIRECTORY_BY_BRANCH_PATH_IDENTITY: &[&str] = &["path", "lixcol_branch_id"];
+
+/// Executes the exact root-directory listing used by the filesystem API
+/// directly from the shared path index.
+pub(crate) async fn execute_exact_lix_directory_root_listing(
+    active_branch_id: &str,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+) -> Result<SqlQueryResult, LixError> {
+    let branch_binding = BranchBinding::active(active_branch_id);
+    let branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        vec![active_branch_id.to_string()],
+    )
+    .await?;
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(branch_ids))
+        .await?;
+    let matches = indexed_path_matches(
+        index,
+        &FilePathPredicate::All,
+        FilesystemPathKind::Directory,
+    );
+    let mut entries = matches
+        .entries()
+        .filter(|entry| entry.parent_id.is_none())
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            vec![
+                Value::Text(entry.id().to_string()),
+                Value::Text(entry.path.clone()),
+                Value::Text(entry.name.clone()),
+                Value::Text(entry.updated_at().to_string()),
+            ]
+        })
+        .collect();
+    Ok(SqlQueryResult {
+        columns: vec![
+            "id".to_string(),
+            "path".to_string(),
+            "name".to_string(),
+            "lixcol_updated_at".to_string(),
+        ],
+        rows,
+        notices: Vec::new(),
+    })
+}
 
 pub(super) async fn register_lix_directory_active_provider(
     session: &SessionContext,

@@ -890,15 +890,15 @@ where
                 .map_err(|error| normalize_sql_surface_error(error, &sql_for_error));
         }
 
-        let exact_lix_file_read = exact_lix_file_read_route(&statement, params);
-        let late_file_data_read = exact_lix_file_read
+        let exact_filesystem_read = exact_filesystem_read_route(&statement, params);
+        let late_file_data_read = exact_filesystem_read
             .is_none()
             .then(|| late_materialized_lix_file_data_read(&statement))
             .flatten();
         let acknowledge_file_views = is_acknowledgeable_file_data_read(&statement, params)
             || matches!(
-                &exact_lix_file_read,
-                Some(ExactLixFileRead::PathDataBatch(_))
+                &exact_filesystem_read,
+                Some(ExactFilesystemRead::PathDataBatch(_))
             )
             || late_file_data_read.is_some();
         let has_durable_runtime_function = sql2::statement_has_durable_runtime_function(&statement);
@@ -935,7 +935,7 @@ where
                     statement,
                     params,
                     acknowledge_file_views,
-                    exact_lix_file_read,
+                    exact_filesystem_read,
                     late_file_data_read,
                     has_durable_runtime_function,
                 )
@@ -1776,7 +1776,7 @@ where
         statement: datafusion::sql::parser::Statement,
         params: &[Value],
         acknowledge_file_views: bool,
-        exact_lix_file_read: Option<ExactLixFileRead>,
+        exact_filesystem_read: Option<ExactFilesystemRead>,
         late_file_data_read: Option<LateMaterializedLixFileDataRead>,
         has_durable_runtime_function: bool,
     ) -> Result<
@@ -1788,9 +1788,9 @@ where
     > {
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
         let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
-        if let Some(exact_lix_file_read) = exact_lix_file_read {
-            let query = match exact_lix_file_read {
-                ExactLixFileRead::RootListing => {
+        if let Some(exact_filesystem_read) = exact_filesystem_read {
+            let query = match exact_filesystem_read {
+                ExactFilesystemRead::RootFileListing => {
                     let filesystem_path_index: Arc<
                         dyn crate::filesystem::FilesystemPathIndexReader,
                     > = Arc::new(self.live_state.reader(read_store.clone()));
@@ -1803,7 +1803,20 @@ where
                     )
                     .await?
                 }
-                exact_lix_file_read => {
+                ExactFilesystemRead::RootDirectoryListing => {
+                    let filesystem_path_index: Arc<
+                        dyn crate::filesystem::FilesystemPathIndexReader,
+                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    let branch_ref: Arc<dyn BranchRefReader> =
+                        Arc::new(self.branch_ctx.ref_reader(read_store));
+                    sql2::execute_exact_lix_directory_root_listing(
+                        &active_branch_id,
+                        filesystem_path_index,
+                        branch_ref,
+                    )
+                    .await?
+                }
+                exact_filesystem_read => {
                     let live_state: Arc<dyn crate::live_state::LiveStateReader> =
                         Arc::new(self.live_state.reader(read_store.clone()));
                     let filesystem_path_index: Arc<
@@ -1813,8 +1826,8 @@ where
                         Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
                     let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
                         Arc::new(self.binary_cas.reader(read_store));
-                    match exact_lix_file_read {
-                        ExactLixFileRead::Point(selector, column) => {
+                    match exact_filesystem_read {
+                        ExactFilesystemRead::Point(selector, column) => {
                             sql2::execute_exact_lix_file_read(
                                 &active_branch_id,
                                 live_state,
@@ -1828,7 +1841,7 @@ where
                             )
                             .await?
                         }
-                        ExactLixFileRead::PathDataBatch(paths) => {
+                        ExactFilesystemRead::PathDataBatch(paths) => {
                             sql2::execute_exact_lix_file_batch_read(
                                 &active_branch_id,
                                 live_state,
@@ -1842,9 +1855,10 @@ where
                             )
                             .await?
                         }
-                        ExactLixFileRead::RootListing => {
-                            unreachable!("root listing handled before file data readers")
-                        }
+                        ExactFilesystemRead::RootFileListing
+                        | ExactFilesystemRead::RootDirectoryListing => unreachable!(
+                            "root filesystem listings handled before file data readers"
+                        ),
                     }
                 }
             };
@@ -2766,38 +2780,68 @@ impl Visitor for ColumnReferenceVisitor<'_> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExactLixFileRead {
-    RootListing,
+enum ExactFilesystemRead {
+    RootFileListing,
+    RootDirectoryListing,
     Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
     PathDataBatch(BTreeSet<String>),
 }
 
-fn exact_lix_file_read_route(
+fn exact_filesystem_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
-) -> Option<ExactLixFileRead> {
+) -> Option<ExactFilesystemRead> {
     if exact_lix_file_root_listing(statement, params) {
-        return Some(ExactLixFileRead::RootListing);
+        return Some(ExactFilesystemRead::RootFileListing);
+    }
+    if exact_lix_directory_root_listing(statement, params) {
+        return Some(ExactFilesystemRead::RootDirectoryListing);
     }
     if let Some((selector, column)) = exact_lix_file_point_read(statement, params) {
-        return Some(ExactLixFileRead::Point(selector, column));
+        return Some(ExactFilesystemRead::Point(selector, column));
     }
 
     let point_read = simple_point_read(statement)?;
     if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
         return None;
     }
-    exact_path_data_batch(point_read.select, params).map(ExactLixFileRead::PathDataBatch)
+    exact_path_data_batch(point_read.select, params).map(ExactFilesystemRead::PathDataBatch)
 }
 
 fn exact_lix_file_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
+    exact_root_listing(
+        statement,
+        params,
+        "lix_file",
+        &["id", "path", "name", "lixcol_metadata", "lixcol_updated_at"],
+        "directory_id",
+    )
+}
+
+fn exact_lix_directory_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
+    exact_root_listing(
+        statement,
+        params,
+        "lix_directory",
+        &["id", "path", "name", "lixcol_updated_at"],
+        "parent_id",
+    )
+}
+
+fn exact_root_listing(
+    statement: &DataFusionStatement,
+    params: &[Value],
+    table_name: &str,
+    projection: &[&str],
+    parent_column: &str,
+) -> bool {
     if !params.is_empty() {
         return false;
     }
     let Some(simple) = simple_single_table_select(statement) else {
         return false;
     };
-    if simple.table_name != "lix_file"
+    if simple.table_name != table_name
         || !simple.unqualified_unquoted_table
         || simple.alias.is_some()
         || simple.query.limit_clause.is_some()
@@ -2805,26 +2849,25 @@ fn exact_lix_file_root_listing(statement: &DataFusionStatement, params: &[Value]
     {
         return false;
     }
-    let expected = ["id", "path", "name", "lixcol_metadata", "lixcol_updated_at"];
-    if simple.select.projection.len() != expected.len()
+    if simple.select.projection.len() != projection.len()
         || !simple
             .select
             .projection
             .iter()
-            .zip(expected)
+            .zip(projection)
             .all(|(item, expected)| {
                 let SelectItem::UnnamedExpr(expression) = item else {
                     return false;
                 };
-                exact_point_column(expression).as_deref() == Some(expected)
+                exact_point_column(expression).as_deref() == Some(*expected)
             })
     {
         return false;
     }
-    let Some(Expr::IsNull(directory_id)) = simple.select.selection.as_ref() else {
+    let Some(Expr::IsNull(parent)) = simple.select.selection.as_ref() else {
         return false;
     };
-    if exact_point_column(directory_id).as_deref() != Some("directory_id") {
+    if exact_point_column(parent).as_deref() != Some(parent_column) {
         return false;
     }
     let Some(order_by) = &simple.query.order_by else {
@@ -3397,21 +3440,30 @@ mod tests {
     }
 
     #[test]
-    fn exact_lix_file_read_recognizes_only_the_narrow_shapes() {
-        let root_listing = sql2::parse_statement(
+    fn exact_filesystem_read_recognizes_only_the_narrow_shapes() {
+        let root_file_listing = sql2::parse_statement(
             "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
              FROM lix_file WHERE directory_id IS NULL ORDER BY name",
         )
         .unwrap();
         assert_eq!(
-            exact_lix_file_read_route(&root_listing, &[]),
-            Some(ExactLixFileRead::RootListing)
+            exact_filesystem_read_route(&root_file_listing, &[]),
+            Some(ExactFilesystemRead::RootFileListing)
+        );
+        let root_directory_listing = sql2::parse_statement(
+            "SELECT id, path, name, lixcol_updated_at \
+             FROM lix_directory WHERE parent_id IS NULL ORDER BY name",
+        )
+        .unwrap();
+        assert_eq!(
+            exact_filesystem_read_route(&root_directory_listing, &[]),
+            Some(ExactFilesystemRead::RootDirectoryListing)
         );
 
         let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
-            exact_lix_file_read_route(&data_by_id, &[Value::Text("file-a".to_string())]),
-            Some(ExactLixFileRead::Point(
+            exact_filesystem_read_route(&data_by_id, &[Value::Text("file-a".to_string())]),
+            Some(ExactFilesystemRead::Point(
                 sql2::ExactLixFileReadSelector::Id("file-a".to_string()),
                 sql2::ExactLixFileReadColumn::Data,
             ))
@@ -3420,8 +3472,8 @@ mod tests {
         let change_by_path =
             sql2::parse_statement("SELECT lixcol_change_id FROM lix_file WHERE path = ?").unwrap();
         assert_eq!(
-            exact_lix_file_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
-            Some(ExactLixFileRead::Point(
+            exact_filesystem_read_route(&change_by_path, &[Value::Text("/a.txt".to_string())]),
+            Some(ExactFilesystemRead::Point(
                 sql2::ExactLixFileReadSelector::Path("/a.txt".to_string()),
                 sql2::ExactLixFileReadColumn::ChangeId,
             ))
@@ -3431,7 +3483,7 @@ mod tests {
             sql2::parse_statement("SELECT path, data FROM lix_file WHERE path IN ($1, $2, $3)")
                 .unwrap();
         assert_eq!(
-            exact_lix_file_read_route(
+            exact_filesystem_read_route(
                 &data_by_paths,
                 &[
                     Value::Text("/b.txt".to_string()),
@@ -3439,13 +3491,34 @@ mod tests {
                     Value::Text("/b.txt".to_string()),
                 ],
             ),
-            Some(ExactLixFileRead::PathDataBatch(BTreeSet::from([
+            Some(ExactFilesystemRead::PathDataBatch(BTreeSet::from([
                 "/a.txt".to_string(),
                 "/b.txt".to_string(),
             ])))
         );
 
         for (sql, params) in [
+            (
+                "SELECT id, path, name, lixcol_updated_at \
+                 FROM lix_directory AS directory \
+                 WHERE parent_id IS NULL ORDER BY name",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_updated_at \
+                 FROM lix_directory WHERE parent_id IS NULL ORDER BY path",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_updated_at \
+                 FROM lix_directory WHERE parent_id IS NULL ORDER BY name DESC",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_updated_at \
+                 FROM lix_directory WHERE parent_id IS NULL ORDER BY name LIMIT 1",
+                vec![],
+            ),
             (
                 "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
                  FROM lix_file AS file WHERE directory_id IS NULL ORDER BY name",
@@ -3506,7 +3579,7 @@ mod tests {
         ] {
             let statement = sql2::parse_statement(sql).unwrap();
             assert_eq!(
-                exact_lix_file_read_route(&statement, &params),
+                exact_filesystem_read_route(&statement, &params),
                 None,
                 "unexpected batch fast-path match for {sql}"
             );
@@ -3553,7 +3626,7 @@ mod tests {
         ] {
             let statement = sql2::parse_statement(sql).unwrap();
             assert_eq!(
-                exact_lix_file_read_route(&statement, &params),
+                exact_filesystem_read_route(&statement, &params),
                 None,
                 "unexpected fast-path match for {sql}"
             );
@@ -3561,11 +3634,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exact_root_file_listing_matches_the_relational_path() {
+    async fn exact_root_filesystem_listings_match_the_relational_path() {
         let session = open_session().await;
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('nested-dir', '/nested/')",
+                "INSERT INTO lix_directory (id, path) VALUES \
+                 ('nested-dir', '/nested/'), ('alpha-dir', '/alpha-dir/')",
                 &[],
             )
             .await
@@ -3612,6 +3686,36 @@ mod tests {
         assert_eq!(
             exact.rows()[1].value("lixcol_metadata").unwrap(),
             &Value::Json(serde_json::json!({"rank": 2}))
+        );
+
+        let exact_directories = session
+            .execute(
+                "SELECT id, path, name, lixcol_updated_at \
+                 FROM lix_directory WHERE parent_id IS NULL ORDER BY name",
+                &[],
+            )
+            .await
+            .unwrap();
+        let relational_directories = session
+            .execute(
+                "SELECT directory.id AS id, directory.path AS path, \
+                        directory.name AS name, \
+                        directory.lixcol_updated_at AS lixcol_updated_at \
+                 FROM lix_directory AS directory \
+                 WHERE directory.parent_id IS NULL ORDER BY directory.name",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_directories, relational_directories);
+        assert_eq!(exact_directories.rows().len(), 2);
+        assert_eq!(
+            exact_directories.rows()[0].get::<String>("id").unwrap(),
+            "alpha-dir"
+        );
+        assert_eq!(
+            exact_directories.rows()[1].get::<String>("id").unwrap(),
+            "nested-dir"
         );
     }
 
