@@ -624,6 +624,66 @@ pub(crate) async fn execute_exact_lix_file_read(
     )
 }
 
+/// Executes the exact root-file listing used by the filesystem API directly
+/// from the shared path index. The recognized SQL shape has no joins,
+/// grouping, computed values, or residual predicates, so constructing a
+/// DataFusion catalog, logical plan, physical plan and Arrow batch adds no
+/// semantics.
+pub(crate) async fn execute_exact_lix_file_root_listing(
+    active_branch_id: &str,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+) -> Result<SqlQueryResult, LixError> {
+    let branch_binding = BranchBinding::active(active_branch_id);
+    let branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        vec![active_branch_id.to_string()],
+    )
+    .await?;
+    let index = filesystem_path_index
+        .path_index(&FilesystemPathIndexRequest::new(branch_ids))
+        .await?;
+    let matches = indexed_file_matches(index, &FilePathPredicate::All);
+    let mut entries = matches
+        .entries()
+        .filter(|entry| entry.parent_id.is_none())
+        .collect::<Vec<_>>();
+    entries.sort_unstable_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    let rows = entries
+        .into_iter()
+        .map(|entry| {
+            let metadata = entry
+                .metadata()
+                .map(|metadata| parse_row_metadata_value(metadata, "lix_file"))
+                .transpose()?;
+            Ok(vec![
+                Value::Text(entry.id().to_string()),
+                Value::Text(entry.path.clone()),
+                Value::Text(entry.name.clone()),
+                metadata.map_or(Value::Null, Value::Json),
+                Value::Text(entry.updated_at().to_string()),
+            ])
+        })
+        .collect::<Result<Vec<_>, LixError>>()?;
+    Ok(SqlQueryResult {
+        columns: vec![
+            "id".to_string(),
+            "path".to_string(),
+            "name".to_string(),
+            "lixcol_metadata".to_string(),
+            "lixcol_updated_at".to_string(),
+        ],
+        rows,
+        notices: Vec::new(),
+    })
+}
+
 /// Executes Lixray's exact active-branch file batch without constructing a
 /// DataFusion catalog, plan, or Arrow result batch. Keep this separate from
 /// the established point-read path so unrelated file queries remain

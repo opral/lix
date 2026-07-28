@@ -438,6 +438,7 @@ struct WritePipelineState {
     draining: bool,
     visible: VecDeque<Arc<PublishedWrite>>,
     active_views: BTreeMap<(u64, u64), usize>,
+    newest_snapshot_sequence: u64,
     next_publication_id: u64,
     terminal_error: Option<StorageError>,
     latest_snapshot: Option<Arc<DbSnapshot>>,
@@ -557,6 +558,7 @@ impl WritePipeline {
                     .tail
                     .as_ref()
                     .is_none_or(|tail| tail.done.load(Ordering::Acquire))
+                && snapshot_covers_persisted_publications(&state, snapshot.seq())
         };
         if cacheable {
             self.install_snapshot(Arc::clone(&snapshot));
@@ -585,6 +587,7 @@ impl WritePipeline {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(snapshot_sequence);
         cleanup_publications(&mut state, snapshot_sequence);
         let publication_id = state.next_publication_id;
         *state
@@ -654,7 +657,8 @@ impl Drop for PublicationView {
         if remove {
             state.active_views.remove(&key);
         }
-        cleanup_publications(&mut state, u64::MAX);
+        let newest_snapshot_sequence = state.newest_snapshot_sequence;
+        cleanup_publications(&mut state, newest_snapshot_sequence);
     }
 }
 
@@ -682,6 +686,16 @@ fn cleanup_publications(state: &mut WritePipelineState, newest_snapshot_sequence
     }) {
         state.visible.pop_front();
     }
+}
+
+fn snapshot_covers_persisted_publications(
+    state: &WritePipelineState,
+    snapshot_sequence: u64,
+) -> bool {
+    state.visible.iter().all(|write| {
+        let persisted = write.persisted_sequence.load(Ordering::Acquire);
+        persisted != PENDING_WRITE_SEQUENCE && persisted <= snapshot_sequence
+    })
 }
 
 impl SnapshotPointCache {
@@ -3407,6 +3421,52 @@ mod tests {
             "publication is reclaimed after its last dependent view"
         );
         drop(newer);
+    }
+
+    #[test]
+    fn dropping_unrelated_view_does_not_reclaim_publication_a_stale_fetch_needs() {
+        let pipeline = WritePipeline::new();
+        let unrelated = pipeline.capture(1);
+        let key = Key(Bytes::from_static(b"stale-fetch"));
+        let value = Bytes::from_static(b"published");
+        let published = Arc::new(PublishedWrite {
+            publication_id: 1,
+            overlay: Arc::new(BTreeMap::from([(key.clone(), Some(value.clone()))])),
+            persisted_sequence: AtomicU64::new(2),
+        });
+        {
+            let mut state = pipeline.state.lock().expect("lock publication state");
+            state.next_publication_id = 1;
+            state.visible.push_back(published);
+        }
+
+        // Model a snapshot fetch that started at sequence 1 before the
+        // publication persisted. Dropping an older unrelated view in the gap
+        // must not discard the overlay before that fetch captures its view.
+        drop(unrelated);
+        let stale_fetch = pipeline.capture(1);
+
+        assert_eq!(
+            pipeline.point_value(
+                stale_fetch.snapshot_sequence,
+                stale_fetch.publication_id,
+                &key,
+            ),
+            Some(Some(value))
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_is_not_cacheable_after_publication_persists() {
+        let mut state = WritePipelineState::default();
+        state.visible.push_back(Arc::new(PublishedWrite {
+            publication_id: 1,
+            overlay: Arc::new(BTreeMap::new()),
+            persisted_sequence: AtomicU64::new(2),
+        }));
+
+        assert!(!snapshot_covers_persisted_publications(&state, 1));
+        assert!(snapshot_covers_persisted_publications(&state, 2));
     }
 
     #[test]

@@ -213,6 +213,74 @@ where
             percentile(&samples, 95).as_nanos(),
         );
     }
+
+    let root_listing_sql = "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+         FROM lix_file WHERE directory_id IS NULL ORDER BY name";
+    for _ in 0..WARMUPS {
+        black_box(
+            session
+                .execute(root_listing_sql, &[])
+                .await
+                .expect("warm root listing"),
+        );
+    }
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let started = Instant::now();
+        let result = session
+            .execute(root_listing_sql, &[])
+            .await
+            .expect("execute root listing");
+        black_box(&result);
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let mean_ns = samples.iter().map(Duration::as_nanos).sum::<u128>()
+        / u128::try_from(samples.len()).expect("sample count fits u128");
+    println!(
+        "exact_file_read backend={backend} files={file_count} shape=root_listing rounds={ROUNDS} p50_ns={} p95_ns={} mean_ns={mean_ns}",
+        percentile(&samples, 50).as_nanos(),
+        percentile(&samples, 95).as_nanos(),
+    );
+
+    let root_directory_sql = "SELECT id, path, name, lixcol_updated_at \
+         FROM lix_directory WHERE parent_id IS NULL ORDER BY name";
+    for _ in 0..WARMUPS {
+        black_box(
+            session
+                .execute(root_directory_sql, &[])
+                .await
+                .expect("warm root directories"),
+        );
+        black_box(
+            session
+                .execute(root_listing_sql, &[])
+                .await
+                .expect("warm root files"),
+        );
+    }
+    let mut samples = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        let started = Instant::now();
+        let directories = session
+            .execute(root_directory_sql, &[])
+            .await
+            .expect("execute root directories");
+        let files = session
+            .execute(root_listing_sql, &[])
+            .await
+            .expect("execute root files");
+        black_box((&directories, &files));
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    let mean_ns = samples.iter().map(Duration::as_nanos).sum::<u128>()
+        / u128::try_from(samples.len()).expect("sample count fits u128");
+    println!(
+        "exact_file_read backend={backend} files={file_count} shape=root_directory_listing rounds={ROUNDS} p50_ns={} p95_ns={} mean_ns={mean_ns}",
+        percentile(&samples, 50).as_nanos(),
+        percentile(&samples, 95).as_nanos(),
+    );
 }
 
 fn file_count_from_env() -> usize {
