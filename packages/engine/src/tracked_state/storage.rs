@@ -97,6 +97,11 @@ struct CommitDeltaPayloadIndexRef<'a> {
 }
 
 impl<'a> CommitDeltaPayloadIndexRef<'a> {
+    #[cfg(test)]
+    fn len(self) -> usize {
+        self.entry_count
+    }
+
     fn decode(self, entry_index: usize) -> Result<CommitDeltaPayload, LixError> {
         let range = self.payload_range(entry_index)?;
         if range.is_empty() {
