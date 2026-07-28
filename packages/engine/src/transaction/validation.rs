@@ -2251,6 +2251,10 @@ fn validate_pending_delete_restrictions(
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    if pending_constraints.fk_references.is_empty() {
+        return Ok(());
+    }
+
     for tombstone in &pending_constraints.tombstones {
         let identity_targets = tombstone
             .identity
@@ -6797,6 +6801,44 @@ mod tests {
 
         validate_pending_delete_restrictions(&catalog, &indexes)
             .expect("a row deleted in the same transaction should not block target delete");
+    }
+
+    #[test]
+    fn pending_delete_restrictions_reject_active_referencing_rows() {
+        let mut indexes = PendingConstraintIndexes::default();
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
+        parent_delete.snapshot = None;
+        indexes.remember_tombstone(PreparedValidationRow::State(parent_delete.borrowed()));
+
+        let reference = state_surface_ref_row(
+            "ref-1",
+            "parent-1",
+            "fk_parent_schema",
+            "01920000-0000-7000-8000-0000000000a2",
+        );
+        let reference_snapshot = serde_json::from_str::<JsonValue>(
+            reference
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.normalized())
+                .expect("fixture should have snapshot"),
+        )
+        .expect("fixture JSON should parse");
+        let visible_schemas = vec![fk_parent_schema(), state_surface_ref_schema()];
+        let staged_writes = empty_staged_write_set();
+        let input = validation_input(&staged_writes, &visible_schemas);
+        let catalog = catalog_from_transaction_input(&input).expect("catalog should build");
+        indexes
+            .remember_foreign_key_references(
+                PreparedValidationRow::State(reference.borrowed()),
+                test_plan_from_schema(state_surface_ref_schema()),
+                &reference_snapshot,
+            )
+            .expect("state-surface row should index FK reference");
+
+        let error = validate_pending_delete_restrictions(&catalog, &indexes)
+            .expect_err("an active pending reference should block target deletion");
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
     }
 
     #[test]
