@@ -82,8 +82,8 @@ impl EngineOptions {
     }
 
     /// Sets the per-actor Wasm linear-memory ceiling and the hard maximum
-    /// number of live v2 plugin Stores for this engine. Defaults are 128 MiB
-    /// and four Stores, bounding guest linear memory to 512 MiB before
+    /// number of live v2 plugin Stores for this engine. Defaults are 64 MiB
+    /// and sixteen Stores, bounding guest linear memory to 1 GiB before
     /// host-side document state. Cached actors, active transaction leases,
     /// pending publications, cold-open candidates, and upgrade preflight
     /// Stores all consume the same workspace-wide admission budget.

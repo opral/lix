@@ -17,10 +17,10 @@ use zip::write::SimpleFileOptions;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
-// The replay opens Lix with the default four-Store v2 actor bound. Batches
+// The replay opens Lix with the default 16-Store v2 actor bound. Batches
 // that fit can populate the bounded cache; broader imports retire candidates
 // as they go so one transaction never exhausts admission.
-const RETAINED_PLUGIN_ACTOR_BATCH_LIMIT: usize = 4;
+const RETAINED_PLUGIN_ACTOR_BATCH_LIMIT: usize = 16;
 // Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
 // Keeping each flush below that floor lets the caller enqueue a small request
 // window before draining responses without depending on a platform's larger
