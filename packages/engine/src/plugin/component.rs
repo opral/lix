@@ -15,8 +15,9 @@ use super::{
 /// for normal operations. The cold-file budget may extend up to this ceiling,
 /// but no guest call can exceed it.
 const MAX_PLUGIN_EXECUTION_TIMEOUT_MS: u64 = 60_000;
-/// Recursive plugins retain semantic indexes alongside accepted source bytes.
-pub(crate) const DEFAULT_PLUGIN_V2_MEMORY_BYTES: u64 = 128 * 1024 * 1024;
+/// Preserve enough headroom for recursive plugins while favoring a wider file
+/// working set over the prior 128 MiB per-actor ceiling.
+pub(crate) const DEFAULT_PLUGIN_V2_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 
 fn plugin_v2_wasm_limits(max_memory_bytes: u64) -> Result<WasmLimits, LixError> {
     if max_memory_bytes == 0 {
@@ -264,7 +265,11 @@ mod tests {
         assert_eq!(WasmLimits::default().max_memory_bytes, 64 * 1024 * 1024);
         assert_eq!(
             default_plugin_v2_wasm_limits().max_memory_bytes,
-            128 * 1024 * 1024
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            DEFAULT_PLUGIN_V2_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS as u64,
+            1024 * 1024 * 1024
         );
         assert_eq!(
             default_plugin_v2_wasm_limits().timeout_ms,
