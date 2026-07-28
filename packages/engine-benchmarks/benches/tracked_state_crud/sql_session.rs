@@ -184,6 +184,20 @@ impl SqlFixture {
         }
     }
 
+    pub(crate) async fn update_bound_rows(&self, row_count: usize) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.update_bound_rows(row_count).await,
+            Self::RocksDB(fixture) => fixture.update_bound_rows(row_count).await,
+        }
+    }
+
+    pub(crate) async fn update_spread_bound_rows(&self, row_count: usize) -> usize {
+        match self {
+            Self::SQLite(fixture) => fixture.update_spread_bound_rows(row_count).await,
+            Self::RocksDB(fixture) => fixture.update_spread_bound_rows(row_count).await,
+        }
+    }
+
     pub(crate) async fn update_one_by_pk(&self) -> usize {
         match self {
             Self::SQLite(fixture) => fixture.update_one_by_pk().await,
@@ -273,18 +287,55 @@ where
         affected as usize
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     async fn update_all_bound(&self) -> usize {
+        self.update_bound_rows(self.row_count).await
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    async fn update_bound_rows(&self, row_count: usize) -> usize {
+        assert!(
+            (1..=self.row_count).contains(&row_count),
+            "bound update row count must be between 1 and {}, got {row_count}",
+            self.row_count
+        );
         let results = self
             .session
-            .execute_batch(&self.bound_update_all_batch)
+            .execute_batch(&self.bound_update_all_batch[..row_count])
             .await
             .expect("execute tracked-state CRUD bound update batch");
         let affected = results
             .iter()
             .map(ExecuteResult::rows_affected)
             .sum::<u64>();
-        assert_eq!(affected as usize, self.row_count);
+        assert_eq!(affected as usize, row_count);
+        affected as usize
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    async fn update_spread_bound_rows(&self, row_count: usize) -> usize {
+        assert!(
+            (1..=self.row_count).contains(&row_count),
+            "bound update row count must be between 1 and {}, got {row_count}",
+            self.row_count
+        );
+        let last = self.row_count - 1;
+        let batch = if row_count == 1 {
+            vec![self.bound_update_all_batch[0].clone()]
+        } else {
+            (0..row_count)
+                .map(|index| self.bound_update_all_batch[index * last / (row_count - 1)].clone())
+                .collect::<Vec<_>>()
+        };
+        let results = self
+            .session
+            .execute_batch(&batch)
+            .await
+            .expect("execute spread tracked-state CRUD bound update batch");
+        let affected = results
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(affected as usize, row_count);
         affected as usize
     }
 
