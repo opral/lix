@@ -149,6 +149,16 @@ impl FilesystemDescriptorKey {
         &self.descriptor_id
     }
 
+    pub(crate) fn blob_ref_key(&self) -> FilesystemBlobRefKey {
+        FilesystemBlobRefKey(Self {
+            branch_id: self.branch_id.clone(),
+            global: self.global,
+            untracked: self.untracked,
+            file_id: Some(self.descriptor_id.clone()),
+            descriptor_id: self.descriptor_id.clone(),
+        })
+    }
+
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
         self.branch_id.capacity()
             + self.file_id.as_ref().map_or(0, String::capacity)
