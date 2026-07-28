@@ -39,15 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V15 makes the complete hot current-state generation authoritative for both
-/// tracked and untracked rows. Untracked values have no separate index,
-/// presence marker, or standalone changelog record. Opening an older store
-/// must fail closed rather than mixing its former visibility rules with the
-/// unified current-state layout.
+/// V16 adds the branch-control schema-presence summary used to prove constraint
+/// source ranges empty. Opening an older store must fail closed before reading
+/// its v7 branch controls as though the v8 control space were authoritative.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v15";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v16";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

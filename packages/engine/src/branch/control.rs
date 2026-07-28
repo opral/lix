@@ -90,6 +90,10 @@ impl BranchHeadControl {
         }
     }
 
+    pub(crate) fn reset_schema_presence(&mut self) {
+        self.schema_presence_bloom = [0; SCHEMA_PRESENCE_BLOOM_WORDS];
+    }
+
     pub(crate) fn may_have_schema(&self, schema_key: &str) -> bool {
         let hash = xxh3_64(schema_key.as_bytes()).to_be_bytes();
         hash.chunks_exact(2).all(|pair| {
@@ -352,6 +356,8 @@ mod tests {
         presence.note_schema("present");
         assert!(presence.may_have_schema("present"));
         assert!(!presence.may_have_schema("absent"));
+        presence.reset_schema_presence();
+        assert!(!presence.may_have_schema("present"));
 
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, &branch_b, first)

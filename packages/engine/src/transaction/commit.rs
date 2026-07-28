@@ -1561,6 +1561,7 @@ async fn stage_tracked_head(
                 .await?;
             let mut control =
                 normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
+            control.reset_schema_presence();
             control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
             insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
