@@ -299,6 +299,139 @@ simulation_test!(
 );
 
 simulation_test!(
+    file_working_change_reports_root_file_changes_without_directory_changes,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("workspace session should open"),
+            &engine,
+        );
+        let file_id = "01950000-0000-7000-8000-000000000099";
+        let nested_file_id = "01950000-0000-7000-8000-000000000100";
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('{file_id}', '/a.md', X'6F6C64')"
+                ),
+                &[],
+            )
+            .await
+            .expect("root file insert should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_change",
+            )
+            .await,
+            vec![vec![
+                Value::Text(file_id.to_string()),
+                Value::Text("/a.md".to_string()),
+                Value::Null,
+                Value::Text("added".to_string()),
+            ]],
+            "a root file add must not require an unrelated directory change",
+        );
+
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('{nested_file_id}', '/existing/b.md', X'6F6C64')"
+                ),
+                &[],
+            )
+            .await
+            .expect("nested baseline file insert should succeed");
+        session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should succeed");
+        for changed_file_id in [file_id, nested_file_id] {
+            session
+                .execute(
+                    &format!("UPDATE lix_file SET data = X'6E6577' WHERE id = '{changed_file_id}'"),
+                    &[],
+                )
+                .await
+                .expect("file data update should succeed");
+        }
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_change ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text(file_id.to_string()),
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+                vec![
+                    Value::Text(nested_file_id.to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+            ],
+            "data-only file changes must resolve targeted file and ancestor descriptors",
+        );
+
+        session
+            .create_checkpoint()
+            .await
+            .expect("second baseline checkpoint should succeed");
+        session
+            .execute(&format!("DELETE FROM lix_file WHERE id = '{file_id}'"), &[])
+            .await
+            .expect("root file delete should succeed");
+        session
+            .execute(
+                &format!(
+                    "UPDATE lix_file SET path = '/existing/c.md' WHERE id = '{nested_file_id}'"
+                ),
+                &[],
+            )
+            .await
+            .expect("nested file rename should succeed");
+
+        assert_eq!(
+            select_rows(
+                &session,
+                "SELECT id, path, previous_path, change_kind \
+                 FROM lix_file_working_change ORDER BY id",
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text(file_id.to_string()),
+                    Value::Null,
+                    Value::Text("/a.md".to_string()),
+                    Value::Text("removed".to_string()),
+                ],
+                vec![
+                    Value::Text(nested_file_id.to_string()),
+                    Value::Text("/existing/c.md".to_string()),
+                    Value::Text("/existing/b.md".to_string()),
+                    Value::Text("modified".to_string()),
+                ],
+            ],
+            "descriptor-only removes and renames must use typed targeted keys",
+        );
+    }
+);
+
+simulation_test!(
     filesystem_working_change_surfaces_compose_paths_and_directory_moves,
     |sim| async move {
         let engine = sim.boot_engine().await;
