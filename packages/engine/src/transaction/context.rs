@@ -36,8 +36,8 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     BlobRefRowInput, DERIVED_FILE_REF_SCHEMA_KEY, DerivedFileRefRowInput, FilesystemPathIndex,
     FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    FilesystemPathKind, FilesystemRowContext, blob_ref_row, blob_ref_tombstone_row,
-    derived_file_ref_row, derived_file_ref_tombstone_row, load_path_index_revision,
+    FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
+    append_derived_file_ref_tombstone_row, load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
 use crate::gc::{
@@ -1614,9 +1614,9 @@ where
         &mut self,
         file_key: &PluginFileWriteKey,
         target: PluginMaterialization,
-    ) -> Result<Option<TransactionWriteRow>, LixError> {
+    ) -> Result<RawWriteBatch, LixError> {
         let Some(visible) = self.visible_v2_materialization(file_key).await? else {
-            return Ok(None);
+            return Ok(RawWriteBatch::new());
         };
         let context = FilesystemRowContext {
             branch_id: file_key.branch_id.clone(),
@@ -1625,16 +1625,17 @@ where
             file_id: None,
             metadata: None,
         };
-        let row = match (target, visible.bytes) {
+        let mut rows = RawWriteBatch::with_capacity(1);
+        match (target, visible.bytes) {
             (PluginMaterialization::Derived, VisibleV2MaterializationBytes::Blob { .. }) => {
-                Some(blob_ref_tombstone_row(file_key.file_id.clone(), context))
+                append_blob_ref_tombstone_row(&mut rows, file_key.file_id.clone(), context);
             }
-            (PluginMaterialization::Blob, VisibleV2MaterializationBytes::Derived { .. }) => Some(
-                derived_file_ref_tombstone_row(file_key.file_id.clone(), context),
-            ),
-            _ => None,
-        };
-        Ok(row)
+            (PluginMaterialization::Blob, VisibleV2MaterializationBytes::Derived { .. }) => {
+                append_derived_file_ref_tombstone_row(&mut rows, file_key.file_id.clone(), context);
+            }
+            _ => {}
+        }
+        Ok(rows)
     }
 
     async fn reconcile_plugin_write(
@@ -1666,17 +1667,12 @@ where
                     } else {
                         PluginMaterialization::Blob
                     };
-                    let tombstone = self
+                    let mut materialization_rows = self
                         .opposite_materialization_tombstone(file_key, target)
                         .await?;
-                    if let Some(mut tombstone) = tombstone {
-                        mark_plugin_reconciliation_row(&mut tombstone);
-                        rows.push_raw(tombstone);
-                    }
-                    let mut materialized_row = if let Some(proof) =
-                        reconciliation.derived_materializations.get(file_key)
-                    {
-                        derived_file_ref_row(DerivedFileRefRowInput {
+                    let materialized_row_index = materialization_rows.len();
+                    if let Some(proof) = reconciliation.derived_materializations.get(file_key) {
+                        DerivedFileRefRowInput {
                             file_id: file_key.file_id.clone(),
                             path: proof.path.clone(),
                             sha256: proof.sha256.to_lower_hex(),
@@ -1688,7 +1684,8 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        })?
+                        }
+                        .append_to(&mut materialization_rows)?;
                     } else {
                         let payload = file_data
                             .iter()
@@ -1702,7 +1699,7 @@ where
                                     ),
                                 )
                             })?;
-                        blob_ref_row(BlobRefRowInput {
+                        BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
                             blob_hash: payload
                                 .blob_hash()
@@ -1715,11 +1712,15 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        })?
-                    };
-                    materialized_row.change_id = Some(version.clone());
-                    mark_plugin_reconciliation_row(&mut materialized_row);
-                    rows.push_raw(materialized_row);
+                        }
+                        .append_to(&mut materialization_rows)?;
+                    }
+                    materialization_rows.set_change_id(
+                        materialized_row_index,
+                        Some(SharedStr::from(version.clone())),
+                    );
+                    mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
+                    rows.append_raw_batch(materialization_rows);
                 }
                 let write = if file_data.is_empty() {
                     ReconciledTransactionWrite::Rows { mode, rows }
@@ -1772,17 +1773,12 @@ where
                     } else {
                         PluginMaterialization::Blob
                     };
-                    let tombstone = self
+                    let mut materialization_rows = self
                         .opposite_materialization_tombstone(file_key, target)
                         .await?;
-                    if let Some(mut tombstone) = tombstone {
-                        mark_plugin_reconciliation_row(&mut tombstone);
-                        rows.push_raw(tombstone);
-                    }
-                    let mut materialized_row = if let Some(proof) =
-                        reconciliation.derived_materializations.get(file_key)
-                    {
-                        derived_file_ref_row(DerivedFileRefRowInput {
+                    let materialized_row_index = materialization_rows.len();
+                    if let Some(proof) = reconciliation.derived_materializations.get(file_key) {
+                        DerivedFileRefRowInput {
                             file_id: file_key.file_id.clone(),
                             path: proof.path.clone(),
                             sha256: proof.sha256.to_lower_hex(),
@@ -1794,7 +1790,8 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        })?
+                        }
+                        .append_to(&mut materialization_rows)?;
                     } else {
                         let payload = file_data
                             .iter()
@@ -1808,7 +1805,7 @@ where
                                     ),
                                 )
                             })?;
-                        blob_ref_row(BlobRefRowInput {
+                        BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
                             blob_hash: payload
                                 .blob_hash()
@@ -1821,10 +1818,15 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        })?
-                    };
-                    materialized_row.change_id = Some(version.clone());
-                    rows.push_raw(materialized_row);
+                        }
+                        .append_to(&mut materialization_rows)?;
+                    }
+                    materialization_rows.set_change_id(
+                        materialized_row_index,
+                        Some(SharedStr::from(version.clone())),
+                    );
+                    mark_plugin_reconciliation_batch(&mut materialization_rows, 0)?;
+                    rows.append_raw_batch(materialization_rows);
                 }
                 let file_data = file_data
                     .into_iter()
@@ -7502,6 +7504,7 @@ fn plugin_reconciliation_origin() -> TransactionWriteOrigin {
     }
 }
 
+#[cfg(test)]
 fn mark_plugin_reconciliation_row(row: &mut TransactionWriteRow) {
     row.origin = Some(plugin_reconciliation_origin());
 }
