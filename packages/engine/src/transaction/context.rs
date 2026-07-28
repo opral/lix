@@ -639,26 +639,25 @@ where
                 .await;
             return Err(error);
         }
-        let filesystem_delta_rows = if prepared_writes
-            .state_rows
-            .iter()
-            .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        {
-            Vec::new()
-        } else {
-            prepared_writes
-                .state_rows
-                .iter()
-                .filter(|row| {
-                    matches!(
-                        row.schema_key.as_str(),
-                        "lix_file_descriptor" | "lix_directory_descriptor"
-                    )
-                })
-                .cloned()
-                .map(MaterializedLiveStateRow::from)
-                .collect::<Vec<_>>()
-        };
+        let filesystem_delta_rows =
+            if prepared_writes_require_filesystem_index_rebuild(&prepared_writes) {
+                Vec::new()
+            } else {
+                prepared_writes
+                    .state_rows
+                    .iter()
+                    .filter(|row| {
+                        matches!(
+                            row.schema_key.as_str(),
+                            "lix_file_descriptor"
+                                | "lix_directory_descriptor"
+                                | BLOB_REF_SCHEMA_KEY
+                        )
+                    })
+                    .cloned()
+                    .map(MaterializedLiveStateRow::from)
+                    .collect::<Vec<_>>()
+            };
         let previous_filesystem_revision = if filesystem_delta_rows.is_empty() {
             None
         } else {
@@ -2706,6 +2705,12 @@ where
 
         let mut state_groups = BTreeMap::<PluginStateGroupKey, PluginStateGroup>::new();
         for (key, owner) in &owners {
+            // Descriptor deletion cascades file-scoped current state in the
+            // head materializer. Avoid hydrating the full plugin graph only
+            // to persist one historical tombstone per semantic entity.
+            if deleted_file_keys.contains_key(key) {
+                continue;
+            }
             let selected = selected_plugins.get(key);
             let semantic = semantic_groups.get(key).map(|group| &group.plugin);
             // A same-owner v2 write is authorized by an exact document
@@ -3731,43 +3736,23 @@ where
             reconciled_file_keys.insert(file_key);
         }
 
-        for (file_key, metadata) in deleted_file_keys {
+        for (file_key, _metadata) in deleted_file_keys {
             if reconciled_file_keys.contains(&file_key) {
                 continue;
             }
             reconciliation
                 .rows
                 .extend(self.v2_id_reservation_tombstones(&file_key).await?);
-            let Some(owner) = owners.get(&file_key) else {
+            if !owners.contains_key(&file_key) {
                 reconciliation.remove_session_file_view(SessionFileViewKey::new(
                     &file_key.branch_id,
                     &file_key.file_id,
                 ));
                 continue;
-            };
+            }
             reconciliation.remove_session_file_view(SessionFileViewKey::new(
                 &file_key.branch_id,
                 &file_key.file_id,
-            ));
-            let active_state = state_by_file
-                .get(&PluginStateFileKey {
-                    branch_id: file_key.branch_id.clone(),
-                    plugin_key: owner.plugin_key().to_string(),
-                    file_id: file_key.file_id.clone(),
-                })
-                .cloned()
-                .unwrap_or_default();
-            let context = FilesystemRowContext {
-                branch_id: file_key.branch_id.clone(),
-                global: false,
-                untracked: false,
-                file_id: None,
-                metadata,
-            };
-            reconciliation.rows.extend(plugin_state_tombstone_rows(
-                &active_state,
-                &file_key.file_id,
-                &context,
             ));
             reconciliation.rows.push(PluginFileOwner::delete_row(
                 file_key.file_id,
@@ -4646,6 +4631,23 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
         .any(|change_ref| change_ref.schema_key == REGISTERED_SCHEMA_KEY)
 }
 
+fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
+    prepared_writes
+        .state_rows
+        .iter()
+        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        || prepared_writes
+            .commit_change_refs_by_branch
+            .values()
+            .flat_map(|change_refs| change_refs.selected_change_refs.iter())
+            .any(|change_ref| {
+                matches!(
+                    change_ref.schema_key.as_str(),
+                    "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+                )
+            })
+}
+
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
     pub(crate) transaction: Transaction<StorageImpl>,
     pub(crate) runtime_functions: FunctionContext,
@@ -4805,7 +4807,10 @@ fn prepared_transaction_write_affects_filesystem_path_index(
     prepared_transaction_write_rows(write).iter().any(|row| {
         matches!(
             row.schema_key.as_str(),
-            "lix_file_descriptor" | "lix_directory_descriptor" | BRANCH_REF_SCHEMA_KEY
+            "lix_file_descriptor"
+                | "lix_directory_descriptor"
+                | BLOB_REF_SCHEMA_KEY
+                | BRANCH_REF_SCHEMA_KEY
         )
     })
 }
@@ -6811,7 +6816,7 @@ mod tests {
     use crate::changelog::ChangelogReader;
     use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
-    use crate::transaction::types::TransactionJson;
+    use crate::transaction::types::{StagedCommitChangeRefs, TransactionJson};
     use crate::wasm::WasmEntity;
 
     fn live_state_context() -> LiveStateContext {
@@ -6819,6 +6824,33 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn selected_blob_ref_change_requires_filesystem_index_rebuild() {
+        let mut selected_changes = StagedCommitChangeRefs::default();
+        selected_changes.add_selected_change_ref(StagedCommitChangeRef {
+            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+            file_id: Some("file-a".to_string()),
+            entity_pk: EntityPk::single("file-a"),
+            change_id: ChangeId::default(),
+            deleted: false,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
+        });
+        let prepared_writes = PreparedWriteSet {
+            state_rows: Vec::new(),
+            insert_identities: BTreeMap::new(),
+            commit_change_refs_by_branch: BTreeMap::from([("main".to_string(), selected_changes)]),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            file_data_writes: Vec::new(),
+        };
+
+        assert!(prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
 
     #[test]
     fn visible_materialization_requires_a_matching_blob_ref_identity() {

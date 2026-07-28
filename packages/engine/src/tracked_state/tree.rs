@@ -363,9 +363,10 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
+        file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'a>>,
         mutations: I,
         commit_id: Option<&str>,
-    ) -> Result<TrackedStateApplyResult, LixError>
+    ) -> Result<(TrackedStateApplyResult, usize), LixError>
     where
         I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
     {
@@ -373,10 +374,14 @@ impl TrackedStateTree {
         let mut mutations = mutations.into_iter();
         let mut next_mutation = next_root_mutation(&mut mutations)?;
         let mut assembler = OrderedTreeAssembler::new(&self.options);
+        let mut cascaded_rows = 0usize;
 
         let mut next_parent_entry = parent_entries.next(self, store, overlay).await?;
         while let Some(parent_entry) = next_parent_entry.take() {
             let Some(mutation) = next_mutation.take() else {
+                let (parent_entry, cascaded) =
+                    cascade_parent_entry(parent_entry, file_delete_cascades)?;
+                cascaded_rows += usize::from(cascaded);
                 assembler.push(parent_entry)?;
                 next_parent_entry = parent_entries.next(self, store, overlay).await?;
                 continue;
@@ -398,6 +403,9 @@ impl TrackedStateTree {
                     next_parent_entry = parent_entries.next(self, store, overlay).await?;
                 }
                 std::cmp::Ordering::Greater => {
+                    let (parent_entry, cascaded) =
+                        cascade_parent_entry(parent_entry, file_delete_cascades)?;
+                    cascaded_rows += usize::from(cascaded);
                     assembler.push(parent_entry)?;
                     next_mutation = Some(mutation);
                     next_parent_entry = parent_entries.next(self, store, overlay).await?;
@@ -412,8 +420,10 @@ impl TrackedStateTree {
         }
 
         let built = assembler.finish(self)?;
-        self.persist_built_tree(writes, overlay, built, commit_id)
-            .await
+        let result = self
+            .persist_built_tree(writes, overlay, built, commit_id)
+            .await?;
+        Ok((result, cascaded_rows))
     }
 
     /// Returns true when every sorted incoming key is strictly beyond the
@@ -2106,6 +2116,34 @@ impl PendingRootMutation<'_> {
             value: encode_value_ref(value),
         }
     }
+}
+
+fn cascade_parent_entry(
+    mut entry: EncodedLeafEntry,
+    file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'_>>,
+) -> Result<(EncodedLeafEntry, bool), LixError> {
+    if file_delete_cascades.is_empty() {
+        return Ok((entry, false));
+    }
+    let key = decode_key(&entry.key)?;
+    let Some(file_id) = key.file_id.as_deref() else {
+        return Ok((entry, false));
+    };
+    let Some(cascade) = file_delete_cascades.get(file_id) else {
+        return Ok((entry, false));
+    };
+    let parent_value = decode_value(&entry.value)?;
+    if parent_value.deleted() {
+        return Ok((entry, false));
+    }
+    entry.value = encode_value_ref(TrackedStateIndexValueRef {
+        change_id: cascade.change_id,
+        commit_id: cascade.commit_id,
+        deleted: true,
+        created_at: parent_value.created_at(),
+        updated_at: cascade.updated_at,
+    });
+    Ok((entry, true))
 }
 
 fn next_root_mutation<'a, I>(mutations: &mut I) -> Result<Option<PendingRootMutation<'a>>, LixError>

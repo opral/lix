@@ -213,6 +213,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         &parent_ids,
         rows,
         &changes,
+        false,
     )
     .await?;
     let deltas = staged
@@ -247,6 +248,60 @@ pub(crate) async fn stage_tracked_root_from_materialized(
 }
 
 #[cfg(test)]
+pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
+    read: &mut (impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    commit_id: &str,
+    parent_commit_id: Option<&str>,
+    rows: &[MaterializedTrackedStateRow],
+) -> Result<(), crate::LixError> {
+    let commit_id_text = test_commit_id(commit_id).to_string();
+    let parent_id_texts = parent_commit_id
+        .map(|parent| vec![test_commit_id(parent).to_string()])
+        .unwrap_or_default();
+    let changes = rows
+        .iter()
+        .map(tracked_change_from_materialized)
+        .collect::<Result<Vec<_>, _>>()?;
+    let staged = stage_test_changelog_commit(
+        read,
+        writes,
+        &commit_id_text,
+        &format!("{commit_id_text}:commit"),
+        &parent_id_texts,
+        rows,
+        &changes,
+        true,
+    )
+    .await?;
+    let deltas = staged
+        .change_commit_ids
+        .iter()
+        .map(|(row_index, change_commit_id)| {
+            let change = &changes[*row_index];
+            let row = &rows[*row_index];
+            TrackedStateDeltaRef {
+                schema_key: &change.schema_key,
+                file_id: change.file_id.as_deref(),
+                entity_pk: &change.entity_pk,
+                change_id: change.change_id,
+                commit_id: *change_commit_id,
+                deleted: change.snapshot.is_none(),
+                created_at: crate::common::LixTimestamp::expect_parse(
+                    "created_at",
+                    &row.created_at,
+                ),
+                updated_at: crate::common::LixTimestamp::expect_parse(
+                    "updated_at",
+                    &row.updated_at,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::tracked_state::stage_commit_deltas(writes, &deltas)
+}
+
+#[cfg(test)]
 pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
     read: &mut (impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
@@ -276,6 +331,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         &parent_id_texts,
         rows,
         &changes,
+        false,
     )
     .await?;
     let deltas = staged
@@ -335,6 +391,7 @@ pub(crate) async fn stage_empty_changelog_commit(
         &parent_ids,
         &[],
         &[],
+        false,
     )
     .await?;
     Ok(())
@@ -361,6 +418,7 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         &parent_id_texts,
         &[],
         &[],
+        false,
     )
     .await?;
     Ok(())
@@ -374,6 +432,7 @@ async fn stage_test_changelog_commit(
     parent_ids: &[String],
     rows: &[MaterializedTrackedStateRow],
     changes: &[ChangeRecord],
+    tracked_state_rootless: bool,
 ) -> Result<TestStagedChangelogCommit, crate::LixError> {
     let typed_commit_id = test_commit_id(commit_id);
     let typed_parent_ids = parent_ids
@@ -415,7 +474,7 @@ async fn stage_test_changelog_commit(
         format_version: 1,
         commit_id: typed_commit_id,
         parent_commit_ids: typed_parent_ids,
-        tracked_state_rootless: false,
+        tracked_state_rootless,
         change_id: typed_commit_change_id,
         author_account_ids: Vec::new(),
         created_at,

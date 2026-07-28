@@ -1041,9 +1041,18 @@ fn disk_usage(path: &Path) -> std::io::Result<DiskUsage> {
 }
 
 fn accumulate_disk_usage(path: &Path, usage: &mut DiskUsage) -> std::io::Result<()> {
-    for entry in fs::read_dir(path)? {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
         let entry = entry?;
-        let file_type = entry.file_type()?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         if file_type.is_dir() {
             accumulate_disk_usage(&entry.path(), usage)?;
             continue;
@@ -1052,7 +1061,14 @@ fn accumulate_disk_usage(path: &Path, usage: &mut DiskUsage) -> std::io::Result<
             continue;
         }
 
-        let bytes = entry.metadata()?.len();
+        // RocksDB may replace an SST between read_dir and metadata while a
+        // background compaction is running. That file belongs to neither
+        // stable side of this best-effort usage snapshot.
+        let bytes = match entry.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
         usage.total_bytes += bytes;

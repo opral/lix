@@ -4137,6 +4137,7 @@ mod tests {
             .filter(|request| {
                 request.filter.schema_keys
                     == vec![
+                        "lix_binary_blob_ref".to_string(),
                         "lix_directory_descriptor".to_string(),
                         "lix_file_descriptor".to_string(),
                     ]
@@ -4163,8 +4164,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             blob_requests.len(),
-            2,
-            "the conflict probe and conflict apply each point-load the targeted blob without rescanning topology"
+            1,
+            "the path index carries the conflict probe blob; only conflict apply point-loads it"
         );
         for request in blob_requests {
             assert_eq!(
@@ -4708,10 +4709,10 @@ mod tests {
         assert_eq!(fast_path, WriteExecutorPath::Fast);
         assert_eq!(datafusion_path, WriteExecutorPath::DataFusion);
         assert_eq!(fast_result.rows, datafusion_result.rows);
-        // The indexed existing-path route performs one path-index load and one
-        // exact blob-ref load. The counting test reader models both as scans.
+        // Both routes now receive the correlated blob ref from the path index;
+        // neither repeats the exact live-state load.
         assert_eq!(fast_scans.load(Ordering::SeqCst), 2);
-        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 3);
+        assert_eq!(datafusion_scans.load(Ordering::SeqCst), 2);
 
         let fast_rows = fast_staged.lock().expect("fast writes lock").deltas[0]
             .pending_write_overlay()
