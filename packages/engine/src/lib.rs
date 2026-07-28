@@ -97,4 +97,4 @@ pub use storage::{
 };
 
 /// Reserved high UUID sentinel for repository-global state.
-pub(crate) const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";
+pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";

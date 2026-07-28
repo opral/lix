@@ -1407,7 +1407,10 @@ where
                 .await?;
             let descriptor_keys = unresolved_keys
                 .iter()
-                .filter_map(file_descriptor_key_for_file_scoped_key)
+                .map(file_descriptor_key_for_file_scoped_key)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -2226,12 +2229,24 @@ fn schema_keys_with_file_descriptors(schema_keys: &[String]) -> Vec<String> {
     schema_keys
 }
 
-fn file_descriptor_key_for_file_scoped_key(key: &TrackedStateKey) -> Option<TrackedStateKey> {
-    key.file_id.as_ref().map(|file_id| TrackedStateKey {
-        schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        file_id: None,
-        entity_pk: EntityPk::single(file_id),
-    })
+fn file_descriptor_key_for_file_scoped_key(
+    key: &TrackedStateKey,
+) -> Result<Option<TrackedStateKey>, LixError> {
+    key.file_id
+        .as_ref()
+        .map(|file_id| {
+            Ok(TrackedStateKey {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                file_id: None,
+                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("validated file ID is not a canonical UUID: {error}"),
+                    )
+                })?,
+            })
+        })
+        .transpose()
 }
 
 fn file_delete_cascade(
@@ -4535,12 +4550,15 @@ mod tests {
 
     #[tokio::test]
     async fn rootless_descriptor_cascade_drives_point_scan_diff_and_merge_reads() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000521";
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut descriptor = row("file-a", "descriptor-create", "initial");
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.entity_pk =
+            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         let mut semantic = row("line-1", "semantic-create", "initial");
-        semantic.file_id = Some("file-a".to_string());
+        semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -4593,7 +4611,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key.clone()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         include_tombstones: true,
                         ..Default::default()
                     },
@@ -4613,7 +4631,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key.clone()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4653,7 +4671,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4674,12 +4692,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_descriptor_delete_cascade_survives_root_rebuild_and_recreate() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000522";
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut descriptor = row("file-a", "descriptor-create", "initial");
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.entity_pk =
+            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         let mut semantic = row("line-1", "semantic-create", "initial");
-        semantic.file_id = Some("file-a".to_string());
+        semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -4756,7 +4777,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4774,7 +4795,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         include_tombstones: true,
                         ..Default::default()
                     },

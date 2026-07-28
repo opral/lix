@@ -31,10 +31,10 @@ impl Tuple for VecTuple {
     }
 
     fn builtin_mix(index: usize) -> Self {
-        if index % 9 == 0 {
+        if index.is_multiple_of(9) {
             Self(vec![
                 Component::Uuid(uuid_bytes(index)),
-                Component::Integer((index % 2) as i64),
+                Component::Integer(i64::try_from(index % 2).expect("fixture integer fits i64")),
             ])
         } else {
             Self(vec![Component::String(
@@ -61,10 +61,10 @@ impl Tuple for InlineOne {
     }
 
     fn builtin_mix(index: usize) -> Self {
-        if index % 9 == 0 {
+        if index.is_multiple_of(9) {
             Self(smallvec![
                 Component::Uuid(uuid_bytes(index)),
-                Component::Integer((index % 2) as i64),
+                Component::Integer(i64::try_from(index % 2).expect("fixture integer fits i64")),
             ])
         } else {
             Self(smallvec![Component::String(
@@ -91,10 +91,10 @@ impl Tuple for InlineTwo {
     }
 
     fn builtin_mix(index: usize) -> Self {
-        if index % 9 == 0 {
+        if index.is_multiple_of(9) {
             Self(smallvec![
                 Component::Uuid(uuid_bytes(index)),
-                Component::Integer((index % 2) as i64),
+                Component::Integer(i64::try_from(index % 2).expect("fixture integer fits i64")),
             ])
         } else {
             Self(smallvec![Component::String(
@@ -162,7 +162,9 @@ fn measure<T: Tuple>(name: &str, workload: &str, make: impl Fn(usize) -> T) {
         encoded_bytes = encoded.len();
         black_box(encoded);
         black_box(tuples);
-        samples.push(started.elapsed().as_nanos() as u64);
+        samples.push(
+            u64::try_from(started.elapsed().as_nanos()).expect("benchmark duration fits u64"),
+        );
     }
     samples.sort_unstable();
     println!(

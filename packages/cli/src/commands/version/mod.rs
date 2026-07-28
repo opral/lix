@@ -180,7 +180,7 @@ mod tests {
         create::run(
             &context,
             CreateVersionCommand {
-                id: Some("feature".to_string()),
+                id: Some("01920000-0000-7000-8000-000000000201".to_string()),
                 name: Some("feature".to_string()),
                 from_id: None,
                 from_name: None,
@@ -265,13 +265,13 @@ mod tests {
         init_lix_at(&path).expect("lix init should succeed");
         let lix = open_lix_at(&path).expect("open should succeed");
         crate::db::block_on(lix.create_branch(CreateBranchOptions {
-            id: Some("feature-a".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000211".to_string()),
             name: "feature".to_string(),
             from_commit_id: None,
         }))
         .expect("first version create should succeed");
         let error = crate::db::block_on(lix.create_branch(CreateBranchOptions {
-            id: Some("feature-b".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000212".to_string()),
             name: "feature".to_string(),
             from_commit_id: None,
         }))

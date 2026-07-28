@@ -567,7 +567,7 @@ mod tests {
         let main_branch_id = root.active_branch_id().await.expect("main branch");
         let draft = root
             .create_branch(CreateBranchOptions {
-                id: Some("pinned-draft".to_string()),
+                id: Some("01920000-0000-7000-8000-000000000501".to_string()),
                 name: "Pinned draft".to_string(),
                 from_commit_id: None,
             })
@@ -594,7 +594,10 @@ mod tests {
 
         assert_eq!(receipt.branch_id, draft.id);
         assert_eq!(pinned.active_branch_id().await.unwrap(), main_branch_id);
-        assert_eq!(switched.active_branch_id().await.unwrap(), "pinned-draft");
+        assert_eq!(
+            switched.active_branch_id().await.unwrap(),
+            "01920000-0000-7000-8000-000000000501"
+        );
         assert_eq!(root.active_branch_id().await.unwrap(), main_branch_id);
 
         let Err(error) = root.open_session("missing-branch").await else {

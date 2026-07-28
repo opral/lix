@@ -41,7 +41,7 @@ fn rows(count: usize) -> Vec<BenchTransactionRow> {
                 file_id: None,
                 entity_pk: entity_pk.clone(),
                 value: json!({
-                    "id": entity_pk.clone(),
+                    "id": &entity_pk,
                     "name": format!("account-{index}"),
                 }),
                 updated_value: json!({

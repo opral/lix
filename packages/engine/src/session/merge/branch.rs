@@ -990,12 +990,19 @@ where
     }
     let keys = file_ids
         .iter()
-        .map(|file_id| TrackedStateKey {
-            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-            file_id: None,
-            entity_pk: EntityPk::single(file_id),
+        .map(|file_id| {
+            Ok(TrackedStateKey {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                file_id: None,
+                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("validated file ID is not a canonical UUID: {error}"),
+                    )
+                })?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let base_commit_id = analysis.commits.base_commit_id.to_string();
     let target_commit_id = analysis.commits.target_commit_id.to_string();
     let source_commit_id = analysis.commits.source_commit_id.to_string();
@@ -1108,7 +1115,12 @@ where
         let key = TrackedStateKey {
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
             file_id: scope_file_id.map(str::to_owned),
-            entity_pk: EntityPk::single(&id),
+            entity_pk: EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("validated directory ID is not a canonical UUID: {error}"),
+                )
+            })?,
         };
         let row = reader
             .load_projected_rows_at_commit(

@@ -6270,7 +6270,10 @@ async fn preflight_owned_v2_generation_upgrades(
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
-                    entity_pks: file_ids.iter().cloned().map(EntityPk::single).collect(),
+                    entity_pks: file_ids
+                        .iter()
+                        .map(|file_id| validated_uuid_entity_pk(file_id))
+                        .collect::<Result<Vec<_>, _>>()?,
                     branch_ids: vec![upgrade.branch_id.clone()],
                     file_ids: file_id_filters,
                     untracked: Some(false),
