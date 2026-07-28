@@ -4,19 +4,20 @@
     clippy::cmp_owned
 )]
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
 use crate::changelog::CommitId;
+use crate::common::SharedStr;
 use crate::storage_adapter::{
-    PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageError, StorageGetManyRequest,
-    StorageGetManyResult, StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue,
-    StorageScanChunk, StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue,
-    StorageWriteSet,
+    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, StorageAdapterRead,
+    StorageCoreProjection, StorageError, StorageGetManyRequest, StorageGetManyResult,
+    StorageGetOptions, StorageKey, StorageKeyRange, StorageProjectedValue, StorageScanChunk,
+    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
 };
 use crate::tracked_state::codec::{
-    DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkWrite, decode_key,
-    decode_node_ref, decode_value, encode_key_ref, encode_leaf_node, encode_schema_key_prefix,
-    encode_value_ref,
+    DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkBatch,
+    TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder, decode_key_shared,
+    decode_node_ref, decode_value, encode_leaf_node, encode_schema_key_prefix,
 };
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
@@ -82,11 +83,241 @@ struct CommitDeltaSegmentBounds {
     last_key: Vec<u8>,
 }
 
+const COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT: usize = 32;
+
+/// Arena-backed decoded mutations from one immutable commit.
+///
+/// Segment decoders reconstruct keys and compact values into one `Bytes`
+/// arena per selected segment. Rows retain only compact arena/dictionary
+/// ordinals plus the typed entity key; repeated schema and file metadata is
+/// stored once for the whole scan.
+#[derive(Debug, Default)]
+pub(crate) struct DecodedCommitDeltaBatch {
+    arenas: Vec<DecodedLeafNodeRef>,
+    schema_keys: Vec<SharedStr>,
+    file_ids: Vec<SharedStr>,
+    rows: Vec<DecodedCommitDeltaRow>,
+    values: Vec<TrackedStateIndexValue>,
+}
+
+#[derive(Debug)]
+struct DecodedCommitDeltaRow {
+    arena_ordinal: u32,
+    entry_ordinal: u16,
+    schema_key_ordinal: u32,
+    /// `u32::MAX` is the null file-id sentinel.
+    file_id_ordinal: u32,
+    entity_pk: crate::entity_pk::EntityPk,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DecodedCommitDeltaRowRef<'a> {
+    batch: &'a DecodedCommitDeltaBatch,
+    ordinal: usize,
+}
+
+impl DecodedCommitDeltaBatch {
+    pub(crate) fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = DecodedCommitDeltaRowRef<'_>> + '_ {
+        (0..self.rows.len()).map(|ordinal| DecodedCommitDeltaRowRef {
+            batch: self,
+            ordinal,
+        })
+    }
+
+    #[cfg(test)]
+    fn arena_count(&self) -> usize {
+        self.arenas.len()
+    }
+
+    #[cfg(test)]
+    fn schema_dictionary_len(&self) -> usize {
+        self.schema_keys.len()
+    }
+
+    #[cfg(test)]
+    fn file_dictionary_len(&self) -> usize {
+        self.file_ids.len()
+    }
+}
+
+impl DecodedCommitDeltaRowRef<'_> {
+    pub(crate) fn key_ref(&self) -> TrackedStateKeyRef<'_> {
+        let row = &self.batch.rows[self.ordinal];
+        TrackedStateKeyRef {
+            schema_key: self.batch.schema_keys[row.schema_key_ordinal as usize].as_str(),
+            file_id: (row.file_id_ordinal != u32::MAX)
+                .then(|| self.batch.file_ids[row.file_id_ordinal as usize].as_str()),
+            entity_pk: &row.entity_pk,
+        }
+    }
+
+    pub(crate) fn value(&self) -> &TrackedStateIndexValue {
+        &self.batch.values[self.ordinal]
+    }
+
+    /// Returns a zero-copy view retaining the selected segment arena.
+    #[cfg(test)]
+    pub(crate) fn encoded_key(&self) -> Bytes {
+        let row = &self.batch.rows[self.ordinal];
+        self.batch.arenas[row.arena_ordinal as usize]
+            .entry_owned(row.entry_ordinal as usize)
+            .expect("decoded commit-delta row references an existing leaf entry")
+            .key
+    }
+
+    /// Returns the encoded identity directly from its decoded segment arena.
+    ///
+    /// First-parent diff flattens these slices into one interval-wide arena,
+    /// so it does not need a `Bytes` clone for every discovered mutation.
+    pub(crate) fn encoded_key_ref(&self) -> &[u8] {
+        let row = &self.batch.rows[self.ordinal];
+        self.batch.arenas[row.arena_ordinal as usize]
+            .key(row.entry_ordinal as usize)
+            .expect("decoded commit-delta key lookup cannot fail")
+            .expect("decoded commit-delta row references an existing leaf entry")
+    }
+}
+
+struct CommitDeltaStringInterner {
+    values: Vec<SharedStr>,
+    ordinals: Option<HashMap<SharedStr, u32>>,
+}
+
+impl CommitDeltaStringInterner {
+    fn new(expected_cardinality: usize) -> Self {
+        Self {
+            values: Vec::with_capacity(
+                expected_cardinality.min(COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT),
+            ),
+            ordinals: None,
+        }
+    }
+
+    fn intern(&mut self, value: SharedStr) -> Result<u32, LixError> {
+        if let Some(ordinals) = &self.ordinals {
+            if let Some(&ordinal) = ordinals.get(&value) {
+                return Ok(ordinal);
+            }
+        } else if let Some(ordinal) = self.values.iter().position(|candidate| candidate == &value) {
+            return Ok(ordinal as u32);
+        }
+
+        let ordinal = u32::try_from(self.values.len()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta string dictionary exceeds u32",
+            )
+        })?;
+        if self.ordinals.is_none()
+            && self.values.len() == COMMIT_DELTA_SMALL_STRING_DICTIONARY_LIMIT
+        {
+            let mut ordinals = HashMap::with_capacity(self.values.len().saturating_mul(2));
+            for (ordinal, existing) in self.values.iter().enumerate() {
+                ordinals.insert(existing.clone(), ordinal as u32);
+            }
+            self.ordinals = Some(ordinals);
+        }
+        if let Some(ordinals) = &mut self.ordinals {
+            ordinals.insert(value.clone(), ordinal);
+        }
+        self.values.push(value);
+        Ok(ordinal)
+    }
+}
+
+struct DecodedCommitDeltaBatchBuilder {
+    arenas: Vec<DecodedLeafNodeRef>,
+    schema_keys: CommitDeltaStringInterner,
+    file_ids: CommitDeltaStringInterner,
+    rows: Vec<DecodedCommitDeltaRow>,
+    values: Vec<TrackedStateIndexValue>,
+}
+
+impl DecodedCommitDeltaBatchBuilder {
+    fn with_capacity(row_capacity: usize, arena_capacity: usize) -> Self {
+        Self {
+            arenas: Vec::with_capacity(arena_capacity),
+            schema_keys: CommitDeltaStringInterner::new(row_capacity),
+            file_ids: CommitDeltaStringInterner::new(row_capacity),
+            rows: Vec::with_capacity(row_capacity),
+            values: Vec::with_capacity(row_capacity),
+        }
+    }
+
+    fn push_leaf(
+        &mut self,
+        leaf: DecodedLeafNodeRef,
+        commit_id: CommitId,
+        requested_schemas: &BTreeSet<&str>,
+    ) -> Result<(), LixError> {
+        let arena_ordinal = u32::try_from(self.arenas.len()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta scan has too many segment arenas",
+            )
+        })?;
+        let first_row = self.rows.len();
+        visit_commit_delta_leaf(&leaf, commit_id, |entry_index, _encoded_key, value| {
+            let key = decode_key_shared(
+                leaf.entry_owned(entry_index)
+                    .expect("visited commit-delta leaf entry exists")
+                    .key,
+            )?;
+            if !requested_schemas.is_empty() && !requested_schemas.contains(key.schema_key.as_str())
+            {
+                return Ok(());
+            }
+            let entry_ordinal = u16::try_from(entry_index).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta segment exceeds u16 row ordinals",
+                )
+            })?;
+            let schema_key_ordinal = self.schema_keys.intern(key.schema_key)?;
+            let file_id_ordinal = key
+                .file_id
+                .map_or(Ok(u32::MAX), |file_id| self.file_ids.intern(file_id))?;
+            self.rows.push(DecodedCommitDeltaRow {
+                arena_ordinal,
+                entry_ordinal,
+                schema_key_ordinal,
+                file_id_ordinal,
+                entity_pk: key.entity_pk,
+            });
+            self.values.push(value);
+            Ok(())
+        })?;
+        if self.rows.len() != first_row {
+            self.arenas.push(leaf);
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> DecodedCommitDeltaBatch {
+        DecodedCommitDeltaBatch {
+            arenas: self.arenas,
+            schema_keys: self.schema_keys.values,
+            file_ids: self.file_ids.values,
+            rows: self.rows,
+            values: self.values,
+        }
+    }
+}
+
 async fn get_one(
     store: &(impl StorageAdapterRead + ?Sized),
     space: StorageSpace,
     key: Vec<u8>,
-) -> Result<Option<Vec<u8>>, LixError> {
+) -> Result<Option<Bytes>, LixError> {
     let result = PointReadPlan::new(space, &[StorageKey(Bytes::from(key))])
         .materialize(store, StorageGetOptions::default())
         .await?;
@@ -95,7 +326,7 @@ async fn get_one(
         .into_iter()
         .next()
         .flatten()
-        .and_then(full_value))
+        .and_then(full_value_bytes))
 }
 
 pub(crate) async fn load_root(
@@ -223,7 +454,7 @@ pub(crate) fn stage_commit_deltas(
     let Some(&commit_id) = deltas.first().map(|delta| &delta.commit_id) else {
         return Ok(());
     };
-    let mut entries = Vec::with_capacity(deltas.len());
+    let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
     for delta in deltas {
         if delta.commit_id != commit_id {
             return Err(LixError::new(
@@ -231,21 +462,30 @@ pub(crate) fn stage_commit_deltas(
                 "tracked_state cannot pack deltas from different commits together",
             ));
         }
-        entries.push(EncodedLeafEntry {
-            key: encode_key_ref(TrackedStateKeyRef {
+        entries.push(
+            TrackedStateKeyRef {
                 schema_key: delta.schema_key,
                 file_id: delta.file_id,
                 entity_pk: delta.entity_pk,
-            }),
-            value: encode_value_ref(TrackedStateIndexValueRef {
+            },
+            TrackedStateIndexValueRef {
                 change_id: delta.change_id,
                 commit_id: delta.commit_id,
                 deleted: delta.deleted,
                 created_at: delta.created_at,
                 updated_at: delta.updated_at,
-            }),
-        });
+            },
+        );
     }
+    let mut entries = entries
+        .finish()
+        .into_mutations()
+        .into_iter()
+        .map(|mutation| EncodedLeafEntry {
+            key: mutation.encoded_key,
+            value: mutation.encoded_value,
+        })
+        .collect::<Vec<_>>();
     entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
     if entries.windows(2).any(|pair| pair[0].key == pair[1].key) {
         return Err(LixError::new(
@@ -286,8 +526,8 @@ pub(crate) fn stage_commit_deltas(
             .key
             .clone();
         manifest.segments.push(CommitDeltaSegmentBounds {
-            first_key,
-            last_key,
+            first_key: first_key.to_vec(),
+            last_key: last_key.to_vec(),
         });
         writes.put(
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
@@ -311,43 +551,74 @@ pub(crate) async fn load_commit_delta_values(
     if keys.is_empty() {
         return Ok(Vec::new());
     }
-    let mut values = vec![None; keys.len()];
+    let mut key_batch = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+    for key in keys {
+        key_batch.push(TrackedStateKeyRef {
+            schema_key: &key.schema_key,
+            file_id: key.file_id.as_deref(),
+            entity_pk: &key.entity_pk,
+        });
+    }
+    let encoded_keys = key_batch.finish();
+    load_commit_delta_values_encoded(store, commit_id, &encoded_keys).await
+}
+
+/// Encoded-key counterpart used by first-parent batch replay.
+///
+/// Callers may pass `Bytes` slices that retain decoded commit-delta arenas, so
+/// replay does not need to allocate schema/file strings merely to perform a
+/// point lookup. The owned point API above remains the public compatibility
+/// boundary.
+pub(crate) async fn load_commit_delta_values_encoded(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    encoded_keys: &[Bytes],
+) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+    if encoded_keys.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut values = vec![None; encoded_keys.len()];
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
         return Ok(values);
     };
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_segment(inline_segment, None, commit_id)?;
-        for (output_index, key) in keys.iter().enumerate() {
-            let encoded_key = encode_key_ref(TrackedStateKeyRef {
-                schema_key: &key.schema_key,
-                file_id: key.file_id.as_deref(),
-                entity_pk: &key.entity_pk,
-            });
-            values[output_index] = find_commit_delta_value(&leaf, &encoded_key, commit_id)?;
+        for (output_index, encoded_key) in encoded_keys.iter().enumerate() {
+            values[output_index] = find_commit_delta_value(&leaf, encoded_key, commit_id)?;
         }
         return Ok(values);
     }
-    let mut lookups_by_segment = BTreeMap::<usize, Vec<(usize, Vec<u8>)>>::new();
-    for (output_index, key) in keys.iter().enumerate() {
-        let encoded_key = encode_key_ref(TrackedStateKeyRef {
-            schema_key: &key.schema_key,
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        });
-        if let Some(segment_index) = commit_delta_segment_for_key(&manifest, &encoded_key) {
-            lookups_by_segment
-                .entry(segment_index)
-                .or_default()
-                .push((output_index, encoded_key));
+    // Keep one dense lookup column instead of one tree node and one owned
+    // vector per touched segment. The key bytes remain in the caller's shared
+    // arena; rows retain only their output ordinal.
+    let mut lookups = Vec::<(usize, usize)>::with_capacity(encoded_keys.len());
+    for (output_index, encoded_key) in encoded_keys.iter().enumerate() {
+        if let Some(segment_index) = commit_delta_segment_for_key(&manifest, encoded_key) {
+            lookups.push((segment_index, output_index));
         }
     }
-    if lookups_by_segment.is_empty() {
+    if lookups.is_empty() {
         return Ok(values);
     }
-    let segment_indices = lookups_by_segment.keys().copied().collect::<Vec<_>>();
-    let storage_keys = segment_indices
+    lookups.sort_unstable();
+    let segment_count = 1 + lookups
+        .windows(2)
+        .filter(|pair| pair[0].0 != pair[1].0)
+        .count();
+    let mut segment_ranges = Vec::with_capacity(segment_count);
+    let mut offset = 0;
+    while offset < lookups.len() {
+        let segment_index = lookups[offset].0;
+        let mut end = offset + 1;
+        while end < lookups.len() && lookups[end].0 == segment_index {
+            end += 1;
+        }
+        segment_ranges.push((segment_index, offset, end));
+        offset = end;
+    }
+    let storage_keys = segment_ranges
         .iter()
-        .map(|&segment_index| {
+        .map(|&(segment_index, _, _)| {
             commit_delta_segment_key(commit_id, segment_index)
                 .map(|key| StorageKey(Bytes::from(key)))
         })
@@ -355,7 +626,7 @@ pub(crate) async fn load_commit_delta_values(
     let result = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
-    for ((segment_index, lookups), value) in lookups_by_segment.into_iter().zip(result.value) {
+    for ((segment_index, start, end), value) in segment_ranges.into_iter().zip(result.value) {
         let bytes = value
             .and_then(full_value_bytes)
             .ok_or_else(|| {
@@ -371,8 +642,9 @@ pub(crate) async fn load_commit_delta_values(
             Some(&manifest.segments[segment_index]),
             commit_id,
         )?;
-        for (output_index, encoded_key) in lookups {
-            values[output_index] = find_commit_delta_value(&leaf, &encoded_key, commit_id)?;
+        for &(_, output_index) in &lookups[start..end] {
+            values[output_index] =
+                find_commit_delta_value(&leaf, &encoded_keys[output_index], commit_id)?;
         }
     }
     Ok(values)
@@ -386,9 +658,9 @@ pub(crate) async fn scan_commit_delta_values(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
     schema_keys: &[String],
-) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
+) -> Result<DecodedCommitDeltaBatch, LixError> {
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
-        return Ok(Vec::new());
+        return Ok(DecodedCommitDeltaBatch::default());
     };
     let requested_schemas = schema_keys
         .iter()
@@ -396,13 +668,13 @@ pub(crate) async fn scan_commit_delta_values(
         .collect::<BTreeSet<_>>();
     if let Some(inline_segment) = manifest.inline_segment() {
         let leaf = decode_commit_delta_leaf(inline_segment, None)?;
-        let mut entries = Vec::with_capacity(leaf.len());
-        collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
-        return Ok(entries);
+        let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(leaf.len(), 1);
+        batch.push_leaf(leaf, commit_id, &requested_schemas)?;
+        return Ok(batch.finish());
     }
     let segment_indices = commit_delta_segments_for_schemas(&manifest, &requested_schemas);
     if segment_indices.is_empty() {
-        return Ok(Vec::new());
+        return Ok(DecodedCommitDeltaBatch::default());
     }
     let storage_keys = segment_indices
         .iter()
@@ -414,7 +686,12 @@ pub(crate) async fn scan_commit_delta_values(
     let segments = PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, &storage_keys)
         .materialize(store, StorageGetOptions::default())
         .await?;
-    let mut entries = Vec::new();
+    let mut batch = DecodedCommitDeltaBatchBuilder::with_capacity(
+        segment_indices
+            .len()
+            .saturating_mul(COMMIT_DELTA_SEGMENT_ROWS),
+        segment_indices.len(),
+    );
     for (segment_index, value) in segment_indices.into_iter().zip(segments.value) {
         let bytes = value
             .and_then(full_value_bytes)
@@ -425,11 +702,11 @@ pub(crate) async fn scan_commit_delta_values(
                         "tracked_state commit_delta manifest for commit '{commit_id}' references missing segment {segment_index}"
                     ),
                 )
-            })?;
+        })?;
         let leaf = decode_commit_delta_leaf(&bytes, Some(&manifest.segments[segment_index]))?;
-        collect_commit_delta_leaf_entries(&leaf, commit_id, &requested_schemas, &mut entries)?;
+        batch.push_leaf(leaf, commit_id, &requested_schemas)?;
     }
-    Ok(entries)
+    Ok(batch.finish())
 }
 
 fn encode_commit_delta_manifest(manifest: &CommitDeltaManifest) -> Result<Vec<u8>, LixError> {
@@ -626,7 +903,7 @@ fn decode_commit_delta_segment(
     expected_commit_id: CommitId,
 ) -> Result<DecodedLeafNodeRef, LixError> {
     let leaf = decode_commit_delta_leaf(bytes, expected_bounds)?;
-    visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _| Ok(()))?;
+    visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _, _| Ok(()))?;
     Ok(leaf)
 }
 
@@ -637,7 +914,7 @@ fn decode_commit_delta_segment(
 fn visit_commit_delta_leaf(
     leaf: &DecodedLeafNodeRef,
     expected_commit_id: CommitId,
-    mut visit: impl FnMut(&[u8], TrackedStateIndexValue) -> Result<(), LixError>,
+    mut visit: impl FnMut(usize, &[u8], TrackedStateIndexValue) -> Result<(), LixError>,
 ) -> Result<(), LixError> {
     let mut previous_key: Option<&[u8]> = None;
     for entry_index in 0..leaf.len() {
@@ -663,25 +940,10 @@ fn visit_commit_delta_leaf(
                 ),
             ));
         }
-        visit(entry.key, value)?;
+        visit(entry_index, entry.key, value)?;
         previous_key = Some(entry.key);
     }
     Ok(())
-}
-
-fn collect_commit_delta_leaf_entries(
-    leaf: &DecodedLeafNodeRef,
-    commit_id: CommitId,
-    requested_schemas: &BTreeSet<&str>,
-    entries: &mut Vec<(TrackedStateKey, TrackedStateIndexValue)>,
-) -> Result<(), LixError> {
-    visit_commit_delta_leaf(leaf, commit_id, |encoded_key, value| {
-        let key = decode_key(encoded_key)?;
-        if requested_schemas.is_empty() || requested_schemas.contains(key.schema_key.as_str()) {
-            entries.push((key, value));
-        }
-        Ok(())
-    })
 }
 
 fn find_commit_delta_value(
@@ -727,7 +989,7 @@ fn find_commit_delta_value(
 pub(crate) async fn read_chunk(
     store: &(impl StorageAdapterRead + ?Sized),
     hash: &[u8; TRACKED_STATE_HASH_BYTES],
-) -> Result<Option<Vec<u8>>, LixError> {
+) -> Result<Option<Bytes>, LixError> {
     get_one(store, TRACKED_STATE_TREE_CHUNK_SPACE, hash.to_vec()).await
 }
 
@@ -755,19 +1017,9 @@ pub(crate) fn debug_verify_chunk_hash(
     Ok(())
 }
 
-pub(crate) fn stage_chunks(writes: &mut StorageWriteSet, chunks: &[PendingChunkWrite]) {
-    for chunk in chunks {
-        writes.put_content_addressed(
-            TRACKED_STATE_TREE_CHUNK_SPACE,
-            key(chunk.hash.to_vec()),
-            value(chunk.data.clone()),
-        );
-    }
-}
-
 #[derive(Debug, Default)]
 pub(crate) struct TrackedStateChunkOverlay {
-    chunks: HashMap<[u8; TRACKED_STATE_HASH_BYTES], Vec<u8>>,
+    chunks: HashMap<[u8; TRACKED_STATE_HASH_BYTES], Bytes>,
 }
 
 impl TrackedStateChunkOverlay {
@@ -776,18 +1028,41 @@ impl TrackedStateChunkOverlay {
     }
 
     pub(crate) fn staged_chunk(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<&[u8]> {
-        self.chunks.get(hash).map(Vec::as_slice)
+        self.chunks.get(hash).map(AsRef::as_ref)
+    }
+
+    fn staged_chunk_bytes(&self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) -> Option<Bytes> {
+        self.chunks.get(hash).cloned()
     }
 
     pub(crate) fn stage_chunks(
         &mut self,
         writes: &mut StorageWriteSet,
-        chunks: &[PendingChunkWrite],
+        chunks: &PendingChunkBatch,
     ) {
-        for chunk in chunks {
-            self.chunks.insert(chunk.hash, chunk.data.clone());
+        if chunks.is_empty() {
+            return;
         }
-        stage_chunks(writes, chunks);
+        let mut key_arena =
+            Vec::with_capacity(chunks.len().saturating_mul(TRACKED_STATE_HASH_BYTES));
+        let mut puts = Vec::with_capacity(chunks.len());
+        for chunk in chunks.chunks() {
+            let key_start = key_arena.len();
+            key_arena.extend_from_slice(&chunk.hash);
+            puts.push(EncodedPut {
+                key: BufferRange::new(key_start, TRACKED_STATE_HASH_BYTES),
+                value: BufferRange::new(chunk.data_start, chunk.data_len),
+            });
+            self.chunks.insert(chunk.hash, chunks.chunk_data(*chunk));
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_arena),
+            chunks.data().clone(),
+            puts,
+            Vec::new(),
+        )
+        .expect("tracked-state chunk batch descriptors must match their arenas");
+        writes.stage_content_addressed_encoded_batch(TRACKED_STATE_TREE_CHUNK_SPACE, batch);
     }
 }
 
@@ -830,14 +1105,14 @@ where
         })
     }
 
-    fn staged_bytes(&self, space: StorageSpaceId, key: &StorageKey) -> Option<&[u8]> {
+    fn staged_bytes(&self, space: StorageSpaceId, key: &StorageKey) -> Option<Bytes> {
         if space == TRACKED_STATE_COMMIT_ROOT_SPACE.id {
             let key = <&[u8; 16]>::try_from(key.0.as_ref()).ok()?;
-            return self.commit_roots.get(key).map(AsRef::as_ref);
+            return self.commit_roots.get(key).cloned();
         }
         if space == TRACKED_STATE_TREE_CHUNK_SPACE.id {
             let key = <&[u8; TRACKED_STATE_HASH_BYTES]>::try_from(key.0.as_ref()).ok()?;
-            return self.chunks.staged_chunk(key);
+            return self.chunks.staged_chunk_bytes(key);
         }
         None
     }
@@ -871,9 +1146,7 @@ where
                 };
                 *slot = Some(match request.opts.projection {
                     StorageCoreProjection::KeyOnly => StorageProjectedValue::KeyOnly,
-                    StorageCoreProjection::FullValue => {
-                        StorageProjectedValue::FullValue(Bytes::copy_from_slice(bytes))
-                    }
+                    StorageCoreProjection::FullValue => StorageProjectedValue::FullValue(bytes),
                 });
             }
         }
@@ -914,10 +1187,6 @@ fn full_value_bytes(value: StorageProjectedValue) -> Option<Bytes> {
     }
 }
 
-fn full_value(value: StorageProjectedValue) -> Option<Vec<u8>> {
-    full_value_bytes(value).map(|bytes| bytes.to_vec())
-}
-
 fn encode_commit_root(metadata: &TrackedStateCommitRoot) -> Result<Vec<u8>, LixError> {
     let payload = storage_codec::encode("tracked_state commit_root", metadata)?;
     let mut encoded = Vec::with_capacity(TRACKED_STATE_COMMIT_ROOT_MAGIC.len() + payload.len());
@@ -942,6 +1211,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
+    use bytes::Bytes;
+
     use crate::LixError;
     use crate::binary_cas::kv::{
         BINARY_CAS_CHUNK_PRESENCE_SPACE, BINARY_CAS_CHUNK_SPACE, BINARY_CAS_MANIFEST_CHUNK_SPACE,
@@ -961,7 +1232,10 @@ mod tests {
         HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, TRACKED_WORKING_DIFF_MARKER_SPACE,
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
-    use crate::tracked_state::codec::{EncodedLeafEntry, encode_key_ref, encode_value_ref};
+    use crate::tracked_state::codec::{
+        EncodedLeafEntry, PendingChunk, PendingChunkBatch, encode_key_ref, encode_value_ref,
+        hash_bytes,
+    };
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
         TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
@@ -969,9 +1243,10 @@ mod tests {
     };
 
     use super::{
-        CommitDeltaManifest, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
-        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, commit_delta_manifest_key,
+        COMMIT_DELTA_SEGMENT_ROWS, CommitDeltaManifest, DecodedCommitDeltaBatch,
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
+        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, commit_delta_manifest_key,
         decode_commit_delta_manifest, decode_commit_root, encode_commit_delta_manifest,
         encode_commit_delta_segment, encode_commit_root, key, load_commit_delta_values,
         scan_commit_delta_values, stage_commit_deltas, stage_delete_commit_deltas, value,
@@ -1045,6 +1320,70 @@ mod tests {
             .collect()
     }
 
+    fn decoded_commit_delta_rows(
+        batch: &DecodedCommitDeltaBatch,
+    ) -> Vec<(TrackedStateKey, TrackedStateIndexValue)> {
+        batch
+            .iter()
+            .map(|row| {
+                let key = row.key_ref();
+                (
+                    TrackedStateKey {
+                        schema_key: key.schema_key.to_owned(),
+                        file_id: key.file_id.map(str::to_owned),
+                        entity_pk: key.entity_pk.clone(),
+                    },
+                    row.value().clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn large_chunk_batch_stages_two_shared_arenas() {
+        let chunk_count = 4_096;
+        let mut data_arena = Vec::with_capacity(chunk_count * 64);
+        let mut descriptors = Vec::with_capacity(chunk_count);
+        for index in 0..chunk_count {
+            let data_start = data_arena.len();
+            data_arena.extend_from_slice(&(index as u64).to_be_bytes());
+            data_arena.resize(data_start + 64, (index % 251) as u8);
+            descriptors.push(PendingChunk {
+                hash: hash_bytes(&data_arena[data_start..data_start + 64]),
+                data_start,
+                data_len: 64,
+            });
+        }
+        let chunks = PendingChunkBatch::from_parts(Bytes::from(data_arena), descriptors);
+        let mut writes = crate::storage_adapter::StorageWriteSet::new();
+        let mut overlay = TrackedStateChunkOverlay::new();
+        overlay.stage_chunks(&mut writes, &chunks);
+
+        let arena = writes.arena_stats();
+        assert_eq!(arena.put_descriptors, chunk_count);
+        assert_eq!(arena.key_shared_buffers, 1);
+        assert_eq!(arena.value_shared_buffers, 1);
+        assert_eq!(arena.key_inline_allocations, 0);
+        assert_eq!(arena.value_inline_allocations, 0);
+
+        let first_chunk = chunks.chunks()[0];
+        let first = overlay
+            .staged_chunk(&first_chunk.hash)
+            .expect("first staged chunk");
+        let arena_start = first.as_ptr() as usize;
+        for chunk in chunks.chunks() {
+            let staged = overlay
+                .staged_chunk(&chunk.hash)
+                .expect("every chunk should be retained by the overlay");
+            assert_eq!(
+                staged.as_ptr() as usize,
+                arena_start + chunk.data_start,
+                "overlay chunks must be slices of one contiguous value arena"
+            );
+            assert_eq!(staged, chunks.chunk_bytes(*chunk));
+        }
+    }
+
     #[tokio::test]
     async fn packed_commit_deltas_preserve_point_and_schema_replay() {
         let storage = StorageAdapter::new(Memory::new());
@@ -1107,14 +1446,19 @@ mod tests {
             .await
             .expect("schema replay should scan packed deltas");
         assert_eq!(alpha.len(), 150);
-        assert!(alpha.iter().all(|(key, _)| key.schema_key == "alpha"));
-        assert!(alpha.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(alpha.iter().all(|row| row.key_ref().schema_key == "alpha"));
+        let alpha_keys = alpha
+            .iter()
+            .map(|row| row.encoded_key())
+            .collect::<Vec<_>>();
+        assert!(alpha_keys.windows(2).all(|pair| pair[0] < pair[1]));
 
         let all = scan_commit_delta_values(&read, commit_id, &[])
             .await
             .expect("unconstrained replay should scan packed deltas");
         assert_eq!(all.len(), fixtures.len());
-        assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let all_keys = all.iter().map(|row| row.encoded_key()).collect::<Vec<_>>();
+        assert!(all_keys.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[tokio::test]
@@ -1157,10 +1501,12 @@ mod tests {
                 .expect("inline point replay should load"),
             vec![Some(fixture.value(commit_id))]
         );
-        assert_eq!(
+        let batch =
             scan_commit_delta_values(&read, commit_id, std::slice::from_ref(&fixture.schema_key))
                 .await
-                .expect("inline schema replay should load"),
+                .expect("inline schema replay should load");
+        assert_eq!(
+            decoded_commit_delta_rows(&batch),
             vec![(fixture.key(), fixture.value(commit_id))]
         );
 
@@ -1189,28 +1535,32 @@ mod tests {
                     schema_key: &alpha.schema_key,
                     file_id: alpha.file_id.as_deref(),
                     entity_pk: &alpha.entity_pk,
-                }),
+                })
+                .into(),
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: alpha.change_id,
                     commit_id,
                     deleted: alpha.deleted,
                     created_at: alpha.created_at,
                     updated_at: alpha.updated_at,
-                }),
+                })
+                .into(),
             },
             EncodedLeafEntry {
                 key: encode_key_ref(TrackedStateKeyRef {
                     schema_key: &beta.schema_key,
                     file_id: beta.file_id.as_deref(),
                     entity_pk: &beta.entity_pk,
-                }),
+                })
+                .into(),
                 value: encode_value_ref(TrackedStateIndexValueRef {
                     change_id: beta.change_id,
                     commit_id: wrong_commit_id,
                     deleted: beta.deleted,
                     created_at: beta.created_at,
                     updated_at: beta.updated_at,
-                }),
+                })
+                .into(),
             },
         ];
         entries.sort_unstable_by(|left, right| left.key.cmp(&right.key));
@@ -1359,12 +1709,71 @@ mod tests {
                 .expect("file-scoped point replay should load"),
             vec![Some(sparse.value(indexed_commit_id))]
         );
+        let batch = scan_commit_delta_values(&read, indexed_commit_id, &["sparse".to_string()])
+            .await
+            .expect("sparse schema replay should load");
         assert_eq!(
-            scan_commit_delta_values(&read, indexed_commit_id, &["sparse".to_string()])
-                .await
-                .expect("sparse schema replay should load"),
+            decoded_commit_delta_rows(&batch),
             vec![(sparse.key(), sparse.value(indexed_commit_id))]
         );
+    }
+
+    #[tokio::test]
+    async fn large_commit_delta_scan_dictionary_encodes_repeated_metadata_once() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("large-shared-decoded-delta-batch");
+        let fixtures = (0..10_000)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "shared-schema".to_string(),
+                file_id: Some("01920000-0000-7000-8000-000000000442".to_string()),
+                entity_pk: EntityPk::single(format!("entity-{index:05}")),
+                change_id: ChangeId::for_test_label(&format!("large-shared-decoded-delta-{index}")),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(index + 1),
+            })
+            .collect::<Vec<_>>();
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas).expect("large commit delta should stage");
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("large commit delta should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("large commit delta read should open");
+        let batch = scan_commit_delta_values(&read, commit_id, &[])
+            .await
+            .expect("large commit delta should decode");
+
+        assert_eq!(batch.len(), fixtures.len());
+        assert_eq!(batch.schema_dictionary_len(), 1);
+        assert_eq!(batch.file_dictionary_len(), 1);
+        assert_eq!(
+            batch.arena_count(),
+            fixtures.len().div_ceil(COMMIT_DELTA_SEGMENT_ROWS),
+            "the batch retains one decoded arena per packed segment, never one owner per row"
+        );
+        assert!(
+            batch.arena_count() * COMMIT_DELTA_SEGMENT_ROWS >= batch.len(),
+            "segment arena ownership must stay bounded independently of row metadata"
+        );
+        let first = batch.iter().next().expect("large batch has a first row");
+        let first_key = first.key_ref();
+        let schema_pointer = first_key.schema_key.as_ptr();
+        let file_pointer = first_key.file_id.expect("shared file id").as_ptr();
+        assert!(batch.iter().all(|row| {
+            let key = row.key_ref();
+            key.schema_key == "shared-schema"
+                && key.file_id == Some("01920000-0000-7000-8000-000000000442")
+                && key.schema_key.as_ptr() == schema_pointer
+                && key
+                    .file_id
+                    .is_some_and(|file_id| file_id.as_ptr() == file_pointer)
+        }));
     }
 
     #[test]

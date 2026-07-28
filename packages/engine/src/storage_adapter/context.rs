@@ -85,8 +85,11 @@ where
     pub async fn prepare_write_set(
         &self,
         write_set: StorageWriteSet,
-        opts: WriteOptions,
+        mut opts: WriteOptions,
     ) -> Result<PreparedStorageCommit<'_, StorageImpl>, StorageWriteSetError> {
+        opts.batch_capacity_hint_bytes = opts
+            .batch_capacity_hint_bytes
+            .max(write_set.backend_batch_capacity_hint_bytes());
         let mut write = self
             .storage
             .begin_write(opts)

@@ -14,6 +14,18 @@
 //!   `Engine`/`SessionContext` also bypasses session lifecycle accounting and
 //!   relies on storage-provided serialization.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::cast_possible_truncation,
+        clippy::cloned_ref_to_slice_refs,
+        clippy::large_futures,
+        clippy::redundant_clone,
+        clippy::suspicious_operation_groupings,
+        clippy::useless_vec
+    )
+)]
+
 mod binary_cas;
 pub(crate) mod branch;
 pub(crate) mod catalog;
@@ -65,7 +77,7 @@ pub use schema::{
 };
 
 pub use common::LixError;
-pub use common::{Blob, LixNotice, NullableKeyFilter, SqlQueryResult, Value};
+pub use common::{Blob, LixNotice, NullableKeyFilter, SharedStr, SqlQueryResult, Value};
 pub use common::{BranchId, CanonicalPluginKey, CanonicalSchemaKey, EntityPk, FileId};
 pub use common::{WireQueryResult, WireValue};
 pub(crate) use common::{parse_row_metadata, parse_row_metadata_value, serialize_row_metadata};

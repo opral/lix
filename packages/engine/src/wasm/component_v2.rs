@@ -5,14 +5,18 @@
 //! each branch/file actor owns one isolated mutable instance and all document,
 //! cursor, output-table, and transition handles created by that instance.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde_json::Value as JsonValue;
+use smallvec::SmallVec;
 
-use crate::{LixError, wasm::WasmLimits};
+use crate::{
+    LixError, catalog::SchemaPlanFingerprint, common::SharedStr, entity_pk::EntityPk,
+    wasm::WasmLimits,
+};
 
 pub const PACKET_FORMAT_V1: u16 = 1;
 pub const WASM_COMPONENT_V2_API_VERSION: &str = "2.1.0";
@@ -302,12 +306,387 @@ impl WasmSourceSlice {
 
 #[derive(Debug, Clone)]
 pub enum WasmHostBytes {
-    Inline(Vec<u8>),
+    /// Immutable bytes that can retain a slice of a materialization batch
+    /// without allocating a row-owned buffer.
+    Inline(Bytes),
     Source(WasmSourceSlice),
-    CanonicalJson {
-        value: Arc<JsonValue>,
-        normalized: Arc<str>,
+    CanonicalJson(WasmCanonicalJson),
+}
+
+/// One canonical JSON row backed by cursor-page storage.
+///
+/// Cloning a row clones only this owner pointer and row ordinal. Snapshot
+/// values and canonical bytes stay owned once by the bounded batch produced
+/// while draining the enclosing v2 cursor page. Certified pages retain their
+/// original shared UTF-8 row buffers; decoded or mixed pages use one compact
+/// normalized arena.
+#[derive(Debug, Clone)]
+pub struct WasmCanonicalJson {
+    batch: Arc<WasmCanonicalJsonBatch>,
+    row: u32,
+}
+
+#[derive(Debug)]
+struct WasmCanonicalJsonBatch {
+    storage: WasmCanonicalJsonStorage,
+    parse_count: usize,
+    serialize_count: usize,
+    arena_allocation_count: u8,
+}
+
+#[derive(Debug)]
+enum WasmCanonicalJsonStorage {
+    Arena {
+        values: Box<[Option<JsonValue>]>,
+        certificates: Box<[Option<WasmCanonicalJsonCertificate>]>,
+        normalized: SharedStr,
+        offsets: Box<[WasmCanonicalJsonOffset]>,
     },
+    CertifiedRows {
+        entity_pks: Box<[EntityPk]>,
+        schema_fingerprints: Box<[Arc<SchemaPlanFingerprint>]>,
+        schema_fingerprint_indices: Box<[u32]>,
+        normalized: Box<[SharedStr]>,
+        normalized_len: u32,
+    },
+}
+
+/// Schema and identity facts proven while streaming one exact canonical guest
+/// snapshot. The entity key remains the protocol's owner of schema metadata;
+/// this certificate retains the typed identity plus one shared fingerprint of
+/// the exact schema plan against which the proof was issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasmCanonicalJsonCertificate {
+    entity_pk: EntityPk,
+    schema_fingerprint: Arc<SchemaPlanFingerprint>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WasmCanonicalJsonCertificateRef<'a> {
+    entity_pk: &'a EntityPk,
+    schema_fingerprint: &'a Arc<SchemaPlanFingerprint>,
+}
+
+#[cfg(test)]
+impl WasmCanonicalJsonCertificateRef<'_> {
+    pub(crate) fn entity_pk(&self) -> &EntityPk {
+        self.entity_pk
+    }
+}
+
+impl WasmCanonicalJsonCertificate {
+    pub(crate) fn new(entity_pk: EntityPk, schema_fingerprint: Arc<SchemaPlanFingerprint>) -> Self {
+        Self {
+            entity_pk,
+            schema_fingerprint,
+        }
+    }
+
+    pub(crate) fn entity_pk(&self) -> &EntityPk {
+        &self.entity_pk
+    }
+
+    pub(crate) fn schema_fingerprint(&self) -> &SchemaPlanFingerprint {
+        self.schema_fingerprint.as_ref()
+    }
+
+    fn borrowed(&self) -> WasmCanonicalJsonCertificateRef<'_> {
+        WasmCanonicalJsonCertificateRef {
+            entity_pk: &self.entity_pk,
+            schema_fingerprint: &self.schema_fingerprint,
+        }
+    }
+}
+
+impl WasmCanonicalJsonCertificateRef<'_> {
+    pub(crate) fn into_owned(self) -> WasmCanonicalJsonCertificate {
+        WasmCanonicalJsonCertificate {
+            entity_pk: self.entity_pk.clone(),
+            schema_fingerprint: self.schema_fingerprint.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WasmCanonicalJsonOffset {
+    start: u32,
+    end: u32,
+}
+
+impl WasmCanonicalJson {
+    pub(crate) fn from_batch_parts(
+        values: Vec<JsonValue>,
+        normalized: Vec<u8>,
+        offsets: Vec<(u32, u32)>,
+        parse_count: usize,
+        serialize_count: usize,
+    ) -> Result<Vec<Self>, LixError> {
+        let row_count = values.len();
+        let mut optional_values = Vec::with_capacity(row_count);
+        optional_values.extend(values.into_iter().map(Some));
+        Self::from_mixed_batch_parts(
+            optional_values,
+            vec![None; row_count],
+            normalized,
+            offsets,
+            parse_count,
+            serialize_count,
+        )
+    }
+
+    pub(crate) fn from_mixed_batch_parts(
+        values: Vec<Option<JsonValue>>,
+        certificates: Vec<Option<WasmCanonicalJsonCertificate>>,
+        normalized: Vec<u8>,
+        offsets: Vec<(u32, u32)>,
+        parse_count: usize,
+        serialize_count: usize,
+    ) -> Result<Vec<Self>, LixError> {
+        if values.len() != offsets.len() {
+            return Err(invalid_param(
+                "canonical JSON batch value and offset counts differ",
+            ));
+        }
+        if certificates.len() != offsets.len() {
+            return Err(invalid_param(
+                "canonical JSON batch certificate and offset counts differ",
+            ));
+        }
+        if values
+            .iter()
+            .zip(&certificates)
+            .any(|(value, certificate)| value.is_some() == certificate.is_some())
+        {
+            return Err(invalid_param(
+                "canonical JSON batch rows must own exactly one decoded value or certificate",
+            ));
+        }
+        // `Bytes::from(Vec<u8>)` retains the Vec allocation even when it has
+        // spare capacity. `SharedStr` then validates and retains that same
+        // immutable allocation, so row materialization can take cheap slices
+        // instead of copying each canonical payload.
+        let arena_allocation_count = u8::from(normalized.capacity() != 0);
+        let normalized = SharedStr::from_utf8(Bytes::from(normalized))
+            .map_err(|_| invalid_param("canonical JSON batch arena is not UTF-8"))?;
+        let arena_len = u32::try_from(normalized.len())
+            .map_err(|_| invalid_param("canonical JSON batch arena exceeds u32"))?;
+        let mut previous_end = 0_u32;
+        let mut validated_offsets = Vec::with_capacity(offsets.len());
+        for (start, end) in offsets {
+            if start != previous_end || end < start || end > arena_len {
+                return Err(invalid_param(
+                    "canonical JSON batch offsets are invalid or non-contiguous",
+                ));
+            }
+            if !normalized.as_str().is_char_boundary(start as usize)
+                || !normalized.as_str().is_char_boundary(end as usize)
+            {
+                return Err(invalid_param(
+                    "canonical JSON batch offsets split a UTF-8 scalar",
+                ));
+            }
+            previous_end = end;
+            validated_offsets.push(WasmCanonicalJsonOffset { start, end });
+        }
+        if previous_end != arena_len {
+            return Err(invalid_param(
+                "canonical JSON batch offsets do not cover the arena",
+            ));
+        }
+
+        Self::from_validated_batch(WasmCanonicalJsonBatch {
+            storage: WasmCanonicalJsonStorage::Arena {
+                values: values.into_boxed_slice(),
+                certificates: certificates.into_boxed_slice(),
+                normalized,
+                offsets: validated_offsets.into_boxed_slice(),
+            },
+            parse_count,
+            serialize_count,
+            arena_allocation_count,
+        })
+    }
+
+    pub(crate) fn from_certified_batch_parts(
+        normalized: Vec<SharedStr>,
+        entity_pks: Vec<EntityPk>,
+        schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
+        schema_fingerprint_indices: Vec<u32>,
+        parse_count: usize,
+    ) -> Result<Vec<Self>, LixError> {
+        if normalized.len() != entity_pks.len()
+            || normalized.len() != schema_fingerprint_indices.len()
+        {
+            return Err(invalid_param(
+                "certified canonical JSON batch row and metadata counts differ",
+            ));
+        }
+        if schema_fingerprint_indices
+            .iter()
+            .any(|index| *index as usize >= schema_fingerprints.len())
+        {
+            return Err(invalid_param(
+                "certified canonical JSON batch schema index is invalid",
+            ));
+        }
+
+        let normalized_len = normalized.iter().try_fold(0_u32, |total, row| {
+            let row_len = u32::try_from(row.len())
+                .map_err(|_| invalid_param("certified canonical JSON row exceeds u32"))?;
+            total
+                .checked_add(row_len)
+                .ok_or_else(|| invalid_param("certified canonical JSON batch exceeds u32"))
+        })?;
+
+        Self::from_validated_batch(WasmCanonicalJsonBatch {
+            storage: WasmCanonicalJsonStorage::CertifiedRows {
+                entity_pks: entity_pks.into_boxed_slice(),
+                schema_fingerprints: schema_fingerprints.into_boxed_slice(),
+                schema_fingerprint_indices: schema_fingerprint_indices.into_boxed_slice(),
+                normalized: normalized.into_boxed_slice(),
+                normalized_len,
+            },
+            parse_count,
+            serialize_count: 0,
+            arena_allocation_count: 0,
+        })
+    }
+
+    fn from_validated_batch(batch: WasmCanonicalJsonBatch) -> Result<Vec<Self>, LixError> {
+        let batch = Arc::new(batch);
+        let mut rows = Vec::with_capacity(batch.row_count());
+        for row in 0..batch.row_count() {
+            rows.push(Self {
+                batch: batch.clone(),
+                row: u32::try_from(row)
+                    .map_err(|_| invalid_param("canonical JSON batch has too many rows"))?,
+            });
+        }
+        Ok(rows)
+    }
+
+    pub fn value(&self) -> &JsonValue {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena { values, .. } => values[self.row_index()]
+                .as_ref()
+                .expect("certified canonical JSON rows do not own decoded values"),
+            WasmCanonicalJsonStorage::CertifiedRows { .. } => {
+                panic!("certified canonical JSON rows do not own decoded values")
+            }
+        }
+    }
+
+    pub(crate) fn certificate(&self) -> Option<WasmCanonicalJsonCertificateRef<'_>> {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena { certificates, .. } => certificates[self.row_index()]
+                .as_ref()
+                .map(WasmCanonicalJsonCertificate::borrowed),
+            WasmCanonicalJsonStorage::CertifiedRows {
+                entity_pks,
+                schema_fingerprints,
+                schema_fingerprint_indices,
+                ..
+            } => Some(WasmCanonicalJsonCertificateRef {
+                entity_pk: &entity_pks[self.row_index()],
+                schema_fingerprint: &schema_fingerprints
+                    [schema_fingerprint_indices[self.row_index()] as usize],
+            }),
+        }
+    }
+
+    pub fn normalized(&self) -> &str {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena {
+                normalized,
+                offsets,
+                ..
+            } => normalized
+                .as_str()
+                .get(offset_range(offsets[self.row_index()]))
+                .expect("canonical JSON row offsets were validated at batch construction"),
+            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
+                normalized[self.row_index()].as_str()
+            }
+        }
+    }
+
+    pub(crate) fn normalized_shared(&self) -> SharedStr {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena {
+                normalized,
+                offsets,
+                ..
+            } => normalized
+                .slice(offset_range(offsets[self.row_index()]))
+                .expect("canonical JSON row offsets were validated at batch construction"),
+            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => {
+                normalized[self.row_index()].clone()
+            }
+        }
+    }
+
+    pub fn row_index(&self) -> usize {
+        self.row as usize
+    }
+
+    pub fn batch_row_count(&self) -> usize {
+        self.batch.row_count()
+    }
+
+    pub fn batch_arena_len(&self) -> usize {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena { normalized, .. } => normalized.len(),
+            WasmCanonicalJsonStorage::CertifiedRows { normalized_len, .. } => {
+                *normalized_len as usize
+            }
+        }
+    }
+
+    pub fn shares_batch_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.batch, &other.batch)
+    }
+
+    pub fn validation_counts(&self) -> (usize, usize) {
+        (self.batch.parse_count, self.batch.serialize_count)
+    }
+
+    pub fn batch_arena_allocation_count(&self) -> usize {
+        self.batch.arena_allocation_count as usize
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_decoded_value_count(&self) -> usize {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena { values, .. } => {
+                values.iter().filter(|value| value.is_some()).count()
+            }
+            WasmCanonicalJsonStorage::CertifiedRows { .. } => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_certified_schema_count(&self) -> usize {
+        match &self.batch.storage {
+            WasmCanonicalJsonStorage::Arena { .. } => 0,
+            WasmCanonicalJsonStorage::CertifiedRows {
+                schema_fingerprints,
+                ..
+            } => schema_fingerprints.len(),
+        }
+    }
+}
+
+impl WasmCanonicalJsonBatch {
+    fn row_count(&self) -> usize {
+        match &self.storage {
+            WasmCanonicalJsonStorage::Arena { offsets, .. } => offsets.len(),
+            WasmCanonicalJsonStorage::CertifiedRows { normalized, .. } => normalized.len(),
+        }
+    }
+}
+
+fn offset_range(offset: WasmCanonicalJsonOffset) -> std::ops::Range<usize> {
+    offset.start as usize..offset.end as usize
 }
 
 impl WasmHostBytes {
@@ -315,7 +694,7 @@ impl WasmHostBytes {
         match self {
             Self::Inline(bytes) => bytes.len() as u64,
             Self::Source(slice) => slice.range.length,
-            Self::CanonicalJson { normalized, .. } => normalized.len() as u64,
+            Self::CanonicalJson(json) => json.normalized().len() as u64,
         }
     }
 
@@ -349,8 +728,27 @@ pub struct WasmInputSplice {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WasmEntityKey {
-    pub schema_key: String,
-    pub entity_pk: Vec<String>,
+    pub schema_key: SharedStr,
+    pub entity_pk: SmallVec<[SharedStr; 2]>,
+}
+
+impl WasmEntityKey {
+    pub fn from_owned_parts(schema_key: impl Into<SharedStr>, entity_pk: Vec<String>) -> Self {
+        Self {
+            schema_key: schema_key.into(),
+            entity_pk: entity_pk.into_iter().map(SharedStr::from).collect(),
+        }
+    }
+
+    pub fn from_shared_parts(
+        schema_key: SharedStr,
+        entity_pk: impl IntoIterator<Item = SharedStr>,
+    ) -> Self {
+        Self {
+            schema_key,
+            entity_pk: entity_pk.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,36 +824,15 @@ impl<B> Default for WasmEntityChanges<B> {
 
 impl<B> WasmEntityChanges<B> {
     pub fn validate(&self) -> Result<(), LixError> {
-        let mut seen_entities = BTreeSet::new();
-        let mut seen_creates = BTreeSet::new();
-        for change in &self.changes {
-            match change {
-                WasmEntityChange::Create {
-                    schema_key,
-                    local_ref,
-                    ..
-                } => {
-                    if !seen_creates.insert((schema_key, local_ref)) {
-                        return Err(invalid_param(
-                            "a v2 create local reference may occur only once per schema in one transition",
-                        ));
-                    }
-                }
-                WasmEntityChange::Upsert { entity, .. } => {
-                    if !seen_entities.insert(&entity.key) {
-                        return Err(invalid_param(
-                            "a v2 entity key may occur only once in one transition",
-                        ));
-                    }
-                }
-                WasmEntityChange::Delete(key) => {
-                    if !seen_entities.insert(key) {
-                        return Err(invalid_param(
-                            "a v2 entity key may occur only once in one transition",
-                        ));
-                    }
-                }
-            }
+        if change_keys_have_duplicates(&self.changes) {
+            return Err(invalid_param(
+                "a v2 entity key may occur only once in one transition",
+            ));
+        }
+        if create_refs_have_duplicates(&self.changes) {
+            return Err(invalid_param(
+                "a v2 create local reference may occur only once per schema in one transition",
+            ));
         }
         Ok(())
     }
@@ -463,6 +840,64 @@ impl<B> WasmEntityChanges<B> {
     pub fn entity_change_count(&self) -> usize {
         self.changes.len()
     }
+}
+
+/// Builds the sole transition-wide duplicate-check index as borrowed key
+/// references. Sorting never moves or clones a key owner, and the exact
+/// capacity prevents geometric growth for a large cursor.
+fn sorted_change_key_refs<B>(changes: &[WasmEntityChange<B>]) -> Vec<&WasmEntityKey> {
+    let mut keys = Vec::with_capacity(changes.len());
+    keys.extend(changes.iter().filter_map(WasmEntityChange::entity_key));
+    keys.sort_unstable();
+    keys
+}
+
+fn sorted_create_refs<B>(changes: &[WasmEntityChange<B>]) -> Vec<(&str, u64)> {
+    let mut creates = Vec::with_capacity(changes.len());
+    creates.extend(changes.iter().filter_map(|change| match change {
+        WasmEntityChange::Create {
+            schema_key,
+            local_ref,
+            ..
+        } => Some((schema_key.as_str(), *local_ref)),
+        WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => None,
+    }));
+    creates.sort_unstable();
+    creates
+}
+
+fn change_keys_have_duplicates<B>(changes: &[WasmEntityChange<B>]) -> bool {
+    sorted_change_key_refs(changes)
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+}
+
+fn create_refs_have_duplicates<B>(changes: &[WasmEntityChange<B>]) -> bool {
+    sorted_create_refs(changes)
+        .windows(2)
+        .any(|pair| pair[0] == pair[1])
+}
+
+/// Validates cursor-wide uniqueness after all pages have been moved into their
+/// stable host vector.
+///
+/// Keeping this separate from [`WasmChangeDrainValidator`] avoids cloning every
+/// untrusted key into a transition-lived owning tree while preserving
+/// arbitrary guest output order and the established rejection text.
+pub(crate) fn validate_change_cursor_key_uniqueness<B>(
+    changes: &[WasmEntityChange<B>],
+) -> Result<(), LixError> {
+    if change_keys_have_duplicates(changes) {
+        return Err(invalid_param(
+            "a v2 entity key may occur only once across a change cursor",
+        ));
+    }
+    if create_refs_have_duplicates(changes) {
+        return Err(invalid_param(
+            "a v2 create local reference may occur only once per schema across a change cursor",
+        ));
+    }
+    Ok(())
 }
 
 pub type WasmHostEntityChanges = WasmEntityChanges<WasmHostBytes>;
@@ -753,7 +1188,9 @@ pub struct WasmOutputRange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WasmGuestBytes {
-    Inline(Vec<u8>),
+    /// A shared slice of the guest packet payload. Every inline value decoded
+    /// from one packet page retains the same backing allocation.
+    Inline(Bytes),
     Output(WasmOutputRange),
 }
 
@@ -781,13 +1218,12 @@ pub struct WasmEditPage {
 
 /// Cross-page validator for a guest change cursor. Raw packet framing and
 /// inline byte bounds are checked by the binding before it constructs a typed
-/// page; this validator owns transition-wide uniqueness, page, reference, and
-/// permanent-EOF invariants.
-#[derive(Debug)]
+/// page; this validator owns page, reference, and permanent-EOF invariants.
+/// Cursor-wide uniqueness is checked once over borrowed keys after the stable
+/// output vector has been assembled.
+#[derive(Debug, Clone, Copy)]
 pub struct WasmChangeDrainValidator {
     limits: WasmTransitionLimits,
-    seen_entities: BTreeSet<WasmEntityKey>,
-    seen_creates: BTreeSet<(String, u64)>,
     pages: u32,
     attachment_refs: u32,
     reached_eof: bool,
@@ -797,8 +1233,6 @@ impl WasmChangeDrainValidator {
     pub fn new(limits: WasmTransitionLimits) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
-            seen_entities: BTreeSet::new(),
-            seen_creates: BTreeSet::new(),
             pages: 0,
             attachment_refs: 0,
             reached_eof: false,
@@ -815,8 +1249,6 @@ impl WasmChangeDrainValidator {
         if page.changes.changes.is_empty() {
             return Err(invalid_param("a v2 change page must not be empty"));
         }
-        // The transition-wide `seen` set below also catches duplicates within
-        // this page. Do not build a second page-local tree for the same keys.
         self.pages = self
             .pages
             .checked_add(1)
@@ -827,50 +1259,27 @@ impl WasmChangeDrainValidator {
 
         let mut page_refs = 0u32;
         for change in &page.changes.changes {
-            match change {
+            let output = match change {
                 WasmEntityChange::Create {
-                    schema_key,
-                    local_ref,
-                    snapshot_content,
-                } => {
-                    if !self.seen_creates.insert((schema_key.clone(), *local_ref)) {
-                        return Err(invalid_param(
-                            "a v2 create local reference may occur only once per schema across a change cursor",
-                        ));
-                    }
-                    if let WasmGuestBytes::Output(range) = snapshot_content {
-                        range
-                            .offset
-                            .checked_add(range.length)
-                            .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
-                        page_refs = page_refs.checked_add(1).ok_or_else(|| {
-                            invalid_param("v2 attachment reference count overflowed")
-                        })?;
-                    }
-                }
-                WasmEntityChange::Upsert { entity, .. } => {
-                    if !self.seen_entities.insert(entity.key.clone()) {
-                        return Err(invalid_param(
-                            "a v2 entity key may occur only once across a change cursor",
-                        ));
-                    }
-                    if let WasmGuestBytes::Output(range) = &entity.snapshot_content {
-                        range
-                            .offset
-                            .checked_add(range.length)
-                            .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
-                        page_refs = page_refs.checked_add(1).ok_or_else(|| {
-                            invalid_param("v2 attachment reference count overflowed")
-                        })?;
-                    }
-                }
-                WasmEntityChange::Delete(key) => {
-                    if !self.seen_entities.insert(key.clone()) {
-                        return Err(invalid_param(
-                            "a v2 entity key may occur only once across a change cursor",
-                        ));
-                    }
-                }
+                    snapshot_content, ..
+                } => match snapshot_content {
+                    WasmGuestBytes::Output(range) => Some(range),
+                    WasmGuestBytes::Inline(_) => None,
+                },
+                WasmEntityChange::Upsert { entity, .. } => match &entity.snapshot_content {
+                    WasmGuestBytes::Output(range) => Some(range),
+                    WasmGuestBytes::Inline(_) => None,
+                },
+                WasmEntityChange::Delete(_) => None,
+            };
+            if let Some(range) = output {
+                range
+                    .offset
+                    .checked_add(range.length)
+                    .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
+                page_refs = page_refs
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_param("v2 attachment reference count overflowed"))?;
             }
         }
         validate_attachment_table_presence(page_refs, page.outputs.is_some())?;
@@ -1294,6 +1703,170 @@ mod tests {
     }
 
     #[test]
+    fn canonical_json_rows_share_one_utf8_arena_without_copying() {
+        let first = r#"{"label":"é"}"#;
+        let second = r#"{"label":"雪"}"#;
+        let first_end = u32::try_from(first.len()).unwrap();
+        let arena_len = first.len() + second.len();
+        let mut normalized = Vec::with_capacity(arena_len + 64);
+        normalized.extend_from_slice(first.as_bytes());
+        normalized.extend_from_slice(second.as_bytes());
+        let arena_pointer = normalized.as_ptr();
+
+        let rows = WasmCanonicalJson::from_batch_parts(
+            vec![
+                serde_json::from_str(first).unwrap(),
+                serde_json::from_str(second).unwrap(),
+            ],
+            normalized,
+            vec![(0, first_end), (first_end, arena_len as u32)],
+            2,
+            2,
+        )
+        .unwrap();
+
+        let first_shared = rows[0].normalized_shared();
+        let second_shared = rows[1].normalized_shared();
+        assert_eq!(rows[0].normalized(), first);
+        assert_eq!(rows[1].normalized(), second);
+        assert_eq!(first_shared.as_str(), first);
+        assert_eq!(second_shared.as_str(), second);
+        assert_eq!(first_shared.as_bytes().as_ptr(), arena_pointer);
+        assert!(first_shared.shares_buffer_with(&second_shared));
+        assert_eq!(first_shared.retained_buffer_len(), arena_len);
+        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
+        assert_eq!(rows[0].validation_counts(), (2, 2));
+    }
+
+    #[test]
+    fn canonical_json_rejects_offsets_inside_unicode_scalars() {
+        let normalized = "é{}".as_bytes().to_vec();
+        let error = WasmCanonicalJson::from_batch_parts(
+            vec![JsonValue::Null, JsonValue::Object(Default::default())],
+            normalized,
+            vec![(0, 1), (1, 4)],
+            2,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("UTF-8 scalar"));
+    }
+
+    #[test]
+    fn canonical_json_large_batch_reserves_its_handle_vector_once() {
+        let row_count = 10_000usize;
+        let normalized = b"null".repeat(row_count);
+        let offsets = (0..row_count)
+            .map(|row| {
+                let start = u32::try_from(row * 4).expect("test arena fits u32");
+                (start, start + 4)
+            })
+            .collect();
+
+        let rows = WasmCanonicalJson::from_batch_parts(
+            vec![JsonValue::Null; row_count],
+            normalized,
+            offsets,
+            row_count,
+            row_count,
+        )
+        .expect("large canonical batch");
+
+        assert_eq!(rows.len(), row_count);
+        assert_eq!(
+            rows.capacity(),
+            row_count,
+            "the handle column must be reserved at its final size"
+        );
+        assert_eq!(rows.last().expect("last row").row_index(), row_count - 1);
+        assert!(rows[0].shares_batch_with(rows.last().expect("last row")));
+    }
+
+    #[test]
+    fn large_common_keys_stay_inline_and_duplicate_sort_borrows_original_owners() {
+        let schema = SharedStr::from_static("csv_row");
+        let namespace = SharedStr::from_static("namespace");
+        let entity = SharedStr::from_static("entity");
+        let changes = (0..10_000)
+            .map(|ordinal| {
+                let entity_pk = if ordinal % 2 == 0 {
+                    [namespace.clone()].into_iter().collect()
+                } else {
+                    [namespace.clone(), entity.clone()].into_iter().collect()
+                };
+                WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey {
+                    schema_key: schema.clone(),
+                    entity_pk,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for (ordinal, change) in changes.iter().enumerate() {
+            let key = change.entity_key().expect("delete carries an entity key");
+            assert_eq!(key.entity_pk.len(), 1 + (ordinal % 2));
+            assert!(
+                !key.entity_pk.spilled(),
+                "one- and two-component protocol keys must stay inline"
+            );
+            assert!(key.schema_key.shares_buffer_with(&schema));
+            assert!(key.entity_pk[0].shares_buffer_with(&namespace));
+            if ordinal % 2 == 1 {
+                assert!(key.entity_pk[1].shares_buffer_with(&entity));
+            }
+        }
+
+        let mut original_owner_addresses = changes
+            .iter()
+            .map(|change| {
+                let key: *const WasmEntityKey =
+                    change.entity_key().expect("delete carries an entity key");
+                key as usize
+            })
+            .collect::<Vec<_>>();
+        let sorted = sorted_change_key_refs(&changes);
+        let mut sorted_owner_addresses = sorted
+            .iter()
+            .map(|key| {
+                let key: *const WasmEntityKey = *key;
+                key as usize
+            })
+            .collect::<Vec<_>>();
+        original_owner_addresses.sort_unstable();
+        sorted_owner_addresses.sort_unstable();
+
+        assert_eq!(sorted.len(), changes.len());
+        assert_eq!(
+            sorted_owner_addresses, original_owner_addresses,
+            "the duplicate index must contain references to original key owners"
+        );
+        assert!(change_keys_have_duplicates(&changes));
+        assert_eq!(
+            validate_change_cursor_key_uniqueness(&changes)
+                .expect_err("the repeated structural keys are duplicates")
+                .message,
+            "a v2 entity key may occur only once across a change cursor"
+        );
+    }
+
+    #[test]
+    fn cursor_key_uniqueness_accepts_arbitrary_unique_order() {
+        let changes = vec![
+            WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey::from_shared_parts(
+                SharedStr::from_static("schema-z"),
+                [SharedStr::from_static("row-z")],
+            )),
+            WasmEntityChange::<WasmGuestBytes>::Delete(WasmEntityKey::from_shared_parts(
+                SharedStr::from_static("schema-a"),
+                [SharedStr::from_static("row-a")],
+            )),
+        ];
+
+        validate_change_cursor_key_uniqueness(&changes)
+            .expect("cursor duplicate validation must not impose key order");
+    }
+
+    #[test]
     fn create_context_produces_canonical_uuid_components() {
         let creates = WasmCreateContext {
             high: 0x0192_0000_0000_7000,
@@ -1339,10 +1912,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_entity_keys() {
-        let key = WasmEntityKey {
-            schema_key: "csv_row".to_owned(),
-            entity_pk: vec!["row".to_owned()],
-        };
+        let key = WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
         let duplicate = WasmEntityChanges::<WasmGuestBytes> {
             changes: vec![
                 WasmEntityChange::Delete(key.clone()),
@@ -1396,11 +1966,8 @@ mod tests {
     }
 
     #[test]
-    fn change_drain_validation_is_transition_wide() {
-        let key = WasmEntityKey {
-            schema_key: "csv_row".to_owned(),
-            entity_pk: vec!["row".to_owned()],
-        };
+    fn change_drain_validator_owns_framing_but_not_key_copies() {
+        let key = WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]);
         let page = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
             changes: WasmEntityChanges {
@@ -1410,7 +1977,7 @@ mod tests {
         };
         let mut validator = WasmChangeDrainValidator::new(WasmTransitionLimits::default()).unwrap();
         validator.accept_page(&page).unwrap();
-        assert!(validator.accept_page(&page).is_err());
+        validator.accept_page(&page).unwrap();
         validator.accept_eof();
         assert!(validator.accept_page(&page).is_err());
     }
@@ -1448,7 +2015,7 @@ mod tests {
         let inline = |offset, bytes: &[u8]| WasmOutputSplice {
             offset,
             delete_len: 0,
-            insert: WasmGuestBytes::Inline(bytes.to_vec()),
+            insert: WasmGuestBytes::Inline(bytes.to_vec().into()),
         };
 
         let record_limits = WasmTransitionLimits {

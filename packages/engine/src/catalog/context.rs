@@ -12,9 +12,11 @@ use crate::catalog::snapshot::{
     CatalogFingerprint, fingerprint_schema_facts, hash_fingerprint_part,
 };
 use crate::catalog::{CatalogSnapshot, SchemaCatalogFact};
-use crate::domain::{Domain, committed_row_is_exact_branch_scoped};
-use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
+use crate::domain::{Domain, committed_row_ref_is_exact_branch_scoped};
+use crate::live_state::{
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateRowRef,
+};
 use crate::schema::schema_key_from_definition;
 use crate::{LixError, NullableKeyFilter};
 
@@ -128,11 +130,11 @@ impl CatalogContext {
     {
         let catalog_rows = scan_catalog_rows(live_state, domain).await?;
         let mut hasher = blake3::Hasher::new();
-        for (schema_domain, row) in &catalog_rows {
+        for (schema_domain, row) in catalog_rows.iter() {
             hash_fingerprint_part(&mut hasher, &schema_domain.fingerprint_component());
             let snapshot_content = row
-                .snapshot_content
-                .as_deref()
+                .snapshot_content()
+                .map(|content| content.as_str())
                 .expect("catalog rows are filtered to rows with snapshot_content");
             hash_fingerprint_part(&mut hasher, snapshot_content);
         }
@@ -260,15 +262,33 @@ impl CatalogContext {
 
 /// Scans the raw registered-schema rows reachable from `domain`, without
 /// decoding their snapshots.
-async fn scan_catalog_rows<R>(
-    live_state: &R,
-    domain: &Domain,
-) -> Result<Vec<(Domain, MaterializedLiveStateRow)>, LixError>
+struct CatalogRows {
+    domains: Vec<CatalogDomainRows>,
+}
+
+impl CatalogRows {
+    fn iter(&self) -> impl Iterator<Item = (&Domain, MaterializedLiveStateRowRef<'_>)> {
+        self.domains.iter().flat_map(|domain_rows| {
+            domain_rows.rows.iter().filter_map(move |row| {
+                row_belongs_to_schema_catalog_domain(row, &domain_rows.domain)
+                    .then_some((&domain_rows.domain, row))
+            })
+        })
+    }
+}
+
+struct CatalogDomainRows {
+    domain: Domain,
+    rows: MaterializedLiveStateBatch,
+}
+
+async fn scan_catalog_rows<R>(live_state: &R, domain: &Domain) -> Result<CatalogRows, LixError>
 where
     R: LiveStateReader + ?Sized,
 {
-    let mut catalog_rows = Vec::new();
-    for schema_domain in domain.schema_catalog_domains() {
+    let schema_domains = domain.schema_catalog_domains();
+    let mut catalog_rows = Vec::with_capacity(schema_domains.len());
+    for schema_domain in schema_domains {
         let request = LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
@@ -281,24 +301,28 @@ where
             ..LiveStateScanRequest::default()
         };
         let rows = if schema_domain.untracked() {
-            live_state.scan_rows(&request).await?
+            live_state.scan_batch(&request).await?
         } else {
-            live_state.scan_tracked_rows(&request).await?
+            live_state.scan_tracked_batch(&request).await?
         };
-        catalog_rows.extend(
-            rows.into_iter()
-                .filter(|row| row_belongs_to_schema_catalog_domain(row, &schema_domain))
-                .map(|row| (schema_domain.clone(), row)),
-        );
+        catalog_rows.push(CatalogDomainRows {
+            domain: schema_domain,
+            rows,
+        });
     }
-    Ok(catalog_rows)
+    Ok(CatalogRows {
+        domains: catalog_rows,
+    })
 }
 
-fn facts_from_catalog_rows(
-    catalog_rows: &[(Domain, MaterializedLiveStateRow)],
-) -> Result<Vec<SchemaCatalogFact>, LixError> {
-    let mut facts = Vec::new();
-    for (schema_domain, row) in catalog_rows {
+fn facts_from_catalog_rows(catalog_rows: &CatalogRows) -> Result<Vec<SchemaCatalogFact>, LixError> {
+    let row_count = catalog_rows
+        .domains
+        .iter()
+        .map(|domain| domain.rows.len())
+        .sum();
+    let mut facts = Vec::with_capacity(row_count);
+    for (schema_domain, row) in catalog_rows.iter() {
         let Some((key, schema)) = decode_registered_schema_row(row)? else {
             continue;
         };
@@ -307,29 +331,32 @@ fn facts_from_catalog_rows(
     Ok(facts)
 }
 
-fn row_belongs_to_schema_catalog_domain(row: &MaterializedLiveStateRow, domain: &Domain) -> bool {
-    row.schema_key == REGISTERED_SCHEMA_KEY
-        && row.file_id.is_none()
-        && row.snapshot_content.is_some()
-        && row.branch_id.as_ref() == domain.branch_id()
-        && row.untracked == domain.untracked()
-        && committed_row_is_exact_branch_scoped(row, domain.branch_id())
+fn row_belongs_to_schema_catalog_domain(
+    row: MaterializedLiveStateRowRef<'_>,
+    domain: &Domain,
+) -> bool {
+    row.schema_key() == REGISTERED_SCHEMA_KEY
+        && row.file_id().is_none()
+        && row.snapshot_content().is_some()
+        && row.branch_id() == domain.branch_id()
+        && row.untracked() == domain.untracked()
+        && committed_row_ref_is_exact_branch_scoped(row, domain.branch_id())
 }
 
 fn decode_registered_schema_row(
-    row: &MaterializedLiveStateRow,
+    row: MaterializedLiveStateRowRef<'_>,
 ) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
-    if row.schema_key != REGISTERED_SCHEMA_KEY {
+    if row.schema_key() != REGISTERED_SCHEMA_KEY {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
                 "expected lix_registered_schema row, got schema_key={}",
-                row.schema_key
+                row.schema_key()
             ),
         ));
     }
 
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+    let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str()) else {
         return Ok(None);
     };
 
@@ -358,7 +385,7 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
-    use crate::live_state::LiveStateRowRequest;
+    use crate::live_state::{LiveStateRowRequest, MaterializedLiveStateRow};
 
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
@@ -836,7 +863,8 @@ mod tests {
                         "additionalProperties": false
                     }
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ),
         }
     }

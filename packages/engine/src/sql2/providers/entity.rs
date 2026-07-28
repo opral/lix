@@ -17,10 +17,12 @@ use serde_json::Value as JsonValue;
 use crate::branch::BranchRefReader;
 use crate::commit_graph::CommitGraphReader;
 use crate::entity_pk::EntityPk;
+#[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter, LiveStateScanRequest,
 };
+use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder};
 use crate::sql2::branch_scope::{BranchBinding, resolve_provider_branch_ids};
 use crate::sql2::catalog::{
     EntityColumnType, EntitySurfaceShape, EntitySurfaceSpec, PublicCatalog, PublicSurfaceKind,
@@ -39,14 +41,13 @@ use crate::sql2::{
     WriteContextLiveStateReader,
 };
 use crate::transaction::types::{
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
+    RawWriteBatch, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 
 use super::ProviderSelection;
 use super::entity_history::register_entity_history_surface;
 use datafusion::physical_plan::ExecutionPlan;
 
-use super::columns::{ColumnTableError, LIVE_STATE_COLS, build_array};
 use super::spec::{
     InsertApply, PlannedDml, PlannedScan, TableSpec, projected_schema, register_spec_table,
     row_source,
@@ -375,12 +376,18 @@ impl TableSpec for EntitySpec {
                         return RecordBatch::try_new(schema, columns)
                             .map_err(DataFusionError::from);
                     }
-                    let mut rows = live_state
-                        .scan_rows(&request)
+                    let rows = live_state
+                        .scan_batch(&request)
                         .await
                         .map_err(lix_error_to_datafusion_error)?;
-                    apply_entity_row_filters(&mut rows, &row_filters)?;
-                    entity_record_batch(&spec, schema, &rows, batch_projection)
+                    let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                    entity_record_batch_with_parsed(
+                        &spec,
+                        schema,
+                        &filtered.rows,
+                        batch_projection,
+                        filtered.parsed_snapshots.as_deref(),
+                    )
                 },
             ),
         })
@@ -427,12 +434,18 @@ impl TableSpec for EntitySpec {
                 batch_projection,
             ),
             |(spec, live_state, schema, request, row_filters, batch_projection)| async move {
-                let mut rows = live_state
-                    .scan_rows(&request)
+                let rows = live_state
+                    .scan_batch(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
-                apply_entity_row_filters(&mut rows, &row_filters)?;
-                entity_record_batch(&spec, schema, &rows, batch_projection)
+                let filtered = apply_entity_batch_filters(rows, &row_filters)?;
+                entity_record_batch_with_parsed(
+                    &spec,
+                    schema,
+                    &filtered.rows,
+                    batch_projection,
+                    filtered.parsed_snapshots.as_deref(),
+                )
             },
         );
         let spec = Arc::clone(&self.spec);
@@ -492,95 +505,97 @@ fn entity_delete_stage_rows_from_batch(
     batch: &RecordBatch,
     spec: &EntitySurfaceSpec,
     branch_binding: &BranchBinding,
-) -> Result<Vec<TransactionWriteRow>> {
-    (0..batch.num_rows())
-        .map(|row_index| {
-            let global = optional_bool_value(
-                batch,
-                row_index,
-                "lixcol_global",
-                "DELETE FROM entity surface",
-            )?
-            .unwrap_or(false);
-            let source_branch_id = optional_string_value(
-                batch,
-                row_index,
-                "lixcol_branch_id",
-                "DELETE FROM entity surface",
-            )?;
-            if matches!(branch_binding, BranchBinding::Explicit)
-                && global
-                && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
-            {
-                return Err(DataFusionError::Execution(
-                    "DELETE through an entity by-branch surface cannot mutate a projected global row"
-                        .to_string(),
-                ));
-            }
-            let branch_id = if global {
-                GLOBAL_BRANCH_ID.to_string()
-            } else {
-                source_branch_id
-                    .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "DELETE FROM entity by-branch requires lixcol_branch_id".to_string(),
-                        )
-                    })?
-            };
-            let entity_pk = EntityPk::from_json_array_text(&required_string_value(
-                batch,
-                row_index,
-                "lixcol_entity_pk",
-                "DELETE FROM entity surface",
-            )?)
-            .map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "DELETE FROM entity surface has invalid lixcol_entity_pk: {error}"
-                ))
-            })?;
-            let metadata = optional_string_value(
-                batch,
-                row_index,
-                "lixcol_metadata",
-                "DELETE FROM entity surface",
-            )?
-            .map(|value| {
-                let metadata =
-                    parse_row_metadata_value(&value, &spec.schema_key).map_err(lix_error_to_datafusion_error)?;
-                TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
-                    .map_err(lix_error_to_datafusion_error)
-            })
-            .transpose()?;
-
-            Ok(TransactionWriteRow {
-                entity_pk: Some(entity_pk),
-                schema_key: spec.schema_key.clone(),
-                file_id: optional_string_value(
-                    batch,
-                    row_index,
-                    "lixcol_file_id",
-                    "DELETE FROM entity surface",
-                )?,
-                snapshot: None,
-                metadata,
-                origin: None,
-                created_at: None,
-                updated_at: None,
-                global,
-                change_id: None,
-                commit_id: None,
-                untracked: optional_bool_value(
-                    batch,
-                    row_index,
-                    "lixcol_untracked",
-                    "DELETE FROM entity surface",
-                )?
-                .unwrap_or(false),
-                branch_id,
-            })
+) -> Result<RawWriteBatch> {
+    let mut rows = RawWriteBatch::with_capacity(batch.num_rows());
+    for row_index in 0..batch.num_rows() {
+        let global = optional_bool_value(
+            batch,
+            row_index,
+            "lixcol_global",
+            "DELETE FROM entity surface",
+        )?
+        .unwrap_or(false);
+        let source_branch_id = optional_string_value(
+            batch,
+            row_index,
+            "lixcol_branch_id",
+            "DELETE FROM entity surface",
+        )?;
+        if matches!(branch_binding, BranchBinding::Explicit)
+            && global
+            && source_branch_id.as_deref() != Some(GLOBAL_BRANCH_ID)
+        {
+            return Err(DataFusionError::Execution(
+                "DELETE through an entity by-branch surface cannot mutate a projected global row"
+                    .to_string(),
+            ));
+        }
+        let branch_id = if global {
+            GLOBAL_BRANCH_ID.to_string()
+        } else {
+            source_branch_id
+                .or_else(|| branch_binding.active_branch_id().map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "DELETE FROM entity by-branch requires lixcol_branch_id".to_string(),
+                    )
+                })?
+        };
+        let entity_pk = EntityPk::from_json_array_text(&required_string_value(
+            batch,
+            row_index,
+            "lixcol_entity_pk",
+            "DELETE FROM entity surface",
+        )?)
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "DELETE FROM entity surface has invalid lixcol_entity_pk: {error}"
+            ))
+        })?;
+        let metadata = optional_string_value(
+            batch,
+            row_index,
+            "lixcol_metadata",
+            "DELETE FROM entity surface",
+        )?
+        .map(|value| {
+            let metadata = parse_row_metadata_value(&value, &spec.schema_key)
+                .map_err(lix_error_to_datafusion_error)?;
+            TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
+                .map_err(lix_error_to_datafusion_error)
         })
-        .collect()
+        .transpose()?;
+        let file_id = optional_string_value(
+            batch,
+            row_index,
+            "lixcol_file_id",
+            "DELETE FROM entity surface",
+        )?
+        .map(Into::into);
+        let untracked = optional_bool_value(
+            batch,
+            row_index,
+            "lixcol_untracked",
+            "DELETE FROM entity surface",
+        )?
+        .unwrap_or(false);
+        rows.push_parts(
+            Some(entity_pk),
+            spec.schema_key.as_str().into(),
+            file_id,
+            None,
+            metadata,
+            None,
+            None,
+            None,
+            global,
+            None,
+            None,
+            untracked,
+            branch_id.into(),
+        );
+    }
+    Ok(rows)
 }
 
 pub(super) fn entity_pks_from_primary_key_filters(
@@ -1294,6 +1309,7 @@ fn identity_matches_parts(
         })
 }
 
+#[cfg(test)]
 fn apply_entity_row_filters(
     rows: &mut Vec<MaterializedLiveStateRow>,
     filters: &[EntityRowFilter],
@@ -1328,6 +1344,58 @@ fn apply_entity_row_filters(
     }
     *rows = filtered_rows;
     Ok(())
+}
+
+fn apply_entity_batch_filters(
+    rows: MaterializedLiveStateBatch,
+    filters: &[EntityRowFilter],
+) -> Result<FilteredEntityBatch> {
+    if filters.is_empty() {
+        return Ok(FilteredEntityBatch {
+            rows,
+            parsed_snapshots: None,
+        });
+    }
+    let mut filtered = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
+    let mut parsed_snapshots = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let Some(snapshot_content) = row.snapshot_content().map(AsRef::<str>::as_ref) else {
+            continue;
+        };
+        let snapshot = parse_snapshot_value(snapshot_content).map_err(|error| {
+            DataFusionError::External(Box::new(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "entity scan filter could not parse snapshot_content for schema '{}' entity_pk '{:?}': {error}",
+                    row.schema_key(),
+                    row.entity_pk()
+                ),
+            )))
+        })?;
+        let mut matches = true;
+        for filter in filters {
+            if !filter.matches_snapshot(Some(&snapshot), row.schema_key())? {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            filtered.push_ref(row, None);
+            parsed_snapshots.push(Some(snapshot));
+        }
+    }
+    Ok(FilteredEntityBatch {
+        rows: filtered.finish(),
+        parsed_snapshots: Some(parsed_snapshots),
+    })
+}
+
+struct FilteredEntityBatch {
+    rows: MaterializedLiveStateBatch,
+    /// Parsed snapshots retained only when row predicates already needed a
+    /// DOM. Projection consumes this side column instead of parsing winners a
+    /// second time.
+    parsed_snapshots: Option<Vec<Option<JsonValue>>>,
 }
 
 fn entity_live_state_scan_request(
@@ -1418,23 +1486,38 @@ impl EntityBatchProjection {
     }
 }
 
+#[cfg(test)]
 fn entity_record_batch(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[MaterializedLiveStateRow],
+    rows: &MaterializedLiveStateBatch,
     projection: EntityBatchProjection,
+) -> Result<RecordBatch> {
+    entity_record_batch_with_parsed(spec, schema, rows, projection, None)
+}
+
+fn entity_record_batch_with_parsed(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &MaterializedLiveStateBatch,
+    projection: EntityBatchProjection,
+    parsed_snapshots: Option<&[Option<JsonValue>]>,
 ) -> Result<RecordBatch> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options)
             .map_err(DataFusionError::from);
     }
+    if let Some(parsed_snapshots) = parsed_snapshots {
+        debug_assert_eq!(parsed_snapshots.len(), rows.len());
+        return entity_record_batch_from_parsed_snapshots(spec, schema, rows, parsed_snapshots);
+    }
 
     match projection {
         EntityBatchProjection::ParsedSnapshots => {
             entity_record_batch_from_snapshots(spec, schema, rows)
         }
-        EntityBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked) => {
+        EntityBatchProjection::RawTrackedProjection if rows.iter().all(|row| !row.untracked()) => {
             entity_record_batch_from_raw_projection(spec, schema, rows)
         }
         // Raw projection depends on the tracked write invariant: compact
@@ -1449,17 +1532,26 @@ fn entity_record_batch(
 fn entity_record_batch_from_snapshots(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[MaterializedLiveStateRow],
+    rows: &MaterializedLiveStateBatch,
 ) -> Result<RecordBatch> {
     let snapshots = rows
         .iter()
-        .map(|row| parse_snapshot(row.snapshot_content.as_deref()))
+        .map(|row| parse_snapshot(row.snapshot_content().map(AsRef::<str>::as_ref)))
         .collect::<Result<Vec<_>>>()?;
 
+    entity_record_batch_from_parsed_snapshots(spec, schema, rows, &snapshots)
+}
+
+fn entity_record_batch_from_parsed_snapshots(
+    spec: &EntitySurfaceSpec,
+    schema: SchemaRef,
+    rows: &MaterializedLiveStateBatch,
+    snapshots: &[Option<JsonValue>],
+) -> Result<RecordBatch> {
     let columns = schema
         .fields()
         .iter()
-        .map(|field| entity_column_array(spec, field.name(), rows, &snapshots))
+        .map(|field| entity_column_array(spec, field.name(), rows, snapshots))
         .collect::<Result<Vec<_>>>()?;
 
     RecordBatch::try_new(schema, columns).map_err(DataFusionError::from)
@@ -1468,7 +1560,7 @@ fn entity_record_batch_from_snapshots(
 fn entity_record_batch_from_raw_projection(
     spec: &EntitySurfaceSpec,
     schema: SchemaRef,
-    rows: &[MaterializedLiveStateRow],
+    rows: &MaterializedLiveStateBatch,
 ) -> Result<RecordBatch> {
     let decoder = EntityProjectionDecoder::new(
         spec,
@@ -1480,10 +1572,11 @@ fn entity_record_batch_from_raw_projection(
     // The tracked write path persists TransactionJson-normalized bytes.
     // Visibility is resolved by the existing live-state reader first.
     let mut visible_columns = decoder
-        .decode_arrow_columns(
-            rows.iter()
-                .map(|row| row.snapshot_content.as_deref().map(str::as_bytes)),
-        )
+        .decode_arrow_columns(rows.iter().map(|row| {
+            row.snapshot_content()
+                .map(AsRef::<str>::as_ref)
+                .map(str::as_bytes)
+        }))
         .map_err(entity_projection_error_to_datafusion_error)?
         .into_iter();
     let columns = schema
@@ -1510,7 +1603,7 @@ fn entity_record_batch_from_raw_projection(
 fn entity_column_array(
     spec: &EntitySurfaceSpec,
     column_name: &str,
-    rows: &[MaterializedLiveStateRow],
+    rows: &MaterializedLiveStateBatch,
     snapshots: &[Option<JsonValue>],
 ) -> Result<ArrayRef> {
     if let Some(property_name) = column_name.strip_prefix("lixcol_") {
@@ -1559,45 +1652,103 @@ fn entity_column_array(
     })
 }
 
-/// Materialize `lixcol_*` system columns by stripping the prefix and using the
-/// shared live-state accessors in [`LIVE_STATE_COLS`].
+/// Materialize `lixcol_*` system columns from borrowed batch rows.
+///
+/// Identity dictionaries and payload arenas remain owned by the live-state
+/// batch until Arrow has copied the selected values into its output buffers;
+/// no terminal row DTOs are manufactured on this path.
 fn entity_system_column_array(
     column_name: &str,
-    rows: &[MaterializedLiveStateRow],
+    rows: &MaterializedLiveStateBatch,
 ) -> Result<ArrayRef> {
-    let col = LIVE_STATE_COLS.col(column_name).ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "sql2 entity provider does not support system column 'lixcol_{column_name}'"
-        ))
-    })?;
-    build_array(col, rows).map_err(entity_system_column_error)
-}
-
-/// Map [`ColumnTableError`] onto entity's existing error surface. Only the
-/// `Row` variant is reachable from [`entity_system_column_array`] (the column
-/// lookup happens before the build); the rest are mapped for completeness.
-fn entity_system_column_error(error: ColumnTableError) -> DataFusionError {
-    match error {
-        ColumnTableError::Row(error) => lix_error_to_datafusion_error(error),
-        ColumnTableError::UnsupportedColumn(other) => DataFusionError::Execution(format!(
-            "sql2 entity provider does not support system column 'lixcol_{other}'"
-        )),
-        ColumnTableError::Arrow(error) | ColumnTableError::ArrowZeroColumn(error) => {
-            DataFusionError::from(error)
+    #[expect(trivial_casts)]
+    let array = match column_name {
+        "entity_pk" => Arc::new(StringArray::from(
+            rows.iter()
+                .map(|row| row.entity_pk().as_json_array_text().map(Some))
+                .collect::<std::result::Result<Vec<_>, LixError>>()
+                .map_err(lix_error_to_datafusion_error)?,
+        )) as ArrayRef,
+        "schema_key" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.schema_key())),
+        )) as ArrayRef,
+        "file_id" => {
+            Arc::new(StringArray::from_iter(rows.iter().map(|row| row.file_id()))) as ArrayRef
         }
-    }
+        "snapshot_content" => Arc::new(StringArray::from_iter(
+            rows.iter()
+                .map(|row| row.snapshot_content().map(AsRef::<str>::as_ref)),
+        )) as ArrayRef,
+        "metadata" => Arc::new(StringArray::from_iter(rows.iter().map(|row| {
+            row.metadata()
+                .map(AsRef::<str>::as_ref)
+                .map(crate::serialize_row_metadata)
+        }))) as ArrayRef,
+        "created_at" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.created_at().to_string())),
+        )) as ArrayRef,
+        "updated_at" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.updated_at().to_string())),
+        )) as ArrayRef,
+        "global" => Arc::new(BooleanArray::from_iter(
+            rows.iter().map(|row| Some(row.global())),
+        )) as ArrayRef,
+        "change_id" => Arc::new(StringArray::from_iter(
+            rows.iter()
+                .map(|row| row.change_id().map(|id| id.to_string())),
+        )) as ArrayRef,
+        "commit_id" => Arc::new(StringArray::from_iter(
+            rows.iter()
+                .map(|row| row.commit_id().map(|id| id.to_string())),
+        )) as ArrayRef,
+        "untracked" => Arc::new(BooleanArray::from_iter(
+            rows.iter().map(|row| Some(row.untracked())),
+        )) as ArrayRef,
+        "branch_id" => Arc::new(StringArray::from_iter(
+            rows.iter().map(|row| Some(row.branch_id())),
+        )) as ArrayRef,
+        _ => {
+            return Err(DataFusionError::Execution(format!(
+                "sql2 entity provider does not support system column 'lixcol_{column_name}'"
+            )));
+        }
+    };
+    Ok(array)
 }
 
 pub(super) fn parse_snapshot(snapshot_content: Option<&str>) -> Result<Option<JsonValue>> {
     snapshot_content
         .map(|snapshot| {
-            serde_json::from_str::<JsonValue>(snapshot).map_err(|error| {
+            parse_snapshot_value(snapshot).map_err(|error| {
                 DataFusionError::Execution(format!(
                     "sql2 entity provider expected valid snapshot_content JSON: {error}"
                 ))
             })
         })
         .transpose()
+}
+
+fn parse_snapshot_value(snapshot: &str) -> serde_json::Result<JsonValue> {
+    #[cfg(test)]
+    ENTITY_SNAPSHOT_PARSE_COUNT.with(|count| count.set(count.get() + 1));
+    serde_json::from_str(snapshot)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENTITY_SNAPSHOT_PARSE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+fn reset_entity_snapshot_parse_count() {
+    ENTITY_SNAPSHOT_PARSE_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn entity_snapshot_parse_count() -> usize {
+    ENTITY_SNAPSHOT_PARSE_COUNT.with(std::cell::Cell::get)
 }
 
 pub(super) fn entity_json_text_value(
@@ -1663,7 +1814,8 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::live_state::{
         LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter,
-        LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+        LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+        MaterializedLiveStateRow,
     };
     use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
@@ -1742,11 +1894,25 @@ mod tests {
             ]))
         }
 
-        async fn scan_live_state(
+        async fn scan_live_state_batch(
             &mut self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(Vec::new())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::default())
+        }
+
+        async fn load_exact_live_state_batch(
+            &mut self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            Ok(
+                crate::live_state::MaterializedLiveStateExactBatch::from_rows(vec![
+                    None;
+                    request
+                        .rows
+                        .len()
+                ]),
+            )
         }
 
         async fn load_branch_head(
@@ -1818,9 +1984,9 @@ mod tests {
             file_id: None,
             snapshot_content: Some(
                 "{\"body\":\"hello\",\"rating\":4.5,\"count\":7,\"enabled\":true,\"meta\":{\"x\":1}}"
-                    .to_string(),
+                    .into(),
             ),
-            metadata: Some(json!({"source": "test"}).to_string()),
+            metadata: Some(json!({"source": "test"}).to_string().into()),
             deleted: false,
             branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
             change_id: Some(ChangeId::for_test_label("change-a")),
@@ -1830,6 +1996,10 @@ mod tests {
             created_at: LixTimestamp::expect_parse("test created_at", "2026-04-23T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("test updated_at", "2026-04-23T01:00:00Z"),
         }
+    }
+
+    fn live_batch(rows: Vec<MaterializedLiveStateRow>) -> MaterializedLiveStateBatch {
+        MaterializedLiveStateBatch::from_rows(rows)
     }
 
     fn entity_insert_spec_with_primary_key() -> Arc<super::EntitySurfaceSpec> {
@@ -1926,7 +2096,7 @@ mod tests {
     #[test]
     fn zero_column_entity_batches_keep_row_count_on_the_generic_path() {
         let spec = entity_insert_spec_with_primary_key();
-        let rows = [live_row(), live_row()];
+        let rows = live_batch(vec![live_row(), live_row()]);
         let batch = entity_record_batch(
             &spec,
             Arc::new(Schema::empty()),
@@ -1936,6 +2106,96 @@ mod tests {
         .expect("generic zero-column entity batch should build");
         assert_eq!(batch.num_columns(), 0);
         assert_eq!(batch.num_rows(), rows.len());
+    }
+
+    #[test]
+    fn filtered_entity_projection_reuses_each_candidate_parse_once() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "type": "object",
+                "properties": { "body": { "type": "string" } }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let mut winner = live_row();
+        winner.untracked = true;
+        let rejected = MaterializedLiveStateRow {
+            snapshot_content: Some(r#"{"body":"goodbye"}"#.into()),
+            ..live_row()
+        };
+        let tombstone = MaterializedLiveStateRow {
+            snapshot_content: None,
+            ..live_row()
+        };
+        let filter = super::EntityRowFilter::ColumnEq {
+            column: "body".to_string(),
+            column_type: EntityColumnType::String,
+            value: super::EntityFilterValue::String("hello".to_string()),
+        };
+
+        super::reset_entity_snapshot_parse_count();
+        let filtered = super::apply_entity_batch_filters(
+            live_batch(vec![winner, rejected, tombstone]),
+            &[filter],
+        )
+        .expect("entity filter should build a parsed side column");
+        assert_eq!(filtered.rows.len(), 1);
+        assert_eq!(
+            filtered
+                .parsed_snapshots
+                .as_ref()
+                .expect("filtered rows retain parsed snapshots")
+                .len(),
+            filtered.rows.len()
+        );
+        assert_eq!(super::entity_snapshot_parse_count(), 2);
+
+        let batch = super::entity_record_batch_with_parsed(
+            &spec,
+            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            &filtered.rows,
+            super::EntityBatchProjection::RawTrackedProjection,
+            filtered.parsed_snapshots.as_deref(),
+        )
+        .expect("mixed-retention projection should consume the parsed side column");
+        assert_eq!(
+            super::entity_snapshot_parse_count(),
+            2,
+            "Arrow projection must not parse a filtered winner again"
+        );
+        assert_eq!(
+            batch
+                .column_by_name("body")
+                .expect("body column")
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .expect("body is utf8")
+                .value(0),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn unfiltered_parsed_projection_parses_each_row_once() {
+        let spec = Arc::new(
+            derive_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "project_message",
+                "type": "object",
+                "properties": { "body": { "type": "string" } }
+            }))
+            .expect("schema should derive entity surface spec"),
+        );
+        let rows = live_batch(vec![live_row(), live_row()]);
+        super::reset_entity_snapshot_parse_count();
+        entity_record_batch(
+            &spec,
+            entity_surface_schema(&spec, EntitySurfaceShape::Active),
+            &rows,
+            super::EntityBatchProjection::ParsedSnapshots,
+        )
+        .expect("parsed entity projection should build");
+        assert_eq!(super::entity_snapshot_parse_count(), rows.len());
     }
 
     fn filter_pushdown_spec() -> Arc<super::EntitySurfaceSpec> {
@@ -2133,7 +2393,7 @@ mod tests {
         let batch = entity_record_batch(
             &spec,
             schema,
-            &[live_row()],
+            &live_batch(vec![live_row()]),
             super::EntityBatchProjection::ParsedSnapshots,
         )
         .expect("entity batch should build");
@@ -2214,7 +2474,7 @@ mod tests {
         let row = MaterializedLiveStateRow {
             snapshot_content: Some(
                 r#"{"body":"hello","rating":4.5,"count":7,"enabled":true,"meta":{"z":2,"a":1}}"#
-                    .to_string(),
+                    .into(),
             ),
             ..live_row()
         };
@@ -2232,7 +2492,7 @@ mod tests {
             super::EntityBatchProjection::ParsedSnapshots
         ));
 
-        let batch = entity_record_batch(&spec, schema, &[row], projection)
+        let batch = entity_record_batch(&spec, schema, &live_batch(vec![row]), projection)
             .expect("exact primary-key batch should build");
         assert_eq!(
             batch
@@ -2274,11 +2534,11 @@ mod tests {
         let batch = entity_record_batch(
             &spec,
             entity_surface_schema(&spec, EntitySurfaceShape::Active),
-            &[MaterializedLiveStateRow {
-                snapshot_content: Some(r#"{"body":"sidecar","count":"bad","count":7}"#.to_string()),
+            &live_batch(vec![MaterializedLiveStateRow {
+                snapshot_content: Some(r#"{"body":"sidecar","count":"bad","count":7}"#.into()),
                 untracked: true,
                 ..live_row()
-            }],
+            }]),
             super::EntityBatchProjection::RawTrackedProjection,
         )
         .expect("untracked broad batch must use the established parser path");
@@ -2338,22 +2598,22 @@ mod tests {
         let branch_row = MaterializedLiveStateRow {
             entity_pk: crate::entity_pk::EntityPk::single("branch-row"),
             file_id: Some("file-branch".to_string()),
-            snapshot_content: Some(branch_snapshot.normalized().to_string()),
-            metadata: Some(r#"{"source":"branch"}"#.to_string()),
+            snapshot_content: Some(branch_snapshot.normalized().into()),
+            metadata: Some(r#"{"source":"branch"}"#.into()),
             ..live_row()
         };
         let global_row = MaterializedLiveStateRow {
             entity_pk: crate::entity_pk::EntityPk::single("global-row"),
             file_id: None,
-            snapshot_content: Some(global_snapshot.normalized().to_string()),
-            metadata: Some(r#"{"source":"global"}"#.to_string()),
+            snapshot_content: Some(global_snapshot.normalized().into()),
+            metadata: Some(r#"{"source":"global"}"#.into()),
             branch_id: "global".into(),
             global: true,
             change_id: Some(ChangeId::for_test_label("change-global")),
             commit_id: Some(CommitId::for_test_label("commit-global")),
             ..live_row()
         };
-        let rows = vec![branch_row, global_row];
+        let rows = live_batch(vec![branch_row, global_row]);
         let schema = entity_surface_schema(&spec, EntitySurfaceShape::ByBranch);
         let parsed = entity_record_batch(
             &spec,
@@ -2415,10 +2675,10 @@ mod tests {
         let error = entity_record_batch(
             &spec,
             entity_surface_schema(&spec, EntitySurfaceShape::Active),
-            &[MaterializedLiveStateRow {
-                snapshot_content: Some("{not-json".to_string()),
+            &live_batch(vec![MaterializedLiveStateRow {
+                snapshot_content: Some("{not-json".into()),
                 ..live_row()
-            }],
+            }]),
             super::EntityBatchProjection::RawTrackedProjection,
         )
         .expect_err("malformed snapshot must fail");
@@ -2747,7 +3007,7 @@ mod tests {
     #[test]
     fn payload_row_filter_invalid_snapshot_errors() {
         let mut rows = vec![MaterializedLiveStateRow {
-            snapshot_content: Some("{not-json".to_string()),
+            snapshot_content: Some("{not-json".into()),
             ..live_row()
         }];
         let filters = vec![super::EntityRowFilter::ColumnEq {
@@ -2770,7 +3030,7 @@ mod tests {
     #[test]
     fn payload_integer_filter_rejects_out_of_bigint_snapshot() {
         let mut rows = vec![MaterializedLiveStateRow {
-            snapshot_content: Some(r#"{"body":"hello","count":9223372036854775808}"#.to_string()),
+            snapshot_content: Some(r#"{"body":"hello","count":9223372036854775808}"#.into()),
             ..live_row()
         }];
         let filters = vec![super::EntityRowFilter::ColumnEq {

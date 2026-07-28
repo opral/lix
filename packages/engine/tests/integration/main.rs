@@ -4,6 +4,7 @@
 mod support;
 
 mod branching;
+mod checkpoint_gc;
 mod code_structure;
 mod commit_graph;
 mod correlated_live_state_perf;

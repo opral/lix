@@ -2,11 +2,11 @@ use crate::LixError;
 use crate::changelog::CommitId;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
-    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStateStoreReader,
-    plan_merge,
+    TrackedStateDiff, TrackedStateDiffRequest, TrackedStateMergePlan, TrackedStatePayloadBatch,
+    TrackedStateStoreReader, plan_merge,
 };
 
-use super::conflicts::{MergeConflict, conflicts_from_plan};
+use super::conflicts::MergeConflictBatch;
 use super::stats::{MergeStats, stats_from_diff, stats_from_plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,13 +30,16 @@ pub(crate) struct MergeAnalysis {
     pub(crate) source_diff: TrackedStateDiff,
     pub(crate) target_diff: TrackedStateDiff,
     pub(crate) stats: MergeStats,
-    pub(crate) conflicts: Vec<MergeConflict>,
     pub(crate) merge_plan: Option<TrackedStateMergePlan>,
 }
 
 impl MergeAnalysis {
     pub(crate) fn merge_plan(&self) -> Option<&TrackedStateMergePlan> {
         self.merge_plan.as_ref()
+    }
+
+    pub(crate) fn conflict_batch(&self) -> Option<MergeConflictBatch<'_>> {
+        self.merge_plan.as_ref().map(MergeConflictBatch::from_plan)
     }
 }
 
@@ -76,8 +79,12 @@ where
 
     let merge_plan = if outcome == MergeOutcome::MergeCommitted {
         let fallback_ids =
-            crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff);
-        let payloads = reader.load_change_payloads(&fallback_ids).await?;
+            crate::tracked_state::merge_payload_fallback_ids(&target_diff, &source_diff)?;
+        let payloads = if fallback_ids.is_empty() {
+            TrackedStatePayloadBatch::default()
+        } else {
+            reader.load_change_payloads(&fallback_ids).await?
+        };
         Some(plan_merge(&target_diff, &source_diff, &payloads)?)
     } else {
         None
@@ -93,25 +100,18 @@ where
             .unwrap_or_default(),
     };
 
-    let conflicts = merge_plan
-        .as_ref()
-        .map(conflicts_from_plan)
-        .transpose()?
-        .unwrap_or_default();
-
     Ok(MergeAnalysis {
         outcome,
         commits,
         source_diff,
         target_diff,
         stats,
-        conflicts,
         merge_plan,
     })
 }
 
 fn exclude_internal_checkpoint_markers(diff: &mut TrackedStateDiff) {
     diff.entries.retain(|entry| {
-        entry.identity.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+        entry.identity.schema_key() != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
     });
 }

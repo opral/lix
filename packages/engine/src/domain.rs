@@ -1,5 +1,7 @@
 use crate::entity_pk::EntityPk;
+#[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::MaterializedLiveStateRowRef;
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 /// Validation/storage coordinate for repository facts.
@@ -39,11 +41,20 @@ impl Domain {
         Self::any_file(branch_id, untracked)
     }
 
+    #[cfg(test)]
     pub(crate) fn for_live_row(row: &MaterializedLiveStateRow) -> Self {
         Self::exact_file(
             row.branch_id.to_string(),
             row.untracked,
             row.file_id.clone(),
+        )
+    }
+
+    pub(crate) fn for_live_row_ref(row: MaterializedLiveStateRowRef<'_>) -> Self {
+        Self::exact_file(
+            row.branch_id(),
+            row.untracked(),
+            row.file_id().map(str::to_owned),
         )
     }
 
@@ -103,13 +114,20 @@ impl Domain {
         }
     }
 
-    pub(crate) fn contains(&self, row: &MaterializedLiveStateRow) -> bool {
-        row.branch_id.as_ref() == self.branch_id
-            && row.untracked == self.untracked
-            && committed_row_is_exact_branch_scoped(row, &self.branch_id)
+    pub(crate) fn contains_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+        row.branch_id() == self.branch_id
+            && row.untracked() == self.untracked
+            && self.contains_canonical_ref(row)
+    }
+
+    /// Matches branch and file scope while accepting whichever durability
+    /// member won canonical tracked/untracked overlay.
+    pub(crate) fn contains_canonical_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+        row.branch_id() == self.branch_id
+            && committed_row_ref_is_exact_branch_scoped(row, &self.branch_id)
             && match &self.file_scope {
                 DomainFileScope::Any => true,
-                DomainFileScope::Exact(file_id) => row.file_id == *file_id,
+                DomainFileScope::Exact(file_id) => row.file_id() == file_id.as_deref(),
             }
     }
 
@@ -193,6 +211,7 @@ impl DomainRowIdentity {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_live_row(row: &MaterializedLiveStateRow) -> Self {
         Self::new(
             Domain::for_live_row(row),
@@ -252,13 +271,10 @@ impl DomainRowIdentity {
         self.entity_pk.clone()
     }
 
-    pub(crate) fn matches_parts(
-        &self,
-        domain: &Domain,
-        schema_key: &str,
-        entity_pk: &EntityPk,
-    ) -> bool {
-        &self.domain == domain && self.schema_key == schema_key && &self.entity_pk == entity_pk
+    pub(crate) fn matches_live_row_ref(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+        self.domain.contains_ref(row)
+            && self.schema_key == row.schema_key()
+            && &self.entity_pk == row.entity_pk()
     }
 
     pub(crate) fn reachable_target_identities(&self) -> Vec<Self> {
@@ -301,12 +317,11 @@ impl DomainSchemaIdentity {
     }
 }
 
-pub(crate) fn committed_row_is_exact_branch_scoped(
-    row: &MaterializedLiveStateRow,
+pub(crate) fn committed_row_ref_is_exact_branch_scoped(
+    row: MaterializedLiveStateRowRef<'_>,
     branch_id: &str,
 ) -> bool {
-    row.branch_id.as_ref() == branch_id
-        && row.global == (row.branch_id.as_ref() == GLOBAL_BRANCH_ID)
+    row.branch_id() == branch_id && row.global() == (row.branch_id() == GLOBAL_BRANCH_ID)
 }
 
 fn nullable_filter_from_option(value: Option<&String>) -> NullableKeyFilter<String> {

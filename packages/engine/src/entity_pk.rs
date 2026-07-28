@@ -1,11 +1,19 @@
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::ops::Deref;
+use std::sync::Arc;
+
 use base64::Engine as _;
+use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
 use crate::LixError;
-use crate::common::json_pointer_get;
+use crate::common::{SharedStr, json_pointer_get};
 use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
+
+type EntityPkComponentBuffer = SmallVec<[EntityPkComponent; 2]>;
 
 /// Logical entity primary key derived from a schema primary key.
 ///
@@ -13,7 +21,95 @@ use musli::{Allocator, Context, Decode, Decoder, Encode, Encoder};
 /// scalar representations only at API and SQL boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct EntityPk {
-    pub(crate) components: SmallVec<[EntityPkComponent; 1]>,
+    pub(crate) components: EntityPkComponents,
+}
+
+/// A single primary-key component stays inline; composite tuples share one
+/// immutable component slice across every identity clone.
+///
+/// This mirrors a small-vector's one-component happy path without making a
+/// composite clone allocate a fresh vector. Component payloads are themselves
+/// shared, so cloning either representation only increments existing owners.
+#[derive(Debug, Clone)]
+pub(crate) enum EntityPkComponents {
+    Empty,
+    Single(EntityPkComponent),
+    Shared(Arc<[EntityPkComponent]>),
+}
+
+impl EntityPkComponents {
+    fn from_smallvec(mut components: EntityPkComponentBuffer) -> Self {
+        match components.len() {
+            0 => Self::Empty,
+            1 => Self::Single(
+                components
+                    .pop()
+                    .expect("one primary-key component was just counted"),
+            ),
+            2 => {
+                let second = components
+                    .pop()
+                    .expect("two primary-key components were just counted");
+                let first = components
+                    .pop()
+                    .expect("two primary-key components were just counted");
+                let owner: Arc<[EntityPkComponent; 2]> = Arc::new([first, second]);
+                Self::Shared(owner)
+            }
+            _ => Self::Shared(Arc::from(components.into_vec())),
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[EntityPkComponent] {
+        match self {
+            Self::Empty => &[],
+            Self::Single(component) => std::slice::from_ref(component),
+            Self::Shared(components) => components,
+        }
+    }
+}
+
+impl Deref for EntityPkComponents {
+    type Target = [EntityPkComponent];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a EntityPkComponents {
+    type Item = &'a EntityPkComponent;
+    type IntoIter = std::slice::Iter<'a, EntityPkComponent>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl PartialEq for EntityPkComponents {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for EntityPkComponents {}
+
+impl PartialOrd for EntityPkComponents {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for EntityPkComponents {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.as_slice().cmp(other.as_slice())
+    }
+}
+
+impl Hash for EntityPkComponents {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
 }
 
 /// Cross-type order is part of the physical key contract.
@@ -21,8 +117,8 @@ pub(crate) struct EntityPk {
 pub(crate) enum EntityPkComponent {
     Uuid([u8; 16]),
     Integer(i64),
-    String(Box<str>),
-    Bytes(Box<[u8]>),
+    String(SharedStr),
+    Bytes(Bytes),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,31 +186,34 @@ impl std::fmt::Display for EntityPkError {
 impl EntityPk {
     pub(crate) fn single(value: impl Into<String>) -> Self {
         Self {
-            components: smallvec![EntityPkComponent::String(value.into().into_boxed_str())],
+            components: EntityPkComponents::Single(EntityPkComponent::String(value.into().into())),
         }
     }
 
-    pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, EntityPkError> {
+    pub(crate) fn from_shared_parts(
+        parts: impl IntoIterator<Item = SharedStr>,
+    ) -> Result<Self, EntityPkError> {
         Self::from_components(
             parts
                 .into_iter()
-                .map(|part| EntityPkComponent::String(part.into_boxed_str()))
-                .collect(),
+                .map(EntityPkComponent::String)
+                .collect::<EntityPkComponentBuffer>(),
         )
     }
 
     pub(crate) fn into_parts(self) -> Vec<String> {
         self.components
-            .into_iter()
+            .iter()
             .map(|component| component.external_string())
             .collect()
     }
 
     pub(crate) fn estimated_heap_bytes(&self) -> usize {
-        let tuple_storage = if self.components.spilled() {
-            self.components.capacity() * size_of::<EntityPkComponent>()
-        } else {
-            0
+        let tuple_storage = match &self.components {
+            EntityPkComponents::Shared(components) => {
+                components.len() * size_of::<EntityPkComponent>()
+            }
+            EntityPkComponents::Empty | EntityPkComponents::Single(_) => 0,
         };
         tuple_storage
             + self
@@ -129,12 +228,14 @@ impl EntityPk {
     }
 
     pub(crate) fn from_components(
-        components: SmallVec<[EntityPkComponent; 1]>,
+        components: EntityPkComponentBuffer,
     ) -> Result<Self, EntityPkError> {
         if components.is_empty() {
             return Err(EntityPkError::EmptyPrimaryKey);
         }
-        Ok(Self { components })
+        Ok(Self {
+            components: EntityPkComponents::from_smallvec(components),
+        })
     }
 
     pub(crate) fn uuid_from_canonical(value: &str) -> Result<Self, EntityPkError> {
@@ -145,7 +246,7 @@ impl EntityPk {
             },
         )?;
         Ok(Self {
-            components: smallvec![EntityPkComponent::Uuid(bytes)],
+            components: EntityPkComponents::Single(EntityPkComponent::Uuid(bytes)),
         })
     }
 
@@ -153,45 +254,43 @@ impl EntityPk {
         parts: Vec<String>,
         component_types: &[EntityPkComponentType],
     ) -> Result<Self, EntityPkError> {
-        if parts.is_empty() {
+        Self::from_shared_external_parts(parts.into_iter().map(SharedStr::from), component_types)
+    }
+
+    pub(crate) fn from_shared_external_parts(
+        parts: impl IntoIterator<Item = SharedStr>,
+        component_types: &[EntityPkComponentType],
+    ) -> Result<Self, EntityPkError> {
+        let mut parts = parts.into_iter().peekable();
+        if parts.peek().is_none() {
             return Err(EntityPkError::EmptyPrimaryKey);
         }
-        if parts.len() != component_types.len() {
+        let mut components = EntityPkComponentBuffer::new();
+        let mut conversion_error = None;
+        let mut missing_part = false;
+        for (index, component_type) in component_types.iter().copied().enumerate() {
+            let Some(part) = parts.next() else {
+                missing_part = true;
+                break;
+            };
+            match component_from_external_shared_part(part, component_type, index) {
+                Ok(component) => components.push(component),
+                Err(error) if conversion_error.is_none() => conversion_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        if missing_part || parts.next().is_some() {
             return Err(EntityPkError::InvalidEncodedEntityPk);
         }
-        let mut components = SmallVec::with_capacity(parts.len());
-        for (index, (part, component_type)) in parts.into_iter().zip(component_types).enumerate() {
-            let component = match component_type {
-                EntityPkComponentType::Uuid => {
-                    let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(&part)
-                        .ok_or(EntityPkError::InvalidPrimaryKeyValue {
-                        index,
-                        expected: "canonical UUID string",
-                    })?;
-                    EntityPkComponent::Uuid(bytes)
-                }
-                EntityPkComponentType::Integer => {
-                    EntityPkComponent::Integer(part.parse().map_err(|_| {
-                        EntityPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "integer",
-                        }
-                    })?)
-                }
-                EntityPkComponentType::String => EntityPkComponent::String(part.into_boxed_str()),
-                EntityPkComponentType::Bytes => {
-                    let value = base64::engine::general_purpose::STANDARD
-                        .decode(part)
-                        .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
-                            index,
-                            expected: "base64 string",
-                        })?;
-                    EntityPkComponent::Bytes(value.into_boxed_slice())
-                }
-            };
-            components.push(component);
+        if let Some(error) = conversion_error {
+            return Err(error);
         }
         Self::from_components(components)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts(parts: Vec<String>) -> Result<Self, EntityPkError> {
+        Self::from_shared_parts(parts.into_iter().map(SharedStr::from))
     }
 
     #[cfg(test)]
@@ -202,10 +301,12 @@ impl EntityPk {
     #[cfg(test)]
     pub(crate) fn from_parts_unchecked(parts: Vec<String>) -> Self {
         Self {
-            components: parts
-                .into_iter()
-                .map(|part| EntityPkComponent::String(part.into_boxed_str()))
-                .collect(),
+            components: EntityPkComponents::from_smallvec(
+                parts
+                    .into_iter()
+                    .map(|part| EntityPkComponent::String(part.into()))
+                    .collect(),
+            ),
         }
     }
 
@@ -415,11 +516,18 @@ where
     where
         E: Encoder<Mode = M>,
     {
-        if let [EntityPkComponent::Uuid(bytes)] = self.components.as_slice() {
-            let component = [EntityPkComponentWireRef {
-                tag: 0,
-                value: bytes,
-            }];
+        if let [component] = self.components.as_slice() {
+            let integer;
+            let (tag, value) = match component {
+                EntityPkComponent::Uuid(bytes) => (0, bytes.as_slice()),
+                EntityPkComponent::Integer(value) => {
+                    integer = value.to_be_bytes();
+                    (1, integer.as_slice())
+                }
+                EntityPkComponent::String(value) => (2, value.as_bytes()),
+                EntityPkComponent::Bytes(value) => (3, value.as_ref()),
+            };
+            let component = [EntityPkComponentWireRef { tag, value }];
             return encoder.encode(EntityPkWireRef {
                 version: ENTITY_PK_VALUE_CODEC_V1,
                 components: &component,
@@ -515,9 +623,9 @@ where
                                 "string entity primary-key component {index} is not UTF-8: {error}"
                             ))
                         })?
-                        .into_boxed_str(),
+                        .into(),
                 ),
-                3 => EntityPkComponent::Bytes(component.value.into_boxed_slice()),
+                3 => EntityPkComponent::Bytes(component.value.into()),
                 tag => {
                     return Err(cx.message(format_args!(
                         "unknown entity primary-key component tag {tag}"
@@ -539,12 +647,46 @@ fn untyped_component_from_json_value(
     index: usize,
 ) -> Result<EntityPkComponent, EntityPkError> {
     match value {
-        JsonValue::String(value) => Ok(EntityPkComponent::String(value.clone().into_boxed_str())),
+        JsonValue::String(value) => Ok(EntityPkComponent::String(value.as_str().into())),
         JsonValue::Number(value) => value
             .as_i64()
             .map(EntityPkComponent::Integer)
             .ok_or(EntityPkError::UnsupportedPrimaryKeyValue { index }),
         _ => Err(EntityPkError::UnsupportedPrimaryKeyValue { index }),
+    }
+}
+
+fn component_from_external_shared_part(
+    part: SharedStr,
+    component_type: EntityPkComponentType,
+    index: usize,
+) -> Result<EntityPkComponent, EntityPkError> {
+    match component_type {
+        EntityPkComponentType::Uuid => {
+            let bytes = crate::storage_codec::id_string::uuid_bytes_from_canonical(&part).ok_or(
+                EntityPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "canonical UUID string",
+                },
+            )?;
+            Ok(EntityPkComponent::Uuid(bytes))
+        }
+        EntityPkComponentType::Integer => {
+            Ok(EntityPkComponent::Integer(part.as_str().parse().map_err(
+                |_| EntityPkError::InvalidPrimaryKeyValue {
+                    index,
+                    expected: "integer",
+                },
+            )?))
+        }
+        EntityPkComponentType::String => Ok(EntityPkComponent::String(part)),
+        EntityPkComponentType::Bytes => base64::engine::general_purpose::STANDARD
+            .decode(part.as_bytes())
+            .map(|value| EntityPkComponent::Bytes(value.into()))
+            .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
+                index,
+                expected: "base64 string",
+            }),
     }
 }
 
@@ -591,7 +733,7 @@ fn component_from_json_value(
                 })?;
             base64::engine::general_purpose::STANDARD
                 .decode(value)
-                .map(|value| EntityPkComponent::Bytes(value.into_boxed_slice()))
+                .map(|value| EntityPkComponent::Bytes(value.into()))
                 .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
                     index,
                     expected: "base64 string",
@@ -661,6 +803,161 @@ mod tests {
                 .as_json_array_text()
                 .expect("projection should work"),
             "[\"namespace\",\"42\"]"
+        );
+    }
+
+    #[test]
+    fn ten_thousand_composite_clones_share_component_and_payload_owners() {
+        let identity = EntityPk::tuple(vec![
+            "namespace-with-a-non-inline-payload".to_string(),
+            "entity-with-a-non-inline-payload".to_string(),
+        ])
+        .expect("composite identity");
+        let EntityPkComponents::Shared(owner) = &identity.components else {
+            panic!("a composite identity must use shared tuple storage")
+        };
+
+        let clones = std::iter::repeat_n(identity.clone(), 10_000).collect::<Vec<_>>();
+        for cloned in &clones {
+            let EntityPkComponents::Shared(cloned_owner) = &cloned.components else {
+                panic!("a composite clone must retain shared tuple storage")
+            };
+            assert!(
+                Arc::ptr_eq(owner, cloned_owner),
+                "composite clones must retain the original component owner"
+            );
+            for (original, cloned) in owner.iter().zip(cloned_owner.iter()) {
+                let (EntityPkComponent::String(original), EntityPkComponent::String(cloned)) =
+                    (original, cloned)
+                else {
+                    panic!("test identity contains only string components")
+                };
+                assert!(
+                    original.shares_buffer_with(cloned),
+                    "component payload clones must retain the original byte owner"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ten_thousand_single_clones_share_the_inline_component_payload() {
+        let identity = EntityPk::single("entity-with-a-non-inline-payload");
+        let [EntityPkComponent::String(owner)] = identity.components.as_slice() else {
+            panic!("single string identity must stay inline")
+        };
+
+        let clones = std::iter::repeat_n(identity.clone(), 10_000).collect::<Vec<_>>();
+        for cloned in &clones {
+            let [EntityPkComponent::String(cloned_owner)] = cloned.components.as_slice() else {
+                panic!("single string clone must stay inline")
+            };
+            assert!(
+                owner.shares_buffer_with(cloned_owner),
+                "single-component clones must retain the original byte owner"
+            );
+        }
+    }
+
+    #[test]
+    fn shared_external_common_path_streams_without_heap_spilling_scratch() {
+        struct NoSizeHint<I>(I);
+
+        impl<I: Iterator> Iterator for NoSizeHint<I> {
+            type Item = I::Item;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                self.0.next()
+            }
+
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                panic!("the direct lockstep path must not collect external parts first")
+            }
+        }
+
+        let scratch = EntityPkComponentBuffer::new();
+        assert_eq!(scratch.capacity(), 2);
+        assert!(!scratch.spilled());
+
+        let namespace = SharedStr::from_static("namespace");
+        let entity = SharedStr::from_static("entity");
+        let identity = EntityPk::from_shared_external_parts(
+            NoSizeHint([namespace.clone(), entity.clone()].into_iter()),
+            &[EntityPkComponentType::String, EntityPkComponentType::String],
+        )
+        .expect("two-component external identity");
+        let EntityPkComponents::Shared(owner) = &identity.components else {
+            panic!("two components retain one final shared owner")
+        };
+        let [
+            EntityPkComponent::String(actual_namespace),
+            EntityPkComponent::String(actual_entity),
+        ] = owner.as_ref()
+        else {
+            panic!("test identity contains two string components")
+        };
+
+        assert_eq!(Arc::strong_count(owner), 1);
+        assert!(actual_namespace.shares_buffer_with(&namespace));
+        assert!(actual_entity.shares_buffer_with(&entity));
+
+        let identities = (0..10_000)
+            .map(|_| {
+                EntityPk::from_shared_external_parts(
+                    [namespace.clone(), entity.clone()],
+                    &[EntityPkComponentType::String, EntityPkComponentType::String],
+                )
+                .expect("two-component external identity")
+            })
+            .collect::<Vec<_>>();
+        for identity in &identities {
+            let EntityPkComponents::Shared(owner) = &identity.components else {
+                panic!("two components retain one final shared owner")
+            };
+            let [
+                EntityPkComponent::String(actual_namespace),
+                EntityPkComponent::String(actual_entity),
+            ] = owner.as_ref()
+            else {
+                panic!("test identity contains two string components")
+            };
+            assert_eq!(Arc::strong_count(owner), 1);
+            assert!(actual_namespace.shares_buffer_with(&namespace));
+            assert!(actual_entity.shares_buffer_with(&entity));
+        }
+
+        let single = EntityPk::from_shared_external_parts(
+            NoSizeHint([entity.clone()].into_iter()),
+            &[EntityPkComponentType::String],
+        )
+        .expect("single-component external identity");
+        let [EntityPkComponent::String(actual)] = single.components.as_slice() else {
+            panic!("one component must stay inline")
+        };
+        assert!(actual.shares_buffer_with(&entity));
+    }
+
+    #[test]
+    fn shared_external_cardinality_errors_precede_component_errors() {
+        assert_eq!(
+            EntityPk::from_shared_external_parts(
+                [
+                    SharedStr::from_static("not-an-integer"),
+                    SharedStr::from_static("extra"),
+                ],
+                &[EntityPkComponentType::Integer],
+            ),
+            Err(EntityPkError::InvalidEncodedEntityPk)
+        );
+        assert_eq!(
+            EntityPk::from_shared_external_parts(
+                [SharedStr::from_static("not-an-integer")],
+                &[
+                    EntityPkComponentType::Integer,
+                    EntityPkComponentType::String,
+                ],
+            ),
+            Err(EntityPkError::InvalidEncodedEntityPk)
         );
     }
 
@@ -848,6 +1145,34 @@ mod tests {
         let decoded: EntityPk = crate::storage_codec::decode("entity primary key", &bytes)
             .expect("entity pk should decode");
 
+        assert_eq!(decoded, identity);
+    }
+
+    #[test]
+    fn storage_codec_preserves_typed_components_and_semantic_traits() {
+        let identity = EntityPk::from_components(SmallVec::from_vec(vec![
+            EntityPkComponent::Uuid([0x2a; 16]),
+            EntityPkComponent::Integer(-42),
+            EntityPkComponent::Bytes(Bytes::from_static(&[0, 1, 0xff])),
+        ]))
+        .expect("typed entity pk");
+        let cloned = identity.clone();
+
+        assert_eq!(identity.cmp(&cloned), Ordering::Equal);
+        let mut original_hash = std::collections::hash_map::DefaultHasher::new();
+        identity.hash(&mut original_hash);
+        let mut cloned_hash = std::collections::hash_map::DefaultHasher::new();
+        cloned.hash(&mut cloned_hash);
+        assert_eq!(original_hash.finish(), cloned_hash.finish());
+        assert_eq!(
+            serde_json::to_value(&identity).expect("typed primary key should serialize"),
+            json!(["2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a", -42, "AAH/"])
+        );
+
+        let encoded = crate::storage_codec::encode("typed entity primary key", &identity)
+            .expect("typed entity pk should encode");
+        let decoded: EntityPk = crate::storage_codec::decode("typed entity primary key", &encoded)
+            .expect("typed entity pk should decode");
         assert_eq!(decoded, identity);
     }
 

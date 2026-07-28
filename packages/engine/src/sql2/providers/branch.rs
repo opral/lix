@@ -23,7 +23,7 @@ use crate::changelog::CommitId;
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
-    MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef,
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{
@@ -32,8 +32,8 @@ use crate::sql2::write_normalization::{
 };
 use crate::sql2::{SqlWriteContext, WriteAccess, WriteContextLiveStateReader};
 use crate::transaction::types::{
-    LogicalPrimaryKey, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteRow,
+    LogicalPrimaryKey, RawWriteBatch, TransactionWrite, TransactionWriteMode,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
 };
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
@@ -153,7 +153,12 @@ impl TableSpec for BranchSpec {
                     "INSERT into lix_branch could not resolve active branch head".to_string(),
                 )
             })?;
-        let mut rows = Vec::new();
+        let row_capacity = batches
+            .iter()
+            .map(RecordBatch::num_rows)
+            .sum::<usize>()
+            .saturating_mul(2);
+        let mut rows = RawWriteBatch::with_capacity(row_capacity);
         let mut count = 0u64;
         for batch in batches {
             let branch_rows = branch_insert_rows_from_batch(&batch, &default_commit_id)?;
@@ -162,7 +167,9 @@ impl TableSpec for BranchSpec {
                     DataFusionError::Execution("INSERT row count overflow".to_string())
                 })?)
                 .ok_or_else(|| DataFusionError::Execution("INSERT row count overflow".into()))?;
-            rows.extend(branch_rows.into_iter().flat_map(branch_insert_stage_rows));
+            for row in branch_rows {
+                push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Insert, false);
+            }
         }
 
         if !rows.is_empty() {
@@ -199,10 +206,16 @@ impl TableSpec for BranchSpec {
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("DELETE row count overflow".to_string())
                     })?;
-                    let rows = branch_rows
-                        .into_iter()
-                        .flat_map(branch_tombstone_rows)
-                        .collect::<Vec<_>>();
+                    let mut rows =
+                        RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    for row in branch_rows {
+                        push_branch_stage_rows(
+                            &mut rows,
+                            row,
+                            TransactionWriteOperation::Delete,
+                            true,
+                        );
+                    }
 
                     if !rows.is_empty() {
                         write_ctx
@@ -241,10 +254,16 @@ impl TableSpec for BranchSpec {
                     let count = u64::try_from(branch_rows.len()).map_err(|_| {
                         DataFusionError::Execution("UPDATE row count overflow".to_string())
                     })?;
-                    let rows = branch_rows
-                        .into_iter()
-                        .flat_map(branch_update_stage_rows)
-                        .collect::<Vec<_>>();
+                    let mut rows =
+                        RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+                    for row in branch_rows {
+                        push_branch_stage_rows(
+                            &mut rows,
+                            row,
+                            TransactionWriteOperation::Update,
+                            false,
+                        );
+                    }
 
                     if !rows.is_empty() {
                         write_ctx
@@ -318,10 +337,10 @@ impl UpsertSupport for BranchSpec {
                 )
             })?;
         let branch_rows = branch_insert_rows_from_batch(batch, &default_commit_id)?;
-        let rows = branch_rows
-            .into_iter()
-            .flat_map(branch_insert_stage_rows)
-            .collect::<Vec<_>>();
+        let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+        for row in branch_rows {
+            push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Insert, false);
+        }
         Ok(StagedUpsert::rows(rows))
     }
 
@@ -390,10 +409,10 @@ impl UpsertSupport for BranchSpec {
         let branch_rows =
             branch_update_rows_from_batch(augmented, assignments, &lix_branch_schema())?;
         reject_protected_branch_updates(&branch_rows)?;
-        let rows = branch_rows
-            .into_iter()
-            .flat_map(branch_update_stage_rows)
-            .collect::<Vec<_>>();
+        let mut rows = RawWriteBatch::with_capacity(branch_rows.len().saturating_mul(2));
+        for row in branch_rows {
+            push_branch_stage_rows(&mut rows, row, TransactionWriteOperation::Update, false);
+        }
         Ok(StagedUpsert::rows(rows))
     }
 }
@@ -478,7 +497,7 @@ async fn load_branch_rows_scoped(
             .collect::<Result<Vec<_>, _>>()?,
     };
     let descriptor_rows = live_state
-        .scan_rows(&LiveStateScanRequest {
+        .scan_batch(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_branch_descriptor".to_string()],
                 branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
@@ -659,7 +678,7 @@ struct BranchDescriptor {
     hidden: bool,
 }
 
-fn parse_descriptor(row: &MaterializedLiveStateRow) -> Result<BranchDescriptor, LixError> {
+fn parse_descriptor(row: MaterializedLiveStateRowRef<'_>) -> Result<BranchDescriptor, LixError> {
     let snapshot = parse_snapshot(row, "lix_branch_descriptor")?;
     let id = snapshot
         .get("id")
@@ -678,13 +697,19 @@ fn parse_descriptor(row: &MaterializedLiveStateRow) -> Result<BranchDescriptor, 
     Ok(BranchDescriptor { id, name, hidden })
 }
 
-fn parse_snapshot(row: &MaterializedLiveStateRow, schema_key: &str) -> Result<JsonValue, LixError> {
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("{schema_key} row is missing snapshot_content"),
-        )
-    })?;
+fn parse_snapshot(
+    row: MaterializedLiveStateRowRef<'_>,
+    schema_key: &str,
+) -> Result<JsonValue, LixError> {
+    let snapshot_content = row
+        .snapshot_content()
+        .map(|content| content.as_str())
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{schema_key} row is missing snapshot_content"),
+            )
+        })?;
     serde_json::from_str(snapshot_content).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -848,38 +873,29 @@ fn parse_branch_row_commit_id(
     })
 }
 
-fn branch_stage_rows(
+fn push_branch_stage_rows(
+    rows: &mut RawWriteBatch,
     row: BranchRow,
-    origin: Option<TransactionWriteOrigin>,
-) -> Vec<TransactionWriteRow> {
-    vec![
-        with_origin(
+    operation: TransactionWriteOperation,
+    tombstone: bool,
+) {
+    let origin = Some(lix_branch_origin(operation, &row.id));
+    if tombstone {
+        rows.push(with_origin(
+            branch_descriptor_tombstone_row(&row.id),
+            origin.clone(),
+        ));
+        rows.push(with_origin(branch_ref_tombstone_row(&row.id), origin));
+    } else {
+        rows.push(with_origin(
             branch_descriptor_stage_row(&row.id, &row.name, row.hidden),
             origin.clone(),
-        ),
-        with_origin(branch_ref_stage_row(&row.id, &row.commit_id), origin),
-    ]
-}
-
-fn branch_tombstone_rows(row: BranchRow) -> Vec<TransactionWriteRow> {
-    let origin = Some(lix_branch_origin(
-        TransactionWriteOperation::Delete,
-        &row.id,
-    ));
-    vec![
-        with_origin(branch_descriptor_tombstone_row(&row.id), origin.clone()),
-        with_origin(branch_ref_tombstone_row(&row.id), origin),
-    ]
-}
-
-fn branch_insert_stage_rows(row: BranchRow) -> Vec<TransactionWriteRow> {
-    let origin = lix_branch_origin(TransactionWriteOperation::Insert, &row.id);
-    branch_stage_rows(row, Some(origin))
-}
-
-fn branch_update_stage_rows(row: BranchRow) -> Vec<TransactionWriteRow> {
-    let origin = lix_branch_origin(TransactionWriteOperation::Update, &row.id);
-    branch_stage_rows(row, Some(origin))
+        ));
+        rows.push(with_origin(
+            branch_ref_stage_row(&row.id, &row.commit_id),
+            origin,
+        ));
+    }
 }
 
 fn with_origin(
@@ -892,12 +908,9 @@ fn with_origin(
 
 fn lix_branch_origin(action: TransactionWriteOperation, branch_id: &str) -> TransactionWriteOrigin {
     TransactionWriteOrigin {
-        surface: "lix_branch".to_string(),
+        surface: crate::transaction::types::shared_origin_surface("lix_branch"),
         operation: action,
-        primary_key: Some(LogicalPrimaryKey {
-            columns: vec!["id".to_string()],
-            values: vec![branch_id.to_string()],
-        }),
+        primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(branch_id))),
     }
 }
 
@@ -983,7 +996,7 @@ mod tests {
 
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::live_state::LiveStateRowRequest;
+    use crate::live_state::{LiveStateRowRequest, MaterializedLiveStateRow};
     use datafusion::common::Column;
 
     struct RowsLiveStateReader {
@@ -1116,7 +1129,9 @@ mod tests {
             schema_key: "lix_branch_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
-                serde_json::json!({ "id": id, "name": name, "hidden": false }).to_string(),
+                serde_json::json!({ "id": id, "name": name, "hidden": false })
+                    .to_string()
+                    .into(),
             ),
             metadata: None,
             deleted: false,
@@ -1141,6 +1156,37 @@ mod tests {
             branch_id: branch_id.to_string(),
             commit_id: CommitId::for_test_label(&format!("commit-{branch_id}")),
         }
+    }
+
+    #[test]
+    fn branch_multi_row_stage_uses_one_shared_metadata_dictionary() {
+        let mut rows = RawWriteBatch::with_capacity(200);
+        for index in 0..100 {
+            let id = format!("01920000-0000-7000-8000-{index:012x}");
+            push_branch_stage_rows(
+                &mut rows,
+                BranchRow {
+                    name: format!("Branch {index}"),
+                    commit_id: CommitId::for_test_label(&format!("commit-{index}")),
+                    id,
+                    hidden: false,
+                },
+                TransactionWriteOperation::Insert,
+                false,
+            );
+        }
+
+        assert_eq!(rows.len(), 200);
+        assert_eq!(
+            rows.shared_string_count(),
+            3,
+            "descriptor schema, ref schema, and global branch are batch-wide dictionary values"
+        );
+        assert!(std::ptr::eq(
+            rows.row(0).branch_id,
+            rows.row(rows.len() - 1).branch_id
+        ));
+        assert!(std::ptr::eq(rows.row(0).schema_key, rows.row(2).schema_key));
     }
 
     fn string_literal(value: &str) -> Expr {

@@ -4,6 +4,8 @@
 //! session, and the returned [`Lix`] handle owns the small application-facing
 //! surface.
 
+#![cfg_attr(test, allow(clippy::cast_possible_truncation))]
+
 mod client_state;
 #[cfg(feature = "default_wasm_runtime")]
 mod default_wasm_runtime;

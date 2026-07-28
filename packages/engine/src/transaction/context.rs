@@ -4,7 +4,7 @@
     clippy::needless_pass_by_ref_mut
 )]
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,12 +25,12 @@ use crate::branch::{
     branch_ref_stage_row,
 };
 use crate::catalog::{
-    CatalogContext, CatalogFingerprint, CatalogSnapshot, load_catalog_revision,
+    CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
     stage_catalog_revision,
 };
 use crate::changelog::{ChangeId, CommitId};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
 use crate::entity_pk::EntityPk;
 use crate::filesystem::{
@@ -44,29 +44,32 @@ use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
     load_recovery_ref,
 };
+#[cfg(test)]
+use crate::live_state::overlay_load_exact_rows;
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff, overlay_load_exact_rows,
-    overlay_scan_rows,
+    LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef, StagedLiveStateRows, TrackedHeadContext, TrackedWorkingDiff,
+    overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
     PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
     PluginActorKey, PluginActorLease, PluginActorStore, PluginArchiveInstallPlan,
-    PluginContentType, PluginDetectedChange, PluginFileOwner, PluginMaterialization,
-    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
-    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
-    VecEntitySource, build_file_update_splices, drain_conflict_transition_resolutions,
-    drain_entity_transition_edits, drain_file_transition_changes,
-    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
-    inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
-    plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
-    plugin_state_live_state_projection, require_existing_id_authorities, reservation_tombstone_row,
-    reserve_create_row, transport_splice_preserves_git_text, transport_splice_preserves_utf8,
-    validate_create_changes, validate_create_reservation,
+    PluginContentType, PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry,
+    PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
+    ValidatedConflictTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
+    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    drain_conflict_transition_resolutions, drain_entity_transition_edits,
+    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
+    host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
+    is_reservation_key, local_mutation_identity, materialize_keyless_creates,
+    plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
+    plugin_key_from_archive_delete_origin, plugin_state_live_state_projection,
+    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
+    transport_splice_preserves_git_text, transport_splice_preserves_utf8, validate_create_changes,
+    validate_create_reservation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -88,7 +91,7 @@ use crate::storage_adapter::{
 use crate::tracked_state::{TrackedStateContext, TrackedStateDiffRequest, TrackedStateStoreReader};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
-    NormalizedTransactionWriteRow, REGISTERED_SCHEMA_KEY, normalize_transaction_write_row,
+    NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
     remember_pending_registered_schema,
 };
 use crate::transaction::schema_resolver::TransactionSchemaResolver;
@@ -96,14 +99,16 @@ use crate::transaction::staging::{
     PreparedStateRowOverlay, PreparedWriteSet, TransactionWriteBuffer,
 };
 use crate::transaction::types::{
-    PreparedStateRow, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteOutcome, TransactionWriteRow, stage_json_from_value,
+    PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
+    StagedCommitChangeBatch, TransactionFileData, TransactionJson, TransactionWrite,
+    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
+    stage_json_from_value,
 };
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
-    validate_prepared_writes,
+    validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
 use crate::wasm::{
     WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictUpdate,
@@ -140,17 +145,44 @@ enum VisibleV2MaterializationBytes {
     },
 }
 
+#[cfg(test)]
 fn decode_visible_v2_materialization(
     row: &MaterializedLiveStateRow,
     file_id: &str,
 ) -> Result<VisibleV2Materialization, LixError> {
-    let semantic_root = row.change_id.map(|root| root.to_string()).ok_or_else(|| {
+    decode_visible_v2_materialization_parts(
+        row.schema_key.as_str(),
+        row.change_id,
+        row.snapshot_content.as_deref(),
+        file_id,
+    )
+}
+
+fn decode_visible_v2_materialization_ref(
+    row: MaterializedLiveStateRowRef<'_>,
+    file_id: &str,
+) -> Result<VisibleV2Materialization, LixError> {
+    decode_visible_v2_materialization_parts(
+        row.schema_key(),
+        row.change_id(),
+        row.snapshot_content().map(|content| content.as_str()),
+        file_id,
+    )
+}
+
+fn decode_visible_v2_materialization_parts(
+    schema_key: &str,
+    change_id: Option<ChangeId>,
+    snapshot_content: Option<&str>,
+    file_id: &str,
+) -> Result<VisibleV2Materialization, LixError> {
+    let semantic_root = change_id.map(|root| root.to_string()).ok_or_else(|| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("v2 materialization root for file '{file_id}' is missing change_id"),
         )
     })?;
-    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
+    let snapshot = snapshot_content.ok_or_else(|| {
         LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
@@ -158,7 +190,7 @@ fn decode_visible_v2_materialization(
             ),
         )
     })?;
-    let bytes = match row.schema_key.as_str() {
+    let bytes = match schema_key {
         BLOB_REF_SCHEMA_KEY => {
             let snapshot: PluginUpgradeBlobRefSnapshot =
                 serde_json::from_str(snapshot).map_err(|error| {
@@ -300,7 +332,7 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     opening_tracked_mutation_revision: Option<Bytes>,
     commit_boundary: Option<TransactionCommitBoundary>,
     trust_filesystem_planner: bool,
-    origin_key: Option<String>,
+    origin_key: Option<SharedStr>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
     session_file_views: SessionFileViews,
     retain_plugin_actor_publications: bool,
@@ -654,7 +686,6 @@ where
                                 | BLOB_REF_SCHEMA_KEY
                         )
                     })
-                    .cloned()
                     .map(MaterializedLiveStateRow::from)
                     .collect::<Vec<_>>()
             };
@@ -814,9 +845,9 @@ where
     /// Stages one decoded write batch into this transaction.
     ///
     /// This is the programmatic write entrypoint used by non-SQL APIs. The
-    /// transaction still owns preparation from `TransactionWriteRow` into
-    /// `PreparedStateRow`, so generated timestamps, change ids, commit ids, and
-    /// commit change refs stay in one place.
+    /// transaction owns the `RawWriteBatch` → `PreparedStateBatch` transition,
+    /// so generated timestamps, change ids, commit ids, and commit change refs
+    /// stay in one batch pipeline.
     pub(crate) async fn stage_write(
         &mut self,
         write: TransactionWrite,
@@ -851,14 +882,14 @@ where
                 transaction_write_untracked_row_count(&write),
             );
         }
-        let (write, file_view_mutations, actor_publications, prepared_semantic_rows) =
+        let (write, file_view_mutations, actor_publications) =
             self.reconcile_plugin_write(write).await?;
-        if let Err(error) = require_valid_transaction_write_storage_scopes(&write) {
+        if let Err(error) = require_valid_reconciled_transaction_write_storage_scopes(&write) {
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
         }
         let write = match self
-            .prepare_transaction_write(write, prepared_semantic_rows)
+            .prepare_transaction_write(write)
             .instrument(tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.transaction_prepare_rows"
@@ -882,12 +913,8 @@ where
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
         }
-        if prepared_transaction_write_affects_filesystem_path_index(&write) {
-            // TransactionWriteBuffer may retain an earlier row from this batch even
-            // when a later row makes staging fail, so invalidate before staging.
-            self.filesystem_path_index_epoch
-                .fetch_add(1, Ordering::SeqCst);
-        }
+        let affects_filesystem_path_index =
+            prepared_transaction_write_affects_filesystem_path_index(&write);
         let outcome = match tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_buffer_stage"
@@ -900,6 +927,10 @@ where
                 return Err(error);
             }
         };
+        if affects_filesystem_path_index {
+            self.filesystem_path_index_epoch
+                .fetch_add(1, Ordering::SeqCst);
+        }
         self.pending_file_view_mutations.extend(file_view_mutations);
         self.pending_plugin_actor_publications
             .extend(actor_publications);
@@ -924,10 +955,7 @@ where
         }) {
             return Ok(());
         }
-        let prospective_rows = prepared_rows
-            .iter()
-            .map(MaterializedLiveStateRow::from)
-            .collect::<Vec<_>>();
+        let prospective_rows = materialized_live_state_batch_from_prepared(prepared_rows);
         let staged = self.staged_writes.staging_overlay()?;
         let prospective = ProspectiveStagedRows {
             staged: staged.clone(),
@@ -1054,10 +1082,10 @@ where
         Ok(validated)
     }
 
-    async fn scan_visible_live_state(
+    async fn scan_visible_live_state_batch(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
@@ -1065,7 +1093,7 @@ where
                 .await?,
         );
         let base = self.live_state.reader(read);
-        overlay_scan_rows(&base, &staged, request).await
+        overlay_scan_batch(&base, &staged, request).await
     }
 
     async fn visible_v2_materialization(
@@ -1073,7 +1101,7 @@ where
         key: &PluginFileWriteKey,
     ) -> Result<Option<VisibleV2Materialization>, LixError> {
         let rows = self
-            .scan_visible_live_state(&LiveStateScanRequest {
+            .scan_visible_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![
                         BLOB_REF_SCHEMA_KEY.to_string(),
@@ -1098,9 +1126,8 @@ where
                 ),
             ));
         }
-        rows.into_iter()
-            .next()
-            .map(|row| decode_visible_v2_materialization(&row, &key.file_id))
+        rows.get(0)
+            .map(|row| decode_visible_v2_materialization_ref(row, &key.file_id))
             .transpose()
     }
 
@@ -1126,7 +1153,7 @@ where
             untracked: false,
             file_id: actor_key.file_id.clone(),
         };
-        let blob_rows = overlay_scan_rows(
+        let blob_rows = overlay_scan_batch(
             &base,
             &staged,
             &LiveStateScanRequest {
@@ -1146,7 +1173,7 @@ where
             },
         )
         .await?;
-        let [blob_row] = blob_rows.as_slice() else {
+        if blob_rows.len() != 1 {
             return Err(LixError::new(
                 LixError::CODE_PLUGIN_OBSERVATION_STALE,
                 format!(
@@ -1155,8 +1182,9 @@ where
                     blob_rows.len()
                 ),
             ));
-        };
-        let materialization = decode_visible_v2_materialization(blob_row, &actor_key.file_id)?;
+        }
+        let materialization =
+            decode_visible_v2_materialization_ref(blob_rows.row(0), &actor_key.file_id)?;
         if !matches!(
             (plugin.materialization(), &materialization.bytes),
             (
@@ -1183,7 +1211,7 @@ where
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
         let store_permit = cache.admit_cold_store(&mut cold_install)?;
-        let rows = overlay_scan_rows(
+        let rows = overlay_scan_batch(
             &base,
             &staged,
             &LiveStateScanRequest {
@@ -1199,19 +1227,10 @@ where
             },
         )
         .await?;
-        let rows = rows
-            .into_iter()
-            .filter(|row| {
-                row.branch_id.as_ref() == file_key.branch_id
-                    && row.file_id.as_deref() == Some(file_key.file_id.as_str())
-                    && !row.global
-                    && !row.untracked
-                    && row.snapshot_content.is_some()
-                    && plugin.schema_keys().binary_search(&row.schema_key).is_ok()
-            })
-            .collect::<Vec<_>>();
-        let entity_count = rows.len();
         let limits = WasmTransitionLimits::default();
+        let entities =
+            v2_host_entities_from_live_batch(&rows, &file_key, plugin.schema_keys(), limits)?;
+        let entity_count = entities.len();
         let mut actor = factory.instantiate_actor().await?;
         if let VisibleV2MaterializationBytes::Derived { path, .. } = &materialization.bytes
             && descriptor.path.as_deref() != Some(path.as_str())
@@ -1252,8 +1271,7 @@ where
                     )
                 })?
                 .into();
-                let source =
-                    VecEntitySource::new(v2_host_entities_from_live_rows(rows, limits)?, limits)?;
+                let source = VecEntitySource::new(entities, limits)?;
                 let transition = match actor
                     .open_entities(
                         limits,
@@ -1293,8 +1311,7 @@ where
             VisibleV2MaterializationBytes::Derived {
                 sha256, size_bytes, ..
             } => {
-                let source =
-                    VecEntitySource::new(v2_host_entities_from_live_rows(rows, limits)?, limits)?;
+                let source = VecEntitySource::new(entities, limits)?;
                 let transition = match actor
                     .open_entities(
                         limits,
@@ -1370,10 +1387,10 @@ where
             .await
     }
 
-    async fn load_visible_exact_live_state_rows(
+    async fn load_visible_exact_live_state_batch(
         &mut self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
             self.storage
@@ -1381,7 +1398,7 @@ where
                 .await?,
         );
         let base = self.live_state.reader(read);
-        overlay_load_exact_rows(&base, &staged, request).await
+        overlay_load_exact_batch(&base, &staged, request).await
     }
 
     /// Drops `format-only` upserts that are semantically identical to the
@@ -1415,7 +1432,7 @@ where
             .iter()
             .map(|key| {
                 Ok(LiveStateExactRowRequest {
-                    schema_key: key.schema_key.clone(),
+                    schema_key: key.schema_key.to_string(),
                     branch_id: file_key.branch_id.clone(),
                     entity_pk: plugin_entity_pk(plugin, key)?,
                     file_id: Some(file_key.file_id.clone()),
@@ -1423,7 +1440,7 @@ where
             })
             .collect::<Result<Vec<_>, LixError>>()?;
         let current = self
-            .load_visible_exact_live_state_rows(&LiveStateExactBatchRequest {
+            .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: requests,
                 projection: plugin_state_live_state_projection(),
                 untracked: Some(false),
@@ -1432,7 +1449,15 @@ where
             .await?;
         let accepted = format_only_keys
             .into_iter()
-            .zip(current)
+            .enumerate()
+            .map(|(slot, key)| {
+                // The format-only comparator is a terminal WASM boundary that
+                // still accepts its historical owned DTO.
+                (
+                    key,
+                    current.row(slot).map(MaterializedLiveStateRowRef::to_owned),
+                )
+            })
             .collect::<BTreeMap<_, _>>();
         suppress_v2_format_only_noops_against_rows(changes, &accepted)
     }
@@ -1447,11 +1472,11 @@ where
         bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
         existing_reservation: Option<&MaterializedLiveStateRow>,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
+    ) -> Result<RawWriteBatch, LixError> {
         let validation = validate_create_changes(plugin, changes)?;
         materialize_keyless_creates(changes, bound.creates())?;
         if !validation.requires_reservation && validation.existing_authorities.is_empty() {
-            return Ok(Vec::new());
+            return Ok(RawWriteBatch::new());
         }
 
         let exact_rows = validation
@@ -1468,7 +1493,7 @@ where
                     ));
                 };
                 Ok(LiveStateExactRowRequest {
-                    schema_key: key.schema_key.clone(),
+                    schema_key: key.schema_key.to_string(),
                     branch_id: file_key.branch_id.clone(),
                     entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
                         LixError::new(
@@ -1480,27 +1505,33 @@ where
                 })
             })
             .collect::<Result<Vec<_>, LixError>>()?;
-        let authority_count = validation.existing_authorities.len();
         let loaded = if exact_rows.is_empty() {
             Vec::new()
         } else {
-            self.load_visible_exact_live_state_rows(&LiveStateExactBatchRequest {
-                rows: exact_rows,
-                projection: plugin_state_live_state_projection(),
-                untracked: Some(false),
-                include_tombstones: false,
-            })
-            .await?
+            let loaded = self
+                .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
+                    rows: exact_rows,
+                    projection: plugin_state_live_state_projection(),
+                    untracked: Some(false),
+                    include_tombstones: false,
+                })
+                .await?;
+            // Namespace validation is the terminal plugin boundary. Retain the
+            // exact owner through the read and scalarize only its aligned
+            // authority slots for the legacy validator.
+            (0..loaded.len())
+                .map(|slot| loaded.row(slot).map(MaterializedLiveStateRowRef::to_owned))
+                .collect()
         };
         require_existing_id_authorities(
             plugin,
             &validation.existing_authorities,
-            &loaded[..authority_count],
+            &loaded,
             &file_key.file_id,
             &file_key.branch_id,
         )?;
 
-        let mut rows = Vec::new();
+        let mut rows = RawWriteBatch::with_capacity(usize::from(validation.requires_reservation));
         if validation.requires_reservation {
             if let Some(row) = reserve_create_row(
                 existing_reservation,
@@ -1520,8 +1551,8 @@ where
         file_key: &PluginFileWriteKey,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         let reservation_key = bound.reservation_key();
-        let mut loaded = self
-            .load_visible_exact_live_state_rows(&LiveStateExactBatchRequest {
+        let loaded = self
+            .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
                 rows: vec![LiveStateExactRowRequest {
                     schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
                     branch_id: file_key.branch_id.clone(),
@@ -1533,7 +1564,7 @@ where
                 include_tombstones: false,
             })
             .await?;
-        let existing = loaded.pop().flatten();
+        let existing = loaded.row(0).map(MaterializedLiveStateRowRef::to_owned);
         validate_create_reservation(
             existing.as_ref(),
             bound,
@@ -1546,9 +1577,9 @@ where
     async fn v2_id_reservation_tombstones(
         &mut self,
         file_key: &PluginFileWriteKey,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
+    ) -> Result<RawWriteBatch, LixError> {
         let rows = self
-            .scan_visible_live_state(&LiveStateScanRequest {
+            .scan_visible_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![KEY_VALUE_SCHEMA_KEY.to_string()],
                     branch_ids: vec![file_key.branch_id.clone()],
@@ -1560,16 +1591,20 @@ where
                 ..Default::default()
             })
             .await?;
-        rows.into_iter()
-            .filter_map(|row| {
-                let key = row.entity_pk.as_single_string().ok()?.to_string();
-                is_reservation_key(&key).then_some(reservation_tombstone_row(
-                    &key,
+        let mut tombstones = RawWriteBatch::with_capacity(rows.len());
+        for row in rows.iter() {
+            let Ok(key) = row.entity_pk().as_single_string() else {
+                continue;
+            };
+            if is_reservation_key(key) {
+                tombstones.push(reservation_tombstone_row(
+                    key,
                     &file_key.file_id,
                     &file_key.branch_id,
-                ))
-            })
-            .collect()
+                )?);
+            }
+        }
+        Ok(tombstones)
     }
 
     /// Replacing one materialization representation must retire the other
@@ -1607,10 +1642,9 @@ where
         write: TransactionWrite,
     ) -> Result<
         (
-            TransactionWrite,
+            ReconciledTransactionWrite,
             BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
             Vec<PendingPluginActorPublication>,
-            PreparedSemanticRows,
         ),
         LixError,
     > {
@@ -1620,10 +1654,9 @@ where
                 let count = rows.len() as u64;
                 let mut file_data = Vec::new();
                 let mut reconciliation = self
-                    .plugin_write_reconciliation(&rows, &mut file_data)
+                    .plugin_write_reconciliation(&mut rows, &mut file_data)
                     .await?;
-                mark_plugin_reconciliation_rows(&mut reconciliation.rows);
-                rows.extend(reconciliation.rows);
+                let mut rows = reconciliation.take_reconciled_rows(rows);
                 for (file_key, version) in &reconciliation.materialization_versions {
                     let target = if reconciliation
                         .derived_materializations
@@ -1637,8 +1670,8 @@ where
                         .opposite_materialization_tombstone(file_key, target)
                         .await?;
                     if let Some(mut tombstone) = tombstone {
-                        mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
-                        rows.push(tombstone);
+                        mark_plugin_reconciliation_row(&mut tombstone);
+                        rows.push_raw(tombstone);
                     }
                     let mut materialized_row = if let Some(proof) =
                         reconciliation.derived_materializations.get(file_key)
@@ -1685,13 +1718,13 @@ where
                         })?
                     };
                     materialized_row.change_id = Some(version.clone());
-                    mark_plugin_reconciliation_rows(std::slice::from_mut(&mut materialized_row));
-                    rows.push(materialized_row);
+                    mark_plugin_reconciliation_row(&mut materialized_row);
+                    rows.push_raw(materialized_row);
                 }
                 let write = if file_data.is_empty() {
-                    TransactionWrite::Rows { mode, rows }
+                    ReconciledTransactionWrite::Rows { mode, rows }
                 } else {
-                    TransactionWrite::RowsWithFileData {
+                    ReconciledTransactionWrite::RowsWithFileData {
                         mode,
                         rows,
                         file_data,
@@ -1702,7 +1735,6 @@ where
                     write,
                     reconciliation.file_view_mutations,
                     reconciliation.actor_publications,
-                    reconciliation.prepared_semantic_rows,
                 ))
             }
             TransactionWrite::RowsWithFileData {
@@ -1713,33 +1745,29 @@ where
             } => {
                 let mut rows = rows;
                 reject_external_plugin_registry_rows(&rows)?;
-                let PluginWriteReconciliation {
-                    file_keys,
-                    materialized_file_keys,
-                    materialization_versions,
-                    derived_materializations,
-                    rows: mut plugin_rows,
-                    file_view_mutations,
-                    actor_publications,
-                    prepared_semantic_rows,
-                } = self
-                    .plugin_write_reconciliation(&rows, &mut file_data)
+                let mut reconciliation = self
+                    .plugin_write_reconciliation(&mut rows, &mut file_data)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.plugin_reconciliation"
                     ))
                     .await?;
-                mark_plugin_reconciliation_rows(&mut plugin_rows);
-                rows.retain(|row| {
-                    !materialization_versions
+                let mut rows = reconciliation.take_reconciled_rows(rows);
+                rows.retain_raw(|row| {
+                    !reconciliation
+                        .materialization_versions
                         .keys()
                         .any(|key| key.matches_materialization_row(row))
-                        && !file_keys
+                        && !reconciliation
+                            .file_keys
                             .iter()
                             .any(|key| key.matches_materialization_row(row))
-                });
-                for (file_key, version) in &materialization_versions {
-                    let target = if derived_materializations.contains_key(file_key) {
+                })?;
+                for (file_key, version) in &reconciliation.materialization_versions {
+                    let target = if reconciliation
+                        .derived_materializations
+                        .contains_key(file_key)
+                    {
                         PluginMaterialization::Derived
                     } else {
                         PluginMaterialization::Blob
@@ -1748,75 +1776,75 @@ where
                         .opposite_materialization_tombstone(file_key, target)
                         .await?;
                     if let Some(mut tombstone) = tombstone {
-                        mark_plugin_reconciliation_rows(std::slice::from_mut(&mut tombstone));
-                        rows.push(tombstone);
+                        mark_plugin_reconciliation_row(&mut tombstone);
+                        rows.push_raw(tombstone);
                     }
-                    let mut materialized_row =
-                        if let Some(proof) = derived_materializations.get(file_key) {
-                            derived_file_ref_row(DerivedFileRefRowInput {
-                                file_id: file_key.file_id.clone(),
-                                path: proof.path.clone(),
-                                sha256: proof.sha256.to_lower_hex(),
-                                size_bytes: proof.size_bytes,
-                                context: FilesystemRowContext {
-                                    branch_id: file_key.branch_id.clone(),
-                                    global: file_key.global,
-                                    untracked: file_key.untracked,
-                                    file_id: None,
-                                    metadata: None,
-                                },
-                            })?
-                        } else {
-                            let payload = file_data
-                                .iter()
-                                .find(|write| PluginFileWriteKey::from(*write) == *file_key)
-                                .ok_or_else(|| {
-                                    LixError::new(
-                                        LixError::CODE_INTERNAL_ERROR,
-                                        format!(
-                                            "v2 materialization payload for file '{}' is missing",
-                                            file_key.file_id
-                                        ),
-                                    )
-                                })?;
-                            blob_ref_row(BlobRefRowInput {
-                                file_id: file_key.file_id.clone(),
-                                blob_hash: payload
-                                    .blob_hash()
-                                    .unwrap_or_else(|| BlobHash::from_content(payload.data())),
-                                size_bytes: payload.len(),
-                                context: FilesystemRowContext {
-                                    branch_id: file_key.branch_id.clone(),
-                                    global: file_key.global,
-                                    untracked: file_key.untracked,
-                                    file_id: None,
-                                    metadata: None,
-                                },
-                            })?
-                        };
+                    let mut materialized_row = if let Some(proof) =
+                        reconciliation.derived_materializations.get(file_key)
+                    {
+                        derived_file_ref_row(DerivedFileRefRowInput {
+                            file_id: file_key.file_id.clone(),
+                            path: proof.path.clone(),
+                            sha256: proof.sha256.to_lower_hex(),
+                            size_bytes: proof.size_bytes,
+                            context: FilesystemRowContext {
+                                branch_id: file_key.branch_id.clone(),
+                                global: file_key.global,
+                                untracked: file_key.untracked,
+                                file_id: None,
+                                metadata: None,
+                            },
+                        })?
+                    } else {
+                        let payload = file_data
+                            .iter()
+                            .find(|write| PluginFileWriteKey::from(*write) == *file_key)
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "v2 materialization payload for file '{}' is missing",
+                                        file_key.file_id
+                                    ),
+                                )
+                            })?;
+                        blob_ref_row(BlobRefRowInput {
+                            file_id: file_key.file_id.clone(),
+                            blob_hash: payload
+                                .blob_hash()
+                                .unwrap_or_else(|| BlobHash::from_content(payload.data())),
+                            size_bytes: payload.len(),
+                            context: FilesystemRowContext {
+                                branch_id: file_key.branch_id.clone(),
+                                global: file_key.global,
+                                untracked: file_key.untracked,
+                                file_id: None,
+                                metadata: None,
+                            },
+                        })?
+                    };
                     materialized_row.change_id = Some(version.clone());
-                    rows.push(materialized_row);
+                    rows.push_raw(materialized_row);
                 }
-                rows.extend(plugin_rows);
                 let file_data = file_data
                     .into_iter()
                     .filter(|write| {
                         let key = PluginFileWriteKey::from(write);
-                        !file_keys.contains(&key)
-                            && !derived_materializations.contains_key(&key)
-                            && (!write.is_empty() || materialized_file_keys.contains(&key))
+                        !reconciliation.file_keys.contains(&key)
+                            && !reconciliation.derived_materializations.contains_key(&key)
+                            && (!write.is_empty()
+                                || reconciliation.materialized_file_keys.contains(&key))
                     })
                     .collect();
                 Ok((
-                    TransactionWrite::RowsWithFileData {
+                    ReconciledTransactionWrite::RowsWithFileData {
                         mode,
                         rows,
                         file_data,
                         count,
                     },
-                    file_view_mutations,
-                    actor_publications,
-                    prepared_semantic_rows,
+                    reconciliation.file_view_mutations,
+                    reconciliation.actor_publications,
                 ))
             }
         }
@@ -1896,12 +1924,14 @@ where
     /// batched owner/state/CAS reads and execute plugin calls in input order.
     async fn plugin_write_reconciliation(
         &mut self,
-        input_rows: &[TransactionWriteRow],
+        rows: &mut RawWriteBatch,
         file_data: &mut Vec<TransactionFileData>,
     ) -> Result<PluginWriteReconciliation, LixError> {
+        let input_row_count = rows.len();
         let mut reconciliation = PluginWriteReconciliation::default();
         let mut lifecycle = BTreeMap::<PluginLifecycleKey, Option<PluginRegistryEntry>>::new();
-        let mut lifecycle_schema_rows = Vec::<(PluginLifecycleKey, TransactionWriteRow)>::new();
+        let mut lifecycle_schema_keys = Vec::<PluginLifecycleKey>::new();
+        let mut lifecycle_schema_rows = RawWriteBatch::new();
         let mut current_install_schema_definitions =
             BTreeMap::<PluginLifecycleKey, BTreeMap<String, JsonValue>>::new();
         let mut current_install_wasm = BTreeMap::<BlobHash, Vec<u8>>::new();
@@ -2005,18 +2035,18 @@ where
                 .entry(parsed.wasm_hash)
                 .or_insert_with(|| parsed.wasm_bytes.clone());
             write.add_auxiliary_payload(parsed.wasm_bytes);
-            lifecycle_schema_rows.extend(
-                schema_rows
-                    .into_iter()
-                    .map(|row| (lifecycle_key.clone(), row)),
-            );
+            lifecycle_schema_keys.extend(std::iter::repeat_n(
+                lifecycle_key.clone(),
+                schema_rows.len(),
+            ));
+            lifecycle_schema_rows.append(schema_rows);
             branch_ids.insert(write.branch_id.clone());
         }
 
         // A canonical archive descriptor tombstone is the uninstall signal.
         // Other descriptor tombstones are ownership cleanup candidates.
         let mut deleted_file_keys = BTreeMap::<PluginFileWriteKey, Option<TransactionJson>>::new();
-        for row in input_rows {
+        for row in rows.iter().take(input_row_count) {
             if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.snapshot.is_some() {
                 continue;
             }
@@ -2040,37 +2070,37 @@ where
                     ));
                 }
                 let lifecycle_key = PluginLifecycleKey {
-                    branch_id: row.branch_id.clone(),
+                    branch_id: row.branch_id.to_string(),
                     plugin_key: plugin_key.to_string(),
                 };
                 if lifecycle.insert(lifecycle_key, None).is_some() {
                     return Err(duplicate_plugin_lifecycle_mutation());
                 }
-                branch_ids.insert(row.branch_id.clone());
+                branch_ids.insert(row.branch_id.to_string());
                 continue;
             }
             if row.global || row.untracked {
                 continue;
             }
             let key = PluginFileWriteKey {
-                branch_id: row.branch_id.clone(),
+                branch_id: row.branch_id.to_string(),
                 global: false,
                 untracked: false,
                 file_id,
             };
             deleted_file_keys
                 .entry(key)
-                .or_insert_with(|| row.metadata.clone());
-            branch_ids.insert(row.branch_id.clone());
+                .or_insert_with(|| row.metadata.cloned());
+            branch_ids.insert(row.branch_id.to_string());
         }
 
         // Registered-schema writes are rare lifecycle operations, but they
         // must still consult the registry even when no file data is present.
         // Otherwise a later public UPDATE/DELETE could invalidate an active
         // plugin's durable state contract behind the registry's back.
-        for row in input_rows {
+        for row in rows.iter().take(input_row_count) {
             if row.schema_key == REGISTERED_SCHEMA_KEY && !row.global && !row.untracked {
-                branch_ids.insert(row.branch_id.clone());
+                branch_ids.insert(row.branch_id.to_string());
             }
         }
 
@@ -2078,9 +2108,9 @@ where
         // file-scoped row may nevertheless belong to an active plugin and
         // therefore needs the small branch registry lookup before the host can
         // decide whether an entity-to-file transition is required.
-        for row in input_rows {
+        for row in rows.iter().take(input_row_count) {
             if !row.global && !row.untracked && row.file_id.is_some() {
-                branch_ids.insert(row.branch_id.clone());
+                branch_ids.insert(row.branch_id.to_string());
             }
         }
 
@@ -2106,20 +2136,23 @@ where
 
         if !lifecycle_schema_rows.is_empty() {
             let mut desired_schemas = BTreeMap::<(String, EntityPk), (String, JsonValue)>::new();
-            for (lifecycle_key, row) in &lifecycle_schema_rows {
-                let entity_pk = row.entity_pk.clone().ok_or_else(|| {
+            for (lifecycle_key, row) in lifecycle_schema_keys
+                .iter()
+                .zip(lifecycle_schema_rows.iter())
+            {
+                let entity_pk = row.entity_pk.cloned().ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "plugin schema row is missing its entity identity",
                     )
                 })?;
-                let snapshot = row.snapshot.as_ref().ok_or_else(|| {
+                let snapshot = row.snapshot.ok_or_else(|| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         "plugin schema row is missing its definition",
                     )
                 })?;
-                let identity = (row.branch_id.clone(), entity_pk);
+                let identity = (row.branch_id.to_string(), entity_pk);
                 let definition = snapshot.value().clone();
                 if let Some((other_plugin, other_definition)) = desired_schemas.get(&identity)
                     && other_definition != &definition
@@ -2133,7 +2166,7 @@ where
                 desired_schemas.insert(identity, (lifecycle_key.plugin_key.clone(), definition));
             }
 
-            let schema_rows = overlay_scan_rows(
+            let schema_rows = overlay_scan_batch(
                 &base,
                 &staged,
                 &LiveStateScanRequest {
@@ -2161,12 +2194,12 @@ where
             )
             .await?;
             let mut existing_schemas = BTreeMap::<(String, EntityPk), JsonValue>::new();
-            for row in schema_rows {
-                let Some(snapshot) = row.snapshot_content.as_deref() else {
+            for row in schema_rows.iter() {
+                let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
                     continue;
                 };
                 existing_schemas.insert(
-                    (row.branch_id.to_string(), row.entity_pk),
+                    (row.branch_id().to_string(), row.entity_pk().clone()),
                     serde_json::from_str(snapshot).map_err(|error| {
                         LixError::new(
                             LixError::CODE_SCHEMA_DEFINITION,
@@ -2178,7 +2211,7 @@ where
             // Programmatic writes may pair a schema mutation with a plugin
             // archive in one transaction batch. Model those rows after the
             // visible snapshot before checking the derived plugin rows.
-            for row in input_rows {
+            for row in rows.iter().take(input_row_count) {
                 if row.schema_key != REGISTERED_SCHEMA_KEY
                     || row.global
                     || row.untracked
@@ -2186,14 +2219,14 @@ where
                 {
                     continue;
                 }
-                let Some(entity_pk) = row.entity_pk.clone() else {
+                let Some(entity_pk) = row.entity_pk.cloned() else {
                     continue;
                 };
-                let identity = (row.branch_id.clone(), entity_pk);
+                let identity = (row.branch_id.to_string(), entity_pk);
                 if !desired_schemas.contains_key(&identity) {
                     continue;
                 }
-                match row.snapshot.as_ref() {
+                match row.snapshot {
                     Some(snapshot) => {
                         existing_schemas.insert(identity, snapshot.value().clone());
                     }
@@ -2209,12 +2242,10 @@ where
                     return Err(plugin_schema_collision_error(plugin_key, &identity.1, None));
                 }
             }
-            reconciliation
-                .rows
-                .extend(lifecycle_schema_rows.into_iter().map(|(_, row)| row));
+            rows.append(lifecycle_schema_rows);
         }
 
-        let registry_rows = overlay_load_exact_rows(
+        let registry_rows = overlay_load_exact_batch(
             &base,
             &staged,
             &LiveStateExactBatchRequest {
@@ -2233,30 +2264,30 @@ where
             },
         )
         .await?;
-        let mut registry_rows_by_branch = BTreeMap::<String, MaterializedLiveStateRow>::new();
-        for row in registry_rows.into_iter().flatten() {
-            if registry_rows_by_branch
-                .insert(row.branch_id.to_string(), row)
-                .is_some()
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    "durable plugin registry lookup returned duplicate branch rows",
-                ));
-            }
-        }
-
         let mut registries = BTreeMap::<String, PluginRegistry>::new();
         let mut changed_registry_branches = BTreeSet::<String>::new();
         let mut generation_upgrades = Vec::<PluginGenerationUpgrade>::new();
         let mut derived_plugin_uninstalls = BTreeMap::<String, BTreeSet<String>>::new();
-        for branch_id in &branch_ids {
+        if registry_rows.len() != branch_ids.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "durable plugin registry lookup expected {} aligned slots, got {}",
+                    branch_ids.len(),
+                    registry_rows.len()
+                ),
+            ));
+        }
+        for (slot, branch_id) in branch_ids.iter().enumerate() {
+            // Registry decoding is the terminal plugin-parser boundary. Keep
+            // the exact batch owner alive and materialize at most this one
+            // scalar DTO while the parser validates it.
+            let row = registry_rows
+                .row(slot)
+                .map(MaterializedLiveStateRowRef::to_owned);
             registries.insert(
                 branch_id.clone(),
-                PluginRegistry::from_optional_live_state_row(
-                    registry_rows_by_branch.get(branch_id),
-                    branch_id,
-                )?,
+                PluginRegistry::from_optional_live_state_row(row.as_ref(), branch_id)?,
             );
         }
         for (key, mutation) in lifecycle {
@@ -2289,7 +2320,7 @@ where
             }
             changed_registry_branches.insert(key.branch_id);
         }
-        for row in input_rows {
+        for row in rows.iter().take(input_row_count) {
             if row.schema_key != REGISTERED_SCHEMA_KEY || row.global || row.untracked {
                 continue;
             }
@@ -2300,7 +2331,7 @@ where
             else {
                 continue;
             };
-            let Some(plugin) = registries.get(&row.branch_id).and_then(|registry| {
+            let Some(plugin) = registries.get(row.branch_id.as_str()).and_then(|registry| {
                 registry
                     .plugins()
                     .iter()
@@ -2340,7 +2371,7 @@ where
             .await?;
         }
         for branch_id in changed_registry_branches {
-            reconciliation.rows.push(
+            rows.push(
                 registries
                     .get(&branch_id)
                     .expect("changed registry branch should remain loaded")
@@ -2373,6 +2404,7 @@ where
                     &write.file_id,
                 ));
             }
+            mark_plugin_reconciliation_batch(rows, input_row_count)?;
             return Ok(reconciliation);
         }
 
@@ -2390,29 +2422,31 @@ where
         for key in deleted_file_keys.keys() {
             candidate_file_keys.insert(key.clone());
         }
-        for row in input_rows {
+        for row in rows.iter().take(input_row_count) {
             if row.global
                 || row.untracked
-                || !active_branch_ids.contains(&row.branch_id)
+                || !active_branch_ids.contains(row.branch_id.as_str())
                 || row.file_id.is_none()
             {
                 continue;
             }
             candidate_file_keys.insert(PluginFileWriteKey {
-                branch_id: row.branch_id.clone(),
+                branch_id: row.branch_id.to_string(),
                 global: false,
                 untracked: false,
                 file_id: row
                     .file_id
-                    .clone()
+                    .as_ref()
+                    .map(ToString::to_string)
                     .expect("candidate semantic row has a file id"),
             });
         }
         if candidate_file_keys.is_empty() {
+            mark_plugin_reconciliation_batch(rows, input_row_count)?;
             return Ok(reconciliation);
         }
 
-        let owner_rows = overlay_load_exact_rows(
+        let owner_rows = overlay_load_exact_batch(
             &base,
             &staged,
             &LiveStateExactBatchRequest {
@@ -2433,12 +2467,13 @@ where
         .await?;
         let mut owners = BTreeMap::<PluginFileWriteKey, PluginFileOwner>::new();
         let mut owner_change_ids = BTreeMap::<PluginFileWriteKey, String>::new();
-        for row in owner_rows.into_iter().flatten() {
-            let branch_id = row.branch_id.to_string();
-            let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+        for row in (0..owner_rows.len()).filter_map(|slot| owner_rows.row(slot)) {
+            let branch_id = row.branch_id().to_string();
+            let owner_row = row.to_owned();
+            let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
                 continue;
             };
-            let owner_change_id = row.change_id.ok_or_else(|| {
+            let owner_change_id = row.change_id().ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
@@ -2477,29 +2512,29 @@ where
             .iter()
             .map(PluginFileWriteKey::from)
             .collect::<BTreeSet<_>>();
-        let mut unresolved_semantic_groups = BTreeMap::<
-            PluginFileWriteKey,
-            (PluginRegistryEntry, String, Vec<TransactionWriteRow>),
-        >::new();
-        for row in input_rows {
+        let mut unresolved_semantic_groups =
+            BTreeMap::<PluginFileWriteKey, (PluginRegistryEntry, String, Vec<usize>)>::new();
+        for (row_index, row) in rows.iter().take(input_row_count).enumerate() {
             let Some(file_id) = row.file_id.as_deref() else {
                 continue;
             };
-            if row.global || row.untracked || !active_branch_ids.contains(&row.branch_id) {
+            if row.global || row.untracked || !active_branch_ids.contains(row.branch_id.as_str()) {
                 continue;
             }
             let registry = registries
-                .get(&row.branch_id)
+                .get(row.branch_id.as_str())
                 .expect("active semantic-write branch has a registry");
-            let schema_is_plugin_owned = registry
-                .plugins()
-                .iter()
-                .any(|plugin| plugin.schema_keys().binary_search(&row.schema_key).is_ok());
+            let schema_is_plugin_owned = registry.plugins().iter().any(|plugin| {
+                plugin
+                    .schema_keys()
+                    .binary_search_by(|key| key.as_str().cmp(row.schema_key.as_str()))
+                    .is_ok()
+            });
             if !schema_is_plugin_owned {
                 continue;
             }
             let file_key = PluginFileWriteKey {
-                branch_id: row.branch_id.clone(),
+                branch_id: row.branch_id.to_string(),
                 global: false,
                 untracked: false,
                 file_id: file_id.to_string(),
@@ -2523,8 +2558,14 @@ where
                     ),
                 )
             })?;
-            if plugin.schema_keys().binary_search(&row.schema_key).is_err()
-                || owner.schema_keys().binary_search(&row.schema_key).is_err()
+            if plugin
+                .schema_keys()
+                .binary_search_by(|key| key.as_str().cmp(row.schema_key.as_str()))
+                .is_err()
+                || owner
+                    .schema_keys()
+                    .binary_search_by(|key| key.as_str().cmp(row.schema_key.as_str()))
+                    .is_err()
             {
                 return Err(LixError::new(
                     LixError::CODE_CONSTRAINT_VIOLATION,
@@ -2572,7 +2613,7 @@ where
                     ),
                 ));
             }
-            group.2.push(row.clone());
+            group.2.push(row_index);
         }
 
         let mut semantic_groups = BTreeMap::<PluginFileWriteKey, PluginV2SemanticWriteGroup>::new();
@@ -2584,7 +2625,7 @@ where
                     .collect(),
             );
             let path_index = self.filesystem_path_index(&request).await?;
-            for (file_key, (plugin, owner_change_id, rows)) in unresolved_semantic_groups {
+            for (file_key, (plugin, owner_change_id, row_indices)) in unresolved_semantic_groups {
                 let entries = path_index
                     .exact_file_id_entries(&file_key.file_id)
                     .into_iter()
@@ -2627,7 +2668,7 @@ where
                         path: entry.path.clone(),
                         filename: entry.name.clone(),
                         owner_change_id,
-                        rows,
+                        row_indices,
                     },
                 );
             }
@@ -2751,10 +2792,11 @@ where
                     .extend(selected.schema_keys().iter().cloned());
             }
         }
-        let mut state_by_file =
-            BTreeMap::<PluginStateFileKey, Vec<MaterializedLiveStateRow>>::new();
+        let mut state_batches =
+            Vec::<MaterializedLiveStateBatch>::with_capacity(state_groups.len());
+        let mut state_group_keys = Vec::<PluginStateGroupKey>::with_capacity(state_groups.len());
         for (group_key, group) in state_groups {
-            let rows = overlay_scan_rows(
+            let rows = overlay_scan_batch(
                 &base,
                 &staged,
                 &LiveStateScanRequest {
@@ -2775,19 +2817,79 @@ where
                 },
             )
             .await?;
-            for row in rows {
-                let Some(file_id) = row.file_id.clone() else {
-                    continue;
-                };
-                state_by_file
-                    .entry(PluginStateFileKey {
-                        branch_id: group_key.branch_id.clone(),
-                        plugin_key: group_key.plugin_key.clone(),
-                        file_id,
-                    })
-                    .or_default()
-                    .push(row);
+            u32::try_from(state_batches.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin reconciliation state batch count exceeds u32 ordinals",
+                )
+            })?;
+            u32::try_from(rows.len()).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "plugin reconciliation state row count exceeds u32 ordinals",
+                )
+            })?;
+            state_group_keys.push(group_key);
+            state_batches.push(rows);
+        }
+        let state_row_count = state_batches
+            .iter()
+            .map(MaterializedLiveStateBatch::len)
+            .sum();
+        let mut state_rows = Vec::<PluginStateBatchRow>::with_capacity(state_row_count);
+        for (batch_index, batch) in state_batches.iter().enumerate() {
+            let batch_index =
+                u32::try_from(batch_index).expect("plugin state batch count was checked");
+            for (row_index, row) in batch.iter().enumerate() {
+                if row.file_id().is_some() {
+                    state_rows.push(PluginStateBatchRow {
+                        batch_index,
+                        row_index: u32::try_from(row_index)
+                            .expect("plugin state batch row count was checked"),
+                    });
+                }
             }
+        }
+        state_rows.sort_unstable_by(|left, right| {
+            left.batch_index.cmp(&right.batch_index).then_with(|| {
+                let left = state_batches[left.batch_index as usize]
+                    .row(left.row_index as usize)
+                    .file_id()
+                    .expect("selected plugin state row carries file_id");
+                let right = state_batches[right.batch_index as usize]
+                    .row(right.row_index as usize)
+                    .file_id()
+                    .expect("selected plugin state row carries file_id");
+                left.cmp(right)
+            })
+        });
+        let mut state_by_file =
+            std::iter::repeat_with(BTreeMap::<String, std::ops::Range<usize>>::new)
+                .take(state_group_keys.len())
+                .collect::<Vec<_>>();
+        let mut selection_start = 0;
+        while selection_start < state_rows.len() {
+            let selected = state_rows[selection_start];
+            let file_id = state_batches[selected.batch_index as usize]
+                .row(selected.row_index as usize)
+                .file_id()
+                .expect("selected plugin state row carries file_id");
+            let mut selection_end = selection_start + 1;
+            while selection_end < state_rows.len() {
+                let candidate = state_rows[selection_end];
+                if candidate.batch_index != selected.batch_index
+                    || state_batches[candidate.batch_index as usize]
+                        .row(candidate.row_index as usize)
+                        .file_id()
+                        != Some(file_id)
+                {
+                    break;
+                }
+                selection_end += 1;
+            }
+            state_by_file[selected.batch_index as usize]
+                .insert(file_id.to_owned(), selection_start..selection_end);
+            selection_start = selection_end;
         }
 
         let mut selected_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
@@ -2903,26 +3005,30 @@ where
             };
             let old_state = owner
                 .and_then(|owner| {
-                    state_by_file.get(&PluginStateFileKey {
-                        branch_id: write.branch_id.clone(),
-                        plugin_key: owner.plugin_key().to_string(),
-                        file_id: write.file_id.clone(),
-                    })
+                    let group_index = state_group_keys
+                        .binary_search_by(|group| {
+                            group
+                                .branch_id
+                                .as_str()
+                                .cmp(write.branch_id.as_str())
+                                .then_with(|| group.plugin_key.as_str().cmp(owner.plugin_key()))
+                        })
+                        .ok()?;
+                    state_by_file[group_index].get(write.file_id.as_str())
                 })
-                .cloned()
+                .map(|range| &state_rows[range.clone()])
                 .unwrap_or_default();
 
             if owner.is_some_and(|owner| {
                 selected.is_none_or(|selected| selected.key() != owner.plugin_key())
             }) {
-                reconciliation.rows.extend(plugin_state_tombstone_rows(
-                    &old_state,
+                rows.append(plugin_state_tombstone_batch(
+                    old_state,
+                    &state_batches,
                     &write.file_id,
                     &context,
                 ));
-                reconciliation
-                    .rows
-                    .extend(self.v2_id_reservation_tombstones(&file_key).await?);
+                rows.append(self.v2_id_reservation_tombstones(&file_key).await?);
             }
 
             let Some(selected) = selected else {
@@ -2931,7 +3037,7 @@ where
                     &write.file_id,
                 ));
                 if owner.is_some() {
-                    reconciliation.rows.push(PluginFileOwner::delete_row(
+                    rows.push(PluginFileOwner::delete_row(
                         write.file_id.clone(),
                         &write.branch_id,
                     )?);
@@ -2959,7 +3065,7 @@ where
                 let owner_change_id = self.functions.call_uuid_v7().to_string();
                 let mut owner_row = desired_owner.write_row(&write.branch_id)?;
                 owner_row.change_id = Some(owner_change_id.clone());
-                reconciliation.rows.push(owner_row);
+                rows.push(owner_row);
                 owner_change_id
             } else {
                 current_owner_change_id.clone().ok_or_else(|| {
@@ -3005,7 +3111,10 @@ where
             }
             let descriptor = v2_file_descriptor(write, selected);
             let limits = WasmTransitionLimits::default();
-            let schemas = V2SchemaAllowlist::from_slice(selected.schema_keys())?;
+            let schemas = V2SchemaAllowlist::from_catalog(
+                selected.schema_keys(),
+                Arc::clone(&self.sql_schema_snapshot),
+            )?;
             let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                 local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
             });
@@ -3395,34 +3504,22 @@ where
                     create_rows,
                 )
             };
+            rows.append(create_rows);
             let change_rows = tracing::debug_span!(
                 target: "lix_perf",
                 "lix.perf.plugin_change_rows"
             )
             .in_scope(|| {
-                plugin_detected_changes_from_v2(selected, &changes).and_then(|detected| {
-                    plugin_change_rows(
-                        selected,
-                        detected,
-                        &write.file_id,
-                        &context,
-                        "plugin v2 file transition",
-                    )
-                })
+                append_plugin_change_rows_from_v2(rows, selected, changes, &write.file_id, &context)
             });
-            let change_rows = match change_rows {
-                Ok(rows) => rows,
-                Err(error) => {
-                    publication.discard().await;
-                    discard_plugin_actor_publications(std::mem::take(
-                        &mut reconciliation.actor_publications,
-                    ))
-                    .await;
-                    return Err(error);
-                }
-            };
-            reconciliation.rows.extend(create_rows);
-            reconciliation.rows.extend(change_rows);
+            if let Err(error) = change_rows {
+                publication.discard().await;
+                discard_plugin_actor_publications(std::mem::take(
+                    &mut reconciliation.actor_publications,
+                ))
+                .await;
+                return Err(error);
+            }
             match selected.materialization() {
                 PluginMaterialization::Blob => {
                     if materialized_bytes.as_ref() != write.data() {
@@ -3459,6 +3556,13 @@ where
             reconciled_file_keys.insert(file_key);
         }
 
+        // Promote only the semantic path. Ordinary SQL and file batches keep
+        // their original Vec allocation through reconciliation.
+        let mut reconciled_rows = if semantic_groups.is_empty() {
+            None
+        } else {
+            Some(ReconciledRowBatch::promote_raw_rows(rows))
+        };
         for (file_key, group) in semantic_groups {
             let session_key = SessionFileViewKey::new(&file_key.branch_id, &file_key.file_id);
             if reconciliation
@@ -3502,22 +3606,30 @@ where
                 plugin_key: group.plugin.key().to_string(),
                 plugin_generation: group.plugin.archive_blob_hash().to_string(),
             };
+            // Move semantic sources out exactly once. Their typed slots retain
+            // the original batch positions while the plugin renderer runs.
+            let semantic_rows = {
+                let rows = reconciled_rows
+                    .as_mut()
+                    .expect("semantic groups promote the reconciled row batch");
+                rows.take_raw_rows_at(&group.row_indices)?
+            };
             let prepared = self
-                .prepare_transaction_rows(group.rows.clone())
+                .prepare_transaction_rows(semantic_rows)
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
                     "lix.perf.plugin_semantic_prepare_rows"
                 ))
                 .await?;
             if prepared.iter().any(|row| {
-                row.branch_id != file_key.branch_id
-                    || row.file_id.as_deref() != Some(file_key.file_id.as_str())
+                row.branch_id.as_str() != file_key.branch_id
+                    || row.file_id.map(SharedStr::as_str) != Some(file_key.file_id.as_str())
                     || row.global
                     || row.untracked
                     || group
                         .plugin
                         .schema_keys()
-                        .binary_search(&row.schema_key)
+                        .binary_search_by(|key| key.as_str().cmp(row.schema_key.as_str()))
                         .is_err()
             }) {
                 return Err(LixError::new(
@@ -3529,7 +3641,7 @@ where
                 ));
             }
             let limits = WasmTransitionLimits::default();
-            let changes = v2_host_changes_from_prepared_rows(prepared.clone(), limits)?;
+            let changes = v2_host_changes_from_prepared_rows(&prepared, limits)?;
             if changes.entity_change_count() == 0 {
                 return Err(LixError::new(
                     LixError::CODE_INVALID_PARAM,
@@ -3748,11 +3860,10 @@ where
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
-            for (source, prepared) in group.rows.iter().zip(prepared) {
-                reconciliation
-                    .prepared_semantic_rows
-                    .insert(source, prepared)?;
-            }
+            let rows = reconciled_rows
+                .as_mut()
+                .expect("semantic groups promote the reconciled row batch");
+            rows.put_prepared_batch_at(&group.row_indices, prepared)?;
             let publication = if self.retain_plugin_actor_publications {
                 publication
             } else {
@@ -3766,9 +3877,12 @@ where
             if reconciled_file_keys.contains(&file_key) {
                 continue;
             }
-            reconciliation
-                .rows
-                .extend(self.v2_id_reservation_tombstones(&file_key).await?);
+            let reservation_tombstones = self.v2_id_reservation_tombstones(&file_key).await?;
+            if let Some(rows) = &mut reconciled_rows {
+                rows.append_raw_batch(reservation_tombstones);
+            } else {
+                rows.append(reservation_tombstones);
+            }
             if !owners.contains_key(&file_key) {
                 reconciliation.remove_session_file_view(SessionFileViewKey::new(
                     &file_key.branch_id,
@@ -3780,58 +3894,133 @@ where
                 &file_key.branch_id,
                 &file_key.file_id,
             ));
-            reconciliation.rows.push(PluginFileOwner::delete_row(
-                file_key.file_id,
-                &file_key.branch_id,
-            )?);
+            let owner_tombstone =
+                PluginFileOwner::delete_row(file_key.file_id, &file_key.branch_id)?;
+            if let Some(rows) = &mut reconciled_rows {
+                rows.push_raw(owner_tombstone);
+            } else {
+                rows.push(owner_tombstone);
+            }
         }
 
+        if let Some(mut rows) = reconciled_rows {
+            rows.mark_plugin_reconciliation_rows_from(input_row_count)?;
+            reconciliation.reconciled_rows = Some(rows);
+        } else {
+            mark_plugin_reconciliation_batch(rows, input_row_count)?;
+        }
         Ok(reconciliation)
     }
 
     async fn prepare_transaction_write(
         &mut self,
-        write: TransactionWrite,
-        mut prepared_semantic_rows: PreparedSemanticRows,
+        write: ReconciledTransactionWrite,
     ) -> Result<PreparedTransactionWrite, LixError> {
-        let prepared = match write {
-            TransactionWrite::Rows { mode, rows } => PreparedTransactionWrite::Rows {
+        Ok(match write {
+            ReconciledTransactionWrite::Rows { mode, rows } => PreparedTransactionWrite::Rows {
                 mode,
-                rows: self
-                    .prepare_transaction_rows_with_frozen(rows, &mut prepared_semantic_rows)
-                    .await?,
+                rows: self.prepare_reconciled_rows(rows).await?,
             },
-            TransactionWrite::RowsWithFileData {
+            ReconciledTransactionWrite::RowsWithFileData {
                 mode,
                 rows,
                 file_data,
                 count,
             } => PreparedTransactionWrite::RowsWithFileData {
                 mode,
-                rows: self
-                    .prepare_transaction_rows_with_frozen(rows, &mut prepared_semantic_rows)
-                    .await?,
+                rows: self.prepare_reconciled_rows(rows).await?,
                 file_data,
                 count,
             },
-        };
-        prepared_semantic_rows.require_consumed()?;
-        Ok(prepared)
+        })
+    }
+
+    async fn prepare_reconciled_rows(
+        &mut self,
+        rows: ReconciledRowBatch,
+    ) -> Result<PreparedStateBatch, LixError> {
+        match rows {
+            ReconciledRowBatch::Raw(rows) => self.prepare_transaction_rows(rows).await,
+            ReconciledRowBatch::Mixed(mut mixed) => {
+                if mixed
+                    .slots
+                    .iter()
+                    .any(|slot| matches!(slot, ReconciledRowSlot::Extracted))
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "transaction preparation observed an unfilled semantic slot",
+                    ));
+                }
+
+                let raw_count = mixed
+                    .slots
+                    .iter()
+                    .filter(|slot| matches!(slot, ReconciledRowSlot::Raw(_)))
+                    .count();
+                let mut raw_ordinals = Vec::with_capacity(raw_count);
+                for slot in &mut mixed.slots {
+                    if let ReconciledRowSlot::Raw(ordinal) = *slot {
+                        raw_ordinals.push(ordinal as usize);
+                        *slot = ReconciledRowSlot::Extracted;
+                    }
+                }
+                let raw_rows = mixed.raw.take_rows(&raw_ordinals);
+                let prepared_raw_rows = self
+                    .prepare_transaction_rows_with_homogeneous(raw_rows, false)
+                    .await?;
+                if prepared_raw_rows.len() != raw_count {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "raw transaction preparation changed the reconciled row count",
+                    ));
+                }
+
+                let raw_base = mixed.prepared.len();
+                mixed.prepared.append(prepared_raw_rows);
+                let mut next_raw = 0usize;
+                let mut source_by_destination = Vec::with_capacity(mixed.slots.len());
+                for slot in mixed.slots {
+                    match slot {
+                        ReconciledRowSlot::Prepared(ordinal) => {
+                            source_by_destination.push(ordinal as usize);
+                        }
+                        ReconciledRowSlot::Extracted => {
+                            source_by_destination.push(raw_base + next_raw);
+                            next_raw += 1;
+                        }
+                        ReconciledRowSlot::Raw(_) => {
+                            unreachable!(
+                                "all raw reconciled slots were extracted before preparation"
+                            )
+                        }
+                    }
+                }
+                if next_raw != raw_count {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "reconciled raw row preparation did not fill every matching slot",
+                    ));
+                }
+                mixed.prepared.select_rows(&source_by_destination);
+                Ok(mixed.prepared)
+            }
+        }
     }
 
     async fn prepare_transaction_rows(
         &mut self,
-        rows: Vec<TransactionWriteRow>,
-    ) -> Result<Vec<PreparedStateRow>, LixError> {
-        self.prepare_transaction_rows_with_frozen(rows, &mut PreparedSemanticRows::default())
+        rows: RawWriteBatch,
+    ) -> Result<PreparedStateBatch, LixError> {
+        self.prepare_transaction_rows_with_homogeneous(rows, true)
             .await
     }
 
-    async fn prepare_transaction_rows_with_frozen(
+    async fn prepare_transaction_rows_with_homogeneous(
         &mut self,
-        rows: Vec<TransactionWriteRow>,
-        prepared_semantic_rows: &mut PreparedSemanticRows,
-    ) -> Result<Vec<PreparedStateRow>, LixError> {
+        rows: RawWriteBatch,
+        allow_homogeneous: bool,
+    ) -> Result<PreparedStateBatch, LixError> {
         let row_count = rows.len();
         let staged = self.staged_writes.staging_overlay()?;
         let read = SharedStorageAdapterRead::new(
@@ -3840,47 +4029,77 @@ where
                 .await?,
         );
         let live_state = self.live_state.reader(&read);
-        if prepared_semantic_rows.remaining == 0
-            && let Some(domain) = homogeneous_row_normalization_domain(&rows)
-        {
+        if allow_homogeneous && let Some(domain) = homogeneous_row_normalization_domain(&rows) {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
                 .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
-            return rows
-                .into_iter()
-                .map(|row| {
-                    let normalized =
-                        normalize_transaction_write_row(row, catalog, functions.clone())?;
-                    prepare_state_row(normalized, &functions, self.origin_key.clone())
-                })
-                .collect();
-        }
-        let mut prepared_rows = Vec::with_capacity(row_count);
-        prepared_rows.resize_with(row_count, || None);
-        let mut rows_by_scope = BTreeMap::<Domain, Vec<(usize, TransactionWriteRow)>>::new();
-        for (index, row) in rows.into_iter().enumerate() {
-            if let Some(prepared) = prepared_semantic_rows.take_for(&row)? {
-                prepared_rows[index] = Some(prepared);
-                continue;
+            let mut scalar_facts = PreparedScalarBatch::with_capacity(rows.len());
+            let mut rows = rows;
+            for index in 0..rows.len() {
+                let normalized =
+                    normalize_raw_write_row_in_place(&mut rows, index, catalog, functions.clone())?;
+                scalar_facts.push(plan_prepared_row_scalars(
+                    rows.row(index),
+                    normalized,
+                    &functions,
+                )?);
             }
+            if rows.iter().any(|row| {
+                row.snapshot
+                    .is_some_and(TransactionJson::requires_batch_canonicalization)
+            }) {
+                canonicalize_transaction_json_batch(
+                    rows.snapshot_slots_mut(),
+                    "prepared snapshot_content",
+                )?;
+            }
+            if rows.iter().any(|row| {
+                row.metadata
+                    .is_some_and(TransactionJson::requires_batch_canonicalization)
+            }) {
+                canonicalize_transaction_json_batch(
+                    rows.metadata_slots_mut(),
+                    "prepared metadata",
+                )?;
+            }
+            let mut prepared_rows = PreparedStateBatch::with_capacity(row_count);
+            for index in 0..row_count {
+                push_prepared_state_row_from_planned_parts(
+                    &mut prepared_rows,
+                    &mut rows,
+                    index,
+                    scalar_facts.row(index),
+                    self.origin_key.as_ref(),
+                )?;
+            }
+            return Ok(prepared_rows);
+        }
+        let mut rows = rows;
+        let mut normalized_facts = Vec::with_capacity(row_count);
+        normalized_facts.resize_with(row_count, || None);
+        let mut scalar_facts = PreparedScalarBatch::with_capacity(row_count);
+        let mut scalar_ordinal_by_row = vec![usize::MAX; row_count];
+        let mut rows_by_scope = BTreeMap::<Domain, Vec<usize>>::new();
+        for (index, row) in rows.iter().enumerate() {
             rows_by_scope
                 .entry(Domain::schema_catalog(
                     row.schema_scope_branch_id().to_string(),
                     row.untracked,
                 ))
                 .or_default()
-                .push((index, row));
+                .push(index);
         }
 
-        for (domain, rows) in rows_by_scope {
+        for (domain, row_indices) in rows_by_scope {
             let functions = self.functions.clone();
             let catalog = self
                 .schema_resolver
                 .catalog_for_row_normalization(&live_state, &staged, &domain)
                 .await?;
-            for (_, row) in &rows {
+            for &index in &row_indices {
+                let row = rows.row(index);
                 if row.schema_key != REGISTERED_SCHEMA_KEY {
                     continue;
                 }
@@ -3892,29 +4111,63 @@ where
                     .with_hint("Schema definitions are scoped by branch and durability only; write them with null file_id."));
                 }
                 remember_pending_registered_schema(
-                    row.snapshot.as_ref().map(TransactionJson::value),
+                    row.snapshot.map(TransactionJson::value),
                     Domain::schema_catalog(row.schema_scope_branch_id().to_string(), row.untracked),
                     catalog,
                 )?;
             }
-            let normalized_rows = rows
-                .into_iter()
-                .map(|(index, row)| {
-                    normalize_transaction_write_row(row, catalog, functions.clone())
-                        .map(|row| (index, row))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            for (index, row) in normalized_rows {
-                prepared_rows[index] =
-                    Some(prepare_state_row(row, &functions, self.origin_key.clone())?);
+            for &index in &row_indices {
+                normalized_facts[index] = Some(normalize_raw_write_row_in_place(
+                    &mut rows,
+                    index,
+                    catalog,
+                    functions.clone(),
+                )?);
+            }
+            // Preserve the historical domain-by-domain provider/error order:
+            // normalize every row in this domain, then scalar-plan those same
+            // rows before advancing to the next domain.
+            for index in row_indices {
+                let scalar = plan_prepared_row_scalars(
+                    rows.row(index),
+                    normalized_facts[index]
+                        .take()
+                        .expect("normalized domain row must have facts"),
+                    &functions,
+                )?;
+                scalar_ordinal_by_row[index] = scalar_facts.schema_plan_ids.len();
+                scalar_facts.push(scalar);
             }
         }
-        Ok(prepared_rows
-            .into_iter()
-            .map(|row| {
-                row.expect("every row should be prepared exactly once by schema scope grouping")
-            })
-            .collect())
+
+        if rows.iter().any(|row| {
+            row.snapshot
+                .is_some_and(TransactionJson::requires_batch_canonicalization)
+        }) {
+            canonicalize_transaction_json_batch(
+                rows.snapshot_slots_mut(),
+                "prepared snapshot_content",
+            )?;
+        }
+        if rows.iter().any(|row| {
+            row.metadata
+                .is_some_and(TransactionJson::requires_batch_canonicalization)
+        }) {
+            canonicalize_transaction_json_batch(rows.metadata_slots_mut(), "prepared metadata")?;
+        }
+
+        let mut prepared_rows = PreparedStateBatch::with_capacity(row_count);
+        for (index, &scalar_ordinal) in scalar_ordinal_by_row.iter().enumerate() {
+            debug_assert_ne!(scalar_ordinal, usize::MAX);
+            push_prepared_state_row_from_planned_parts(
+                &mut prepared_rows,
+                &mut rows,
+                index,
+                scalar_facts.row(scalar_ordinal),
+                self.origin_key.as_ref(),
+            )?;
+        }
+        Ok(prepared_rows)
     }
 
     async fn validate_prepared_writes_by_branch(
@@ -3923,6 +4176,20 @@ where
         prepared_writes: &PreparedWriteSet,
     ) -> Result<(), LixError> {
         if prepared_tracked_rows_have_row_local_certificates(&prepared_writes.state_rows) {
+            // Row-local certificates avoid rebuilding the O(rows) validation
+            // index, but they do not prove that a public INSERT identity is
+            // absent from committed state.
+            if !prepared_writes.insert_selection.is_empty() {
+                #[cfg(feature = "storage-benches")]
+                crate::storage_bench::record_transaction_validation_branch();
+                let live_state = self.live_state.reader(read);
+                validate_certified_tracked_insert_identities(&live_state, prepared_writes)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.validation.insert_identities"
+                    ))
+                    .await?;
+            }
             return Ok(());
         }
         if self.trust_filesystem_planner
@@ -3944,11 +4211,6 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let branch_prepared_writes = validation_index.validation_set_for_schema_scope(scope);
-            if crate::transaction::validation::tracked_row_local_certificates_cover_validation(
-                &branch_prepared_writes,
-            ) {
-                continue;
-            }
             let live_state = self.live_state.reader(read);
             let schema_catalog = self
                 .schema_resolver
@@ -3970,7 +4232,7 @@ where
     /// Convenience helper for programmatic APIs that only stage state rows.
     pub(crate) async fn stage_rows(
         &mut self,
-        rows: Vec<TransactionWriteRow>,
+        rows: RawWriteBatch,
     ) -> Result<TransactionWriteOutcome, LixError> {
         self.stage_write(TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
@@ -4074,7 +4336,7 @@ where
     }
 
     pub(crate) fn replace_origin_key(&mut self, origin_key: Option<String>) -> Option<String> {
-        std::mem::replace(&mut self.origin_key, origin_key)
+        std::mem::replace(&mut self.origin_key, origin_key.map(SharedStr::from)).map(Into::into)
     }
 
     pub(crate) async fn execute_read_sql_statement(
@@ -4135,9 +4397,11 @@ where
         branch_id: &str,
         commit_id: CommitId,
     ) -> Result<(), LixError> {
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(branch_ref_stage_row(branch_id, &commit_id));
         self.stage_write(TransactionWrite::Rows {
             mode: TransactionWriteMode::Replace,
-            rows: vec![branch_ref_stage_row(branch_id, &commit_id)],
+            rows,
         })
         .await?;
         Ok(())
@@ -4147,7 +4411,7 @@ where
         &self,
         branch_id: String,
         source_parent_commit_id: CommitId,
-        selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
+        selected_changes: StagedCommitChangeBatch,
     ) -> Result<String, LixError> {
         let commit_id = self
             .staged_writes
@@ -4164,7 +4428,7 @@ where
         recovered_head_commit_id: CommitId,
         interval_has_commits: bool,
         gc_state: CheckpointGcState,
-        selected_changes: impl IntoIterator<Item = StagedCommitChangeRef>,
+        selected_changes: StagedCommitChangeBatch,
     ) -> Result<String, LixError> {
         let commit_id = self
             .staged_writes
@@ -4429,19 +4693,19 @@ impl<R> crate::live_state::LiveStateReader for TransactionReadLiveStateReader<R>
 where
     R: crate::storage_adapter::StorageRead + 'static,
 {
-    async fn scan_rows(
+    async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_rows(&self.base, &self.staged, request).await
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        overlay_scan_batch(&self.base, &self.staged, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        Ok(self
-            .scan_rows(&LiveStateScanRequest {
+        let rows = self
+            .scan_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
@@ -4452,16 +4716,23 @@ where
                 limit: Some(1),
                 ..Default::default()
             })
-            .await?
-            .into_iter()
-            .next())
+            .await?;
+        Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
     }
 
+    #[cfg(test)]
     async fn load_exact_rows(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
         overlay_load_exact_rows(&self.base, &self.staged, request).await
+    }
+
+    async fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        overlay_load_exact_batch(&self.base, &self.staged, request).await
     }
 }
 
@@ -4492,10 +4763,10 @@ where
             return Ok(index);
         }
         let rows =
-            overlay_scan_rows(&self.base, &self.staged, &request.live_state_request()).await?;
+            overlay_scan_batch(&self.base, &self.staged, &request.live_state_request()).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
-        let index = Arc::new(FilesystemPathIndex::from_live_rows(rows)?);
+        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
         Ok(match cache_revision {
             Some(cache_revision) => {
                 self.filesystem_path_index_cache
@@ -4557,62 +4828,151 @@ where
     }
 }
 
-fn prepare_state_row(
-    normalized: NormalizedTransactionWriteRow,
+#[derive(Debug, Clone, Copy)]
+struct PreparedScalarRow {
+    schema_plan_id: SchemaPlanId,
+    facts: PreparedRowFacts,
+    created_at: LixTimestamp,
+    updated_at: LixTimestamp,
+    change_id: Option<ChangeId>,
+    commit_id: Option<CommitId>,
+}
+
+/// Fixed-width scalar columns planned in source order before JSON lowering.
+///
+/// Function-provider calls and scalar parse errors retain their historical
+/// row-by-row order, while snapshots and metadata still canonicalize once as
+/// a contiguous batch after all semantic normalization succeeds.
+struct PreparedScalarBatch {
+    schema_plan_ids: Vec<SchemaPlanId>,
+    facts: Vec<PreparedRowFacts>,
+    created_at: Vec<LixTimestamp>,
+    updated_at: Vec<LixTimestamp>,
+    change_ids: Vec<Option<ChangeId>>,
+    commit_ids: Vec<Option<CommitId>>,
+}
+
+impl PreparedScalarBatch {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            schema_plan_ids: Vec::with_capacity(capacity),
+            facts: Vec::with_capacity(capacity),
+            created_at: Vec::with_capacity(capacity),
+            updated_at: Vec::with_capacity(capacity),
+            change_ids: Vec::with_capacity(capacity),
+            commit_ids: Vec::with_capacity(capacity),
+        }
+    }
+
+    fn push(&mut self, row: PreparedScalarRow) {
+        self.schema_plan_ids.push(row.schema_plan_id);
+        self.facts.push(row.facts);
+        self.created_at.push(row.created_at);
+        self.updated_at.push(row.updated_at);
+        self.change_ids.push(row.change_id);
+        self.commit_ids.push(row.commit_id);
+    }
+
+    fn row(&self, index: usize) -> PreparedScalarRow {
+        PreparedScalarRow {
+            schema_plan_id: self.schema_plan_ids[index],
+            facts: self.facts[index],
+            created_at: self.created_at[index],
+            updated_at: self.updated_at[index],
+            change_id: self.change_ids[index],
+            commit_id: self.commit_ids[index],
+        }
+    }
+}
+
+fn plan_prepared_row_scalars(
+    row: RawWriteRowRef<'_>,
+    normalized: NormalizedRowFacts,
     functions: &FunctionProviderHandle,
-    origin_key: Option<String>,
-) -> Result<PreparedStateRow, LixError> {
-    let NormalizedTransactionWriteRow {
-        row,
-        snapshot,
+) -> Result<PreparedScalarRow, LixError> {
+    let NormalizedRowFacts {
         schema_plan_id,
         facts,
     } = normalized;
     let updated_at = match row.updated_at {
-        Some(updated_at) => parse_prepared_timestamp("updated_at", &updated_at)?,
+        Some(updated_at) => parse_prepared_timestamp("updated_at", updated_at)?,
         None => functions.call_timestamp(),
     };
     let created_at = match row.created_at {
-        Some(created_at) => parse_prepared_timestamp("created_at", &created_at)?,
+        Some(created_at) => parse_prepared_timestamp("created_at", created_at)?,
         None => updated_at,
     };
-    let snapshot = snapshot
-        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
+    if row.entity_pk.is_none() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "normalized transaction write row is missing entity_pk",
+        ));
+    }
+    let change_id = Some(match row.change_id {
+        Some(change_id) => ChangeId::parse_lix(change_id, "prepared row change_id")?,
+        None => ChangeId::from(functions.call_uuid_v7()),
+    });
+    let commit_id = row
+        .commit_id
+        .map(|id| CommitId::parse_lix(id, "prepared row commit_id"))
         .transpose()?;
-    let metadata = row
-        .metadata
-        .map(|value| stage_json_from_value(value, "prepared row metadata"))
-        .transpose()?;
-    Ok(PreparedStateRow {
+    Ok(PreparedScalarRow {
         schema_plan_id,
         facts,
-        entity_pk: row.entity_pk.ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "normalized transaction write row is missing entity_pk",
-            )
-        })?,
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        snapshot,
-        metadata,
-        origin: row.origin,
-        origin_key,
         created_at,
         updated_at,
-        global: row.global,
-        change_id: Some(match row.change_id {
-            Some(change_id) => ChangeId::parse_lix(&change_id, "prepared row change_id")?,
-            None => ChangeId::from(functions.call_uuid_v7()),
-        }),
-        commit_id: row
-            .commit_id
-            .as_deref()
-            .map(|id| CommitId::parse_lix(id, "prepared row commit_id"))
-            .transpose()?,
-        untracked: row.untracked,
-        branch_id: row.branch_id,
+        change_id,
+        commit_id,
     })
+}
+
+fn push_prepared_state_row_from_planned_parts(
+    prepared: &mut PreparedStateBatch,
+    rows: &mut RawWriteBatch,
+    row_index: usize,
+    scalar: PreparedScalarRow,
+    origin_key: Option<&SharedStr>,
+) -> Result<(), LixError> {
+    let row = rows.row(row_index);
+    let schema_key = row.schema_key.clone();
+    let file_id = row.file_id.cloned();
+    let origin = row.origin.cloned();
+    let global = row.global;
+    let untracked = row.untracked;
+    let branch_id = row.branch_id.clone();
+    let snapshot = rows
+        .take_snapshot(row_index)
+        .map(|value| stage_json_from_value(value, "prepared row snapshot_content"))
+        .transpose()?;
+    let metadata = rows
+        .take_metadata(row_index)
+        .map(|value| stage_json_from_value(value, "prepared row metadata"))
+        .transpose()?;
+    let entity_pk = rows.take_entity_pk(row_index).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "normalized transaction write row is missing entity_pk",
+        )
+    })?;
+    prepared.push_parts(
+        scalar.schema_plan_id,
+        scalar.facts,
+        entity_pk,
+        schema_key,
+        file_id,
+        snapshot,
+        metadata,
+        origin,
+        origin_key,
+        scalar.created_at,
+        scalar.updated_at,
+        global,
+        scalar.change_id,
+        scalar.commit_id,
+        untracked,
+        branch_id,
+    );
+    Ok(())
 }
 
 /// Returns the sole schema-catalog scope for a straightforward statement
@@ -4620,8 +4980,8 @@ fn prepare_state_row(
 /// durability, so it can normalize rows in input order without allocating the
 /// generic scope/reordering maps. Schema registration stays on the generic
 /// path because registrations can change the catalog for later rows.
-fn homogeneous_row_normalization_domain(rows: &[TransactionWriteRow]) -> Option<Domain> {
-    let first = rows.first()?;
+fn homogeneous_row_normalization_domain(rows: &RawWriteBatch) -> Option<Domain> {
+    let first = rows.get(0)?;
     if first.schema_key == REGISTERED_SCHEMA_KEY {
         return None;
     }
@@ -4653,8 +5013,8 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
     }) || prepared_writes
         .commit_change_refs_by_branch
         .values()
-        .flat_map(|change_refs| change_refs.selected_change_refs.iter())
-        .any(|change_ref| change_ref.schema_key == REGISTERED_SCHEMA_KEY)
+        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .any(|change_ref| change_ref.schema_key() == REGISTERED_SCHEMA_KEY)
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
@@ -4665,10 +5025,10 @@ fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWr
         || prepared_writes
             .commit_change_refs_by_branch
             .values()
-            .flat_map(|change_refs| change_refs.selected_change_refs.iter())
+            .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
             .any(|change_ref| {
                 matches!(
-                    change_ref.schema_key.as_str(),
+                    change_ref.schema_key(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
                 )
             })
@@ -4751,18 +5111,18 @@ where
         load_transaction_blob_bytes(&base, &self.staged_writes, hashes).await
     }
 
-    async fn scan_live_state(
+    async fn scan_live_state_batch(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_visible_live_state(request).await
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        self.scan_visible_live_state_batch(request).await
     }
 
-    async fn load_exact_live_state_rows(
+    async fn load_exact_live_state_batch(
         &mut self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        self.load_visible_exact_live_state_rows(request).await
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        self.load_visible_exact_live_state_batch(request).await
     }
 
     async fn filesystem_path_index(
@@ -4793,10 +5153,10 @@ where
         }
         let staged = self.staged_writes.staging_overlay()?;
         let base = self.live_state.reader(read);
-        let rows = overlay_scan_rows(&base, &staged, &request.live_state_request()).await?;
+        let rows = overlay_scan_batch(&base, &staged, &request.live_state_request()).await?;
         #[cfg(test)]
         record_transaction_path_index_build(rows.len());
-        let index = Arc::new(FilesystemPathIndex::from_live_rows(rows)?);
+        let index = Arc::new(FilesystemPathIndex::from_live_batch(&rows)?);
         Ok(match cache_revision {
             Some(cache_revision) => {
                 self.filesystem_path_index_cache
@@ -4841,11 +5201,35 @@ fn prepared_transaction_write_affects_filesystem_path_index(
     })
 }
 
-fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &[PreparedStateRow] {
+fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &PreparedStateBatch {
     match write {
         PreparedTransactionWrite::Rows { rows, .. }
         | PreparedTransactionWrite::RowsWithFileData { rows, .. } => rows,
     }
+}
+
+fn materialized_live_state_batch_from_prepared(
+    rows: &PreparedStateBatch,
+) -> MaterializedLiveStateBatch {
+    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
+    for row in rows.iter() {
+        output.push_materialized_ref(
+            row.entity_pk,
+            row.schema_key.as_str(),
+            row.file_id.map(SharedStr::as_str),
+            row.snapshot.map(|snapshot| snapshot.materialize_shared()),
+            row.metadata.map(|metadata| metadata.materialize_shared()),
+            row.snapshot.is_none(),
+            row.created_at,
+            row.updated_at,
+            row.global,
+            row.change_id,
+            row.commit_id,
+            row.untracked,
+            row.branch_id.as_str(),
+        );
+    }
+    output.finish()
 }
 
 fn transaction_path_index_cache_revision(
@@ -4869,6 +5253,13 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
+const V2_FORMAT_ONLY_METADATA_JSON: &str = r#"{"impact":"format"}"#;
+
+fn v2_format_only_metadata() -> TransactionJson {
+    TransactionJson::from_certified_shared_normalized_metadata(SharedStr::from_static(
+        V2_FORMAT_ONLY_METADATA_JSON,
+    ))
+}
 
 fn v2_file_descriptor(
     write: &TransactionFileData,
@@ -4932,8 +5323,8 @@ fn suppress_v2_format_only_noops_against_rows(
                     effective.push(change);
                     continue;
                 };
-                let candidate = match &entity.snapshot_content {
-                    WasmHostBytes::CanonicalJson { value, .. } => value.as_ref(),
+                let canonical = match &entity.snapshot_content {
+                    WasmHostBytes::CanonicalJson(json) => json,
                     WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
@@ -4941,13 +5332,17 @@ fn suppress_v2_format_only_noops_against_rows(
                         ));
                     }
                 };
-                let base = serde_json::from_str::<JsonValue>(base_snapshot).map_err(|error| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!("accepted v2 snapshot is invalid JSON: {error}"),
-                    )
-                })?;
-                candidate == &base
+                let candidate = canonical.normalized();
+                if candidate == base_snapshot {
+                    true
+                } else {
+                    // New writes retain exact canonical bytes, so equality is
+                    // normally one slice comparison. Historical rows may use
+                    // a different key order or equivalent escape spelling;
+                    // canonicalize that base exactly once only on mismatch.
+                    candidate.as_bytes()
+                        == canonicalize_v2_snapshot(base_snapshot.as_bytes())?.as_slice()
+                }
             }
             WasmEntityChange::Create { .. }
             | WasmEntityChange::Upsert { .. }
@@ -4960,12 +5355,27 @@ fn suppress_v2_format_only_noops_against_rows(
     Ok(WasmHostEntityChanges { changes: effective })
 }
 
-fn plugin_detected_changes_from_v2(
+fn append_plugin_change_rows_from_v2(
+    rows: &mut RawWriteBatch,
     plugin: &PluginRegistryEntry,
-    changes: &WasmHostEntityChanges,
-) -> Result<Vec<PluginDetectedChange>, LixError> {
-    let mut detected = Vec::with_capacity(changes.entity_change_count());
-    for change in &changes.changes {
+    changes: WasmHostEntityChanges,
+    file_id: &str,
+    context: &FilesystemRowContext,
+) -> Result<(), LixError> {
+    let allowed_schema_keys = plugin
+        .schema_keys()
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    rows.reserve(changes.entity_change_count());
+    let mut interned_schema_keys = BTreeMap::<SharedStr, SharedStr>::new();
+    let file_id = SharedStr::from(file_id);
+    let branch_id = SharedStr::from(context.branch_id.as_str());
+    // Format-only is a typed guest effect, so its exact engine metadata is
+    // already known-valid canonical JSON. Retain one static byte owner for the
+    // complete batch instead of parsing and serializing the same DOM per row.
+    let format_only_metadata = v2_format_only_metadata();
+    for change in changes.changes {
         let (key, snapshot_content, effect) = match change {
             WasmEntityChange::Create { .. } => {
                 return Err(LixError::new(
@@ -4975,9 +5385,9 @@ fn plugin_detected_changes_from_v2(
             }
             WasmEntityChange::Delete(key) => (key, None, WasmChangeEffect::Content),
             WasmEntityChange::Upsert { entity, effect } => {
-                let snapshot = match &entity.snapshot_content {
-                    WasmHostBytes::CanonicalJson { value, normalized } => {
-                        TransactionJson::from_parts(value.clone(), normalized.clone())
+                let snapshot = match entity.snapshot_content {
+                    WasmHostBytes::CanonicalJson(json) => {
+                        TransactionJson::from_canonical_batch(json)
                     }
                     WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
@@ -4986,18 +5396,41 @@ fn plugin_detected_changes_from_v2(
                         ));
                     }
                 };
-                (&entity.key, Some(snapshot), *effect)
+                (entity.key, Some(snapshot), effect)
             }
         };
-        detected.push(PluginDetectedChange {
-            entity_pk: plugin_entity_pk(plugin, key)?,
-            schema_key: key.schema_key.clone(),
+        let entity_pk = plugin_entity_pk(plugin, &key)?;
+        let schema_key = interned_schema_keys
+            .entry(key.schema_key)
+            .or_insert_with_key(|key| key.as_str().into())
+            .clone();
+        if !allowed_schema_keys.contains(schema_key.as_str()) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "plugin '{}' emitted schema key '{}' that is not declared in its manifest",
+                    plugin.key(),
+                    schema_key
+                ),
+            ));
+        }
+        rows.push_parts(
+            Some(entity_pk),
+            schema_key,
+            Some(file_id.clone()),
             snapshot_content,
-            metadata: (effect == WasmChangeEffect::FormatOnly)
-                .then(|| r#"{"impact":"format"}"#.to_string()),
-        });
+            (effect == WasmChangeEffect::FormatOnly).then(|| format_only_metadata.clone()),
+            None,
+            None,
+            None,
+            context.global,
+            None,
+            None,
+            context.untracked,
+            branch_id.clone(),
+        );
     }
-    Ok(detected)
+    Ok(())
 }
 
 fn plugin_entity_pk(
@@ -5006,7 +5439,7 @@ fn plugin_entity_pk(
 ) -> Result<EntityPk, LixError> {
     let result = if plugin
         .create_schema_keys()
-        .binary_search(&key.schema_key)
+        .binary_search_by(|candidate| candidate.as_str().cmp(key.schema_key.as_str()))
         .is_ok()
     {
         let [id] = key.entity_pk.as_slice() else {
@@ -5020,7 +5453,7 @@ fn plugin_entity_pk(
         };
         EntityPk::uuid_from_canonical(id)
     } else {
-        EntityPk::from_parts(key.entity_pk.clone())
+        EntityPk::from_shared_parts(key.entity_pk.iter().cloned())
     };
     result.map_err(|error| {
         LixError::new(
@@ -5030,23 +5463,73 @@ fn plugin_entity_pk(
     })
 }
 
-fn v2_host_entities_from_live_rows(
-    rows: Vec<MaterializedLiveStateRow>,
+fn v2_host_entities_from_live_batch_ordinals(
+    rows: &MaterializedLiveStateBatch,
+    ordinals: &[u32],
+    limits: WasmTransitionLimits,
+) -> Result<Vec<WasmHostEntity>, LixError> {
+    let mut entities = Vec::with_capacity(ordinals.len());
+    for ordinal in ordinals {
+        let row = rows.get(*ordinal as usize).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin state selection references a row outside its batch owner",
+            )
+        })?;
+        let Some(snapshot_content) = row.snapshot_content() else {
+            continue;
+        };
+        entities.push(host_entity_with_lazy_snapshot(
+            WasmEntityKey::from_owned_parts(
+                row.schema_key().to_owned(),
+                row.entity_pk().clone().into_parts(),
+            ),
+            snapshot_content.clone().into_bytes(),
+            limits,
+        )?);
+    }
+    entities.sort_by(|left, right| left.key.cmp(&right.key));
+    for pair in entities.windows(2) {
+        if pair[0].key == pair[1].key {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "durable v2 entity hydration returned duplicate keys",
+            ));
+        }
+    }
+    Ok(entities)
+}
+
+fn v2_host_entities_from_live_batch(
+    rows: &MaterializedLiveStateBatch,
+    file_key: &PluginFileWriteKey,
+    schema_keys: &[String],
     limits: WasmTransitionLimits,
 ) -> Result<Vec<WasmHostEntity>, LixError> {
     let mut entities = rows
-        .into_iter()
-        .filter_map(|row| {
-            row.snapshot_content.map(|snapshot_content| {
-                host_entity_with_lazy_snapshot(
-                    WasmEntityKey {
-                        schema_key: row.schema_key,
-                        entity_pk: row.entity_pk.into_parts(),
-                    },
-                    snapshot_content.into_bytes(),
-                    limits,
-                )
-            })
+        .iter()
+        .filter(|row| {
+            row.branch_id() == file_key.branch_id
+                && row.file_id() == Some(file_key.file_id.as_str())
+                && !row.global()
+                && !row.untracked()
+                && row.snapshot_content().is_some()
+                && schema_keys
+                    .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
+                    .is_ok()
+        })
+        .map(|row| {
+            host_entity_with_lazy_snapshot(
+                WasmEntityKey::from_owned_parts(
+                    row.schema_key().to_owned(),
+                    row.entity_pk().clone().into_parts(),
+                ),
+                row.snapshot_content()
+                    .expect("filtered v2 row carries a live snapshot")
+                    .clone()
+                    .into_bytes(),
+                limits,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     entities.sort_by(|left, right| left.key.cmp(&right.key));
@@ -5062,11 +5545,11 @@ fn v2_host_entities_from_live_rows(
 }
 
 fn v2_host_changes_from_prepared_rows(
-    rows: Vec<PreparedStateRow>,
+    rows: &PreparedStateBatch,
     limits: WasmTransitionLimits,
 ) -> Result<WasmHostEntityChanges, LixError> {
     let mut changes = rows
-        .into_iter()
+        .iter()
         .map(|row| {
             if row.global || row.untracked || row.file_id.is_none() {
                 return Err(LixError::new(
@@ -5074,18 +5557,15 @@ fn v2_host_changes_from_prepared_rows(
                     "v2 semantic rendering requires tracked, branch-local, file-scoped rows",
                 ));
             }
-            let key = WasmEntityKey {
-                schema_key: row.schema_key,
-                entity_pk: row.entity_pk.into_parts(),
-            };
+            let key = WasmEntityKey::from_owned_parts(
+                row.schema_key.clone(),
+                row.entity_pk.clone().into_parts(),
+            );
             match row.snapshot {
                 Some(snapshot) => {
-                    let format_only = row
-                        .metadata
-                        .as_ref()
-                        .and_then(|metadata| metadata.value().get("impact"))
-                        .and_then(JsonValue::as_str)
-                        .is_some_and(|impact| impact == "format");
+                    let format_only = row.metadata.is_some_and(|metadata| {
+                        metadata.normalized() == V2_FORMAT_ONLY_METADATA_JSON
+                    });
                     let effect = if format_only {
                         WasmChangeEffect::FormatOnly
                     } else {
@@ -5093,7 +5573,7 @@ fn v2_host_changes_from_prepared_rows(
                     };
                     host_entity_change_with_lazy_snapshot(
                         key,
-                        snapshot.materialize().into_bytes(),
+                        snapshot.materialize_shared().into_bytes().into(),
                         effect,
                         limits,
                     )
@@ -5114,18 +5594,16 @@ fn v2_host_changes_from_prepared_rows(
     Ok(WasmHostEntityChanges { changes })
 }
 
-fn reject_external_plugin_registry_rows(rows: &[TransactionWriteRow]) -> Result<(), LixError> {
+fn reject_external_plugin_registry_rows(rows: &RawWriteBatch) -> Result<(), LixError> {
     for row in rows {
         if row.schema_key != KEY_VALUE_SCHEMA_KEY {
             continue;
         }
         let entity_key = row
             .entity_pk
-            .as_ref()
             .and_then(|entity_pk| entity_pk.as_single_string().ok());
         let snapshot_key = row
             .snapshot
-            .as_ref()
             .and_then(|snapshot| snapshot.get("key"))
             .and_then(JsonValue::as_str);
         let reserved = [entity_key, snapshot_key]
@@ -5153,23 +5631,23 @@ struct PluginFileWriteKey {
 }
 
 impl PluginFileWriteKey {
-    fn matches_blob_ref_row(&self, row: &TransactionWriteRow) -> bool {
+    fn matches_blob_ref_row(&self, row: RawWriteRowRef<'_>) -> bool {
         row.schema_key == BLOB_REF_SCHEMA_KEY
-            && row.branch_id == self.branch_id
+            && row.branch_id.as_str() == self.branch_id
             && row.global == self.global
             && row.untracked == self.untracked
-            && row.file_id.as_deref() == Some(self.file_id.as_str())
+            && row.file_id.map(SharedStr::as_str) == Some(self.file_id.as_str())
     }
 
-    fn matches_derived_file_ref_row(&self, row: &TransactionWriteRow) -> bool {
+    fn matches_derived_file_ref_row(&self, row: RawWriteRowRef<'_>) -> bool {
         row.schema_key == DERIVED_FILE_REF_SCHEMA_KEY
-            && row.branch_id == self.branch_id
+            && row.branch_id.as_str() == self.branch_id
             && row.global == self.global
             && row.untracked == self.untracked
-            && row.file_id.as_deref() == Some(self.file_id.as_str())
+            && row.file_id.map(SharedStr::as_str) == Some(self.file_id.as_str())
     }
 
-    fn matches_materialization_row(&self, row: &TransactionWriteRow) -> bool {
+    fn matches_materialization_row(&self, row: RawWriteRowRef<'_>) -> bool {
         self.matches_blob_ref_row(row) || self.matches_derived_file_ref_row(row)
     }
 }
@@ -5202,16 +5680,294 @@ impl DerivedMaterializationProof {
     }
 }
 
+/// Internal write shape after plugin reconciliation.
+///
+/// The public transaction boundary remains row-oriented, but semantic plugin
+/// sources can be prepared before the renderer runs. This typed stage keeps
+/// those exact prepared rows in their batch positions without manufacturing an
+/// invalid `TransactionWriteRow` sentinel or serializing a row fingerprint.
+enum ReconciledTransactionWrite {
+    Rows {
+        mode: TransactionWriteMode,
+        rows: ReconciledRowBatch,
+    },
+    RowsWithFileData {
+        mode: TransactionWriteMode,
+        rows: ReconciledRowBatch,
+        file_data: Vec<TransactionFileData>,
+        count: u64,
+    },
+}
+
+#[derive(Debug)]
+enum ReconciledRowBatch {
+    /// The allocation-preserving path for ordinary SQL and file writes.
+    Raw(RawWriteBatch),
+    /// Promoted only when semantic rows have already been supplied to a plugin
+    /// renderer. Slot order is the original transaction row order.
+    Mixed(ReconciledMixedBatch),
+}
+
+#[derive(Debug)]
+struct ReconciledMixedBatch {
+    slots: Vec<ReconciledRowSlot>,
+    raw: RawWriteBatch,
+    prepared: PreparedStateBatch,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReconciledRowSlot {
+    Raw(u32),
+    Prepared(u32),
+    /// Transient ownership marker while one semantic group is being prepared
+    /// and rendered. A completed reconciliation must not expose this variant.
+    Extracted,
+}
+
+impl ReconciledRowBatch {
+    fn raw(rows: RawWriteBatch) -> Self {
+        Self::Raw(rows)
+    }
+
+    fn promote_raw_rows(rows: &mut RawWriteBatch) -> Self {
+        Self::from_raw_slots(std::mem::take(rows))
+    }
+
+    fn from_raw_slots(rows: RawWriteBatch) -> Self {
+        let mut slots = Vec::with_capacity(rows.len());
+        slots.extend((0..rows.len()).map(|ordinal| {
+            ReconciledRowSlot::Raw(
+                u32::try_from(ordinal).expect("reconciled raw ordinal must fit u32"),
+            )
+        }));
+        Self::Mixed(ReconciledMixedBatch {
+            slots,
+            raw: rows,
+            prepared: PreparedStateBatch::new(),
+        })
+    }
+
+    fn promote(&mut self) -> &mut ReconciledMixedBatch {
+        if let Self::Raw(rows) = self {
+            let rows = std::mem::take(rows);
+            let mut slots = Vec::with_capacity(rows.len());
+            slots.extend((0..rows.len()).map(|ordinal| {
+                ReconciledRowSlot::Raw(
+                    u32::try_from(ordinal).expect("reconciled raw ordinal must fit u32"),
+                )
+            }));
+            *self = Self::Mixed(ReconciledMixedBatch {
+                slots,
+                raw: rows,
+                prepared: PreparedStateBatch::new(),
+            });
+        }
+        let Self::Mixed(mixed) = self else {
+            unreachable!("raw reconciled rows were just promoted");
+        };
+        mixed
+    }
+
+    fn take_raw_rows_at(&mut self, source_indices: &[usize]) -> Result<RawWriteBatch, LixError> {
+        let mixed = self.promote();
+        let mut raw_ordinals = Vec::with_capacity(source_indices.len());
+        for &source_index in source_indices {
+            let slot = mixed.slots.get_mut(source_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("semantic row index {source_index} is outside the reconciled batch"),
+                )
+            })?;
+            let ReconciledRowSlot::Raw(ordinal) = *slot else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "semantic row at batch index {source_index} was extracted more than once"
+                    ),
+                ));
+            };
+            raw_ordinals.push(ordinal as usize);
+            *slot = ReconciledRowSlot::Extracted;
+        }
+        Ok(mixed.raw.take_rows(&raw_ordinals))
+    }
+
+    fn put_prepared_batch_at(
+        &mut self,
+        source_indices: &[usize],
+        prepared: PreparedStateBatch,
+    ) -> Result<(), LixError> {
+        if source_indices.len() != prepared.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "semantic preparation changed the reconciled row count",
+            ));
+        }
+        let mixed = self.promote();
+        let prepared_base = mixed.prepared.len();
+        for (prepared_index, &source_index) in source_indices.iter().enumerate() {
+            let slot = mixed.slots.get_mut(source_index).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("semantic row index {source_index} is outside the reconciled batch"),
+                )
+            })?;
+            if !matches!(slot, ReconciledRowSlot::Extracted) {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "prepared semantic row at batch index {source_index} has no extracted source"
+                    ),
+                ));
+            }
+            *slot = ReconciledRowSlot::Prepared(
+                u32::try_from(prepared_base + prepared_index)
+                    .expect("prepared reconciled ordinal must fit u32"),
+            );
+        }
+        mixed.prepared.append(prepared);
+        Ok(())
+    }
+
+    fn push_raw(&mut self, row: TransactionWriteRow) {
+        match self {
+            Self::Raw(rows) => rows.push(row),
+            Self::Mixed(mixed) => {
+                let ordinal =
+                    u32::try_from(mixed.raw.len()).expect("reconciled raw ordinal must fit u32");
+                mixed.raw.push(row);
+                mixed.slots.push(ReconciledRowSlot::Raw(ordinal));
+            }
+        }
+    }
+
+    fn append_raw_batch(&mut self, rows: RawWriteBatch) {
+        match self {
+            Self::Raw(batch) => batch.append(rows),
+            Self::Mixed(mixed) => {
+                let additional = rows.len();
+                let base = mixed.raw.len();
+                mixed.raw.reserve(additional);
+                mixed.slots.reserve(additional);
+                mixed.raw.append(rows);
+                for ordinal in base..base + additional {
+                    mixed.slots.push(ReconciledRowSlot::Raw(
+                        u32::try_from(ordinal).expect("reconciled raw ordinal must fit u32"),
+                    ));
+                }
+            }
+        }
+    }
+
+    fn retain_raw(
+        &mut self,
+        mut retain: impl FnMut(RawWriteRowRef<'_>) -> bool,
+    ) -> Result<(), LixError> {
+        match self {
+            Self::Raw(rows) => rows.retain(|row| retain(row)),
+            Self::Mixed(mixed) => {
+                if mixed
+                    .slots
+                    .iter()
+                    .any(|slot| matches!(slot, ReconciledRowSlot::Extracted))
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "reconciled row retention observed an unfilled semantic slot",
+                    ));
+                }
+                mixed.slots.retain(|slot| match *slot {
+                    ReconciledRowSlot::Raw(ordinal) => retain(mixed.raw.row(ordinal as usize)),
+                    ReconciledRowSlot::Prepared(_) => true,
+                    ReconciledRowSlot::Extracted => {
+                        unreachable!("extracted semantic slots were rejected before retention")
+                    }
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_plugin_reconciliation_rows_from(
+        &mut self,
+        source_index: usize,
+    ) -> Result<(), LixError> {
+        let origin = plugin_reconciliation_origin();
+        match self {
+            Self::Raw(rows) => {
+                if source_index > rows.len() {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin reconciliation row boundary exceeds the raw batch",
+                    ));
+                }
+                for index in source_index..rows.len() {
+                    rows.set_origin(index, Some(origin.clone()));
+                }
+            }
+            Self::Mixed(mixed) => {
+                let slots = mixed.slots.get_mut(source_index..).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin reconciliation row boundary exceeds the mixed batch",
+                    )
+                })?;
+                for slot in slots {
+                    match *slot {
+                        ReconciledRowSlot::Raw(ordinal) => {
+                            mixed.raw.set_origin(ordinal as usize, Some(origin.clone()));
+                        }
+                        ReconciledRowSlot::Prepared(_) => {}
+                        ReconciledRowSlot::Extracted => {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "plugin reconciliation completed with an unfilled semantic slot",
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_valid_storage_scopes(&self) -> Result<(), LixError> {
+        match self {
+            Self::Raw(rows) => require_valid_transaction_write_row_storage_scopes(rows),
+            Self::Mixed(mixed) => {
+                for slot in &mixed.slots {
+                    match *slot {
+                        ReconciledRowSlot::Raw(ordinal) => {
+                            let row = mixed.raw.row(ordinal as usize);
+                            require_valid_storage_scope(row.branch_id.as_str(), row.global)?;
+                        }
+                        ReconciledRowSlot::Prepared(ordinal) => {
+                            let row = mixed.prepared.row(ordinal as usize);
+                            require_valid_storage_scope(row.branch_id.as_str(), row.global)?;
+                        }
+                        ReconciledRowSlot::Extracted => {
+                            return Err(LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                "reconciled write exposed an unfilled semantic slot",
+                            ));
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct PluginWriteReconciliation {
     file_keys: BTreeSet<PluginFileWriteKey>,
     materialized_file_keys: BTreeSet<PluginFileWriteKey>,
     materialization_versions: BTreeMap<PluginFileWriteKey, String>,
     derived_materializations: BTreeMap<PluginFileWriteKey, DerivedMaterializationProof>,
-    rows: Vec<TransactionWriteRow>,
     file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     actor_publications: Vec<PendingPluginActorPublication>,
-    prepared_semantic_rows: PreparedSemanticRows,
+    reconciled_rows: Option<ReconciledRowBatch>,
 }
 
 impl PluginWriteReconciliation {
@@ -5219,82 +5975,12 @@ impl PluginWriteReconciliation {
         self.file_view_mutations
             .insert(key.clone(), SessionFileViewMutation::Remove { key });
     }
-}
 
-/// Exact normalized rows already supplied to a v2 renderer.
-///
-/// The raw source row is the lookup key because reconciliation may append
-/// engine-managed rows before final staging. Keeping the prepared row here
-/// prevents volatile schema defaults, derived primary keys, timestamps, and
-/// change IDs from being evaluated a second time after the guest rendered
-/// them.
-#[derive(Debug, Default)]
-struct PreparedSemanticRows {
-    by_source: BTreeMap<Vec<u8>, VecDeque<PreparedStateRow>>,
-    remaining: usize,
-}
-
-impl PreparedSemanticRows {
-    fn insert(
-        &mut self,
-        source: &TransactionWriteRow,
-        prepared: PreparedStateRow,
-    ) -> Result<(), LixError> {
-        self.by_source
-            .entry(transaction_write_row_fingerprint(source)?)
-            .or_default()
-            .push_back(prepared);
-        self.remaining = self.remaining.checked_add(1).ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "prepared v2 semantic row count overflowed",
-            )
-        })?;
-        Ok(())
+    fn take_reconciled_rows(&mut self, raw_rows: RawWriteBatch) -> ReconciledRowBatch {
+        self.reconciled_rows
+            .take()
+            .unwrap_or_else(|| ReconciledRowBatch::raw(raw_rows))
     }
-
-    fn take_for(
-        &mut self,
-        source: &TransactionWriteRow,
-    ) -> Result<Option<PreparedStateRow>, LixError> {
-        if self.remaining == 0 {
-            return Ok(None);
-        }
-        let fingerprint = transaction_write_row_fingerprint(source)?;
-        let Some(queue) = self.by_source.get_mut(&fingerprint) else {
-            return Ok(None);
-        };
-        let prepared = queue.pop_front();
-        if prepared.is_some() {
-            self.remaining -= 1;
-        }
-        if queue.is_empty() {
-            self.by_source.remove(&fingerprint);
-        }
-        Ok(prepared)
-    }
-
-    fn require_consumed(&self) -> Result<(), LixError> {
-        if self.remaining == 0 {
-            return Ok(());
-        }
-        Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "{} prepared v2 semantic row(s) disappeared during reconciliation",
-                self.remaining
-            ),
-        ))
-    }
-}
-
-fn transaction_write_row_fingerprint(row: &TransactionWriteRow) -> Result<Vec<u8>, LixError> {
-    serde_json::to_vec(row).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("failed to fingerprint a prepared v2 semantic row: {error}"),
-        )
-    })
 }
 
 struct PendingPluginActorView {
@@ -5632,7 +6318,7 @@ async fn preflight_derived_plugin_uninstalls(
     uninstalls: &BTreeMap<String, BTreeSet<String>>,
     deleted_file_keys: &BTreeMap<PluginFileWriteKey, Option<TransactionJson>>,
 ) -> Result<(), LixError> {
-    let owner_rows = overlay_scan_rows(
+    let owner_rows = overlay_scan_batch(
         base,
         staged,
         &LiveStateScanRequest {
@@ -5649,12 +6335,13 @@ async fn preflight_derived_plugin_uninstalls(
     )
     .await?;
 
-    for row in owner_rows {
-        let branch_id = row.branch_id.to_string();
+    for row in owner_rows.iter() {
+        let branch_id = row.branch_id().to_string();
         let Some(uninstalled_plugins) = uninstalls.get(&branch_id) else {
             continue;
         };
-        let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+        let owner_row = row.to_owned();
+        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
             continue;
         };
         if !uninstalled_plugins.contains(owner.plugin_key()) {
@@ -5695,43 +6382,69 @@ async fn preflight_derived_path_stability(
     base: &dyn crate::live_state::LiveStateReader,
     staged: &impl StagedLiveStateRows,
     prospective: &impl StagedLiveStateRows,
-    prospective_rows: &[MaterializedLiveStateRow],
+    prospective_rows: &MaterializedLiveStateBatch,
 ) -> Result<(), LixError> {
-    let mut final_descriptor_rows =
-        BTreeMap::<(String, String, EntityPk, Option<String>), &MaterializedLiveStateRow>::new();
-    for row in prospective_rows.iter().filter(|row| {
-        !row.global
-            && !row.untracked
-            && matches!(
-                row.schema_key.as_str(),
-                FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
-            )
-    }) {
-        final_descriptor_rows.insert(
-            (
-                row.branch_id.to_string(),
-                row.schema_key.clone(),
-                row.entity_pk.clone(),
-                row.file_id.clone(),
-            ),
-            row,
-        );
-    }
+    let mut final_descriptor_rows = prospective_rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| {
+            !row.global()
+                && !row.untracked()
+                && matches!(
+                    row.schema_key(),
+                    FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+                )
+        })
+        .map(|(ordinal, _)| ordinal)
+        .collect::<Vec<_>>();
+    final_descriptor_rows.sort_unstable_by(|left, right| {
+        let left_row = prospective_rows.row(*left);
+        let right_row = prospective_rows.row(*right);
+        (
+            left_row.branch_id(),
+            left_row.schema_key(),
+            left_row.entity_pk(),
+            left_row.file_id(),
+            *left,
+        )
+            .cmp(&(
+                right_row.branch_id(),
+                right_row.schema_key(),
+                right_row.entity_pk(),
+                right_row.file_id(),
+                *right,
+            ))
+    });
+    // The final row for an identity wins when the prospective batch contains
+    // multiple mutations, matching transaction staging. Reverse/deduplicate
+    // keeps that row without allocating one owned map key per descriptor.
+    final_descriptor_rows.reverse();
+    final_descriptor_rows.dedup_by(|left, right| {
+        let left = prospective_rows.row(*left);
+        let right = prospective_rows.row(*right);
+        left.branch_id() == right.branch_id()
+            && left.schema_key() == right.schema_key()
+            && left.entity_pk() == right.entity_pk()
+            && left.file_id() == right.file_id()
+    });
+    final_descriptor_rows.reverse();
     if final_descriptor_rows.is_empty() {
         return Ok(());
     }
-    let final_descriptor_rows = final_descriptor_rows.into_values().collect::<Vec<_>>();
-    let prior_descriptors = overlay_load_exact_rows(
+    let prior_descriptors = overlay_load_exact_batch(
         base,
         staged,
         &LiveStateExactBatchRequest {
             rows: final_descriptor_rows
                 .iter()
-                .map(|row| LiveStateExactRowRequest {
-                    schema_key: row.schema_key.clone(),
-                    branch_id: row.branch_id.to_string(),
-                    entity_pk: row.entity_pk.clone(),
-                    file_id: row.file_id.clone(),
+                .map(|ordinal| {
+                    let row = prospective_rows.row(*ordinal);
+                    LiveStateExactRowRequest {
+                        schema_key: row.schema_key().to_string(),
+                        branch_id: row.branch_id().to_string(),
+                        entity_pk: row.entity_pk().clone(),
+                        file_id: row.file_id().map(str::to_owned),
+                    }
                 })
                 .collect(),
             projection: plugin_registry_live_state_projection(),
@@ -5742,22 +6455,23 @@ async fn preflight_derived_path_stability(
     .await?;
     let mut moved_files = BTreeSet::<(String, String)>::new();
     let mut moved_directory_branches = BTreeSet::<String>::new();
-    for (next, previous) in final_descriptor_rows.iter().zip(prior_descriptors) {
-        let Some(previous) = previous else {
+    for (slot, ordinal) in final_descriptor_rows.iter().enumerate() {
+        let next = prospective_rows.row(*ordinal);
+        let Some(previous) = prior_descriptors.row(slot) else {
             continue;
         };
-        if previous.deleted
-            || previous.snapshot_content.is_none()
-            || next.deleted
-            || next.snapshot_content.is_none()
-            || descriptor_parent_and_name(&previous)? == descriptor_parent_and_name(next)?
+        if previous.deleted()
+            || previous.snapshot_content().is_none()
+            || next.deleted()
+            || next.snapshot_content().is_none()
+            || descriptor_parent_and_name(previous)? == descriptor_parent_and_name(next)?
         {
             continue;
         }
-        let branch_id = next.branch_id.to_string();
-        match next.schema_key.as_str() {
+        let branch_id = next.branch_id().to_string();
+        match next.schema_key() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                let file_id = next.entity_pk.as_single_string_owned().map_err(|error| {
+                let file_id = next.entity_pk().as_single_string_owned().map_err(|error| {
                     LixError::new(
                         LixError::CODE_INVALID_PLUGIN,
                         format!("file descriptor path update has an invalid identity: {error}"),
@@ -5792,7 +6506,7 @@ async fn preflight_derived_file_path_moves(
     if moved_files.is_empty() {
         return Ok(());
     }
-    let proofs = overlay_load_exact_rows(
+    let proofs = overlay_load_exact_batch(
         base,
         staged,
         &LiveStateExactBatchRequest {
@@ -5813,12 +6527,12 @@ async fn preflight_derived_file_path_moves(
         },
     )
     .await?;
-    for ((branch_id, file_id), proof) in moved_files.iter().zip(proofs) {
-        let Some(proof) = proof else {
+    for (slot, (branch_id, file_id)) in moved_files.iter().enumerate() {
+        let Some(proof) = proofs.row(slot) else {
             continue;
         };
         let VisibleV2MaterializationBytes::Derived { .. } =
-            decode_visible_v2_materialization(&proof, file_id)?.bytes
+            decode_visible_v2_materialization_ref(proof, file_id)?.bytes
         else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -5839,13 +6553,11 @@ async fn preflight_derived_directory_path_moves(
     branch_ids: &BTreeSet<String>,
 ) -> Result<(), LixError> {
     let request = FilesystemPathIndexRequest::new(branch_ids.iter().cloned().collect());
-    let before = FilesystemPathIndex::from_live_rows(
-        overlay_scan_rows(base, staged, &request.live_state_request()).await?,
-    )?;
-    let after = FilesystemPathIndex::from_live_rows(
-        overlay_scan_rows(base, prospective, &request.live_state_request()).await?,
-    )?;
-    let proof_rows = overlay_scan_rows(
+    let before_rows = overlay_scan_batch(base, staged, &request.live_state_request()).await?;
+    let before = FilesystemPathIndex::from_live_batch(&before_rows)?;
+    let after_rows = overlay_scan_batch(base, prospective, &request.live_state_request()).await?;
+    let after = FilesystemPathIndex::from_live_batch(&after_rows)?;
+    let proof_rows = overlay_scan_batch(
         base,
         staged,
         &LiveStateScanRequest {
@@ -5860,15 +6572,15 @@ async fn preflight_derived_directory_path_moves(
         },
     )
     .await?;
-    for row in proof_rows {
-        if row.global || row.untracked || row.deleted || row.snapshot_content.is_none() {
+    for row in proof_rows.iter() {
+        if row.global() || row.untracked() || row.deleted() || row.snapshot_content().is_none() {
             continue;
         }
-        let branch_id = row.branch_id.to_string();
+        let branch_id = row.branch_id().to_string();
         let file_id = row
-            .file_id
-            .clone()
-            .or_else(|| row.entity_pk.as_single_string_owned().ok())
+            .file_id()
+            .map(str::to_owned)
+            .or_else(|| row.entity_pk().as_single_string_owned().ok())
             .ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INVALID_PLUGIN,
@@ -5876,7 +6588,7 @@ async fn preflight_derived_directory_path_moves(
                 )
             })?;
         let VisibleV2MaterializationBytes::Derived { .. } =
-            decode_visible_v2_materialization(&row, &file_id)?.bytes
+            decode_visible_v2_materialization_ref(row, &file_id)?.bytes
         else {
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
@@ -5909,15 +6621,18 @@ async fn preflight_derived_directory_path_moves(
 }
 
 fn descriptor_parent_and_name(
-    row: &MaterializedLiveStateRow,
+    row: MaterializedLiveStateRowRef<'_>,
 ) -> Result<(Option<String>, String), LixError> {
-    let snapshot = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            "path descriptor is missing its snapshot",
-        )
-    })?;
-    match row.schema_key.as_str() {
+    let snapshot = row
+        .snapshot_content()
+        .map(|content| content.as_str())
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                "path descriptor is missing its snapshot",
+            )
+        })?;
+    match row.schema_key() {
         FILE_DESCRIPTOR_SCHEMA_KEY => {
             let snapshot: PathFileDescriptorSnapshot =
                 serde_json::from_str(snapshot).map_err(|error| {
@@ -6010,51 +6725,165 @@ fn derived_file_path_for_branch(
 /// `TransactionWriteBuffer::stage_write`, without making an error irreversible.
 struct ProspectiveStagedRows {
     staged: PreparedStateRowOverlay,
-    rows: Vec<MaterializedLiveStateRow>,
+    rows: MaterializedLiveStateBatch,
 }
 
 impl StagedLiveStateRows for ProspectiveStagedRows {
-    fn staged_rows(
+    fn staged_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        let mut rows = self.staged.staged_rows(request)?;
-        rows.extend(
-            self.rows
-                .iter()
-                .filter(|row| prospective_row_matches_scan(row, request))
-                .cloned(),
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let staged = self.staged.staged_batch(request)?;
+        let prospective_count = self
+            .rows
+            .iter()
+            .filter(|row| prospective_row_matches_scan(*row, request))
+            .count();
+        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(
+            staged
+                .len()
+                .checked_add(prospective_count)
+                .expect("prospective staged row count overflow"),
         );
-        Ok(rows)
+        for row in staged.iter() {
+            rows.push_ref(row, None);
+        }
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| prospective_row_matches_scan(*row, request))
+        {
+            rows.push_ref(row, None);
+        }
+        Ok(rows.finish())
+    }
+
+    fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        let staged = self.staged.load_exact_batch(request)?;
+        if staged.len() != request.rows.len() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "prospective staged exact read expected {} base slots, got {}",
+                    request.rows.len(),
+                    staged.len()
+                ),
+            ));
+        }
+        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+        let mut slots = Vec::with_capacity(request.rows.len());
+        let mut prospective_ordinals = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| {
+                request
+                    .untracked
+                    .is_none_or(|untracked| row.untracked() == untracked)
+            })
+            .map(|(ordinal, _)| ordinal)
+            .collect::<Vec<_>>();
+        prospective_ordinals.sort_unstable_by(|left, right| {
+            let left_row = self.rows.row(*left);
+            let right_row = self.rows.row(*right);
+            (
+                left_row.schema_key(),
+                left_row.entity_pk(),
+                left_row.file_id(),
+                left_row.branch_id(),
+                *left,
+            )
+                .cmp(&(
+                    right_row.schema_key(),
+                    right_row.entity_pk(),
+                    right_row.file_id(),
+                    right_row.branch_id(),
+                    *right,
+                ))
+        });
+        for (slot, requested) in request.rows.iter().enumerate() {
+            let upper = prospective_ordinals.partition_point(|ordinal| {
+                prospective_exact_identity_cmp(self.rows.row(*ordinal), requested)
+                    != std::cmp::Ordering::Greater
+            });
+            let winner = upper
+                .checked_sub(1)
+                .map(|ordinal| self.rows.row(prospective_ordinals[ordinal]))
+                .filter(|row| {
+                    prospective_exact_identity_cmp(*row, requested) == std::cmp::Ordering::Equal
+                });
+            let winner = winner.or_else(|| staged.row(slot));
+            let Some(row) = winner else {
+                slots.push(None);
+                continue;
+            };
+            if row.deleted() && !request.include_tombstones {
+                slots.push(None);
+                continue;
+            }
+            let ordinal = u32::try_from(rows.push_ref(row, None)).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "prospective staged exact batch exceeds u32 rows",
+                )
+            })?;
+            slots.push(Some(ordinal));
+        }
+        MaterializedLiveStateExactBatch::new(rows.finish(), slots)
     }
 }
 
 fn prospective_row_matches_scan(
-    row: &MaterializedLiveStateRow,
+    row: MaterializedLiveStateRowRef<'_>,
     request: &LiveStateScanRequest,
 ) -> bool {
     let filter = &request.filter;
-    (filter.schema_keys.is_empty() || filter.schema_keys.contains(&row.schema_key))
-        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(&row.entity_pk))
+    (filter.schema_keys.is_empty()
+        || filter
+            .schema_keys
+            .iter()
+            .any(|schema_key| schema_key == row.schema_key()))
+        && (filter.entity_pks.is_empty() || filter.entity_pks.contains(row.entity_pk()))
         && (filter.branch_ids.is_empty()
             || filter
                 .branch_ids
                 .iter()
-                .any(|branch_id| branch_id == row.branch_id.as_ref())
-            || (row.branch_id.as_ref() == GLOBAL_BRANCH_ID
+                .any(|branch_id| branch_id == row.branch_id())
+            || (row.branch_id() == GLOBAL_BRANCH_ID
                 && filter
                     .branch_ids
                     .iter()
                     .any(|branch_id| branch_id != GLOBAL_BRANCH_ID)))
         && filter
             .untracked
-            .is_none_or(|untracked| row.untracked == untracked)
+            .is_none_or(|untracked| row.untracked() == untracked)
         && (filter.file_ids.is_empty()
             || filter.file_ids.iter().any(|file_id| match file_id {
                 NullableKeyFilter::Any => true,
-                NullableKeyFilter::Null => row.file_id.is_none(),
-                NullableKeyFilter::Value(file_id) => row.file_id.as_ref() == Some(file_id),
+                NullableKeyFilter::Null => row.file_id().is_none(),
+                NullableKeyFilter::Value(file_id) => row.file_id() == Some(file_id.as_str()),
             }))
+}
+
+fn prospective_exact_identity_cmp(
+    row: MaterializedLiveStateRowRef<'_>,
+    requested: &LiveStateExactRowRequest,
+) -> std::cmp::Ordering {
+    (
+        row.schema_key(),
+        row.entity_pk(),
+        row.file_id(),
+        row.branch_id(),
+    )
+        .cmp(&(
+            requested.schema_key.as_str(),
+            &requested.entity_pk,
+            requested.file_id.as_deref(),
+            requested.branch_id.as_str(),
+        ))
 }
 
 /// Proves that replacing a component generation cannot reinterpret any
@@ -6077,7 +6906,7 @@ async fn preflight_owned_v2_generation_upgrades(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let owner_rows = overlay_scan_rows(
+    let owner_rows = overlay_scan_batch(
         base,
         staged,
         &LiveStateScanRequest {
@@ -6108,9 +6937,10 @@ async fn preflight_owned_v2_generation_upgrades(
         })
         .collect::<BTreeMap<_, _>>();
     let mut owners_by_upgrade = vec![Vec::<PluginFileOwner>::new(); upgrades.len()];
-    for row in owner_rows {
-        let branch_id = row.branch_id.clone();
-        let Some(owner) = PluginFileOwner::from_live_state_row(&row, &branch_id)? else {
+    for row in owner_rows.iter() {
+        let branch_id = row.branch_id().to_string();
+        let owner_row = row.to_owned();
+        let Some(owner) = PluginFileOwner::from_live_state_row(&owner_row, &branch_id)? else {
             continue;
         };
         let Some(index) = upgrade_indexes
@@ -6139,13 +6969,13 @@ async fn preflight_owned_v2_generation_upgrades(
         return Ok(());
     }
 
-    let descriptor_rows = overlay_scan_rows(
+    let descriptor_rows = overlay_scan_batch(
         base,
         staged,
         &FilesystemPathIndexRequest::new(branch_ids).live_state_request(),
     )
     .await?;
-    let path_index = FilesystemPathIndex::from_live_rows(descriptor_rows)?;
+    let path_index = FilesystemPathIndex::from_live_batch(&descriptor_rows)?;
 
     let owned_schema_keys = upgrades
         .iter()
@@ -6156,7 +6986,7 @@ async fn preflight_owned_v2_generation_upgrades(
         .into_iter()
         .map(EntityPk::single)
         .collect::<Vec<_>>();
-    let registered_schema_rows = overlay_scan_rows(
+    let registered_schema_rows = overlay_scan_batch(
         base,
         staged,
         &LiveStateScanRequest {
@@ -6181,14 +7011,14 @@ async fn preflight_owned_v2_generation_upgrades(
     )
     .await?;
     let mut registered_schema_definitions = BTreeMap::<(String, String), JsonValue>::new();
-    for row in registered_schema_rows {
-        let schema_key = row.entity_pk.as_single_string().map_err(|error| {
+    for row in registered_schema_rows.iter() {
+        let schema_key = row.entity_pk().as_single_string().map_err(|error| {
             LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!("active plugin schema has an invalid identity: {error}"),
             )
         })?;
-        let Some(snapshot) = row.snapshot_content.as_deref() else {
+        let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
             continue;
         };
         let snapshot: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
@@ -6205,7 +7035,7 @@ async fn preflight_owned_v2_generation_upgrades(
         })?;
         if registered_schema_definitions
             .insert(
-                (row.branch_id.to_string(), schema_key.to_string()),
+                (row.branch_id().to_string(), schema_key.to_string()),
                 definition,
             )
             .is_some()
@@ -6281,7 +7111,7 @@ async fn preflight_owned_v2_generation_upgrades(
             .cloned()
             .map(NullableKeyFilter::Value)
             .collect::<Vec<_>>();
-        let state_rows = overlay_scan_rows(
+        let state_rows = overlay_scan_batch(
             base,
             staged,
             &LiveStateScanRequest {
@@ -6297,31 +7127,58 @@ async fn preflight_owned_v2_generation_upgrades(
             },
         )
         .await?;
-        let mut state_by_file = file_ids
-            .iter()
-            .cloned()
-            .map(|file_id| (file_id, Vec::<MaterializedLiveStateRow>::new()))
-            .collect::<BTreeMap<_, _>>();
-        for row in state_rows {
-            let Some(file_id) = row.file_id.clone() else {
+        let mut state_ordinals = Vec::<u32>::with_capacity(state_rows.len());
+        for (ordinal, row) in state_rows.iter().enumerate() {
+            let Some(file_id) = row.file_id() else {
                 continue;
             };
-            if row.branch_id.as_ref() == upgrade.branch_id
-                && !row.global
-                && !row.untracked
-                && row.snapshot_content.is_some()
+            if row.branch_id() == upgrade.branch_id
+                && !row.global()
+                && !row.untracked()
+                && row.snapshot_content().is_some()
                 && upgrade
                     .previous
                     .schema_keys()
-                    .binary_search(&row.schema_key)
+                    .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
                     .is_ok()
-                && let Some(rows) = state_by_file.get_mut(&file_id)
+                && file_ids
+                    .binary_search_by(|candidate| candidate.as_str().cmp(file_id))
+                    .is_ok()
             {
-                rows.push(row);
+                state_ordinals.push(u32::try_from(ordinal).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "plugin upgrade state batch exceeds u32 rows",
+                    )
+                })?);
             }
         }
+        state_ordinals.sort_unstable_by(|left, right| {
+            let left = state_rows.row(*left as usize);
+            let right = state_rows.row(*right as usize);
+            left.file_id()
+                .cmp(&right.file_id())
+                .then_with(|| left.schema_key().cmp(right.schema_key()))
+                .then_with(|| left.entity_pk().cmp(right.entity_pk()))
+        });
+        let mut state_by_file = BTreeMap::<String, std::ops::Range<usize>>::new();
+        let mut start = 0;
+        while start < state_ordinals.len() {
+            let file_id = state_rows
+                .row(state_ordinals[start] as usize)
+                .file_id()
+                .expect("selected plugin upgrade state row carries file_id");
+            let mut end = start + 1;
+            while end < state_ordinals.len()
+                && state_rows.row(state_ordinals[end] as usize).file_id() == Some(file_id)
+            {
+                end += 1;
+            }
+            state_by_file.insert(file_id.to_owned(), start..end);
+            start = end;
+        }
 
-        let blob_rows = overlay_scan_rows(
+        let blob_rows = overlay_scan_batch(
             base,
             staged,
             &LiveStateScanRequest {
@@ -6342,14 +7199,14 @@ async fn preflight_owned_v2_generation_upgrades(
         )
         .await?;
         let mut materialized_hash_by_file = BTreeMap::<String, BlobHash>::new();
-        for row in blob_rows {
-            let Some(file_id) = row.file_id.as_deref() else {
+        for row in blob_rows.iter() {
+            let Some(file_id) = row.file_id() else {
                 continue;
             };
-            if row.branch_id.as_ref() != upgrade.branch_id || row.global || row.untracked {
+            if row.branch_id() != upgrade.branch_id || row.global() || row.untracked() {
                 continue;
             }
-            let Some(snapshot) = row.snapshot_content.as_deref() else {
+            let Some(snapshot) = row.snapshot_content().map(|content| content.as_str()) else {
                 continue;
             };
             let snapshot: PluginUpgradeBlobRefSnapshot =
@@ -6471,8 +7328,10 @@ async fn preflight_owned_v2_generation_upgrades(
                     ),
                 ));
             };
-            let entities = v2_host_entities_from_live_rows(
-                state_by_file.remove(owner.file_id()).unwrap_or_default(),
+            let range = state_by_file.get(owner.file_id()).cloned().unwrap_or(0..0);
+            let entities = v2_host_entities_from_live_batch_ordinals(
+                &state_rows,
+                &state_ordinals[range],
                 limits,
             )?;
             let store_permit = host
@@ -6583,11 +7442,10 @@ struct PluginStateGroup {
     schema_keys: BTreeSet<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct PluginStateFileKey {
-    branch_id: String,
-    plugin_key: String,
-    file_id: String,
+#[derive(Debug, Clone, Copy)]
+struct PluginStateBatchRow {
+    batch_index: u32,
+    row_index: u32,
 }
 
 #[derive(Debug)]
@@ -6596,7 +7454,7 @@ struct PluginV2SemanticWriteGroup {
     path: String,
     filename: String,
     owner_change_id: String,
-    rows: Vec<TransactionWriteRow>,
+    row_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -6636,14 +7494,33 @@ fn plugin_schema_collision_error(
     )
 }
 
-fn mark_plugin_reconciliation_rows(rows: &mut [TransactionWriteRow]) {
-    for row in rows {
-        row.origin = Some(TransactionWriteOrigin {
-            surface: "plugin_reconciliation".to_string(),
-            operation: TransactionWriteOperation::Update,
-            primary_key: None,
-        });
+fn plugin_reconciliation_origin() -> TransactionWriteOrigin {
+    TransactionWriteOrigin {
+        surface: SharedStr::from_static("plugin_reconciliation"),
+        operation: TransactionWriteOperation::Update,
+        primary_key: None,
     }
+}
+
+fn mark_plugin_reconciliation_row(row: &mut TransactionWriteRow) {
+    row.origin = Some(plugin_reconciliation_origin());
+}
+
+fn mark_plugin_reconciliation_batch(
+    rows: &mut RawWriteBatch,
+    source_index: usize,
+) -> Result<(), LixError> {
+    if source_index > rows.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "plugin reconciliation row boundary exceeds the raw batch",
+        ));
+    }
+    let origin = plugin_reconciliation_origin();
+    for index in source_index..rows.len() {
+        rows.set_origin(index, Some(origin.clone()));
+    }
+    Ok(())
 }
 
 fn plugin_registry_live_state_projection() -> LiveStateProjection {
@@ -6652,82 +7529,32 @@ fn plugin_registry_live_state_projection() -> LiveStateProjection {
     }
 }
 
-fn plugin_change_rows(
-    plugin: &PluginRegistryEntry,
-    changes: Vec<PluginDetectedChange>,
+fn plugin_state_tombstone_batch(
+    active_state: &[PluginStateBatchRow],
+    state_batches: &[MaterializedLiveStateBatch],
     file_id: &str,
     context: &FilesystemRowContext,
-    json_context: &str,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
-    let schema_keys = plugin.schema_keys().iter().collect::<BTreeSet<_>>();
-    changes
-        .into_iter()
-        .map(|change| {
-            if !schema_keys.contains(&change.schema_key) {
-                return Err(LixError::new(
-                    LixError::CODE_SCHEMA_VALIDATION,
-                    format!(
-                        "plugin '{}' emitted schema key '{}' that is not declared in its manifest",
-                        plugin.key(),
-                        change.schema_key
-                    ),
-                ));
-            }
-            Ok(TransactionWriteRow {
-                entity_pk: Some(change.entity_pk),
-                schema_key: change.schema_key,
-                file_id: Some(file_id.to_string()),
-                snapshot: change.snapshot_content,
-                metadata: change
-                    .metadata
-                    .map(|raw| plugin_transaction_json(&raw, json_context))
-                    .transpose()?,
-                origin: None,
-                created_at: None,
-                updated_at: None,
-                global: context.global,
-                change_id: None,
-                commit_id: None,
-                untracked: context.untracked,
-                branch_id: context.branch_id.clone(),
-            })
-        })
-        .collect()
-}
-
-fn plugin_state_tombstone_rows(
-    active_state: &[MaterializedLiveStateRow],
-    file_id: &str,
-    context: &FilesystemRowContext,
-) -> Vec<TransactionWriteRow> {
-    active_state
-        .iter()
-        .map(|row| TransactionWriteRow {
-            entity_pk: Some(row.entity_pk.clone()),
-            schema_key: row.schema_key.clone(),
-            file_id: Some(file_id.to_string()),
-            snapshot: None,
-            metadata: context.metadata.clone(),
-            origin: None,
-            created_at: None,
-            updated_at: None,
-            global: context.global,
-            change_id: None,
-            commit_id: None,
-            untracked: context.untracked,
-            branch_id: context.branch_id.clone(),
-        })
-        .collect()
-}
-
-fn plugin_transaction_json(raw: &str, context: &str) -> Result<TransactionJson, LixError> {
-    let value = serde_json::from_str::<JsonValue>(raw).map_err(|error| {
-        LixError::new(
-            LixError::CODE_SCHEMA_VALIDATION,
-            format!("{context} emitted invalid JSON: {error}"),
-        )
-    })?;
-    TransactionJson::from_value(value, context)
+) -> RawWriteBatch {
+    let mut rows = RawWriteBatch::with_capacity(active_state.len());
+    for selected in active_state {
+        let row = state_batches[selected.batch_index as usize].row(selected.row_index as usize);
+        rows.push_parts(
+            Some(row.entity_pk().clone()),
+            row.schema_key().into(),
+            Some(file_id.into()),
+            None,
+            context.metadata.clone(),
+            None,
+            None,
+            None,
+            context.global,
+            None,
+            None,
+            context.untracked,
+            context.branch_id.as_str().into(),
+        );
+    }
+    rows
 }
 
 fn transaction_write_targets_non_active_branch(
@@ -6754,7 +7581,7 @@ fn transaction_write_targets_non_active_branch(
 }
 
 fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) -> bool {
-    let (rows, file_data): (&[TransactionWriteRow], &[TransactionFileData]) = match write {
+    let (rows, file_data): (&RawWriteBatch, &[TransactionFileData]) = match write {
         TransactionWrite::Rows { rows, .. } => (rows, &[]),
         TransactionWrite::RowsWithFileData {
             rows, file_data, ..
@@ -6768,10 +7595,9 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
                 && row.snapshot.is_none()
                 && row
                     .entity_pk
-                    .as_ref()
                     .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
                     .zip(
-                        row.origin.as_ref().and_then(|origin| {
+                        row.origin.and_then(|origin| {
                             plugin_key_from_archive_delete_origin(&origin.surface)
                         }),
                     )
@@ -6784,13 +7610,13 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
 fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
     match write {
         TransactionWrite::Rows { rows, .. } => {
-            rows.iter().map(|row| row.branch_id.clone()).collect()
+            rows.iter().map(|row| row.branch_id.to_string()).collect()
         }
         TransactionWrite::RowsWithFileData {
             rows, file_data, ..
         } => rows
             .iter()
-            .map(|row| row.branch_id.clone())
+            .map(|row| row.branch_id.to_string())
             .chain(file_data.iter().map(|write| write.branch_id.clone()))
             .collect(),
     }
@@ -6827,8 +7653,19 @@ fn require_valid_transaction_write_storage_scopes(
     }
 }
 
+fn require_valid_reconciled_transaction_write_storage_scopes(
+    write: &ReconciledTransactionWrite,
+) -> Result<(), LixError> {
+    match write {
+        ReconciledTransactionWrite::Rows { rows, .. }
+        | ReconciledTransactionWrite::RowsWithFileData { rows, .. } => {
+            rows.require_valid_storage_scopes()
+        }
+    }
+}
+
 fn require_valid_transaction_write_row_storage_scopes(
-    rows: &[TransactionWriteRow],
+    rows: &RawWriteBatch,
 ) -> Result<(), LixError> {
     for row in rows {
         require_valid_storage_scope(row.branch_id.as_str(), row.global)?;
@@ -6872,6 +7709,7 @@ fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
     use serde_json::json;
@@ -6882,10 +7720,19 @@ mod tests {
     use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
     use crate::changelog::ChangelogReader;
+    use crate::functions::FunctionProvider;
     use crate::storage_adapter::{Memory, StorageReadOptions};
-    use crate::tracked_state::{TrackedStateKey, TrackedStateScanRequest};
-    use crate::transaction::types::{StagedCommitChangeRefs, TransactionJson};
+    use crate::tracked_state::{
+        TrackedStateDiffIdentity, TrackedStateKey, TrackedStateScanRequest,
+    };
+    use crate::transaction::types::{
+        StagedCommitChangeBatchBuilder, StagedCommitChangeRefs, TransactionJson,
+    };
     use crate::wasm::WasmEntity;
+
+    fn raw_write_rows(rows: Vec<TransactionWriteRow>) -> RawWriteBatch {
+        RawWriteBatch::from_test_rows(rows)
+    }
 
     fn live_state_context() -> LiveStateContext {
         LiveStateContext::new(TrackedStateContext::new(), CommitGraphContext::new())
@@ -6894,20 +7741,130 @@ mod tests {
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
 
     #[test]
+    fn prospective_overlay_keeps_ten_thousand_rows_in_one_dictionary_batch() {
+        const ROW_COUNT: usize = 10_000;
+
+        let timestamp =
+            LixTimestamp::expect_parse("prospective overlay timestamp", "2026-01-01T00:00:00.000Z");
+        let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(ROW_COUNT);
+        for ordinal in 0..ROW_COUNT {
+            let entity_pk = EntityPk::single(format!("entity-{ordinal}"));
+            rows.push_materialized_ref(
+                &entity_pk,
+                "example",
+                Some("shared-file"),
+                Some(SharedStr::from_static(r#"{"value":true}"#)),
+                None,
+                false,
+                timestamp,
+                timestamp,
+                false,
+                None,
+                None,
+                false,
+                "main",
+            );
+        }
+        let prospective = ProspectiveStagedRows {
+            staged: Arc::new(TransactionWriteBuffer::new(FunctionProviderHandle::system()))
+                .staging_overlay()
+                .expect("empty staging overlay"),
+            rows: rows.finish(),
+        };
+
+        let batch = prospective
+            .staged_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["example".to_string()],
+                    branch_ids: vec!["main".to_string()],
+                    file_ids: vec![NullableKeyFilter::Value("shared-file".to_string())],
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .expect("prospective batch scan");
+
+        assert_eq!(batch.len(), ROW_COUNT);
+        assert_eq!(batch.dictionary_entry_count(), 3);
+        assert_eq!(batch.dictionary_arena_buffer_count(), 1);
+    }
+
+    #[test]
+    fn reconciliation_rows_share_one_static_surface_across_mark_calls() {
+        let mut first = key_value_stage_row("first", "value", false);
+        let mut second = key_value_stage_row("second", "value", false);
+
+        mark_plugin_reconciliation_row(&mut first);
+        mark_plugin_reconciliation_row(&mut second);
+
+        let first_surface = &first.origin.as_ref().expect("first origin").surface;
+        let second_surface = &second.origin.as_ref().expect("second origin").surface;
+        assert!(first_surface.shares_buffer_with(second_surface));
+        assert_eq!(
+            first_surface.as_bytes().as_ptr(),
+            second_surface.as_bytes().as_ptr()
+        );
+    }
+
+    #[test]
+    fn format_only_plugin_rows_share_one_certified_metadata_buffer() {
+        const ROW_COUNT: usize = 10_000;
+
+        let metadata = v2_format_only_metadata();
+        let mut rows = RawWriteBatch::with_capacity(ROW_COUNT);
+        for _ in 0..ROW_COUNT {
+            rows.push_parts(
+                None,
+                SharedStr::from_static("format_only_probe"),
+                None,
+                None,
+                Some(metadata.clone()),
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                false,
+                SharedStr::from_static("main"),
+            );
+        }
+
+        let first = rows
+            .row(0)
+            .metadata
+            .expect("format-only row carries metadata");
+        assert!(first.metadata_content_certified());
+        assert_eq!(first.normalized(), V2_FORMAT_ONLY_METADATA_JSON);
+        let first_pointer = first.normalized().as_ptr();
+        assert!(rows.iter().all(|row| {
+            let metadata = row.metadata.expect("format-only row carries metadata");
+            metadata.metadata_content_certified()
+                && metadata.normalized().as_ptr() == first_pointer
+                && metadata.normalized() == V2_FORMAT_ONLY_METADATA_JSON
+        }));
+    }
+
+    #[test]
     fn selected_blob_ref_change_requires_filesystem_index_rebuild() {
         let mut selected_changes = StagedCommitChangeRefs::default();
-        selected_changes.add_selected_change_ref(StagedCommitChangeRef {
-            schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-            file_id: Some("file-a".to_string()),
-            entity_pk: EntityPk::single("file-a"),
-            change_id: ChangeId::default(),
-            deleted: false,
-            created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-            updated_at: LixTimestamp::from_unix_millis_utc_lossy(0),
-        });
+        let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
+        batch.push(
+            TrackedStateDiffIdentity::from_key(TrackedStateKey {
+                schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
+                file_id: Some("file-a".to_string()),
+                entity_pk: EntityPk::single("file-a"),
+            }),
+            ChangeId::default(),
+            false,
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+            LixTimestamp::from_unix_millis_utc_lossy(0),
+        );
+        selected_changes.add_selected_change_batch(batch.finish());
         let prepared_writes = PreparedWriteSet {
-            state_rows: Vec::new(),
-            insert_identities: BTreeMap::new(),
+            state_rows: PreparedStateBatch::new(),
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
             commit_change_refs_by_branch: BTreeMap::from([("main".to_string(), selected_changes)]),
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
@@ -6932,7 +7889,8 @@ mod tests {
                     "id": snapshot_id,
                     "blob_hash": blob_hash.to_hex(),
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ),
             metadata: None,
             deleted: false,
@@ -7010,15 +7968,12 @@ mod tests {
 
     #[test]
     fn format_only_equal_snapshots_are_semantic_noops() {
-        let key = |id: &str| WasmEntityKey {
-            schema_key: "plugin_note".to_string(),
-            entity_pk: vec![id.to_string()],
-        };
+        let key = |id: &str| WasmEntityKey::from_owned_parts("plugin_note", vec![id.to_string()]);
         let live = |id: &str, snapshot_content: &str| MaterializedLiveStateRow {
             entity_pk: EntityPk::single(id),
             schema_key: "plugin_note".to_string(),
             file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
-            snapshot_content: Some(snapshot_content.to_string()),
+            snapshot_content: Some(snapshot_content.to_string().into()),
             metadata: None,
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(0),
@@ -7032,15 +7987,21 @@ mod tests {
         let upsert = |id: &str, snapshot: &[u8], effect| {
             let value = serde_json::from_slice::<JsonValue>(snapshot)
                 .expect("test snapshot must contain valid JSON");
-            let normalized =
-                String::from_utf8(snapshot.to_vec()).expect("test snapshot must be UTF-8");
+            let normalized_len = u32::try_from(snapshot.len()).expect("test snapshot fits u32");
+            let canonical = crate::wasm::WasmCanonicalJson::from_batch_parts(
+                vec![value],
+                snapshot.to_vec(),
+                vec![(0, normalized_len)],
+                1,
+                1,
+            )
+            .expect("test canonical batch must be valid")
+            .pop()
+            .expect("test canonical batch has one row");
             WasmEntityChange::Upsert {
                 entity: WasmEntity {
                     key: key(id),
-                    snapshot_content: WasmHostBytes::CanonicalJson {
-                        value: Arc::new(value),
-                        normalized: normalized.into(),
-                    },
+                    snapshot_content: WasmHostBytes::CanonicalJson(canonical),
                 },
                 effect,
             }
@@ -7049,7 +8010,7 @@ mod tests {
             changes: vec![
                 upsert(
                     "equal",
-                    br#"{"id":"equal","text":"\u00e9"}"#,
+                    r#"{"id":"equal","text":"é"}"#.as_bytes(),
                     WasmChangeEffect::FormatOnly,
                 ),
                 upsert(
@@ -7068,7 +8029,7 @@ mod tests {
         let accepted = BTreeMap::from([
             (
                 key("equal"),
-                Some(live("equal", r#"{"text":"é","id":"equal"}"#)),
+                Some(live("equal", r#"{"text":"\u00e9","id":"equal"}"#)),
             ),
             (
                 key("changed"),
@@ -7120,10 +8081,10 @@ mod tests {
     #[test]
     fn active_branch_write_gate_ignores_global_companion_rows_and_files() {
         let mut active_row = key_value_stage_row("active-row", "value", false);
-        active_row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
+        active_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         active_row.global = false;
         let mut global_row = key_value_stage_row("global-row", "value", false);
-        global_row.branch_id = GLOBAL_BRANCH_ID.to_string();
+        global_row.branch_id = GLOBAL_BRANCH_ID.into();
         global_row.global = true;
         let global_file = TransactionFileData::new(
             "global-file".to_string(),
@@ -7139,7 +8100,7 @@ mod tests {
             !transaction_write_targets_non_active_branch(
                 &TransactionWrite::RowsWithFileData {
                     mode: TransactionWriteMode::Replace,
-                    rows: vec![active_row.clone(), global_row],
+                    rows: raw_write_rows(vec![active_row.clone(), global_row]),
                     file_data: vec![global_file],
                     count: 1,
                 },
@@ -7148,11 +8109,11 @@ mod tests {
             "normal local writes commonly carry global bookkeeping rows"
         );
 
-        active_row.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
+        active_row.branch_id = "01920000-0000-7000-8000-0000000000b1".into();
         assert!(transaction_write_targets_non_active_branch(
             &TransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![active_row],
+                rows: raw_write_rows(vec![active_row]),
             },
             "01920000-0000-7000-8000-0000000000a1",
         ));
@@ -7274,7 +8235,7 @@ mod tests {
                 edits: vec![crate::wasm::WasmOutputSplice {
                     offset: 0,
                     delete_len: 0,
-                    insert: crate::wasm::WasmGuestBytes::Inline(bytes.clone()),
+                    insert: crate::wasm::WasmGuestBytes::Inline(bytes.clone().into()),
                 }],
                 outputs: None,
             }))
@@ -7658,10 +8619,10 @@ mod tests {
         let runtime_functions = opened.runtime_functions;
 
         transaction
-            .stage_rows(vec![
+            .stage_rows(raw_write_rows(vec![
                 key_value_stage_row("tracked-programmatic", "tracked", false),
                 key_value_stage_row("untracked-programmatic", "untracked", true),
-            ])
+            ]))
             .await
             .expect("programmatic rows should stage");
         transaction
@@ -7833,13 +8794,13 @@ mod tests {
         row.updated_at = Some("2026-04-23T00:00:00.123456Z".to_string());
 
         let outcome = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect("valid ISO timestamps should stage after lossy normalization");
         assert_eq!(outcome.count, 1);
 
         let rows = transaction
-            .scan_live_state(&LiveStateScanRequest {
+            .scan_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![EntityPk::single("lossy-timestamp")],
@@ -7856,11 +8817,17 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert!(
-            rows[0].change_id.is_some(),
+            rows.row(0).change_id().is_some(),
             "prepared untracked rows must receive a real change id"
         );
-        assert_eq!(rows[0].created_at.to_string(), "1970-01-01T00:00:00.000Z");
-        assert_eq!(rows[0].updated_at.to_string(), "2026-04-23T00:00:00.123Z");
+        assert_eq!(
+            rows.row(0).created_at().to_string(),
+            "1970-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            rows.row(0).updated_at().to_string(),
+            "2026-04-23T00:00:00.123Z"
+        );
     }
 
     #[tokio::test]
@@ -7895,7 +8862,7 @@ mod tests {
             json!({"key": "invalid-programmatic"}),
         ));
         let error = transaction
-            .stage_rows(vec![invalid_row])
+            .stage_rows(raw_write_rows(vec![invalid_row]))
             .await
             .expect_err("row-local validation should reject while staging");
         assert!(
@@ -7930,7 +8897,7 @@ mod tests {
         let mut row = key_value_stage_row("invalid-metadata", "value", false);
         row.metadata = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("non-object metadata should fail statement validation");
 
@@ -7955,10 +8922,10 @@ mod tests {
             open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("unknown-schema", "value", false);
-        row.schema_key = "missing_schema".to_string();
+        row.schema_key = "missing_schema".into();
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("unknown schema should be rejected while staging");
 
@@ -7978,11 +8945,11 @@ mod tests {
             open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("ghost-branch-row", "value", false);
-        row.branch_id = "ghost-branch".to_string();
+        row.branch_id = "ghost-branch".into();
         row.global = false;
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("missing branch should be rejected before staging");
 
@@ -8002,11 +8969,11 @@ mod tests {
             open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("invalid-storage-scope", "value", false);
-        row.branch_id = GLOBAL_BRANCH_ID.to_string();
+        row.branch_id = GLOBAL_BRANCH_ID.into();
         row.global = false;
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("invalid storage scope should be rejected before staging");
 
@@ -8029,7 +8996,7 @@ mod tests {
         row.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("non-object snapshot should be rejected while staging");
 
@@ -8052,7 +9019,7 @@ mod tests {
             json!({"key": "schema-mismatch"}),
         ));
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("JSON Schema mismatch should fail statement validation");
 
@@ -8077,7 +9044,7 @@ mod tests {
             open_test_transaction(&storage).await;
 
         let mut row = key_value_stage_row("malformed-registered-schema", "value", false);
-        row.schema_key = "lix_registered_schema".to_string();
+        row.schema_key = "lix_registered_schema".into();
         row.snapshot = Some(TransactionJson::from_value_for_test(json!({
             "value": {
                 "x-lix-key": "malformed_registered_schema",
@@ -8093,7 +9060,7 @@ mod tests {
         row.entity_pk = None;
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("malformed registered schema should be rejected while staging");
 
@@ -8114,7 +9081,7 @@ mod tests {
         row.entity_pk = Some(EntityPk::single("wrong-id"));
 
         let error = transaction
-            .stage_rows(vec![row])
+            .stage_rows(raw_write_rows(vec![row]))
             .await
             .expect_err("entity pk mismatch should be rejected while staging");
 
@@ -8124,6 +9091,188 @@ mod tests {
                 .message
                 .contains("does not match x-lix-primary-key derived entity_pk"),
             "error should explain entity pk mismatch: {error:?}"
+        );
+    }
+
+    #[derive(Clone)]
+    struct CountingPreparationProvider {
+        uuid_calls: Arc<AtomicUsize>,
+        timestamp_calls: Arc<AtomicUsize>,
+    }
+
+    impl FunctionProvider for CountingPreparationProvider {
+        fn uuid_v7(&mut self) -> uuid::Uuid {
+            let call = self.uuid_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            counting_preparation_uuid(call)
+        }
+
+        fn timestamp(&mut self) -> LixTimestamp {
+            self.timestamp_calls.fetch_add(1, Ordering::SeqCst);
+            LixTimestamp::expect_parse("test timestamp", "2026-01-01T00:00:00.000Z")
+        }
+    }
+
+    fn counting_preparation_uuid(call: usize) -> uuid::Uuid {
+        uuid::Uuid::from_u128(0x0192_0000_0000_7000_8000_0000_0000_0000_u128 + call as u128)
+    }
+
+    fn install_counting_preparation_provider(
+        transaction: &mut Transaction,
+    ) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let uuid_calls = Arc::new(AtomicUsize::new(0));
+        let timestamp_calls = Arc::new(AtomicUsize::new(0));
+        transaction.functions =
+            FunctionProviderHandle::shared(Box::new(CountingPreparationProvider {
+                uuid_calls: Arc::clone(&uuid_calls),
+                timestamp_calls: Arc::clone(&timestamp_calls),
+            }));
+        (uuid_calls, timestamp_calls)
+    }
+
+    fn account_stage_row(name: &str) -> TransactionWriteRow {
+        TransactionWriteRow {
+            entity_pk: None,
+            schema_key: "lix_account".into(),
+            file_id: None,
+            snapshot: Some(TransactionJson::from_value_for_test(
+                json!({ "name": name }),
+            )),
+            metadata: None,
+            origin: None,
+            created_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            updated_at: Some("2026-01-01T00:00:00.000Z".to_string()),
+            global: true,
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            branch_id: GLOBAL_BRANCH_ID.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn homogeneous_preparation_preserves_per_row_function_call_order() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let (uuid_calls, _timestamp_calls) =
+            install_counting_preparation_provider(&mut transaction);
+
+        let prepared = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![
+                account_stage_row("Ada"),
+                account_stage_row("Grace"),
+            ]))
+            .await
+            .expect("accounts should prepare");
+
+        assert_eq!(
+            prepared.row(0).entity_pk,
+            &EntityPk::uuid_from_canonical(&counting_preparation_uuid(1).to_string())
+                .expect("UUID pk")
+        );
+        assert_eq!(
+            prepared.row(0).change_id,
+            Some(ChangeId::from(counting_preparation_uuid(2)))
+        );
+        assert_eq!(
+            prepared.row(1).entity_pk,
+            &EntityPk::uuid_from_canonical(&counting_preparation_uuid(3).to_string())
+                .expect("UUID pk")
+        );
+        assert_eq!(
+            prepared.row(1).change_id,
+            Some(ChangeId::from(counting_preparation_uuid(4)))
+        );
+        assert_eq!(uuid_calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn homogeneous_preparation_reports_earlier_scalar_error_before_later_schema_error() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let mut scalar_invalid = key_value_stage_row("scalar-invalid", "value", false);
+        scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
+        let mut schema_invalid = key_value_stage_row("schema-invalid", "value", false);
+        schema_invalid.snapshot =
+            Some(TransactionJson::from_value_for_test(json!("not-an-object")));
+
+        let error = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![scalar_invalid, schema_invalid]))
+            .await
+            .expect_err("the first row's scalar error should retain precedence");
+        assert!(
+            error.message.contains("invalid updated_at timestamp"),
+            "unexpected preparation error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mixed_reconciliation_normalizes_all_raw_rows_before_scalar_provider_calls() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let prepared_source = key_value_stage_row("prepared", "value", false);
+        let prepared = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
+            .await
+            .expect("prepared semantic slot");
+        let raw_valid = key_value_stage_row("raw-valid", "value", false);
+        let mut raw_invalid = key_value_stage_row("raw-invalid", "value", false);
+        raw_invalid.snapshot = Some(TransactionJson::from_value_for_test(json!("not-an-object")));
+        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
+            prepared_source,
+            raw_valid,
+            raw_invalid,
+        ]));
+        rows.take_raw_rows_at(&[0])
+            .expect("semantic source should extract");
+        rows.put_prepared_batch_at(&[0], prepared)
+            .expect("prepared source should fill its slot");
+        let (uuid_calls, timestamp_calls) = install_counting_preparation_provider(&mut transaction);
+
+        let error = transaction
+            .prepare_reconciled_rows(rows)
+            .await
+            .expect_err("later raw normalization should fail");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(uuid_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(timestamp_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mixed_reconciliation_preserves_normalization_error_precedence_over_scalar_error() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let prepared_source = key_value_stage_row("prepared", "value", false);
+        let prepared = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![prepared_source.clone()]))
+            .await
+            .expect("prepared semantic slot");
+        let mut scalar_invalid = key_value_stage_row("raw-scalar-invalid", "value", false);
+        scalar_invalid.updated_at = Some("not-a-timestamp".to_string());
+        let mut schema_invalid = key_value_stage_row("raw-schema-invalid", "value", false);
+        schema_invalid.snapshot =
+            Some(TransactionJson::from_value_for_test(json!("not-an-object")));
+        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
+            prepared_source,
+            scalar_invalid,
+            schema_invalid,
+        ]));
+        rows.take_raw_rows_at(&[0])
+            .expect("semantic source should extract");
+        rows.put_prepared_batch_at(&[0], prepared)
+            .expect("prepared source should fill its slot");
+
+        let error = transaction
+            .prepare_reconciled_rows(rows)
+            .await
+            .expect_err("normalization must finish before scalar planning");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert!(
+            !error.message.contains("invalid updated_at timestamp"),
+            "generic mixed preparation must preserve normalization precedence: {error:?}"
         );
     }
 
@@ -8182,7 +9331,7 @@ mod tests {
                         .expect("registered schema identity should derive"),
                     schema_key: "lix_registered_schema".to_string(),
                     file_id: None,
-                    snapshot_content: Some(snapshot_content),
+                    snapshot_content: Some(snapshot_content.into()),
                     metadata: None,
                     deleted: false,
                     created_at: "1970-01-01T00:00:00.000Z".to_string(),
@@ -8279,7 +9428,7 @@ mod tests {
     fn key_value_stage_row(key: &str, value: &str, untracked: bool) -> TransactionWriteRow {
         TransactionWriteRow {
             entity_pk: Some(EntityPk::single(key)),
-            schema_key: "lix_key_value".to_string(),
+            schema_key: "lix_key_value".into(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({
                 "key": key,
@@ -8293,17 +9442,17 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked,
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.into(),
         }
     }
     #[tokio::test]
-    async fn prepared_semantic_rows_freeze_nondeterministic_defaults_for_staging() {
+    async fn reconciled_prepared_slot_freezes_nondeterministic_defaults_for_staging() {
         let storage = Memory::new();
         let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
             open_test_transaction(&storage).await;
         let source = TransactionWriteRow {
             entity_pk: None,
-            schema_key: "lix_account".to_string(),
+            schema_key: "lix_account".into(),
             file_id: None,
             snapshot: Some(TransactionJson::from_value_for_test(json!({
                 "name": "Ada",
@@ -8316,47 +9465,173 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: true,
-            branch_id: GLOBAL_BRANCH_ID.to_string(),
+            branch_id: GLOBAL_BRANCH_ID.into(),
         };
         let rendered = transaction
-            .prepare_transaction_rows(vec![source.clone()])
+            .prepare_transaction_rows(raw_write_rows(vec![source.clone()]))
             .await
-            .expect("the semantic row should normalize once")
-            .pop()
-            .expect("one semantic row should be prepared");
+            .expect("the semantic row should normalize once");
         let independently_reprepared = transaction
-            .prepare_transaction_rows(vec![source.clone()])
+            .prepare_transaction_rows(raw_write_rows(vec![source.clone()]))
             .await
-            .expect("a second normalization should also succeed")
-            .pop()
-            .expect("one comparison row should be prepared");
+            .expect("a second normalization should also succeed");
         assert_ne!(
-            rendered.entity_pk, independently_reprepared.entity_pk,
+            rendered.row(0).entity_pk,
+            independently_reprepared.row(0).entity_pk,
             "the fixture must prove its UUID default is nondeterministic"
         );
 
-        let mut frozen = PreparedSemanticRows::default();
-        frozen
-            .insert(&source, rendered.clone())
-            .expect("the exact rendered row should freeze");
+        let mut reconciled_rows = ReconciledRowBatch::raw(raw_write_rows(vec![source]));
+        reconciled_rows
+            .take_raw_rows_at(&[0])
+            .expect("the semantic source should move out exactly once");
+        reconciled_rows
+            .put_prepared_batch_at(&[0], rendered.clone())
+            .expect("the exact rendered row should fill its typed slot");
         let PreparedTransactionWrite::Rows { rows, .. } = transaction
-            .prepare_transaction_write(
-                TransactionWrite::Rows {
-                    mode: TransactionWriteMode::Insert,
-                    rows: vec![source],
-                },
-                frozen,
-            )
+            .prepare_transaction_write(ReconciledTransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows: reconciled_rows,
+            })
             .await
-            .expect("final preparation should reuse the frozen row")
+            .expect("final preparation should reuse the prepared slot")
         else {
             panic!("row-only input should stay row-only");
         };
         assert_eq!(
-            rows,
-            vec![rendered],
+            rows, rendered,
             "durable staging must receive the exact row supplied to entities_changed"
         );
+    }
+
+    #[tokio::test]
+    async fn reconciled_prepared_slots_follow_raw_row_compaction_in_order() {
+        let storage = Memory::new();
+        let (_live_state, _binary_cas, _branch_ref, _runtime_functions, mut transaction) =
+            open_test_transaction(&storage).await;
+        let first_source = key_value_stage_row("semantic-first", "first", true);
+        let second_source = key_value_stage_row("semantic-second", "second", true);
+        let prepared = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![
+                first_source.clone(),
+                second_source.clone(),
+            ]))
+            .await
+            .expect("semantic sources should prepare");
+        let mut first_prepared = prepared.clone();
+        first_prepared.select_rows(&[0]);
+        let mut second_prepared = prepared;
+        second_prepared.select_rows(&[1]);
+
+        // Two independently prepared semantic groups remain in their original
+        // relative order while stale raw rows before and between them are
+        // compacted and a new engine row is appended.
+        let mut rows = ReconciledRowBatch::raw(raw_write_rows(vec![
+            key_value_stage_row("remove-before-semantic", "stale", true),
+            first_source,
+            key_value_stage_row("remove-between-semantic", "stale", true),
+            second_source,
+            key_value_stage_row("appended-reconciliation", "new", true),
+        ]));
+        rows.take_raw_rows_at(&[1])
+            .expect("first semantic source should move once");
+        rows.put_prepared_batch_at(&[1], first_prepared.clone())
+            .expect("first prepared slot should retain its position");
+        rows.take_raw_rows_at(&[3])
+            .expect("second semantic source should move once");
+        rows.put_prepared_batch_at(&[3], second_prepared.clone())
+            .expect("second prepared slot should retain its position");
+        rows.retain_raw(|row| {
+            !matches!(
+                row.entity_pk
+                    .and_then(|entity_pk| entity_pk.as_single_string().ok()),
+                Some("remove-before-semantic" | "remove-between-semantic")
+            )
+        })
+        .expect("raw row compaction should preserve typed prepared slots");
+
+        let prepared = transaction
+            .prepare_reconciled_rows(rows)
+            .await
+            .expect("mixed reconciled rows should prepare once in batch order");
+        assert_eq!(prepared.len(), 3);
+        assert_eq!(prepared.row(0), first_prepared.row(0));
+        assert_eq!(prepared.row(1), second_prepared.row(0));
+        assert_eq!(
+            prepared
+                .row(2)
+                .entity_pk
+                .as_single_string()
+                .expect("appended key should stay scalar"),
+            "appended-reconciliation",
+            "the raw appended row should follow both prepared semantic groups"
+        );
+    }
+
+    #[test]
+    fn reconciled_raw_ordinals_move_canonical_owners_without_row_materialization() {
+        let mut values = Vec::new();
+        let mut normalized = Vec::new();
+        let mut offsets = Vec::new();
+        for index in 0..3 {
+            let value = json!({"key": format!("canonical-{index}"), "value": index});
+            let encoded = serde_json::to_vec(&value).expect("canonical fixture");
+            let start = u32::try_from(normalized.len()).expect("canonical offset");
+            normalized.extend_from_slice(&encoded);
+            let end = u32::try_from(normalized.len()).expect("canonical offset");
+            values.push(value);
+            offsets.push((start, end));
+        }
+        let canonical =
+            crate::wasm::WasmCanonicalJson::from_batch_parts(values, normalized, offsets, 3, 3)
+                .expect("canonical raw batch");
+        let arena_probe = canonical[0].clone();
+        let rows = canonical
+            .into_iter()
+            .enumerate()
+            .map(|(index, snapshot)| {
+                let mut row = key_value_stage_row(&format!("canonical-{index}"), "value", true);
+                row.snapshot = Some(TransactionJson::from_canonical_batch(snapshot));
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut reconciled = ReconciledRowBatch::raw(raw_write_rows(rows));
+
+        let moved = reconciled
+            .take_raw_rows_at(&[2, 0])
+            .expect("noncontiguous raw ordinals should move in requested order");
+        assert_eq!(moved.len(), 2);
+        assert_eq!(
+            moved
+                .row(0)
+                .entity_pk
+                .expect("moved identity")
+                .as_single_string()
+                .expect("scalar identity"),
+            "canonical-2"
+        );
+        let moved_first = moved
+            .row(0)
+            .snapshot
+            .and_then(TransactionJson::canonical_batch_row)
+            .expect("moved canonical owner");
+        let moved_second = moved
+            .row(1)
+            .snapshot
+            .and_then(TransactionJson::canonical_batch_row)
+            .expect("moved canonical owner");
+        assert!(moved_first.shares_batch_with(moved_second));
+        assert!(moved_second.shares_batch_with(&arena_probe));
+
+        let remaining = reconciled
+            .take_raw_rows_at(&[1])
+            .expect("unmoved raw ordinal must remain addressable");
+        let remaining = remaining
+            .row(0)
+            .snapshot
+            .and_then(TransactionJson::canonical_batch_row)
+            .expect("remaining canonical owner");
+        assert!(remaining.shares_batch_with(&arena_probe));
     }
 
     #[tokio::test]
@@ -8366,27 +9641,50 @@ mod tests {
             open_test_transaction(&storage).await;
         let limits = WasmTransitionLimits::default();
         let large_value = "x".repeat(limits.max_record_bytes as usize + 32);
-        let mut prepared = transaction
-            .prepare_transaction_rows(vec![key_value_stage_row(
+        let prepared = transaction
+            .prepare_transaction_rows(raw_write_rows(vec![key_value_stage_row(
                 "large-semantic-entity",
                 &large_value,
                 true,
-            )])
+            )]))
             .await
-            .expect("large semantic row should normalize")
-            .pop()
-            .expect("one prepared semantic row should exist");
+            .expect("large semantic row should normalize");
         let expected = prepared
+            .row(0)
             .snapshot
-            .as_ref()
             .expect("semantic upsert should carry a snapshot")
-            .materialize();
-        prepared.file_id = Some("large-file".to_string());
-        prepared.global = false;
-        prepared.untracked = false;
-        prepared.branch_id = "main".to_string();
+            .materialize_shared();
 
-        let changes = v2_host_changes_from_prepared_rows(vec![prepared], limits)
+        // Semantic normalization is domain-aware. Normalize against the
+        // seeded global catalog first, then shape the already-prepared row as
+        // the branch-local, file-scoped plugin output this renderer consumes.
+        // This preserves the original fixture's boundary without teaching
+        // normalization that the synthetic, unseeded `main` branch is valid.
+        let source = prepared.row(0);
+        assert!(source.global);
+        assert!(source.untracked);
+        assert!(source.file_id.is_none());
+        let mut semantic_rows = PreparedStateBatch::with_capacity(1);
+        semantic_rows.push_parts(
+            source.schema_plan_id,
+            source.facts,
+            source.entity_pk.clone(),
+            source.schema_key.clone(),
+            Some("large-file".into()),
+            source.snapshot.cloned(),
+            source.metadata.cloned(),
+            source.origin.cloned(),
+            source.origin_key,
+            source.created_at,
+            source.updated_at,
+            false,
+            source.change_id,
+            source.commit_id,
+            false,
+            "main".into(),
+        );
+
+        let changes = v2_host_changes_from_prepared_rows(&semantic_rows, limits)
             .expect("direct semantic rendering should select a lazy snapshot source");
         let WasmEntityChange::Upsert { entity, .. } = &changes.changes[0] else {
             panic!("prepared semantic snapshot should become an upsert")

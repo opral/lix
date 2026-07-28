@@ -1,6 +1,8 @@
 //! Canonical HTTP transport for independent pinned sessions on a workspace-mode
 //! root [`lix_sdk::Lix`] handle.
 
+#![cfg_attr(test, allow(clippy::large_futures))]
+
 use axum::{
     Extension, Json, Router,
     body::Bytes,

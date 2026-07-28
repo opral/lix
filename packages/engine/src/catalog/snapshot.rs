@@ -1,14 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{cmp::Ordering, collections::BTreeMap, sync::Arc};
 
 use jsonschema::JSONSchema;
 use serde_json::{Map as JsonMap, Value as JsonValue};
+use smallvec::SmallVec;
 
 use crate::LixError;
 use crate::common::{format_json_pointer, parse_json_pointer};
 use crate::domain::{Domain, DomainSchemaIdentity};
-use crate::entity_pk::canonical_json_text;
+use crate::entity_pk::{EntityPk, canonical_json_text};
 use crate::functions::FunctionProviderHandle;
 use crate::schema::{SchemaKey, compile_lix_schema, validate_schema_amendment};
+use crate::wasm::WasmEntityKey;
 
 #[derive(Default)]
 pub(crate) struct CatalogSnapshot {
@@ -382,11 +384,15 @@ impl SchemaPlanId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct SchemaPlanFingerprint([u8; 32]);
+
 pub(crate) type PointerGroup = Vec<Vec<String>>;
 
 pub(crate) struct SchemaPlan {
     pub(crate) key: SchemaCatalogKey,
     pub(crate) schema: Arc<JsonValue>,
+    fingerprint: Arc<SchemaPlanFingerprint>,
     pub(crate) compiled_schema: JSONSchema,
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
@@ -397,11 +403,118 @@ pub(crate) struct SchemaPlan {
     pub(crate) state_foreign_keys: Vec<StateForeignKeyPlan>,
 }
 
+#[derive(Debug)]
+pub(crate) struct CertifiedV2PluginRow {
+    pub(crate) entity_pk: EntityPk,
+    /// `None` retains the guest buffer because its spelling is already
+    /// canonical. `Some` is the canonical spelling produced by the same
+    /// structural parser pass that validated the row.
+    pub(crate) normalized: Option<Vec<u8>>,
+}
+
 impl SchemaPlan {
+    pub(crate) fn fingerprint(&self) -> &SchemaPlanFingerprint {
+        self.fingerprint.as_ref()
+    }
+
+    pub(crate) fn shared_fingerprint(&self) -> Arc<SchemaPlanFingerprint> {
+        Arc::clone(&self.fingerprint)
+    }
+
     pub(crate) fn accepts_row_content_fast(&self, value: &JsonValue) -> bool {
         self.fast_object_validation
             .as_ref()
             .is_some_and(|plan| plan.accepts(value))
+    }
+
+    /// Parses, validates, and, only when necessary, canonicalizes one v2
+    /// plugin row in one structural pass.
+    ///
+    /// Eligible canonical rows retain the guest buffer without building a
+    /// DOM. Eligible compatibility spellings return one canonical byte
+    /// buffer from that same pass. `Ok(None)` is reserved for plans that need
+    /// the general DOM validation path.
+    pub(crate) fn certify_or_normalize_v2_plugin_row(
+        &self,
+        bytes: &[u8],
+        key: &WasmEntityKey,
+    ) -> Result<Option<CertifiedV2PluginRow>, LixError> {
+        if !self.accepts_v2_canonical_certificate() {
+            return Ok(None);
+        }
+        let validation = self
+            .fast_object_validation
+            .as_ref()
+            .expect("certificate eligibility requires fast object validation");
+        let primary_key_paths = self
+            .primary_key
+            .as_deref()
+            .expect("certificate eligibility requires a primary key");
+        let component_types = self
+            .primary_key_component_types
+            .as_deref()
+            .expect("certificate eligibility requires typed primary-key components");
+        if key.entity_pk.len() != primary_key_paths.len() {
+            return Ok(None);
+        }
+        if key.schema_key != self.key.schema_key {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "plugin snapshot schema '{}' does not match schema plan '{}'",
+                    key.schema_key, self.key.schema_key
+                ),
+            ));
+        }
+
+        let mut parser = CanonicalPluginRowParser::new(bytes)?;
+        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &key.entity_pk);
+        let normalized = match parser.parse_root_object(validation, &mut primary_key) {
+            Ok(normalized) => normalized,
+            Err(CanonicalPluginRowError::InvalidPlugin(message)) => {
+                return Err(LixError::new(LixError::CODE_INVALID_PLUGIN, message));
+            }
+            Err(CanonicalPluginRowError::Schema(message)) => {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "snapshot_content validation failed for schema '{}': {message}",
+                        self.key.schema_key
+                    ),
+                ));
+            }
+        };
+
+        EntityPk::from_shared_external_parts(key.entity_pk.iter().cloned(), component_types)
+            .map(|entity_pk| {
+                Some(CertifiedV2PluginRow {
+                    entity_pk,
+                    normalized,
+                })
+            })
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "plugin entity_pk is invalid for schema '{}': {error}",
+                        self.key.schema_key
+                    ),
+                )
+            })
+    }
+
+    pub(crate) fn accepts_v2_canonical_certificate(&self) -> bool {
+        self.fast_object_validation
+            .as_ref()
+            .is_some_and(FastObjectValidationPlan::supports_canonical_streaming)
+            && self
+                .primary_key
+                .as_ref()
+                .is_some_and(|paths| paths.len() <= 128 && paths.iter().all(|path| path.len() == 1))
+            && self.primary_key_component_types.is_some()
+            && self.uniques.is_empty()
+            && self.foreign_keys.is_empty()
+            && self.state_foreign_keys.is_empty()
     }
 
     fn compile(
@@ -410,6 +523,15 @@ impl SchemaPlan {
         key_index: &BTreeMap<SchemaCatalogKey, SchemaPlanId>,
         schema_index: &BTreeMap<SchemaCatalogKey, &JsonValue>,
     ) -> Result<Self, LixError> {
+        let canonical_schema = canonical_json_text(&schema).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_DEFINITION,
+                format!("failed to fingerprint compiled schema plan: {error}"),
+            )
+        })?;
+        let fingerprint = Arc::new(SchemaPlanFingerprint(
+            *blake3::hash(canonical_schema.as_bytes()).as_bytes(),
+        ));
         let compiled_schema = compile_lix_schema(&schema)?;
         let fast_object_validation = FastObjectValidationPlan::compile(&schema);
         let defaults = DefaultPlan::from_schema(&schema);
@@ -430,6 +552,7 @@ impl SchemaPlan {
         Ok(Self {
             key,
             schema: Arc::new(schema),
+            fingerprint,
             compiled_schema,
             fast_object_validation,
             defaults,
@@ -485,9 +608,10 @@ fn primary_key_component_types(
 
 #[derive(Debug)]
 struct FastObjectValidationPlan {
-    properties: BTreeMap<String, FastJsonTypes>,
+    properties: BTreeMap<String, FastValueValidation>,
     required: Vec<String>,
     additional_properties: bool,
+    min_properties: usize,
 }
 
 impl FastObjectValidationPlan {
@@ -499,10 +623,14 @@ impl FastObjectValidationPlan {
         if schema.keys().any(|key| !fast_object_root_keyword(key)) {
             return None;
         }
+        Self::compile_object(schema)
+    }
+
+    fn compile_object(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
         let mut properties = BTreeMap::new();
         if let Some(property_schemas) = schema.get("properties") {
             for (name, schema) in property_schemas.as_object()? {
-                properties.insert(name.clone(), FastJsonTypes::compile_property(schema)?);
+                properties.insert(name.clone(), FastValueValidation::compile_property(schema)?);
             }
         }
         let required = if let Some(required) = schema.get("required") {
@@ -519,10 +647,15 @@ impl FastObjectValidationPlan {
         } else {
             true
         };
+        let min_properties = match schema.get("minProperties") {
+            Some(value) => usize::try_from(value.as_u64()?).ok()?,
+            None => 0,
+        };
         Some(Self {
             properties,
             required,
             additional_properties,
+            min_properties,
         })
     }
 
@@ -530,6 +663,9 @@ impl FastObjectValidationPlan {
         let Some(value) = value.as_object() else {
             return false;
         };
+        if value.len() < self.min_properties {
+            return false;
+        }
         if self
             .required
             .iter()
@@ -543,6 +679,14 @@ impl FastObjectValidationPlan {
                 .map_or(self.additional_properties, |types| types.accepts(value))
         })
     }
+
+    fn supports_canonical_streaming(&self) -> bool {
+        self.required.len() <= 128
+            && self
+                .properties
+                .values()
+                .all(FastValueValidation::supports_canonical_streaming)
+    }
 }
 
 fn fast_object_root_keyword(key: &str) -> bool {
@@ -552,10 +696,397 @@ fn fast_object_root_keyword(key: &str) -> bool {
             | "properties"
             | "required"
             | "additionalProperties"
+            | "minProperties"
             | "description"
             | "examples"
             | "$schema"
     ) || key.starts_with("x-lix-")
+}
+
+#[derive(Debug)]
+enum FastValueValidation {
+    Types(FastJsonTypes),
+    String(FastStringValidation),
+    Array(FastArrayValidation),
+    Object(FastObjectValidationPlan),
+    StringOrNull(FastStringValidation),
+}
+
+impl FastValueValidation {
+    fn compile_property(schema: &JsonValue) -> Option<Self> {
+        let schema = schema.as_object()?;
+        if schema.keys().any(|key| !fast_property_keyword(key)) {
+            return None;
+        }
+
+        match (schema.get("type"), schema.get("anyOf")) {
+            (None, Some(options)) => Self::compile_any_of(schema, options),
+            (None, None) => {
+                if schema.keys().all(|key| fast_property_annotation(key)) {
+                    Some(Self::Types(FastJsonTypes::ANY))
+                } else {
+                    None
+                }
+            }
+            (Some(_), Some(_)) => None,
+            (Some(types), None) => {
+                let types = FastJsonTypes::compile_types(types)?;
+                if schema
+                    .keys()
+                    .all(|key| key == "type" || fast_property_annotation(key))
+                {
+                    return Some(Self::Types(types));
+                }
+                match types.0 {
+                    FastJsonTypes::STRING if schema.keys().all(|key| fast_string_keyword(key)) => {
+                        FastStringValidation::compile(schema).map(Self::String)
+                    }
+                    FastJsonTypes::ARRAY if schema.keys().all(|key| fast_array_keyword(key)) => {
+                        FastArrayValidation::compile(schema).map(Self::Array)
+                    }
+                    FastJsonTypes::OBJECT
+                        if schema.keys().all(|key| fast_nested_object_keyword(key)) =>
+                    {
+                        FastObjectValidationPlan::compile_object(schema).map(Self::Object)
+                    }
+                    _ => None,
+                }
+            }
+        }
+    }
+
+    fn compile_any_of(schema: &JsonMap<String, JsonValue>, options: &JsonValue) -> Option<Self> {
+        if !schema
+            .keys()
+            .all(|key| key == "anyOf" || fast_property_annotation(key))
+        {
+            return None;
+        }
+        let options = options.as_array()?;
+        if options.is_empty() {
+            return None;
+        }
+
+        let mut simple_types = 0u16;
+        let mut constrained_string = None;
+        for option in options {
+            match Self::compile_property(option)? {
+                Self::Types(types) => simple_types |= types.0,
+                Self::String(validation) if constrained_string.is_none() => {
+                    constrained_string = Some(validation);
+                }
+                _ => return None,
+            }
+        }
+        match constrained_string {
+            None => Some(Self::Types(FastJsonTypes(simple_types))),
+            Some(validation) if simple_types == FastJsonTypes::NULL => {
+                Some(Self::StringOrNull(validation))
+            }
+            Some(_) => None,
+        }
+    }
+
+    fn accepts(&self, value: &JsonValue) -> bool {
+        match self {
+            Self::Types(types) => types.accepts(value),
+            Self::String(validation) => value
+                .as_str()
+                .is_some_and(|value| validation.accepts(value)),
+            Self::Array(validation) => value
+                .as_array()
+                .is_some_and(|value| validation.accepts(value)),
+            Self::Object(validation) => validation.accepts(value),
+            Self::StringOrNull(validation) => {
+                value.is_null()
+                    || value
+                        .as_str()
+                        .is_some_and(|value| validation.accepts(value))
+            }
+        }
+    }
+
+    fn supports_canonical_streaming(&self) -> bool {
+        match self {
+            Self::Types(_) | Self::String(_) | Self::StringOrNull(_) => true,
+            Self::Array(validation) => validation
+                .items
+                .as_deref()
+                .is_none_or(Self::supports_canonical_streaming),
+            Self::Object(validation) => validation.supports_canonical_streaming(),
+        }
+    }
+}
+
+fn fast_property_keyword(key: &str) -> bool {
+    key == "type"
+        || key == "anyOf"
+        || fast_property_annotation(key)
+        || matches!(
+            key,
+            "minLength"
+                | "const"
+                | "enum"
+                | "pattern"
+                | "minItems"
+                | "items"
+                | "properties"
+                | "required"
+                | "additionalProperties"
+                | "minProperties"
+                | "format"
+        )
+}
+
+fn fast_property_annotation(key: &str) -> bool {
+    matches!(
+        key,
+        "description" | "examples" | "default" | "x-lix-default"
+    )
+}
+
+fn fast_string_keyword(key: &str) -> bool {
+    key == "type"
+        || fast_property_annotation(key)
+        || matches!(key, "minLength" | "const" | "enum" | "pattern" | "format")
+}
+
+fn fast_array_keyword(key: &str) -> bool {
+    key == "type" || fast_property_annotation(key) || matches!(key, "minItems" | "items")
+}
+
+fn fast_nested_object_keyword(key: &str) -> bool {
+    key == "type"
+        || fast_property_annotation(key)
+        || matches!(
+            key,
+            "properties" | "required" | "additionalProperties" | "minProperties"
+        )
+}
+
+#[derive(Debug)]
+struct FastStringValidation {
+    min_length: usize,
+    constant: Option<String>,
+    enum_values: Option<Vec<String>>,
+    pattern: Option<FastAsciiPattern>,
+    uuid: bool,
+}
+
+impl FastStringValidation {
+    fn compile(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
+        let min_length = match schema.get("minLength") {
+            Some(value) => usize::try_from(value.as_u64()?).ok()?,
+            None => 0,
+        };
+        let constant = match schema.get("const") {
+            Some(value) => Some(value.as_str()?.to_string()),
+            None => None,
+        };
+        let enum_values = match schema.get("enum") {
+            Some(values) => Some(
+                values
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_str().map(str::to_string))
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            None => None,
+        };
+        let pattern = match schema.get("pattern") {
+            Some(value) => Some(FastAsciiPattern::compile(value.as_str()?)?),
+            None => None,
+        };
+        let uuid = match schema.get("format") {
+            Some(value) if value.as_str()? == "uuid" => true,
+            Some(_) => return None,
+            None => false,
+        };
+        Some(Self {
+            min_length,
+            constant,
+            enum_values,
+            pattern,
+            uuid,
+        })
+    }
+
+    fn accepts(&self, value: &str) -> bool {
+        if self.min_length != 0 && value.chars().take(self.min_length).count() < self.min_length {
+            return false;
+        }
+        if self.uuid && uuid::Uuid::parse_str(value).is_err() {
+            return false;
+        }
+        if self
+            .constant
+            .as_deref()
+            .is_some_and(|constant| value != constant)
+        {
+            return false;
+        }
+        if self
+            .enum_values
+            .as_ref()
+            .is_some_and(|values| !values.iter().any(|candidate| candidate == value))
+        {
+            return false;
+        }
+        self.pattern.is_none_or(|pattern| pattern.accepts(value))
+    }
+
+    fn accepts_canonical(&self, value: CanonicalJsonString<'_>) -> bool {
+        if self.min_length != 0 && value.chars().take(self.min_length).count() < self.min_length {
+            return false;
+        }
+        if self.uuid && uuid::Uuid::parse_str(value.encoded).is_err() {
+            return false;
+        }
+        if self
+            .constant
+            .as_deref()
+            .is_some_and(|constant| !value.eq_str(constant))
+        {
+            return false;
+        }
+        if self
+            .enum_values
+            .as_ref()
+            .is_some_and(|values| !values.iter().any(|candidate| value.eq_str(candidate)))
+        {
+            return false;
+        }
+        self.pattern
+            .is_none_or(|pattern| pattern.accepts_canonical(value))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FastAsciiPattern {
+    FractionalOrderKey,
+    JsonWhitespace,
+    NonEmptyBase64Url,
+    SafeAsciiDelimiter,
+    PrintableNonSpaceAscii,
+}
+
+impl FastAsciiPattern {
+    fn compile(pattern: &str) -> Option<Self> {
+        Some(match pattern {
+            r"^(?:[0-9a-f]{2})*(?:0[1-9a-f]|[1-9a-f][0-9a-f])$" => Self::FractionalOrderKey,
+            r"^[\t\n\r ]*$" => Self::JsonWhitespace,
+            r"^[A-Za-z0-9_-]+$" => Self::NonEmptyBase64Url,
+            r"^(?:\t|[ -~])$" => Self::SafeAsciiDelimiter,
+            r"^[!-~]$" => Self::PrintableNonSpaceAscii,
+            _ => return None,
+        })
+    }
+
+    fn accepts(self, value: &str) -> bool {
+        let bytes = value.as_bytes();
+        match self {
+            Self::FractionalOrderKey => {
+                bytes.len() >= 2
+                    && bytes.len().is_multiple_of(2)
+                    && bytes.iter().all(u8::is_ascii_hexdigit)
+                    && bytes.iter().all(|byte| !byte.is_ascii_uppercase())
+                    && bytes[bytes.len() - 2..] != *b"00"
+            }
+            Self::JsonWhitespace => bytes
+                .iter()
+                .all(|byte| matches!(byte, b'\t' | b'\n' | b'\r' | b' ')),
+            Self::NonEmptyBase64Url => {
+                !bytes.is_empty()
+                    && bytes
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            }
+            Self::SafeAsciiDelimiter => {
+                matches!(bytes, [b'\t'] | [b' '..=b'~'])
+            }
+            Self::PrintableNonSpaceAscii => matches!(bytes, [b'!'..=b'~']),
+        }
+    }
+
+    fn accepts_canonical(self, value: CanonicalJsonString<'_>) -> bool {
+        match self {
+            Self::FractionalOrderKey => {
+                let mut length = 0_usize;
+                let mut penultimate = None;
+                let mut last = None;
+                for scalar in value.chars() {
+                    if !matches!(scalar, '0'..='9' | 'a'..='f') {
+                        return false;
+                    }
+                    length += 1;
+                    penultimate = last;
+                    last = Some(scalar);
+                }
+                length >= 2
+                    && length.is_multiple_of(2)
+                    && !matches!((penultimate, last), (Some('0'), Some('0')))
+            }
+            Self::JsonWhitespace => value
+                .chars()
+                .all(|scalar| matches!(scalar, '\t' | '\n' | '\r' | ' ')),
+            Self::NonEmptyBase64Url => {
+                let mut empty = true;
+                for scalar in value.chars() {
+                    empty = false;
+                    if !scalar.is_ascii_alphanumeric() && !matches!(scalar, '_' | '-') {
+                        return false;
+                    }
+                }
+                !empty
+            }
+            Self::SafeAsciiDelimiter => {
+                let mut chars = value.chars();
+                matches!(chars.next(), Some('\t' | ' '..='~')) && chars.next().is_none()
+            }
+            Self::PrintableNonSpaceAscii => {
+                let mut chars = value.chars();
+                matches!(chars.next(), Some('!'..='~')) && chars.next().is_none()
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FastArrayValidation {
+    min_items: usize,
+    items: Option<Box<FastValueValidation>>,
+}
+
+impl FastArrayValidation {
+    fn compile(schema: &JsonMap<String, JsonValue>) -> Option<Self> {
+        let min_items = match schema.get("minItems") {
+            Some(value) => usize::try_from(value.as_u64()?).ok()?,
+            None => 0,
+        };
+        let items = match schema.get("items") {
+            Some(schema) => {
+                let validation = FastValueValidation::compile_property(schema)?;
+                let string_items = matches!(
+                    &validation,
+                    FastValueValidation::Types(types) if types.0 == FastJsonTypes::STRING
+                ) || matches!(&validation, FastValueValidation::String(_));
+                if !string_items {
+                    return None;
+                }
+                Some(Box::new(validation))
+            }
+            None => None,
+        };
+        Some(Self { min_items, items })
+    }
+
+    fn accepts(&self, value: &[JsonValue]) -> bool {
+        value.len() >= self.min_items
+            && self
+                .items
+                .as_ref()
+                .is_none_or(|items| value.iter().all(|value| items.accepts(value)))
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -578,30 +1109,6 @@ impl FastJsonTypes {
             | Self::ARRAY
             | Self::OBJECT,
     );
-
-    fn compile_property(schema: &JsonValue) -> Option<Self> {
-        let schema = schema.as_object()?;
-        if schema.keys().any(|key| {
-            !matches!(
-                key.as_str(),
-                "type" | "anyOf" | "description" | "examples" | "default" | "x-lix-default"
-            )
-        }) {
-            return None;
-        }
-        match (schema.get("type"), schema.get("anyOf")) {
-            (Some(types), None) => Self::compile_types(types),
-            (None, Some(options)) => {
-                let mut mask = 0;
-                for option in options.as_array()? {
-                    mask |= Self::compile_property(option)?.0;
-                }
-                Some(Self(mask))
-            }
-            (None, None) => Some(Self::ANY),
-            (Some(_), Some(_)) => None,
-        }
-    }
 
     fn compile_types(types: &JsonValue) -> Option<Self> {
         let mut mask = 0;
@@ -642,6 +1149,972 @@ impl FastJsonTypes {
         };
         self.0 & bit != 0
     }
+
+    fn accepts_canonical_kind(self, kind: CanonicalJsonKind) -> bool {
+        let bit = match kind {
+            CanonicalJsonKind::Null => Self::NULL,
+            CanonicalJsonKind::Boolean => Self::BOOLEAN,
+            CanonicalJsonKind::String => Self::STRING,
+            CanonicalJsonKind::Array => Self::ARRAY,
+            CanonicalJsonKind::Object => Self::OBJECT,
+        };
+        self.0 & bit != 0
+    }
+}
+
+#[derive(Debug)]
+enum CanonicalPluginRowError {
+    InvalidPlugin(String),
+    Schema(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CanonicalJsonKind {
+    Null,
+    Boolean,
+    String,
+    Array,
+    Object,
+}
+
+/// A decoded view over one string token in the engine's exact canonical JSON
+/// spelling. Iteration decodes the only escapes the canonical encoder emits
+/// (`\"`, `\\`, the five short control escapes, and lowercase `\u00xx`
+/// for remaining control scalars) without allocating.
+#[derive(Clone, Copy, Debug)]
+struct CanonicalJsonString<'a> {
+    encoded: &'a str,
+}
+
+impl<'a> CanonicalJsonString<'a> {
+    fn chars(self) -> CanonicalJsonStringChars<'a> {
+        CanonicalJsonStringChars {
+            encoded: self.encoded,
+            offset: 0,
+        }
+    }
+
+    fn eq_str(self, expected: &str) -> bool {
+        self.chars().eq(expected.chars())
+    }
+
+    fn cmp(self, other: Self) -> Ordering {
+        self.chars().cmp(other.chars())
+    }
+}
+
+struct CanonicalJsonStringChars<'a> {
+    encoded: &'a str,
+    offset: usize,
+}
+
+impl Iterator for CanonicalJsonStringChars<'_> {
+    type Item = char;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let remaining = self.encoded.get(self.offset..)?;
+        let first = *remaining.as_bytes().first()?;
+        if first != b'\\' {
+            let scalar = remaining.chars().next()?;
+            self.offset += scalar.len_utf8();
+            return Some(scalar);
+        }
+        let escaped = remaining.as_bytes()[1];
+        match escaped {
+            b'"' => {
+                self.offset += 2;
+                Some('"')
+            }
+            b'\\' => {
+                self.offset += 2;
+                Some('\\')
+            }
+            b'b' => {
+                self.offset += 2;
+                Some('\u{08}')
+            }
+            b't' => {
+                self.offset += 2;
+                Some('\t')
+            }
+            b'n' => {
+                self.offset += 2;
+                Some('\n')
+            }
+            b'f' => {
+                self.offset += 2;
+                Some('\u{0c}')
+            }
+            b'r' => {
+                self.offset += 2;
+                Some('\r')
+            }
+            b'u' => {
+                let high = canonical_hex_value(remaining.as_bytes()[4]);
+                let low = canonical_hex_value(remaining.as_bytes()[5]);
+                self.offset += 6;
+                char::from_u32(u32::from((high << 4) | low))
+            }
+            _ => unreachable!("canonical string parser admitted an unsupported escape"),
+        }
+    }
+}
+
+fn canonical_hex_value(value: u8) -> u8 {
+    match value {
+        b'0'..=b'9' => value - b'0',
+        b'a'..=b'f' => value - b'a' + 10,
+        _ => unreachable!("canonical string parser admitted a non-lowercase hexadecimal digit"),
+    }
+}
+
+enum ParsedJsonString<'a> {
+    Canonical(CanonicalJsonString<'a>),
+    Decoded(String),
+}
+
+impl ParsedJsonString<'_> {
+    fn is_canonical(&self) -> bool {
+        matches!(self, Self::Canonical(_))
+    }
+
+    fn eq_str(&self, expected: &str) -> bool {
+        match self {
+            Self::Canonical(value) => value.eq_str(expected),
+            Self::Decoded(value) => value == expected,
+        }
+    }
+
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self, other) {
+            (Self::Canonical(left), Self::Canonical(right)) => left.cmp(*right),
+            (Self::Canonical(left), Self::Decoded(right)) => left.chars().cmp(right.chars()),
+            (Self::Decoded(left), Self::Canonical(right)) => left.chars().cmp(right.chars()),
+            (Self::Decoded(left), Self::Decoded(right)) => left.cmp(right),
+        }
+    }
+
+    fn write_canonical(&self, output: &mut Vec<u8>) {
+        output.push(b'"');
+        match self {
+            Self::Canonical(value) => output.extend_from_slice(value.encoded.as_bytes()),
+            Self::Decoded(value) => write_canonical_json_string_contents(value, output),
+        }
+        output.push(b'"');
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ParsedJsonValue(usize);
+
+enum ParsedJsonNode<'a> {
+    Exact {
+        encoded: &'a str,
+        kind: CanonicalJsonKind,
+    },
+    String(ParsedJsonString<'a>),
+    Array {
+        first: Option<usize>,
+    },
+    Object {
+        first: Option<usize>,
+    },
+}
+
+struct ParsedJsonProperty<'a> {
+    key: ParsedJsonString<'a>,
+    value: ParsedJsonValue,
+    next: Option<usize>,
+}
+
+struct ParsedJsonElement {
+    value: ParsedJsonValue,
+    next: Option<usize>,
+}
+
+fn write_canonical_json_string_contents(value: &str, output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for scalar in value.chars() {
+        match scalar {
+            '"' => output.extend_from_slice(br#"\""#),
+            '\\' => output.extend_from_slice(br#"\\"#),
+            '\u{08}' => output.extend_from_slice(br"\b"),
+            '\t' => output.extend_from_slice(br"\t"),
+            '\n' => output.extend_from_slice(br"\n"),
+            '\u{0c}' => output.extend_from_slice(br"\f"),
+            '\r' => output.extend_from_slice(br"\r"),
+            '\u{00}'..='\u{07}' | '\u{0b}' | '\u{0e}'..='\u{1f}' => {
+                let byte = scalar as u8;
+                output.extend_from_slice(br"\u00");
+                output.push(HEX[usize::from(byte >> 4)]);
+                output.push(HEX[usize::from(byte & 0x0f)]);
+            }
+            _ => {
+                let mut encoded = [0_u8; 4];
+                output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+            }
+        }
+    }
+}
+
+struct CanonicalPrimaryKeyMatcher<'a> {
+    paths: &'a [Vec<String>],
+    emitted: &'a [crate::common::SharedStr],
+    seen: u128,
+}
+
+impl<'a> CanonicalPrimaryKeyMatcher<'a> {
+    fn new(paths: &'a [Vec<String>], emitted: &'a [crate::common::SharedStr]) -> Self {
+        Self {
+            paths,
+            emitted,
+            seen: 0,
+        }
+    }
+
+    fn component_for_key(&self, key: &ParsedJsonString<'_>) -> Option<usize> {
+        self.paths.iter().position(|path| key.eq_str(&path[0]))
+    }
+
+    fn observe(&mut self, index: usize, actual: Option<&ParsedJsonString<'_>>) -> Option<String> {
+        self.seen |= 1_u128 << index;
+        let Some(actual) = actual else {
+            return Some(format!(
+                "primary-key property '{}' must be a string in production v2 snapshots",
+                self.paths[index][0]
+            ));
+        };
+        if actual.eq_str(self.emitted[index].as_str()) {
+            None
+        } else {
+            Some(format!(
+                "snapshot primary-key property '{}' does not match the emitted entity_pk",
+                self.paths[index][0]
+            ))
+        }
+    }
+
+    fn finish(&self) -> Option<String> {
+        let expected = if self.paths.len() == 128 {
+            u128::MAX
+        } else {
+            (1_u128 << self.paths.len()) - 1
+        };
+        if self.seen == expected {
+            None
+        } else {
+            Some("snapshot is missing one or more primary-key properties".to_owned())
+        }
+    }
+}
+
+/// One-pass parser for canonical and compatibility-spelled, number-free v2
+/// snapshots.
+///
+/// Exact values collapse to borrowed source slices. A noncanonical container
+/// keeps only typed child fragments, using inline storage for the common row
+/// shapes. At the root those fragments are emitted once into a single
+/// canonical buffer. No `serde_json::Value` is constructed.
+struct CanonicalPluginRowParser<'a> {
+    input: &'a str,
+    offset: usize,
+    semantic_error: Option<String>,
+    nodes: SmallVec<[ParsedJsonNode<'a>; 64]>,
+    properties: SmallVec<[ParsedJsonProperty<'a>; 16]>,
+    elements: SmallVec<[ParsedJsonElement; 64]>,
+}
+
+impl<'a> CanonicalPluginRowParser<'a> {
+    const MAX_DEPTH: usize = 128;
+
+    fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
+        let input = std::str::from_utf8(bytes).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!("v2 snapshot must be UTF-8 JSON: {error}"),
+            )
+        })?;
+        Ok(Self {
+            input,
+            offset: 0,
+            semantic_error: None,
+            nodes: SmallVec::new(),
+            properties: SmallVec::new(),
+            elements: SmallVec::new(),
+        })
+    }
+
+    fn parse_root_object(
+        &mut self,
+        validation: &FastObjectValidationPlan,
+        primary_key: &mut CanonicalPrimaryKeyMatcher<'_>,
+    ) -> Result<Option<Vec<u8>>, CanonicalPluginRowError> {
+        let leading_whitespace = self.skip_whitespace();
+        if self.peek() != Some(b'{') {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 entity snapshots must be JSON objects".to_owned(),
+            ));
+        }
+        let value = self.parse_object(Some(validation), Some(primary_key), 0)?;
+        let trailing_whitespace = self.skip_whitespace();
+        if self.offset != self.input.len() {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains trailing or invalid JSON input".to_owned(),
+            ));
+        }
+        if let Some(message) = primary_key.finish() {
+            self.record_schema(message);
+        }
+        if let Some(message) = self.semantic_error.take() {
+            return Err(CanonicalPluginRowError::Schema(message));
+        }
+        if self.value_is_canonical(value) && !leading_whitespace && !trailing_whitespace {
+            return Ok(None);
+        }
+        let mut normalized = Vec::with_capacity(self.input.len());
+        self.write_value(value, &mut normalized);
+        Ok(Some(normalized))
+    }
+
+    fn parse_value(
+        &mut self,
+        validation: Option<&FastValueValidation>,
+        depth: usize,
+    ) -> Result<ParsedJsonValue, CanonicalPluginRowError> {
+        if depth > Self::MAX_DEPTH {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot JSON nesting exceeds the host limit".to_owned(),
+            ));
+        }
+        let start = self.offset;
+        let value = match self.peek() {
+            Some(b'"') => {
+                let string = self.parse_string()?;
+                self.push_node(ParsedJsonNode::String(string))
+            }
+            Some(b'{') => {
+                let object_validation = match validation {
+                    Some(FastValueValidation::Object(validation)) => Some(validation),
+                    _ => None,
+                };
+                self.parse_object(object_validation, None, depth)?
+            }
+            Some(b'[') => {
+                let array_validation = match validation {
+                    Some(FastValueValidation::Array(validation)) => Some(validation),
+                    _ => None,
+                };
+                self.parse_array(array_validation, depth)?
+            }
+            Some(b'n') => {
+                self.parse_literal(b"null")?;
+                self.push_node(ParsedJsonNode::Exact {
+                    encoded: &self.input[start..self.offset],
+                    kind: CanonicalJsonKind::Null,
+                })
+            }
+            Some(b't') => {
+                self.parse_literal(b"true")?;
+                self.push_node(ParsedJsonNode::Exact {
+                    encoded: &self.input[start..self.offset],
+                    kind: CanonicalJsonKind::Boolean,
+                })
+            }
+            Some(b'f') => {
+                self.parse_literal(b"false")?;
+                self.push_node(ParsedJsonNode::Exact {
+                    encoded: &self.input[start..self.offset],
+                    kind: CanonicalJsonKind::Boolean,
+                })
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "JSON numbers are not enabled for production v2".to_owned(),
+                ));
+            }
+            Some(_) => {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot contains malformed JSON".to_owned(),
+                ));
+            }
+            None => {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot ended before a JSON value".to_owned(),
+                ));
+            }
+        };
+        self.validate_value(validation, value);
+        Ok(value)
+    }
+
+    fn parse_object(
+        &mut self,
+        validation: Option<&FastObjectValidationPlan>,
+        mut primary_key: Option<&mut CanonicalPrimaryKeyMatcher<'_>>,
+        depth: usize,
+    ) -> Result<ParsedJsonValue, CanonicalPluginRowError> {
+        let start = self.offset;
+        self.expect_byte(b'{')?;
+        let mut canonical = !self.skip_whitespace();
+        let mut first_property = None;
+        let mut last_property = None::<usize>;
+        let mut required_seen = 0_u128;
+        let mut property_count = 0_usize;
+        if self.consume_byte(b'}') {
+            self.validate_object_end(validation, required_seen, property_count);
+            return Ok(if canonical {
+                self.push_node(ParsedJsonNode::Exact {
+                    encoded: &self.input[start..self.offset],
+                    kind: CanonicalJsonKind::Object,
+                })
+            } else {
+                self.push_node(ParsedJsonNode::Object { first: None })
+            });
+        }
+
+        loop {
+            if self.peek() != Some(b'"') {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot object keys must be JSON strings".to_owned(),
+                ));
+            }
+            let key = self.parse_string()?;
+            canonical &= key.is_canonical();
+            if let Some(previous) = last_property {
+                match self.properties[previous].key.cmp(&key) {
+                    Ordering::Less => {}
+                    Ordering::Equal => {
+                        return Err(CanonicalPluginRowError::InvalidPlugin(
+                            "v2 snapshot contains a duplicate decoded JSON object key".to_owned(),
+                        ));
+                    }
+                    Ordering::Greater => canonical = false,
+                }
+            }
+            property_count += 1;
+
+            let property_validation = validation.and_then(|plan| {
+                plan.properties
+                    .iter()
+                    .find_map(|(name, validation)| key.eq_str(name).then_some(validation))
+            });
+            if let Some(plan) = validation {
+                if let Some(index) = plan
+                    .required
+                    .iter()
+                    .position(|required| key.eq_str(required))
+                {
+                    required_seen |= 1_u128 << index;
+                }
+                if property_validation.is_none() && !plan.additional_properties {
+                    self.record_schema("snapshot contains an undeclared property".to_owned());
+                }
+            }
+
+            canonical &= !self.skip_whitespace();
+            if self.peek() != Some(b':') {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot object key is not followed by ':'".to_owned(),
+                ));
+            }
+            self.offset += 1;
+            canonical &= !self.skip_whitespace();
+            let primary_component = primary_key
+                .as_deref()
+                .and_then(|matcher| matcher.component_for_key(&key));
+            let value = self.parse_value(property_validation, depth + 1)?;
+            canonical &= self.value_is_canonical(value);
+            if let (Some(index), Some(matcher)) = (primary_component, primary_key.as_deref_mut()) {
+                if let Some(message) = matcher.observe(index, self.value_string(value)) {
+                    self.record_schema(message);
+                }
+            }
+            let property = self.properties.len();
+            self.properties.push(ParsedJsonProperty {
+                key,
+                value,
+                next: None,
+            });
+            if let Some(previous) = last_property {
+                self.properties[previous].next = Some(property);
+            } else {
+                first_property = Some(property);
+            }
+            last_property = Some(property);
+
+            canonical &= !self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => {
+                    self.offset += 1;
+                    canonical &= !self.skip_whitespace();
+                }
+                Some(b'}') => {
+                    self.offset += 1;
+                    break;
+                }
+                _ => {
+                    return Err(CanonicalPluginRowError::InvalidPlugin(
+                        "v2 snapshot object contains malformed JSON".to_owned(),
+                    ));
+                }
+            }
+        }
+        self.validate_object_end(validation, required_seen, property_count);
+        if canonical {
+            return Ok(self.push_node(ParsedJsonNode::Exact {
+                encoded: &self.input[start..self.offset],
+                kind: CanonicalJsonKind::Object,
+            }));
+        }
+        let first = self.sort_object_properties(first_property)?;
+        Ok(self.push_node(ParsedJsonNode::Object { first }))
+    }
+
+    fn validate_object_end(
+        &mut self,
+        validation: Option<&FastObjectValidationPlan>,
+        required_seen: u128,
+        property_count: usize,
+    ) {
+        let Some(validation) = validation else {
+            return;
+        };
+        let expected_required = if validation.required.len() == 128 {
+            u128::MAX
+        } else {
+            (1_u128 << validation.required.len()) - 1
+        };
+        if required_seen != expected_required {
+            self.record_schema("snapshot is missing one or more required properties".to_owned());
+        }
+        if property_count < validation.min_properties {
+            self.record_schema(format!(
+                "snapshot object has fewer than {} properties",
+                validation.min_properties
+            ));
+        }
+    }
+
+    fn parse_array(
+        &mut self,
+        validation: Option<&FastArrayValidation>,
+        depth: usize,
+    ) -> Result<ParsedJsonValue, CanonicalPluginRowError> {
+        let start = self.offset;
+        self.expect_byte(b'[')?;
+        let mut canonical = !self.skip_whitespace();
+        let mut first_element = None;
+        let mut last_element = None::<usize>;
+        let mut item_count = 0_usize;
+        if self.consume_byte(b']') {
+            if validation.is_some_and(|validation| validation.min_items > 0) {
+                self.record_schema("snapshot array has too few items".to_owned());
+            }
+            return Ok(if canonical {
+                self.push_node(ParsedJsonNode::Exact {
+                    encoded: &self.input[start..self.offset],
+                    kind: CanonicalJsonKind::Array,
+                })
+            } else {
+                self.push_node(ParsedJsonNode::Array { first: None })
+            });
+        }
+        loop {
+            let value =
+                self.parse_value(validation.and_then(|plan| plan.items.as_deref()), depth + 1)?;
+            canonical &= self.value_is_canonical(value);
+            let element = self.elements.len();
+            self.elements.push(ParsedJsonElement { value, next: None });
+            if let Some(previous) = last_element {
+                self.elements[previous].next = Some(element);
+            } else {
+                first_element = Some(element);
+            }
+            last_element = Some(element);
+            item_count += 1;
+            canonical &= !self.skip_whitespace();
+            match self.peek() {
+                Some(b',') => {
+                    self.offset += 1;
+                    canonical &= !self.skip_whitespace();
+                }
+                Some(b']') => {
+                    self.offset += 1;
+                    break;
+                }
+                _ => {
+                    return Err(CanonicalPluginRowError::InvalidPlugin(
+                        "v2 snapshot array contains malformed JSON".to_owned(),
+                    ));
+                }
+            }
+        }
+        if validation.is_some_and(|validation| item_count < validation.min_items) {
+            self.record_schema("snapshot array has too few items".to_owned());
+        }
+        if canonical {
+            Ok(self.push_node(ParsedJsonNode::Exact {
+                encoded: &self.input[start..self.offset],
+                kind: CanonicalJsonKind::Array,
+            }))
+        } else {
+            Ok(self.push_node(ParsedJsonNode::Array {
+                first: first_element,
+            }))
+        }
+    }
+
+    fn parse_string(&mut self) -> Result<ParsedJsonString<'a>, CanonicalPluginRowError> {
+        self.expect_byte(b'"')?;
+        let start = self.offset;
+        let mut decoded = None::<String>;
+        while let Some(byte) = self.peek() {
+            match byte {
+                b'"' => {
+                    let end = self.offset;
+                    self.offset += 1;
+                    return Ok(match decoded {
+                        Some(decoded) => ParsedJsonString::Decoded(decoded),
+                        None => ParsedJsonString::Canonical(CanonicalJsonString {
+                            encoded: &self.input[start..end],
+                        }),
+                    });
+                }
+                b'\\' => {
+                    let (scalar, consumed, canonical_escape) =
+                        self.parse_string_escape(self.offset)?;
+                    if !canonical_escape && decoded.is_none() {
+                        decoded = Some(
+                            CanonicalJsonString {
+                                encoded: &self.input[start..self.offset],
+                            }
+                            .chars()
+                            .collect(),
+                        );
+                    }
+                    if let Some(decoded) = decoded.as_mut() {
+                        decoded.push(scalar);
+                    }
+                    self.offset += consumed;
+                }
+                0x00..=0x1f => {
+                    return Err(CanonicalPluginRowError::InvalidPlugin(
+                        "v2 snapshot string contains an unescaped control byte".to_owned(),
+                    ));
+                }
+                byte if byte.is_ascii() => {
+                    if let Some(decoded) = decoded.as_mut() {
+                        decoded.push(char::from(byte));
+                    }
+                    self.offset += 1;
+                }
+                _ => {
+                    let remaining = &self.input[self.offset..];
+                    let scalar = remaining
+                        .chars()
+                        .next()
+                        .expect("input was validated as UTF-8");
+                    if let Some(decoded) = decoded.as_mut() {
+                        decoded.push(scalar);
+                    }
+                    self.offset += scalar.len_utf8();
+                }
+            }
+        }
+        Err(CanonicalPluginRowError::InvalidPlugin(
+            "v2 snapshot contains an unterminated JSON string".to_owned(),
+        ))
+    }
+
+    fn parse_string_escape(
+        &self,
+        offset: usize,
+    ) -> Result<(char, usize, bool), CanonicalPluginRowError> {
+        let remaining = &self.input.as_bytes()[offset..];
+        let Some(escaped) = remaining.get(1).copied() else {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains an unterminated JSON string escape".to_owned(),
+            ));
+        };
+        let simple = match escaped {
+            b'"' => Some(('"', true)),
+            b'\\' => Some(('\\', true)),
+            b'/' => Some(('/', false)),
+            b'b' => Some(('\u{08}', true)),
+            b't' => Some(('\t', true)),
+            b'n' => Some(('\n', true)),
+            b'f' => Some(('\u{0c}', true)),
+            b'r' => Some(('\r', true)),
+            _ => None,
+        };
+        if let Some((scalar, canonical)) = simple {
+            return Ok((scalar, 2, canonical));
+        }
+        if escaped != b'u' {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot string contains an invalid JSON escape".to_owned(),
+            ));
+        }
+        let high = parse_json_hex_quad(remaining.get(2..6).ok_or_else(|| {
+            CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains an incomplete unicode escape".to_owned(),
+            )
+        })?)
+        .ok_or_else(|| {
+            CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot string contains an invalid unicode escape".to_owned(),
+            )
+        })?;
+        if (0xd800..=0xdbff).contains(&high) {
+            if remaining.get(6..8) != Some(br"\u") {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot string contains an unpaired unicode surrogate".to_owned(),
+                ));
+            }
+            let low = parse_json_hex_quad(remaining.get(8..12).ok_or_else(|| {
+                CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot contains an incomplete unicode surrogate pair".to_owned(),
+                )
+            })?)
+            .ok_or_else(|| {
+                CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot string contains an invalid unicode surrogate pair".to_owned(),
+                )
+            })?;
+            if !(0xdc00..=0xdfff).contains(&low) {
+                return Err(CanonicalPluginRowError::InvalidPlugin(
+                    "v2 snapshot string contains an unpaired unicode surrogate".to_owned(),
+                ));
+            }
+            let scalar = 0x1_0000 + ((u32::from(high) - 0xd800) << 10) + (u32::from(low) - 0xdc00);
+            return Ok((
+                char::from_u32(scalar).expect("valid surrogate pair forms a unicode scalar"),
+                12,
+                false,
+            ));
+        }
+        if (0xdc00..=0xdfff).contains(&high) {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot string contains an unpaired unicode surrogate".to_owned(),
+            ));
+        }
+        let scalar =
+            char::from_u32(u32::from(high)).expect("non-surrogate u16 is a unicode scalar");
+        let canonical = matches!(
+            high,
+            0x00..=0x07 | 0x0b | 0x0e..=0x1f
+        ) && remaining.get(2..4) == Some(b"00")
+            && remaining[4..6]
+                .iter()
+                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+        Ok((scalar, 6, canonical))
+    }
+
+    fn parse_literal(&mut self, literal: &[u8]) -> Result<(), CanonicalPluginRowError> {
+        if self
+            .input
+            .as_bytes()
+            .get(self.offset..self.offset.saturating_add(literal.len()))
+            == Some(literal)
+        {
+            self.offset += literal.len();
+            Ok(())
+        } else {
+            Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains a malformed JSON literal".to_owned(),
+            ))
+        }
+    }
+
+    fn push_node(&mut self, node: ParsedJsonNode<'a>) -> ParsedJsonValue {
+        let value = ParsedJsonValue(self.nodes.len());
+        self.nodes.push(node);
+        value
+    }
+
+    fn value_kind(&self, value: ParsedJsonValue) -> CanonicalJsonKind {
+        match &self.nodes[value.0] {
+            ParsedJsonNode::Exact { kind, .. } => *kind,
+            ParsedJsonNode::String(_) => CanonicalJsonKind::String,
+            ParsedJsonNode::Array { .. } => CanonicalJsonKind::Array,
+            ParsedJsonNode::Object { .. } => CanonicalJsonKind::Object,
+        }
+    }
+
+    fn value_string(&self, value: ParsedJsonValue) -> Option<&ParsedJsonString<'a>> {
+        match &self.nodes[value.0] {
+            ParsedJsonNode::String(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn value_is_canonical(&self, value: ParsedJsonValue) -> bool {
+        match &self.nodes[value.0] {
+            ParsedJsonNode::Exact { .. } => true,
+            ParsedJsonNode::String(value) => value.is_canonical(),
+            ParsedJsonNode::Array { .. } | ParsedJsonNode::Object { .. } => false,
+        }
+    }
+
+    fn write_value(&self, value: ParsedJsonValue, output: &mut Vec<u8>) {
+        match &self.nodes[value.0] {
+            ParsedJsonNode::Exact { encoded, .. } => {
+                output.extend_from_slice(encoded.as_bytes());
+            }
+            ParsedJsonNode::String(value) => value.write_canonical(output),
+            ParsedJsonNode::Array { first } => {
+                output.push(b'[');
+                let mut element = *first;
+                let mut first_output = true;
+                while let Some(index) = element {
+                    if !first_output {
+                        output.push(b',');
+                    }
+                    first_output = false;
+                    let value = self.elements[index].value;
+                    element = self.elements[index].next;
+                    self.write_value(value, output);
+                }
+                output.push(b']');
+            }
+            ParsedJsonNode::Object { first } => {
+                output.push(b'{');
+                let mut property = *first;
+                let mut first_output = true;
+                while let Some(index) = property {
+                    if !first_output {
+                        output.push(b',');
+                    }
+                    first_output = false;
+                    self.properties[index].key.write_canonical(output);
+                    output.push(b':');
+                    let value = self.properties[index].value;
+                    property = self.properties[index].next;
+                    self.write_value(value, output);
+                }
+                output.push(b'}');
+            }
+        }
+    }
+
+    /// Sorting storage exists only after a row has diverged from canonical
+    /// spelling. The canonical lane compares each key with the prior key and
+    /// never constructs this list.
+    fn sort_object_properties(
+        &mut self,
+        first: Option<usize>,
+    ) -> Result<Option<usize>, CanonicalPluginRowError> {
+        let mut ordered = SmallVec::<[usize; 8]>::new();
+        let mut property = first;
+        while let Some(index) = property {
+            ordered.push(index);
+            property = self.properties[index].next;
+        }
+        ordered.sort_unstable_by(|left, right| {
+            self.properties[*left].key.cmp(&self.properties[*right].key)
+        });
+        if ordered.windows(2).any(|pair| {
+            self.properties[pair[0]]
+                .key
+                .cmp(&self.properties[pair[1]].key)
+                == Ordering::Equal
+        }) {
+            return Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains a duplicate decoded JSON object key".to_owned(),
+            ));
+        }
+        for pair in ordered.windows(2) {
+            self.properties[pair[0]].next = Some(pair[1]);
+        }
+        if let Some(last) = ordered.last().copied() {
+            self.properties[last].next = None;
+        }
+        Ok(ordered.first().copied())
+    }
+
+    fn validate_value(&mut self, validation: Option<&FastValueValidation>, value: ParsedJsonValue) {
+        let Some(validation) = validation else {
+            return;
+        };
+        let accepted = match validation {
+            FastValueValidation::Types(types) => {
+                types.accepts_canonical_kind(self.value_kind(value))
+            }
+            FastValueValidation::String(validation) => {
+                self.value_string(value).is_some_and(|value| match value {
+                    ParsedJsonString::Canonical(value) => validation.accepts_canonical(*value),
+                    ParsedJsonString::Decoded(value) => validation.accepts(value),
+                })
+            }
+            FastValueValidation::Array(_) => self.value_kind(value) == CanonicalJsonKind::Array,
+            FastValueValidation::Object(_) => self.value_kind(value) == CanonicalJsonKind::Object,
+            FastValueValidation::StringOrNull(validation) => {
+                self.value_kind(value) == CanonicalJsonKind::Null
+                    || self.value_string(value).is_some_and(|value| match value {
+                        ParsedJsonString::Canonical(value) => validation.accepts_canonical(*value),
+                        ParsedJsonString::Decoded(value) => validation.accepts(value),
+                    })
+            }
+        };
+        if !accepted {
+            self.record_schema("snapshot property does not satisfy its schema".to_owned());
+        }
+    }
+
+    fn record_schema(&mut self, message: String) {
+        if self.semantic_error.is_none() {
+            self.semantic_error = Some(message);
+        }
+    }
+
+    fn expect_byte(&mut self, expected: u8) -> Result<(), CanonicalPluginRowError> {
+        if self.consume_byte(expected) {
+            Ok(())
+        } else {
+            Err(CanonicalPluginRowError::InvalidPlugin(
+                "v2 snapshot contains malformed JSON".to_owned(),
+            ))
+        }
+    }
+
+    fn consume_byte(&mut self, expected: u8) -> bool {
+        if self.peek() == Some(expected) {
+            self.offset += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.input.as_bytes().get(self.offset).copied()
+    }
+
+    fn skip_whitespace(&mut self) -> bool {
+        let start = self.offset;
+        while self
+            .peek()
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            self.offset += 1;
+        }
+        self.offset != start
+    }
+}
+
+fn parse_json_hex_quad(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() != 4 {
+        return None;
+    }
+    bytes.iter().try_fold(0_u16, |value, byte| {
+        let digit = match byte {
+            b'0'..=b'9' => u16::from(byte - b'0'),
+            b'a'..=b'f' => u16::from(byte - b'a' + 10),
+            b'A'..=b'F' => u16::from(byte - b'A' + 10),
+            _ => return None,
+        };
+        Some((value << 4) | digit)
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -736,6 +2209,18 @@ impl DefaultPlan {
             changed = true;
         }
         Ok(changed)
+    }
+
+    /// Returns whether applying this plan would mutate `snapshot`.
+    ///
+    /// Batch-backed canonical rows use this check to keep their parsed value
+    /// and normalized bytes in the transition arena when every defaulted
+    /// property is already present. The uncommon missing-default case is
+    /// materialized into an owned object before evaluation.
+    pub(crate) fn would_apply(&self, snapshot: &JsonMap<String, JsonValue>) -> bool {
+        self.properties
+            .iter()
+            .any(|property| !snapshot.contains_key(&property.field_name))
     }
 }
 
@@ -1253,6 +2738,45 @@ mod tests {
 
     use super::*;
 
+    const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
+
+    fn compile_actual_fast_schema(schema_json: &str) -> SchemaPlan {
+        let schema: JsonValue =
+            serde_json::from_str(schema_json).expect("built-in schema JSON should parse");
+        let schema_key = schema
+            .get("x-lix-key")
+            .and_then(JsonValue::as_str)
+            .expect("built-in schema should declare x-lix-key")
+            .to_owned();
+        let plan = SchemaPlan::compile(
+            SchemaCatalogKey {
+                schema_key: schema_key.clone(),
+            },
+            schema,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("built-in schema should compile");
+        assert!(
+            plan.fast_object_validation.is_some(),
+            "built-in schema '{schema_key}' should have a fast validation plan"
+        );
+        plan
+    }
+
+    fn assert_fast_validation(plan: &SchemaPlan, value: JsonValue, expected: bool) {
+        assert_eq!(
+            plan.compiled_schema.is_valid(&value),
+            expected,
+            "full JSON Schema result differed for {value}"
+        );
+        assert_eq!(
+            plan.accepts_row_content_fast(&value),
+            expected,
+            "fast validation result differed for {value}"
+        );
+    }
+
     #[test]
     fn fast_object_validation_accepts_key_value_rows_and_rejects_invalid_shapes() {
         let schema = crate::schema::seed_schema_definition("lix_key_value")
@@ -1286,17 +2810,491 @@ mod tests {
     }
 
     #[test]
-    fn fast_object_validation_declines_unsupported_keywords() {
-        let schema = json!({
-            "x-lix-key": "patterned",
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "pattern": "^[a-z]+$"}
+    fn fast_object_validation_compiles_actual_json_v2_schemas() {
+        let root = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_root.json"
+        ));
+        for value in [
+            json!({"id": "root", "kind": "object"}),
+            json!({
+                "id": "root",
+                "kind": "null",
+                "scalar_json": "null",
+                "prefix_json": "\t\n ",
+                "suffix_json": "\r",
+            }),
+        ] {
+            assert_fast_validation(&root, value, true);
+        }
+        for value in [
+            json!({"id": "other", "kind": "object"}),
+            json!({"id": "root", "kind": "date"}),
+            json!({"id": "root", "kind": "string", "scalar_json": ""}),
+            json!({"id": "root", "kind": "object", "prefix_json": "\u{a0}"}),
+            json!({"id": "root", "kind": "object", "extra": true}),
+        ] {
+            assert_fast_validation(&root, value, false);
+        }
+
+        let object_member = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_object_member.json"
+        ));
+        for value in [
+            json!({
+                "parent_id": "root",
+                "key": "",
+                "order_key": "01",
+                "kind": "object",
+            }),
+            json!({
+                "parent_id": "root",
+                "key": "member",
+                "order_key": "0001",
+                "kind": "string",
+                "scalar_json": "\"value\"",
+                "container_id": "child",
+                "suffix_json": " \n",
+            }),
+        ] {
+            assert_fast_validation(&object_member, value, true);
+        }
+        for value in [
+            json!({"parent_id": "", "key": "member", "order_key": "01", "kind": "string"}),
+            json!({"parent_id": "root", "key": "member", "order_key": "00", "kind": "string"}),
+            json!({"parent_id": "root", "key": "member", "order_key": "0A", "kind": "string"}),
+            json!({"parent_id": "root", "key": "member", "order_key": "01", "kind": "date"}),
+            json!({
+                "parent_id": "root",
+                "key": "member",
+                "order_key": "01",
+                "kind": "string",
+                "suffix_json": "x",
+            }),
+        ] {
+            assert_fast_validation(&object_member, value, false);
+        }
+
+        let array_item = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_array_item.json"
+        ));
+        assert_fast_validation(
+            &array_item,
+            json!({
+                "id": UUID_A,
+                "parent_id": "root",
+                "order_key": "ff",
+                "kind": "boolean",
+                "scalar_json": "true",
+            }),
+            true,
+        );
+        for value in [
+            json!({"id": UUID_A, "parent_id": "", "order_key": "01", "kind": "null"}),
+            json!({"id": UUID_A, "parent_id": "root", "order_key": "1", "kind": "null"}),
+            json!({
+                "id": UUID_A,
+                "parent_id": "root",
+                "order_key": "01",
+                "kind": "null",
+                "empty_json": "\u{a0}",
+            }),
+        ] {
+            assert_fast_validation(&array_item, value, false);
+        }
+    }
+
+    #[test]
+    fn fast_object_validation_compiles_actual_csv_v2_schemas() {
+        let row = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ));
+        for value in [
+            json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"]}),
+            json!({
+                "id": UUID_A,
+                "order_key": "0001",
+                "cells": ["alpha", ""],
+                "layout": {"terminator": ""},
+            }),
+            json!({
+                "id": UUID_A,
+                "order_key": "ff",
+                "cells": ["alpha"],
+                "layout": {"force_quote": "AZ_-", "terminator": "\r\n"},
+            }),
+        ] {
+            assert_fast_validation(&row, value, true);
+        }
+        for value in [
+            json!({"id": UUID_A, "order_key": "01", "cells": []}),
+            json!({"id": UUID_A, "order_key": "01", "cells": [1]}),
+            json!({"id": UUID_A, "order_key": "00", "cells": ["alpha"]}),
+            json!({"id": UUID_A, "order_key": "01", "cells": ["alpha"], "layout": {}}),
+            json!({
+                "id": UUID_A,
+                "order_key": "01",
+                "cells": ["alpha"],
+                "layout": {"force_quote": ""},
+            }),
+            json!({
+                "id": UUID_A,
+                "order_key": "01",
+                "cells": ["alpha"],
+                "layout": {"terminator": "\n\n"},
+            }),
+            json!({
+                "id": UUID_A,
+                "order_key": "01",
+                "cells": ["alpha"],
+                "layout": {"terminator": "\n", "extra": true},
+            }),
+        ] {
+            assert_fast_validation(&row, value, false);
+        }
+
+        let table = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+        ));
+        for value in [
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": ",", "quote": "\"", "terminator": "\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": "\t", "quote": null, "terminator": "\r\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": " ", "quote": "!", "terminator": "\r"},
+            }),
+        ] {
+            assert_fast_validation(&table, value, true);
+        }
+        for value in [
+            json!({
+                "id": "table",
+                "dialect": {"delimiter": ",", "quote": null, "terminator": "\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": ",,", "quote": null, "terminator": "\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": "\n", "quote": null, "terminator": "\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": ",", "quote": " ", "terminator": "\n"},
+            }),
+            json!({
+                "id": "root",
+                "dialect": {"delimiter": ",", "quote": "é", "terminator": "\n"},
+            }),
+            json!({"id": "root", "dialect": {"delimiter": ",", "terminator": "\n"}}),
+            json!({
+                "id": "root",
+                "dialect": {
+                    "delimiter": ",",
+                    "quote": null,
+                    "terminator": "\n",
+                    "extra": true,
+                },
+            }),
+        ] {
+            assert_fast_validation(&table, value, false);
+        }
+    }
+
+    #[test]
+    fn fast_object_validation_declines_unsupported_or_unsafe_constraints() {
+        for property in [
+            json!({"type": "string", "pattern": "^[a-z]+$"}),
+            json!({"type": "string", "maxLength": 10}),
+            json!({"type": "array", "items": {"type": "integer"}}),
+            json!({
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+            }),
+            json!({
+                "anyOf": [
+                    {"type": "string", "pattern": "^[!-~]$"},
+                    {"type": "boolean"},
+                ],
+            }),
+        ] {
+            let schema = json!({
+                "x-lix-key": "unsupported",
+                "type": "object",
+                "properties": {"id": property},
+                "required": ["id"],
+                "additionalProperties": false,
+            });
+            assert!(FastObjectValidationPlan::compile(&schema).is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_plugin_row_certificate_proves_csv_schema_and_typed_identity() {
+        let plan = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ));
+        assert!(plan.accepts_v2_canonical_certificate());
+        let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
+        let certified = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                &key,
+            )
+            .expect("canonical CSV row should validate")
+            .expect("canonical CSV row should receive a certificate");
+        assert_eq!(
+            certified.entity_pk,
+            EntityPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
+        );
+        assert!(
+            certified.normalized.is_none(),
+            "canonical CSV row retains the guest buffer"
+        );
+
+        let validation = plan
+            .fast_object_validation
+            .as_ref()
+            .expect("CSV schema has streaming validation");
+        let primary_key_paths = plan.primary_key.as_deref().expect("CSV primary key");
+        let mut parser = CanonicalPluginRowParser::new(
+            br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+        )
+        .expect("canonical parser");
+        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &key.entity_pk);
+        assert!(
+            parser
+                .parse_root_object(validation, &mut primary_key)
+                .expect("canonical CSV row")
+                .is_none()
+        );
+        assert!(!parser.nodes.spilled(), "canonical node arena stays inline");
+        assert!(
+            !parser.properties.spilled(),
+            "canonical property arena stays inline"
+        );
+        assert!(
+            !parser.elements.spilled(),
+            "canonical array-element arena stays inline"
+        );
+
+        let normalized = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"id":"019a0000-0000-7000-8000-000000000001","order_key":"01","cells":["a","b"]}"#,
+                &key,
+            )
+            .expect("valid noncanonical CSV row")
+            .expect("eligible compatibility row")
+            .normalized
+            .expect("legacy guest key order must be normalized");
+        assert_eq!(
+            normalized,
+            br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+        );
+        let normalized = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["line\u000Abreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                &key,
+            )
+            .expect("valid alternative escape")
+            .expect("eligible compatibility row")
+            .normalized
+            .expect("alternative JSON escape must be normalized");
+        assert_eq!(
+            normalized,
+            br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+        );
+        assert!(
+            plan.certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["line\nbreak"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                &key,
+            )
+            .expect("serde canonical short escape should validate")
+            .expect("eligible canonical row")
+            .normalized
+            .is_none(),
+            "exact serde control escapes must remain on the certificate path"
+        );
+        assert!(
+            plan.certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["\b\t\n\f\r\u0001\u001f"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                &key,
+            )
+            .expect("all exact serde control escapes should validate")
+            .expect("eligible canonical row")
+            .normalized
+            .is_none()
+        );
+        let normalized = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["\u001F"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                &key,
+            )
+            .expect("uppercase hexadecimal escape should validate")
+            .expect("eligible compatibility row")
+            .normalized
+            .expect("uppercase hexadecimal escape must be normalized");
+        assert_eq!(
+            normalized,
+            br#"{"cells":["\u001f"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+        );
+    }
+
+    #[test]
+    fn canonical_plugin_row_certificate_validates_non_primary_uuid_formats() {
+        let plan = SchemaPlan::compile(
+            SchemaCatalogKey {
+                schema_key: "uuid_format_row".to_owned(),
             },
-            "required": ["id"],
-            "additionalProperties": false
-        });
-        assert!(FastObjectValidationPlan::compile(&schema).is_none());
+            json!({
+                "x-lix-key": "uuid_format_row",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "external_id": {"type": "string", "format": "uuid"},
+                    "id": {"type": "string"}
+                },
+                "required": ["external_id", "id"],
+                "additionalProperties": false
+            }),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("UUID schema should compile");
+        assert!(plan.accepts_v2_canonical_certificate());
+        let key = WasmEntityKey::from_owned_parts("uuid_format_row", vec!["row-1".to_owned()]);
+
+        let certified = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"external_id":"019a0000-0000-7000-8000-000000000001","id":"row-1"}"#,
+                &key,
+            )
+            .expect("valid UUID should pass streaming validation")
+            .expect("eligible canonical row should receive a certificate");
+        assert!(certified.normalized.is_none());
+
+        let error = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"external_id":"not-a-uuid","id":"row-1"}"#,
+                &key,
+            )
+            .expect_err("invalid non-primary UUID must not receive a certificate");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+    }
+
+    #[test]
+    fn canonical_certificate_covers_csv_table_and_json_v2_schemas() {
+        let table = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+        ));
+        assert!(table.accepts_v2_canonical_certificate());
+        assert!(
+            table
+                .certify_or_normalize_v2_plugin_row(
+                    br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#,
+                    &WasmEntityKey::from_owned_parts("csv_v2_table", vec!["root".to_owned()],),
+                )
+                .expect("canonical CSV table")
+                .expect("eligible canonical row")
+                .normalized
+                .is_none()
+        );
+
+        let json_root = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_root.json"
+        ));
+        assert!(json_root.accepts_v2_canonical_certificate());
+        assert!(
+            json_root
+                .certify_or_normalize_v2_plugin_row(
+                    br#"{"id":"root","kind":"object"}"#,
+                    &WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+                )
+                .expect("canonical JSON root")
+                .expect("eligible canonical row")
+                .normalized
+                .is_none()
+        );
+
+        let object_member = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_object_member.json"
+        ));
+        assert!(object_member.accepts_v2_canonical_certificate());
+        assert!(
+            object_member
+                .certify_or_normalize_v2_plugin_row(
+                    br#"{"key":"name","kind":"string","order_key":"01","parent_id":"root","scalar_json":"\"Lix\""}"#,
+                    &WasmEntityKey::from_owned_parts(
+                        "json_object_member",
+                        vec!["root".to_owned(), "name".to_owned()],
+                    ),
+                )
+                .expect("canonical JSON object member")
+                .expect("eligible canonical row")
+                .normalized
+                .is_none()
+        );
+
+        let array_item = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/json-v2/schema/json_array_item.json"
+        ));
+        assert!(array_item.accepts_v2_canonical_certificate());
+        assert!(
+            array_item
+                .certify_or_normalize_v2_plugin_row(
+                    br#"{"id":"019a0000-0000-7000-8000-000000000001","kind":"null","order_key":"01","parent_id":"root","scalar_json":"null"}"#,
+                    &WasmEntityKey::from_owned_parts(
+                        "json_array_item",
+                        vec![UUID_A.to_owned()],
+                    ),
+                )
+                .expect("canonical JSON array item")
+                .expect("eligible canonical row")
+                .normalized
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn canonical_plugin_row_certificate_rejects_hostile_rows() {
+        let plan = compile_actual_fast_schema(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ));
+        let key = WasmEntityKey::from_owned_parts("csv_v2_row", vec![UUID_A.to_owned()]);
+
+        for bytes in [
+            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
+            br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01""#.as_slice(),
+        ] {
+            let error = plan
+                .certify_or_normalize_v2_plugin_row(bytes, &key)
+                .expect_err("hostile plugin snapshot must be rejected");
+            assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN, "{bytes:?}");
+        }
+
+        let wrong_identity = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"01"}"#,
+                &key,
+            )
+            .expect_err("snapshot identity must match emitted entity key");
+        assert_eq!(wrong_identity.code, LixError::CODE_SCHEMA_VALIDATION);
+
+        let invalid_order_key = plan
+            .certify_or_normalize_v2_plugin_row(
+                br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"00"}"#,
+                &key,
+            )
+            .expect_err("schema-invalid canonical row must be rejected");
+        assert_eq!(invalid_order_key.code, LixError::CODE_SCHEMA_VALIDATION);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateRow, StagedLiveStateRows, overlay_load_exact_rows, overlay_scan_rows,
-    overlay_scan_tracked_rows,
+    MaterializedLiveStateBatch, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
 
@@ -114,26 +114,26 @@ impl<S> LiveStateReader for TransactionSchemaLiveStateReader<'_, S>
 where
     S: StagedLiveStateRows + Sync + ?Sized,
 {
-    async fn scan_rows(
+    async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_rows(self.base, self.staged, request).await
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        overlay_scan_batch(self.base, self.staged, request).await
     }
 
-    async fn scan_tracked_rows(
+    async fn scan_tracked_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        overlay_scan_tracked_rows(self.base, self.staged, request).await
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        overlay_scan_tracked_batch(self.base, self.staged, request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        Ok(self
-            .scan_rows(&LiveStateScanRequest {
+        let rows = self
+            .scan_batch(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
@@ -144,16 +144,17 @@ where
                 limit: Some(1),
                 ..Default::default()
             })
-            .await?
-            .into_iter()
-            .next())
+            .await?;
+        Ok(rows
+            .get(0)
+            .map(crate::live_state::MaterializedLiveStateRowRef::to_owned))
     }
 
-    async fn load_exact_rows(
+    async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        overlay_load_exact_rows(self.base, self.staged, request).await
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        overlay_load_exact_batch(self.base, self.staged, request).await
     }
 }
 
@@ -235,7 +236,7 @@ mod tests {
         };
 
         let rows = reader
-            .scan_tracked_rows(&LiveStateScanRequest {
+            .scan_tracked_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_registered_schema".to_string()],
                     branch_ids: vec!["main".to_string()],
@@ -245,7 +246,8 @@ mod tests {
                 ..LiveStateScanRequest::default()
             })
             .await
-            .expect("tracked schema scan should succeed");
+            .expect("tracked schema scan should succeed")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].untracked);
@@ -265,7 +267,7 @@ mod tests {
         };
 
         let rows = reader
-            .scan_tracked_rows(&LiveStateScanRequest {
+            .scan_tracked_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_registered_schema".to_string()],
                     branch_ids: vec!["main".to_string()],
@@ -274,7 +276,8 @@ mod tests {
                 ..LiveStateScanRequest::default()
             })
             .await
-            .expect("tracked staged schema scan should succeed");
+            .expect("tracked staged schema scan should succeed")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].untracked);
@@ -289,7 +292,7 @@ mod tests {
             entity_pk: EntityPk::single("example_schema"),
             schema_key: "lix_registered_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(snapshot_content.to_string()),
+            snapshot_content: Some(snapshot_content.to_string().into()),
             metadata: None,
             deleted: false,
             created_at: LixTimestamp::expect_parse("created_at", "2026-01-01T00:00:00.000Z"),

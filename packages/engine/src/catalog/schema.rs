@@ -1,4 +1,4 @@
 pub(crate) use super::snapshot::{
-    ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanId,
-    StateForeignKeyPlan,
+    ForeignKeyPlan, SchemaCatalogFact, SchemaCatalogKey, SchemaPlan, SchemaPlanFingerprint,
+    SchemaPlanId, StateForeignKeyPlan,
 };

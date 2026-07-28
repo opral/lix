@@ -24,7 +24,7 @@ use crate::storage_adapter::{
     StorageWriteSetStats,
 };
 use crate::tracked_state::TrackedStateContext;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
@@ -118,11 +118,10 @@ where
     }
 
     pub async fn insert_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self
-            .rows
-            .iter()
-            .map(|row| transaction_row(row, &row.value))
-            .collect();
+        let mut rows = RawWriteBatch::with_capacity(self.rows.len());
+        for row in &self.rows {
+            rows.push(transaction_row(row, &row.value));
+        }
         self.commit_rows(rows).await
     }
 
@@ -131,11 +130,10 @@ where
     }
 
     pub async fn update_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self
-            .rows
-            .iter()
-            .map(|row| transaction_row(row, &row.updated_value))
-            .collect();
+        let mut rows = RawWriteBatch::with_capacity(self.rows.len());
+        for row in &self.rows {
+            rows.push(transaction_row(row, &row.updated_value));
+        }
         self.commit_rows(rows).await
     }
 
@@ -145,8 +143,9 @@ where
 
     pub async fn update_one_by_pk_accounting(&mut self) -> BenchWriteAccounting {
         let row = &self.rows[self.rows.len() / 2];
-        self.commit_rows(vec![transaction_row(row, &row.updated_value)])
-            .await
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(transaction_row(row, &row.updated_value));
+        self.commit_rows(rows).await
     }
 
     pub async fn delete_all(&mut self) -> usize {
@@ -154,7 +153,10 @@ where
     }
 
     pub async fn delete_all_accounting(&mut self) -> BenchWriteAccounting {
-        let rows = self.rows.iter().map(transaction_delete_row).collect();
+        let mut rows = RawWriteBatch::with_capacity(self.rows.len());
+        for row in &self.rows {
+            rows.push(transaction_delete_row(row));
+        }
         self.commit_rows(rows).await
     }
 
@@ -166,7 +168,9 @@ where
         let row_index = (self.rows.len() / 2 + self.delete_one_offset) % self.rows.len();
         self.delete_one_offset += 1;
         let row = &self.rows[row_index];
-        self.commit_rows(vec![transaction_delete_row(row)]).await
+        let mut rows = RawWriteBatch::with_capacity(1);
+        rows.push(transaction_delete_row(row));
+        self.commit_rows(rows).await
     }
 
     pub async fn read_all(&self) -> usize {
@@ -179,7 +183,7 @@ where
         let rows = self
             .live_state
             .reader(read)
-            .scan_rows(&LiveStateScanRequest {
+            .scan_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
                     branch_ids: vec![BENCH_BRANCH_ID.to_string()],
@@ -230,7 +234,7 @@ where
         let rows = self
             .live_state
             .reader(read)
-            .scan_rows(&LiveStateScanRequest {
+            .scan_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["json_pointer".to_string()],
                     branch_ids: vec![BENCH_BRANCH_ID.to_string()],
@@ -244,13 +248,18 @@ where
             .await
             .expect("scan transaction bench rows");
         let mut contents = rows
-            .into_iter()
+            .iter()
             .map(|row| {
                 let entity_pk = row
-                    .entity_pk
+                    .entity_pk()
                     .as_json_array_text()
                     .expect("bench entity pk should render");
-                (entity_pk, row.snapshot_content.unwrap_or_default())
+                (
+                    entity_pk,
+                    row.snapshot_content()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
+                )
             })
             .collect::<Vec<_>>();
         contents.sort();
@@ -280,7 +289,7 @@ where
     }
 
     #[expect(clippy::needless_pass_by_ref_mut)]
-    async fn commit_rows(&mut self, rows: Vec<TransactionWriteRow>) -> BenchWriteAccounting {
+    async fn commit_rows(&mut self, rows: RawWriteBatch) -> BenchWriteAccounting {
         let logical_rows = rows.len();
         let opened = super::open_transaction(
             &SessionMode::Pinned {
@@ -415,8 +424,8 @@ fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWr
 fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionWriteRow {
     TransactionWriteRow {
         entity_pk: Some(EntityPk::single(row.entity_pk.clone())),
-        schema_key: row.schema_key.clone(),
-        file_id: row.file_id.clone(),
+        schema_key: row.schema_key.as_str().into(),
+        file_id: row.file_id.as_deref().map(Into::into),
         snapshot: Some(TransactionJson::from_value_unchecked(value.clone())),
         metadata: None,
         origin: None,
@@ -426,7 +435,7 @@ fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionW
         change_id: None,
         commit_id: None,
         untracked: false,
-        branch_id: BENCH_BRANCH_ID.to_string(),
+        branch_id: BENCH_BRANCH_ID.into(),
     }
 }
 
@@ -459,7 +468,7 @@ async fn seed_visible_schema_rows<StorageImpl>(
                     .expect("registered schema identity should derive"),
                 schema_key: "lix_registered_schema".to_string(),
                 file_id: None,
-                snapshot_content: Some(snapshot_content),
+                snapshot_content: Some(snapshot_content.into()),
                 metadata: None,
                 deleted: false,
                 created_at: TIMESTAMP.to_string(),

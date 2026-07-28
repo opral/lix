@@ -7,13 +7,11 @@ use crate::LixError;
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
 use crate::common::compose_directory_path;
-use crate::sql2::history_route::HistoryEntry;
 
-pub(super) trait HistoryDirectoryPathRecord {
+pub(super) trait DirectoryPathRecord {
     fn id(&self) -> &str;
     fn parent_id(&self) -> Option<&str>;
     fn name(&self) -> Option<&str>;
-    fn entry(&self) -> &HistoryEntry;
 }
 
 /// Immutable child index for one exact observed filesystem state.
@@ -29,7 +27,7 @@ pub(super) struct HistoryDirectoryTree {
 }
 
 impl HistoryDirectoryTree {
-    pub(super) fn from_records<R: HistoryDirectoryPathRecord>(directories: &[R]) -> Self {
+    pub(super) fn from_records<R: DirectoryPathRecord>(directories: &[R]) -> Self {
         let mut children_by_parent = BTreeMap::<String, BTreeSet<String>>::new();
         let mut parent_by_directory = BTreeMap::new();
         for directory in directories {
@@ -82,6 +80,42 @@ impl HistoryDirectoryTree {
     }
 }
 
+/// Resolves a path inside one exact observed commit-root batch.
+///
+/// Unlike traversal history records, every row in this collection already
+/// belongs to the same commit and depth. Avoid synthesizing a `HistoryEntry`
+/// per row solely to satisfy those predicates.
+pub(super) fn resolve_observed_directory_path<R: DirectoryPathRecord>(
+    directory_id: &str,
+    directories: &[R],
+    cache: &mut BTreeMap<String, Option<String>>,
+    visiting: &mut BTreeSet<String>,
+) -> Option<String> {
+    if let Some(path) = cache.get(directory_id) {
+        return path.clone();
+    }
+    if !visiting.insert(directory_id.to_string()) {
+        cache.insert(directory_id.to_string(), None);
+        return None;
+    }
+
+    let directory = directories
+        .iter()
+        .find(|directory| directory.name().is_some() && directory.id() == directory_id)?;
+    let name = directory.name()?;
+    let path = match directory.parent_id() {
+        Some(parent_id) => {
+            let parent_path =
+                resolve_observed_directory_path(parent_id, directories, cache, visiting)?;
+            compose_directory_path(Some(&parent_path), name).ok()?
+        }
+        None => compose_directory_path(None, name).ok()?,
+    };
+    visiting.remove(directory_id);
+    cache.insert(directory_id.to_string(), Some(path.clone()));
+    Some(path)
+}
+
 /// Loads direct-parent edges for every commit reachable from the requested
 /// history anchors.
 ///
@@ -111,58 +145,4 @@ pub(super) async fn load_history_commit_parents(
         }
     }
     Ok(parents_by_commit)
-}
-
-pub(super) fn resolve_history_directory_path<R: HistoryDirectoryPathRecord>(
-    directory_id: &str,
-    as_of_commit_id: &str,
-    target_depth: u32,
-    directories: &[R],
-    cache: &mut BTreeMap<String, Option<String>>,
-    visiting: &mut BTreeSet<String>,
-) -> Option<String> {
-    if let Some(path) = cache.get(directory_id) {
-        return path.clone();
-    }
-    if !visiting.insert(directory_id.to_string()) {
-        cache.insert(directory_id.to_string(), None);
-        return None;
-    }
-
-    let directory = directories
-        .iter()
-        .filter(|directory| {
-            let entry = directory.entry();
-            directory.name().is_some()
-                && directory.id() == directory_id
-                && entry.as_of_commit_id == as_of_commit_id
-                && entry.depth >= target_depth
-        })
-        .min_by(|left, right| {
-            let left_entry = left.entry();
-            let right_entry = right.entry();
-            left_entry
-                .depth
-                .cmp(&right_entry.depth)
-                .then(left_entry.change.id.cmp(&right_entry.change.id))
-        })?;
-
-    let name = directory.name()?;
-    let path = match directory.parent_id() {
-        Some(parent_id) => {
-            let parent_path = resolve_history_directory_path(
-                parent_id,
-                as_of_commit_id,
-                target_depth,
-                directories,
-                cache,
-                visiting,
-            )?;
-            compose_directory_path(Some(&parent_path), name).ok()?
-        }
-        None => compose_directory_path(None, name).ok()?,
-    };
-    visiting.remove(directory_id);
-    cache.insert(directory_id.to_string(), Some(path.clone()));
-    Some(path)
 }

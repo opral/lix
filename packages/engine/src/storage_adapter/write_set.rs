@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 
 use crate::storage::{
-    CommitResult, Key, PutBatch, PutEntry, SpaceId, Storage, StorageError, StorageWrite,
-    StoredValue, WriteOptions,
+    BufferRange, CommitResult, EncodedMutationBatch, Key, PutBatch, PutEntry, SpaceId, Storage,
+    StorageError, StorageWrite, StoredValue, WriteOptions,
 };
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
@@ -84,9 +84,70 @@ pub struct StorageWriteSet {
 #[derive(Clone, Debug)]
 struct StorageWriteGroup {
     space: StorageSpace,
-    puts: Vec<PutEntry>,
-    deletes: Vec<Key>,
+    key_arena: MutationArena,
+    value_arena: MutationArena,
+    puts: Vec<StagedPut>,
+    deletes: Vec<ArenaRange>,
     conflicting_declarations: Vec<StorageSpace>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MutationArena {
+    shared: Vec<Bytes>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArenaRange {
+    buffer_index: usize,
+    range: BufferRange,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StagedPut {
+    key: ArenaRange,
+    value: ArenaRange,
+}
+
+#[derive(Clone, Copy)]
+enum MutationIndex {
+    Put(usize),
+    Delete(usize),
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct ContentAddressedRef<'a> {
+    key: &'a [u8],
+    value: &'a [u8],
+}
+
+struct ArenaRemap {
+    shared_buffer_base: usize,
+}
+
+struct FrozenMutationArena {
+    shared: Vec<Bytes>,
+}
+
+#[cfg(any(test, feature = "storage-benches"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageWriteSetArenaStats {
+    pub spaces: usize,
+    pub put_descriptors: usize,
+    pub delete_descriptors: usize,
+    pub put_descriptor_capacity: usize,
+    pub delete_descriptor_capacity: usize,
+    pub key_inline_bytes: usize,
+    pub key_inline_capacity: usize,
+    pub key_inline_allocations: usize,
+    pub key_shared_buffers: usize,
+    pub key_shared_bytes: usize,
+    pub key_shared_capacity: usize,
+    pub value_inline_bytes: usize,
+    pub value_inline_capacity: usize,
+    pub value_inline_allocations: usize,
+    pub value_shared_buffers: usize,
+    pub value_shared_bytes: usize,
+    pub value_shared_capacity: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,6 +192,28 @@ impl StorageWriteSet {
             .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
+    /// Conservative encoded-size hint for contiguous backend write batches.
+    ///
+    /// Sixteen bytes per mutation covers a space prefix, record tag, and
+    /// length prefixes for current backends. The fixed tail covers the batch
+    /// header and the mutation-revision record appended by the adapter.
+    pub(crate) fn backend_batch_capacity_hint_bytes(&self) -> usize {
+        self.groups.iter().fold(64_usize, |total, group| {
+            let puts = group.puts.iter().fold(0_usize, |bytes, put| {
+                bytes
+                    .saturating_add(group.key_bytes(put.key).len())
+                    .saturating_add(group.value_bytes(put.value).len())
+                    .saturating_add(16)
+            });
+            let deletes = group.deletes.iter().fold(0_usize, |bytes, key| {
+                bytes
+                    .saturating_add(group.key_bytes(*key).len())
+                    .saturating_add(16)
+            });
+            total.saturating_add(puts).saturating_add(deletes)
+        })
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) async fn apply<StorageImpl>(
         self,
@@ -151,85 +234,141 @@ impl StorageWriteSet {
         K: IntoStorageKey,
         V: IntoStorageValue,
     {
+        let key = key.into_storage_key();
         let value = value.into_storage_value();
         self.stats.staged_puts += 1;
         self.stats.written_bytes += value.bytes.len() as u64;
         self.group_mut(space.into_storage_space())
-            .puts
-            .push(PutEntry {
-                key: key.into_storage_key(),
-                value,
-            });
-    }
-
-    /// Stages a content-addressed put, coalescing an identical put already in
-    /// this write set.
-    ///
-    /// A same-key, different-value mutation is still staged twice so normal
-    /// duplicate validation rejects the hash/key invariant violation.
-    pub(crate) fn put_content_addressed(
-        &mut self,
-        space: StorageSpace,
-        key: Key,
-        value: StoredValue,
-    ) {
-        let already_staged = self
-            .group_mut(space)
-            .puts
-            .iter()
-            .any(|put| put.key == key && put.value == value);
-        if !already_staged {
-            self.put(space, key, value);
-        }
+            .stage_put(key.0, value.bytes);
     }
 
     /// Stages a batch of content-addressed puts with one lookup pass over the
     /// already staged lane.
     ///
     /// This is for a caller that has an entire content-addressed batch ready
-    /// at once. Repeated [`Self::put_content_addressed`] calls each scan the
-    /// lane independently, which is needlessly quadratic for a large batch.
+    /// at once.
     /// Identical entries already staged by an earlier batch are coalesced;
     /// same-key, different-value entries remain duplicate mutations and are
     /// deliberately left for the canonical validator to reject.
+    #[cfg(test)]
     pub(crate) fn put_content_addressed_batch<I>(&mut self, space: StorageSpace, entries: I)
     where
         I: IntoIterator<Item = (Key, StoredValue)>,
     {
-        let mut entries = entries.into_iter().peekable();
-        if entries.peek().is_none() {
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        if entries.is_empty() {
             return;
         }
 
-        let (staged_puts, written_bytes) = {
+        let keep = {
             let group = self.group_mut(space);
-            let mut existing = HashMap::with_capacity_and_hasher(
-                group.puts.len(),
+            let mut existing = HashSet::with_capacity_and_hasher(
+                group.puts.len().saturating_add(entries.len()),
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             );
             for put in &group.puts {
-                existing
-                    .entry(put.key.clone())
-                    .or_insert_with(|| put.value.clone());
+                existing.insert(ContentAddressedRef {
+                    key: group.key_bytes(put.key),
+                    value: group.value_bytes(put.value),
+                });
             }
 
-            let mut staged_puts = 0;
-            let mut written_bytes = 0;
-            for (key, value) in entries {
-                if existing.get(&key).is_some_and(|prior| prior == &value) {
-                    continue;
-                }
-                if !existing.contains_key(&key) {
-                    existing.insert(key.clone(), value.clone());
-                }
-                written_bytes += value.bytes.len() as u64;
-                staged_puts += 1;
-                group.puts.push(PutEntry { key, value });
-            }
-            (staged_puts, written_bytes)
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    existing.insert(ContentAddressedRef {
+                        key: key.0.as_ref(),
+                        value: value.bytes.as_ref(),
+                    })
+                })
+                .collect::<Vec<_>>()
         };
+
+        let mut staged_puts = 0;
+        let mut written_bytes = 0;
+        let group = self.group_mut(space);
+        for ((key, value), keep) in entries.into_iter().zip(keep) {
+            if !keep {
+                continue;
+            }
+            written_bytes += value.bytes.len() as u64;
+            staged_puts += 1;
+            group.stage_put(key.0, value.bytes);
+        }
         self.stats.staged_puts += staged_puts;
         self.stats.written_bytes += written_bytes;
+    }
+
+    /// Retains one already-encoded contiguous mutation batch without copying
+    /// its key or value buffers.
+    ///
+    /// Domain lowerers should prefer this path when they can count and encode
+    /// the full space-local batch in one pass. The write set stores only range
+    /// descriptors until backend lowering; the existing [`StorageWrite`] trait
+    /// receives lightweight `Bytes` slices at that final boundary.
+    pub fn stage_encoded_batch(&mut self, space: StorageSpace, batch: EncodedMutationBatch) {
+        if batch.is_empty() {
+            return;
+        }
+        let staged_puts = batch.put_count() as u64;
+        let staged_deletes = batch.delete_count() as u64;
+        let written_bytes = batch
+            .puts()
+            .iter()
+            .map(|put| put.value.len() as u64)
+            .sum::<u64>();
+        self.group_mut(space).stage_encoded_batch(batch);
+        self.stats.staged_puts += staged_puts;
+        self.stats.staged_deletes += staged_deletes;
+        self.stats.written_bytes += written_bytes;
+    }
+
+    /// Retains one contiguous content-addressed batch while coalescing puts
+    /// already present in the same storage-space lane.
+    ///
+    /// Keys and values stay as ranges over the two incoming arenas. Filtering
+    /// removes descriptors only, so a tracked-state chunk batch is still
+    /// represented by exactly one key buffer and one value buffer after
+    /// duplicate content is discarded.
+    pub(crate) fn stage_content_addressed_encoded_batch(
+        &mut self,
+        space: StorageSpace,
+        batch: EncodedMutationBatch,
+    ) {
+        if batch.is_empty() {
+            return;
+        }
+        let (key_bytes, value_bytes, puts, deletes) = batch.into_parts();
+        debug_assert!(
+            deletes.is_empty(),
+            "content-addressed encoded batches contain puts only"
+        );
+        let puts = {
+            let group = self.group_mut(space);
+            let mut existing = HashSet::with_capacity_and_hasher(
+                group.puts.len().saturating_add(puts.len()),
+                FastHashBuilder::with_seeds(0, 0, 0, 0),
+            );
+            for put in &group.puts {
+                existing.insert(ContentAddressedRef {
+                    key: group.key_bytes(put.key),
+                    value: group.value_bytes(put.value),
+                });
+            }
+            puts.into_iter()
+                .filter(|put| {
+                    existing.insert(ContentAddressedRef {
+                        key: &key_bytes
+                            [put.key.offset()..put.key.offset().saturating_add(put.key.len())],
+                        value: &value_bytes[put.value.offset()
+                            ..put.value.offset().saturating_add(put.value.len())],
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let batch = EncodedMutationBatch::try_new(key_bytes, value_bytes, puts, deletes)
+            .expect("filtered encoded batch retains validated buffer ranges");
+        self.stage_encoded_batch(space, batch);
     }
 
     pub fn delete<S, K>(&mut self, space: S, key: K)
@@ -237,10 +376,10 @@ impl StorageWriteSet {
         S: IntoStorageSpace,
         K: IntoStorageKey,
     {
+        let key = key.into_storage_key();
         self.stats.staged_deletes += 1;
         self.group_mut(space.into_storage_space())
-            .deletes
-            .push(key.into_storage_key());
+            .stage_delete(key.0);
     }
 
     /// Reserves capacity for a storage space's grouped puts and deletes.
@@ -256,6 +395,10 @@ impl StorageWriteSet {
         let group = self.group_mut(space);
         group.puts.reserve(expected_puts);
         group.deletes.reserve(expected_deletes);
+        group
+            .key_arena
+            .reserve_shared(expected_puts.saturating_add(expected_deletes));
+        group.value_arena.reserve_shared(expected_puts);
     }
 
     /// Returns whether this write set already stages a put for an exact
@@ -267,30 +410,55 @@ impl StorageWriteSet {
         self.group_index
             .get(&space.id)
             .and_then(|index| self.groups.get(*index))
-            .is_some_and(|group| group.puts.iter().any(|put| put.key.0.as_ref() == key))
+            .is_some_and(|group| group.puts.iter().any(|put| group.key_bytes(put.key) == key))
     }
 
     pub fn extend(&mut self, other: Self) {
-        self.changelog_gc_sealed |= other.changelog_gc_sealed;
-        for group in other.groups {
+        let Self {
+            groups,
+            stats,
+            changelog_gc_sealed,
+            ..
+        } = other;
+        self.changelog_gc_sealed |= changelog_gc_sealed;
+        for group in groups {
             let space = group.space;
-            let conflicting_declarations = group.conflicting_declarations;
-            for put in group.puts {
-                self.put(space, put.key, put.value);
-            }
-            for delete in group.deletes {
-                self.delete(space, delete);
-            }
-
             let target = self.group_mut(space);
-            target
-                .conflicting_declarations
-                .extend(conflicting_declarations);
+            target.append(group);
         }
+        self.stats.staged_puts += stats.staged_puts;
+        self.stats.staged_deletes += stats.staged_deletes;
+        self.stats.written_bytes += stats.written_bytes;
     }
 
     pub fn stats(&self) -> StorageWriteSetStats {
         self.stats
+    }
+
+    #[cfg(any(test, feature = "storage-benches"))]
+    pub fn arena_stats(&self) -> StorageWriteSetArenaStats {
+        let mut stats = StorageWriteSetArenaStats {
+            spaces: self.groups.len(),
+            ..StorageWriteSetArenaStats::default()
+        };
+        for group in &self.groups {
+            stats.put_descriptors += group.puts.len();
+            stats.delete_descriptors += group.deletes.len();
+            stats.put_descriptor_capacity += group.puts.capacity();
+            stats.delete_descriptor_capacity += group.deletes.capacity();
+            stats.key_shared_buffers += group.key_arena.shared.len();
+            stats.key_shared_bytes += group.key_arena.shared.iter().map(Bytes::len).sum::<usize>();
+            stats.key_shared_capacity += group.key_arena.shared.capacity();
+            stats.value_shared_buffers += group.value_arena.shared.len();
+            stats.value_shared_bytes += group
+                .value_arena
+                .shared
+                .iter()
+                .map(Bytes::len)
+                .sum::<usize>();
+            stats.value_shared_capacity += group.value_arena.shared.capacity();
+        }
+        stats
     }
 
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
@@ -324,27 +492,23 @@ impl StorageWriteSet {
             }
         }
 
-        let mut seen = HashMap::<(SpaceId, Key), StorageSpace, FastHashBuilder>::with_hasher(
-            FastHashBuilder::with_seeds(0, 0, 0, 0),
-        );
         for group in &self.groups {
-            for put in &group.puts {
-                let key = (group.space.id, put.key.clone());
-                if seen.insert(key, group.space).is_some() {
-                    return Err(StorageWriteSetError::DuplicateMutation {
-                        space: group.space,
-                        key: put.key.clone(),
-                    });
-                }
-            }
-            for delete in &group.deletes {
-                let key = (group.space.id, delete.clone());
-                if seen.insert(key, group.space).is_some() {
-                    return Err(StorageWriteSetError::DuplicateMutation {
-                        space: group.space,
-                        key: delete.clone(),
-                    });
-                }
+            let mut mutations =
+                Vec::with_capacity(group.puts.len().saturating_add(group.deletes.len()));
+            mutations.extend((0..group.puts.len()).map(MutationIndex::Put));
+            mutations.extend((0..group.deletes.len()).map(MutationIndex::Delete));
+            mutations.sort_unstable_by(|left, right| {
+                group.mutation_key(*left).cmp(group.mutation_key(*right))
+            });
+            if let Some(duplicate) = mutations.windows(2).find_map(|pair| {
+                let left = group.mutation_key(pair[0]);
+                let right = group.mutation_key(pair[1]);
+                (left == right).then_some(left)
+            }) {
+                return Err(StorageWriteSetError::DuplicateMutation {
+                    space: group.space,
+                    key: Key(Bytes::copy_from_slice(duplicate)),
+                });
             }
         }
         Ok(())
@@ -382,10 +546,8 @@ impl StorageWriteSet {
         }
 
         for group in &mut self.groups {
-            let puts_sorted = group
-                .puts
-                .is_sorted_by(|left, right| left.key.0 <= right.key.0);
-            let deletes_sorted = group.deletes.is_sorted();
+            let puts_sorted = group.puts_are_sorted();
+            let deletes_sorted = group.deletes_are_sorted();
             #[cfg(feature = "storage-benches")]
             if order_stats_enabled() && !group.puts.is_empty() {
                 eprintln!(
@@ -396,12 +558,10 @@ impl StorageWriteSet {
                 );
             }
             if !puts_sorted {
-                group
-                    .puts
-                    .sort_unstable_by(|left, right| left.key.0.cmp(&right.key.0));
+                group.sort_puts();
             }
             if !deletes_sorted {
-                group.deletes.sort_unstable();
+                group.sort_deletes();
             }
             validate_sorted_group(group)?;
         }
@@ -425,13 +585,13 @@ impl StorageWriteSet {
                 let key_bytes = group
                     .puts
                     .iter()
-                    .map(|put| put.key.0.len())
-                    .chain(group.deletes.iter().map(|key| key.0.len()))
+                    .map(|put| group.key_bytes(put.key).len())
+                    .chain(group.deletes.iter().map(|key| group.key_bytes(*key).len()))
                     .sum::<usize>();
                 let value_bytes = group
                     .puts
                     .iter()
-                    .map(|put| put.value.bytes.len())
+                    .map(|put| group.value_bytes(put.value).len())
                     .sum::<usize>();
                 eprintln!(
                     "write-set-space space={} puts={} deletes={} key_bytes={} value_bytes={}",
@@ -442,24 +602,20 @@ impl StorageWriteSet {
                     value_bytes,
                 );
             }
-            if !group.puts.is_empty() {
+            let (space, puts, deletes) = group.lower();
+            if !puts.is_empty() {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many(
-                        group.space.id,
-                        PutBatch {
-                            entries: group.puts,
-                        },
-                    )
+                    .put_many(space.id, PutBatch { entries: puts })
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
-            if !group.deletes.is_empty() {
+            if !deletes.is_empty() {
                 stats.delete_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .delete_many(group.space.id, &group.deletes)
+                    .delete_many(space.id, &deletes)
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -516,37 +672,39 @@ impl StorageWriteSet {
 }
 
 fn validate_sorted_group(group: &StorageWriteGroup) -> Result<(), StorageWriteSetError> {
-    if let Some(duplicate) = group
-        .puts
-        .windows(2)
-        .find_map(|pair| (pair[0].key == pair[1].key).then(|| pair[0].key.clone()))
-    {
+    if let Some(duplicate) = group.puts.windows(2).find_map(|pair| {
+        let left = group.key_bytes(pair[0].key);
+        let right = group.key_bytes(pair[1].key);
+        (left == right).then_some(left)
+    }) {
         return Err(StorageWriteSetError::DuplicateMutation {
             space: group.space,
-            key: duplicate,
+            key: Key(Bytes::copy_from_slice(duplicate)),
         });
     }
-    if let Some(duplicate) = group
-        .deletes
-        .windows(2)
-        .find_map(|pair| (pair[0] == pair[1]).then(|| pair[0].clone()))
-    {
+    if let Some(duplicate) = group.deletes.windows(2).find_map(|pair| {
+        let left = group.key_bytes(pair[0]);
+        let right = group.key_bytes(pair[1]);
+        (left == right).then_some(left)
+    }) {
         return Err(StorageWriteSetError::DuplicateMutation {
             space: group.space,
-            key: duplicate,
+            key: Key(Bytes::copy_from_slice(duplicate)),
         });
     }
 
     let mut put_index = 0usize;
     let mut delete_index = 0usize;
     while put_index < group.puts.len() && delete_index < group.deletes.len() {
-        match group.puts[put_index].key.cmp(&group.deletes[delete_index]) {
+        let put_key = group.key_bytes(group.puts[put_index].key);
+        let delete_key = group.key_bytes(group.deletes[delete_index]);
+        match put_key.cmp(delete_key) {
             std::cmp::Ordering::Less => put_index += 1,
             std::cmp::Ordering::Greater => delete_index += 1,
             std::cmp::Ordering::Equal => {
                 return Err(StorageWriteSetError::DuplicateMutation {
                     space: group.space,
-                    key: group.puts[put_index].key.clone(),
+                    key: Key(Bytes::copy_from_slice(put_key)),
                 });
             }
         }
@@ -569,11 +727,208 @@ impl StorageWriteGroup {
     fn new(space: StorageSpace) -> Self {
         Self {
             space,
+            key_arena: MutationArena::default(),
+            value_arena: MutationArena::default(),
             puts: Vec::new(),
             deletes: Vec::new(),
             conflicting_declarations: Vec::new(),
         }
     }
+
+    fn stage_put(&mut self, key: Bytes, value: Bytes) {
+        let key = self.key_arena.stage_bytes(key);
+        let value = self.value_arena.stage_bytes(value);
+        self.puts.push(StagedPut { key, value });
+    }
+
+    fn stage_delete(&mut self, key: Bytes) {
+        let key = self.key_arena.stage_bytes(key);
+        self.deletes.push(key);
+    }
+
+    fn stage_encoded_batch(&mut self, batch: EncodedMutationBatch) {
+        let (key_bytes, value_bytes, puts, deletes) = batch.into_parts();
+        self.puts.reserve(puts.len());
+        self.deletes.reserve(deletes.len());
+        let key_buffer_index = self.key_arena.import(key_bytes);
+        let value_buffer_index = (!puts.is_empty()).then(|| self.value_arena.import(value_bytes));
+        self.puts.extend(puts.into_iter().map(|put| StagedPut {
+            key: ArenaRange {
+                buffer_index: key_buffer_index,
+                range: put.key,
+            },
+            value: ArenaRange {
+                buffer_index:
+                    value_buffer_index.expect("an encoded put batch must retain its value buffer"),
+                range: put.value,
+            },
+        }));
+        self.deletes
+            .extend(deletes.into_iter().map(|range| ArenaRange {
+                buffer_index: key_buffer_index,
+                range,
+            }));
+    }
+
+    fn key_bytes(&self, range: ArenaRange) -> &[u8] {
+        self.key_arena.bytes(range)
+    }
+
+    fn value_bytes(&self, range: ArenaRange) -> &[u8] {
+        self.value_arena.bytes(range)
+    }
+
+    fn mutation_key(&self, mutation: MutationIndex) -> &[u8] {
+        match mutation {
+            MutationIndex::Put(index) => self.key_bytes(self.puts[index].key),
+            MutationIndex::Delete(index) => self.key_bytes(self.deletes[index]),
+        }
+    }
+
+    fn puts_are_sorted(&self) -> bool {
+        self.puts
+            .windows(2)
+            .all(|pair| self.key_bytes(pair[0].key) <= self.key_bytes(pair[1].key))
+    }
+
+    fn deletes_are_sorted(&self) -> bool {
+        self.deletes
+            .windows(2)
+            .all(|pair| self.key_bytes(pair[0]) <= self.key_bytes(pair[1]))
+    }
+
+    fn sort_puts(&mut self) {
+        let key_arena = &self.key_arena;
+        self.puts.sort_unstable_by(|left, right| {
+            key_arena.bytes(left.key).cmp(key_arena.bytes(right.key))
+        });
+    }
+
+    fn sort_deletes(&mut self) {
+        let key_arena = &self.key_arena;
+        self.deletes
+            .sort_unstable_by(|left, right| key_arena.bytes(*left).cmp(key_arena.bytes(*right)));
+    }
+
+    fn append(&mut self, other: Self) {
+        let Self {
+            space,
+            key_arena,
+            value_arena,
+            puts,
+            deletes,
+            conflicting_declarations,
+        } = other;
+        debug_assert_eq!(self.space.id, space.id);
+        self.puts.reserve(puts.len());
+        self.deletes.reserve(deletes.len());
+        let key_remap = self.key_arena.append(key_arena);
+        let value_remap = self.value_arena.append(value_arena);
+        self.puts.extend(puts.into_iter().map(|put| StagedPut {
+            key: key_remap.remap(put.key),
+            value: value_remap.remap(put.value),
+        }));
+        self.deletes
+            .extend(deletes.into_iter().map(|key| key_remap.remap(key)));
+        self.conflicting_declarations
+            .extend(conflicting_declarations);
+    }
+
+    fn lower(self) -> (StorageSpace, Vec<PutEntry>, Vec<Key>) {
+        let Self {
+            space,
+            key_arena,
+            value_arena,
+            puts,
+            deletes,
+            ..
+        } = self;
+        let key_arena = key_arena.freeze();
+        let value_arena = value_arena.freeze();
+        let puts = puts
+            .into_iter()
+            .map(|put| PutEntry {
+                key: Key(key_arena.slice(put.key)),
+                value: StoredValue {
+                    bytes: value_arena.slice(put.value),
+                },
+            })
+            .collect();
+        let deletes = deletes
+            .into_iter()
+            .map(|key| Key(key_arena.slice(key)))
+            .collect();
+        (space, puts, deletes)
+    }
+}
+
+impl MutationArena {
+    fn reserve_shared(&mut self, additional: usize) {
+        self.shared.reserve(additional);
+    }
+
+    fn stage_bytes(&mut self, bytes: Bytes) -> ArenaRange {
+        let length = bytes.len();
+        let buffer_index = self.import(bytes);
+        ArenaRange {
+            buffer_index,
+            range: BufferRange::new(0, length),
+        }
+    }
+
+    fn import(&mut self, bytes: Bytes) -> usize {
+        let index = self.shared.len();
+        self.shared.push(bytes);
+        index
+    }
+
+    fn bytes(&self, range: ArenaRange) -> &[u8] {
+        slice_bytes(
+            self.shared
+                .get(range.buffer_index)
+                .expect("staged mutation references a retained shared buffer"),
+            range.range,
+        )
+    }
+
+    fn append(&mut self, other: Self) -> ArenaRemap {
+        let shared_buffer_base = self.shared.len();
+        self.shared.extend(other.shared);
+        ArenaRemap { shared_buffer_base }
+    }
+
+    fn freeze(self) -> FrozenMutationArena {
+        FrozenMutationArena {
+            shared: self.shared,
+        }
+    }
+}
+
+impl ArenaRemap {
+    fn remap(&self, range: ArenaRange) -> ArenaRange {
+        ArenaRange {
+            buffer_index: self.shared_buffer_base + range.buffer_index,
+            range: range.range,
+        }
+    }
+}
+
+impl FrozenMutationArena {
+    fn slice(&self, range: ArenaRange) -> Bytes {
+        let bytes = self
+            .shared
+            .get(range.buffer_index)
+            .expect("lowered mutation references a retained shared buffer");
+        let range = range.range;
+        if range.offset() == 0 && range.len() == bytes.len() {
+            return bytes.clone();
+        }
+        bytes.slice(range.offset()..range.offset() + range.len())
+    }
+}
+
+fn slice_bytes(bytes: &[u8], range: BufferRange) -> &[u8] {
+    &bytes[range.offset()..range.offset() + range.len()]
 }
 
 impl fmt::Display for StorageWriteSetError {
@@ -615,7 +970,11 @@ fn order_stats_enabled() -> bool {
 mod tests {
     use bytes::Bytes;
 
-    use crate::storage::{Key, Memory, SpaceId, StoredValue, WriteOptions};
+    use crate::storage::{
+        BufferRange, CommitResult, EncodedMutationBatch, EncodedMutationBatchError, EncodedPut,
+        Key, KeyRange, Memory, PutBatch, SpaceId, StorageError, StorageWrite, StoredValue,
+        WriteOptions,
+    };
     use crate::storage_adapter::{StorageSpace, StorageWriteSet, StorageWriteSetError};
 
     fn key(bytes: &'static str) -> Key {
@@ -630,6 +989,53 @@ mod tests {
 
     fn space() -> StorageSpace {
         StorageSpace::new(SpaceId(1), "test.space")
+    }
+
+    #[derive(Default)]
+    struct CapturingStorageWrite {
+        puts: Vec<(SpaceId, PutBatch)>,
+        deletes: Vec<(SpaceId, Vec<Key>)>,
+    }
+
+    impl StorageWrite for CapturingStorageWrite {
+        fn put_many(
+            &mut self,
+            space: SpaceId,
+            entries: PutBatch,
+        ) -> impl Future<Output = Result<(), StorageError>> + Send {
+            self.puts.push((space, entries));
+            async { Ok(()) }
+        }
+
+        fn delete_many(
+            &mut self,
+            space: SpaceId,
+            keys: &[Key],
+        ) -> impl Future<Output = Result<(), StorageError>> + Send {
+            self.deletes.push((space, keys.to_vec()));
+            async { Ok(()) }
+        }
+
+        fn delete_range(
+            &mut self,
+            _space: SpaceId,
+            _range: KeyRange,
+        ) -> impl Future<Output = Result<(), StorageError>> + Send {
+            async { Ok(()) }
+        }
+
+        fn commit(self) -> impl Future<Output = Result<CommitResult, StorageError>> + Send {
+            async {
+                Ok(CommitResult {
+                    commit_id: None,
+                    stats: Default::default(),
+                })
+            }
+        }
+
+        fn rollback(self) -> impl Future<Output = Result<(), StorageError>> + Send {
+            async { Ok(()) }
+        }
     }
 
     #[tokio::test]
@@ -667,6 +1073,284 @@ mod tests {
         assert_eq!(stats.delete_batches, 1);
         assert_eq!(commit.stats.put_entries, 2);
         assert_eq!(commit.stats.deleted_entries, 1);
+    }
+
+    #[tokio::test]
+    async fn fallback_mutations_retain_caller_buffers_without_payload_copies() {
+        const PUTS: usize = 1024;
+        const DELETES: usize = 1024;
+        const KEY_BYTES: usize = 1 + size_of::<u32>();
+        const VALUE_BYTES: usize = 8;
+
+        let mut writes = StorageWriteSet::new();
+        writes.reserve_space(space(), PUTS, DELETES);
+        let mut put_key_pointers = Vec::with_capacity(PUTS);
+        let mut value_pointers = Vec::with_capacity(PUTS);
+        for index in 0..PUTS {
+            let mut key = Vec::with_capacity(KEY_BYTES);
+            key.push(b'p');
+            key.extend_from_slice(&(index as u32).to_be_bytes());
+            let key = Bytes::from(key);
+            let value = Bytes::from(vec![index as u8; VALUE_BYTES]);
+            put_key_pointers.push(key.as_ptr() as usize);
+            value_pointers.push(value.as_ptr() as usize);
+            writes.put(space(), Key(key), StoredValue { bytes: value });
+        }
+        let mut delete_key_pointers = Vec::with_capacity(DELETES);
+        for index in 0..DELETES {
+            let mut key = Vec::with_capacity(KEY_BYTES);
+            key.push(b'd');
+            key.extend_from_slice(&(index as u32).to_be_bytes());
+            let key = Bytes::from(key);
+            delete_key_pointers.push(key.as_ptr() as usize);
+            writes.delete(space(), Key(key));
+        }
+
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.spaces, 1);
+        assert_eq!(arenas.put_descriptors, PUTS);
+        assert_eq!(arenas.delete_descriptors, DELETES);
+        assert_eq!(arenas.key_inline_bytes, 0);
+        assert_eq!(arenas.value_inline_bytes, 0);
+        assert_eq!(arenas.key_inline_capacity, 0);
+        assert_eq!(arenas.value_inline_capacity, 0);
+        assert_eq!(arenas.key_inline_allocations, 0);
+        assert_eq!(arenas.value_inline_allocations, 0);
+        assert_eq!(arenas.key_shared_buffers, PUTS + DELETES);
+        assert_eq!(arenas.value_shared_buffers, PUTS);
+        assert_eq!(arenas.key_shared_bytes, (PUTS + DELETES) * KEY_BYTES);
+        assert_eq!(arenas.value_shared_bytes, PUTS * VALUE_BYTES);
+        assert!(arenas.put_descriptor_capacity >= PUTS);
+        assert!(arenas.delete_descriptor_capacity >= DELETES);
+        assert!(arenas.key_shared_capacity >= PUTS + DELETES);
+        assert!(arenas.value_shared_capacity >= PUTS);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower retained caller buffers");
+        let (_, batch) = backend.puts.pop().expect("one put batch");
+        assert_eq!(batch.entries.len(), PUTS);
+        assert_eq!(
+            batch
+                .entries
+                .iter()
+                .map(|entry| entry.key.0.as_ptr() as usize)
+                .collect::<Vec<_>>(),
+            put_key_pointers
+        );
+        assert_eq!(
+            batch
+                .entries
+                .iter()
+                .map(|entry| entry.value.bytes.as_ptr() as usize)
+                .collect::<Vec<_>>(),
+            value_pointers
+        );
+        let (_, deletes) = backend.deletes.pop().expect("one delete batch");
+        assert_eq!(deletes.len(), DELETES);
+        assert_eq!(
+            deletes
+                .iter()
+                .map(|key| key.0.as_ptr() as usize)
+                .collect::<Vec<_>>(),
+            delete_key_pointers
+        );
+    }
+
+    #[tokio::test]
+    async fn encoded_batch_ingress_retains_caller_key_and_value_buffers() {
+        let key_bytes = Bytes::from(b"abc".to_vec());
+        let value_bytes = Bytes::from(b"AABB".to_vec());
+        let key_probe = key_bytes.clone();
+        let value_probe = value_bytes.clone();
+        let batch = EncodedMutationBatch::try_new(
+            key_bytes,
+            value_bytes,
+            vec![
+                EncodedPut {
+                    key: BufferRange::new(0, 1),
+                    value: BufferRange::new(0, 2),
+                },
+                EncodedPut {
+                    key: BufferRange::new(2, 1),
+                    value: BufferRange::new(2, 2),
+                },
+            ],
+            vec![BufferRange::new(1, 1)],
+        )
+        .expect("valid encoded batch");
+
+        let mut writes = StorageWriteSet::new();
+        writes.stage_encoded_batch(space(), batch);
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.key_inline_bytes, 0);
+        assert_eq!(arenas.value_inline_bytes, 0);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        assert_eq!(arenas.put_descriptors, 2);
+        assert_eq!(arenas.delete_descriptors, 1);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower encoded batch");
+        let (_, puts) = backend.puts.pop().expect("one put batch");
+        assert_eq!(
+            puts.entries[0].key.0.as_ptr(),
+            key_probe.as_ptr(),
+            "first encoded key must slice the caller buffer"
+        );
+        assert_eq!(
+            puts.entries[1].key.0.as_ptr(),
+            key_probe.as_ptr().wrapping_add(2),
+            "second encoded key must slice the caller buffer"
+        );
+        assert_eq!(
+            puts.entries[0].value.bytes.as_ptr(),
+            value_probe.as_ptr(),
+            "first encoded value must slice the caller buffer"
+        );
+        assert_eq!(
+            puts.entries[1].value.bytes.as_ptr(),
+            value_probe.as_ptr().wrapping_add(2),
+            "second encoded value must slice the caller buffer"
+        );
+        let (_, deletes) = backend.deletes.pop().expect("one delete batch");
+        assert_eq!(deletes[0].0.as_ptr(), key_probe.as_ptr().wrapping_add(1));
+    }
+
+    #[test]
+    fn content_addressed_encoded_batch_coalesces_without_splitting_arenas() {
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"aab"),
+            Bytes::from_static(b"AAB"),
+            vec![
+                EncodedPut {
+                    key: BufferRange::new(0, 1),
+                    value: BufferRange::new(0, 1),
+                },
+                EncodedPut {
+                    key: BufferRange::new(1, 1),
+                    value: BufferRange::new(1, 1),
+                },
+                EncodedPut {
+                    key: BufferRange::new(2, 1),
+                    value: BufferRange::new(2, 1),
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("valid content-addressed batch");
+        let mut writes = StorageWriteSet::new();
+        writes.stage_content_addressed_encoded_batch(space(), batch.clone());
+        writes.stage_content_addressed_encoded_batch(space(), batch);
+
+        let arenas = writes.arena_stats();
+        assert_eq!(writes.stats().staged_puts, 2);
+        assert_eq!(arenas.put_descriptors, 2);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        writes
+            .validate()
+            .expect("identical content-addressed descriptors should coalesce");
+    }
+
+    #[tokio::test]
+    async fn small_fallback_inputs_retain_existing_bytes() {
+        let put_key = Bytes::from(vec![b'k'; 8]);
+        let put_value = Bytes::from(vec![b'v'; 8]);
+        let delete_key = Bytes::from(vec![b'd'; 8]);
+        let put_key_pointer = put_key.as_ptr() as usize;
+        let put_value_pointer = put_value.as_ptr() as usize;
+        let delete_key_pointer = delete_key.as_ptr() as usize;
+        let mut writes = StorageWriteSet::new();
+        writes.put(space(), Key(put_key), StoredValue { bytes: put_value });
+        writes.delete(space(), Key(delete_key));
+
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.key_inline_bytes, 0);
+        assert_eq!(arenas.value_inline_bytes, 0);
+        assert_eq!(arenas.key_shared_buffers, 2);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, 16);
+        assert_eq!(arenas.value_shared_bytes, 8);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower retained fallback bytes");
+        let put = &backend.puts[0].1.entries[0];
+        assert_eq!(put.key.0.as_ptr() as usize, put_key_pointer);
+        assert_eq!(put.value.bytes.as_ptr() as usize, put_value_pointer);
+        assert_eq!(
+            backend.deletes[0].1[0].0.as_ptr() as usize,
+            delete_key_pointer
+        );
+    }
+
+    #[tokio::test]
+    async fn extending_write_sets_remaps_source_arenas_without_row_copies() {
+        let mut writes = StorageWriteSet::new();
+        writes.put(space(), key("b"), value("B"));
+
+        let mut other = StorageWriteSet::new();
+        other.put(space(), key("a"), value("A"));
+        other.delete(space(), key("c"));
+        writes.extend(other);
+
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.put_descriptors, 2);
+        assert_eq!(arenas.delete_descriptors, 1);
+        assert_eq!(arenas.key_shared_buffers, 3);
+        assert_eq!(arenas.value_shared_buffers, 2);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower extended arenas");
+        assert_eq!(
+            backend.puts[0]
+                .1
+                .entries
+                .iter()
+                .map(|entry| entry.key.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"a".as_slice(), b"b".as_slice()]
+        );
+        assert_eq!(
+            backend.puts[0]
+                .1
+                .entries
+                .iter()
+                .map(|entry| entry.value.bytes.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"A".as_slice(), b"B".as_slice()]
+        );
+        assert_eq!(backend.deletes[0].1[0].0.as_ref(), b"c");
+    }
+
+    #[test]
+    fn encoded_batch_rejects_out_of_bounds_descriptors() {
+        let error = EncodedMutationBatch::try_new(
+            Bytes::from_static(b"k"),
+            Bytes::from_static(b"v"),
+            vec![EncodedPut {
+                key: BufferRange::new(1, 1),
+                value: BufferRange::new(0, 1),
+            }],
+            Vec::new(),
+        )
+        .expect_err("key range exceeds buffer");
+
+        assert!(matches!(
+            error,
+            EncodedMutationBatchError::PutKeyOutOfBounds { index: 0, .. }
+        ));
     }
 
     #[test]

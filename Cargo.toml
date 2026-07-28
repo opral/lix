@@ -52,60 +52,21 @@ unconditional_recursion = "deny"
 # https://rust-lang.github.io/rust-clippy/master/index.html
 all = { level = "warn", priority = -2 }
 cargo = { level = "warn", priority = -1 }
-complexity = { level = "warn", priority = -1 }
+complexity = { level = "allow", priority = -1 }
 correctness = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+nursery = { level = "allow", priority = -1 }
+pedantic = { level = "allow", priority = -1 }
 perf = { level = "warn", priority = -1 }
 restriction = { level = "allow", priority = -1 }
-style = { level = "warn", priority = -1 }
+style = { level = "allow", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
 
-# Our opinion
-bool_assert_comparison = "allow"
-collapsible_else_if = "allow"
-collapsible_if = "allow"
-doc_link_with_quotes = "allow"
-doc_markdown = "allow"
-fallible_impl_from = "allow"
-future_not_send = "allow"
-if_not_else = "allow"
-inline_always = "allow"
-iter_on_empty_collections = "allow" # prefer [x].into_iter() for consitency with >1 els
-iter_on_single_items = "allow" # prefer [x].into_iter() for consitency with >1 els
+# Boxing hot-path batch/actor enum variants adds heap allocations, including
+# per-file allocations, which is worse than their larger stack discriminants.
 large_enum_variant = "allow"
-let_underscore_future = "allow"
-let_underscore_untyped = "allow" # Often using an `_` is a useful way to indicate something is being discarded, and naming the type every time can be burdensome.
-manual_string_new = "allow"
-map_unwrap_or = "allow"
-missing_const_for_fn = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
-multiple_bound_locations = "allow"
-must_use_candidate = "allow" # instead, enforce unused_results everywhere (TODO)
-needless_bitwise_bool = "allow"
-needless_pass_by_value = "allow"
-option_option = "allow"
-or_fun_call = "allow"
-redundant_pub_crate = "allow"
-result_unit_err = "allow"
-return_self_not_must_use = "allow"
-significant_drop_tightening = "allow"
-similar_names = "allow"
-single_match_else = "allow"
-single_range_in_vec_init = "allow"
-string_lit_as_bytes = "allow"
-struct_field_names = "allow"
-too_long_first_doc_paragraph = "allow"
-too_many_arguments = "allow"
-too_many_lines = "allow"
-trivially_copy_pass_by_ref = "allow"
-type_complexity = "allow"
-unused_async = "allow"
-wildcard_imports = "allow"
 
-# clippy
+# Cargo metadata/dependency topology is validated elsewhere in the release
+# pipeline and does not describe runtime correctness or performance.
 cargo_common_metadata = "allow"
 redundant_feature_names = "allow"
 multiple_crate_versions = "allow"

@@ -14,17 +14,21 @@ use std::fmt;
 use async_trait::async_trait;
 use bytes::Bytes;
 
+#[cfg(test)]
+use super::codec::encode_commit_record;
 use super::codec::{
-    decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
-    encode_commit_change_ref_chunk, encode_commit_record, encode_transaction_change_record,
+    append_change_record, append_commit_change_ref_chunk, append_commit_change_ref_chunk_entries,
+    append_commit_record, append_transaction_change_record, decode_change_record,
+    decode_commit_change_ref_chunk,
 };
 use super::store::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE, COMMIT_CHANGE_ID_SPACE,
-    COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_id_from_key, change_key,
-    commit_change_id_index_format_key, commit_change_id_index_format_value, commit_change_id_key,
-    commit_change_id_value, commit_change_ref_chunk_key, commit_change_ref_chunk_prefix,
-    commit_id_from_key, commit_key,
+    CHANGE_SPACE, COMMIT_CHANGE_ID_INDEX_FORMAT_KEY, COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
+    COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_id_from_key,
+    change_key, commit_change_id_index_format_key, commit_change_id_key,
+    commit_change_ref_chunk_key, commit_change_ref_chunk_prefix, commit_id_from_key, commit_key,
 };
+#[cfg(test)]
+use super::store::{commit_change_id_index_format_value, commit_change_id_value};
 use crate::changelog::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeScanBatch, ChangeScanRequest,
     ChangelogAppend, ChangelogReader, ChangelogWriter, CommitChangeRefChunk, CommitChangeRefSet,
@@ -32,12 +36,13 @@ use crate::changelog::{
     CommitScanBatch, CommitScanRequest, TransactionChangelogAppend,
 };
 use crate::changelog::{GcPlan, GcRoot};
-use crate::json_store::{JsonRef, JsonSlot, JsonStoreContext};
+use crate::json_store::{JsonRef, JsonSlot, JsonSlotRef, JsonStoreContext};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
-    PointReadPlan, ScanPlan, StorageAdapter, StorageAdapterRead, StorageCoreProjection,
-    StorageGetManyRequest, StorageGetOptions, StorageKey, StoragePrefix, StorageProjectedValue,
-    StorageReadOptions, StorageScanOptions, StorageSpace, StorageWriteSet,
+    BufferRange, EncodedMutationBatch, EncodedPut, PointReadPlan, ScanPlan, StorageAdapter,
+    StorageAdapterRead, StorageCoreProjection, StorageGetManyRequest, StorageGetOptions,
+    StorageKey, StoragePrefix, StorageProjectedValue, StorageReadOptions, StorageScanOptions,
+    StorageSpace, StorageWriteSet,
 };
 use crate::{LixError, storage_codec};
 
@@ -90,6 +95,163 @@ pub(crate) struct ChangelogStoreWriter<'a, S: ?Sized> {
     staged_changes: HashMap<ChangeId, ChangeRecord>,
     staged_change_deletes: HashSet<ChangeId>,
     staged_commit_change_ref_chunks: HashMap<CommitId, Vec<CommitChangeRefChunk>>,
+}
+
+struct EncodedChangelogBatch {
+    key_bytes: Vec<u8>,
+    value_bytes: Vec<u8>,
+    puts: Vec<EncodedPut>,
+}
+
+impl EncodedChangelogBatch {
+    fn with_capacity(puts: usize, key_bytes: usize, value_bytes: usize) -> Self {
+        Self {
+            key_bytes: Vec::with_capacity(key_bytes),
+            value_bytes: Vec::with_capacity(value_bytes),
+            puts: Vec::with_capacity(puts),
+        }
+    }
+
+    fn try_put(
+        &mut self,
+        key: &[u8],
+        encode_value: impl FnOnce(&mut Vec<u8>) -> Result<std::ops::Range<usize>, LixError>,
+    ) -> Result<(), LixError> {
+        let value = encode_value(&mut self.value_bytes)?;
+        self.put_range(key, value);
+        Ok(())
+    }
+
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        let start = self.value_bytes.len();
+        self.value_bytes.extend_from_slice(value);
+        self.put_range(key, start..self.value_bytes.len());
+    }
+
+    fn put_range(&mut self, key: &[u8], value: std::ops::Range<usize>) {
+        let key_start = self.key_bytes.len();
+        self.key_bytes.extend_from_slice(key);
+        self.puts.push(EncodedPut {
+            key: BufferRange::new(key_start, self.key_bytes.len() - key_start),
+            value: BufferRange::new(value.start, value.end - value.start),
+        });
+    }
+
+    fn stage(self, writes: &mut StorageWriteSet, space: StorageSpace) {
+        if self.puts.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(self.key_bytes),
+            Bytes::from(self.value_bytes),
+            self.puts,
+            Vec::new(),
+        )
+        .expect("changelog ranges originate in the supplied encoded buffers");
+        writes.stage_encoded_batch(space, batch);
+    }
+}
+
+fn transaction_change_value_capacity(
+    change: &crate::changelog::TransactionChangeRecordRef<'_>,
+) -> usize {
+    96usize
+        .saturating_add(change.schema_key.len())
+        .saturating_add(change.entity_pk.estimated_heap_bytes())
+        .saturating_add(change.file_id.map_or(0, str::len))
+        .saturating_add(change.origin_key.map_or(0, str::len))
+        .saturating_add(json_slot_ref_value_capacity(change.snapshot))
+        .saturating_add(json_slot_ref_value_capacity(change.metadata))
+}
+
+fn change_value_capacity(change: &ChangeRecord) -> usize {
+    let change = crate::changelog::TransactionChangeRecordRef::from(change);
+    transaction_change_value_capacity(&change)
+}
+
+fn json_slot_ref_value_capacity(slot: JsonSlotRef<'_>) -> usize {
+    match slot {
+        JsonSlotRef::None => 1,
+        JsonSlotRef::Ref(_) => 33,
+        JsonSlotRef::Inline(json) => json.len().saturating_add(9),
+    }
+}
+
+fn commit_value_capacity(commit: &CommitRecord) -> usize {
+    96usize
+        .saturating_add(commit.parent_commit_ids.len().saturating_mul(16))
+        .saturating_add(
+            commit
+                .author_account_ids
+                .iter()
+                .map(String::len)
+                .sum::<usize>(),
+        )
+}
+
+fn commit_change_ref_chunk_value_capacity(chunk: &CommitChangeRefChunk) -> usize {
+    16usize.saturating_add(chunk.entries.len().saturating_mul(16))
+}
+
+fn transaction_commit_change_ref_batch(
+    mut refs: Vec<CommitChangeRefSet>,
+) -> Result<EncodedChangelogBatch, LixError> {
+    let (chunk_count, value_capacity) =
+        refs.iter()
+            .fold((0usize, 0usize), |(chunks, values), refs| {
+                let ref_chunks = commit_change_ref_chunk_count(refs.entries.len());
+                (
+                    chunks.saturating_add(ref_chunks),
+                    values
+                        .saturating_add(ref_chunks.saturating_mul(16))
+                        .saturating_add(refs.entries.len().saturating_mul(16)),
+                )
+            });
+    let mut batch = EncodedChangelogBatch::with_capacity(
+        chunk_count,
+        chunk_count.saturating_mul(20),
+        value_capacity,
+    );
+    for refs in &mut refs {
+        refs.entries.sort_unstable();
+        if refs.entries.is_empty() {
+            try_put_commit_change_ref_entries(&mut batch, refs.commit_id, 0, &[])?;
+            continue;
+        }
+        for (chunk_no, entries) in refs
+            .entries
+            .chunks(COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES)
+            .enumerate()
+        {
+            try_put_commit_change_ref_entries(
+                &mut batch,
+                refs.commit_id,
+                chunk_no as u32,
+                entries,
+            )?;
+        }
+    }
+    Ok(batch)
+}
+
+fn commit_change_ref_chunk_count(entry_count: usize) -> usize {
+    entry_count
+        .max(1)
+        .div_ceil(COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES)
+}
+
+fn try_put_commit_change_ref_entries(
+    batch: &mut EncodedChangelogBatch,
+    commit_id: CommitId,
+    chunk_no: u32,
+    entries: &[ChangeId],
+) -> Result<(), LixError> {
+    let mut key = [0; 20];
+    key[..16].copy_from_slice(commit_id.as_uuid().as_bytes());
+    key[16..].copy_from_slice(&chunk_no.to_be_bytes());
+    batch.try_put(&key, |bytes| {
+        append_commit_change_ref_chunk_entries(bytes, entries)
+    })
 }
 
 #[derive(Debug)]
@@ -407,46 +569,41 @@ where
             changes,
             commit_change_refs,
         } = append;
-        self.writes.reserve_space(CHANGE_SPACE, changes.len(), 0);
-        self.writes.reserve_space(COMMIT_SPACE, commits.len(), 0);
-        self.writes
-            .reserve_space(COMMIT_CHANGE_ID_SPACE, commits.len(), 0);
-
-        for change in changes {
-            self.writes.put(
-                CHANGE_SPACE,
-                change_key(change.change_id),
-                encode_transaction_change_record(&change)?,
-            );
-        }
-
-        let chunks = chunk_commit_change_refs(commit_change_refs);
-        self.writes.reserve_space(
-            COMMIT_CHANGE_REF_CHUNK_SPACE,
-            chunks.values().map(Vec::len).sum(),
-            0,
+        let chunk_batch = transaction_commit_change_ref_batch(commit_change_refs)?;
+        let mut change_batch = EncodedChangelogBatch::with_capacity(
+            changes.len(),
+            changes.len() * 16,
+            changes.iter().map(transaction_change_value_capacity).sum(),
         );
-        for commit in commits {
-            self.writes.put(
-                COMMIT_SPACE,
-                commit_key(commit.commit_id),
-                encode_commit_record(&commit)?,
-            );
-            self.writes.put(
-                COMMIT_CHANGE_ID_SPACE,
-                commit_change_id_key(commit.change_id),
-                commit_change_id_value(commit.commit_id),
+        let mut commit_batch = EncodedChangelogBatch::with_capacity(
+            commits.len(),
+            commits.len() * 16,
+            commits.iter().map(commit_value_capacity).sum(),
+        );
+        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
+            commits.len(),
+            commits.len() * 16,
+            commits.len() * 16,
+        );
+
+        for change in &changes {
+            change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
+                append_transaction_change_record(bytes, change)
+            })?;
+        }
+        for commit in &commits {
+            commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
+                append_commit_record(bytes, commit)
+            })?;
+            commit_change_id_batch.put(
+                commit.change_id.as_uuid().as_bytes(),
+                commit.commit_id.as_uuid().as_bytes(),
             );
         }
-        for (commit_id, commit_chunks) in chunks {
-            for (chunk_no, chunk) in commit_chunks.iter().enumerate() {
-                self.writes.put(
-                    COMMIT_CHANGE_REF_CHUNK_SPACE,
-                    commit_change_ref_chunk_key(commit_id, chunk_no as u32),
-                    encode_commit_change_ref_chunk(chunk)?,
-                );
-            }
-        }
+        change_batch.stage(self.writes, CHANGE_SPACE);
+        commit_batch.stage(self.writes, COMMIT_SPACE);
+        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
+        chunk_batch.stage(self.writes, COMMIT_CHANGE_REF_CHUNK_SPACE);
         Ok(())
     }
 
@@ -455,60 +612,81 @@ where
         append: ChangelogAppend,
         stage_commit_change_id_index_format: bool,
     ) -> Result<(), LixError> {
+        let ChangelogAppend {
+            commits,
+            changes,
+            commit_change_refs,
+        } = append;
+        let chunks = chunk_commit_change_refs(commit_change_refs);
+        let chunk_count = chunks.values().map(Vec::len).sum::<usize>();
+        let mut change_batch = EncodedChangelogBatch::with_capacity(
+            changes.len(),
+            changes.len() * 16,
+            changes.iter().map(change_value_capacity).sum(),
+        );
+        let mut commit_batch = EncodedChangelogBatch::with_capacity(
+            commits.len(),
+            commits.len() * 16,
+            commits.iter().map(commit_value_capacity).sum(),
+        );
+        let reverse_count = commits.len() + usize::from(stage_commit_change_id_index_format);
+        let mut commit_change_id_batch = EncodedChangelogBatch::with_capacity(
+            reverse_count,
+            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.len(),
+            commits.len() * 16 + COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.len(),
+        );
+        let mut chunk_batch = EncodedChangelogBatch::with_capacity(
+            chunk_count,
+            chunk_count * 20,
+            chunks
+                .values()
+                .flat_map(|chunks| chunks.iter())
+                .map(commit_change_ref_chunk_value_capacity)
+                .sum(),
+        );
         if stage_commit_change_id_index_format {
-            self.writes.put(
-                COMMIT_CHANGE_ID_SPACE,
-                commit_change_id_index_format_key(),
-                commit_change_id_index_format_value(),
+            commit_change_id_batch.put(
+                COMMIT_CHANGE_ID_INDEX_FORMAT_KEY,
+                COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE,
             );
         }
-
-        self.writes
-            .reserve_space(CHANGE_SPACE, append.changes.len(), 0);
-        self.writes
-            .reserve_space(COMMIT_SPACE, append.commits.len(), 0);
-        self.writes
-            .reserve_space(COMMIT_CHANGE_ID_SPACE, append.commits.len(), 0);
-        self.staged_changes.reserve(append.changes.len());
-        self.staged_commits.reserve(append.commits.len());
-
-        for change in append.changes {
-            self.writes.put(
-                CHANGE_SPACE,
-                change_key(change.change_id),
-                encode_change_record(&change)?,
+        for change in &changes {
+            change_batch.try_put(change.change_id.as_uuid().as_bytes(), |bytes| {
+                append_change_record(bytes, change)
+            })?;
+        }
+        for commit in &commits {
+            commit_batch.try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
+                append_commit_record(bytes, commit)
+            })?;
+            commit_change_id_batch.put(
+                commit.change_id.as_uuid().as_bytes(),
+                commit.commit_id.as_uuid().as_bytes(),
             );
+        }
+        for (commit_id, commit_chunks) in &chunks {
+            for (chunk_no, chunk) in commit_chunks.iter().enumerate() {
+                let mut key = [0; 20];
+                key[..16].copy_from_slice(commit_id.as_uuid().as_bytes());
+                key[16..].copy_from_slice(&(chunk_no as u32).to_be_bytes());
+                chunk_batch.try_put(&key, |bytes| append_commit_change_ref_chunk(bytes, chunk))?;
+            }
+        }
+
+        change_batch.stage(self.writes, CHANGE_SPACE);
+        commit_batch.stage(self.writes, COMMIT_SPACE);
+        commit_change_id_batch.stage(self.writes, COMMIT_CHANGE_ID_SPACE);
+        chunk_batch.stage(self.writes, COMMIT_CHANGE_REF_CHUNK_SPACE);
+
+        self.staged_changes.reserve(changes.len());
+        self.staged_commits.reserve(commits.len());
+        for change in changes {
             self.staged_changes.insert(change.change_id, change);
         }
-
-        let chunks = chunk_commit_change_refs(append.commit_change_refs);
-        self.writes.reserve_space(
-            COMMIT_CHANGE_REF_CHUNK_SPACE,
-            chunks.values().map(Vec::len).sum(),
-            0,
-        );
-        for commit in append.commits {
-            self.writes.put(
-                COMMIT_SPACE,
-                commit_key(commit.commit_id),
-                encode_commit_record(&commit)?,
-            );
-            self.writes.put(
-                COMMIT_CHANGE_ID_SPACE,
-                commit_change_id_key(commit.change_id),
-                commit_change_id_value(commit.commit_id),
-            );
+        for commit in commits {
             self.staged_commits.insert(commit.commit_id, commit);
         }
-
         for (commit_id, commit_chunks) in chunks {
-            for (chunk_no, chunk) in commit_chunks.iter().enumerate() {
-                self.writes.put(
-                    COMMIT_CHANGE_REF_CHUNK_SPACE,
-                    commit_change_ref_chunk_key(commit_id, chunk_no as u32),
-                    encode_commit_change_ref_chunk(chunk)?,
-                );
-            }
             self.staged_commit_change_ref_chunks
                 .insert(commit_id, commit_chunks);
         }
@@ -1086,8 +1264,25 @@ fn chunk_one_commit_change_refs(
     }
     refs.entries
         .chunks(max_entries)
-        .map(|entries| commit_change_ref_chunk(refs.commit_id, entries.to_vec()))
+        .map(|entries| {
+            #[cfg(test)]
+            OWNED_COMMIT_CHANGE_REF_IDS_COPIED.with(|copied| {
+                copied.set(copied.get().saturating_add(entries.len()));
+            });
+            commit_change_ref_chunk(refs.commit_id, entries.to_vec())
+        })
         .collect()
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static OWNED_COMMIT_CHANGE_REF_IDS_COPIED: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn owned_commit_change_ref_ids_copied() -> usize {
+    OWNED_COMMIT_CHANGE_REF_IDS_COPIED.with(std::cell::Cell::get)
 }
 
 fn commit_change_ref_chunk(commit_id: CommitId, entries: Vec<ChangeId>) -> CommitChangeRefChunk {
@@ -1537,6 +1732,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+
     use async_trait::async_trait;
 
     use crate::changelog::test_support::{
@@ -1578,6 +1775,166 @@ mod tests {
         let mut ids = labels.into_iter().map(change_id).collect::<Vec<_>>();
         ids.sort();
         ids
+    }
+
+    #[derive(Default)]
+    struct CapturingChangelogWrite {
+        puts: Vec<(crate::storage::SpaceId, crate::storage::PutBatch)>,
+    }
+
+    impl crate::storage::StorageWrite for CapturingChangelogWrite {
+        fn put_many(
+            &mut self,
+            space: crate::storage::SpaceId,
+            entries: crate::storage::PutBatch,
+        ) -> impl Future<Output = Result<(), crate::storage::StorageError>> + Send {
+            self.puts.push((space, entries));
+            async { Ok(()) }
+        }
+
+        fn delete_many(
+            &mut self,
+            _space: crate::storage::SpaceId,
+            _keys: &[crate::storage::Key],
+        ) -> impl Future<Output = Result<(), crate::storage::StorageError>> + Send {
+            async { Ok(()) }
+        }
+
+        fn delete_range(
+            &mut self,
+            _space: crate::storage::SpaceId,
+            _range: crate::storage::KeyRange,
+        ) -> impl Future<Output = Result<(), crate::storage::StorageError>> + Send {
+            async { Ok(()) }
+        }
+
+        fn commit(
+            self,
+        ) -> impl Future<
+            Output = Result<crate::storage::CommitResult, crate::storage::StorageError>,
+        > + Send {
+            async {
+                Ok(crate::storage::CommitResult {
+                    commit_id: None,
+                    stats: Default::default(),
+                })
+            }
+        }
+
+        fn rollback(self) -> impl Future<Output = Result<(), crate::storage::StorageError>> + Send {
+            async { Ok(()) }
+        }
+    }
+
+    #[test]
+    fn changelog_batch_staging_retains_encoded_arenas() {
+        let commit = test_commit_record();
+        let mut batch = EncodedChangelogBatch::with_capacity(1, 16, commit_value_capacity(&commit));
+        batch
+            .try_put(commit.commit_id.as_uuid().as_bytes(), |bytes| {
+                append_commit_record(bytes, &commit)
+            })
+            .expect("encode commit");
+        let mut writes = StorageWriteSet::new();
+
+        batch.stage(&mut writes, COMMIT_SPACE);
+
+        let stats = writes.arena_stats();
+        assert_eq!(stats.spaces, 1);
+        assert_eq!(stats.put_descriptors, 1);
+        assert_eq!(stats.key_inline_bytes, 0);
+        assert_eq!(stats.value_inline_bytes, 0);
+        assert_eq!(stats.key_shared_buffers, 1);
+        assert_eq!(stats.value_shared_buffers, 1);
+    }
+
+    #[tokio::test]
+    async fn transaction_ref_batch_uses_one_arena_without_owned_chunk_copies() {
+        const ENTRY_COUNT: usize = COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES * 2 + 1;
+
+        let commit_id = CommitId::for_test_label("shared-ref-arena-commit");
+        let mut expected = (0..ENTRY_COUNT)
+            .rev()
+            .map(|index| ChangeId::for_test_label(&format!("shared-ref-arena-{index}")))
+            .collect::<Vec<_>>();
+        let copied_before = owned_commit_change_ref_ids_copied();
+        let batch = transaction_commit_change_ref_batch(vec![CommitChangeRefSet {
+            commit_id,
+            entries: expected.clone(),
+        }])
+        .expect("encode transaction change-ref chunks");
+        expected.sort_unstable();
+
+        assert_eq!(
+            owned_commit_change_ref_ids_copied(),
+            copied_before,
+            "terminal transaction staging must encode borrowed entry slices without owned chunk copies"
+        );
+        assert_eq!(batch.puts.len(), 3);
+        let key_pointer = batch.key_bytes.as_ptr();
+        let value_pointer = batch.value_bytes.as_ptr();
+        let mut writes = StorageWriteSet::new();
+        batch.stage(&mut writes, COMMIT_CHANGE_REF_CHUNK_SPACE);
+        let stats = writes.arena_stats();
+        assert_eq!(stats.spaces, 1);
+        assert_eq!(stats.put_descriptors, 3);
+        assert_eq!(stats.key_shared_buffers, 1);
+        assert_eq!(stats.value_shared_buffers, 1);
+        assert_eq!(stats.key_inline_bytes, 0);
+        assert_eq!(stats.value_inline_bytes, 0);
+
+        let mut backend = CapturingChangelogWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower shared transaction change-ref batch");
+        let (space, puts) = backend.puts.pop().expect("one chunk put batch");
+        assert_eq!(space, COMMIT_CHANGE_REF_CHUNK_SPACE.id);
+        assert_eq!(puts.entries.len(), 3);
+        for (chunk_no, put) in puts.entries.iter().enumerate() {
+            assert_eq!(
+                put.key.0.as_ptr(),
+                key_pointer.wrapping_add(chunk_no * 20),
+                "chunk keys must slice the one encoded key arena"
+            );
+        }
+        assert_eq!(puts.entries[0].value.bytes.as_ptr(), value_pointer);
+        for pair in puts.entries.windows(2) {
+            assert_eq!(
+                pair[1].value.bytes.as_ptr(),
+                pair[0]
+                    .value
+                    .bytes
+                    .as_ptr()
+                    .wrapping_add(pair[0].value.bytes.len()),
+                "chunk values must be adjacent slices of one encoded value arena"
+            );
+        }
+        let chunks = puts
+            .entries
+            .iter()
+            .map(|put| decode_commit_change_ref_chunk(&put.value.bytes, commit_id))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("decode staged transaction change-ref chunks");
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.entries.len())
+                .collect::<Vec<_>>(),
+            vec![
+                COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES,
+                COMMIT_CHANGE_REF_CHUNK_MAX_ENTRIES,
+                1,
+            ]
+        );
+        assert_eq!(
+            chunks
+                .into_iter()
+                .flat_map(|chunk| chunk.entries)
+                .collect::<Vec<_>>(),
+            expected,
+            "direct slice encoding must preserve sorted chunk codec output"
+        );
     }
 
     fn append_with_commit_count(label: &str, count: usize) -> ChangelogAppend {

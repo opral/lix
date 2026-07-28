@@ -7,7 +7,9 @@ use crate::checkpoint::{
 use crate::gc::CheckpointGcState;
 use crate::storage_adapter::Storage;
 use crate::tracked_state::{TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow};
-use crate::transaction::types::{StagedCommitChangeRef, TransactionWrite, TransactionWriteMode};
+use crate::transaction::types::{
+    RawWriteBatch, StagedCommitChangeBatchBuilder, TransactionWrite, TransactionWriteMode,
+};
 
 use super::context::SessionContext;
 
@@ -109,26 +111,24 @@ where
                                 .await?
                                 .entries
                         };
-                        entries
-                            .into_iter()
-                            .filter(|entry| {
-                                entry.identity.schema_key != CHECKPOINT_MARKER_SCHEMA_KEY
-                            })
-                            .map(|entry| {
-                                entry
-                                    .after
-                                    .map(|row| selected_change_ref(row, entry.kind))
-                                    .ok_or_else(|| {
-                                        LixError::new(
-                                            LixError::CODE_INTERNAL_ERROR,
-                                            format!(
-                                                "working change for schema '{}' entity {:?} has no target row",
-                                                entry.identity.schema_key, entry.identity.entity_pk
-                                            ),
-                                        )
-                                    })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?
+                        let mut selected_changes =
+                            StagedCommitChangeBatchBuilder::with_capacity(entries.len());
+                        for entry in entries.into_iter().filter(|entry| {
+                            entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY
+                        }) {
+                            let row = entry.after.ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INTERNAL_ERROR,
+                                    format!(
+                                        "working change for schema '{}' entity {:?} has no target row",
+                                        entry.identity.schema_key(),
+                                        entry.identity.entity_pk()
+                                    ),
+                                )
+                            })?;
+                            push_selected_change(&mut selected_changes, row, entry.kind);
+                        }
+                        selected_changes.finish()
                     };
                     gc_state.checkpoint_sequence = gc_state
                         .checkpoint_sequence
@@ -145,10 +145,12 @@ where
                     }
                     let gc_due = checkpoint_gc_due(gc_state)?;
 
+                    let mut marker_rows = RawWriteBatch::with_capacity(1);
+                    marker_rows.push(checkpoint_marker_stage_row(&branch_id));
                     transaction
                         .stage_write(TransactionWrite::Rows {
                             mode: TransactionWriteMode::Replace,
-                            rows: vec![checkpoint_marker_stage_row(&branch_id)],
+                            rows: marker_rows,
                         })
                         .await?;
                     let commit_id = transaction.stage_checkpoint_commit(
@@ -199,10 +201,11 @@ pub(crate) fn checkpoint_gc_due(state: CheckpointGcState) -> Result<bool, LixErr
     Ok(checkpoint_age >= age_limit)
 }
 
-fn selected_change_ref(
+fn push_selected_change(
+    selected_changes: &mut StagedCommitChangeBatchBuilder,
     row: TrackedStateDiffRow,
     kind: TrackedStateDiffKind,
-) -> StagedCommitChangeRef {
+) {
     // A changelog change durably stores one timestamp, which rebuild uses for
     // both timestamps when the entity is absent from the parent checkpoint.
     // Canonicalize newly added rows to that representation so checkpoint roots
@@ -211,15 +214,10 @@ fn selected_change_ref(
         TrackedStateDiffKind::Added => row.updated_at,
         TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
     };
-    StagedCommitChangeRef {
-        schema_key: row.schema_key,
-        file_id: row.file_id,
-        entity_pk: row.entity_pk,
-        change_id: row.change_id,
-        deleted: row.deleted,
-        created_at,
-        updated_at: row.updated_at,
-    }
+    let deleted = row.deleted;
+    let change_id = row.change_id;
+    let updated_at = row.updated_at;
+    selected_changes.push(row.identity, change_id, deleted, created_at, updated_at);
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use crate::branch::{
     branch_ref_stage_row,
 };
 use crate::storage_adapter::Storage;
-use crate::transaction::types::{TransactionWrite, TransactionWriteMode};
+use crate::transaction::types::{RawWriteBatch, TransactionWrite, TransactionWriteMode};
 
 use super::context::SessionContext;
 
@@ -74,13 +74,17 @@ where
                         .await?
                 };
 
+                let mut rows = RawWriteBatch::with_capacity(2);
+                rows.push(branch_descriptor_stage_row(
+                    &branch_id,
+                    &options.name,
+                    false,
+                ));
+                rows.push(branch_ref_stage_row(&branch_id, &source_head));
                 transaction
                     .stage_write(TransactionWrite::Rows {
                         mode: TransactionWriteMode::Insert,
-                        rows: vec![
-                            branch_descriptor_stage_row(&branch_id, &options.name, false),
-                            branch_ref_stage_row(&branch_id, &source_head),
-                        ],
+                        rows,
                     })
                     .await?;
 

@@ -17,6 +17,7 @@ use serde_json::{Value as JsonValue, json};
 use crate::binary_cas::BlobHash;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
+use crate::tracked_state::MaterializedTrackedStateRowRef;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::{GLOBAL_BRANCH_ID, LixError};
 
@@ -530,6 +531,7 @@ impl PluginFileOwner {
         Self::from_snapshot(file_id, &snapshot).map(Some)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_tracked_state_row(
         row: &crate::tracked_state::MaterializedTrackedStateRow,
     ) -> Result<Option<Self>, LixError> {
@@ -548,6 +550,33 @@ impl PluginFileOwner {
         }
         let snapshot = serde_json::from_str(
             row.snapshot_content.as_deref().expect("checked above"),
+        )
+        .map_err(|error| {
+            invalid_registry(format!(
+                "tracked plugin owner snapshot is invalid JSON: {error}"
+            ))
+        })?;
+        Self::from_snapshot(file_id, &snapshot).map(Some)
+    }
+
+    pub(crate) fn from_tracked_state_row_ref(
+        row: MaterializedTrackedStateRowRef<'_>,
+    ) -> Result<Option<Self>, LixError> {
+        let file_id = row.file_id().ok_or_else(|| {
+            invalid_registry("plugin owner row is missing its file_id storage identity")
+        })?;
+        if row.schema_key() != KEY_VALUE_SCHEMA_KEY
+            || row.entity_pk().as_single_string().ok() != Some(PLUGIN_OWNER_KEY)
+        {
+            return Err(invalid_registry(
+                "tracked plugin owner row has an invalid storage identity",
+            ));
+        }
+        if row.deleted() || row.snapshot_content().is_none() {
+            return Ok(None);
+        }
+        let snapshot = serde_json::from_str(
+            row.snapshot_content().expect("checked above").as_str(),
         )
         .map_err(|error| {
             invalid_registry(format!(
@@ -1027,8 +1056,8 @@ fn tracked_key_value_write_row(
         .transpose()?;
     Ok(TransactionWriteRow {
         entity_pk: Some(EntityPk::single(key)),
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-        file_id,
+        schema_key: KEY_VALUE_SCHEMA_KEY.into(),
+        file_id: file_id.map(Into::into),
         snapshot,
         metadata: None,
         origin: None,
@@ -1038,7 +1067,7 @@ fn tracked_key_value_write_row(
         change_id: None,
         commit_id: None,
         untracked: false,
-        branch_id: branch_id.to_string(),
+        branch_id: branch_id.into(),
     })
 }
 

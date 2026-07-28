@@ -28,7 +28,7 @@ use crate::sql2::SqlWriteContext;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::write_normalization::{insert_column_is_omitted, mark_omitted_insert_columns};
 use crate::transaction::types::{
-    TransactionFileData, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
+    RawWriteBatch, TransactionFileData, TransactionWrite, TransactionWriteMode,
 };
 
 /// Which `ON CONFLICT` action to take on a conflicting row.
@@ -83,33 +83,30 @@ impl UpsertConflictTarget {
 /// rows plus any file-data blobs (only `lix_file` populates the latter).
 #[derive(Default)]
 pub(super) struct StagedUpsert {
-    pub(super) rows: Vec<TransactionWriteRow>,
+    pub(super) rows: RawWriteBatch,
     pub(super) file_data: Vec<TransactionFileData>,
 }
 
 impl StagedUpsert {
     /// Plain state rows (the common case for every table except `lix_file`).
-    pub(super) fn rows(rows: Vec<TransactionWriteRow>) -> Self {
+    pub(super) fn rows(rows: RawWriteBatch) -> Self {
         Self {
             rows,
             file_data: Vec::new(),
         }
     }
 
-    pub(super) fn with_file_data(
-        rows: Vec<TransactionWriteRow>,
-        file_data: Vec<TransactionFileData>,
-    ) -> Self {
+    pub(super) fn with_file_data(rows: RawWriteBatch, file_data: Vec<TransactionFileData>) -> Self {
         Self { rows, file_data }
     }
 
     fn extend(&mut self, other: Self) {
-        self.rows.extend(other.rows);
+        self.rows.append(other.rows);
         self.file_data.extend(other.file_data);
     }
 
     fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.file_data.is_empty()
+        self.rows.len() == 0 && self.file_data.is_empty()
     }
 }
 

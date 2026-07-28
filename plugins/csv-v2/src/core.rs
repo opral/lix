@@ -3485,11 +3485,7 @@ fn row_snapshot_bytes(
     dialect: Dialect,
 ) -> Result<Vec<u8>, String> {
     let mut output = Vec::with_capacity(128);
-    output.extend_from_slice(b"{\"id\":");
-    serde_json::to_writer(&mut output, id).map_err(|error| error.to_string())?;
-    output.extend_from_slice(b",\"order_key\":");
-    serde_json::to_writer(&mut output, order_key).map_err(|error| error.to_string())?;
-    output.extend_from_slice(b",\"cells\":[");
+    output.extend_from_slice(b"{\"cells\":[");
     let row_start = usize::try_from(chunk.byte_start + row.relative_start).expect("u32 fits usize");
     let row_bytes = blob.range(
         row_start,
@@ -3509,17 +3505,18 @@ fn row_snapshot_bytes(
             force_quote[index / 8] |= 1 << (index % 8);
         }
         let value = decoded_field(&row_bytes, 0, field, dialect.quote)?;
-        serde_json::to_writer(&mut output, &value).map_err(|error| error.to_string())?;
+        write_canonical_json_string(&mut output, &value);
     }
     output.push(b']');
+    output.extend_from_slice(b",\"id\":");
+    write_canonical_json_string(&mut output, id);
     let has_force_quote = !force_quote.is_empty();
     let exceptional_ending = (row.ending() != Some(dialect.terminator)).then_some(row.ending());
     if has_force_quote || exceptional_ending.is_some() {
         output.extend_from_slice(b",\"layout\":{");
         let needs_comma = if has_force_quote {
             output.extend_from_slice(b"\"force_quote\":");
-            serde_json::to_writer(&mut output, &URL_SAFE_NO_PAD.encode(force_quote))
-                .map_err(|error| error.to_string())?;
+            write_canonical_json_string(&mut output, &URL_SAFE_NO_PAD.encode(force_quote));
             true
         } else {
             false
@@ -3529,38 +3526,81 @@ fn row_snapshot_bytes(
                 output.push(b',');
             }
             output.extend_from_slice(b"\"terminator\":");
-            serde_json::to_writer(
+            write_canonical_json_string(
                 &mut output,
                 ending.map_or("", |terminator| terminator.snapshot()),
-            )
-            .map_err(|error| error.to_string())?;
+            );
         }
         output.push(b'}');
     }
+    output.extend_from_slice(b",\"order_key\":");
+    write_canonical_json_string(&mut output, order_key);
     output.push(b'}');
     Ok(output)
 }
 
 fn table_snapshot(dialect: Dialect) -> Vec<u8> {
-    let mut output = String::with_capacity(96);
-    output.push_str("{\"id\":\"root\",\"dialect\":{\"delimiter\":");
+    let mut output = Vec::with_capacity(96);
+    output.extend_from_slice(b"{\"dialect\":{\"delimiter\":");
     let delimiter = char::from(dialect.delimiter).to_string();
-    output.push_str(&serde_json::to_string(&delimiter).expect("string serialization cannot fail"));
-    output.push_str(",\"quote\":");
+    write_canonical_json_string(&mut output, &delimiter);
+    output.extend_from_slice(b",\"quote\":");
     match dialect.quote {
-        Some(quote) => output.push_str(
-            &serde_json::to_string(&char::from(quote).to_string())
-                .expect("string serialization cannot fail"),
-        ),
-        None => output.push_str("null"),
+        Some(quote) => {
+            write_canonical_json_string(&mut output, &char::from(quote).to_string());
+        }
+        None => output.extend_from_slice(b"null"),
     }
-    output.push_str(",\"terminator\":");
-    output.push_str(
-        &serde_json::to_string(dialect.terminator.snapshot())
-            .expect("string serialization cannot fail"),
-    );
-    output.push_str("}}");
-    output.into_bytes()
+    output.extend_from_slice(b",\"terminator\":");
+    write_canonical_json_string(&mut output, dialect.terminator.snapshot());
+    output.extend_from_slice(b"},\"id\":\"root\"}");
+    output
+}
+
+pub(crate) fn write_canonical_json_string(output: &mut Vec<u8>, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = value.as_bytes();
+    output.push(b'"');
+
+    // CSV snapshots are overwhelmingly ASCII and escape-free. Copy that
+    // complete UTF-8 run in one operation instead of decoding and appending
+    // every scalar separately.
+    let Some(mut cursor) = bytes
+        .iter()
+        .position(|&byte| byte <= 0x1f || matches!(byte, b'"' | b'\\'))
+    else {
+        output.extend_from_slice(bytes);
+        output.push(b'"');
+        return;
+    };
+
+    let mut run_start = 0;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if byte > 0x1f && !matches!(byte, b'"' | b'\\') {
+            cursor += 1;
+            continue;
+        }
+        output.extend_from_slice(&bytes[run_start..cursor]);
+        match byte {
+            b'"' => output.extend_from_slice(br#"\""#),
+            b'\\' => output.extend_from_slice(br#"\\"#),
+            b'\x08' => output.extend_from_slice(br#"\b"#),
+            b'\t' => output.extend_from_slice(br#"\t"#),
+            b'\n' => output.extend_from_slice(br#"\n"#),
+            b'\x0c' => output.extend_from_slice(br#"\f"#),
+            b'\r' => output.extend_from_slice(br#"\r"#),
+            byte => {
+                output.extend_from_slice(b"\\u00");
+                output.push(HEX[usize::from(byte >> 4)]);
+                output.push(HEX[usize::from(byte & 0x0f)]);
+            }
+        }
+        cursor += 1;
+        run_start = cursor;
+    }
+    output.extend_from_slice(&bytes[run_start..]);
+    output.push(b'"');
 }
 
 fn parse_table_snapshot(bytes: &[u8]) -> Result<Dialect, String> {
@@ -3750,39 +3790,37 @@ pub fn resolve_row_conflict(
 
 fn canonical_row_snapshot(snapshot: &RowSnapshot) -> Result<Vec<u8>, String> {
     let mut output = Vec::with_capacity(128);
-    output.extend_from_slice(b"{\"id\":");
-    serde_json::to_writer(&mut output, &snapshot.id).map_err(|error| error.to_string())?;
-    output.extend_from_slice(b",\"order_key\":");
-    serde_json::to_writer(&mut output, &snapshot.order_key).map_err(|error| error.to_string())?;
-    output.extend_from_slice(b",\"cells\":[");
+    output.extend_from_slice(b"{\"cells\":[");
     for (index, cell) in snapshot.cells.iter().enumerate() {
         if index > 0 {
             output.push(b',');
         }
-        serde_json::to_writer(&mut output, cell).map_err(|error| error.to_string())?;
+        write_canonical_json_string(&mut output, cell);
     }
     output.push(b']');
+    output.extend_from_slice(b",\"id\":");
+    write_canonical_json_string(&mut output, &snapshot.id);
     if !snapshot.layout.is_default() {
         output.extend_from_slice(b",\"layout\":{");
         let has_force_quote = !snapshot.layout.force_quote.is_empty();
         if has_force_quote {
             output.extend_from_slice(b"\"force_quote\":");
-            serde_json::to_writer(
+            write_canonical_json_string(
                 &mut output,
                 &URL_SAFE_NO_PAD.encode(&snapshot.layout.force_quote),
-            )
-            .map_err(|error| error.to_string())?;
+            );
         }
         if let Some(ending) = snapshot.layout.terminator {
             if has_force_quote {
                 output.push(b',');
             }
             output.extend_from_slice(b"\"terminator\":");
-            serde_json::to_writer(&mut output, ending.map_or("", Terminator::snapshot))
-                .map_err(|error| error.to_string())?;
+            write_canonical_json_string(&mut output, ending.map_or("", Terminator::snapshot));
         }
         output.push(b'}');
     }
+    output.extend_from_slice(b",\"order_key\":");
+    write_canonical_json_string(&mut output, &snapshot.order_key);
     output.push(b'}');
     Ok(output)
 }

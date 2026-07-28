@@ -12,10 +12,9 @@ mod store;
 mod test_support;
 mod types;
 
-pub(crate) use codec::{
-    decode_change_record, decode_commit_change_ref_chunk, encode_change_record,
-    encode_commit_change_ref_chunk, encode_commit_record, encode_transaction_change_record,
-};
+#[cfg(test)]
+pub(crate) use codec::encode_commit_record;
+pub(crate) use codec::{decode_change_record, decode_commit_change_ref_chunk};
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 pub(crate) use materialization::{
     ChangeRecordProjection, MaterializedChangeIdentity, MaterializedChangePayload,

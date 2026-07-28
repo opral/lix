@@ -195,13 +195,13 @@ where
                                 .map_err(lix_error_to_datafusion_error)?
                         };
                         for entry in diff.entries {
-                            if entry.identity.schema_key == CHECKPOINT_MARKER_SCHEMA_KEY {
+                            if entry.identity.schema_key() == CHECKPOINT_MARKER_SCHEMA_KEY {
                                 continue;
                             }
                             rows.push(WorkingChangeSqlRow {
-                                entity_pk: entry.identity.entity_pk.as_json_array_text(),
-                                schema_key: entry.identity.schema_key,
-                                file_id: entry.identity.file_id,
+                                entity_pk: entry.identity.entity_pk().as_json_array_text(),
+                                schema_key: entry.identity.schema_key().to_owned(),
+                                file_id: entry.identity.file_id().map(str::to_owned),
                                 change_kind: match entry.kind {
                                     TrackedStateDiffKind::Added => "added",
                                     TrackedStateDiffKind::Modified => "modified",

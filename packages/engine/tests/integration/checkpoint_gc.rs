@@ -1,6 +1,4 @@
-#[macro_use]
-mod support;
-
+use crate::support;
 use lix_engine::{CreateBranchOptions, Value};
 use serde_json::json;
 use tokio::time::{Duration, Instant};
@@ -214,8 +212,7 @@ simulation_test!(
             )
             .await
             .expect("other interval write should succeed");
-        let other_auto_commit =
-            branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
+        let other_auto_commit = branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
         other
             .create_checkpoint()
             .await

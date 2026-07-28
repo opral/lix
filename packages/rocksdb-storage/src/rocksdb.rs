@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -61,7 +61,8 @@ pub struct RocksDBWrite {
     inner: Arc<RocksDBInner>,
     _writer_permit: OwnedMutexGuard<()>,
     batch: WriteBatch,
-    staged_put_keys: Vec<Key>,
+    staged_put_key_bytes: Vec<u8>,
+    staged_put_key_ranges: Vec<Range<usize>>,
     stats: WriteStats,
 }
 
@@ -164,8 +165,13 @@ impl Storage for RocksDB {
             Ok(RocksDBWrite {
                 inner: Arc::clone(&self.inner),
                 _writer_permit: writer_permit,
-                batch: WriteBatch::default(),
-                staged_put_keys: Vec::new(),
+                batch: if opts.batch_capacity_hint_bytes == 0 {
+                    WriteBatch::default()
+                } else {
+                    WriteBatch::with_capacity_bytes(opts.batch_capacity_hint_bytes)
+                },
+                staged_put_key_bytes: Vec::new(),
+                staged_put_key_ranges: Vec::new(),
                 stats: WriteStats::default(),
             })
         }
@@ -363,13 +369,25 @@ impl StorageWrite for RocksDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let physical_key_bytes = entries.entries.iter().fold(0_usize, |bytes, entry| {
+                bytes.saturating_add(4).saturating_add(entry.key.0.len())
+            });
+            self.staged_put_key_bytes.reserve(physical_key_bytes);
+            self.staged_put_key_ranges.reserve(entries.entries.len());
+            let space_prefix = space.0.to_be_bytes();
             for entry in entries.entries {
-                let key = physical_key(space, &entry.key);
+                let key_start = self.staged_put_key_bytes.len();
+                self.staged_put_key_bytes.extend_from_slice(&space_prefix);
+                self.staged_put_key_bytes.extend_from_slice(&entry.key.0);
+                let key_end = self.staged_put_key_bytes.len();
                 let value = stored_value_bytes(entry.value);
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += value.len() as u64;
-                self.staged_put_keys.push(key.clone());
-                self.batch.put(key.0.as_ref(), value.as_ref());
+                self.batch.put(
+                    &self.staged_put_key_bytes[key_start..key_end],
+                    value.as_ref(),
+                );
+                self.staged_put_key_ranges.push(key_start..key_end);
             }
             self.stats.storage_calls += 1;
             Ok(())
@@ -382,8 +400,17 @@ impl StorageWrite for RocksDBWrite {
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let physical_key_bytes = keys.iter().fold(0_usize, |bytes, key| {
+                bytes.saturating_add(4).saturating_add(key.0.len())
+            });
+            let mut key_bytes = Vec::with_capacity(physical_key_bytes);
+            let space_prefix = space.0.to_be_bytes();
             for key in keys {
-                self.batch.delete(physical_key(space, key).0.as_ref());
+                let key_start = key_bytes.len();
+                key_bytes.extend_from_slice(&space_prefix);
+                key_bytes.extend_from_slice(&key.0);
+                let key_end = key_bytes.len();
+                self.batch.delete(&key_bytes[key_start..key_end]);
             }
             self.stats.deleted_entries += keys.len() as u64;
             self.stats.storage_calls += 1;
@@ -418,9 +445,10 @@ impl StorageWrite for RocksDBWrite {
                     self.batch.delete(encoded_key);
                 }
 
-                for key in &self.staged_put_keys {
-                    if bounds.contains(key.0.as_ref()) {
-                        self.batch.delete(key.0.as_ref());
+                for key in &self.staged_put_key_ranges {
+                    let key = &self.staged_put_key_bytes[key.clone()];
+                    if bounds.contains(key) {
+                        self.batch.delete(key);
                     }
                 }
             }
@@ -556,7 +584,6 @@ fn rocksdb_delete_range_bounds(range: &KeyRange) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-#[expect(clippy::unnecessary_wraps)]
 fn next_lexicographic_key(key: &Key) -> Option<Vec<u8>> {
     let mut bytes = key.0.to_vec();
     bytes.push(0);

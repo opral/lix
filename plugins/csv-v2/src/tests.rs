@@ -1,5 +1,5 @@
 use super::*;
-use crate::core::{RowConflictResolution, resolve_row_conflict};
+use crate::core::{RowConflictResolution, resolve_row_conflict, write_canonical_json_string};
 use serde_json::Value;
 
 fn namespace() -> IdNamespace {
@@ -76,6 +76,61 @@ fn import_streams_number_free_complete_snapshots() {
     for change in changes {
         let value: Value = serde_json::from_slice(change.snapshot.as_ref().unwrap()).unwrap();
         assert!(!has_number(&value));
+    }
+}
+
+#[test]
+fn import_emits_exact_engine_canonical_snapshot_spelling() {
+    let (_document, changes) =
+        Document::open_file(b"a,b\n".to_vec(), Some("fixture.csv"), namespace()).unwrap();
+    let changes = changes.collect::<Result<Vec<_>, _>>().unwrap();
+    let table = changes
+        .iter()
+        .find(|change| change.schema_key == TABLE_SCHEMA_KEY)
+        .and_then(|change| change.snapshot.as_deref())
+        .expect("table snapshot");
+    assert_eq!(
+        table,
+        br#"{"dialect":{"delimiter":",","quote":"\"","terminator":"\n"},"id":"root"}"#
+    );
+
+    let row = changes
+        .iter()
+        .find(|change| change.schema_key == ROW_SCHEMA_KEY)
+        .expect("row snapshot");
+    let decoded = parse_row_snapshot(row.snapshot.as_deref().expect("row upsert")).unwrap();
+    let expected = format!(
+        r#"{{"cells":["a","b"],"id":"{}","order_key":"{}"}}"#,
+        decoded.id, decoded.order_key
+    );
+    assert_eq!(
+        row.snapshot.as_deref().expect("row upsert"),
+        expected.as_bytes()
+    );
+}
+
+#[test]
+fn canonical_string_writer_matches_serde_json_for_escapes_and_unicode() {
+    let mut controls = String::new();
+    for scalar in 0..=0x1f {
+        controls.push(char::from_u32(scalar).unwrap());
+    }
+    controls.push_str("\"\\/\u{7f}\u{85}\u{2028}");
+
+    let values = [
+        "plain ASCII without escapes",
+        "héllo 雪man 😀",
+        "prefix \"quoted\" and \\\\ suffix",
+        controls.as_str(),
+    ];
+    for value in values {
+        let mut encoded = Vec::new();
+        write_canonical_json_string(&mut encoded, value);
+        assert_eq!(
+            encoded,
+            serde_json::to_vec(value).expect("string serialization cannot fail"),
+            "canonical spelling diverged for {value:?}"
+        );
     }
 }
 
@@ -955,6 +1010,10 @@ fn conflict_resolver_composes_distinct_cell_edits() {
     else {
         panic!("independent cell changes must compose");
     };
+    assert_eq!(
+        snapshot,
+        br#"{"cells":["A","middle","B"],"id":"row","order_key":"01"}"#
+    );
     let snapshot = parse_row_snapshot(&snapshot).unwrap();
     assert_eq!(snapshot.cells, ["A", "middle", "B"]);
 }

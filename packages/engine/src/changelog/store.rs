@@ -50,6 +50,7 @@ pub(crate) fn commit_change_id_key(change_id: ChangeId) -> Vec<u8> {
     change_key(change_id)
 }
 
+#[cfg(test)]
 pub(crate) fn commit_change_id_value(commit_id: CommitId) -> Vec<u8> {
     commit_key(commit_id)
 }
@@ -58,6 +59,7 @@ pub(crate) fn commit_change_id_index_format_key() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_KEY.to_vec()
 }
 
+#[cfg(test)]
 pub(crate) fn commit_change_id_index_format_value() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.to_vec()
 }

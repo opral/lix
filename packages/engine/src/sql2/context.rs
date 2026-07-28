@@ -19,7 +19,8 @@ use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
@@ -133,33 +134,24 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     async fn load_bytes_many(&mut self, hashes: &[BlobHash]) -> Result<BlobBytesBatch, LixError>;
 
-    async fn scan_live_state(
+    async fn scan_live_state_batch(
         &mut self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+    ) -> Result<MaterializedLiveStateBatch, LixError>;
 
-    async fn load_exact_live_state_rows(
+    async fn load_exact_live_state_batch(
         &mut self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        let mut rows = Vec::with_capacity(request.rows.len());
-        for row in &request.rows {
-            rows.push(
-                self.scan_live_state(&request.row_scan_request(row))
-                    .await?
-                    .into_iter()
-                    .next(),
-            );
-        }
-        Ok(rows)
-    }
+    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
 
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,
     ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-        let rows = self.scan_live_state(&request.live_state_request()).await?;
-        Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
+        let rows = self
+            .scan_live_state_batch(&request.live_state_request())
+            .await?;
+        Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
     }
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
@@ -237,10 +229,10 @@ impl SqlWriteContext {
         unsafe { self.ptr.0.as_ref().session_file_views() }
     }
 
-    pub(crate) async fn scan_live_state(
+    pub(crate) async fn scan_live_state_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -248,15 +240,15 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .scan_live_state(request)
+                .scan_live_state_batch(request)
                 .await
         }
     }
 
-    pub(crate) async fn load_exact_live_state_rows(
+    pub(crate) async fn load_exact_live_state_batch(
         &self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr
@@ -264,7 +256,7 @@ impl SqlWriteContext {
                 .as_ptr()
                 .as_mut()
                 .unwrap()
-                .load_exact_live_state_rows(request)
+                .load_exact_live_state_batch(request)
                 .await
         }
     }
@@ -395,20 +387,20 @@ impl WriteContextLiveStateReader {
 
 #[async_trait]
 impl LiveStateReader for WriteContextLiveStateReader {
-    async fn scan_rows(
+    async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.ctx.scan_live_state(request).await
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        self.ctx.scan_live_state_batch(request).await
     }
 
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        let mut rows = self
+        let rows = self
             .ctx
-            .scan_live_state(&LiveStateScanRequest {
+            .scan_live_state_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
@@ -420,14 +412,16 @@ impl LiveStateReader for WriteContextLiveStateReader {
                 limit: Some(1),
             })
             .await?;
-        Ok(rows.pop())
+        Ok(rows
+            .get(0)
+            .map(crate::live_state::MaterializedLiveStateRowRef::to_owned))
     }
 
-    async fn load_exact_rows(
+    async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        self.ctx.load_exact_live_state_rows(request).await
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        self.ctx.load_exact_live_state_batch(request).await
     }
 }
 

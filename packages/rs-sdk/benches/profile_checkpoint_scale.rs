@@ -1,3 +1,5 @@
+#![allow(clippy::large_futures)]
+
 //! Reproducible scale/profile harness for checkpoint compaction.
 //!
 //! The default workload models a 10,000-file workspace and 1,000 checkpoints.
