@@ -23,6 +23,15 @@ use wasmtime::component::{Resource, ResourceAny};
 
 use super::*;
 
+/// Sync component bindings may invoke WASI's blocking adapter. Keep those
+/// boundaries off the Tokio executor thread that is polling this async actor.
+fn call_sync_guest<T: Send>(call: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|scope| match scope.spawn(call).join() {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    })
+}
+
 struct TransitionBudgetState {
     limits: WasmTransitionLimits,
     started: Instant,
@@ -1890,7 +1899,8 @@ impl WasmtimeV2Actor {
         }
         for resource in resources {
             self.prepare_transition_resource_drop(&active.budget)?;
-            if let Err(error) = resource.resource_drop(self.store_mut()?) {
+            let store = self.store_mut()?;
+            if let Err(error) = call_sync_guest(|| resource.resource_drop(store)) {
                 return Err(
                     self.retire_with_error("failed to discard v2 transition resource", error)
                 );
@@ -3544,7 +3554,8 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
         self.prepare_standalone_guest_call()?;
         let guest = self.guest.clone();
-        let result = guest.document().call_fork(self.store_mut()?, resource);
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| guest.document().call_fork(store, resource));
         let fork = match result {
             Ok(fork) => fork,
             Err(error) => {
@@ -3577,11 +3588,10 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 return Err(error);
             }
         };
-        let result = guest.call_open_file(
-            self.store_mut()?,
-            Resource::new_borrow(budget_rep),
-            &binding_input,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.call_open_file(store, Resource::new_borrow(budget_rep), &binding_input)
+        });
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
@@ -3621,11 +3631,10 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 return Err(error);
             }
         };
-        let result = guest.call_open_entities(
-            self.store_mut()?,
-            Resource::new_borrow(budget_rep),
-            &binding_input,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.call_open_entities(store, Resource::new_borrow(budget_rep), &binding_input)
+        });
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
@@ -3690,12 +3699,15 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 return Err(error);
             }
         };
-        let result = guest.document().call_file_changed(
-            self.store_mut()?,
-            document_resource,
-            Resource::new_borrow(budget_rep),
-            &binding_update,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.document().call_file_changed(
+                store,
+                document_resource,
+                Resource::new_borrow(budget_rep),
+                &binding_update,
+            )
+        });
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
@@ -3739,12 +3751,15 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 return Err(error);
             }
         };
-        let result = guest.document().call_entities_changed(
-            self.store_mut()?,
-            document_resource,
-            Resource::new_borrow(budget_rep),
-            &binding_update,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.document().call_entities_changed(
+                store,
+                document_resource,
+                Resource::new_borrow(budget_rep),
+                &binding_update,
+            )
+        });
         let value = match result {
             Ok(Ok(value)) => value,
             Ok(Err(error)) => {
@@ -3782,11 +3797,10 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 return Err(error);
             }
         };
-        let result = guest.call_resolve_conflicts(
-            self.store_mut()?,
-            Resource::new_borrow(budget_rep),
-            &binding_update,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.call_resolve_conflicts(store, Resource::new_borrow(budget_rep), &binding_update)
+        });
         let cursor = match result {
             Ok(Ok(cursor)) => cursor,
             Ok(Err(error)) => {
@@ -3822,17 +3836,20 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
+        let store = self.store_mut()?;
         let result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.plugin_drain_guest_next"
         )
         .in_scope(|| {
-            guest.change_cursor().call_next(
-                self.store_mut()?,
-                resource,
-                Resource::new_borrow(budget_rep),
-                max_bytes,
-            )
+            call_sync_guest(|| {
+                guest.change_cursor().call_next(
+                    store,
+                    resource,
+                    Resource::new_borrow(budget_rep),
+                    max_bytes,
+                )
+            })
         });
         let page = match result {
             Ok(Ok(Some(page))) => page,
@@ -3935,12 +3952,15 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
-        let result = guest.resolution_cursor().call_next(
-            self.store_mut()?,
-            resource,
-            Resource::new_borrow(budget_rep),
-            max_bytes,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.resolution_cursor().call_next(
+                store,
+                resource,
+                Resource::new_borrow(budget_rep),
+                max_bytes,
+            )
+        });
         let page = match result {
             Ok(Ok(Some(page))) => page,
             Ok(Ok(None)) => {
@@ -4051,13 +4071,16 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
-        let result = guest.edit_cursor().call_next(
-            self.store_mut()?,
-            resource,
-            Resource::new_borrow(budget_rep),
-            max_edits,
-            max_inline_bytes,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.edit_cursor().call_next(
+                store,
+                resource,
+                Resource::new_borrow(budget_rep),
+                max_edits,
+                max_inline_bytes,
+            )
+        });
         let page = match result {
             Ok(Ok(Some(page))) => page,
             Ok(Ok(None)) => {
@@ -4215,9 +4238,8 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
-        let result = guest
-            .byte_outputs()
-            .call_len(self.store_mut()?, resource, index);
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| guest.byte_outputs().call_len(store, resource, index));
         let length = match result {
             Ok(Ok(length)) => length,
             Ok(Err(error)) => {
@@ -4264,14 +4286,17 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();
-        let result = guest.byte_outputs().call_read(
-            self.store_mut()?,
-            resource,
-            Resource::new_borrow(budget_rep),
-            index,
-            offset,
-            length,
-        );
+        let store = self.store_mut()?;
+        let result = call_sync_guest(|| {
+            guest.byte_outputs().call_read(
+                store,
+                resource,
+                Resource::new_borrow(budget_rep),
+                index,
+                offset,
+                length,
+            )
+        });
         let bytes = match result {
             Ok(Ok(bytes)) => bytes,
             Ok(Err(error)) => {
@@ -4357,7 +4382,8 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .chain(output_resources)
         {
             self.prepare_transition_resource_drop(&active.budget)?;
-            if let Err(error) = resource.resource_drop(self.store_mut()?) {
+            let store = self.store_mut()?;
+            if let Err(error) = call_sync_guest(|| resource.resource_drop(store)) {
                 return Err(self.retire_with_error("failed to drop v2 guest resource", error));
             }
         }
@@ -4418,7 +4444,8 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .documents
             .remove(&document.0)
             .expect("v2 document handle was checked before standalone preparation");
-        if let Err(error) = resource.resource_drop(self.store_mut()?) {
+        let store = self.store_mut()?;
+        if let Err(error) = call_sync_guest(|| resource.resource_drop(store)) {
             return Err(self.retire_with_error("failed to drop v2 document", error));
         }
         Ok(())
@@ -4451,10 +4478,10 @@ impl WasmtimeV2Actor {
                 *length
             } else {
                 self.prepare_nested_call(transition)?;
-                match guest
-                    .byte_outputs()
-                    .call_len(self.store_mut()?, resource, range.index)
-                {
+                let store = self.store_mut()?;
+                match call_sync_guest(|| {
+                    guest.byte_outputs().call_len(store, resource, range.index)
+                }) {
                     Ok(Ok(length)) => {
                         lengths.insert(range.index, length);
                         length
