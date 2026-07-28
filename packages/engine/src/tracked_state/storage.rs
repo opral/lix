@@ -97,10 +97,6 @@ struct CommitDeltaPayloadIndexRef<'a> {
 }
 
 impl<'a> CommitDeltaPayloadIndexRef<'a> {
-    fn len(self) -> usize {
-        self.entry_count
-    }
-
     fn decode(self, entry_index: usize) -> Result<CommitDeltaPayload, LixError> {
         let range = self.payload_range(entry_index)?;
         if range.is_empty() {
@@ -1071,18 +1067,13 @@ pub(crate) async fn scan_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
     let mut records = BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
-    let manifests = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE).await?;
-    for (key, bytes) in manifests {
-        let commit_id = commit_id_from_delta_key(&key)?;
-        let manifest = decode_commit_delta_manifest(&bytes)?;
-        if let Some(inline_segment) = manifest.inline_segment() {
-            collect_all_commit_delta_change_records(inline_segment, None, commit_id, &mut records)?;
+    let inventory = scan_commit_delta_inventory(store).await?;
+    for entry in inventory.commits.into_values() {
+        for member in entry.members {
+            records
+                .entry(member.change.change_id)
+                .or_insert(member.change);
         }
-    }
-    let segments = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE).await?;
-    for (key, bytes) in segments {
-        let commit_id = commit_id_from_delta_key(&key)?;
-        collect_all_commit_delta_change_records(&bytes, None, commit_id, &mut records)?;
     }
     Ok(records.into_values().collect())
 }
@@ -1367,55 +1358,6 @@ fn validate_commit_delta_member_order_and_ids(
                 "tracked_state commit_delta for commit '{commit_id}' contains duplicate change id '{change_id}'"
             ),
         ));
-    }
-    Ok(())
-}
-
-fn collect_all_commit_delta_change_records(
-    bytes: &[u8],
-    expected_bounds: Option<&CommitDeltaSegmentBounds>,
-    expected_commit_id: CommitId,
-    records: &mut BTreeMap<crate::changelog::ChangeId, crate::changelog::ChangeRecord>,
-) -> Result<(), LixError> {
-    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
-    for entry_index in 0..payloads.len() {
-        let payload = payloads.decode(entry_index)?;
-        let entry = leaf.entry(entry_index)?.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_delta payload has no matching identity",
-            )
-        })?;
-        let value = decode_value(entry.value)?;
-        if value.commit_id != expected_commit_id {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_delta payload commit does not match its storage key",
-            ));
-        }
-        let identity = decode_key(entry.key)?;
-        let record = crate::changelog::ChangeRecord {
-            format_version: 2,
-            change_id: value.change_id,
-            schema_key: identity.schema_key,
-            entity_pk: identity.entity_pk,
-            file_id: identity.file_id,
-            snapshot: payload.snapshot,
-            metadata: payload.metadata,
-            created_at: value.updated_at,
-            origin_key: payload.origin_key,
-        };
-        if let Some(existing) = records.insert(record.change_id, record.clone())
-            && existing != record
-        {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "tracked_state change '{}' has conflicting authoritative packed payloads",
-                    record.change_id
-                ),
-            ));
-        }
     }
     Ok(())
 }
