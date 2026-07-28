@@ -15,7 +15,7 @@ use crate::binary_cas::BlobHash;
 use crate::common::LixTimestamp;
 use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{MaterializedLiveStateExactBatch, MaterializedLiveStateRow};
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
     WasmCanonicalJson, WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange,
@@ -258,7 +258,7 @@ pub(crate) fn materialize_keyless_creates(
 pub(crate) fn require_existing_id_authorities(
     plugin: &PluginRegistryEntry,
     keys: &[WasmEntityKey],
-    rows: &[Option<MaterializedLiveStateRow>],
+    rows: &MaterializedLiveStateExactBatch,
     file_id: &str,
     branch_id: &str,
 ) -> Result<(), LixError> {
@@ -268,18 +268,18 @@ pub(crate) fn require_existing_id_authorities(
             "create authority lookup returned the wrong cardinality",
         ));
     }
-    for (key, row) in keys.iter().zip(rows) {
-        let valid = row.as_ref().is_some_and(|row| {
-            !row.deleted
-                && row.snapshot_content.is_some()
-                && row.schema_key == key.schema_key
+    for (slot, key) in keys.iter().enumerate() {
+        let valid = rows.row(slot).is_some_and(|row| {
+            !row.deleted()
+                && row.snapshot_content().is_some()
+                && key.schema_key == row.schema_key()
                 && key.entity_pk.len() == 1
                 && EntityPk::uuid_from_canonical(&key.entity_pk[0])
-                    .is_ok_and(|entity_pk| row.entity_pk == entity_pk)
-                && row.file_id.as_deref() == Some(file_id)
-                && row.branch_id.as_ref() == branch_id
-                && !row.global
-                && !row.untracked
+                    .is_ok_and(|entity_pk| row.entity_pk() == &entity_pk)
+                && row.file_id() == Some(file_id)
+                && row.branch_id() == branch_id
+                && !row.global()
+                && !row.untracked()
         });
         if !valid {
             return Err(LixError::new(
@@ -688,7 +688,7 @@ mod tests {
         require_existing_id_authorities(
             &plugin(),
             &[key],
-            &[Some(row)],
+            &MaterializedLiveStateExactBatch::from_rows(vec![Some(row)]),
             "01920000-0000-7000-8000-0000000000a2",
             "main",
         )

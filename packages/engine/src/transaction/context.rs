@@ -1445,19 +1445,7 @@ where
                 include_tombstones: false,
             })
             .await?;
-        let accepted = format_only_keys
-            .into_iter()
-            .enumerate()
-            .map(|(slot, key)| {
-                // The format-only comparator is a terminal WASM boundary that
-                // still accepts its historical owned DTO.
-                (
-                    key,
-                    current.row(slot).map(MaterializedLiveStateRowRef::to_owned),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        suppress_v2_format_only_noops_against_rows(changes, &accepted)
+        suppress_v2_format_only_noops_against_batch(changes, &format_only_keys, &current)
     }
 
     /// Materializes keyless creates and returns the one durable mutation
@@ -1504,22 +1492,15 @@ where
             })
             .collect::<Result<Vec<_>, LixError>>()?;
         let loaded = if exact_rows.is_empty() {
-            Vec::new()
+            MaterializedLiveStateExactBatch::default()
         } else {
-            let loaded = self
-                .load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
-                    rows: exact_rows,
-                    projection: plugin_state_live_state_projection(),
-                    untracked: Some(false),
-                    include_tombstones: false,
-                })
-                .await?;
-            // Namespace validation is the terminal plugin boundary. Retain the
-            // exact owner through the read and scalarize only its aligned
-            // authority slots for the legacy validator.
-            (0..loaded.len())
-                .map(|slot| loaded.row(slot).map(MaterializedLiveStateRowRef::to_owned))
-                .collect()
+            self.load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
+                rows: exact_rows,
+                projection: plugin_state_live_state_projection(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?
         };
         require_existing_id_authorities(
             plugin,
@@ -5300,10 +5281,22 @@ fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm:
         .creates()
 }
 
-fn suppress_v2_format_only_noops_against_rows(
+fn suppress_v2_format_only_noops_against_batch(
     changes: WasmHostEntityChanges,
-    accepted: &BTreeMap<WasmEntityKey, Option<MaterializedLiveStateRow>>,
+    keys: &[WasmEntityKey],
+    accepted: &MaterializedLiveStateExactBatch,
 ) -> Result<WasmHostEntityChanges, LixError> {
+    if keys.len() != accepted.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "format-only lookup returned the wrong cardinality",
+        ));
+    }
+    let accepted = keys
+        .iter()
+        .enumerate()
+        .map(|(slot, key)| (key, accepted.row(slot)))
+        .collect::<BTreeMap<_, _>>();
     let mut effective = Vec::with_capacity(changes.changes.len());
     for change in changes.changes {
         let is_noop = match &change {
@@ -5315,7 +5308,7 @@ fn suppress_v2_format_only_noops_against_rows(
                     effective.push(change);
                     continue;
                 };
-                let Some(base_snapshot) = base.snapshot_content.as_deref() else {
+                let Some(base_snapshot) = base.snapshot_content() else {
                     effective.push(change);
                     continue;
                 };
@@ -5329,7 +5322,7 @@ fn suppress_v2_format_only_noops_against_rows(
                     }
                 };
                 let candidate = canonical.normalized();
-                if candidate == base_snapshot {
+                if candidate == base_snapshot.as_str() {
                     true
                 } else {
                     // New writes retain exact canonical bytes, so equality is
@@ -8023,7 +8016,7 @@ mod tests {
                 WasmEntityChange::Delete(key("deleted")),
             ],
         };
-        let accepted = BTreeMap::from([
+        let accepted = [
             (
                 key("equal"),
                 Some(live("equal", r#"{"text":"\u00e9","id":"equal"}"#)),
@@ -8036,10 +8029,18 @@ mod tests {
                 key("content"),
                 Some(live("content", r#"{"id":"content","text":"same"}"#)),
             ),
-        ]);
+        ];
+        let accepted_keys = accepted
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let accepted = MaterializedLiveStateExactBatch::from_rows(
+            accepted.into_iter().map(|(_, row)| row).collect(),
+        );
 
-        let effective = suppress_v2_format_only_noops_against_rows(changes, &accepted)
-            .expect("number-free normalized snapshots should compare");
+        let effective =
+            suppress_v2_format_only_noops_against_batch(changes, &accepted_keys, &accepted)
+                .expect("number-free normalized snapshots should compare");
         assert_eq!(effective.changes.len(), 3);
         assert_eq!(effective.changes[0].entity_key(), Some(&key("changed")));
         assert_eq!(effective.changes[1].entity_key(), Some(&key("content")));
