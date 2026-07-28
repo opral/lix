@@ -22,70 +22,19 @@ pub(crate) enum VisibilityBranchScope {
 
 pub(crate) trait StagedLiveStateRows {
     /// Returns staged candidates in one shared columnar owner.
-    ///
-    /// Production overlays must implement this batch lane directly. The
-    /// row-oriented fallback exists only for compact test fakes.
-    #[cfg(not(test))]
     fn staged_batch(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError>;
 
-    #[cfg(test)]
-    fn staged_batch(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.staged_rows(request)
-            .map(MaterializedLiveStateBatch::from_rows)
-    }
-
-    /// Test-only terminal bridge for row-oriented fakes and assertions.
-    #[cfg(test)]
-    fn staged_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.staged_batch(request)
-            .map(MaterializedLiveStateBatch::into_rows)
-    }
-
     /// Loads exact staged storage identities in request order.
     ///
     /// This does not apply global fallback: overlay composition needs the
     /// branch and global candidates separately to preserve their precedence.
-    #[cfg(not(test))]
     fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError>;
-
-    /// Test-only bridge for small row-oriented staged-state fakes.
-    #[cfg(test)]
-    fn load_exact_rows(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        request
-            .rows
-            .iter()
-            .map(|row| {
-                Ok(self
-                    .staged_rows(&request.row_scan_request(row))?
-                    .into_iter()
-                    .next())
-            })
-            .collect()
-    }
-
-    #[cfg(test)]
-    fn load_exact_batch(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
-        self.load_exact_rows(request)
-            .map(MaterializedLiveStateExactBatch::from_rows)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1483,11 +1432,21 @@ mod tests {
     struct EmptyStagedRows;
 
     impl StagedLiveStateRows for EmptyStagedRows {
-        fn staged_rows(
+        fn staged_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(Vec::new())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::default())
+        }
+
+        fn load_exact_batch(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            MaterializedLiveStateExactBatch::new(
+                MaterializedLiveStateBatch::default(),
+                vec![None; request.rows.len()],
+            )
         }
     }
 
@@ -1496,16 +1455,37 @@ mod tests {
     }
 
     impl StagedLiveStateRows for FilteringStagedRows {
-        fn staged_rows(
+        fn staged_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .rows
-                .iter()
-                .filter(|row| matches_scan_request(row, request))
-                .cloned()
-                .collect())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::from_rows(
+                self.rows
+                    .iter()
+                    .filter(|row| matches_scan_request(row, request))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+
+        fn load_exact_batch(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            Ok(MaterializedLiveStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|request_row| {
+                        self.rows
+                            .iter()
+                            .find(|row| {
+                                matches_scan_request(row, &request.row_scan_request(request_row))
+                            })
+                            .cloned()
+                    })
+                    .collect(),
+            ))
         }
     }
 

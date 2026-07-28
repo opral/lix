@@ -1579,27 +1579,11 @@ impl PreparedStateRowOverlay {
 }
 
 impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
-    #[cfg(test)]
-    fn staged_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(self.scan_batch(request)?.into_rows())
-    }
-
     fn staged_batch(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         self.scan_batch(request)
-    }
-
-    #[cfg(test)]
-    fn load_exact_rows(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        Ok(self.load_exact_batch(request)?.into_rows())
     }
 
     fn load_exact_batch(
@@ -2536,8 +2520,9 @@ mod tests {
         assert!(batch.row(4).is_none());
         assert!(batch.row(5).is_none());
 
-        let rows = StagedLiveStateRows::load_exact_rows(&overlay, &exact_request)
-            .expect("exact staged rows should load");
+        let rows = StagedLiveStateRows::load_exact_batch(&overlay, &exact_request)
+            .expect("exact staged rows should load")
+            .into_rows();
 
         assert!(rows[0].is_some());
         assert_eq!(rows[0], rows[3]);
@@ -2546,7 +2531,7 @@ mod tests {
         assert_eq!(rows[4], None);
         assert_eq!(rows[5], None, "tombstone should be hidden by default");
 
-        let tombstone = StagedLiveStateRows::load_exact_rows(
+        let tombstone = StagedLiveStateRows::load_exact_batch(
             &overlay,
             &LiveStateExactBatchRequest {
                 rows: vec![exact("deleted", "deleted")],
@@ -2555,6 +2540,7 @@ mod tests {
             },
         )
         .expect("exact staged tombstone should load")
+        .into_rows()
         .pop()
         .flatten()
         .expect("tombstone should be returned");

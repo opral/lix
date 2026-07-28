@@ -210,16 +210,35 @@ mod tests {
     struct StaticStagedRows(Vec<MaterializedLiveStateRow>);
 
     impl StagedLiveStateRows for StaticStagedRows {
-        fn staged_rows(
+        fn staged_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .0
-                .iter()
-                .filter(|row| row_matches(row, request))
-                .cloned()
-                .collect())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::from_rows(
+                self.0
+                    .iter()
+                    .filter(|row| row_matches(row, request))
+                    .cloned()
+                    .collect(),
+            ))
+        }
+
+        fn load_exact_batch(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            Ok(MaterializedLiveStateExactBatch::from_rows(
+                request
+                    .rows
+                    .iter()
+                    .map(|request_row| {
+                        self.0
+                            .iter()
+                            .find(|row| row_matches(row, &request.row_scan_request(request_row)))
+                            .cloned()
+                    })
+                    .collect(),
+            ))
         }
     }
 
