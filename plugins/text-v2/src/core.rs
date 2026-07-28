@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -33,8 +34,41 @@ struct DocumentInner {
 pub(crate) struct Line {
     id: String,
     order_key: OrderKey,
-    bytes: Arc<Vec<u8>>,
+    bytes: LineBytes,
 }
+
+#[derive(Debug, Clone)]
+struct LineBytes {
+    backing: Arc<Vec<u8>>,
+    range: Range<usize>,
+}
+
+impl LineBytes {
+    fn new(backing: Arc<Vec<u8>>, range: Range<usize>) -> Self {
+        Self { backing, range }
+    }
+
+    fn owned(bytes: Vec<u8>) -> Self {
+        let end = bytes.len();
+        Self::new(Arc::new(bytes), 0..end)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.backing[self.range.clone()]
+    }
+
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+}
+
+impl PartialEq for LineBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl Eq for LineBytes {}
 
 pub(crate) struct AllUpserts {
     document: Document,
@@ -72,14 +106,15 @@ impl Document {
         mut id_for_ordinal: impl FnMut(u64) -> String,
     ) -> Result<(Self, AllUpserts), String> {
         validate_git_text(&bytes)?;
-        let chunks = split_lines(&bytes);
+        let bytes = Arc::new(bytes);
+        let chunks = split_lines(Arc::clone(&bytes));
         let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
         let mut lines = Vec::with_capacity(chunks.len());
         for (ordinal, (bytes, order_key)) in chunks.into_iter().zip(order_keys).enumerate() {
             lines.push(Line {
                 id: id_for_ordinal(usize_to_u64(ordinal, "line ID ordinal")?),
                 order_key,
-                bytes: Arc::new(bytes),
+                bytes,
             });
         }
         // A cold open constructs lines in strict order from one already
@@ -88,10 +123,7 @@ impl Document {
         // `from_lines` would only revalidate every line, populate two trees,
         // sort the already-sorted vector, render the original file again, and
         // validate that duplicate byte buffer a second time.
-        let document = Self(Arc::new(DocumentInner {
-            bytes: Arc::new(bytes),
-            lines,
-        }));
+        let document = Self(Arc::new(DocumentInner { bytes, lines }));
         let changes = AllUpserts {
             document: document.clone(),
             index: 0,
@@ -130,9 +162,9 @@ impl Document {
         splices: &[InputSplice],
         mut id_for_ordinal: impl FnMut(u64) -> String,
     ) -> Result<(Self, Vec<lix::EntityChange>), String> {
-        let bytes = apply_splices(self.bytes(), splices)?;
+        let bytes = Arc::new(apply_splices(self.bytes(), splices)?);
         validate_git_text(&bytes)?;
-        let chunks = split_lines(&bytes);
+        let chunks = split_lines(Arc::clone(&bytes));
 
         // Preserve the overwhelmingly common unchanged prefix and suffix
         // without indexing the complete document. Generated bundles can have
@@ -239,7 +271,7 @@ impl Document {
             lines.push(Line {
                 id,
                 order_key,
-                bytes: Arc::new(bytes),
+                bytes,
             });
         }
 
@@ -248,10 +280,7 @@ impl Document {
         // Schema-defaulted UUIDs are already collision checked. Preserve that
         // exact owned state instead of sorting, rendering, and validating the
         // complete document a second time.
-        let document = Self(Arc::new(DocumentInner {
-            bytes: Arc::new(bytes),
-            lines,
-        }));
+        let document = Self(Arc::new(DocumentInner { bytes, lines }));
         let changes = self.changes_to(&document)?;
         Ok((document, changes))
     }
@@ -427,7 +456,7 @@ impl Document {
                     edits.push(lix::ByteEdit::new(
                         offset,
                         usize_to_u64(before.bytes.len(), "line byte length")?,
-                        after.bytes.as_ref().clone(),
+                        after.bytes.as_slice().to_vec(),
                     ));
                 }
                 offset = offset
@@ -497,7 +526,7 @@ impl Line {
         Ok(Self {
             id: snapshot.id,
             order_key,
-            bytes: Arc::new(bytes),
+            bytes: LineBytes::owned(bytes),
         })
     }
 
@@ -510,14 +539,23 @@ impl Line {
     }
 }
 
-fn split_lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+fn split_lines(bytes: Arc<Vec<u8>>) -> Vec<LineBytes> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    bytes
-        .split_inclusive(|byte| *byte == b'\n')
-        .map(ToOwned::to_owned)
-        .collect()
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'\n' {
+            let end = index + 1;
+            lines.push(LineBytes::new(Arc::clone(&bytes), start..end));
+            start = end;
+        }
+    }
+    if start < bytes.len() {
+        lines.push(LineBytes::new(Arc::clone(&bytes), start..bytes.len()));
+    }
+    lines
 }
 
 fn validate_line_bytes(bytes: &[u8]) -> Result<(), String> {
