@@ -13,7 +13,7 @@ use crate::live_state::LiveStateRowRequest;
 use crate::observe_coordinator::ObserveCoordinator;
 use crate::observe_invalidation::ObserveInvalidation;
 use crate::plugin::{
-    DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
+    DEFAULT_MAX_LIVE_PLUGIN_STORES, DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost,
 };
 use crate::session::SessionContext;
 use crate::sql2::SqlPlanningCache;
@@ -52,7 +52,7 @@ pub struct EngineOptions {
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
     plugin_v2_max_memory_bytes: u64,
-    plugin_v2_max_live_file_actors: usize,
+    plugin_v2_max_live_stores: usize,
 }
 
 impl Default for EngineOptions {
@@ -61,7 +61,7 @@ impl Default for EngineOptions {
             wasm_runtime: None,
             telemetry: None,
             plugin_v2_max_memory_bytes: DEFAULT_PLUGIN_V2_MEMORY_BYTES,
-            plugin_v2_max_live_file_actors: DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS,
+            plugin_v2_max_live_stores: DEFAULT_MAX_LIVE_PLUGIN_STORES,
         }
     }
 }
@@ -81,19 +81,25 @@ impl EngineOptions {
         self
     }
 
-    /// Sets the per-actor Wasm linear-memory ceiling and the hard maximum
-    /// number of live v2 plugin Stores for this engine. Defaults are 64 MiB
-    /// and sixteen Stores, bounding guest linear memory to 1 GiB before
-    /// host-side document state. Cached actors, active transaction leases,
-    /// pending publications, cold-open candidates, and upgrade preflight
-    /// Stores all consume the same workspace-wide admission budget.
+    /// Sets the per-Store Wasm linear-memory ceiling and the hard maximum
+    /// number of simultaneously live v2 plugin Stores for this engine.
+    ///
+    /// The Store limit bounds the active working set, not the number of plugin
+    /// documents an atomic transaction may open. Transactions retire completed
+    /// Stores and reuse their slots while preserving atomic commit.
+    /// Defaults are 64 MiB and sixteen Stores, bounding guest linear memory to
+    /// 1 GiB before host-side document state. Cached actors, active
+    /// existing-document transaction leases, pending publications, cold-open
+    /// candidates, and upgrade preflight Stores consume the same
+    /// workspace-wide budget. Completed publications may retire their Stores
+    /// under pressure and cold-open again after commit.
     pub fn with_plugin_v2_resource_limits(
         mut self,
         max_memory_bytes: u64,
-        max_live_file_actors: usize,
+        max_live_stores: usize,
     ) -> Self {
         self.plugin_v2_max_memory_bytes = max_memory_bytes;
-        self.plugin_v2_max_live_file_actors = max_live_file_actors;
+        self.plugin_v2_max_live_stores = max_live_stores;
         self
     }
 }
@@ -148,7 +154,7 @@ where
         let plugin_host = PluginRuntimeHost::new_with_v2_limits(
             wasm_runtime,
             options.plugin_v2_max_memory_bytes,
-            options.plugin_v2_max_live_file_actors,
+            options.plugin_v2_max_live_stores,
         )?;
 
         let tracked_state = Arc::new(TrackedStateContext::new());

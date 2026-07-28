@@ -296,17 +296,6 @@ where
             .await
     }
 
-    #[doc(hidden)]
-    pub async fn execute_batch_for_single_writer_ingest(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        retain_plugin_actors: bool,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        self.session
-            .execute_batch_for_single_writer_ingest(statements, retain_plugin_actors)
-            .await
-    }
-
     /// Classifies an atomic SQL batch for a caller that owns its transport
     /// lifecycle.
     pub fn execute_batch_disposition(

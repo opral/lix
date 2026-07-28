@@ -17,10 +17,6 @@ use zip::write::SimpleFileOptions;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
-// The replay opens Lix with the default 16-Store v2 actor bound. Batches
-// that fit can populate the bounded cache; broader imports retire candidates
-// as they go so one transaction never exhausts admission.
-const RETAINED_PLUGIN_ACTOR_BATCH_LIMIT: usize = 16;
 // Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
 // Keeping each flush below that floor lets the caller enqueue a small request
 // window before draining responses without depending on a platform's larger
@@ -315,12 +311,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
             marker_only += 1;
         }
         let execute_started = Instant::now();
-        execute_statements_as_transaction(
-            &lix,
-            &statements,
-            commit_sha,
-            inserts.saturating_add(updates) <= RETAINED_PLUGIN_ACTOR_BATCH_LIMIT,
-        )?;
+        execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
         phase_totals.execute_ms += execute_ms;
         applied += 1;
@@ -464,7 +455,6 @@ fn execute_statements_as_transaction(
     lix: &RocksLix,
     statements: &[SqlStatement],
     commit_sha: &str,
-    retain_plugin_actors: bool,
 ) -> Result<(), CliError> {
     let batch = statements
         .iter()
@@ -474,11 +464,7 @@ fn execute_statements_as_transaction(
         })
         .collect::<Vec<_>>();
 
-    db::block_on(lix.execute_batch_for_single_writer_ingest(
-        &batch,
-        retain_plugin_actors,
-    ))
-    .map_err(|error| {
+    db::block_on(lix.execute_batch(&batch)).map_err(|error| {
         let sql_preview = batch
             .first()
             .map(|statement| statement.sql.chars().take(160).collect::<String>())
@@ -670,7 +656,7 @@ fn seed_parent_tree(
     let prepared = prepare_commit_changes(state, &changes, &blob_by_oid)?;
     let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
     if !statements.is_empty() {
-        execute_statements_as_transaction(lix, &statements, parent_commit, false)?;
+        execute_statements_as_transaction(lix, &statements, parent_commit)?;
     }
     if verify_state {
         apply_prepared_to_expected_state(expected_state_by_id, &prepared);
@@ -2762,7 +2748,7 @@ mod tests {
 
     #[test]
     fn rocksdb_replay_bounds_text_actor_lifecycle_across_hundred_commits() {
-        const TEXT_FILES: usize = 5;
+        const TEXT_FILES: usize = 17;
 
         let fixture = unique_temp_dir();
         let repo = fixture.join("repo");
@@ -2781,18 +2767,19 @@ mod tests {
             expected_final.push(bytes);
         }
         git_ok(&repo, &["add", "-A"]);
-        git_ok(&repo, &["commit", "-qm", "root five text files"]);
+        git_ok(&repo, &["commit", "-qm", "root text working set"]);
 
         // This one atomic replay batch updates every file that was just
         // imported. It exercises the cold-open Existing path as well as the
-        // five New actors in the root commit.
+        // New actors in the root commit, and deliberately exceeds the default
+        // 16-Store working set.
         for (index, bytes) in expected_final.iter_mut().enumerate() {
             *bytes = format!("second-{index}\n").into_bytes();
             fs::write(repo.join(format!("bulk-{index:02}.txt")), bytes)
                 .expect("second text fixture should write");
         }
         git_ok(&repo, &["add", "-A"]);
-        git_ok(&repo, &["commit", "-qm", "update five text files"]);
+        git_ok(&repo, &["commit", "-qm", "update broad text working set"]);
 
         for revision in 2..100 {
             let index = revision % TEXT_FILES;
@@ -2815,7 +2802,7 @@ mod tests {
             force: false,
             profile_json: Some(profile.clone()),
         })
-        .expect("100-commit replay with five semantic files should complete");
+        .expect("100-commit replay beyond the Store working set should complete");
 
         let profile_json: serde_json::Value =
             serde_json::from_slice(&fs::read(&profile).expect("replay profile should be written"))
@@ -2848,7 +2835,7 @@ mod tests {
             profile_json
                 .get("changed_paths_total")
                 .and_then(serde_json::Value::as_u64),
-            Some(108)
+            Some((TEXT_FILES * 2 + 98) as u64)
         );
         let commits = profile_json
             .get("commits")
@@ -2872,7 +2859,7 @@ mod tests {
                 .get("statement_count")
                 .and_then(serde_json::Value::as_u64),
             Some(2),
-            "five inserts and the replay marker must share one atomic batch"
+            "bulk inserts and the replay marker must share one atomic batch"
         );
         assert_eq!(
             commits[1]
@@ -2885,7 +2872,7 @@ mod tests {
                 .get("statement_count")
                 .and_then(serde_json::Value::as_u64),
             Some(TEXT_FILES as u64 + 1),
-            "five updates and the replay marker must share one atomic batch"
+            "bulk updates and the replay marker must share one atomic batch"
         );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");

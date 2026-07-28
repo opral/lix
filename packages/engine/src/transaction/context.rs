@@ -56,11 +56,12 @@ use crate::live_state::{
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
     PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
-    PluginActorKey, PluginActorLease, PluginActorStore, PluginArchiveInstallPlan,
-    PluginContentType, PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry,
-    PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
-    ValidatedConflictTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit,
+    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -335,7 +336,6 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     origin_key: Option<SharedStr>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
     session_file_views: SessionFileViews,
-    retain_plugin_actor_publications: bool,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -586,7 +586,6 @@ where
                 origin_key: None,
                 idempotency_receipt: None,
                 session_file_views,
-                retain_plugin_actor_publications: true,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
                 plugin_generation_read_guard: None,
@@ -817,12 +816,33 @@ where
         self.trust_filesystem_planner = true;
     }
 
-    /// Bulk import only needs the durable rows produced by a plugin, not a
-    /// warm private Wasm document for every imported file. Retaining those
-    /// documents through one atomic commit can exceed the engine-wide actor
-    /// bound before the transaction is allowed to publish them.
-    pub(crate) fn set_retain_plugin_actor_publications(&mut self, retain: bool) {
-        self.retain_plugin_actor_publications = retain;
+    /// Admits a Store for a file that has no durable plugin actor yet.
+    ///
+    /// Fresh documents are independent until this transaction commits. When
+    /// their pending Stores fill the working set, retire the oldest completed
+    /// candidate after its durable rows and materialization have been staged,
+    /// then reuse that admission slot.
+    async fn admit_fresh_plugin_store(
+        &mut self,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginActorStorePermit, LixError> {
+        loop {
+            match self.plugin_host.actor_cache().admit_store() {
+                Ok(permit) => return Ok(permit),
+                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
+                    if retire_oldest_completed_actor(current_publications).await
+                        || retire_oldest_completed_actor(
+                            &mut self.pending_plugin_actor_publications,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Rolls back the storage transaction.
@@ -1137,6 +1157,7 @@ where
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
         factory: Arc<dyn WasmComponentV2Factory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
     ) -> Result<PluginObservation, LixError> {
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
@@ -1210,7 +1231,23 @@ where
             PluginActorColdOpen::Ready(observation) => return Ok(observation),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
-        let store_permit = cache.admit_cold_store(&mut cold_install)?;
+        let store_permit = loop {
+            match cache.admit_cold_store(&mut cold_install) {
+                Ok(permit) => break permit,
+                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
+                    if retire_oldest_completed_actor(current_publications).await
+                        || retire_oldest_completed_actor(
+                            &mut self.pending_plugin_actor_publications,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let rows = overlay_scan_batch(
             &base,
             &staged,
@@ -1385,6 +1422,55 @@ where
                 Arc::<str>::from(semantic_root),
             )
             .await
+    }
+
+    /// Leases an acknowledged actor, cold-opening only when cache eviction is
+    /// the sole reason the observation no longer resolves.
+    ///
+    /// The durable semantic root must still exactly match the root delivered
+    /// with the observation. A concurrent committed transition therefore
+    /// remains stale and cannot be mistaken for benign working-set eviction.
+    async fn lease_or_reopen_observed_v2_actor(
+        &mut self,
+        observation: &PluginObservation,
+        actor_key: &PluginActorKey,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        factory: Arc<dyn WasmComponentV2Factory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginActorLease, LixError> {
+        let cache = self.plugin_host.actor_cache();
+        match cache.lease_for_transition(observation).await {
+            Ok(lease) => return Ok(lease),
+            Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
+                let file_key = PluginFileWriteKey {
+                    branch_id: actor_key.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: actor_key.file_id.clone(),
+                };
+                let Some(visible_materialization) =
+                    self.visible_v2_materialization(&file_key).await?
+                else {
+                    return Err(error);
+                };
+                if visible_materialization.semantic_root != observation.semantic_root() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+
+        let reopened = self
+            .cold_open_v2_semantic_actor(
+                actor_key,
+                plugin,
+                descriptor,
+                factory,
+                current_publications,
+            )
+            .await?;
+        cache.lease_for_transition(&reopened).await
     }
 
     async fn load_visible_exact_live_state_batch(
@@ -3135,6 +3221,7 @@ where
                                 selected,
                                 descriptor.clone(),
                                 Arc::clone(&factory),
+                                &mut reconciliation.actor_publications,
                             )
                             .await?
                         }
@@ -3158,6 +3245,7 @@ where
                             selected,
                             descriptor.clone(),
                             Arc::clone(&factory),
+                            &mut reconciliation.actor_publications,
                         )
                         .await?
                     }
@@ -3171,13 +3259,20 @@ where
                 }
                 let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
                 let after_descriptor = descriptor.clone();
-                let cache = self.plugin_host.actor_cache();
-                // Acquire serialization first, then read the root again.
-                // A second local session may have committed while this
-                // request waited for the actor; reading before the lease
-                // would mistake that valid serialization for an external
-                // stale-cache race.
-                let mut lease = cache.lease_for_transition(&observation).await?;
+                // Acquire serialization first, reopening a benignly evicted
+                // observation only while its exact durable root is unchanged.
+                // Then read the root again: a second local session may have
+                // committed while this request waited for the actor.
+                let mut lease = self
+                    .lease_or_reopen_observed_v2_actor(
+                        &observation,
+                        &actor_key,
+                        selected,
+                        descriptor.clone(),
+                        Arc::clone(&factory),
+                        &mut reconciliation.actor_publications,
+                    )
+                    .await?;
                 let visible_materialization = self
                     .visible_v2_materialization(&file_key)
                     .await?
@@ -3412,7 +3507,9 @@ where
                     create_rows,
                 )
             } else {
-                let store_permit = self.plugin_host.actor_cache().admit_store()?;
+                let store_permit = self
+                    .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
+                    .await?;
                 let mut actor = factory
                     .instantiate_actor()
                     .instrument(tracing::debug_span!(
@@ -3530,11 +3627,6 @@ where
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
-            let publication = if self.retain_plugin_actor_publications {
-                publication
-            } else {
-                publication.into_uncached().await
-            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -3700,6 +3792,7 @@ where
                                 &group.plugin,
                                 descriptor.clone(),
                                 factory,
+                                &mut reconciliation.actor_publications,
                             )
                             .instrument(tracing::debug_span!(
                                 target: "lix_perf",
@@ -3847,11 +3940,6 @@ where
                 .as_mut()
                 .expect("semantic groups promote the reconciled row batch");
             rows.put_prepared_batch_at(&group.row_indices, prepared)?;
-            let publication = if self.retain_plugin_actor_publications {
-                publication
-            } else {
-                publication.into_uncached().await
-            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -5977,8 +6065,8 @@ enum PendingPluginActorPublication {
         semantic_root: Arc<str>,
         view: PendingPluginActorView,
     },
-    /// The plugin transition has already produced its durable rows, but bulk
-    /// ingestion deliberately does not keep its private Wasm Store alive.
+    /// The plugin transition has already produced its durable rows, but the
+    /// bounded working set does not keep its private Wasm Store alive.
     /// Keeping this marker preserves the normal one-transition-per-file
     /// validation and gives the session a non-authoritative file view after
     /// commit, forcing a cold open before any later edit.
@@ -6088,6 +6176,28 @@ impl PendingPluginActorPublication {
             }
         }
     }
+}
+
+/// Releases the oldest completed Store retained only for post-commit cache
+/// publication. Existing-file successors keep their durable staged rows but
+/// become uncached. Dropping their leases makes the predecessor slot evictable
+/// only when no concurrent transition references it; an active or waiting
+/// same-file lease therefore still preserves serialization.
+async fn retire_oldest_completed_actor(
+    publications: &mut Vec<PendingPluginActorPublication>,
+) -> bool {
+    let Some(index) = publications.iter().position(|publication| {
+        matches!(
+            publication,
+            PendingPluginActorPublication::Existing { .. }
+                | PendingPluginActorPublication::New { .. }
+        )
+    }) else {
+        return false;
+    };
+    let publication = publications.remove(index).into_uncached().await;
+    publications.insert(index, publication);
+    true
 }
 
 /// Builds the file write for an accepted semantic renderer transition.
