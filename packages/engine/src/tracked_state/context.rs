@@ -2763,8 +2763,20 @@ where
             .iter()
             .map(|(_, key)| key.clone())
             .collect::<Vec<_>>();
-        let values =
-            storage::load_commit_delta_values(&self.store, commit_id, &missing_keys).await?;
+        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(missing_keys.len());
+        for key in &missing_keys {
+            encoded_keys.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        let values = storage::load_commit_delta_values_encoded(
+            &self.store,
+            commit_id,
+            &encoded_keys.finish(),
+        )
+        .await?;
         for ((index, key), value) in missing.into_iter().zip(values) {
             self.commit_delta_value_cache
                 .insert((commit_id, key), value.clone());

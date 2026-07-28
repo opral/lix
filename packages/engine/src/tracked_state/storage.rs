@@ -16,12 +16,12 @@ use crate::storage_adapter::{
 };
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkBatch,
-    TrackedStateKeyBatchBuilder, TrackedStateMutationBatchBuilder, decode_key_shared,
-    decode_node_ref, decode_value, encode_leaf_node, encode_schema_key_prefix,
+    TrackedStateMutationBatchBuilder, decode_key_shared, decode_node_ref, decode_value,
+    encode_leaf_node, encode_schema_key_prefix,
 };
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateCommitRoot, TrackedStateDeltaRef, TrackedStateIndexValue,
-    TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef, TrackedStateRootId,
+    TrackedStateIndexValueRef, TrackedStateKeyRef, TrackedStateRootId,
 };
 use crate::{LixError, storage_codec};
 use bytes::Bytes;
@@ -543,32 +543,11 @@ pub(crate) fn stage_commit_deltas(
     Ok(())
 }
 
-pub(crate) async fn load_commit_delta_values(
-    store: &(impl StorageAdapterRead + ?Sized),
-    commit_id: CommitId,
-    keys: &[TrackedStateKey],
-) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
-    if keys.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut key_batch = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
-    for key in keys {
-        key_batch.push(TrackedStateKeyRef {
-            schema_key: &key.schema_key,
-            file_id: key.file_id.as_deref(),
-            entity_pk: &key.entity_pk,
-        });
-    }
-    let encoded_keys = key_batch.finish();
-    load_commit_delta_values_encoded(store, commit_id, &encoded_keys).await
-}
-
-/// Encoded-key counterpart used by first-parent batch replay.
+/// Loads commit deltas by encoded key for first-parent batch replay.
 ///
 /// Callers may pass `Bytes` slices that retain decoded commit-delta arenas, so
 /// replay does not need to allocate schema/file strings merely to perform a
-/// point lookup. The owned point API above remains the public compatibility
-/// boundary.
+/// point lookup.
 pub(crate) async fn load_commit_delta_values_encoded(
     store: &(impl StorageAdapterRead + ?Sized),
     commit_id: CommitId,
@@ -1233,8 +1212,8 @@ mod tests {
     };
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
     use crate::tracked_state::codec::{
-        EncodedLeafEntry, PendingChunk, PendingChunkBatch, encode_key_ref, encode_value_ref,
-        hash_bytes,
+        EncodedLeafEntry, PendingChunk, PendingChunkBatch, TrackedStateKeyBatchBuilder,
+        encode_key_ref, encode_value_ref, hash_bytes,
     };
     use crate::tracked_state::types::{
         TrackedStateCommitRoot, TrackedStateCommitRootParent, TrackedStateDeltaRef,
@@ -1248,7 +1227,7 @@ mod tests {
         TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
         TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, commit_delta_manifest_key,
         decode_commit_delta_manifest, decode_commit_root, encode_commit_delta_manifest,
-        encode_commit_delta_segment, encode_commit_root, key, load_commit_delta_values,
+        encode_commit_delta_segment, encode_commit_root, key, load_commit_delta_values_encoded,
         scan_commit_delta_values, stage_commit_deltas, stage_delete_commit_deltas, value,
     };
 
@@ -1281,6 +1260,22 @@ mod tests {
                 updated_at: self.updated_at,
             }
         }
+    }
+
+    async fn load_commit_delta_values_for_test(
+        store: &(impl crate::storage_adapter::StorageAdapterRead + ?Sized),
+        commit_id: CommitId,
+        keys: &[TrackedStateKey],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        let mut encoded_keys = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+        for key in keys {
+            encoded_keys.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        load_commit_delta_values_encoded(store, commit_id, &encoded_keys.finish()).await
     }
 
     fn packed_commit_delta_fixtures() -> Vec<CommitDeltaFixture> {
@@ -1429,7 +1424,7 @@ mod tests {
             missing,
             fixtures[0].key(),
         ];
-        let point_values = load_commit_delta_values(&read, commit_id, &point_keys)
+        let point_values = load_commit_delta_values_for_test(&read, commit_id, &point_keys)
             .await
             .expect("point replay should load packed deltas");
         assert_eq!(
@@ -1496,7 +1491,7 @@ mod tests {
             .await
             .expect("read should open");
         assert_eq!(
-            load_commit_delta_values(&read, commit_id, &[fixture.key()])
+            load_commit_delta_values_for_test(&read, commit_id, &[fixture.key()])
                 .await
                 .expect("inline point replay should load"),
             vec![Some(fixture.value(commit_id))]
@@ -1643,7 +1638,7 @@ mod tests {
             .await
             .expect("post-GC read should open");
         assert!(
-            load_commit_delta_values(&read, commit_id, &[fixtures[0].key()])
+            load_commit_delta_values_for_test(&read, commit_id, &[fixtures[0].key()])
                 .await
                 .expect("post-GC point replay should load")
                 .into_iter()
@@ -1704,7 +1699,7 @@ mod tests {
             .expect("read should open");
         let sparse = &fixtures[255];
         assert_eq!(
-            load_commit_delta_values(&read, indexed_commit_id, &[sparse.key()])
+            load_commit_delta_values_for_test(&read, indexed_commit_id, &[sparse.key()])
                 .await
                 .expect("file-scoped point replay should load"),
             vec![Some(sparse.value(indexed_commit_id))]
