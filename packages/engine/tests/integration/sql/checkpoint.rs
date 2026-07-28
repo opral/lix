@@ -313,7 +313,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('readme', '/docs/readme.md', X'68656C6C6F')",
+                 VALUES ('01950000-0000-7000-8000-000000000001', '/docs/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -327,7 +327,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Text("readme".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000001".to_string()),
                 Value::Text("/docs/readme.md".to_string()),
                 Value::Null,
                 Value::Text("added".to_string()),
@@ -371,7 +371,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Text("readme".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000001".to_string()),
                 Value::Text("/writing/readme.md".to_string()),
                 Value::Text("/docs/readme.md".to_string()),
                 Value::Text("modified".to_string()),

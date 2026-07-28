@@ -1037,7 +1037,7 @@ mod tests {
         let session = SessionContext::new();
         entity::register_entity_providers(
             &session,
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             Arc::new(EmptyLiveStateReader),
             None,
             Arc::new(EmptyBranchRefReader),

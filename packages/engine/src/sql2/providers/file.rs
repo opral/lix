@@ -49,7 +49,7 @@ use crate::plugin::{
     PluginActorStore, PluginFileOwner, PluginMaterialization, PluginRegistry, PluginRegistryEntry,
     PluginRuntimeHost, VecEntitySource, drain_entity_transition_edits,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
-    plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+    plugin_archive_delete_origin, plugin_archive_file_id_matches, plugin_key_from_archive_path,
     plugin_state_live_state_projection, plugin_storage_archive_file_id,
 };
 use crate::sql2::branch_scope::{
@@ -1669,8 +1669,9 @@ impl UpsertSupport for LixFileSpec {
             derived_request.filter.entity_pks = match &target_file_ids {
                 FileIdConstraint::Ids(file_ids) => file_ids
                     .iter()
-                    .map(|file_id| EntityPk::single(file_id.clone()))
-                    .collect(),
+                    .map(|file_id| file_id_entity_pk(file_id))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(lix_error_to_datafusion_error)?,
                 FileIdConstraint::All | FileIdConstraint::None => Vec::new(),
             };
             rows.extend(
@@ -2644,17 +2645,17 @@ async fn load_exact_existing_materializations(
     let blob_requests = unique
         .iter()
         .map(|(key, entry)| {
-            (
+            Ok((
                 key.clone(),
                 LiveStateExactRowRequest {
                     branch_id: entry.key.branch_id().to_string(),
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: EntityPk::single(entry.id()),
+                    entity_pk: file_id_entity_pk(entry.id())?,
                     file_id: Some(entry.id().to_string()),
                 },
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let request = LiveStateExactBatchRequest {
         rows: blob_requests
             .iter()
@@ -2697,17 +2698,17 @@ async fn load_exact_existing_materializations(
                 .is_some_and(|materialization| materialization.has_blob_ref)
         })
         .map(|(key, entry)| {
-            (
+            Ok((
                 key.clone(),
                 LiveStateExactRowRequest {
                     branch_id: entry.key.branch_id().to_string(),
                     schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: EntityPk::single(entry.id()),
+                    entity_pk: file_id_entity_pk(entry.id())?,
                     file_id: Some(entry.id().to_string()),
                 },
-            )
+            ))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     if derived_requests.is_empty() {
         return Ok(materializations);
     }
@@ -2815,7 +2816,7 @@ async fn execute_fast_lix_file_data_update_by_id_impl(
     // derived proof lookup.
     let mut blob_request = lix_file_scan_request(Some(&active_branch_id), None, None);
     blob_request.filter.schema_keys = vec![BLOB_REF_SCHEMA_KEY.to_string()];
-    blob_request.filter.entity_pks = vec![EntityPk::single(file_id.clone())];
+    blob_request.filter.entity_pks = vec![file_id_entity_pk(&file_id)?];
     let rows = ctx.scan_live_state(&blob_request).await?;
 
     let mut prepared = prepare_indexed_lix_file_rows(&indexed_matches, rows)?;
@@ -3035,15 +3036,30 @@ fn lix_file_delete_stage_from_batch(
         let path = optional_string_value(batch, row_index, "path")?;
         validate_lix_file_delete_target(path.as_deref(), &file_id, plugin_archive_delete_target)?;
         let context = file_row_context_from_batch(batch, row_index, branch_binding)?;
+        let mut plan = plan_file_delete(FileDeleteInput {
+            file_id: file_id.clone(),
+            has_blob_ref: blob_ref_keys
+                .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
+            has_derived_file_ref: derived_file_ref_keys
+                .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
+            context,
+        });
+        if let Some(plugin_key) = plugin_archive_delete_target {
+            for row in &mut plan.rows {
+                if row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
+                    row.origin = Some(TransactionWriteOrigin {
+                        surface: plugin_archive_delete_origin(plugin_key),
+                        operation: TransactionWriteOperation::Delete,
+                        primary_key: Some(LogicalPrimaryKey {
+                            columns: vec!["id".to_string()],
+                            values: vec![file_id.clone()],
+                        }),
+                    });
+                }
+            }
+        }
         staged
-            .extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
-                file_id: file_id.clone(),
-                has_blob_ref: blob_ref_keys
-                    .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
-                has_derived_file_ref: derived_file_ref_keys
-                    .contains(&FilesystemBlobRefKey::from_context(&context, &file_id)),
-                context,
-            }))
+            .extend_filesystem_delete_plan(plan)
             .map_err(lix_error_to_datafusion_error)?;
     }
     Ok(staged)
@@ -3054,26 +3070,29 @@ fn validate_lix_file_delete_target(
     file_id: &str,
     plugin_archive_delete_target: Option<&str>,
 ) -> Result<()> {
-    let archive_id_plugin_key = plugin_key_from_archive_file_id(file_id);
+    let archive_target_matches_id = plugin_archive_delete_target
+        .is_some_and(|plugin_key| plugin_archive_file_id_matches(file_id, plugin_key));
     let Some(path) = path else {
-        if archive_id_plugin_key.is_some() {
-            return Err(rejected_plugin_archive_delete_error(None, file_id));
+        if plugin_archive_delete_target.is_none() {
+            return Ok(());
         }
-        return Ok(());
+        if archive_target_matches_id {
+            return Ok(());
+        }
+        return Err(rejected_plugin_archive_delete_error(None, file_id));
     };
     LixPath::try_from_file_path(path).map_err(lix_error_to_datafusion_error)?;
     let archive_path_plugin_key = plugin_key_from_archive_path(path);
-    if !is_plugin_storage_path(path) && archive_id_plugin_key.is_none() {
+    if !is_plugin_storage_path(path) && !archive_target_matches_id {
         return Ok(());
     }
 
     match (
         archive_path_plugin_key.as_deref(),
-        archive_id_plugin_key.as_deref(),
         plugin_archive_delete_target,
     ) {
-        (Some(path_key), Some(id_key), Some(target_key))
-            if path_key == id_key && id_key == target_key =>
+        (Some(path_key), Some(target_key))
+            if path_key == target_key && plugin_archive_file_id_matches(file_id, target_key) =>
         {
             Ok(())
         }
@@ -4278,7 +4297,11 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_entity_pk" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| EntityPk::single(entry.id()).as_json_array_text().map(Some))
+                    .map(|entry| {
+                        file_id_entity_pk(entry.id())?
+                            .as_json_array_text()
+                            .map(Some)
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             "lixcol_schema_key" => {
@@ -5488,8 +5511,8 @@ async fn scan_lix_file_live_rows(
     ];
     file_request.filter.entity_pks = target_file_ids
         .iter()
-        .map(|file_id| EntityPk::single(file_id.clone()))
-        .collect();
+        .map(|file_id| file_id_entity_pk(file_id))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut rows = live_state.scan_rows(&file_request).await?;
 
@@ -5575,16 +5598,16 @@ async fn scan_exact_file_blob_rows(
         .branch_ids
         .iter()
         .flat_map(|branch_id| {
-            file_ids
-                .iter()
-                .map(move |file_id| LiveStateExactRowRequest {
+            file_ids.iter().map(move |file_id| {
+                Ok(LiveStateExactRowRequest {
                     branch_id: branch_id.clone(),
                     schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: EntityPk::single(file_id.clone()),
+                    entity_pk: file_id_entity_pk(file_id)?,
                     file_id: Some(file_id.clone()),
                 })
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let rows = live_state
         .load_exact_rows(&LiveStateExactBatchRequest {
             rows: exact_rows,
@@ -5608,13 +5631,15 @@ async fn scan_exact_derived_file_ref_rows(
         .load_exact_rows(&LiveStateExactBatchRequest {
             rows: file_keys
                 .iter()
-                .map(|file_key| LiveStateExactRowRequest {
-                    branch_id: file_key.branch_id().to_string(),
-                    schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
-                    entity_pk: EntityPk::single(file_key.descriptor_id().to_string()),
-                    file_id: Some(file_key.descriptor_id().to_string()),
+                .map(|file_key| {
+                    Ok(LiveStateExactRowRequest {
+                        branch_id: file_key.branch_id().to_string(),
+                        schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
+                        entity_pk: file_id_entity_pk(file_key.descriptor_id())?,
+                        file_id: Some(file_key.descriptor_id().to_string()),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, LixError>>()?,
             projection: request.projection.clone(),
             untracked: request.filter.untracked,
             include_tombstones: request.filter.include_tombstones,
@@ -5685,15 +5710,14 @@ fn exact_plugin_archive_delete_target_from_filters(filters: &[Expr]) -> Result<O
     )
     .as_deref()
     .and_then(plugin_key_from_archive_path);
-    let id_plugin_key = single_exact_string_constraint(file_id_constraint_from_filters(filters)?)
-        .as_deref()
-        .and_then(plugin_key_from_archive_file_id);
+    let id = single_exact_string_constraint(file_id_constraint_from_filters(filters)?);
 
-    match (path_plugin_key, id_plugin_key) {
-        (Some(path_key), Some(id_key)) if path_key != id_key => Ok(None),
-        (Some(path_key), _) => Ok(Some(path_key)),
-        (_, Some(id_key)) => Ok(Some(id_key)),
-        (None, None) => Ok(None),
+    match (path_plugin_key, id) {
+        (Some(path_key), Some(id)) if plugin_archive_file_id_matches(&id, &path_key) => {
+            Ok(Some(path_key))
+        }
+        (Some(path_key), None) => Ok(Some(path_key)),
+        _ => Ok(None),
     }
 }
 
@@ -6576,6 +6600,15 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
     crate::sql2::error::lix_error_to_datafusion_error(error)
 }
 
+fn file_id_entity_pk(file_id: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("validated file ID is not a canonical UUID: {error}"),
+        )
+    })
+}
+
 #[cfg(test)]
 #[expect(trivial_casts)]
 mod tests {
@@ -6642,6 +6675,11 @@ mod tests {
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
         move || ids.next().expect("test id should exist").to_string()
+    }
+
+    fn uuid_pk(value: &str) -> crate::entity_pk::EntityPk {
+        crate::entity_pk::EntityPk::uuid_from_canonical(value)
+            .expect("fixture ID should be a canonical UUID")
     }
 
     fn test_functions() -> FunctionProviderHandle {
@@ -6721,7 +6759,7 @@ mod tests {
                     "name": format!("path-{path_index:08}.txt"),
                 })
                 .to_string();
-                live_file_row(&id, "branch-b", &snapshot)
+                live_file_row(&id, "01920000-0000-7000-8000-0000000000b1", &snapshot)
             })
             .collect::<Vec<_>>();
 
@@ -6814,24 +6852,27 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_file_row(
-                    "file-z",
-                    "branch-b",
-                    r#"{"id":"file-z","directory_id":null,"name":"a.txt"}"#,
+                    "01920000-0000-7000-8000-000000000532",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000532","directory_id":null,"name":"a.txt"}"#,
                 ),
                 live_file_row(
-                    "file-a",
-                    "branch-b",
-                    r#"{"id":"file-a","directory_id":null,"name":"z.txt"}"#,
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":null,"name":"z.txt"}"#,
                 ),
                 live_file_row(
-                    "file-middle",
-                    "branch-b",
-                    r#"{"id":"file-middle","directory_id":null,"name":"middle.txt"}"#,
+                    "01920000-0000-7000-8000-000000000452",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000452","directory_id":null,"name":"middle.txt"}"#,
                 ),
             ])
             .expect("filesystem path index should build"),
         );
-        let ids = BTreeSet::from(["file-a".to_string(), "file-z".to_string()]);
+        let ids = BTreeSet::from([
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+            "01920000-0000-7000-8000-000000000532".to_string(),
+        ]);
 
         let matches = super::indexed_file_id_matches(
             Arc::clone(&index),
@@ -6885,7 +6926,10 @@ mod tests {
         let constraint = analyzer
             .analyze(&Expr::InList(InList::new(
                 Box::new(column("id")),
-                vec![string_literal("file-b"), string_literal("file-a")],
+                vec![
+                    string_literal("01920000-0000-7000-8000-0000000000b2"),
+                    string_literal("01920000-0000-7000-8000-0000000000a2"),
+                ],
                 false,
             )))
             .unwrap()
@@ -6894,13 +6938,13 @@ mod tests {
         assert_eq!(
             constraint,
             super::FileIdConstraint::Ids(BTreeSet::from([
-                "file-a".to_string(),
-                "file-b".to_string()
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                "01920000-0000-7000-8000-0000000000b2".to_string()
             ]))
         );
-        assert!(analyzer.supports(&eq_filter("id", "file-a")));
+        assert!(analyzer.supports(&eq_filter("id", "01920000-0000-7000-8000-0000000000a2")));
         assert!(analyzer.supports(&Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(string_literal("file-a")),
+            Box::new(string_literal("01920000-0000-7000-8000-0000000000a2")),
             Operator::Eq,
             Box::new(column("id")),
         ))));
@@ -6911,12 +6955,18 @@ mod tests {
         let analyzer = super::LixFileIdFilterAnalyzer;
         let left = Expr::InList(InList::new(
             Box::new(column("id")),
-            vec![string_literal("file-a"), string_literal("file-b")],
+            vec![
+                string_literal("01920000-0000-7000-8000-0000000000a2"),
+                string_literal("01920000-0000-7000-8000-0000000000b2"),
+            ],
             false,
         ));
         let right = Expr::InList(InList::new(
             Box::new(column("id")),
-            vec![string_literal("file-b"), string_literal("file-c")],
+            vec![
+                string_literal("01920000-0000-7000-8000-0000000000b2"),
+                string_literal("01920000-0000-7000-8000-0000000000c2"),
+            ],
             false,
         ));
 
@@ -6930,7 +6980,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             and_constraint,
-            super::FileIdConstraint::Ids(BTreeSet::from(["file-b".to_string()]))
+            super::FileIdConstraint::Ids(BTreeSet::from([
+                "01920000-0000-7000-8000-0000000000b2".to_string()
+            ]))
         );
 
         let or_constraint = analyzer
@@ -6944,9 +6996,9 @@ mod tests {
         assert_eq!(
             or_constraint,
             super::FileIdConstraint::Ids(BTreeSet::from([
-                "file-a".to_string(),
-                "file-b".to_string(),
-                "file-c".to_string()
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                "01920000-0000-7000-8000-0000000000b2".to_string(),
+                "01920000-0000-7000-8000-0000000000c2".to_string()
             ]))
         );
     }
@@ -6954,9 +7006,9 @@ mod tests {
     #[test]
     fn file_id_filters_detect_contradictions() {
         let filters = vec![Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "file-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
             Operator::And,
-            Box::new(eq_filter("id", "file-b")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000b2")),
         ))];
 
         assert_eq!(
@@ -6972,25 +7024,27 @@ mod tests {
         assert!(!analyzer.supports(&eq_filter("name", "readme.md")));
         assert!(!analyzer.supports(&Expr::InList(InList::new(
             Box::new(column("id")),
-            vec![string_literal("file-a")],
+            vec![string_literal("01920000-0000-7000-8000-0000000000a2")],
             true,
         ))));
     }
 
     #[test]
-    fn plugin_archive_delete_target_requires_one_exact_canonical_path_or_id() {
+    fn plugin_archive_delete_target_requires_one_exact_canonical_path() {
         let path = "/.lix/plugins/plugin_sentinel.lixplugin";
-        let file_id = "lix_plugin_archive::plugin_sentinel";
+        let file_id = plugin_storage_archive_file_id("plugin_sentinel");
 
-        for filters in [
-            vec![eq_filter("path", path)],
-            vec![eq_filter("id", file_id)],
-        ] {
-            assert_eq!(
-                super::exact_plugin_archive_delete_target_from_filters(&filters).unwrap(),
-                Some("plugin_sentinel".to_string())
-            );
-        }
+        assert_eq!(
+            super::exact_plugin_archive_delete_target_from_filters(&[eq_filter("path", path)])
+                .unwrap(),
+            Some("plugin_sentinel".to_string())
+        );
+        assert_eq!(
+            super::exact_plugin_archive_delete_target_from_filters(&[eq_filter("id", &file_id)])
+                .unwrap(),
+            None,
+            "a UUID does not embed the plugin key; uninstall routing requires the canonical path"
+        );
 
         for filters in [
             Vec::new(),
@@ -7122,7 +7176,7 @@ mod tests {
     #[test]
     fn file_path_predicates_stay_conservative_across_boolean_filters() {
         let path_filter = eq_filter("path", "/readme.md");
-        let id_filter = eq_filter("id", "file-other");
+        let id_filter = eq_filter("id", "01920000-0000-7000-8000-000000000482");
         let conjunction =
             super::file_path_predicate_from_filters(&[Expr::BinaryExpr(BinaryExpr::new(
                 Box::new(path_filter.clone()),
@@ -7190,24 +7244,24 @@ mod tests {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let mut file = live_file_row(
-            "file-readme",
-            "branch-b",
-            r#"{"id":"file-readme","directory_id":"dir-docs","name":"readme.md"}"#,
+            "01920000-0000-7000-8000-0000000000d2",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"readme.md"}"#,
         );
         file.metadata = Some(r#"{"source":"index"}"#.to_string());
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 file,
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
-            "branch-b",
+            "01920000-0000-7000-8000-0000000000b1",
             Arc::new(RejectingLiveStateReader {
                 scan_count: Arc::clone(&live_state_scans),
             }),
@@ -7255,18 +7309,24 @@ mod tests {
                 .expect("descriptor column should be string data")
                 .value(0)
         };
-        assert_eq!(string_value("id"), "file-readme");
+        assert_eq!(string_value("id"), "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(string_value("path"), "/docs/readme.md");
-        assert_eq!(string_value("directory_id"), "dir-docs");
+        assert_eq!(
+            string_value("directory_id"),
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(string_value("name"), "readme.md");
-        assert_eq!(string_value("lixcol_entity_pk"), "[\"file-readme\"]");
+        assert_eq!(
+            string_value("lixcol_entity_pk"),
+            "[\"01920000-0000-7000-8000-0000000000d2\"]"
+        );
         assert_eq!(
             string_value("lixcol_schema_key"),
             super::FILE_DESCRIPTOR_SCHEMA_KEY
         );
         assert_eq!(
             string_value("lixcol_commit_id"),
-            CommitId::for_test_label("commit-file-readme").to_string()
+            CommitId::for_test_label("commit-01920000-0000-7000-8000-0000000000d2").to_string()
         );
         assert_eq!(string_value("lixcol_metadata"), r#"{"source":"index"}"#);
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
@@ -7280,25 +7340,25 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_file_row(
-                    "file-c",
-                    "branch-b",
-                    r#"{"id":"file-c","directory_id":null,"name":"c.txt"}"#,
+                    "01920000-0000-7000-8000-0000000000c2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000c2","directory_id":null,"name":"c.txt"}"#,
                 ),
                 live_file_row(
-                    "file-a",
-                    "branch-b",
-                    r#"{"id":"file-a","directory_id":null,"name":"a.txt"}"#,
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":null,"name":"a.txt"}"#,
                 ),
                 live_file_row(
-                    "file-b",
-                    "branch-b",
-                    r#"{"id":"file-b","directory_id":null,"name":"b.txt"}"#,
+                    "01920000-0000-7000-8000-0000000000b2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000b2","directory_id":null,"name":"b.txt"}"#,
                 ),
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
-            "branch-b",
+            "01920000-0000-7000-8000-0000000000b1",
             Arc::new(RejectingLiveStateReader {
                 scan_count: Arc::clone(&live_state_scans),
             }),
@@ -7332,7 +7392,7 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .expect("id should be string data")
                 .value(0),
-            "file-a"
+            "01920000-0000-7000-8000-0000000000a2"
         );
 
         let empty_projection = Vec::new();
@@ -7359,18 +7419,18 @@ mod tests {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let mut target = live_file_row(
-            "file-target",
-            "branch-b",
-            r#"{"id":"file-target","directory_id":null,"name":"readme.md"}"#,
+            "01920000-0000-7000-8000-000000000522",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
         );
-        target.file_id = Some("remote-file-target".to_string());
+        target.file_id = Some("remote-01920000-0000-7000-8000-000000000522".to_string());
         target.untracked = true;
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_file_row(
-                    "file-other",
-                    "branch-a",
-                    r#"{"id":"file-other","directory_id":null,"name":"readme.md"}"#,
+                    "01920000-0000-7000-8000-000000000482",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"readme.md"}"#,
                 ),
                 target,
             ])
@@ -7405,7 +7465,10 @@ mod tests {
                 .expect("by-branch descriptor column should exist")
         })
         .collect::<Vec<_>>();
-        let filters = vec![eq_filter("lixcol_branch_id", "branch-b")];
+        let filters = vec![eq_filter(
+            "lixcol_branch_id",
+            "01920000-0000-7000-8000-0000000000b1",
+        )];
 
         let planned = spec
             .plan_scan(Some(&projection), &filters, Some(1), &ExecutionProps::new())
@@ -7432,8 +7495,11 @@ mod tests {
                 .expect("descriptor column should be boolean data")
                 .value(0)
         };
-        assert_eq!(string_value("id"), "file-target");
-        assert_eq!(string_value("lixcol_file_id"), "remote-file-target");
+        assert_eq!(string_value("id"), "01920000-0000-7000-8000-000000000522");
+        assert_eq!(
+            string_value("lixcol_file_id"),
+            "remote-01920000-0000-7000-8000-000000000522"
+        );
         assert!(!boolean_value("lixcol_global"));
         assert!(boolean_value("lixcol_untracked"));
         assert_eq!(
@@ -7444,7 +7510,10 @@ mod tests {
             string_value("lixcol_updated_at"),
             "2026-04-23T01:00:00.000Z"
         );
-        assert_eq!(string_value("lixcol_branch_id"), "branch-b");
+        assert_eq!(
+            string_value("lixcol_branch_id"),
+            "01920000-0000-7000-8000-0000000000b1"
+        );
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
@@ -7457,14 +7526,14 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_file_row(
-                    "file-readme",
-                    "branch-b",
-                    r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
                 ),
                 live_blob_ref_row(
-                    "file-readme",
-                    "branch-b",
-                    "file-readme",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-0000000000d2",
                     &BlobHash::from_content(&data).to_hex(),
                     data.len(),
                 ),
@@ -7472,7 +7541,7 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
-            "branch-b",
+            "01920000-0000-7000-8000-0000000000b1",
             Arc::new(RecordingLiveStateReader {
                 rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
@@ -7487,7 +7556,7 @@ mod tests {
             test_functions(),
         );
         let projection = vec![spec.schema().index_of("data").expect("data column")];
-        let filters = vec![eq_filter("id", "file-readme")];
+        let filters = vec![eq_filter("id", "01920000-0000-7000-8000-0000000000d2")];
 
         let planned = spec
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
@@ -7522,9 +7591,9 @@ mod tests {
         let selected_change_id = ChangeId::for_test_label("selected-search-blob");
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let mut selected_blob = live_blob_ref_row(
-            "file-selected",
-            "branch-b",
-            "file-selected",
+            "01920000-0000-7000-8000-0000000000e2",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-0000000000e2",
             &selected_blob_hash,
             selected_data.len(),
         );
@@ -7532,29 +7601,29 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"Docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"Docs"}"#,
                 ),
                 live_directory_row(
-                    "dir-other",
-                    "branch-b",
-                    r#"{"id":"dir-other","parent_id":null,"name":"Other"}"#,
+                    "01920000-0000-7000-8000-000000000383",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000383","parent_id":null,"name":"Other"}"#,
                 ),
                 live_file_row(
-                    "file-selected",
-                    "branch-b",
-                    r#"{"id":"file-selected","directory_id":"dir-docs","name":"README.md"}"#,
+                    "01920000-0000-7000-8000-0000000000e2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000e2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"README.md"}"#,
                 ),
                 live_file_row(
-                    "file-changelog",
-                    "branch-b",
-                    r#"{"id":"file-changelog","directory_id":"dir-docs","name":"changelog.md"}"#,
+                    "01920000-0000-7000-8000-000000000432",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000432","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"changelog.md"}"#,
                 ),
                 live_file_row(
-                    "file-outside",
-                    "branch-b",
-                    r#"{"id":"file-outside","directory_id":"dir-other","name":"README.md"}"#,
+                    "01920000-0000-7000-8000-000000000492",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000492","directory_id":"01920000-0000-7000-8000-000000000383","name":"README.md"}"#,
                 ),
                 selected_blob.clone(),
             ])
@@ -7582,7 +7651,7 @@ mod tests {
                 .entries()
                 .map(|entry| entry.id().to_owned())
                 .collect::<Vec<_>>(),
-            vec!["file-selected".to_string()],
+            vec!["01920000-0000-7000-8000-0000000000e2".to_string()],
             "the range and contains predicates should exclude both the local non-match and outside root",
         );
 
@@ -7590,16 +7659,16 @@ mod tests {
             rows: vec![
                 selected_blob,
                 live_blob_ref_row(
-                    "file-changelog",
-                    "branch-b",
-                    "file-changelog",
+                    "01920000-0000-7000-8000-000000000432",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000432",
                     &changelog_blob_hash,
                     changelog_data.len(),
                 ),
                 live_blob_ref_row(
-                    "file-outside",
-                    "branch-b",
-                    "file-outside",
+                    "01920000-0000-7000-8000-000000000492",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000492",
                     &outside_blob_hash,
                     outside_data.len(),
                 ),
@@ -7622,8 +7691,11 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&find_files_projection))
             .expect("findFiles projection should be valid");
-        let _request =
-            super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let _request = super::lix_file_scan_request(
+            Some("01920000-0000-7000-8000-0000000000b1"),
+            Some(&projected_schema),
+            None,
+        );
         let rows =
             super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
@@ -7677,30 +7749,36 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_file_row(
-                    "file-docs",
-                    "branch-b",
-                    r#"{"id":"file-docs","directory_id":"dir-docs","name":"readme.md"}"#,
+                    "01920000-0000-7000-8000-0000000000f2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000f2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"readme.md"}"#,
                 ),
                 live_file_row(
-                    "file-other-doc",
-                    "branch-b",
-                    r#"{"id":"file-other-doc","directory_id":"dir-docs","name":"other.md"}"#,
+                    "01920000-0000-7000-8000-000000000102",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000102","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"other.md"}"#,
                 ),
                 live_file_row(
-                    "file-root",
-                    "branch-b",
-                    r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
+                    "01920000-0000-7000-8000-000000000142",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000142","directory_id":null,"name":"root.md"}"#,
                 ),
-                live_blob_ref_row("file-docs", "branch-b", "file-docs", &blob_hash, data.len()),
                 live_blob_ref_row(
-                    "file-other-doc",
-                    "branch-b",
-                    "file-other-doc",
+                    "01920000-0000-7000-8000-0000000000f2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-0000000000f2",
+                    &blob_hash,
+                    data.len(),
+                ),
+                live_blob_ref_row(
+                    "01920000-0000-7000-8000-000000000102",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000102",
                     &other_blob_hash,
                     other_data.len(),
                 ),
@@ -7708,7 +7786,7 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
-            "branch-b",
+            "01920000-0000-7000-8000-0000000000b1",
             Arc::new(RecordingLiveStateReader {
                 rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
@@ -7728,7 +7806,10 @@ mod tests {
                 .index_of("lixcol_change_id")
                 .expect("change-id column"),
         ];
-        let filters = vec![eq_filter("directory_id", "dir-docs")];
+        let filters = vec![eq_filter(
+            "directory_id",
+            "01920000-0000-7000-8000-0000000000d3",
+        )];
 
         assert_eq!(
             spec.filter_pushdown(&filters[0]),
@@ -7771,7 +7852,7 @@ mod tests {
         let error = super::scan_exact_file_blob_rows(
             live_state,
             &LiveStateScanRequest::default(),
-            &BTreeSet::from(["file-a".to_string()]),
+            &BTreeSet::from(["01920000-0000-7000-8000-0000000000a2".to_string()]),
         )
         .await
         .expect_err("branchless exact reads should be rejected");
@@ -7789,68 +7870,67 @@ mod tests {
         let misplaced_data = b"misplaced".to_vec();
 
         let mut global_file = live_file_row(
-            "file-global",
+            "01920000-0000-7000-8000-000000000112",
             // Path-index rows are already projected into the requested branch.
-            "branch-b",
-            r#"{"id":"file-global","directory_id":null,"name":"global.md"}"#,
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000112","directory_id":null,"name":"global.md"}"#,
         );
         global_file.global = true;
         let mut untracked_file = live_file_row(
-            "file-untracked",
-            "branch-b",
-            r#"{"id":"file-untracked","directory_id":null,"name":"untracked.md"}"#,
+            "01920000-0000-7000-8000-000000000132",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"untracked.md"}"#,
         );
         untracked_file.untracked = true;
         let mut index_rows = vec![
             live_file_row(
-                "file-tracked",
-                "branch-b",
-                r#"{"id":"file-tracked","directory_id":null,"name":"tracked.md"}"#,
+                "01920000-0000-7000-8000-000000000122",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"tracked.md"}"#,
             ),
             global_file,
             untracked_file,
         ];
         index_rows.extend((0..30).map(|index| {
+            let file_id = format!("01920000-0000-7000-8000-{index:012x}");
             live_file_row(
-                &format!("file-padding-{index}"),
-                "branch-b",
-                &format!(
-                    r#"{{"id":"file-padding-{index}","directory_id":null,"name":"padding-{index}.md"}}"#
-                ),
+                &file_id,
+                "01920000-0000-7000-8000-0000000000b1",
+                &format!(r#"{{"id":"{file_id}","directory_id":null,"name":"padding-{index}.md"}}"#),
             )
         }));
         let mut tracked_blob = live_blob_ref_row(
-            "file-tracked",
-            "branch-b",
-            "file-tracked",
+            "01920000-0000-7000-8000-000000000122",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-000000000122",
             &BlobHash::from_content(&tracked_data).to_hex(),
             tracked_data.len(),
         );
         tracked_blob.change_id = Some(ChangeId::for_test_label("tracked-blob"));
         let mut global_blob = live_blob_ref_row(
-            "file-global",
+            "01920000-0000-7000-8000-000000000112",
             // Path-index rows are already projected into the requested branch.
-            "branch-b",
-            "file-global",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-000000000112",
             &BlobHash::from_content(&global_data).to_hex(),
             global_data.len(),
         );
         global_blob.global = true;
         global_blob.change_id = Some(ChangeId::for_test_label("global-blob"));
         let mut untracked_blob = live_blob_ref_row(
-            "file-untracked",
-            "branch-b",
-            "file-untracked",
+            "01920000-0000-7000-8000-000000000132",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-000000000132",
             &BlobHash::from_content(&untracked_data).to_hex(),
             untracked_data.len(),
         );
         untracked_blob.untracked = true;
         untracked_blob.change_id = Some(ChangeId::for_test_label("untracked-blob"));
-        // A malformed `(entity=file-tracked, file=different-file-id)` row must
+        // A malformed `(entity=01920000-0000-7000-8000-000000000122, file=different-file-id)` row must
         // never be fetched for the exact descriptor identity.
         let mut misplaced_blob = live_blob_ref_row(
-            "file-tracked",
-            "branch-b",
+            "01920000-0000-7000-8000-000000000122",
+            "01920000-0000-7000-8000-0000000000b1",
             "different-file-id",
             &BlobHash::from_content(&misplaced_data).to_hex(),
             misplaced_data.len(),
@@ -7882,8 +7962,11 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&projection))
             .expect("projection should be valid");
-        let _request =
-            super::lix_file_scan_request(Some("branch-b"), Some(&projected_schema), None);
+        let _request = super::lix_file_scan_request(
+            Some("01920000-0000-7000-8000-0000000000b1"),
+            Some(&projected_schema),
+            None,
+        );
         let rows =
             super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
@@ -7960,31 +8043,31 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_file_row(
-                    "file-nested",
-                    "branch-b",
-                    r#"{"id":"file-nested","directory_id":"dir-docs","name":"readme.md"}"#,
+                    "01920000-0000-7000-8000-000000000462",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000462","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"readme.md"}"#,
                 ),
                 live_file_row(
-                    "file-root",
-                    "branch-b",
-                    r#"{"id":"file-root","directory_id":null,"name":"root.md"}"#,
+                    "01920000-0000-7000-8000-000000000142",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000142","directory_id":null,"name":"root.md"}"#,
                 ),
                 live_blob_ref_row(
-                    "file-root",
-                    "branch-b",
-                    "file-root",
+                    "01920000-0000-7000-8000-000000000142",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000142",
                     &root_blob_hash,
                     root_data.len(),
                 ),
                 live_blob_ref_row(
-                    "file-nested",
-                    "branch-b",
-                    "file-nested",
+                    "01920000-0000-7000-8000-000000000462",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000462",
                     &nested_blob_hash,
                     nested_data.len(),
                 ),
@@ -7992,7 +8075,7 @@ mod tests {
             .expect("filesystem path index should build"),
         );
         let spec = LixFileSpec::active_branch(
-            "branch-b",
+            "01920000-0000-7000-8000-0000000000b1",
             Arc::new(RecordingLiveStateReader {
                 rows: Vec::new(),
                 scan_requests: Arc::clone(&live_state_requests),
@@ -8090,7 +8173,12 @@ mod tests {
             update_columns,
             path_resolvers,
             generate_directory_id,
-            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+            &BTreeSet::from([blob_ref_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                "01920000-0000-7000-8000-0000000000d2",
+            )]),
         )
     }
 
@@ -8222,7 +8310,7 @@ mod tests {
     #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
         fn active_branch_id(&self) -> &str {
-            "branch-b"
+            "01920000-0000-7000-8000-0000000000b1"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -8326,7 +8414,7 @@ mod tests {
     #[async_trait]
     impl SqlWriteExecutionContext for IndexedFileDataUpdateWriteContext {
         fn active_branch_id(&self) -> &str {
-            "branch-b"
+            "01920000-0000-7000-8000-0000000000b1"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -8359,7 +8447,10 @@ mod tests {
             &mut self,
             request: &FilesystemPathIndexRequest,
         ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-            assert_eq!(request.branch_ids, vec!["branch-b".to_string()]);
+            assert_eq!(
+                request.branch_ids,
+                vec!["01920000-0000-7000-8000-0000000000b1".to_string()]
+            );
             self.path_index_requests.fetch_add(1, Ordering::SeqCst);
             Ok(Arc::clone(&self.index))
         }
@@ -8603,7 +8694,8 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+                .expect("fixture directory ID should be a UUID"),
             schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
@@ -8624,8 +8716,14 @@ mod tests {
         branch_id: &str,
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
+        let typed_entity_pk = if matches!(entity_pk, PLUGIN_REGISTRY_KEY | PLUGIN_OWNER_KEY) {
+            crate::entity_pk::EntityPk::single(entity_pk)
+        } else {
+            crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+                .expect("fixture file ID should be a UUID")
+        };
         MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            entity_pk: typed_entity_pk,
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(snapshot_content.to_string()),
@@ -8661,11 +8759,17 @@ mod tests {
     fn file_dml_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
             live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
-            live_blob_ref_row("file-readme", "branch-b", "file-readme", &"0".repeat(64), 5),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
+                &"0".repeat(64),
+                5,
+            ),
         ]
     }
 
@@ -8862,15 +8966,17 @@ mod tests {
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
         let mut columns = vec![
-            string_column(vec![Some("file-readme")]),
-            string_column(vec![Some("dir-docs")]),
+            string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
+            string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
             string_column(vec![Some("readme.md")]),
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
             string_column(vec![Some("{\"source\":\"file\"}")]),
         ];
         if include_branch {
             fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-            columns.push(string_column(vec![Some("branch-b")]));
+            columns.push(string_column(vec![Some(
+                "01920000-0000-7000-8000-0000000000b1",
+            )]));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file insert batch")
     }
@@ -8885,11 +8991,11 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
-                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file data batch")
@@ -8912,10 +9018,10 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![data.as_slice()])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file path data batch")
@@ -8938,10 +9044,10 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![data])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file path update batch")
@@ -8956,10 +9062,10 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some(path)]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file data update batch")
@@ -8976,12 +9082,12 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some("/old.raw")]),
-                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file descriptor data update batch")
@@ -8999,13 +9105,13 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 string_column(vec![Some("/docs/readme.md")]),
-                string_column(vec![Some("dir-docs")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
                 string_column(vec![Some("readme.md")]),
                 Arc::new(BinaryArray::from_vec(vec![b"updated"])) as ArrayRef,
                 string_column(vec![Some(r#"{"source":"upload"}"#)]),
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("file metadata data update batch")
@@ -9019,9 +9125,9 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000d2")]),
                 Arc::new(BinaryArray::from_vec(vec![b""])) as ArrayRef,
-                string_column(vec![Some("branch-b")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000b1")]),
             ],
         )
         .expect("empty file data update batch")
@@ -9032,7 +9138,7 @@ mod tests {
     }
 
     fn file_delete_batch_with_path(path: Option<&str>) -> RecordBatch {
-        file_delete_batch_with_id_and_path("file-readme", path)
+        file_delete_batch_with_id_and_path("01920000-0000-7000-8000-0000000000d2", path)
     }
 
     fn file_delete_batch_with_id_and_path(file_id: &str, path: Option<&str>) -> RecordBatch {
@@ -9043,23 +9149,31 @@ mod tests {
             columns.push(string_column(vec![Some(path)]));
         }
         fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-        columns.push(string_column(vec![Some("branch-b")]));
+        columns.push(string_column(vec![Some(
+            "01920000-0000-7000-8000-0000000000b1",
+        )]));
 
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file delete batch")
     }
 
     #[test]
     fn derives_nested_directory_paths() {
-        let context = FilesystemRowContext::active_branch("branch-a");
+        let context = FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1");
         let root = DirectoryDescriptorRecord {
             parent_id: None,
             name: "docs".to_string(),
-            key: FilesystemDescriptorKey::from_context(&context, "dir-docs"),
+            key: FilesystemDescriptorKey::from_context(
+                &context,
+                "01920000-0000-7000-8000-0000000000d3",
+            ),
         };
         let child = DirectoryDescriptorRecord {
-            parent_id: Some("dir-docs".to_string()),
+            parent_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             name: "guides".to_string(),
-            key: FilesystemDescriptorKey::from_context(&context, "dir-guides"),
+            key: FilesystemDescriptorKey::from_context(
+                &context,
+                "01920000-0000-7000-8000-000000000313",
+            ),
         };
         let child_key = child.key.clone();
         let records = [root, child];
@@ -9078,9 +9192,9 @@ mod tests {
             None,
             true,
             vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                "{\"id\":\"file-readme\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":\"missing-dir\",\"name\":\"readme.md\"}",
             )],
         )
         .await
@@ -9098,26 +9212,26 @@ mod tests {
         let other_hash = BlobHash::from_content(&other_data);
         let rows = vec![
             live_file_row(
-                "file-selected",
-                "branch-b",
-                r#"{"id":"file-selected","directory_id":null,"name":"selected.md"}"#,
+                "01920000-0000-7000-8000-0000000000e2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000e2","directory_id":null,"name":"selected.md"}"#,
             ),
             live_blob_ref_row(
-                "file-selected",
-                "branch-b",
-                "file-selected",
+                "01920000-0000-7000-8000-0000000000e2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000e2",
                 &selected_hash.to_hex(),
                 selected_data.len(),
             ),
             live_file_row(
-                "file-other",
-                "branch-b",
-                r#"{"id":"file-other","directory_id":null,"name":"other.md"}"#,
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
             ),
             live_blob_ref_row(
-                "file-other",
-                "branch-b",
-                "file-other",
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-000000000482",
                 &other_hash.to_hex(),
                 other_data.len(),
             ),
@@ -9167,21 +9281,21 @@ mod tests {
         let blob_hash = BlobHash::from_content(&blob_data);
         let rows = vec![
             live_file_row(
-                "file-stored",
-                "branch-b",
-                r#"{"id":"file-stored","directory_id":null,"name":"stored.md"}"#,
+                "01920000-0000-7000-8000-000000000512",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000512","directory_id":null,"name":"stored.md"}"#,
             ),
             live_blob_ref_row(
-                "file-stored",
-                "branch-b",
-                "file-stored",
+                "01920000-0000-7000-8000-000000000512",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-000000000512",
                 &blob_hash.to_hex(),
                 blob_data.len(),
             ),
             live_file_row(
-                "file-rendered",
-                "branch-b",
-                r#"{"id":"file-rendered","directory_id":null,"name":"rendered.md"}"#,
+                "01920000-0000-7000-8000-000000000502",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000502","directory_id":null,"name":"rendered.md"}"#,
             ),
         ];
 
@@ -9205,11 +9319,11 @@ mod tests {
     async fn file_projection_keeps_same_id_descriptors_in_distinct_file_scopes() {
         let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
         let mut scoped_file = live_file_row(
-            "file-readme",
-            "branch-b",
-            "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"scoped.md\"}",
+            "01920000-0000-7000-8000-0000000000d2",
+            "01920000-0000-7000-8000-0000000000b1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"scoped.md\"}",
         );
-        scoped_file.file_id = Some("owner-file".to_string());
+        scoped_file.file_id = Some("01920000-0000-7000-8000-000000000342".to_string());
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
@@ -9217,9 +9331,9 @@ mod tests {
             true,
             vec![
                 live_file_row(
-                    "file-readme",
-                    "branch-b",
-                    "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"root.md\"}",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
                 ),
                 scoped_file,
             ],
@@ -9243,7 +9357,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert!(values.contains(&None));
-        assert!(values.contains(&Some("owner-file".to_string())));
+        assert!(values.contains(&Some("01920000-0000-7000-8000-000000000342".to_string())));
     }
 
     #[tokio::test]
@@ -9253,11 +9367,11 @@ mod tests {
         let blob_reader =
             Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
         let mut scoped_file = live_file_row(
-            "file-readme",
-            "branch-b",
-            "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"scoped.md\"}",
+            "01920000-0000-7000-8000-0000000000d2",
+            "01920000-0000-7000-8000-0000000000b1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"scoped.md\"}",
         );
-        scoped_file.file_id = Some("owner-file".to_string());
+        scoped_file.file_id = Some("01920000-0000-7000-8000-000000000342".to_string());
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
@@ -9265,15 +9379,15 @@ mod tests {
             true,
             vec![
                 live_file_row(
-                    "file-readme",
-                    "branch-b",
-                    "{\"id\":\"file-readme\",\"directory_id\":null,\"name\":\"root.md\"}",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
                 ),
                 scoped_file,
                 live_blob_ref_row(
-                    "file-readme",
-                    "branch-b",
-                    "file-readme",
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-0000000000d2",
                     &blob_hash,
                     data.len(),
                 ),
@@ -9299,32 +9413,32 @@ mod tests {
         let wasm = b"test wasm";
         let rows = vec![
             live_plugin_registry_row(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 vec![test_plugin_registry_entry(
                     "plugin_sentinel",
-                    "*.branch-a",
+                    "*.01920000-0000-7000-8000-0000000000a1",
                     "plugin_note_a",
                     wasm,
                 )],
             ),
             live_plugin_owner_row(
-                "branch-a",
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a1",
+                "01920000-0000-7000-8000-0000000000a2",
                 "plugin_sentinel",
                 vec!["plugin_note_a".to_string()],
             ),
             live_plugin_registry_row(
-                "branch-b",
+                "01920000-0000-7000-8000-0000000000b1",
                 vec![test_plugin_registry_entry(
                     "plugin_sentinel",
-                    "*.branch-b",
+                    "*.01920000-0000-7000-8000-0000000000b1",
                     "plugin_note_b",
                     wasm,
                 )],
             ),
             live_plugin_owner_row(
-                "branch-b",
-                "file-b",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000b2",
                 "plugin_sentinel",
                 vec!["plugin_note_b".to_string()],
             ),
@@ -9332,14 +9446,14 @@ mod tests {
         let prepared = super::prepare_lix_file_rows(
             vec![
                 live_file_row(
-                    "file-a",
-                    "branch-a",
-                    r#"{"id":"file-a","directory_id":null,"name":"note.branch-a"}"#,
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":null,"name":"note.01920000-0000-7000-8000-0000000000a1"}"#,
                 ),
                 live_file_row(
-                    "file-b",
-                    "branch-b",
-                    r#"{"id":"file-b","directory_id":null,"name":"note.branch-b"}"#,
+                    "01920000-0000-7000-8000-0000000000b2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000b2","directory_id":null,"name":"note.01920000-0000-7000-8000-0000000000b1"}"#,
                 ),
             ],
             &super::FilePathPredicate::All,
@@ -9349,7 +9463,10 @@ mod tests {
             Arc::new(RowsLiveStateReader { rows }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-a".to_string(), "branch-b".to_string()],
+                    branch_ids: vec![
+                        "01920000-0000-7000-8000-0000000000a1".to_string(),
+                        "01920000-0000-7000-8000-0000000000b1".to_string(),
+                    ],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9364,21 +9481,27 @@ mod tests {
 
         assert_eq!(
             context
-                .branch("branch-a")
-                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-a", b""))
+                .branch("01920000-0000-7000-8000-0000000000a1")
+                .and_then(|branch| branch
+                    .catalog
+                    .select_for_bytes("/note.01920000-0000-7000-8000-0000000000a1", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
         assert!(
             context
-                .branch("branch-a")
-                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
+                .branch("01920000-0000-7000-8000-0000000000a1")
+                .and_then(|branch| branch
+                    .catalog
+                    .select_for_bytes("/note.01920000-0000-7000-8000-0000000000b1", b""))
                 .is_none()
         );
         assert_eq!(
             context
-                .branch("branch-b")
-                .and_then(|branch| branch.catalog.select_for_bytes("/note.branch-b", b""))
+                .branch("01920000-0000-7000-8000-0000000000b1")
+                .and_then(|branch| branch
+                    .catalog
+                    .select_for_bytes("/note.01920000-0000-7000-8000-0000000000b1", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_sentinel")
         );
@@ -9389,9 +9512,9 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-note",
-                "branch-b",
-                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+                "01920000-0000-7000-8000-000000000472",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000472","directory_id":null,"name":"note.sentinel"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9403,7 +9526,7 @@ mod tests {
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9423,7 +9546,10 @@ mod tests {
             requests[0].filter.entity_pks,
             vec![crate::entity_pk::EntityPk::single(PLUGIN_REGISTRY_KEY)]
         );
-        assert_eq!(requests[0].filter.branch_ids, vec!["branch-b"]);
+        assert_eq!(
+            requests[0].filter.branch_ids,
+            vec!["01920000-0000-7000-8000-0000000000b1"]
+        );
         assert_eq!(requests[0].filter.file_ids, vec![NullableKeyFilter::Null]);
         assert_eq!(requests[0].filter.untracked, Some(false));
         assert_eq!(requests[0].limit, Some(1));
@@ -9433,7 +9559,9 @@ mod tests {
         );
         assert_eq!(
             requests[1].filter.file_ids,
-            vec![NullableKeyFilter::Value("file-note".to_string())]
+            vec![NullableKeyFilter::Value(
+                "01920000-0000-7000-8000-000000000472".to_string()
+            )]
         );
     }
 
@@ -9443,9 +9571,9 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-note",
-                "branch-b",
-                r#"{"id":"file-note","directory_id":null,"name":"note.txt"}"#,
+                "01920000-0000-7000-8000-000000000472",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000472","directory_id":null,"name":"note.txt"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9453,7 +9581,7 @@ mod tests {
         let context = super::plugin_render_context_for_lix_file_scan(
             Arc::new(RecordingLiveStateReader {
                 rows: vec![live_plugin_registry_row(
-                    "branch-b",
+                    "01920000-0000-7000-8000-0000000000b1",
                     vec![test_plugin_registry_entry(
                         "plugin_sentinel",
                         "*.sentinel",
@@ -9465,7 +9593,7 @@ mod tests {
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9494,9 +9622,9 @@ mod tests {
     async fn blobless_owned_file_requires_its_installed_plugin() {
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-note",
-                "branch-b",
-                r#"{"id":"file-note","directory_id":null,"name":"note.sentinel"}"#,
+                "01920000-0000-7000-8000-000000000472",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000472","directory_id":null,"name":"note.sentinel"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9504,15 +9632,15 @@ mod tests {
         let context = super::plugin_render_context_for_lix_file_scan(
             Arc::new(RowsLiveStateReader {
                 rows: vec![live_plugin_owner_row(
-                    "branch-b",
-                    "file-note",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "01920000-0000-7000-8000-000000000472",
                     "plugin_sentinel",
                     vec!["plugin_note".to_string()],
                 )],
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9548,9 +9676,9 @@ mod tests {
         let wasm = b"test wasm";
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"note.removed"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"note.removed"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9559,7 +9687,7 @@ mod tests {
             Arc::new(RowsLiveStateReader {
                 rows: vec![
                     live_plugin_registry_row(
-                        "branch-b",
+                        "01920000-0000-7000-8000-0000000000b1",
                         vec![test_plugin_registry_entry(
                             "plugin_active",
                             "*.active",
@@ -9568,8 +9696,8 @@ mod tests {
                         )],
                     ),
                     live_plugin_owner_row(
-                        "branch-b",
-                        "file-readme",
+                        "01920000-0000-7000-8000-0000000000b1",
+                        "01920000-0000-7000-8000-0000000000d2",
                         "plugin_removed",
                         vec!["plugin_removed_state".to_string()],
                     ),
@@ -9577,7 +9705,7 @@ mod tests {
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9601,11 +9729,14 @@ mod tests {
             Some(&context),
             &batch,
             &assignment_values,
-            Some("branch-b"),
+            Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .expect("path ownership comparison should succeed");
 
-        assert_eq!(rewritten, BTreeSet::from(["file-readme".to_string()]));
+        assert_eq!(
+            rewritten,
+            BTreeSet::from(["01920000-0000-7000-8000-0000000000d2".to_string()])
+        );
         assert_eq!(
             context
                 .owners_by_file
@@ -9616,7 +9747,7 @@ mod tests {
         );
         assert_eq!(
             context
-                .branch("branch-b")
+                .branch("01920000-0000-7000-8000-0000000000b1")
                 .and_then(|branch| branch.catalog.select_for_bytes("/note.active", b""))
                 .map(PluginRegistryEntry::key),
             Some("plugin_active")
@@ -9628,9 +9759,9 @@ mod tests {
         let wasm = b"test v2 wasm";
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"before.csv"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"before.csv"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9639,7 +9770,7 @@ mod tests {
             Arc::new(RowsLiveStateReader {
                 rows: vec![
                     live_plugin_registry_row(
-                        "branch-b",
+                        "01920000-0000-7000-8000-0000000000b1",
                         vec![test_v2_plugin_registry_entry(
                             "plugin_csv_v2",
                             "*.csv",
@@ -9648,8 +9779,8 @@ mod tests {
                         )],
                     ),
                     live_plugin_owner_row(
-                        "branch-b",
-                        "file-readme",
+                        "01920000-0000-7000-8000-0000000000b1",
+                        "01920000-0000-7000-8000-0000000000d2",
                         "plugin_csv_v2",
                         vec!["csv_row".to_string()],
                     ),
@@ -9657,7 +9788,7 @@ mod tests {
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9681,11 +9812,14 @@ mod tests {
             Some(&context),
             &batch,
             &assignment_values,
-            Some("branch-b"),
+            Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .expect("v2 descriptor transition should be selected");
 
-        assert_eq!(rewritten, BTreeSet::from(["file-readme".to_string()]));
+        assert_eq!(
+            rewritten,
+            BTreeSet::from(["01920000-0000-7000-8000-0000000000d2".to_string()])
+        );
     }
 
     #[tokio::test]
@@ -9693,9 +9827,9 @@ mod tests {
         let wasm = b"test wasm";
         let prepared = super::prepare_lix_file_rows(
             vec![live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"note.raw"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"note.raw"}"#,
             )],
             &super::FilePathPredicate::All,
         )
@@ -9703,7 +9837,7 @@ mod tests {
         let context = super::plugin_render_context_for_lix_file_scan(
             Arc::new(RowsLiveStateReader {
                 rows: vec![live_plugin_registry_row(
-                    "branch-b",
+                    "01920000-0000-7000-8000-0000000000b1",
                     vec![test_plugin_registry_entry_with_content_type(
                         "plugin_text",
                         "*.active",
@@ -9715,7 +9849,7 @@ mod tests {
             }) as Arc<dyn LiveStateReader>,
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
-                    branch_ids: vec!["branch-b".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000b1".to_string()],
                     ..Default::default()
                 },
                 ..Default::default()
@@ -9735,7 +9869,7 @@ mod tests {
         for (data, expected) in [
             (
                 b"hello".as_slice(),
-                BTreeSet::from(["file-readme".to_string()]),
+                BTreeSet::from(["01920000-0000-7000-8000-0000000000d2".to_string()]),
             ),
             ([0xff, 0xfe].as_slice(), BTreeSet::new()),
         ] {
@@ -9746,7 +9880,7 @@ mod tests {
                 Some(&context),
                 &batch,
                 &assignment_values,
-                Some("branch-b"),
+                Some("01920000-0000-7000-8000-0000000000b1"),
             )
             .expect("typed path ownership comparison should succeed");
             assert_eq!(rewritten, expected);
@@ -9762,10 +9896,10 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(rows[0].schema_key, "lix_file_descriptor");
-        assert_eq!(rows[0].branch_id, "branch-b");
+        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000b1");
         assert_eq!(
             rows[0].metadata.as_ref(),
             Some(&TransactionJson::from_value_for_test(
@@ -9773,8 +9907,11 @@ mod tests {
             ))
         );
         let snapshot = rows[0].snapshot.as_ref().expect("descriptor snapshot JSON");
-        assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "readme.md");
     }
 
@@ -9783,10 +9920,11 @@ mod tests {
         let batch = file_insert_batch(false, false);
 
         let rows =
-            lix_file_write_rows_from_batch(&batch, Some("branch-a")).expect("decode file insert");
+            lix_file_write_rows_from_batch(&batch, Some("01920000-0000-7000-8000-0000000000a1"))
+                .expect("decode file insert");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id, "branch-a");
+        assert_eq!(rows[0].branch_id, "01920000-0000-7000-8000-0000000000a1");
     }
 
     #[test]
@@ -9939,7 +10077,7 @@ mod tests {
     fn file_delete_allows_exact_canonical_plugin_archive_target() {
         let staged = lix_file_delete_stage_from_batch(
             &file_delete_batch_with_id_and_path(
-                "lix_plugin_archive::plugin_sentinel",
+                &plugin_storage_archive_file_id("plugin_sentinel"),
                 Some("/.lix/plugins/plugin_sentinel.lixplugin"),
             ),
             None,
@@ -9990,10 +10128,15 @@ mod tests {
     fn file_path_update_stages_descriptor_from_new_path() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::filesystem_storage_scope_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                None,
+            ),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
-                "dir-docs".to_string(),
+                "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
         );
@@ -10019,8 +10162,11 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
         let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "renamed.md");
     }
 
@@ -10028,10 +10174,15 @@ mod tests {
     fn file_path_update_preserves_existing_data_unless_data_is_assigned() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::filesystem_storage_scope_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                None,
+            ),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
-                "dir-docs".to_string(),
+                "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
         );
@@ -10066,12 +10217,12 @@ mod tests {
         let mut resolvers = super::directory_path_resolvers_from_live_state(
             Arc::new(RowsLiveStateReader {
                 rows: vec![live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
                 )],
             }) as Arc<dyn LiveStateReader>,
-            Some("branch-b"),
+            Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .await
         .expect("directory state should seed path resolver");
@@ -10103,7 +10254,10 @@ mod tests {
             .unwrap()
             .value()
             .clone();
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "renamed.md");
     }
 
@@ -10111,7 +10265,7 @@ mod tests {
     async fn file_path_update_stages_only_missing_parent_directories() {
         let mut resolvers = super::directory_path_resolvers_from_live_state(
             Arc::new(RowsLiveStateReader::default()) as Arc<dyn LiveStateReader>,
-            Some("branch-b"),
+            Some("01920000-0000-7000-8000-0000000000b1"),
         )
         .await
         .expect("empty directory state should seed path resolver");
@@ -10124,7 +10278,7 @@ mod tests {
                 descriptor: super::LixFileDescriptorUpdate::Path,
             },
             Some(&mut resolvers),
-            &mut test_id_generator(&["dir-generated-docs"]),
+            &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
         )
         .expect("decode file path update");
 
@@ -10146,7 +10300,7 @@ mod tests {
             .expect("missing /docs/ directory should be staged");
         assert_eq!(
             directory.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("dir-generated-docs"))
+            Some(&uuid_pk("01920000-0000-7000-8000-000000000353"))
         );
 
         let descriptor = staged
@@ -10155,17 +10309,25 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor should be staged");
         let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["directory_id"], "dir-generated-docs");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-000000000353"
+        );
     }
 
     #[test]
     fn file_path_update_with_data_assignment_stages_blob_ref_and_payload() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::filesystem_storage_scope_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                None,
+            ),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
-                "dir-docs".to_string(),
+                "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
         );
@@ -10184,7 +10346,10 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.file_data_writes.len(), 1);
-        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(
+            staged.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(staged.file_data_writes[0].data(), b"hello");
         assert!(
             staged
@@ -10204,10 +10369,15 @@ mod tests {
     fn file_descriptor_update_with_data_stages_payload_at_assigned_path() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::filesystem_storage_scope_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                None,
+            ),
             super::DirectoryPathResolver::from_existing([(
                 "/docs/".to_string(),
-                "dir-docs".to_string(),
+                "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
         );
@@ -10226,7 +10396,10 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.file_data_writes.len(), 1);
-        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(
+            staged.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(
             staged.file_data_writes[0].path.as_deref(),
             Some("/docs/readme.md")
@@ -10273,7 +10446,7 @@ mod tests {
         let structural_columns =
             super::LixFileUpdateColumns::from_assignments(&[literal_assignment(
                 "directory_id",
-                ScalarValue::Utf8(Some("dir-other".to_string())),
+                ScalarValue::Utf8(Some("01920000-0000-7000-8000-000000000383".to_string())),
             )]);
         assert!(
             structural_columns.requires_path_resolver(),
@@ -10287,7 +10460,12 @@ mod tests {
             &assignment_values,
             None,
             update_columns,
-            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+            &BTreeSet::from([blob_ref_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                "01920000-0000-7000-8000-0000000000d2",
+            )]),
             &BTreeSet::new(),
             &BTreeSet::new(),
             None,
@@ -10328,7 +10506,10 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.file_data_writes.len(), 1);
-        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(
+            staged.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(staged.state_rows.len(), 1);
         assert_eq!(staged.state_rows[0].schema_key, "lix_binary_blob_ref");
     }
@@ -10344,7 +10525,12 @@ mod tests {
             },
             None,
             &mut test_id_generator(&["should-not-be-used"]),
-            &BTreeSet::from([blob_ref_key("branch-a", false, false, "file-readme")]),
+            &BTreeSet::from([blob_ref_key(
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                false,
+                "01920000-0000-7000-8000-0000000000d2",
+            )]),
         )
         .expect("decode empty file data update");
 
@@ -10376,12 +10562,21 @@ mod tests {
             .expect("data insert should stage blob ref row");
         assert_eq!(
             blob_ref_row.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(blob_ref_row.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(
+            blob_ref_row.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(staged.file_data_writes.len(), 1);
-        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
-        assert_eq!(staged.file_data_writes[0].branch_id, "branch-b");
+        assert_eq!(
+            staged.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(
+            staged.file_data_writes[0].branch_id,
+            "01920000-0000-7000-8000-0000000000b1"
+        );
         assert_eq!(staged.file_data_writes[0].data(), b"hello");
         let snapshot: serde_json::Value = blob_ref_row
             .snapshot
@@ -10404,7 +10599,12 @@ mod tests {
         let staged = lix_file_delete_stage_from_batch(
             &batch,
             None,
-            &BTreeSet::from([blob_ref_key("branch-b", false, false, "file-readme")]),
+            &BTreeSet::from([blob_ref_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                "01920000-0000-7000-8000-0000000000d2",
+            )]),
             &BTreeSet::new(),
             None,
         )
@@ -10419,7 +10619,7 @@ mod tests {
             .expect("file descriptor tombstone should be staged");
         assert_eq!(
             descriptor.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
@@ -10431,9 +10631,12 @@ mod tests {
             .expect("blob ref tombstone should be staged");
         assert_eq!(
             blob_ref.entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(
+            blob_ref.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(blob_ref.snapshot, None);
     }
 
@@ -10454,7 +10657,7 @@ mod tests {
         assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
         assert_eq!(
             staged.state_rows[0].entity_pk.as_ref(),
-            Some(&crate::entity_pk::EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(staged.state_rows[0].snapshot, None);
     }
@@ -10465,7 +10668,12 @@ mod tests {
         let staged = lix_file_delete_stage_from_batch(
             &batch,
             None,
-            &BTreeSet::from([blob_ref_key("branch-a", false, false, "file-readme")]),
+            &BTreeSet::from([blob_ref_key(
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                false,
+                "01920000-0000-7000-8000-0000000000d2",
+            )]),
             &BTreeSet::new(),
             None,
         )
@@ -10480,10 +10688,21 @@ mod tests {
     fn file_path_insert_reuses_existing_parent_directory() {
         let mut resolvers = BTreeMap::new();
         resolvers.insert(
-            super::filesystem_storage_scope_key("branch-b", false, false, None),
+            super::filesystem_storage_scope_key(
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+                false,
+                None,
+            ),
             super::DirectoryPathResolver::from_existing([
-                ("/docs/".to_string(), "dir-docs".to_string()),
-                ("/docs/guides/".to_string(), "dir-guides".to_string()),
+                (
+                    "/docs/".to_string(),
+                    "01920000-0000-7000-8000-0000000000d3".to_string(),
+                ),
+                (
+                    "/docs/guides/".to_string(),
+                    "01920000-0000-7000-8000-000000000313".to_string(),
+                ),
             ])
             .expect("directory resolver should seed"),
         );
@@ -10500,7 +10719,10 @@ mod tests {
 
         assert_eq!(staged.count, 1);
         assert_eq!(staged.file_data_writes.len(), 1);
-        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(
+            staged.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(staged.state_rows.len(), 2);
         let descriptor = staged
             .state_rows
@@ -10508,8 +10730,11 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be staged");
         let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(snapshot["directory_id"], "dir-guides");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-000000000313"
+        );
         assert_eq!(snapshot["name"], "readme.md");
     }
 
@@ -10522,7 +10747,10 @@ mod tests {
             None,
             "lix_file",
             &mut resolvers,
-            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
+            &mut test_id_generator(&[
+                "01920000-0000-7000-8000-000000000353",
+                "dir-generated-guides",
+            ]),
             true,
         )
         .expect("decode file path data");
@@ -10571,7 +10799,7 @@ mod tests {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(
                     rows[0].entity_pk.as_ref(),
-                    Some(&crate::entity_pk::EntityPk::single("file-readme"))
+                    Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
                 );
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
             }
@@ -10618,11 +10846,17 @@ mod tests {
         let mut rows = file_dml_rows();
         rows.extend([
             live_file_row(
-                "file-other",
-                "branch-b",
-                r#"{"id":"file-other","directory_id":null,"name":"other.md"}"#,
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
             ),
-            live_blob_ref_row("file-other", "branch-b", "file-other", &"1".repeat(64), 7),
+            live_blob_ref_row(
+                "01920000-0000-7000-8000-000000000482",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-000000000482",
+                &"1".repeat(64),
+                7,
+            ),
         ]);
         let mut write_context = CapturingWriteContext {
             rows,
@@ -10631,7 +10865,10 @@ mod tests {
         let write_ctx = SqlWriteContext::new(&mut write_context);
         let spec = file_dml_spec(write_ctx.clone());
         let planned = spec
-            .plan_delete(write_ctx, &[eq_filter("id", "file-readme")])
+            .plan_delete(
+                write_ctx,
+                &[eq_filter("id", "01920000-0000-7000-8000-0000000000d2")],
+            )
             .await
             .expect("plan exact-id file delete");
 
@@ -10645,13 +10882,16 @@ mod tests {
         assert_eq!(write_context.exact_load_requests[0].rows.len(), 1);
         assert_eq!(
             write_context.exact_load_requests[0].rows[0].entity_pk,
-            crate::entity_pk::EntityPk::single("file-readme")
+            crate::entity_pk::EntityPk::uuid_from_canonical(
+                "01920000-0000-7000-8000-0000000000d2",
+            )
+            .expect("fixture file ID")
         );
         assert_eq!(
             write_context.exact_load_requests[0].rows[0]
                 .file_id
                 .as_deref(),
-            Some("file-readme")
+            Some("01920000-0000-7000-8000-0000000000d2")
         );
     }
 
@@ -10694,9 +10934,9 @@ mod tests {
     async fn file_update_exact_id_intersects_path_before_exact_blob_batch() {
         let mut rows = file_dml_rows();
         rows.push(live_file_row(
-            "file-other",
-            "branch-b",
-            r#"{"id":"file-other","directory_id":null,"name":"other.md"}"#,
+            "01920000-0000-7000-8000-000000000482",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000482","directory_id":null,"name":"other.md"}"#,
         ));
         let mut write_context = CapturingWriteContext {
             rows,
@@ -10712,7 +10952,7 @@ mod tests {
                     ScalarValue::Utf8(Some("README.md".to_string())),
                 )],
                 &[
-                    eq_filter("id", "file-readme"),
+                    eq_filter("id", "01920000-0000-7000-8000-0000000000d2"),
                     eq_filter("path", "/other.md"),
                 ],
             )
@@ -10808,14 +11048,14 @@ mod tests {
         let blob_hash = BlobHash::from_content(&data);
         let rows = vec![
             live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
             live_blob_ref_row(
-                "file-readme",
-                "branch-b",
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
                 &blob_hash.to_hex(),
                 data.len(),
             ),
@@ -10851,14 +11091,14 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_file_row(
-                    "file-readme",
-                    "branch-b",
-                    r#"{"id":"file-readme","directory_id":"dir-docs","name":"readme.md"}"#,
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"readme.md"}"#,
                 ),
             ])
             .expect("filesystem path index should build"),
@@ -10867,9 +11107,9 @@ mod tests {
         let mut write_context = IndexedFileDataUpdateWriteContext {
             index,
             blob_rows: vec![live_blob_ref_row(
-                "file-readme",
-                "branch-b",
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
                 &BlobHash::from_content(old_data).to_hex(),
                 old_data.len(),
             )],
@@ -10880,7 +11120,7 @@ mod tests {
 
         let count = super::execute_fast_lix_file_data_update_by_id(
             &mut write_context,
-            Some("file-readme".to_string()),
+            Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             b"new".to_vec().into(),
             None,
             None,
@@ -10899,7 +11139,7 @@ mod tests {
             );
             assert_eq!(
                 requests[0].filter.entity_pks,
-                vec![crate::entity_pk::EntityPk::single("file-readme")]
+                vec![uuid_pk("01920000-0000-7000-8000-0000000000d2")]
             );
         }
 
@@ -10922,7 +11162,7 @@ mod tests {
         );
         let count = super::execute_fast_lix_file_data_update_by_id(
             &mut write_context,
-            Some("file-readme".to_string()),
+            Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             next,
             Some(provenance.clone()),
             Some(crate::common::MutationIdentity {
@@ -10936,7 +11176,7 @@ mod tests {
         let TransactionWrite::RowsWithFileData { file_data, .. } = &write_context.writes[1] else {
             panic!("spliced data update should stage file data");
         };
-        assert_eq!(file_data[0].file_id, "file-readme");
+        assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(file_data[0].data(), b"next");
         assert_eq!(file_data[0].splice_provenance(), Some(&provenance));
         assert_eq!(
@@ -10953,14 +11193,14 @@ mod tests {
         let old_data = b"old";
         let rows = vec![
             live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
             live_blob_ref_row(
-                "file-readme",
-                "branch-b",
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
                 &BlobHash::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
@@ -11040,14 +11280,14 @@ mod tests {
         );
         let rows = vec![
             live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
             live_blob_ref_row(
-                "file-readme",
-                "branch-b",
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
                 &BlobHash::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
@@ -11192,9 +11432,9 @@ mod tests {
     async fn fast_file_path_upsert_preserves_root_directory_namespace_collision() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_directory_row(
-                "dir-docs",
-                "branch-b",
-                r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
             )],
             ..CapturingWriteContext::default()
         };
@@ -11217,29 +11457,29 @@ mod tests {
     #[tokio::test]
     async fn fast_file_path_upsert_does_not_cross_blob_ref_scope_lanes() {
         let local_descriptor = live_file_row(
-            "file-local",
-            "branch-b",
-            r#"{"id":"file-local","directory_id":null,"name":"local.md"}"#,
+            "01920000-0000-7000-8000-000000000442",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000442","directory_id":null,"name":"local.md"}"#,
         );
         let mut global_fallback = live_blob_ref_row(
-            "file-local",
+            "01920000-0000-7000-8000-000000000442",
             crate::GLOBAL_BRANCH_ID,
-            "file-local",
+            "01920000-0000-7000-8000-000000000442",
             &BlobHash::from_content(b"global").to_hex(),
             6,
         );
         global_fallback.global = true;
 
         let mut global_descriptor = live_file_row(
-            "file-global",
-            "branch-b",
-            r#"{"id":"file-global","directory_id":null,"name":"global.md"}"#,
+            "01920000-0000-7000-8000-000000000112",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000112","directory_id":null,"name":"global.md"}"#,
         );
         global_descriptor.global = true;
         let branch_override = live_blob_ref_row(
-            "file-global",
-            "branch-b",
-            "file-global",
+            "01920000-0000-7000-8000-000000000112",
+            "01920000-0000-7000-8000-0000000000b1",
+            "01920000-0000-7000-8000-000000000112",
             &BlobHash::from_content(b"branch").to_hex(),
             6,
         );
@@ -11300,14 +11540,14 @@ mod tests {
         let old_data = b"old";
         let rows = vec![
             live_file_row(
-                "file-readme",
-                "branch-b",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
             live_blob_ref_row(
-                "file-readme",
-                "branch-b",
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000d2",
                 &BlobHash::from_content(old_data).to_hex(),
                 old_data.len(),
             ),
@@ -11349,14 +11589,14 @@ mod tests {
     #[tokio::test]
     async fn fast_file_path_write_declines_ambiguous_cross_scope_paths() {
         let tracked = live_file_row(
-            "file-tracked",
-            "branch-b",
-            r#"{"id":"file-tracked","directory_id":null,"name":"shared.md"}"#,
+            "01920000-0000-7000-8000-000000000122",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000122","directory_id":null,"name":"shared.md"}"#,
         );
         let mut untracked = live_file_row(
-            "file-untracked",
-            "branch-b",
-            r#"{"id":"file-untracked","directory_id":null,"name":"shared.md"}"#,
+            "01920000-0000-7000-8000-000000000132",
+            "01920000-0000-7000-8000-0000000000b1",
+            r#"{"id":"01920000-0000-7000-8000-000000000132","directory_id":null,"name":"shared.md"}"#,
         );
         untracked.untracked = true;
         let mut write_context = CapturingWriteContext {
@@ -11407,9 +11647,9 @@ mod tests {
         let batch = data_insert_batch();
         let mut write_context = CapturingWriteContext {
             rows: vec![live_directory_row(
-                "dir-docs",
-                "branch-b",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             ..CapturingWriteContext::default()
         };
@@ -11445,7 +11685,7 @@ mod tests {
                         .any(|row| row.schema_key == "lix_binary_blob_ref")
                 );
                 assert_eq!(file_data.len(), 1);
-                assert_eq!(file_data[0].file_id, "file-readme");
+                assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
                 assert_eq!(file_data[0].path.as_deref(), Some("/docs/readme.md"));
                 assert_eq!(file_data[0].data(), b"hello");
                 assert!(!file_data[0].had_blob_ref);
@@ -11460,14 +11700,14 @@ mod tests {
         let mut write_context = CapturingWriteContext {
             rows: vec![
                 live_directory_row(
-                    "dir-docs",
-                    "branch-b",
-                    "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
                 ),
                 live_directory_row(
-                    "dir-guides",
-                    "branch-b",
-                    "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+                    "01920000-0000-7000-8000-000000000313",
+                    "01920000-0000-7000-8000-0000000000b1",
+                    "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
                 ),
             ],
             ..CapturingWriteContext::default()
@@ -11493,13 +11733,16 @@ mod tests {
             } => {
                 assert_eq!(*count, 1);
                 assert_eq!(file_data.len(), 1);
-                assert_eq!(file_data[0].file_id, "file-readme");
+                assert_eq!(file_data[0].file_id, "01920000-0000-7000-8000-0000000000d2");
                 let descriptor = rows
                     .iter()
                     .find(|row| row.schema_key == "lix_file_descriptor")
                     .expect("file descriptor row should be staged");
                 let snapshot: JsonValue = descriptor.snapshot.as_ref().unwrap().value().clone();
-                assert_eq!(snapshot["directory_id"], "dir-guides");
+                assert_eq!(
+                    snapshot["directory_id"],
+                    "01920000-0000-7000-8000-000000000313"
+                );
             }
             other => panic!("expected insert with file data staged write, got {other:?}"),
         }

@@ -3462,9 +3462,16 @@ mod tests {
 
         let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
-            exact_filesystem_read_route(&data_by_id, &[Value::Text("file-a".to_string())]),
+            exact_filesystem_read_route(
+                &data_by_id,
+                &[Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                )]
+            ),
             Some(ExactFilesystemRead::Point(
-                sql2::ExactLixFileReadSelector::Id("file-a".to_string()),
+                sql2::ExactLixFileReadSelector::Id(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                ),
                 sql2::ExactLixFileReadColumn::Data,
             ))
         );
@@ -3588,38 +3595,55 @@ mod tests {
         for (sql, params) in [
             (
                 "SELECT id FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data AS bytes FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM lix_file AS file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
-            ("SELECT data FROM lix_file WHERE id = 'file-a'", vec![]),
+            (
+                "SELECT data FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000a2'",
+                vec![],
+            ),
             (
                 "SELECT data FROM lix_file WHERE id = $1 LIMIT 1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT \"DATA\" FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM \"LIX_FILE\" WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM lix_file WHERE id = $1 AND true",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             ("SELECT data FROM lix_file WHERE id = $1", vec![Value::Null]),
             (
                 "SELECT data FROM lix_file WHERE id = $1",
                 vec![
-                    Value::Text("file-a".to_string()),
+                    Value::Text("01920000-0000-7000-8000-0000000000a2".to_string()),
                     Value::Text("extra".to_string()),
                 ],
             ),
@@ -3639,7 +3663,8 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('nested-dir', '/nested/'), ('alpha-dir', '/alpha-dir/')",
+                 ('01920000-0000-7000-8000-0000000000d1', '/nested/'), \
+                 ('01920000-0000-7000-8000-0000000000d2', '/alpha-dir/')",
                 &[],
             )
             .await
@@ -3647,9 +3672,9 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES \
-                 ('root-b', '/b.txt', $1, lix_json('{\"rank\":2}')), \
-                 ('nested', '/nested/a.txt', $2, NULL), \
-                 ('root-a', '/a.txt', $3, NULL)",
+                 ('01920000-0000-7000-8000-0000000000f1', '/b.txt', $1, lix_json('{\"rank\":2}')), \
+                 ('01920000-0000-7000-8000-0000000000f2', '/nested/a.txt', $2, NULL), \
+                 ('01920000-0000-7000-8000-0000000000f3', '/a.txt', $3, NULL)",
                 &[
                     Value::Blob(b"bravo".to_vec().into()),
                     Value::Blob(b"nested".to_vec().into()),
@@ -3681,8 +3706,14 @@ mod tests {
 
         assert_eq!(exact, relational);
         assert_eq!(exact.rows().len(), 2);
-        assert_eq!(exact.rows()[0].get::<String>("id").unwrap(), "root-a");
-        assert_eq!(exact.rows()[1].get::<String>("id").unwrap(), "root-b");
+        assert_eq!(
+            exact.rows()[0].get::<String>("id").unwrap(),
+            "01920000-0000-7000-8000-0000000000f3"
+        );
+        assert_eq!(
+            exact.rows()[1].get::<String>("id").unwrap(),
+            "01920000-0000-7000-8000-0000000000f1"
+        );
         assert_eq!(
             exact.rows()[1].value("lixcol_metadata").unwrap(),
             &Value::Json(serde_json::json!({"rank": 2}))
@@ -3711,11 +3742,11 @@ mod tests {
         assert_eq!(exact_directories.rows().len(), 2);
         assert_eq!(
             exact_directories.rows()[0].get::<String>("id").unwrap(),
-            "alpha-dir"
+            "01920000-0000-7000-8000-0000000000d2"
         );
         assert_eq!(
             exact_directories.rows()[1].get::<String>("id").unwrap(),
-            "nested-dir"
+            "01920000-0000-7000-8000-0000000000d1"
         );
     }
 
@@ -4904,7 +4935,7 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('selected-provider-file', '/selected.txt')",
+                "INSERT INTO lix_file (id, path) VALUES ('01920000-0000-7000-8000-000000000422', '/selected.txt')",
                 &[],
             )
             .await
@@ -4913,7 +4944,7 @@ mod tests {
         let result = transaction
             .execute(
                 "WITH selected AS (\
-                     SELECT id FROM lix_file WHERE id = 'selected-provider-file'\
+                     SELECT id FROM lix_file WHERE id = '01920000-0000-7000-8000-000000000422'\
                  ) \
                  SELECT id FROM selected",
                 &[],
@@ -4922,7 +4953,7 @@ mod tests {
             .expect("selected overlay provider should expose staged writes");
         assert_eq!(
             result.rows()[0].get::<String>("id").unwrap(),
-            "selected-provider-file"
+            "01920000-0000-7000-8000-000000000422"
         );
 
         transaction

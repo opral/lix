@@ -282,8 +282,11 @@ mod tests {
     #[test]
     fn plugin_registry_read_cache_isolated_by_snapshot() {
         let host = PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime));
-        let branches = BTreeSet::from(["branch-a".to_string()]);
-        let registries = BTreeMap::from([("branch-a".to_string(), PluginRegistry::empty())]);
+        let branches = BTreeSet::from(["01920000-0000-7000-8000-0000000000a1".to_string()]);
+        let registries = BTreeMap::from([(
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+            PluginRegistry::empty(),
+        )]);
 
         assert!(
             host.cached_plugin_registries(7, &branches)

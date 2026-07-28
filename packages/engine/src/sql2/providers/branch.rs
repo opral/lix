@@ -465,7 +465,17 @@ async fn load_branch_rows_scoped(
     let entity_pks = match descriptor_scope {
         BranchDescriptorScope::All => Vec::new(),
         BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new()),
-        BranchDescriptorScope::Ids(ids) => ids.into_iter().map(EntityPk::single).collect(),
+        BranchDescriptorScope::Ids(ids) => ids
+            .into_iter()
+            .map(|id| {
+                EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("branch id must be a canonical UUID: {error}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
     };
     let descriptor_rows = live_state
         .scan_rows(&LiveStateScanRequest {
@@ -1102,7 +1112,7 @@ mod tests {
 
     fn descriptor_row(id: &str, name: &str) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_pk: EntityPk::single(id),
+            entity_pk: EntityPk::uuid_from_canonical(id).expect("fixture branch ID"),
             schema_key: "lix_branch_descriptor".to_string(),
             file_id: None,
             snapshot_content: Some(
@@ -1156,14 +1166,18 @@ mod tests {
     ) {
         let live_state = Arc::new(RoutingLiveStateReader {
             rows: vec![
-                descriptor_row("branch-a", "Branch A"),
-                descriptor_row("branch-b", "Branch B"),
-                descriptor_row("branch-c", "Branch C"),
+                descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
+                descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+                descriptor_row("01920000-0000-7000-8000-0000000000c1", "Branch C"),
             ],
             requests: StdMutex::new(Vec::new()),
         });
         let branch_ref = Arc::new(RoutingBranchRefReader {
-            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            heads: vec![
+                head("01920000-0000-7000-8000-0000000000a1"),
+                head("01920000-0000-7000-8000-0000000000b1"),
+                head("01920000-0000-7000-8000-0000000000c1"),
+            ],
             point_read_ids: StdMutex::new(Vec::new()),
         });
         let spec = BranchSpec {
@@ -1177,7 +1191,8 @@ mod tests {
     #[tokio::test]
     async fn branch_write_id_filter_routes_descriptor_and_head_point_reads() {
         let (spec, live_state, branch_ref) = routing_spec();
-        let source = spec.write_row_source(&[eq_filter("id", "branch-b")]);
+        let source =
+            spec.write_row_source(&[eq_filter("id", "01920000-0000-7000-8000-0000000000b1")]);
 
         let batch = source().await.unwrap();
 
@@ -1186,11 +1201,14 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].filter.entity_pks,
-            vec![EntityPk::single("branch-b")]
+            vec![
+                EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000b1")
+                    .expect("fixture branch ID")
+            ]
         );
         assert_eq!(
             branch_ref.point_read_ids.lock().unwrap().as_slice(),
-            &["branch-b".to_string()]
+            &["01920000-0000-7000-8000-0000000000b1".to_string()]
         );
     }
 
@@ -1198,9 +1216,9 @@ mod tests {
     async fn branch_write_or_filter_falls_back_to_full_candidate_source() {
         let (spec, live_state, branch_ref) = routing_spec();
         let filter = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "branch-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a1")),
             Operator::Or,
-            Box::new(eq_filter("id", "branch-b")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000b1")),
         ));
         let source = spec.write_row_source(&[filter]);
 
@@ -1213,9 +1231,9 @@ mod tests {
         assert_eq!(
             branch_ref.point_read_ids.lock().unwrap().as_slice(),
             &[
-                "branch-a".to_string(),
-                "branch-b".to_string(),
-                "branch-c".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000b1".to_string(),
+                "01920000-0000-7000-8000-0000000000c1".to_string(),
             ]
         );
     }
@@ -1224,14 +1242,17 @@ mod tests {
     fn branch_write_filter_routing_accepts_exact_in_and_rejects_expressions() {
         let in_filter = Expr::InList(InList::new(
             Box::new(column("id")),
-            vec![string_literal("branch-b"), string_literal("branch-a")],
+            vec![
+                string_literal("01920000-0000-7000-8000-0000000000b1"),
+                string_literal("01920000-0000-7000-8000-0000000000a1"),
+            ],
             false,
         ));
         assert_eq!(
             exact_branch_ids_from_write_filters(&[in_filter]),
             Some(BTreeSet::from([
-                "branch-a".to_string(),
-                "branch-b".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000b1".to_string(),
             ]))
         );
 
@@ -1254,13 +1275,17 @@ mod tests {
     async fn batch_head_read_joins_matching_descriptors_with_one_scan() {
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                descriptor_row("branch-a", "Branch A"),
-                descriptor_row("branch-b", "Branch B"),
-                descriptor_row("descriptor-only", "Descriptor only"),
+                descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
+                descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+                descriptor_row("01920000-0000-7000-8000-0000000000d1", "Descriptor only"),
             ],
         });
         let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a"), head("branch-b"), head("ref-only")],
+            heads: vec![
+                head("01920000-0000-7000-8000-0000000000a1"),
+                head("01920000-0000-7000-8000-0000000000b1"),
+                head("01920000-0000-7000-8000-0000000000e1"),
+            ],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
             scan_error: None,
@@ -1279,16 +1304,16 @@ mod tests {
             rows,
             vec![
                 BranchRow {
-                    id: "branch-a".to_string(),
+                    id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                     name: "Branch A".to_string(),
                     hidden: false,
-                    commit_id: head("branch-a").commit_id,
+                    commit_id: head("01920000-0000-7000-8000-0000000000a1").commit_id,
                 },
                 BranchRow {
-                    id: "branch-b".to_string(),
+                    id: "01920000-0000-7000-8000-0000000000b1".to_string(),
                     name: "Branch B".to_string(),
                     hidden: false,
-                    commit_id: head("branch-b").commit_id,
+                    commit_id: head("01920000-0000-7000-8000-0000000000b1").commit_id,
                 },
             ]
         );
@@ -1299,10 +1324,13 @@ mod tests {
     #[tokio::test]
     async fn batch_head_read_avoids_scan_for_single_descriptor() {
         let live_state = Arc::new(RowsLiveStateReader {
-            rows: vec![descriptor_row("branch-a", "Branch A")],
+            rows: vec![descriptor_row(
+                "01920000-0000-7000-8000-0000000000a1",
+                "Branch A",
+            )],
         });
         let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a")],
+            heads: vec![head("01920000-0000-7000-8000-0000000000a1")],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
             scan_error: None,
@@ -1326,13 +1354,17 @@ mod tests {
     async fn batch_head_read_falls_back_to_point_reads_when_scan_fails() {
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                descriptor_row("branch-a", "Branch A"),
-                descriptor_row("branch-b", "Branch B"),
-                descriptor_row("branch-c", "Branch C"),
+                descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
+                descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+                descriptor_row("01920000-0000-7000-8000-0000000000c1", "Branch C"),
             ],
         });
         let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            heads: vec![
+                head("01920000-0000-7000-8000-0000000000a1"),
+                head("01920000-0000-7000-8000-0000000000b1"),
+                head("01920000-0000-7000-8000-0000000000c1"),
+            ],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
             scan_error: Some(LixError::new(
@@ -1359,20 +1391,24 @@ mod tests {
     async fn batch_head_read_still_rejects_a_malformed_selected_ref() {
         let live_state = Arc::new(RowsLiveStateReader {
             rows: vec![
-                descriptor_row("branch-a", "Branch A"),
-                descriptor_row("branch-b", "Branch B"),
-                descriptor_row("branch-c", "Branch C"),
+                descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
+                descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+                descriptor_row("01920000-0000-7000-8000-0000000000c1", "Branch C"),
             ],
         });
         let branch_ref = Arc::new(CountingBranchRefReader {
-            heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+            heads: vec![
+                head("01920000-0000-7000-8000-0000000000a1"),
+                head("01920000-0000-7000-8000-0000000000b1"),
+                head("01920000-0000-7000-8000-0000000000c1"),
+            ],
             point_reads: AtomicUsize::new(0),
             scans: AtomicUsize::new(0),
             scan_error: Some(LixError::new(
                 LixError::CODE_UNKNOWN,
                 "a branch ref is malformed",
             )),
-            point_error_branch: Some("branch-b".to_string()),
+            point_error_branch: Some("01920000-0000-7000-8000-0000000000b1".to_string()),
         });
 
         let error = load_branch_rows(
@@ -1383,7 +1419,11 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert!(error.message.contains("branch-b"));
+        assert!(
+            error
+                .message
+                .contains("01920000-0000-7000-8000-0000000000b1")
+        );
         assert_eq!(branch_ref.scans.load(Ordering::Relaxed), 1);
         assert_eq!(branch_ref.point_reads.load(Ordering::Relaxed), 2);
     }
@@ -1397,13 +1437,17 @@ mod tests {
         ] {
             let live_state = Arc::new(RowsLiveStateReader {
                 rows: vec![
-                    descriptor_row("branch-a", "Branch A"),
-                    descriptor_row("branch-b", "Branch B"),
-                    descriptor_row("branch-c", "Branch C"),
+                    descriptor_row("01920000-0000-7000-8000-0000000000a1", "Branch A"),
+                    descriptor_row("01920000-0000-7000-8000-0000000000b1", "Branch B"),
+                    descriptor_row("01920000-0000-7000-8000-0000000000c1", "Branch C"),
                 ],
             });
             let branch_ref = Arc::new(CountingBranchRefReader {
-                heads: vec![head("branch-a"), head("branch-b"), head("branch-c")],
+                heads: vec![
+                    head("01920000-0000-7000-8000-0000000000a1"),
+                    head("01920000-0000-7000-8000-0000000000b1"),
+                    head("01920000-0000-7000-8000-0000000000c1"),
+                ],
                 point_reads: AtomicUsize::new(0),
                 scans: AtomicUsize::new(0),
                 scan_error: Some(LixError::new(code, "branch-ref scan failed")),

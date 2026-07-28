@@ -382,7 +382,7 @@ mod tests {
     #[test]
     fn splits_conjunctions_for_exact_branch_routing() {
         let filters = [col("lixcol_branch_id")
-            .eq(lit("branch-a"))
+            .eq(lit("01920000-0000-7000-8000-0000000000a1"))
             .and(col("commit_id").eq(lit("commit-a")))];
 
         assert_eq!(filter_conjuncts(&filters).len(), 2);
@@ -395,8 +395,13 @@ mod tests {
             load_calls: AtomicUsize::new(0),
             scan_calls: AtomicUsize::new(0),
         };
-        let branch_ids =
-            FileIdConstraint::Ids(["branch-a".to_string(), "branch-b".to_string()].into());
+        let branch_ids = FileIdConstraint::Ids(
+            [
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000b1".to_string(),
+            ]
+            .into(),
+        );
 
         let heads = selected_heads(&reader, None, &branch_ids)
             .await

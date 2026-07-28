@@ -1,4 +1,4 @@
-use lix_sdk::{Memory, OpenLixOptions, Value, open_lix};
+use lix_sdk::{GLOBAL_BRANCH_ID, Memory, OpenLixOptions, Value, open_lix};
 use serde_json::{Value as JsonValue, json};
 
 #[tokio::test]
@@ -56,8 +56,8 @@ async fn client_state_roundtrips_every_json_kind_and_upserts() {
             "SELECT lixcol_branch_id, lixcol_global, lixcol_untracked \
              FROM lix_key_value_by_branch \
              WHERE key = 'lix_client_state:upsert' \
-               AND lixcol_branch_id = 'global'",
-            &[],
+               AND lixcol_branch_id = $1",
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string())],
         )
         .await
         .expect("client state placement reads");
@@ -65,7 +65,7 @@ async fn client_state_roundtrips_every_json_kind_and_upserts() {
     assert_eq!(
         placement.rows()[0].values(),
         &[
-            Value::Text("global".to_string()),
+            Value::Text(GLOBAL_BRANCH_ID.to_string()),
             Value::Boolean(true),
             Value::Boolean(true),
         ]
@@ -110,8 +110,8 @@ async fn client_state_delete_is_idempotent_and_builtin_keys_are_excluded() {
     let builtin = lix
         .execute(
             "SELECT value FROM lix_key_value_by_branch \
-             WHERE key = 'lix_id' AND lixcol_branch_id = 'global'",
-            &[],
+             WHERE key = 'lix_id' AND lixcol_branch_id = $1",
+            &[Value::Text(GLOBAL_BRANCH_ID.to_string())],
         )
         .await
         .expect("built-in KV row reads");

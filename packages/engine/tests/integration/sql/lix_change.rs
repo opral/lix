@@ -164,7 +164,7 @@ simulation_test!(
         assert!(
             error
                 .message
-                .contains("x-lix-primary-key property \"/id\" must have type \"string\""),
+                .contains("must be a non-null integer or string"),
             "error should explain non-string primary-key schema: {error:?}"
         );
     }

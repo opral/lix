@@ -81,8 +81,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) VALUES \
-                 ('shared-point-file', '/shared-point.bin', X'61', false), \
-                 ('shared-point-file', '/shared-point.bin', X'62', true)",
+                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'61', false), \
+                 ('73686172-6564-8d70-8f69-6e742d666900', '/shared-point.bin', X'62', true)",
                 &[],
             )
             .await
@@ -92,7 +92,7 @@ simulation_test!(
             (
                 "SELECT data FROM lix_file WHERE id = $1",
                 "SELECT data FROM lix_file WHERE id = $1 AND true",
-                "shared-point-file",
+                "73686172-6564-8d70-8f69-6e742d666900",
             ),
             (
                 "SELECT data FROM lix_file WHERE path = $1",
@@ -102,12 +102,12 @@ simulation_test!(
             (
                 "SELECT lixcol_change_id FROM lix_file WHERE id = $1",
                 "SELECT lixcol_change_id FROM lix_file WHERE id = $1 AND true",
-                "shared-point-file",
+                "73686172-6564-8d70-8f69-6e742d666900",
             ),
             (
                 "SELECT data FROM lix_file WHERE id = $1",
                 "SELECT data FROM lix_file WHERE id = $1 AND true",
-                "missing-point-file",
+                "6d697373-696e-872d-806f-696e742d6600",
             ),
         ] {
             let params = [Value::Text(parameter.to_string())];

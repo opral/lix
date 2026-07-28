@@ -4,6 +4,7 @@ import initWasm, {
 } from "../dist/wasm/lix_js_sdk.js";
 
 const initialized = initWasm();
+const SNAPSHOT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000441";
 
 async function openMemoryLix(options: { snapshot?: Uint8Array } = {}) {
 	await initialized;
@@ -23,10 +24,10 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 	let revisionBefore;
 	try {
 		await first.createBranch({
-			id: "snapshot-draft",
+			id: SNAPSHOT_DRAFT_BRANCH_ID,
 			name: "Snapshot draft",
 		});
-		await first.switchBranch({ branchId: "snapshot-draft" });
+		await first.switchBranch({ branchId: SNAPSHOT_DRAFT_BRANCH_ID });
 		await first.execute(
 			"INSERT INTO lix_file (path, data) VALUES ($1, $2)",
 			[
@@ -35,8 +36,8 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 			],
 		);
 		branchBefore = await first.execute(
-			"SELECT id, name FROM lix_branch WHERE id = 'snapshot-draft'",
-			noParams,
+			"SELECT id, name FROM lix_branch WHERE id = $1",
+			[{ kind: "text", value: SNAPSHOT_DRAFT_BRANCH_ID }],
 		);
 		fileBefore = await first.execute(
 			"SELECT path, data, lixcol_change_id FROM lix_file WHERE path = '/snapshot.txt'",
@@ -54,11 +55,11 @@ test("Workerd snapshots preserve exact Lix state across bindings", async () => {
 
 	const restored = await openMemoryLix({ snapshot });
 	try {
-		expect(await restored.activeBranchId()).toBe("snapshot-draft");
+		expect(await restored.activeBranchId()).toBe(SNAPSHOT_DRAFT_BRANCH_ID);
 		expect(
 			await restored.execute(
-				"SELECT id, name FROM lix_branch WHERE id = 'snapshot-draft'",
-				noParams,
+				"SELECT id, name FROM lix_branch WHERE id = $1",
+				[{ kind: "text", value: SNAPSHOT_DRAFT_BRANCH_ID }],
 			),
 		).toEqual(branchBefore);
 		const result = await restored.execute(

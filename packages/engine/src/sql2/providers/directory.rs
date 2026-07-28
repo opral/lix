@@ -976,7 +976,11 @@ fn proposed_directory_entity_pks(proposed: &RecordBatch) -> Result<Vec<EntityPk>
     let mut entity_pks = Vec::new();
     for row_index in 0..proposed.num_rows() {
         if let Some(id) = optional_string_value(proposed, row_index, "id")? {
-            entity_pks.push(EntityPk::single(&id));
+            entity_pks.push(EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "lix_directory id must be a canonical UUID: {error}"
+                ))
+            })?);
         }
     }
     Ok(entity_pks)
@@ -2205,7 +2209,7 @@ mod tests {
     #[async_trait]
     impl SqlWriteExecutionContext for CapturingWriteContext {
         fn active_branch_id(&self) -> &str {
-            "branch-a"
+            "01920000-0000-7000-8000-0000000000a1"
         }
 
         fn functions(&self) -> FunctionProviderHandle {
@@ -2278,7 +2282,8 @@ mod tests {
         snapshot_content: &str,
     ) -> MaterializedLiveStateRow {
         MaterializedLiveStateRow {
-            entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
+            entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
+                .expect("fixture filesystem ID should be a UUID"),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
             snapshot_content: Some(snapshot_content.to_string()),
@@ -2297,39 +2302,39 @@ mod tests {
     fn filesystem_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
             live_filesystem_row(
-                "dir-docs",
+                "01920000-0000-7000-8000-0000000000d3",
                 "lix_directory_descriptor",
                 None,
-                "branch-a",
-                r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
             ),
             live_filesystem_row(
-                "dir-guides",
+                "01920000-0000-7000-8000-000000000313",
                 "lix_directory_descriptor",
                 None,
-                "branch-a",
-                r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-000000000313","parent_id":"01920000-0000-7000-8000-0000000000d3","name":"guides"}"#,
             ),
             live_filesystem_row(
-                "file-index",
+                "01920000-0000-7000-8000-000000000372",
                 "lix_file_descriptor",
                 None,
-                "branch-a",
-                r#"{"id":"file-index","directory_id":"dir-docs","name":"index.md"}"#,
+                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-000000000372","directory_id":"01920000-0000-7000-8000-0000000000d3","name":"index.md"}"#,
             ),
             live_filesystem_row(
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
                 "lix_file_descriptor",
                 None,
-                "branch-a",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-000000000313","name":"readme.md"}"#,
             ),
             live_filesystem_row(
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
                 "lix_binary_blob_ref",
-                Some("file-readme"),
-                "branch-a",
-                r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
+                Some("01920000-0000-7000-8000-0000000000d2"),
+                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","blob_hash":"abc123","size_bytes":5}"#,
             ),
         ]
     }
@@ -2347,7 +2352,7 @@ mod tests {
             Field::new("lixcol_metadata", DataType::Utf8, true),
         ];
         let mut columns = vec![
-            string_column(vec![Some("dir-docs")]),
+            string_column(vec![Some("01920000-0000-7000-8000-0000000000d3")]),
             string_column(vec![None]),
             string_column(vec![Some("docs")]),
             Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
@@ -2355,7 +2360,9 @@ mod tests {
         ];
         if include_branch {
             fields.push(Field::new("lixcol_branch_id", DataType::Utf8, false));
-            columns.push(string_column(vec![Some("branch-a")]));
+            columns.push(string_column(vec![Some(
+                "01920000-0000-7000-8000-0000000000a1",
+            )]));
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .expect("directory insert batch should build")
@@ -2369,9 +2376,9 @@ mod tests {
                 Field::new("lixcol_branch_id", DataType::Utf8, false),
             ])),
             vec![
-                string_column(vec![Some("dir-nested")]),
+                string_column(vec![Some("01920000-0000-7000-8000-000000000343")]),
                 string_column(vec![Some(path)]),
-                string_column(vec![Some("branch-a")]),
+                string_column(vec![Some("01920000-0000-7000-8000-0000000000a1")]),
             ],
         )
         .expect("directory path insert batch should build")
@@ -2384,7 +2391,7 @@ mod tests {
                 Field::new("path", DataType::Utf8, true),
             ])),
             vec![
-                string_column(vec![Some("dir-nested")]),
+                string_column(vec![Some("01920000-0000-7000-8000-000000000343")]),
                 string_column(vec![Some(path)]),
             ],
         )
@@ -2399,7 +2406,10 @@ mod tests {
             ])),
             vec![
                 string_column(ids.iter().copied().map(Some).collect::<Vec<_>>()),
-                string_column(vec![Some("branch-a"); ids.len()]),
+                string_column(vec![
+                    Some("01920000-0000-7000-8000-0000000000a1");
+                    ids.len()
+                ]),
             ],
         )
         .expect("directory delete batch should build")
@@ -2408,27 +2418,33 @@ mod tests {
     #[test]
     fn derives_nested_directory_paths() {
         let root_live = live_row(
-            "dir-docs",
-            "branch-a",
-            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
         );
         let child_live = live_row(
-            "dir-guides",
-            "branch-a",
-            "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+            "01920000-0000-7000-8000-000000000313",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
         );
         let root = DirectoryDescriptorRecord {
-            id: "dir-docs".to_string(),
+            id: "01920000-0000-7000-8000-0000000000d3".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(&root_live, "dir-docs"),
+            key: FilesystemDescriptorKey::from_live_row(
+                &root_live,
+                "01920000-0000-7000-8000-0000000000d3",
+            ),
             live: root_live,
         };
         let child = DirectoryDescriptorRecord {
-            id: "dir-guides".to_string(),
-            parent_id: Some("dir-docs".to_string()),
+            id: "01920000-0000-7000-8000-000000000313".to_string(),
+            parent_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             name: "guides".to_string(),
-            key: FilesystemDescriptorKey::from_live_row(&child_live, "dir-guides"),
+            key: FilesystemDescriptorKey::from_live_row(
+                &child_live,
+                "01920000-0000-7000-8000-000000000313",
+            ),
             live: child_live,
         };
         let child_key = child.key.clone();
@@ -2443,14 +2459,14 @@ mod tests {
     fn record_batch_projects_directory_columns() {
         let rows = vec![
             live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_row(
-                "dir-guides",
-                "branch-a",
-                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+                "01920000-0000-7000-8000-000000000313",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
             ),
         ];
 
@@ -2476,7 +2492,7 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .expect("branch is string")
                 .value(1),
-            "branch-a"
+            "01920000-0000-7000-8000-0000000000a1"
         );
     }
 
@@ -2487,30 +2503,30 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_row(
-                    "dir-docs",
-                    "branch-a",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_row(
-                    "dir-guides",
-                    "branch-a",
-                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                    "01920000-0000-7000-8000-000000000313",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000313","parent_id":"01920000-0000-7000-8000-0000000000d3","name":"guides"}"#,
                 ),
                 live_row(
-                    "dir-reference",
-                    "branch-a",
-                    r#"{"id":"dir-reference","parent_id":"dir-docs","name":"reference"}"#,
+                    "01920000-0000-7000-8000-000000000393",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000393","parent_id":"01920000-0000-7000-8000-0000000000d3","name":"reference"}"#,
                 ),
                 live_row(
-                    "dir-other",
-                    "branch-a",
-                    r#"{"id":"dir-other","parent_id":null,"name":"other"}"#,
+                    "01920000-0000-7000-8000-000000000383",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000383","parent_id":null,"name":"other"}"#,
                 ),
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixDirectorySpec::active_branch(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             Arc::new(RejectingLiveStateReader {
                 scan_count: Arc::clone(&live_state_scans),
             }),
@@ -2531,7 +2547,10 @@ mod tests {
                 .index_of("lixcol_updated_at")
                 .expect("updated-at column"),
         ];
-        let filters = vec![eq_filter("parent_id", "dir-docs")];
+        let filters = vec![eq_filter(
+            "parent_id",
+            "01920000-0000-7000-8000-0000000000d3",
+        )];
 
         let planned = spec
             .plan_scan(Some(&projection), &filters, None, &ExecutionProps::new())
@@ -2558,25 +2577,25 @@ mod tests {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![
                 live_row(
-                    "dir-docs",
-                    "branch-a",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_row(
-                    "dir-guides",
-                    "branch-a",
-                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                    "01920000-0000-7000-8000-000000000313",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000313","parent_id":"01920000-0000-7000-8000-0000000000d3","name":"guides"}"#,
                 ),
                 live_row(
-                    "dir-other",
-                    "branch-a",
-                    r#"{"id":"dir-other","parent_id":null,"name":"other"}"#,
+                    "01920000-0000-7000-8000-000000000383",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    r#"{"id":"01920000-0000-7000-8000-000000000383","parent_id":null,"name":"other"}"#,
                 ),
             ])
             .expect("filesystem path index should build"),
         );
         let spec = LixDirectorySpec::active_branch(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             Arc::new(RejectingLiveStateReader {
                 scan_count: Arc::clone(&live_state_scans),
             }),
@@ -2629,23 +2648,31 @@ mod tests {
         assert_eq!(
             rows,
             vec![TransactionWriteRow {
-                entity_pk: Some(crate::entity_pk::EntityPk::single("dir-docs")),
+                entity_pk: Some(
+                    crate::entity_pk::EntityPk::uuid_from_canonical(
+                        "01920000-0000-7000-8000-0000000000d3",
+                    )
+                    .expect("fixture directory ID"),
+                ),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(
-                    json!({"id":"dir-docs","name":"docs","parent_id":null})
+                    json!({"id":"01920000-0000-7000-8000-0000000000d3","name":"docs","parent_id":null})
                 )),
                 metadata: Some(TransactionJson::from_value_for_test(
                     json!({"source": "directory"})
                 )),
-                origin: Some(lix_directory_insert_origin("lix_directory", "dir-docs")),
+                origin: Some(lix_directory_insert_origin(
+                    "lix_directory",
+                    "01920000-0000-7000-8000-0000000000d3"
+                )),
                 created_at: None,
                 updated_at: None,
                 global: false,
                 change_id: None,
                 commit_id: None,
                 untracked: false,
-                branch_id: "branch-a".to_string(),
+                branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             }]
         );
     }
@@ -2689,9 +2716,9 @@ mod tests {
     #[test]
     fn directory_path_insert_reuses_existing_parent_descriptor() {
         let existing_rows = vec![live_row(
-            "dir-docs",
-            "branch-a",
-            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-0000000000d3",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
         )];
         let mut resolvers = directory_path_resolvers_from_state_rows(existing_rows)
             .expect("existing directory rows should seed paths");
@@ -2707,8 +2734,11 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         let snapshot = rows[0].snapshot.as_ref().unwrap();
-        assert_eq!(snapshot["id"], "dir-nested");
-        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -2717,10 +2747,13 @@ mod tests {
         let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
-        visible_filesystems.insert("branch-a".to_string(), visible_filesystem);
+        visible_filesystems.insert(
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+            visible_filesystem,
+        );
 
         let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
-            &directory_delete_batch(&["dir-docs"]),
+            &directory_delete_batch(&["01920000-0000-7000-8000-0000000000d3"]),
             None,
             &visible_filesystems,
         )
@@ -2741,11 +2774,26 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![
-                ("lix_file_descriptor", "file-readme".to_string()),
-                ("lix_binary_blob_ref", "file-readme".to_string()),
-                ("lix_directory_descriptor", "dir-guides".to_string()),
-                ("lix_file_descriptor", "file-index".to_string()),
-                ("lix_directory_descriptor", "dir-docs".to_string()),
+                (
+                    "lix_file_descriptor",
+                    "01920000-0000-7000-8000-0000000000d2".to_string()
+                ),
+                (
+                    "lix_binary_blob_ref",
+                    "01920000-0000-7000-8000-0000000000d2".to_string()
+                ),
+                (
+                    "lix_directory_descriptor",
+                    "01920000-0000-7000-8000-000000000313".to_string()
+                ),
+                (
+                    "lix_file_descriptor",
+                    "01920000-0000-7000-8000-000000000372".to_string()
+                ),
+                (
+                    "lix_directory_descriptor",
+                    "01920000-0000-7000-8000-0000000000d3".to_string()
+                ),
             ]
         );
         assert!(rows.iter().all(|row| row.snapshot.is_none()));
@@ -2756,10 +2804,16 @@ mod tests {
         let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
-        visible_filesystems.insert("branch-a".to_string(), visible_filesystem);
+        visible_filesystems.insert(
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+            visible_filesystem,
+        );
 
         let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
-            &directory_delete_batch(&["dir-docs", "dir-guides"]),
+            &directory_delete_batch(&[
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-000000000313",
+            ]),
             None,
             &visible_filesystems,
         )
@@ -2796,18 +2850,23 @@ mod tests {
             &[TransactionWrite::Rows {
                 mode: TransactionWriteMode::Insert,
                 rows: vec![TransactionWriteRow {
-                    entity_pk: Some(crate::entity_pk::EntityPk::single("dir-docs")),
+                    entity_pk: Some(
+                        crate::entity_pk::EntityPk::uuid_from_canonical(
+                            "01920000-0000-7000-8000-0000000000d3",
+                        )
+                        .expect("fixture directory ID"),
+                    ),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
                     snapshot: Some(TransactionJson::from_value_for_test(
-                        json!({"id":"dir-docs","name":"docs","parent_id":null})
+                        json!({"id":"01920000-0000-7000-8000-0000000000d3","name":"docs","parent_id":null})
                     )),
                     metadata: Some(TransactionJson::from_value_for_test(
                         json!({"source": "directory"})
                     )),
                     origin: Some(lix_directory_insert_origin(
                         "lix_directory_by_branch",
-                        "dir-docs"
+                        "01920000-0000-7000-8000-0000000000d3"
                     )),
                     created_at: None,
                     updated_at: None,
@@ -2815,7 +2874,7 @@ mod tests {
                     change_id: None,
                     commit_id: None,
                     untracked: false,
-                    branch_id: "branch-a".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                 }]
             }]
         );
@@ -2825,9 +2884,9 @@ mod tests {
     async fn directory_insert_sink_seeds_path_resolver_from_filesystem_index() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
             reject_scans: false,
@@ -2844,8 +2903,11 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         let snapshot = rows[0].snapshot.as_ref().unwrap();
-        assert_eq!(snapshot["id"], "dir-nested");
-        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -2853,9 +2915,9 @@ mod tests {
     async fn directory_path_insert_uses_indexed_resolver_without_live_state_fallback() {
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )])
             .expect("filesystem path index should build"),
         );
@@ -2890,8 +2952,11 @@ mod tests {
             .snapshot
             .as_ref()
             .expect("staged descriptor snapshot");
-        assert_eq!(snapshot["id"], "dir-nested");
-        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -2899,9 +2964,9 @@ mod tests {
     async fn directory_path_insert_falls_back_when_path_index_build_fails() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
             reject_scans: false,
@@ -2927,33 +2992,36 @@ mod tests {
             .snapshot
             .as_ref()
             .expect("staged descriptor snapshot");
-        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
     #[tokio::test]
     async fn directory_path_conflict_candidates_use_index_and_retain_visible_lanes() {
         let tracked = live_row(
-            "dir-tracked",
-            "branch-a",
-            "{\"id\":\"dir-tracked\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-000000000403",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-000000000403\",\"parent_id\":null,\"name\":\"docs\"}",
         );
         let mut untracked = live_row(
-            "dir-untracked",
-            "branch-a",
-            "{\"id\":\"dir-untracked\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-000000000413",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
         );
         untracked.untracked = true;
         let mut global = live_row(
-            "dir-global",
-            "global",
-            "{\"id\":\"dir-global\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-000000000363",
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            "{\"id\":\"01920000-0000-7000-8000-000000000363\",\"parent_id\":null,\"name\":\"docs\"}",
         );
         global.global = true;
         let other = live_row(
-            "dir-other",
-            "branch-a",
-            "{\"id\":\"dir-other\",\"parent_id\":null,\"name\":\"other\"}",
+            "01920000-0000-7000-8000-000000000383",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-000000000383\",\"parent_id\":null,\"name\":\"other\"}",
         );
         let index = Arc::new(
             FilesystemPathIndex::from_live_rows(vec![tracked, untracked, global, other])
@@ -2972,7 +3040,7 @@ mod tests {
         let candidates = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 Arc::new(RejectingLiveStateReader {
                     scan_count: Arc::new(AtomicUsize::new(0)),
                 }),
@@ -3020,9 +3088,21 @@ mod tests {
         assert_eq!(
             lanes,
             [
-                ("dir-global".to_string(), true, false),
-                ("dir-tracked".to_string(), false, false),
-                ("dir-untracked".to_string(), false, true),
+                (
+                    "01920000-0000-7000-8000-000000000363".to_string(),
+                    true,
+                    false
+                ),
+                (
+                    "01920000-0000-7000-8000-000000000403".to_string(),
+                    false,
+                    false
+                ),
+                (
+                    "01920000-0000-7000-8000-000000000413".to_string(),
+                    false,
+                    true
+                ),
             ]
             .into_iter()
             .collect(),
@@ -3033,9 +3113,9 @@ mod tests {
     async fn directory_path_conflict_candidates_fall_back_when_index_build_fails() {
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
             reject_scans: false,
@@ -3043,7 +3123,7 @@ mod tests {
         let candidates = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 Arc::new(RejectingLiveStateReader {
                     scan_count: Arc::new(AtomicUsize::new(0)),
                 }),
@@ -3067,15 +3147,15 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("candidate id column should be string");
         assert_eq!(candidates.num_rows(), 1);
-        assert_eq!(ids.value(0), "dir-docs");
+        assert_eq!(ids.value(0), "01920000-0000-7000-8000-0000000000d3");
     }
 
     #[tokio::test]
     async fn directory_id_conflict_candidates_keep_generic_entity_pk_scan() {
         let indexed = live_row(
-            "dir-index-only",
-            "branch-a",
-            "{\"id\":\"dir-index-only\",\"parent_id\":null,\"name\":\"docs\"}",
+            "01920000-0000-7000-8000-000000000373",
+            "01920000-0000-7000-8000-0000000000a1",
+            "{\"id\":\"01920000-0000-7000-8000-000000000373\",\"parent_id\":null,\"name\":\"docs\"}",
         );
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
             Arc::new(StaticFilesystemPathIndexReader {
@@ -3087,9 +3167,9 @@ mod tests {
             });
         let mut write_context = CapturingWriteContext {
             rows: vec![live_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             )],
             writes: Vec::new(),
             reject_scans: false,
@@ -3097,7 +3177,7 @@ mod tests {
         let candidates = {
             let write_ctx = SqlWriteContext::new(&mut write_context);
             let spec = LixDirectorySpec::active_branch(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 Arc::new(RejectingLiveStateReader {
                     scan_count: Arc::new(AtomicUsize::new(0)),
                 }),
@@ -3121,7 +3201,7 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("candidate id column should be string");
         assert_eq!(candidates.num_rows(), 1);
-        assert_eq!(ids.value(0), "dir-docs");
+        assert_eq!(ids.value(0), "01920000-0000-7000-8000-0000000000d3");
     }
 
     #[test]

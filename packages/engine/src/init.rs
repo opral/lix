@@ -39,13 +39,14 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V16 adds the branch-control schema-presence summary used to prove constraint
-/// source ranges empty. Opening an older store must fail closed before reading
-/// its v7 branch controls as though the v8 control space were authoritative.
+/// V17 combines the branch-control schema-presence summary with ordered raw
+/// UUID entity-key components in the hot current-state index and tracked-state
+/// trees. Opening an older store must fail closed rather than mixing either
+/// physical contract.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v16";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v17";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -182,14 +183,16 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
 
     let global_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(GLOBAL_BRANCH_ID),
+        EntityPk::uuid_from_canonical(GLOBAL_BRANCH_ID)
+            .expect("global branch sentinel is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(GLOBAL_BRANCH_ID, "global", true)?,
         timestamp,
     );
     let main_branch_descriptor_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(&main_branch_id),
+        EntityPk::uuid_from_canonical(&main_branch_id)
+            .expect("generated main branch ID is a canonical UUID"),
         BRANCH_DESCRIPTOR_SCHEMA_KEY,
         branch_descriptor_snapshot(&main_branch_id, "main", false)?,
         timestamp,
@@ -203,7 +206,8 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
     );
     let initial_checkpoint_change = canonical_change(
         functions.call_uuid_v7(),
-        EntityPk::single(&main_branch_id),
+        EntityPk::uuid_from_canonical(&main_branch_id)
+            .expect("generated main branch ID is a canonical UUID"),
         CHECKPOINT_MARKER_SCHEMA_KEY,
         checkpoint_marker_snapshot(&main_branch_id)?,
         timestamp,
@@ -581,7 +585,8 @@ fn branch_ref_ledger_change(
 ) -> Result<InitSeedLiveRow, LixError> {
     Ok(InitSeedLiveRow {
         id: ChangeId::from(id),
-        entity_pk: EntityPk::single(branch_id),
+        entity_pk: EntityPk::uuid_from_canonical(branch_id)
+            .expect("seed branch IDs are canonical UUIDs"),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         snapshot_content: branch_ref_snapshot(branch_id, commit_id)?,
         created_at: timestamp,

@@ -338,11 +338,11 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
                 details: None,
             });
         };
-        if !schema_property_is_string_only(property_schema) {
+        if !schema_property_is_primary_key_component(property_schema) {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_DEFINITION,
                 format!(
-                    "Invalid Lix schema definition: x-lix-primary-key property \"{pointer}\" must have type \"string\"."
+                    "Invalid Lix schema definition: x-lix-primary-key property \"{pointer}\" must be a non-null integer or string; strings may use format \"uuid\" or contentEncoding \"base64\"."
                 ),
             ));
         }
@@ -357,6 +357,17 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
     }
 
     Ok(())
+}
+
+fn schema_property_is_primary_key_component(schema: &JsonValue) -> bool {
+    match schema.get("type").and_then(JsonValue::as_str) {
+        Some("integer") => true,
+        Some("string") => schema
+            .get("contentEncoding")
+            .and_then(JsonValue::as_str)
+            .is_none_or(|encoding| encoding == "base64"),
+        _ => false,
+    }
 }
 
 fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {

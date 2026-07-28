@@ -990,12 +990,19 @@ where
     }
     let keys = file_ids
         .iter()
-        .map(|file_id| TrackedStateKey {
-            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-            file_id: None,
-            entity_pk: EntityPk::single(file_id),
+        .map(|file_id| {
+            Ok(TrackedStateKey {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+                file_id: None,
+                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("validated file ID is not a canonical UUID: {error}"),
+                    )
+                })?,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, LixError>>()?;
     let base_commit_id = analysis.commits.base_commit_id.to_string();
     let target_commit_id = analysis.commits.target_commit_id.to_string();
     let source_commit_id = analysis.commits.source_commit_id.to_string();
@@ -1108,7 +1115,12 @@ where
         let key = TrackedStateKey {
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_owned(),
             file_id: scope_file_id.map(str::to_owned),
-            entity_pk: EntityPk::single(&id),
+            entity_pk: EntityPk::uuid_from_canonical(&id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("validated directory ID is not a canonical UUID: {error}"),
+                )
+            })?,
         };
         let row = reader
             .load_projected_rows_at_commit(
@@ -1857,7 +1869,7 @@ mod tests {
 
     #[test]
     fn resolver_owner_requires_one_live_file_incarnation() {
-        let base = owner_row("file-a", "incarnation-a");
+        let base = owner_row("01920000-0000-7000-8000-0000000000a2", "incarnation-a");
         assert!(
             common_live_plugin_owner(Some(&base), Some(&base), Some(&base))
                 .unwrap()
@@ -1872,7 +1884,7 @@ mod tests {
                 .is_none()
         );
 
-        let recreated = owner_row("file-a", "incarnation-b");
+        let recreated = owner_row("01920000-0000-7000-8000-0000000000a2", "incarnation-b");
         assert!(
             common_live_plugin_owner(Some(&base), Some(&recreated), Some(&base))
                 .unwrap()
@@ -1882,10 +1894,14 @@ mod tests {
 
     #[test]
     fn common_descriptor_requires_every_live_historical_root() {
-        let base = descriptor_row("file-a", Some("directory-a"), "readme.md");
+        let base = descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            Some("directory-a"),
+            "readme.md",
+        );
         assert!(
             common_historical_file_descriptor(
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
                 Some(base.clone()),
                 Some(base.clone()),
                 Some(base.clone()),
@@ -1894,7 +1910,7 @@ mod tests {
         );
         assert!(
             common_historical_file_descriptor(
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
                 Some(base.clone()),
                 None,
                 Some(base.clone()),
@@ -1906,7 +1922,7 @@ mod tests {
         tombstone.deleted = true;
         assert!(
             common_historical_file_descriptor(
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
                 Some(base.clone()),
                 Some(tombstone),
                 Some(base.clone()),
@@ -1914,10 +1930,14 @@ mod tests {
             .is_none()
         );
 
-        let renamed = descriptor_row("file-a", Some("directory-a"), "guide.md");
+        let renamed = descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            Some("directory-a"),
+            "guide.md",
+        );
         assert!(
             common_historical_file_descriptor(
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
                 Some(base.clone()),
                 Some(renamed),
                 Some(base),
@@ -1931,7 +1951,7 @@ mod tests {
         let conflict = PluginMergeConflictRow {
             key: TrackedStateKey {
                 schema_key: "csv_v2_row".to_owned(),
-                file_id: Some("file-a".to_owned()),
+                file_id: Some("01920000-0000-7000-8000-0000000000a2".to_owned()),
                 entity_pk: EntityPk::single("row-a"),
             },
             base: None,
@@ -1979,28 +1999,28 @@ mod tests {
 
     #[test]
     fn derived_file_ref_conflicts_are_reconciled_with_plugin_semantic_state() {
-        let owners = derived_file_owner("file-a");
+        let owners = derived_file_owner("01920000-0000-7000-8000-0000000000a2");
 
         assert!(is_derived_blob_conflict(
-            &derived_file_ref_conflict("file-a"),
+            &derived_file_ref_conflict("01920000-0000-7000-8000-0000000000a2"),
             &owners,
         ));
         assert!(!is_derived_blob_conflict(
-            &derived_file_ref_conflict("file-other"),
+            &derived_file_ref_conflict("01920000-0000-7000-8000-000000000482"),
             &owners,
         ));
     }
 
     #[test]
     fn derived_file_ref_picks_are_not_copied_over_semantic_merge_results() {
-        let owners = derived_file_owner("file-a");
+        let owners = derived_file_owner("01920000-0000-7000-8000-0000000000a2");
 
         assert!(pick_is_derived_plugin_state(
-            &derived_file_ref_pick("file-a"),
+            &derived_file_ref_pick("01920000-0000-7000-8000-0000000000a2"),
             &owners,
         ));
         assert!(!pick_is_derived_plugin_state(
-            &derived_file_ref_pick("file-other"),
+            &derived_file_ref_pick("01920000-0000-7000-8000-000000000482"),
             &owners,
         ));
     }

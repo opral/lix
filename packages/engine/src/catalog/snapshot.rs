@@ -391,6 +391,7 @@ pub(crate) struct SchemaPlan {
     fast_object_validation: Option<FastObjectValidationPlan>,
     pub(crate) defaults: DefaultPlan,
     pub(crate) primary_key: Option<PointerGroup>,
+    pub(crate) primary_key_component_types: Option<Vec<crate::entity_pk::EntityPkComponentType>>,
     pub(crate) uniques: Vec<PointerGroup>,
     pub(crate) foreign_keys: Vec<ForeignKeyPlan>,
     pub(crate) state_foreign_keys: Vec<StateForeignKeyPlan>,
@@ -413,6 +414,10 @@ impl SchemaPlan {
         let fast_object_validation = FastObjectValidationPlan::compile(&schema);
         let defaults = DefaultPlan::from_schema(&schema);
         let primary_key = primary_key_paths(&schema)?;
+        let primary_key_component_types = primary_key
+            .as_ref()
+            .map(|paths| primary_key_component_types(&schema, paths))
+            .transpose()?;
         let uniques = pointer_groups(&schema, "x-lix-unique")?;
         let foreign_keys = bind_foreign_key_plans(
             &key,
@@ -429,11 +434,53 @@ impl SchemaPlan {
             fast_object_validation,
             defaults,
             primary_key,
+            primary_key_component_types,
             uniques,
             foreign_keys,
             state_foreign_keys,
         })
     }
+}
+
+fn primary_key_component_types(
+    schema: &JsonValue,
+    paths: &[Vec<String>],
+) -> Result<Vec<crate::entity_pk::EntityPkComponentType>, LixError> {
+    paths
+        .iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let property = path.iter().try_fold(schema, |current, segment| {
+                current.get("properties")?.get(segment)
+            });
+            let Some(property) = property else {
+                return Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!("primary-key path at index {index} has no property schema"),
+                ));
+            };
+            match (
+                property.get("type").and_then(JsonValue::as_str),
+                property.get("format").and_then(JsonValue::as_str),
+                property.get("contentEncoding").and_then(JsonValue::as_str),
+            ) {
+                (Some("integer"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::Integer),
+                (Some("string"), Some("uuid"), _) => {
+                    Ok(crate::entity_pk::EntityPkComponentType::Uuid)
+                }
+                (Some("string"), _, Some("base64")) => {
+                    Ok(crate::entity_pk::EntityPkComponentType::Bytes)
+                }
+                (Some("string"), _, _) => Ok(crate::entity_pk::EntityPkComponentType::String),
+                _ => Err(LixError::new(
+                    LixError::CODE_SCHEMA_DEFINITION,
+                    format!(
+                        "primary-key path at index {index} must be an integer, string, UUID string, or base64 string"
+                    ),
+                )),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug)]

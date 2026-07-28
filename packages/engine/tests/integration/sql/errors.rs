@@ -71,7 +71,9 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT * FROM lix_file WHERE id = ?",
-                &[Value::Text("missing-file".to_string())],
+                &[Value::Text(
+                    "6d697373-696e-872d-8669-6c6500000000".to_string(),
+                )],
             )
             .await
             .expect("anonymous placeholder should still bind when no rows match");
@@ -175,7 +177,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path) VALUES (?, ?)",
                 &[
-                    Value::Text("anonymous-transaction-file".to_string()),
+                    Value::Text("616e6f6e-796d-8f75-832d-7472616e7300".to_string()),
                     Value::Text("/anonymous-transaction.txt".to_string()),
                 ],
             )
@@ -190,7 +192,9 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT path FROM lix_file WHERE id = ?",
-                &[Value::Text("anonymous-transaction-file".to_string())],
+                &[Value::Text(
+                    "616e6f6e-796d-8f75-832d-7472616e7300".to_string(),
+                )],
             )
             .await
             .expect("committed anonymous parameter write should be visible");

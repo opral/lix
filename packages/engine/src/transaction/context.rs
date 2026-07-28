@@ -62,8 +62,8 @@ use crate::plugin::{
     drain_entity_transition_edits, drain_file_transition_changes,
     host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
     inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, plugin_install_plan_from_archive_path,
-    plugin_key_from_archive_file_id, plugin_state_live_state_projection,
+    local_mutation_identity, plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
+    plugin_key_from_archive_delete_origin, plugin_state_live_state_projection,
     require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
     transport_splice_preserves_git_text, transport_splice_preserves_utf8,
     validate_host_allocated_changes, validate_namespace_reservation,
@@ -1079,7 +1079,7 @@ where
                         BLOB_REF_SCHEMA_KEY.to_string(),
                         DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
                     ],
-                    entity_pks: vec![EntityPk::single(key.file_id.clone())],
+                    entity_pks: vec![validated_uuid_entity_pk(&key.file_id)?],
                     branch_ids: vec![key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(key.file_id.clone())],
                     untracked: Some(key.untracked),
@@ -1135,7 +1135,7 @@ where
                         BLOB_REF_SCHEMA_KEY.to_string(),
                         DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
                     ],
-                    entity_pks: vec![EntityPk::single(actor_key.file_id.clone())],
+                    entity_pks: vec![validated_uuid_entity_pk(&actor_key.file_id)?],
                     branch_ids: vec![actor_key.branch_id.clone()],
                     file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
                     untracked: Some(false),
@@ -2017,11 +2017,16 @@ where
             let Some(file_id) = row
                 .entity_pk
                 .as_ref()
-                .and_then(|entity_pk| entity_pk.as_single_string().ok())
+                .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
             else {
                 continue;
             };
-            if let Some(plugin_key) = plugin_key_from_archive_file_id(file_id) {
+            if let Some(plugin_key) = row
+                .origin
+                .as_ref()
+                .and_then(|origin| plugin_key_from_archive_delete_origin(&origin.surface))
+                .filter(|plugin_key| plugin_archive_file_id_matches(&file_id, plugin_key))
+            {
                 if row.global || row.untracked || row.branch_id == GLOBAL_BRANCH_ID {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
@@ -2030,7 +2035,7 @@ where
                 }
                 let lifecycle_key = PluginLifecycleKey {
                     branch_id: row.branch_id.clone(),
-                    plugin_key,
+                    plugin_key: plugin_key.to_string(),
                 };
                 if lifecycle.insert(lifecycle_key, None).is_some() {
                     return Err(duplicate_plugin_lifecycle_mutation());
@@ -2045,7 +2050,7 @@ where
                 branch_id: row.branch_id.clone(),
                 global: false,
                 untracked: false,
-                file_id: file_id.to_string(),
+                file_id,
             };
             deleted_file_keys
                 .entry(key)
@@ -5736,13 +5741,15 @@ async fn preflight_derived_file_path_moves(
         &LiveStateExactBatchRequest {
             rows: moved_files
                 .iter()
-                .map(|(branch_id, file_id)| LiveStateExactRowRequest {
-                    schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
-                    branch_id: branch_id.clone(),
-                    entity_pk: EntityPk::single(file_id),
-                    file_id: Some(file_id.clone()),
+                .map(|(branch_id, file_id)| {
+                    Ok(LiveStateExactRowRequest {
+                        schema_key: DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
+                        branch_id: branch_id.clone(),
+                        entity_pk: validated_uuid_entity_pk(file_id)?,
+                        file_id: Some(file_id.clone()),
+                    })
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, LixError>>()?,
             projection: plugin_registry_live_state_projection(),
             untracked: Some(false),
             include_tombstones: false,
@@ -6263,7 +6270,10 @@ async fn preflight_owned_v2_generation_upgrades(
             &LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![BLOB_REF_SCHEMA_KEY.to_string()],
-                    entity_pks: file_ids.iter().cloned().map(EntityPk::single).collect(),
+                    entity_pks: file_ids
+                        .iter()
+                        .map(|file_id| validated_uuid_entity_pk(file_id))
+                        .collect::<Result<Vec<_>, _>>()?,
                     branch_ids: vec![upgrade.branch_id.clone()],
                     file_ids: file_id_filters,
                     untracked: Some(false),
@@ -6702,9 +6712,15 @@ fn transaction_write_has_plugin_lifecycle_candidate(write: &TransactionWrite) ->
                 && row
                     .entity_pk
                     .as_ref()
-                    .and_then(|entity_pk| entity_pk.as_single_string().ok())
-                    .and_then(plugin_key_from_archive_file_id)
-                    .is_some()
+                    .and_then(|entity_pk| entity_pk.as_single_string_owned().ok())
+                    .zip(
+                        row.origin.as_ref().and_then(|origin| {
+                            plugin_key_from_archive_delete_origin(&origin.surface)
+                        }),
+                    )
+                    .is_some_and(|(file_id, plugin_key)| {
+                        plugin_archive_file_id_matches(&file_id, plugin_key)
+                    })
         })
 }
 
@@ -6787,6 +6803,15 @@ async fn resolve_active_branch_id(
     }
 }
 
+fn validated_uuid_entity_pk(value: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("validated identity is not a canonical UUID: {error}"),
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -6842,9 +6867,9 @@ mod tests {
     fn visible_materialization_requires_a_matching_blob_ref_identity() {
         let blob_hash = BlobHash::from_content(b"base");
         let row = |snapshot_id: &str| MaterializedLiveStateRow {
-            entity_pk: EntityPk::single("file-a"),
+            entity_pk: EntityPk::single("01920000-0000-7000-8000-0000000000a2"),
             schema_key: BLOB_REF_SCHEMA_KEY.to_string(),
-            file_id: Some("file-a".to_string()),
+            file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             snapshot_content: Some(
                 serde_json::json!({
                     "id": snapshot_id,
@@ -6863,14 +6888,20 @@ mod tests {
             branch_id: "main".into(),
         };
 
-        let visible = decode_visible_v2_materialization(&row("file-a"), "file-a")
-            .expect("matching materialization should decode");
+        let visible = decode_visible_v2_materialization(
+            &row("01920000-0000-7000-8000-0000000000a2"),
+            "01920000-0000-7000-8000-0000000000a2",
+        )
+        .expect("matching materialization should decode");
         assert!(matches!(
             visible.bytes,
             VisibleV2MaterializationBytes::Blob { hash } if hash == blob_hash
         ));
-        let error = decode_visible_v2_materialization(&row("other-file"), "file-a")
-            .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
+        let error = decode_visible_v2_materialization(
+            &row("other-file"),
+            "01920000-0000-7000-8000-0000000000a2",
+        )
+        .expect_err("mismatched blob-ref identity must not authorize a cached actor base");
         assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
     }
 
@@ -6878,7 +6909,7 @@ mod tests {
     fn semantic_renderer_splice_provenance_is_bound_to_its_visible_blob() {
         let base_blob_hash = BlobHash::from_content(b"abcdef");
         let rendered = semantic_rendered_file_data(
-            "file-a".to_string(),
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
@@ -6901,7 +6932,7 @@ mod tests {
         );
 
         let malformed = semantic_rendered_file_data(
-            "file-a".to_string(),
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
             "/document.md".to_string(),
             "document.md".to_string(),
             "main".to_string(),
@@ -6929,7 +6960,7 @@ mod tests {
         let live = |id: &str, snapshot_content: &str| MaterializedLiveStateRow {
             entity_pk: EntityPk::single(id),
             schema_key: "plugin_note".to_string(),
-            file_id: Some("file-a".to_string()),
+            file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: None,
             deleted: false,
@@ -6939,7 +6970,7 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: false,
-            branch_id: "branch-a".into(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
         };
         let upsert = |id: &str, snapshot: &[u8], effect| {
             let value = serde_json::from_slice::<JsonValue>(snapshot)
@@ -7002,16 +7033,28 @@ mod tests {
 
     #[test]
     fn plugin_owner_is_only_rewritten_when_its_durable_contract_changes() {
-        let current = PluginFileOwner::new("file-a", "plugin-a", vec!["schema-a".to_string()])
-            .expect("current owner should be valid");
+        let current = PluginFileOwner::new(
+            "01920000-0000-7000-8000-0000000000a2",
+            "plugin-a",
+            vec!["schema-a".to_string()],
+        )
+        .expect("current owner should be valid");
         assert!(!plugin_owner_needs_write(Some(&current), &current));
         assert!(plugin_owner_needs_write(None, &current));
 
         for desired in [
-            PluginFileOwner::new("file-a", "plugin-b", vec!["schema-a".to_string()])
-                .expect("changed plugin owner should be valid"),
-            PluginFileOwner::new("file-a", "plugin-a", vec!["schema-b".to_string()])
-                .expect("changed schema owner should be valid"),
+            PluginFileOwner::new(
+                "01920000-0000-7000-8000-0000000000a2",
+                "plugin-b",
+                vec!["schema-a".to_string()],
+            )
+            .expect("changed plugin owner should be valid"),
+            PluginFileOwner::new(
+                "01920000-0000-7000-8000-0000000000a2",
+                "plugin-a",
+                vec!["schema-b".to_string()],
+            )
+            .expect("changed schema owner should be valid"),
         ] {
             assert!(plugin_owner_needs_write(Some(&current), &desired));
         }
@@ -7020,7 +7063,7 @@ mod tests {
     #[test]
     fn active_branch_write_gate_ignores_global_companion_rows_and_files() {
         let mut active_row = key_value_stage_row("active-row", "value", false);
-        active_row.branch_id = "branch-a".to_string();
+        active_row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         active_row.global = false;
         let mut global_row = key_value_stage_row("global-row", "value", false);
         global_row.branch_id = GLOBAL_BRANCH_ID.to_string();
@@ -7043,18 +7086,18 @@ mod tests {
                     file_data: vec![global_file],
                     count: 1,
                 },
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ),
             "normal local writes commonly carry global bookkeeping rows"
         );
 
-        active_row.branch_id = "branch-b".to_string();
+        active_row.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
         assert!(transaction_write_targets_non_active_branch(
             &TransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![active_row],
             },
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         ));
     }
 
@@ -7286,7 +7329,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: "lix_plugin_archive::plugin_csv_v2".to_string(),
+            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),
             wasm_blob_hash: hash,
@@ -7912,7 +7955,9 @@ mod tests {
 
         assert_eq!(error.code, LixError::CODE_INVALID_STORAGE_SCOPE);
         assert!(
-            error.message.contains("branch_id='global', global=false"),
+            error
+                .message
+                .contains("branch_id='ffffffff-ffff-7fff-bfff-ffffffffffff', global=false"),
             "error should explain invalid storage scope: {error:?}"
         );
     }
@@ -8149,7 +8194,7 @@ mod tests {
         let seed = [7; 16];
         let key = PluginActorKey {
             branch_id: "main".to_string(),
-            file_id: "file-a".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),
             path: "/data.csv".to_string(),
             owner_change_id: "incarnation-a".to_string(),
             plugin_key: "plugin_csv_v2".to_string(),
@@ -8158,7 +8203,7 @@ mod tests {
         assert_eq!(v2_id_namespace(seed, &key), v2_id_namespace(seed, &key));
 
         let mut other_file = key.clone();
-        other_file.file_id = "file-b".to_string();
+        other_file.file_id = "01920000-0000-7000-8000-0000000000b2".to_string();
         assert_ne!(
             v2_id_namespace(seed, &key),
             v2_id_namespace(seed, &other_file)

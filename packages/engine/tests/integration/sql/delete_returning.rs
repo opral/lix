@@ -18,7 +18,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('returning-file', '/returning-file.txt', X'6265666F7265')",
+                 VALUES ('72657475-726e-896e-872d-66696c650000', '/returning-file.txt', X'6265666F7265')",
                 &[],
             )
             .await
@@ -34,7 +34,7 @@ simulation_test!(
         assert_rows_eq(
             deleted_file,
             vec![vec![
-                Value::Text("returning-file".to_string()),
+                Value::Text("72657475-726e-896e-872d-66696c650000".to_string()),
                 Value::Blob(b"before".to_vec().into()),
             ]],
         );
@@ -42,7 +42,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('returning-directory', '/returning-directory/')",
+                 VALUES ('72657475-726e-896e-872d-646972656300', '/72657475-726e-896e-872d-646972656300/')",
                 &[],
             )
             .await
@@ -50,7 +50,7 @@ simulation_test!(
         let deleted_directory = session
             .execute(
                 "DELETE FROM lix_directory \
-                 WHERE path LIKE '/returning-directory/%' \
+                 WHERE path LIKE '/72657475-726e-896e-872d-646972656300/%' \
                  RETURNING id, path",
                 &[],
             )
@@ -60,21 +60,21 @@ simulation_test!(
         assert_rows_eq(
             deleted_directory,
             vec![vec![
-                Value::Text("returning-directory".to_string()),
-                Value::Text("/returning-directory/".to_string()),
+                Value::Text("72657475-726e-896e-872d-646972656300".to_string()),
+                Value::Text("/72657475-726e-896e-872d-646972656300/".to_string()),
             ]],
         );
 
         session
             .execute(
-                "INSERT INTO lix_branch (id, name) VALUES ('returning-branch', 'Returning branch')",
+                "INSERT INTO lix_branch (id, name) VALUES ('72657475-726e-896e-872d-6272616e6300', 'Returning branch')",
                 &[],
             )
             .await
             .expect("branch fixture insert should succeed");
         let deleted_branch = session
             .execute(
-                "DELETE FROM lix_branch WHERE id = 'returning-branch' RETURNING id, name",
+                "DELETE FROM lix_branch WHERE id = '72657475-726e-896e-872d-6272616e6300' RETURNING id, name",
                 &[],
             )
             .await
@@ -83,7 +83,7 @@ simulation_test!(
         assert_rows_eq(
             deleted_branch,
             vec![vec![
-                Value::Text("returning-branch".to_string()),
+                Value::Text("72657475-726e-896e-872d-6272616e6300".to_string()),
                 Value::Text("Returning branch".to_string()),
             ]],
         );

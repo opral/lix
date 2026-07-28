@@ -29,7 +29,7 @@ use crate::{GLOBAL_BRANCH_ID, NullableKeyFilter};
 
 const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-00000000b001";
 const TIMESTAMP: &str = "2026-05-19T00:00:00.000Z";
-const BENCH_BRANCH_ID: &str = "tracked-crud-branch";
+const BENCH_BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
 
 #[derive(Clone, Debug)]
 pub struct BenchTransactionRow {
@@ -503,7 +503,8 @@ async fn seed_visible_schema_rows<StorageImpl>(
     let timestamp = LixTimestamp::expect_parse("timestamp", TIMESTAMP);
     let commit_id = CommitId::for_test_label(SCHEMA_FIXTURE_COMMIT_ID);
     let branch_refs = [GLOBAL_BRANCH_ID, BENCH_BRANCH_ID].map(|branch_id| {
-        let entity_pk = EntityPk::single(branch_id);
+        let entity_pk =
+            EntityPk::uuid_from_canonical(branch_id).expect("benchmark branch ID is canonical");
         let snapshot = json!({"id": branch_id, "commit_id": commit_id}).to_string();
         let change_id = ChangeId::for_test_label(&format!("bench-branch-ref-{branch_id}"));
         (branch_id, entity_pk, snapshot, change_id)

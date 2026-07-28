@@ -44,7 +44,7 @@ simulation_test!(
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -298,7 +298,7 @@ simulation_test!(
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -359,7 +359,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
              (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'first', 'global', true, true) \
+             VALUES ('kv-upsert-global', 'first', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
              ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
                 &[],
             )
@@ -370,7 +370,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
              (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-             VALUES ('kv-upsert-global', 'second', 'global', true, true) \
+             VALUES ('kv-upsert-global', 'second', 'ffffffff-ffff-7fff-bfff-ffffffffffff', true, true) \
              ON CONFLICT(key, lixcol_branch_id) DO UPDATE SET value = excluded.value",
                 &[],
             )
@@ -380,7 +380,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT value FROM lix_key_value_by_branch \
-             WHERE key = 'kv-upsert-global' AND lixcol_branch_id = 'global'",
+             WHERE key = 'kv-upsert-global' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
                 &[],
             )
             .await

@@ -60,7 +60,12 @@ pub(crate) const ACTIVE_BRANCH_PROBE_ID: &str = "__active_branch__";
 const REGISTERED_SCHEMA_PROBE: &[DifferentialProbe] = &[
     DifferentialProbe::RegisteredSchemaActive,
     DifferentialProbe::RegisteredSchemaByBranch {
-        branch_ids: &[ACTIVE_BRANCH_PROBE_ID, "global", "branch-a", "branch-b"],
+        branch_ids: &[
+            ACTIVE_BRANCH_PROBE_ID,
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            "01920000-0000-7000-8000-0000000000a1",
+            "01920000-0000-7000-8000-0000000000b1",
+        ],
     },
 ];
 
@@ -92,16 +97,17 @@ const PARAM_MULTI_FILE_PATH_AND_DATA: &[DifferentialParam] = &[
 
 #[cfg(test)]
 const SETUP_SEED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, data) VALUES ('diff-existing-file', '/diff/existing.md', X'6f6c64')",
+    "INSERT INTO lix_file (id, path, data) VALUES ('01920000-0000-7000-8000-000000000362', '/diff/existing.md', X'6f6c64')",
 ];
 
 #[cfg(test)]
-const TX_SETUP_STAGED_LIX_FILE_ROW: &[&str] =
-    &["INSERT INTO lix_file (id, path, data) VALUES ('diff-tx-file', '/diff/tx.md', X'62617365')"];
+const TX_SETUP_STAGED_LIX_FILE_ROW: &[&str] = &[
+    "INSERT INTO lix_file (id, path, data) VALUES ('01920000-0000-7000-8000-000000000552', '/diff/tx.md', X'62617365')",
+];
 
 #[cfg(test)]
 const SETUP_SEED_UNTRACKED_LIX_FILE_ROW: &[&str] = &[
-    "INSERT INTO lix_file (id, path, data, lixcol_untracked) VALUES ('diff-untracked-file', '/diff/untracked.md', X'6f6c64', true)",
+    "INSERT INTO lix_file (id, path, data, lixcol_untracked) VALUES ('01920000-0000-7000-8000-000000000542', '/diff/untracked.md', X'6f6c64', true)",
 ];
 
 #[cfg(test)]
@@ -139,7 +145,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/base-entity-branch-override".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "UPDATE lix_registered_schema SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_branch_id = 'branch-b'".into(),
+            sql: "UPDATE lix_registered_schema SET value = lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}') WHERE lixcol_branch_id = '01920000-0000-7000-8000-0000000000b1'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -151,7 +157,7 @@ pub(crate) fn deterministic_repro_cases() -> Vec<DifferentialSqlCase> {
             seed: "known/base-entity-insert-hidden-branch-column".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "INSERT INTO lix_registered_schema (value, lixcol_branch_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), 'branch-b')".into(),
+            sql: "INSERT INTO lix_registered_schema (value, lixcol_branch_id) VALUES (lix_json('{\"x-lix-key\":\"x\",\"type\":\"object\"}'), '01920000-0000-7000-8000-0000000000b1')".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,
@@ -429,7 +435,7 @@ pub(crate) fn generated_dml_cases() -> Vec<DifferentialSqlCase> {
             seed: "generated/entity-base/reject-hidden-branch".into(),
             setup_sql: &[],
             transaction_setup_sql: &[],
-            sql: "DELETE FROM lix_registered_schema WHERE lixcol_branch_id = 'branch-a'".into(),
+            sql: "DELETE FROM lix_registered_schema WHERE lixcol_branch_id = '01920000-0000-7000-8000-0000000000a1'".into(),
             params: EMPTY_PARAMS,
             probes: REGISTERED_SCHEMA_PROBE,
             expectation: DifferentialExpectation::SemanticParityMayFallback,

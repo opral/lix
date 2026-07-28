@@ -347,8 +347,8 @@ mod tests {
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
             ref_change_id: ChangeId::for_test_label("second-ref-change"),
         };
-        let branch_a = "branch-a".to_string();
-        let branch_b = "branch-b".to_string();
+        let branch_a = "01920000-0000-7000-8000-0000000000a1".to_string();
+        let branch_b = "01920000-0000-7000-8000-0000000000b1".to_string();
 
         let mut presence = first;
         presence.schema_presence_bloom = [0; 4];

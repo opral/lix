@@ -319,7 +319,7 @@ async fn git_text_plugin_rejects_merging_a_raw_rename_with_derived_materializati
         .expect("main branch should resolve");
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("git-text-raw-rename-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-000000000505".to_owned()),
             name: "Git text raw rename source".to_owned(),
             from_commit_id: None,
         })
@@ -393,7 +393,7 @@ async fn git_text_plugin_rejects_merging_derived_materialization_into_a_raw_rena
         .expect("main branch should resolve");
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("git-text-derived-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-000000000506".to_owned()),
             name: "Git text derived source".to_owned(),
             from_commit_id: None,
         })

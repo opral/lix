@@ -187,30 +187,33 @@ mod tests {
         let reader = Arc::new(RecordingLiveStateReader {
             rows: vec![
                 directory_row(
-                    "dir-docs",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 live_row(
                     "other",
                     "other_schema",
                     None,
                     Some(r#"{"id":"other"}"#),
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                 ),
                 live_row(
-                    "dir-other-branch",
+                    "01920000-0000-7000-8000-000000000383-branch",
                     DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                     None,
-                    Some(r#"{"id":"dir-other-branch","parent_id":null,"name":"docs"}"#),
-                    "branch-b",
+                    Some(
+                        r#"{"id":"01920000-0000-7000-8000-000000000383-branch","parent_id":null,"name":"docs"}"#,
+                    ),
+                    "01920000-0000-7000-8000-0000000000b1",
                 ),
             ],
             last_request: Mutex::new(None),
         });
 
-        let filesystem = VisibleFilesystem::load(reader.clone(), "branch-a")
-            .await
-            .expect("visible filesystem should load");
+        let filesystem =
+            VisibleFilesystem::load(reader.clone(), "01920000-0000-7000-8000-0000000000a1")
+                .await
+                .expect("visible filesystem should load");
 
         let request = reader
             .last_request
@@ -227,18 +230,23 @@ mod tests {
                 DERIVED_FILE_REF_SCHEMA_KEY.to_string(),
             ]
         );
-        assert_eq!(request.filter.branch_ids, vec!["branch-a".to_string()]);
+        assert_eq!(
+            request.filter.branch_ids,
+            vec!["01920000-0000-7000-8000-0000000000a1".to_string()]
+        );
         assert!(
             filesystem
                 .directory_children_by_parent_id
                 .get(&None)
-                .is_some_and(|children| children.contains("dir-docs"))
+                .is_some_and(|children| children.contains("01920000-0000-7000-8000-0000000000d3"))
         );
         assert!(
             !filesystem
                 .directory_children_by_parent_id
                 .get(&None)
-                .is_some_and(|children| children.contains("dir-other-branch"))
+                .is_some_and(
+                    |children| children.contains("01920000-0000-7000-8000-000000000383-branch")
+                )
         );
     }
 
@@ -247,15 +255,15 @@ mod tests {
         let filesystem = VisibleFilesystem::load(
             live_state(vec![
                 directory_row(
-                    "dir-docs",
-                    r#"{"id":"dir-docs","parent_id":null,"name":"docs"}"#,
+                    "01920000-0000-7000-8000-0000000000d3",
+                    r#"{"id":"01920000-0000-7000-8000-0000000000d3","parent_id":null,"name":"docs"}"#,
                 ),
                 directory_row(
-                    "dir-guides",
-                    r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides"}"#,
+                    "01920000-0000-7000-8000-000000000313",
+                    r#"{"id":"01920000-0000-7000-8000-000000000313","parent_id":"01920000-0000-7000-8000-0000000000d3","name":"guides"}"#,
                 ),
             ]),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
         .await
         .expect("visible filesystem should load");
@@ -264,13 +272,16 @@ mod tests {
             filesystem
                 .directory_children_by_parent_id
                 .get(&None)
-                .is_some_and(|children| children.contains("dir-docs"))
+                .is_some_and(|children| children.contains("01920000-0000-7000-8000-0000000000d3"))
         );
         assert!(
             filesystem
                 .directory_children_by_parent_id
-                .get(&Some(descriptor_key("branch-a", "dir-docs")))
-                .is_some_and(|children| children.contains("dir-guides"))
+                .get(&Some(descriptor_key(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "01920000-0000-7000-8000-0000000000d3"
+                )))
+                .is_some_and(|children| children.contains("01920000-0000-7000-8000-000000000313"))
         );
     }
 
@@ -278,36 +289,39 @@ mod tests {
     async fn files_attach_to_directory_ids() {
         let filesystem = VisibleFilesystem::load(
             live_state(vec![file_row(
-                "file-readme",
-                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":"01920000-0000-7000-8000-000000000313","name":"readme.md"}"#,
             )]),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
         .await
         .expect("visible filesystem should load");
 
         let files = filesystem
             .files_by_directory_id
-            .get(&Some(descriptor_key("branch-a", "dir-guides")))
+            .get(&Some(descriptor_key(
+                "01920000-0000-7000-8000-0000000000a1",
+                "01920000-0000-7000-8000-000000000313",
+            )))
             .expect("directory should have attached files");
-        assert!(files.contains("file-readme"));
+        assert!(files.contains("01920000-0000-7000-8000-0000000000d2"));
     }
 
     #[tokio::test]
     async fn blob_refs_attach_to_file_ids() {
         let filesystem = VisibleFilesystem::load(
             live_state(vec![blob_ref_row(
-                "file-readme",
-                r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","blob_hash":"abc123","size_bytes":5}"#,
             )]),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
         .await
         .expect("visible filesystem should load");
 
         assert!(filesystem.has_blob_ref(
-            &FilesystemRowContext::active_branch("branch-a"),
-            "file-readme"
+            &FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+            "01920000-0000-7000-8000-0000000000d2"
         ));
     }
 
@@ -319,32 +333,32 @@ mod tests {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                 None,
                 None,
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ),
             live_row(
                 "file-tombstone",
                 FILE_DESCRIPTOR_SCHEMA_KEY,
                 None,
                 None,
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ),
             live_row(
                 "blob-tombstone",
                 BLOB_REF_SCHEMA_KEY,
                 Some("blob-tombstone".to_string()),
                 None,
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ),
             live_row(
                 "other",
                 "other_schema",
                 None,
                 Some(r#"{"id":"other"}"#),
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ),
             file_row(
-                "file-root",
-                r#"{"id":"file-root","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-000000000142",
+                r#"{"id":"01920000-0000-7000-8000-000000000142","directory_id":null,"name":"readme.md"}"#,
             ),
         ])
         .expect("visible filesystem should load from edge rows");
@@ -356,10 +370,10 @@ mod tests {
             .expect("root files should be indexed under None");
         assert_eq!(
             root_files,
-            &std::collections::BTreeSet::from(["file-root".to_string()])
+            &std::collections::BTreeSet::from(["01920000-0000-7000-8000-000000000142".to_string()])
         );
         assert!(!filesystem.has_blob_ref(
-            &FilesystemRowContext::active_branch("branch-a"),
+            &FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             "blob-tombstone"
         ));
     }
@@ -371,7 +385,7 @@ mod tests {
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some("{not-json"),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )])
         .expect_err("invalid directory JSON should be rejected");
 
@@ -482,7 +496,7 @@ mod tests {
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
     }
 
@@ -492,7 +506,7 @@ mod tests {
             FILE_DESCRIPTOR_SCHEMA_KEY,
             None,
             Some(snapshot_content),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
     }
 
@@ -502,7 +516,7 @@ mod tests {
             BLOB_REF_SCHEMA_KEY,
             Some(entity_pk.to_string()),
             Some(snapshot_content),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         )
     }
 

@@ -65,7 +65,7 @@ impl<'a> BranchLifecycle<'a> {
         operation: BranchOperation,
         role: BranchReferenceRole,
     ) -> Result<(), LixError> {
-        require_non_empty_public_id("branch_id", branch_id, operation, role)
+        require_canonical_uuid("branch_id", branch_id, operation, role)
     }
 
     pub(crate) async fn require_existing_commit(
@@ -145,6 +145,26 @@ fn require_non_empty_public_id(
         })
 }
 
+fn require_canonical_uuid(
+    label: &str,
+    value: &str,
+    operation: BranchOperation,
+    role: BranchReferenceRole,
+) -> Result<(), LixError> {
+    require_non_empty_public_id(label, value, operation, role)?;
+    if crate::storage_codec::id_string::uuid_bytes_from_canonical(value).is_none() {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PARAM,
+            format!(
+                "{} {} {label} must be a canonical UUID",
+                operation.label(),
+                role.label()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
@@ -155,14 +175,14 @@ mod tests {
     #[tokio::test]
     async fn require_existing_ref_returns_head() {
         let reader = RowsBranchRefReader::new(vec![BranchHead {
-            branch_id: "branch-a".to_string(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             commit_id: CommitId::for_test_label("commit-a"),
         }]);
         let lifecycle = BranchLifecycle::new(&reader);
 
         let head = lifecycle
             .require_existing_ref(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 BranchOperation::SwitchBranch,
                 BranchReferenceRole::Target,
             )
@@ -196,7 +216,7 @@ mod tests {
 
         let error = lifecycle
             .require_existing_ref(
-                "missing",
+                "01920000-0000-7000-8000-0000000000f1",
                 BranchOperation::SwitchBranch,
                 BranchReferenceRole::Target,
             )

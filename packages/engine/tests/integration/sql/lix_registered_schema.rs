@@ -679,7 +679,7 @@ simulation_test!(
         );
 
         main.create_branch(CreateBranchOptions {
-            id: Some("schemaless-target".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000015".to_string()),
             name: "Schemaless Target".to_string(),
             from_commit_id: None,
         })
@@ -702,7 +702,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_poison_schema_by_branch \
                  (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('poison-1', 'Poisoned', 'schemaless-target', true)",
+                 VALUES ('poison-1', 'Poisoned', '01930000-0000-7000-8000-000000000015', true)",
                 &[],
             )
             .await
@@ -729,7 +729,7 @@ simulation_test!(
         );
 
         main.create_branch(CreateBranchOptions {
-            id: Some("divergent-target".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000012".to_string()),
             name: "Divergent Target".to_string(),
             from_commit_id: None,
         })
@@ -773,7 +773,7 @@ simulation_test!(
 
         let target = sim.wrap_session(
             engine
-                .open_session("divergent-target")
+                .open_session("01930000-0000-7000-8000-000000000012")
                 .await
                 .expect("target session should open"),
             &engine,
@@ -873,7 +873,7 @@ simulation_test!(
         .expect("base schema should be registered");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("schema-amendment-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000014".to_string()),
             name: "Schema Amendment Draft".to_string(),
             from_commit_id: None,
         })
@@ -882,7 +882,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("schema-amendment-draft")
+                .open_session("01930000-0000-7000-8000-000000000014")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -947,7 +947,7 @@ simulation_test!(
         );
 
         main.create_branch(CreateBranchOptions {
-            id: Some("fk-schemaless-target".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000013".to_string()),
             name: "FK Schemaless Target".to_string(),
             from_commit_id: None,
         })
@@ -982,7 +982,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_fk_parent_schema_by_branch \
                  (id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('parent-1', 'fk-schemaless-target', true)",
+                 VALUES ('parent-1', '01930000-0000-7000-8000-000000000013', true)",
                 &[],
             )
             .await;
@@ -1000,7 +1000,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_fk_child_schema_by_branch \
                  (id, parent_id, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('child-1', 'parent-1', 'fk-schemaless-target', true)",
+                 VALUES ('child-1', 'parent-1', '01930000-0000-7000-8000-000000000013', true)",
                 &[],
             )
             .await
@@ -1140,7 +1140,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
     let engine = sim.boot_engine().await;
     let global_session = sim.wrap_session(
         engine
-            .open_session("global")
+            .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global session should open"),
         &engine,
@@ -1212,7 +1212,7 @@ simulation_test!(entity_by_branch_expands_global_rows, |sim| async move {
             vec![
                 Value::Text("entity-global-overlay".to_string()),
                 Value::Text("Global Entity".to_string()),
-                Value::Text("global".to_string()),
+                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],
@@ -1407,8 +1407,8 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES \
-                 ('file-1', '/file-1.txt', X'31'), \
-                 ('file-2', '/file-2.txt', X'32')",
+                 ('66696c65-2d31-8000-8000-000000000000', '/66696c65-2d31-8000-8000-000000000000.txt', X'31'), \
+                 ('66696c65-2d32-8000-8000-000000000000', '/66696c65-2d32-8000-8000-000000000000.txt', X'32')",
                 &[],
             )
             .await
@@ -1419,8 +1419,8 @@ simulation_test!(
                 "INSERT INTO engine_file_scoped_entity_schema \
                  (id, name, lixcol_file_id, lixcol_global, lixcol_untracked) \
                  VALUES \
-                 ('row-1', 'before-1', 'file-1', false, false), \
-                 ('row-2', 'before-2', 'file-2', false, false)",
+                 ('row-1', 'before-1', '66696c65-2d31-8000-8000-000000000000', false, false), \
+                 ('row-2', 'before-2', '66696c65-2d32-8000-8000-000000000000', false, false)",
                 &[],
             )
             .await
@@ -1430,7 +1430,7 @@ simulation_test!(
             .execute(
                 "UPDATE engine_file_scoped_entity_schema \
                  SET name = 'after' \
-                 WHERE lixcol_file_id = 'file-1'",
+                 WHERE lixcol_file_id = '66696c65-2d31-8000-8000-000000000000'",
                 &[],
             )
             .await
@@ -1452,12 +1452,12 @@ simulation_test!(
                 vec![
                     Value::Text("row-1".to_string()),
                     Value::Text("after".to_string()),
-                    Value::Text("file-1".to_string()),
+                    Value::Text("66696c65-2d31-8000-8000-000000000000".to_string()),
                 ],
                 vec![
                     Value::Text("row-2".to_string()),
                     Value::Text("before-2".to_string()),
-                    Value::Text("file-2".to_string()),
+                    Value::Text("66696c65-2d32-8000-8000-000000000000".to_string()),
                 ],
             ],
         );
@@ -1603,7 +1603,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("base-filter-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000d".to_string()),
             name: "Base Filter Draft".to_string(),
             from_commit_id: None,
         })
@@ -1612,7 +1612,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("base-filter-draft")
+                .open_session("01930000-0000-7000-8000-00000000000d")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1633,7 +1633,7 @@ simulation_test!(
                 "UPDATE engine_base_branch_filter_schema \
                  SET name = 'main-updated-draft' \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND lixcol_branch_id = 'base-filter-draft'",
+                   AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
             .await
@@ -1645,7 +1645,7 @@ simulation_test!(
                 "SELECT name \
                  FROM engine_base_branch_filter_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_branch_id = 'base-filter-draft'",
+                   AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000d'",
                 &[],
             )
             .await
@@ -1679,7 +1679,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("base-insert-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000e".to_string()),
             name: "Base Insert Draft".to_string(),
             from_commit_id: None,
         })
@@ -1690,7 +1690,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_base_insert_branch_schema \
                  (id, name, lixcol_branch_id, lixcol_untracked) \
-                 VALUES ('row-1', 'draft', 'base-insert-draft', false)",
+                 VALUES ('row-1', 'draft', '01930000-0000-7000-8000-00000000000e', false)",
                 &[],
             )
             .await
@@ -1702,7 +1702,7 @@ simulation_test!(
                 "SELECT name \
                  FROM engine_base_insert_branch_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_branch_id = 'base-insert-draft'",
+                   AND lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
                 &[],
             )
             .await
@@ -1867,7 +1867,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("base-insert-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000e".to_string()),
             name: "Base Insert Draft".to_string(),
             from_commit_id: None,
         })
@@ -1878,7 +1878,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO engine_base_branch_insert_schema \
                  (id, name, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('row-1', 'draft-via-main', 'base-insert-draft', false, false)",
+                 VALUES ('row-1', 'draft-via-main', '01930000-0000-7000-8000-00000000000e', false, false)",
                 &[],
             )
             .await
@@ -1889,7 +1889,7 @@ simulation_test!(
             .execute(
                 "SELECT id \
                  FROM engine_base_branch_insert_schema_by_branch \
-                 WHERE lixcol_branch_id = 'base-insert-draft'",
+                 WHERE lixcol_branch_id = '01930000-0000-7000-8000-00000000000e'",
                 &[],
             )
             .await
@@ -1923,7 +1923,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("by-branch-delete-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000010".to_string()),
             name: "By-branch Delete Draft".to_string(),
             from_commit_id: None,
         })
@@ -1941,7 +1941,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-branch-delete-draft")
+                .open_session("01930000-0000-7000-8000-000000000010")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -1970,7 +1970,7 @@ simulation_test!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_delete_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_branch_id IN ('{}', 'by-branch-delete-draft') \
+                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000010') \
                  ORDER BY name",
                     sim.main_branch_id()
                 ),
@@ -1983,7 +1983,7 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-branch-delete-draft".to_string()),
+                    Value::Text("01930000-0000-7000-8000-000000000010".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),
@@ -2019,7 +2019,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("by-branch-update-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000011".to_string()),
             name: "By-branch Update Draft".to_string(),
             from_commit_id: None,
         })
@@ -2037,7 +2037,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-branch-update-draft")
+                .open_session("01930000-0000-7000-8000-000000000011")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -2067,7 +2067,7 @@ simulation_test!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_update_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_branch_id IN ('{}', 'by-branch-update-draft') \
+                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-000000000011') \
                  ORDER BY name",
                     sim.main_branch_id()
                 ),
@@ -2080,7 +2080,7 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-branch-update-draft".to_string()),
+                    Value::Text("01930000-0000-7000-8000-000000000011".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),
@@ -2116,7 +2116,7 @@ simulation_test!(
         .expect("registered schema insert should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("by-branch-alias-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000f".to_string()),
             name: "By-branch Alias Draft".to_string(),
             from_commit_id: None,
         })
@@ -2134,7 +2134,7 @@ simulation_test!(
 
         let draft = sim.wrap_session(
             engine
-                .open_session("by-branch-alias-draft")
+                .open_session("01930000-0000-7000-8000-00000000000f")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -2154,7 +2154,7 @@ simulation_test!(
                 "UPDATE engine_by_branch_alias_scope_schema_by_branch \
                  SET name = 'updated-via-alias' \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND branch_id = 'by-branch-alias-draft'",
+                   AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
             .await
@@ -2165,7 +2165,7 @@ simulation_test!(
             .execute(
                 "DELETE FROM engine_by_branch_alias_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = '[\"row-1\"]' \
-                   AND branch_id = 'by-branch-alias-draft'",
+                   AND branch_id = '01930000-0000-7000-8000-00000000000f'",
                 &[],
             )
             .await
@@ -2178,7 +2178,7 @@ simulation_test!(
                     "SELECT name, lixcol_branch_id \
                  FROM engine_by_branch_alias_scope_schema_by_branch \
                  WHERE lixcol_entity_pk = lix_json('[\"row-1\"]') \
-                   AND lixcol_branch_id IN ('{}', 'by-branch-alias-draft') \
+                   AND lixcol_branch_id IN ('{}', '01930000-0000-7000-8000-00000000000f') \
                  ORDER BY name",
                     sim.main_branch_id()
                 ),
@@ -2191,7 +2191,7 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("draft".to_string()),
-                    Value::Text("by-branch-alias-draft".to_string()),
+                    Value::Text("01930000-0000-7000-8000-00000000000f".to_string()),
                 ],
                 vec![
                     Value::Text("main".to_string()),

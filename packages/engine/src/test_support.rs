@@ -82,7 +82,8 @@ pub(crate) async fn seed_branch_head_with_rows(
     .expect("tracked root should write");
 
     let branch_ref_change_id = test_change_id(&format!("branch-ref-{branch_id}"));
-    let branch_ref_entity_pk = crate::entity_pk::EntityPk::single(branch_id);
+    let branch_ref_entity_pk = crate::entity_pk::EntityPk::uuid_from_canonical(branch_id)
+        .expect("test branch ID must be a canonical UUID");
     let branch_ref_snapshot = serde_json::json!({
         "id": branch_id,
         "commit_id": commit_id,

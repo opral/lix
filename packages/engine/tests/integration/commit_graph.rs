@@ -17,7 +17,7 @@ simulation_test!(branch_ref_advances_after_tracked_commit, |sim| async move {
         .expect("branch head should exist");
     session
         .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('branch-ref-advance', 'one')",
+            "INSERT INTO lix_key_value (key, value) VALUES ('6272616e-6368-8d72-8566-2d6164766100', 'one')",
             &[],
         )
         .await
@@ -47,13 +47,13 @@ simulation_test!(
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
         );
         let global_head_before = engine
-            .load_branch_head_commit_id("global")
+            .load_branch_head_commit_id("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global head should load")
             .expect("global head should exist");
@@ -72,7 +72,7 @@ simulation_test!(
             .expect("tracked write should succeed");
 
         let global_head_after = engine
-            .load_branch_head_commit_id("global")
+            .load_branch_head_commit_id("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global head should load")
             .expect("global head should exist");
@@ -112,7 +112,7 @@ simulation_test!(
         );
         let global_session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,

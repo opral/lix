@@ -13,6 +13,7 @@
   "properties": {
     "id": {
       "type": "string",
+      "format": "uuid",
       "x-lix-default": "lix_uuid_v7()",
       "description": "Stable branch identifier (UUIDv7). Referenced by `lix_branch_ref.id`."
     },

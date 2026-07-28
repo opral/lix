@@ -6,7 +6,7 @@ simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
     let engine = sim.boot_engine().await;
     let session = sim.wrap_session(
         engine
-            .open_session("global")
+            .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("global session should open"),
         &engine,
@@ -28,7 +28,7 @@ simulation_test!(lix_branch_lists_descriptors_with_refs, |sim| async move {
         .map(|row| row.values().to_vec())
         .collect::<Vec<_>>();
     assert!(values.contains(&vec![
-        Value::Text("global".to_string()),
+        Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
         Value::Text("global".to_string()),
         Value::Boolean(true),
         Value::Text(sim.initial_commit_id().to_string()),
@@ -47,7 +47,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("global session should open"),
             &engine,
@@ -104,7 +104,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('branch-ref-public-metadata', 'next-head')",
+                 VALUES ('6272616e-6368-8d72-8566-2d7075626c00', 'next-head')",
                 &[],
             )
             .await
@@ -165,7 +165,7 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-insert', 'SQL Insert')",
+                 VALUES ('73716c2d-6272-816e-8368-2d696e736500', 'SQL Insert')",
                 &[],
             )
             .await
@@ -174,7 +174,7 @@ simulation_test!(
 
         assert_single_branch_row(
             &session,
-            "sql-branch-insert",
+            "73716c2d-6272-816e-8368-2d696e736500",
             "SQL Insert",
             false,
             sim.initial_commit_id(),
@@ -183,7 +183,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = 'sql-branch-insert'",
+                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '73716c2d-6272-816e-8368-2d696e736500'",
             )
             .await,
             1
@@ -191,7 +191,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = 'sql-branch-insert'",
+                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d696e736500'",
             )
             .await,
             1
@@ -215,7 +215,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "INSERT INTO lix_branch (id, name, hidden, commit_id) \
-                     VALUES ('sql-branch-explicit', 'Explicit', true, '{}')",
+                     VALUES ('73716c2d-6272-816e-8368-2d6578706c00', 'Explicit', true, '{}')",
                     sim.initial_commit_id()
                 ),
                 &[],
@@ -226,7 +226,7 @@ simulation_test!(
 
         assert_single_branch_row(
             &session,
-            "sql-branch-explicit",
+            "73716c2d-6272-816e-8368-2d6578706c00",
             "Explicit",
             true,
             sim.initial_commit_id(),
@@ -250,7 +250,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-update', 'Before')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7570646100', 'Before')",
                 &[],
             )
             .await
@@ -259,7 +259,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('sql-branch-update-head', 'after')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7570646100', 'after')",
                 &[],
             )
             .await
@@ -278,7 +278,7 @@ simulation_test!(
                 &format!(
                     "UPDATE lix_branch \
                      SET name = 'After', hidden = true, commit_id = '{new_head}' \
-                     WHERE id = 'sql-branch-update'"
+                     WHERE id = '73716c2d-6272-816e-8368-2d7570646100'"
                 ),
                 &[],
             )
@@ -286,11 +286,18 @@ simulation_test!(
             .expect("lix_branch update should split descriptor and ref changes");
         assert_eq!(update_result, ExecuteResult::from_rows_affected(1));
 
-        assert_single_branch_row(&session, "sql-branch-update", "After", true, &new_head).await;
+        assert_single_branch_row(
+            &session,
+            "73716c2d-6272-816e-8368-2d7570646100",
+            "After",
+            true,
+            &new_head,
+        )
+        .await;
         assert_eq!(
             select_single_text(
                 &session,
-                "SELECT commit_id FROM lix_branch_ref WHERE id = 'sql-branch-update'",
+                "SELECT commit_id FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d7570646100'",
             )
             .await,
             new_head
@@ -313,14 +320,17 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-delete', 'Delete Me')",
+                 VALUES ('73716c2d-6272-816e-8368-2d64656c6500', 'Delete Me')",
                 &[],
             )
             .await
             .expect("branch insert should succeed");
 
         let delete_result = session
-            .execute("DELETE FROM lix_branch WHERE id = 'sql-branch-delete'", &[])
+            .execute(
+                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
+                &[],
+            )
             .await
             .expect("lix_branch delete should remove descriptor and ref atomically");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(1));
@@ -328,7 +338,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-delete'",
+                "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
             )
             .await,
             0
@@ -336,7 +346,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = 'sql-branch-delete'",
+                "SELECT COUNT(*) FROM lix_branch_descriptor WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
             )
             .await,
             0
@@ -344,7 +354,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = 'sql-branch-delete'",
+                "SELECT COUNT(*) FROM lix_branch_ref WHERE id = '73716c2d-6272-816e-8368-2d64656c6500'",
             )
             .await,
             0
@@ -380,7 +390,10 @@ simulation_test!(
         );
 
         let global_error = session
-            .execute("DELETE FROM lix_branch WHERE id = 'global'", &[])
+            .execute(
+                "DELETE FROM lix_branch WHERE id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
+                &[],
+            )
             .await
             .expect_err("delete should reject global branch");
         assert!(
@@ -402,7 +415,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch WHERE id = 'global'"
+                "SELECT COUNT(*) FROM lix_branch WHERE id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
             )
             .await,
             1
@@ -425,7 +438,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-local-untracked', 'Local Untracked')",
+                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'Local Untracked')",
                 &[],
             )
             .await
@@ -433,15 +446,15 @@ simulation_test!(
         let original_head = select_single_text(
             &session,
             "SELECT commit_id FROM lix_branch \
-             WHERE id = 'sql-branch-local-untracked'",
+             WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
         )
         .await;
         session
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
                  (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('sql-branch-local-untracked-key', 'draft', \
-                         'sql-branch-local-untracked', false, true)",
+                 VALUES ('73716c2d-6272-816e-8368-2d6c6f636100', 'draft', \
+                         '73716c2d-6272-816e-8368-2d6c6f636100', false, true)",
                 &[],
             )
             .await
@@ -451,7 +464,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "UPDATE lix_branch SET commit_id = '{original_head}' \
-                     WHERE id = 'sql-branch-local-untracked'"
+                     WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'"
                 ),
                 &[],
             )
@@ -461,7 +474,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('sql-branch-repoint-head', 'new-head')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7265706f00', 'new-head')",
                 &[],
             )
             .await
@@ -479,7 +492,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "UPDATE lix_branch SET commit_id = '{new_head}' \
-                     WHERE id = 'sql-branch-local-untracked'"
+                     WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'"
                 ),
                 &[],
             )
@@ -489,13 +502,13 @@ simulation_test!(
         assert!(
             repoint_error
                 .message
-                .contains("cannot repoint branch 'sql-branch-local-untracked'"),
+                .contains("cannot repoint branch '73716c2d-6272-816e-8368-2d6c6f636100'"),
             "unexpected repoint error: {repoint_error:?}"
         );
 
         let delete_error = session
             .execute(
-                "DELETE FROM lix_branch WHERE id = 'sql-branch-local-untracked'",
+                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
                 &[],
             )
             .await
@@ -504,14 +517,14 @@ simulation_test!(
         assert!(
             delete_error
                 .message
-                .contains("cannot delete branch 'sql-branch-local-untracked'"),
+                .contains("cannot delete branch '73716c2d-6272-816e-8368-2d6c6f636100'"),
             "unexpected delete error: {delete_error:?}"
         );
         assert_eq!(
             select_single_text(
                 &session,
                 "SELECT commit_id FROM lix_branch \
-                 WHERE id = 'sql-branch-local-untracked'",
+                 WHERE id = '73716c2d-6272-816e-8368-2d6c6f636100'",
             )
             .await,
             original_head
@@ -534,7 +547,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-recreate', 'Before Delete')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'Before Delete')",
                 &[],
             )
             .await
@@ -543,8 +556,8 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_key_value_by_branch \
                  (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-                 VALUES ('sql-branch-recreate-key', 'old', \
-                         'sql-branch-recreate', false, false)",
+                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'old', \
+                         '73716c2d-6272-816e-8368-2d7265637201', false, false)",
                 &[],
             )
             .await
@@ -553,8 +566,8 @@ simulation_test!(
             count_rows(
                 &session,
                 "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = 'sql-branch-recreate-key' \
-                   AND lixcol_branch_id = 'sql-branch-recreate'",
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
+                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             1
@@ -562,7 +575,7 @@ simulation_test!(
 
         session
             .execute(
-                "DELETE FROM lix_branch WHERE id = 'sql-branch-recreate'",
+                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d7265637201'",
                 &[],
             )
             .await
@@ -570,7 +583,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-recreate', 'After Delete')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7265637201', 'After Delete')",
                 &[],
             )
             .await
@@ -580,8 +593,8 @@ simulation_test!(
             count_rows(
                 &session,
                 "SELECT COUNT(*) FROM lix_key_value_by_branch \
-                 WHERE key = 'sql-branch-recreate-key' \
-                   AND lixcol_branch_id = 'sql-branch-recreate'",
+                 WHERE key = '73716c2d-6272-816e-8368-2d7265637201' \
+                   AND lixcol_branch_id = '73716c2d-6272-816e-8368-2d7265637201'",
             )
             .await,
             0,
@@ -603,7 +616,7 @@ simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-duplicate', 'First')",
+             VALUES ('73716c2d-6272-816e-8368-2d6475706c00', 'First')",
             &[],
         )
         .await
@@ -612,7 +625,7 @@ simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     let error = session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-duplicate', 'Second')",
+             VALUES ('73716c2d-6272-816e-8368-2d6475706c00', 'Second')",
             &[],
         )
         .await
@@ -620,7 +633,9 @@ simulation_test!(lix_branch_duplicate_insert_rejects, |sim| async move {
     assert_eq!(error.code, LixError::CODE_UNIQUE);
     assert!(
         error.message.contains("table 'lix_branch'")
-            && error.message.contains("id 'sql-branch-duplicate'")
+            && error
+                .message
+                .contains("id '73716c2d-6272-816e-8368-2d6475706c00'")
             && !error.message.contains("lix_branch_descriptor")
             && !error.message.contains("lix_branch_ref"),
         "unexpected error: {error:?}"
@@ -640,7 +655,7 @@ simulation_test!(lix_branch_duplicate_name_insert_rejects, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-name-a', 'Duplicate Name')",
+             VALUES ('73716c2d-6272-816e-8368-2d6e616d6504', 'Duplicate Name')",
             &[],
         )
         .await
@@ -649,7 +664,7 @@ simulation_test!(lix_branch_duplicate_name_insert_rejects, |sim| async move {
     let error = session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-name-b', 'Duplicate Name')",
+             VALUES ('73716c2d-6272-816e-8368-2d6e616d6503', 'Duplicate Name')",
             &[],
         )
         .await
@@ -674,7 +689,7 @@ simulation_test!(lix_branch_duplicate_name_update_rejects, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-name-update-a', 'Name A')",
+             VALUES ('73716c2d-6272-816e-8368-2d6e616d6505', 'Name A')",
             &[],
         )
         .await
@@ -682,7 +697,7 @@ simulation_test!(lix_branch_duplicate_name_update_rejects, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-name-update-b', 'Name B')",
+             VALUES ('73716c2d-6272-816e-8368-2d6e616d6506', 'Name B')",
             &[],
         )
         .await
@@ -692,7 +707,7 @@ simulation_test!(lix_branch_duplicate_name_update_rejects, |sim| async move {
         .execute(
             "UPDATE lix_branch \
              SET name = 'Name A' \
-             WHERE id = 'sql-branch-name-update-b'",
+             WHERE id = '73716c2d-6272-816e-8368-2d6e616d6506'",
             &[],
         )
         .await
@@ -719,7 +734,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_branch (id, name, commit_id) \
-                 VALUES ('sql-branch-invalid-commit', 'Invalid Commit', 'ffffffff-ffff-4fff-bfff-ffffffffffff')",
+                 VALUES ('73716c2d-6272-816e-8368-2d696e766100', 'Invalid Commit', 'ffffffff-ffff-4fff-bfff-ffffffffffff')",
                 &[],
             )
             .await
@@ -729,7 +744,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-invalid-commit'",
+                "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d696e766100'",
             )
             .await,
             0
@@ -750,7 +765,7 @@ simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_branch (id, name) \
-             VALUES ('sql-branch-id-update', 'Before')",
+             VALUES ('73716c2d-6272-816e-8368-2d69642d7500', 'Before')",
             &[],
         )
         .await
@@ -759,8 +774,8 @@ simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     let error = session
         .execute(
             "UPDATE lix_branch \
-             SET id = 'sql-branch-id-update-renamed' \
-             WHERE id = 'sql-branch-id-update'",
+             SET id = '73716c2d-6272-816e-8368-2d69642d7501' \
+             WHERE id = '73716c2d-6272-816e-8368-2d69642d7500'",
             &[],
         )
         .await
@@ -773,7 +788,7 @@ simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     assert_eq!(
         count_rows(
             &session,
-            "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-id-update'",
+            "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d69642d7500'",
         )
         .await,
         1
@@ -781,7 +796,7 @@ simulation_test!(lix_branch_update_rejects_id_change, |sim| async move {
     assert_eq!(
         count_rows(
             &session,
-            "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-id-update-renamed'",
+            "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d69642d7501'",
         )
         .await,
         0
@@ -800,7 +815,7 @@ simulation_test!(lix_branch_update_rejects_global_branch, |sim| async move {
 
     let error = session
         .execute(
-            "UPDATE lix_branch SET name = 'mutated-global' WHERE id = 'global'",
+            "UPDATE lix_branch SET name = 'mutated-global' WHERE id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
             &[],
         )
         .await
@@ -811,7 +826,11 @@ simulation_test!(lix_branch_update_rejects_global_branch, |sim| async move {
     );
 
     assert_eq!(
-        select_single_text(&session, "SELECT name FROM lix_branch WHERE id = 'global'").await,
+        select_single_text(
+            &session,
+            "SELECT name FROM lix_branch WHERE id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
+        )
+        .await,
         "global"
     );
 });
@@ -830,7 +849,7 @@ simulation_test!(
 
         let delete_result = session
             .execute(
-                "DELETE FROM lix_branch WHERE id = 'sql-branch-missing-delete'",
+                "DELETE FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d6d69737300'",
                 &[],
             )
             .await
@@ -854,7 +873,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-upsert', 'Before')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7570736501', 'Before')",
                 &[],
             )
             .await
@@ -863,7 +882,7 @@ simulation_test!(
         let upsert_result = session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-upsert', 'After') \
+                 VALUES ('73716c2d-6272-816e-8368-2d7570736501', 'After') \
                  ON CONFLICT (id) DO UPDATE SET name = excluded.name",
                 &[],
             )
@@ -873,7 +892,7 @@ simulation_test!(
 
         assert_single_branch_row(
             &session,
-            "sql-branch-upsert",
+            "73716c2d-6272-816e-8368-2d7570736501",
             "After",
             false,
             sim.initial_commit_id(),
@@ -882,7 +901,7 @@ simulation_test!(
         assert_eq!(
             count_rows(
                 &session,
-                "SELECT COUNT(*) FROM lix_branch WHERE id = 'sql-branch-upsert'",
+                "SELECT COUNT(*) FROM lix_branch WHERE id = '73716c2d-6272-816e-8368-2d7570736501'",
             )
             .await,
             1
@@ -905,7 +924,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-upsert-nothing', 'Keep')",
+                 VALUES ('73716c2d-6272-816e-8368-2d7570736501', 'Keep')",
                 &[],
             )
             .await
@@ -914,7 +933,7 @@ simulation_test!(
         let upsert_result = session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-upsert-nothing', 'Discard') \
+                 VALUES ('73716c2d-6272-816e-8368-2d7570736501', 'Discard') \
                  ON CONFLICT (id) DO NOTHING",
                 &[],
             )
@@ -924,7 +943,7 @@ simulation_test!(
 
         assert_single_branch_row(
             &session,
-            "sql-branch-upsert-nothing",
+            "73716c2d-6272-816e-8368-2d7570736501",
             "Keep",
             false,
             sim.initial_commit_id(),
@@ -948,7 +967,7 @@ simulation_test!(
         let upsert_result = session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('sql-branch-upsert-absent', 'Fresh') \
+                 VALUES ('73716c2d-6272-816e-8368-2d7570736501', 'Fresh') \
                  ON CONFLICT (id) DO UPDATE SET name = excluded.name",
                 &[],
             )
@@ -958,7 +977,7 @@ simulation_test!(
 
         assert_single_branch_row(
             &session,
-            "sql-branch-upsert-absent",
+            "73716c2d-6272-816e-8368-2d7570736501",
             "Fresh",
             false,
             sim.initial_commit_id(),

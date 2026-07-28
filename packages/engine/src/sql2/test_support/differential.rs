@@ -282,7 +282,10 @@ mod tests {
     }
 
     async fn create_probe_branches(session: &crate::SessionContext) {
-        for id in ["branch-a", "branch-b"] {
+        for id in [
+            "01920000-0000-7000-8000-0000000000a1",
+            "01920000-0000-7000-8000-0000000000b1",
+        ] {
             session
                 .create_branch(CreateBranchOptions {
                     id: Some(id.to_string()),

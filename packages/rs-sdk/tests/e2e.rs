@@ -1,8 +1,8 @@
 use lix_sdk::{
     Blob, CallbackTelemetrySink, CompletedTelemetrySpan, CreateBranchOptions,
-    ExecuteBatchStatement, Lix, LixError, Memory, MergeBranchOptions, MergeBranchOutcome,
-    OpenLixOptions, Storage, SwitchBranchOptions, TelemetryValue, Value, open_lix,
-    open_lix_with_telemetry,
+    ExecuteBatchStatement, GLOBAL_BRANCH_ID, Lix, LixError, Memory, MergeBranchOptions,
+    MergeBranchOutcome, OpenLixOptions, Storage, SwitchBranchOptions, TelemetryValue, Value,
+    open_lix, open_lix_with_telemetry,
 };
 #[cfg(feature = "local_filesystem")]
 use lix_sdk::{LocalFilesystem, LocalFilesystemOpenOptions, open_lix_with_storage};
@@ -191,11 +191,12 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
     lix.execute(
         "INSERT INTO lix_file_by_branch \
          (id, path, data, lixcol_global, lixcol_branch_id) \
-         VALUES ($1, $2, $3, true, 'global')",
+         VALUES ($1, $2, $3, true, $4)",
         &[
-            Value::Text("sdk-native-overlap".to_string()),
+            Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
             Value::Text("/native/overlap.bin".to_string()),
             Value::Blob(b"g".to_vec().into()),
+            Value::Text(GLOBAL_BRANCH_ID.to_string()),
         ],
     )
     .await
@@ -205,7 +206,7 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
          (id, path, data, lixcol_branch_id) \
          VALUES ($1, $2, $3, $4)",
         &[
-            Value::Text("sdk-native-overlap".to_string()),
+            Value::Text("01920000-0000-7000-8000-000000000301".to_string()),
             Value::Text("/native/overlap.bin".to_string()),
             Value::Blob(b"l".to_vec().into()),
             Value::Text(active_branch_id.clone()),
@@ -226,15 +227,23 @@ async fn rs_sdk_native_file_upsert_batch_is_atomic_and_updates_active_overlays()
     );
     assert_active_branch_head_parent(&lix, &overlay_batch_parent).await;
     assert_eq!(
-        read_file_by_branch(&lix, "sdk-native-overlap", &active_branch_id)
-            .await
-            .unwrap(),
+        read_file_by_branch(
+            &lix,
+            "01920000-0000-7000-8000-000000000301",
+            &active_branch_id,
+        )
+        .await
+        .unwrap(),
         Some(b"updated".to_vec())
     );
     assert_eq!(
-        read_file_by_branch(&lix, "sdk-native-overlap", "global")
-            .await
-            .unwrap(),
+        read_file_by_branch(
+            &lix,
+            "01920000-0000-7000-8000-000000000301",
+            GLOBAL_BRANCH_ID,
+        )
+        .await
+        .unwrap(),
         Some(b"g".to_vec())
     );
     assert_eq!(
@@ -325,13 +334,13 @@ async fn rs_sdk_open_register_write_query_branch_and_merge_flow() {
 
     let draft = lix
         .create_branch(CreateBranchOptions {
-            id: Some("draft-branch".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000502".to_string()),
             name: "Draft".to_string(),
             from_commit_id: None,
         })
         .await
         .unwrap();
-    assert_eq!(draft.id, "draft-branch");
+    assert_eq!(draft.id, "01920000-0000-7000-8000-000000000502");
     assert_eq!(draft.name, "Draft");
     assert!(!draft.hidden);
 
@@ -1435,7 +1444,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
     lix.execute(
         "INSERT INTO lix_file (id, path, data, lixcol_untracked) VALUES ($1, $2, $3, true)",
         &[
-            Value::Text("file-untracked".to_string()),
+            Value::Text("01920000-0000-7000-8000-000000000503".to_string()),
             Value::Text("/untracked.txt".to_string()),
             Value::Blob(b"untracked".to_vec().into()),
         ],
@@ -1450,7 +1459,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
     lix.execute(
         "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
         &[
-            Value::Text("dir-untracked".to_string()),
+            Value::Text("01920000-0000-7000-8000-000000000512".to_string()),
             Value::Text("/untracked-dir/".to_string()),
         ],
     )

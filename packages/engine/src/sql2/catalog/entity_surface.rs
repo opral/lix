@@ -5,6 +5,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
+use crate::entity_pk::EntityPkComponentType;
 use crate::sql2::history_route::{
     HISTORY_COL_AS_OF_COMMIT_ID, HISTORY_COL_CHANGE_CREATED_AT, HISTORY_COL_CHANGE_ID,
     HISTORY_COL_COMMIT_CREATED_AT, HISTORY_COL_DEPTH, HISTORY_COL_ENTITY_PK, HISTORY_COL_FILE_ID,
@@ -42,6 +43,7 @@ pub(crate) struct EntitySurfaceColumn {
 pub(crate) struct EntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) primary_key_paths: Vec<Vec<String>>,
+    pub(crate) primary_key_component_types: Vec<EntityPkComponentType>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
     pub(crate) defaults: crate::catalog::DefaultPlan,
     /// Whether changing one row can invalidate another row.
@@ -98,6 +100,27 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
         .filter_map(JsonValue::as_str)
         .collect::<BTreeSet<_>>();
     let primary_key_paths = parse_primary_key_paths(schema)?;
+    let primary_key_component_types = primary_key_paths
+        .iter()
+        .map(|path| {
+            let [property] = path.as_slice() else {
+                return EntityPkComponentType::String;
+            };
+            let property = properties
+                .get(property)
+                .expect("validated primary-key property must exist");
+            if property.get("type").and_then(JsonValue::as_str) == Some("integer") {
+                EntityPkComponentType::Integer
+            } else if property.get("format").and_then(JsonValue::as_str) == Some("uuid") {
+                EntityPkComponentType::Uuid
+            } else if property.get("contentEncoding").and_then(JsonValue::as_str) == Some("base64")
+            {
+                EntityPkComponentType::Bytes
+            } else {
+                EntityPkComponentType::String
+            }
+        })
+        .collect();
     let primary_key_roots = primary_key_paths
         .iter()
         .filter_map(|path| path.first())
@@ -140,6 +163,7 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         primary_key_paths,
+        primary_key_component_types,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
         has_inter_row_constraints: ["x-lix-unique", "x-lix-foreign-keys"].into_iter().any(
