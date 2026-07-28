@@ -49,6 +49,19 @@ pub(crate) struct TrackedStateDeltaRef<'a> {
     pub(crate) updated_at: LixTimestamp,
 }
 
+/// Payload-bearing immutable commit member.
+///
+/// Root mutation logic consumes only [`TrackedStateDeltaRef`]. Packed commit
+/// storage additionally requires the complete authoritative payload; there is
+/// no optional/non-authoritative representation.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TrackedStateCommitDeltaRef<'a> {
+    pub(crate) delta: TrackedStateDeltaRef<'a>,
+    pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
+    pub(crate) origin_key: Option<&'a str>,
+}
+
 /// One ordered tracked-root mutation with its insert-collision contract.
 ///
 /// Bulk commit assembly keeps this zero-copy form until it has compared the

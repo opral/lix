@@ -12,24 +12,26 @@ mod store;
 mod test_support;
 mod types;
 
+pub(crate) use codec::decode_change_record;
 #[cfg(test)]
-pub(crate) use codec::encode_commit_record;
-pub(crate) use codec::{decode_change_record, decode_commit_change_ref_chunk};
+pub(crate) use codec::{
+    encode_change_record, encode_commit_record, encode_transaction_change_record,
+};
 pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreWriter};
 pub(crate) use materialization::{
     ChangeRecordProjection, MaterializedChangeIdentity, MaterializedChangePayload,
-    load_change_records, materialize_change_payloads,
+    load_change_records, materialize_known_change_payloads,
 };
 pub(crate) use store::{
-    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_CHANGE_REF_CHUNK_SPACE, COMMIT_SPACE, change_key,
+    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, change_key, commit_change_id_key,
+    commit_key,
 };
 pub(crate) use store::{ChangelogReader, ChangelogWriter};
 #[cfg(feature = "storage-benches")]
 pub(crate) use types::RebuildIndexStats;
 pub(crate) use types::{
     ChangeId, ChangeLoadBatch, ChangeLoadRequest, ChangeRecord, ChangeRecordView, ChangeScanBatch,
-    ChangeScanRequest, ChangelogAppend, CommitChangeRefChunk, CommitChangeRefSet, CommitId,
-    CommitLoadBatch, CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord,
+    ChangeScanRequest, ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitRecord,
     CommitScanBatch, CommitScanRequest, TransactionChangeRecordRef, TransactionChangelogAppend,
     commit_row_snapshot_json,
 };

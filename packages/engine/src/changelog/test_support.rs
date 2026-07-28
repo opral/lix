@@ -1,37 +1,5 @@
-use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, CommitChangeRefSet, CommitId, CommitRecord,
-};
+use crate::changelog::{ChangeId, ChangeRecord};
 use crate::entity_pk::EntityPk;
-use crate::storage_adapter::{Memory, StorageAdapter};
-
-use super::ChangelogContext;
-
-pub(crate) fn changelog_test_context() -> (ChangelogContext, StorageAdapter) {
-    (ChangelogContext::new(), StorageAdapter::new(Memory::new()))
-}
-
-pub(crate) fn test_append() -> ChangelogAppend {
-    ChangelogAppend {
-        commits: vec![test_commit_record()],
-        changes: vec![test_change_record()],
-        commit_change_refs: vec![CommitChangeRefSet {
-            commit_id: CommitId::for_test_label("commit-1"),
-            entries: vec![ChangeId::for_test_label("change-1")],
-        }],
-    }
-}
-
-pub(crate) fn test_commit_record() -> CommitRecord {
-    CommitRecord {
-        format_version: 1,
-        commit_id: CommitId::for_test_label("commit-1"),
-        parent_commit_ids: Vec::new(),
-        tracked_state_rootless: false,
-        change_id: ChangeId::for_test_label("commit-row-change-1"),
-        author_account_ids: vec!["account-1".to_string()],
-        created_at: crate::common::LixTimestamp::expect_parse("created_at", "2026-05-12T00:00:00Z"),
-    }
-}
 
 pub(crate) fn test_change_record() -> ChangeRecord {
     ChangeRecord {

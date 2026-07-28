@@ -1,7 +1,6 @@
 use crate::changelog::CommitId;
 use crate::changelog::{
-    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogReader,
-    ChangelogWriter, CommitChangeRefSet, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitRecord,
 };
 use crate::json_store::{JsonRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 #[cfg(test)]
@@ -9,7 +8,8 @@ use crate::storage_adapter::StorageAdapter;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::storage_adapter::StorageWriteSet;
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef,
+    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef,
 };
 use std::collections::BTreeMap;
 
@@ -215,14 +215,13 @@ pub(crate) async fn stage_tracked_root_from_materialized(
         &commit_change_id,
         &parent_ids,
         rows,
-        &changes,
         false,
     )
     .await?;
-    let deltas = staged
+    let root_deltas = staged
         .change_commit_ids
         .iter()
-        .map(|(row_index, change_commit_id)| {
+        .map(|(row_index, _)| {
             let change = &changes[*row_index];
             let row = &rows[*row_index];
             TrackedStateDeltaRef {
@@ -230,7 +229,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
                 file_id: change.file_id.as_deref(),
                 entity_pk: &change.entity_pk,
                 change_id: change.change_id,
-                commit_id: *change_commit_id,
+                commit_id,
                 deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
@@ -247,15 +246,28 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     // including commits that also receive a durable root. Keep rooted test
     // fixtures faithful to that invariant so deleting a root exercises the
     // same rootless recovery lane as a real repository.
-    let packed_deltas = deltas
+    let commit_deltas = staged
+        .change_commit_ids
         .iter()
-        .copied()
-        .filter(|delta| delta.commit_id == commit_id)
+        .zip(root_deltas.iter().copied())
+        .map(|((row_index, _), delta)| {
+            let change = &changes[*row_index];
+            TrackedStateCommitDeltaRef {
+                delta,
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+                origin_key: change.origin_key.as_deref(),
+            }
+        })
         .collect::<Vec<_>>();
-    crate::tracked_state::stage_commit_deltas(writes, &packed_deltas)?;
+    stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     tracked_state
         .writer(read, writes)
-        .stage_commit_root(&commit_id_text, parent_commit_id_text.as_deref(), deltas)
+        .stage_commit_root(
+            &commit_id_text,
+            parent_commit_id_text.as_deref(),
+            root_deltas,
+        )
         .await?;
     Ok(())
 }
@@ -284,14 +296,13 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
         &format!("{commit_id_text}:commit"),
         &parent_id_texts,
         rows,
-        &changes,
         true,
     )
     .await?;
-    let deltas = staged
+    let root_deltas = staged
         .change_commit_ids
         .iter()
-        .map(|(row_index, change_commit_id)| {
+        .map(|(row_index, _)| {
             let change = &changes[*row_index];
             let row = &rows[*row_index];
             TrackedStateDeltaRef {
@@ -299,7 +310,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 file_id: change.file_id.as_deref(),
                 entity_pk: &change.entity_pk,
                 change_id: change.change_id,
-                commit_id: *change_commit_id,
+                commit_id,
                 deleted: change.snapshot.is_none(),
                 created_at: crate::common::LixTimestamp::expect_parse(
                     "created_at",
@@ -312,7 +323,21 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
             }
         })
         .collect::<Vec<_>>();
-    crate::tracked_state::stage_commit_deltas(writes, &deltas)
+    let commit_deltas = staged
+        .change_commit_ids
+        .iter()
+        .zip(root_deltas.iter().copied())
+        .map(|((row_index, _), delta)| {
+            let change = &changes[*row_index];
+            TrackedStateCommitDeltaRef {
+                delta,
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+                origin_key: change.origin_key.as_deref(),
+            }
+        })
+        .collect::<Vec<_>>();
+    stage_test_commit_deltas_by_owner(writes, &commit_deltas)
 }
 
 #[cfg(test)]
@@ -344,11 +369,10 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
         &commit_change_id,
         &parent_id_texts,
         rows,
-        &changes,
         false,
     )
     .await?;
-    let deltas = staged
+    let root_deltas = staged
         .change_commit_ids
         .iter()
         .map(|(row_index, change_commit_id)| {
@@ -372,20 +396,44 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             }
         })
         .collect::<Vec<_>>();
-    let packed_deltas = deltas
+    let commit_deltas = staged
+        .change_commit_ids
         .iter()
-        .copied()
-        .filter(|delta| delta.commit_id == commit_id)
+        .zip(root_deltas.iter().copied())
+        .map(|((row_index, _), delta)| {
+            let change = &changes[*row_index];
+            TrackedStateCommitDeltaRef {
+                delta,
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+                origin_key: change.origin_key.as_deref(),
+            }
+        })
         .collect::<Vec<_>>();
-    crate::tracked_state::stage_commit_deltas(writes, &packed_deltas)?;
+    stage_test_commit_deltas_by_owner(writes, &commit_deltas)?;
     tracked_state
         .writer(read, writes)
         .stage_commit_root(
             &commit_id_text,
             commit_root_parent_commit_id_text.as_deref(),
-            deltas,
+            root_deltas,
         )
         .await?;
+    Ok(())
+}
+
+fn stage_test_commit_deltas_by_owner(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+) -> Result<(), crate::LixError> {
+    let mut by_owner = BTreeMap::<CommitId, Vec<TrackedStateCommitDeltaRef<'_>>>::new();
+    for delta in deltas {
+        let owner = delta.delta.commit_id;
+        by_owner.entry(owner).or_default().push(*delta);
+    }
+    for owner_deltas in by_owner.values() {
+        crate::tracked_state::stage_commit_deltas(writes, owner_deltas)?;
+    }
     Ok(())
 }
 
@@ -409,7 +457,6 @@ pub(crate) async fn stage_empty_changelog_commit(
         &commit_id_text,
         &commit_change_id,
         &parent_ids,
-        &[],
         &[],
         false,
     )
@@ -437,7 +484,6 @@ pub(crate) async fn stage_empty_changelog_commit_with_parents(
         &commit_change_id,
         &parent_id_texts,
         &[],
-        &[],
         false,
     )
     .await?;
@@ -451,7 +497,6 @@ async fn stage_test_changelog_commit(
     commit_change_id: &str,
     parent_ids: &[String],
     rows: &[MaterializedTrackedStateRow],
-    changes: &[ChangeRecord],
     tracked_state_rootless: bool,
 ) -> Result<TestStagedChangelogCommit, crate::LixError> {
     let typed_commit_id = test_commit_id(commit_id);
@@ -461,28 +506,17 @@ async fn stage_test_changelog_commit(
         .collect::<Vec<_>>();
     let typed_commit_change_id = test_change_id(commit_change_id);
     let winner_indices = final_state_row_winner_indices(rows)?;
-    let winner_change_ids = winner_indices
-        .iter()
-        .map(|&index| changes[index].change_id)
-        .collect::<Vec<_>>();
-    let existing_change_ids = load_existing_changelog_change_ids(read, &winner_change_ids).await?;
     let mut append = ChangelogAppend::default();
-    let mut refs = Vec::new();
     let mut change_commit_ids = Vec::new();
     let mut json_payloads = Vec::new();
     let mut seen_json_refs = std::collections::BTreeSet::new();
     for &row_index in &winner_indices {
         let row = &rows[row_index];
-        let change = &changes[row_index];
-        if !existing_change_ids.contains(&change.change_id) {
-            for (json_ref, payload) in json_payloads_from_materialized(row) {
-                if seen_json_refs.insert(json_ref.as_hash_bytes().to_vec()) {
-                    json_payloads.push((json_ref, payload));
-                }
+        for (json_ref, payload) in json_payloads_from_materialized(row) {
+            if seen_json_refs.insert(json_ref.as_hash_bytes().to_vec()) {
+                json_payloads.push((json_ref, payload));
             }
-            append.changes.push(change.clone());
         }
-        refs.push(commit_change_ref_from_change(change));
         change_commit_ids.push((row_index, row.commit_id));
     }
     stage_json_payloads(writes, &json_payloads)?;
@@ -499,10 +533,6 @@ async fn stage_test_changelog_commit(
         author_account_ids: Vec::new(),
         created_at,
     });
-    append.commit_change_refs.push(CommitChangeRefSet {
-        commit_id: typed_commit_id,
-        entries: refs,
-    });
     let mut writer = ChangelogContext::new().writer(&mut read, writes);
     writer.stage_append(append).await?;
     change_commit_ids.sort_by_key(|(row_index, _)| *row_index);
@@ -511,29 +541,6 @@ async fn stage_test_changelog_commit(
 
 struct TestStagedChangelogCommit {
     change_commit_ids: Vec<(usize, CommitId)>,
-}
-
-async fn load_existing_changelog_change_ids(
-    read: &mut (impl StorageAdapterRead + ?Sized),
-    change_ids: &[ChangeId],
-) -> Result<std::collections::BTreeSet<ChangeId>, crate::LixError> {
-    if change_ids.is_empty() {
-        return Ok(std::collections::BTreeSet::new());
-    }
-    let mut unique = change_ids.to_vec();
-    unique.sort();
-    unique.dedup();
-    let mut reader = ChangelogContext::new().reader(&mut *read);
-    let batch = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: &unique,
-        })
-        .await?;
-    Ok(unique
-        .into_iter()
-        .zip(batch.entries)
-        .filter_map(|(change_id, entry)| entry.map(|_| change_id))
-        .collect())
 }
 
 #[expect(clippy::unnecessary_wraps)]
@@ -589,10 +596,6 @@ fn stage_json_payloads(
         payloads,
     )?;
     Ok(())
-}
-
-fn commit_change_ref_from_change(change: &ChangeRecord) -> ChangeId {
-    change.change_id
 }
 
 #[expect(clippy::unnecessary_wraps)]

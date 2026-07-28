@@ -24,13 +24,13 @@ mod conformance;
 pub use crate::storage::{
     BufferRange, CoreProjection as StorageCoreProjection, EncodedMutationBatch, EncodedPut,
     GetManyRequest as StorageGetManyRequest, GetManyResult as StorageGetManyResult,
-    GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange, Memory,
-    MemoryRead, MemoryWrite, Precondition as StoragePrecondition, Prefix as StoragePrefix,
-    ProjectedValue as StorageProjectedValue, ReadDurability as StorageReadDurability,
-    ReadEntry as StorageReadEntry, ReadOptions as StorageReadOptions,
-    ScanChunk as StorageScanChunk, ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId,
-    Storage, StorageError, StorageRead, StoredValue as StorageValue,
-    WriteOptions as StorageWriteOptions,
+    GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange,
+    MAX_SCAN_PAGE_ROWS, Memory, MemoryRead, MemoryWrite, Precondition as StoragePrecondition,
+    Prefix as StoragePrefix, ProjectedValue as StorageProjectedValue,
+    ReadDurability as StorageReadDurability, ReadEntry as StorageReadEntry,
+    ReadOptions as StorageReadOptions, ScanChunk as StorageScanChunk,
+    ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId, Storage, StorageError,
+    StorageRead, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
 };
 
 pub use context::StorageAdapter;

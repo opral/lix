@@ -14,8 +14,7 @@ use std::ops::Range;
 
 use crate::changelog::{ChangeId, ChangeRecordProjection};
 use crate::changelog::{
-    ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection,
+    ChangeRecord, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest,
 };
 use crate::common::SharedStr;
 use crate::entity_pk::{EntityPk, EntityPkComponent};
@@ -961,7 +960,7 @@ pub(crate) struct TrackedStateStoreReader<S> {
 }
 
 struct DiffCommitRootValidationCache {
-    commit_ref_winners: HashMap<String, HashMap<TrackedStateIdentity, ChangeId>>,
+    commit_delta_winners: HashMap<String, HashMap<TrackedStateIdentity, ChangeId>>,
     commit_root_metadata: HashMap<String, TrackedStateCommitRoot>,
     commit_roots: HashMap<String, TrackedStateRootId>,
     tree_values: HashMap<(TrackedStateRootId, TrackedStateKey), Option<TrackedStateIndexValue>>,
@@ -978,7 +977,7 @@ struct PointReplayCommit {
 impl DiffCommitRootValidationCache {
     fn new() -> Self {
         Self {
-            commit_ref_winners: HashMap::new(),
+            commit_delta_winners: HashMap::new(),
             commit_root_metadata: HashMap::new(),
             commit_roots: HashMap::new(),
             tree_values: HashMap::new(),
@@ -1233,10 +1232,8 @@ where
         &mut self,
         batch: &TrackedStateTreeDiffBatch,
     ) -> Result<TrackedStatePayloadBatch, LixError> {
-        let changes = self.load_diff_changes(batch.change_ids().collect()).await?;
-        for row in batch.side_rows() {
-            validate_tree_diff_row_against_changelog(row, &changes)?;
-        }
+        let rows = batch.side_rows().collect::<Vec<_>>();
+        let changes = self.load_routed_tree_diff_changes(&rows).await?;
         TrackedStatePayloadBatch::from_payloads(
             changes
                 .into_iter()
@@ -1248,42 +1245,7 @@ where
         &mut self,
         rows: &[&TrackedStateDiffRow],
     ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
-        let changes = self
-            .load_diff_changes(rows.iter().map(|row| row.change_id).collect())
-            .await?;
-        for row in rows {
-            validate_diff_row_against_changelog(row, &changes)?;
-        }
-        Ok(changes)
-    }
-
-    async fn load_diff_changes(
-        &mut self,
-        mut change_ids: Vec<ChangeId>,
-    ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
-        if change_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        change_ids.sort();
-        change_ids.dedup();
-
-        let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
-        let loaded_changes = changelog_reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &change_ids,
-            })
-            .await?;
-        let mut changes = HashMap::new();
-        for (change_id, loaded) in change_ids.into_iter().zip(loaded_changes.entries) {
-            let Some(change) = loaded else {
-                return Err(LixError::unknown(format!(
-                    "tracked-state diff row references missing changelog change '{change_id}'"
-                )));
-            };
-            changes.insert(change_id, change);
-        }
-        Ok(changes)
+        self.load_routed_diff_changes(rows).await
     }
 
     async fn validate_diff_row_commit_root_membership(
@@ -1316,7 +1278,7 @@ where
             }
 
             let winner_change_id = self
-                .load_cached_commit_ref_winner(&current_commit_id, winner_identity, cache)
+                .load_cached_commit_delta_winner(&current_commit_id, winner_identity, cache)
                 .await?;
             if let Some(winner_change_id) = winner_change_id {
                 if winner_change_id == row.change_id {
@@ -1444,97 +1406,77 @@ where
         Ok(None)
     }
 
-    async fn load_cached_commit_ref_winners(
+    async fn load_cached_commit_delta_winners(
         &mut self,
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<HashMap<TrackedStateIdentity, ChangeId>, LixError> {
-        self.ensure_cached_commit_ref_winners(commit_id, cache)
+        self.ensure_cached_commit_delta_winners(commit_id, cache)
             .await?;
         Ok(cache
-            .commit_ref_winners
+            .commit_delta_winners
             .get(commit_id)
             .cloned()
-            .expect("commit-ref winners should be cached after loading"))
+            .expect("commit-delta winners should be cached after loading"))
     }
 
-    async fn load_cached_commit_ref_winner(
+    async fn load_cached_commit_delta_winner(
         &mut self,
         commit_id: &str,
         identity: &TrackedStateIdentity,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<Option<ChangeId>, LixError> {
-        self.ensure_cached_commit_ref_winners(commit_id, cache)
+        self.ensure_cached_commit_delta_winners(commit_id, cache)
             .await?;
         Ok(cache
-            .commit_ref_winners
+            .commit_delta_winners
             .get(commit_id)
             .and_then(|winners| winners.get(identity))
             .copied())
     }
 
-    async fn ensure_cached_commit_ref_winners(
+    async fn ensure_cached_commit_delta_winners(
         &mut self,
         commit_id: &str,
         cache: &mut DiffCommitRootValidationCache,
     ) -> Result<(), LixError> {
-        if cache.commit_ref_winners.contains_key(commit_id) {
+        if cache.commit_delta_winners.contains_key(commit_id) {
             return Ok(());
         }
-        let commit_ids = [CommitId::parse_lix(
-            commit_id,
-            "commit-ref winner commit_id",
-        )?];
+        let commit_id_typed = CommitId::parse_lix(commit_id, "commit-delta winner commit_id")?;
         let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
-                commit_ids: &commit_ids,
-                projection: CommitProjection::Full,
+                commit_ids: &[commit_id_typed],
             })
             .await?;
-        let Some(entry) = batch.entries.into_iter().next().flatten() else {
+        let Some(_) = batch.entries.into_iter().next().flatten() else {
             return Err(LixError::unknown(format!(
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root rows"
             )));
         };
-        let CommitLoadEntry::Full {
-            change_ref_chunks: chunks,
-            ..
-        } = entry
-        else {
-            return Err(LixError::unknown(format!(
-                "changelog commit '{commit_id}' did not return full commit"
-            )));
-        };
         let mut winners = HashMap::new();
-        // Ref chunks carry change ids only; row identities live in the
-        // change records, batch point-read here.
-        let change_ids = chunks
-            .into_iter()
-            .flat_map(|chunk| chunk.entries)
-            .collect::<Vec<_>>();
-        let changes = changelog_reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &change_ids,
-            })
-            .await?;
-        for (change_id, change) in change_ids.iter().zip(changes.entries) {
-            let Some(change) = change else {
-                return Err(LixError::unknown(format!(
-                    "changelog commit '{commit_id}' references change '{change_id}' that is missing from the changelog"
-                )));
-            };
-            winners.insert(
-                TrackedStateIdentity {
-                    schema_key: change.schema_key,
-                    file_id: change.file_id,
-                    entity_pk: change.entity_pk,
-                },
-                *change_id,
-            );
+        for (key, value) in storage::scan_commit_delta_members(&self.store, commit_id_typed).await?
+        {
+            if winners
+                .insert(
+                    TrackedStateIdentity {
+                        schema_key: key.schema_key,
+                        file_id: key.file_id,
+                        entity_pk: key.entity_pk,
+                    },
+                    value.change_id,
+                )
+                .is_some()
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("commit-delta '{commit_id}' contains duplicate tracked identities"),
+                ));
+            }
         }
         cache
-            .commit_ref_winners
+            .commit_delta_winners
             .insert(commit_id.to_string(), winners);
         Ok(())
     }
@@ -1610,7 +1552,6 @@ where
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
                 commit_ids: &commit_ids,
-                projection: CommitProjection::Record,
             })
             .await?;
         let Some(entry) = batch.entries.into_iter().next().flatten() else {
@@ -1618,11 +1559,7 @@ where
                 "changelog commit '{commit_id}' is missing while validating tracked-state commit-root metadata"
             )));
         };
-        let CommitLoadEntry::Record(record) = entry else {
-            return Err(LixError::unknown(format!(
-                "changelog commit '{commit_id}' did not return a commit record"
-            )));
-        };
+        let record = entry;
         let parent_id = record.parent_commit_ids.first().copied();
         cache
             .changelog_first_parents
@@ -1688,11 +1625,9 @@ where
         let batch = changelog_reader
             .load_commits(CommitLoadRequest {
                 commit_ids: &commit_ids,
-                projection: CommitProjection::Record,
             })
             .await?;
-        let Some(CommitLoadEntry::Record(commit)) = batch.entries.into_iter().next().flatten()
-        else {
+        let Some(commit) = batch.entries.into_iter().next().flatten() else {
             return Ok(None);
         };
         for parent_id in commit.parent_commit_ids.iter().skip(1) {
@@ -1794,9 +1729,11 @@ where
             .collect::<HashMap<_, _>>();
         let mut cache = DiffCommitRootValidationCache::new();
         let winners = self
-            .load_cached_commit_ref_winners(commit_id, &mut cache)
+            .load_cached_commit_delta_winners(commit_id, &mut cache)
             .await?;
-        let file_delete_cascades = self.load_file_delete_cascade_winners(&winners).await?;
+        let file_delete_cascades = self
+            .load_file_delete_cascade_winners(&winners, &row_map)
+            .await?;
         for (identity, change_id) in &winners {
             if !tracked_state_identity_matches_tree_request(identity, request) {
                 continue;
@@ -1858,6 +1795,7 @@ where
     async fn load_file_delete_cascade_winners(
         &mut self,
         winners: &HashMap<TrackedStateIdentity, ChangeId>,
+        row_map: &HashMap<TrackedStateIdentity, &TrackedStateIndexValue>,
     ) -> Result<HashMap<String, ChangeId>, LixError> {
         let mut candidates = winners
             .iter()
@@ -1865,31 +1803,57 @@ where
                 if identity.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || identity.file_id.is_some() {
                     return None;
                 }
-                Some((identity.entity_pk.as_single_string_owned(), *change_id))
+                let value = row_map.get(identity)?;
+                Some((
+                    identity.entity_pk.as_single_string_owned(),
+                    *change_id,
+                    value.commit_id,
+                    TrackedStateKey {
+                        schema_key: identity.schema_key.clone(),
+                        file_id: identity.file_id.clone(),
+                        entity_pk: identity.entity_pk.clone(),
+                    },
+                ))
             })
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(HashMap::new());
         }
-        candidates.sort_by_key(|(_, change_id)| *change_id);
-        let change_ids = candidates
-            .iter()
-            .map(|(_, change_id)| *change_id)
-            .collect::<Vec<_>>();
-        let mut changelog_reader = ChangelogContext::new().reader(&mut self.store);
-        let changes = changelog_reader
-            .load_changes(ChangeLoadRequest {
-                change_ids: &change_ids,
-            })
-            .await?;
+        candidates.sort_by_key(|(_, change_id, _, _)| *change_id);
+        let mut changes = vec![None; candidates.len()];
+        let mut by_owner = BTreeMap::<CommitId, Vec<(usize, TrackedStateKey)>>::new();
+        for (index, (_, _, owner_commit_id, key)) in candidates.iter().enumerate() {
+            by_owner
+                .entry(*owner_commit_id)
+                .or_default()
+                .push((index, key.clone()));
+        }
+        for (owner_commit_id, requests) in by_owner {
+            let keys = requests
+                .iter()
+                .map(|(_, key)| key.clone())
+                .collect::<Vec<_>>();
+            let loaded =
+                storage::load_commit_delta_change_records(&self.store, owner_commit_id, &keys)
+                    .await?;
+            for ((index, _), change) in requests.into_iter().zip(loaded) {
+                changes[index] = change;
+            }
+        }
         let mut cascades = HashMap::new();
-        for ((file_id, change_id), change) in candidates.into_iter().zip(changes.entries) {
+        for ((file_id, change_id, _, _), change) in candidates.into_iter().zip(changes) {
             let file_id = file_id?;
             let Some(change) = change else {
                 return Err(LixError::unknown(format!(
-                    "file descriptor winner references missing changelog change '{change_id}'"
+                    "file descriptor winner references missing packed change '{change_id}'"
                 )));
             };
+            if change.change_id != change_id {
+                return Err(LixError::unknown(format!(
+                    "file descriptor winner expects change '{change_id}' but packed authority stores '{}'",
+                    change.change_id
+                )));
+            }
             if change.snapshot.is_none() {
                 cascades.insert(file_id, change_id);
             }
@@ -1909,6 +1873,164 @@ where
                 .into_iter()
                 .map(|(change_id, record)| (change_id, record.snapshot, record.metadata)),
         )
+    }
+
+    /// Loads diff payloads by the physical commit and exact identity already
+    /// carried by endpoint index rows.
+    ///
+    /// Packed tracked changes intentionally do not have one global storage key
+    /// per change id. Routing through their owning commit avoids scanning every
+    /// changelog and commit-delta segment for a sparse diff.
+    async fn load_routed_diff_changes(
+        &mut self,
+        rows: &[&TrackedStateDiffRow],
+    ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
+        let mut by_commit = BTreeMap::<CommitId, Vec<&TrackedStateDiffRow>>::new();
+        for row in rows.iter().copied() {
+            by_commit.entry(row.commit_id).or_default().push(row);
+        }
+        let mut records = HashMap::<ChangeId, ChangeRecord>::new();
+        for (commit_id, commit_rows) in by_commit {
+            let keys = commit_rows
+                .iter()
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key().to_owned(),
+                    file_id: row.file_id().map(str::to_owned),
+                    entity_pk: row.entity_pk().clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut loaded =
+                storage::load_commit_delta_change_records(&self.store, commit_id, &keys).await?;
+            let fallback_rows = commit_rows
+                .iter()
+                .zip(&loaded)
+                .filter_map(|(row, record)| {
+                    (record.is_none() && row.deleted)
+                        .then(|| row.file_id())
+                        .flatten()
+                        .map(cascade_payload_key)
+                })
+                .collect::<Vec<_>>();
+            if !fallback_rows.is_empty() {
+                let fallbacks = storage::load_commit_delta_change_records(
+                    &self.store,
+                    commit_id,
+                    &fallback_rows,
+                )
+                .await?;
+                let mut fallbacks = fallbacks.into_iter();
+                for (row, record) in commit_rows.iter().zip(&mut loaded) {
+                    if record.is_none() && row.deleted && row.file_id().is_some() {
+                        *record = fallbacks
+                            .next()
+                            .expect("one fallback was loaded per missing file-scoped tombstone");
+                    }
+                }
+            }
+            for (row, record) in commit_rows.into_iter().zip(loaded) {
+                let record = record.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state endpoint row '{}' has no authoritative payload in commit '{}'",
+                            row.change_id, commit_id
+                        ),
+                    )
+                })?;
+                if record.change_id != row.change_id {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state endpoint row '{}' resolves to payload '{}'",
+                            row.change_id, record.change_id
+                        ),
+                    ));
+                }
+                records.insert(record.change_id, record);
+            }
+        }
+        for row in rows {
+            if !row.deleted {
+                validate_diff_row_against_changelog(row, &records)?;
+            }
+        }
+        Ok(records)
+    }
+
+    async fn load_routed_tree_diff_changes(
+        &mut self,
+        rows: &[TrackedStateTreeDiffRowRef<'_>],
+    ) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
+        let mut by_commit = BTreeMap::<CommitId, Vec<TrackedStateTreeDiffRowRef<'_>>>::new();
+        for row in rows.iter().copied() {
+            by_commit.entry(row.commit_id()).or_default().push(row);
+        }
+        let mut records = HashMap::<ChangeId, ChangeRecord>::new();
+        for (commit_id, commit_rows) in by_commit {
+            let keys = commit_rows
+                .iter()
+                .map(|row| TrackedStateKey {
+                    schema_key: row.schema_key().to_owned(),
+                    file_id: row.file_id().map(str::to_owned),
+                    entity_pk: row.entity_pk().clone(),
+                })
+                .collect::<Vec<_>>();
+            let mut loaded =
+                storage::load_commit_delta_change_records(&self.store, commit_id, &keys).await?;
+            let fallback_rows = commit_rows
+                .iter()
+                .zip(&loaded)
+                .filter_map(|(row, record)| {
+                    (record.is_none() && row.deleted())
+                        .then(|| row.file_id())
+                        .flatten()
+                        .map(cascade_payload_key)
+                })
+                .collect::<Vec<_>>();
+            if !fallback_rows.is_empty() {
+                let fallbacks = storage::load_commit_delta_change_records(
+                    &self.store,
+                    commit_id,
+                    &fallback_rows,
+                )
+                .await?;
+                let mut fallbacks = fallbacks.into_iter();
+                for (row, record) in commit_rows.iter().zip(&mut loaded) {
+                    if record.is_none() && row.deleted() && row.file_id().is_some() {
+                        *record = fallbacks
+                            .next()
+                            .expect("one fallback was loaded per missing file-scoped tombstone");
+                    }
+                }
+            }
+            for (row, record) in commit_rows.into_iter().zip(loaded) {
+                let record = record.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state diff row '{}' has no authoritative payload in commit '{}'",
+                            row.change_id(),
+                            commit_id
+                        ),
+                    )
+                })?;
+                if let Some(existing) = records.insert(record.change_id, record.clone())
+                    && existing != record
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked-state diff change '{}' resolves to conflicting packed payloads",
+                            row.change_id()
+                        ),
+                    ));
+                }
+            }
+        }
+        for row in rows.iter().copied() {
+            validate_tree_diff_row_against_changelog(row, &records)?;
+        }
+        Ok(records)
     }
 
     pub(crate) async fn diff_tree_entries_at_commits(
@@ -2701,17 +2823,10 @@ where
             let batch = reader
                 .load_commits(CommitLoadRequest {
                     commit_ids: &[commit_id],
-                    projection: CommitProjection::Record,
                 })
                 .await?;
             match batch.entries.into_iter().next().flatten() {
-                Some(CommitLoadEntry::Record(record)) => record,
-                Some(CommitLoadEntry::Full { .. }) => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "changelog returned a full commit load for tracked-state point replay",
-                    ));
-                }
+                Some(record) => record,
                 None => {
                     return Err(LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -3699,6 +3814,15 @@ fn tracked_state_winner_identity_for_diff_row(
         row.change_id,
         change,
     )
+}
+
+fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
+    TrackedStateKey {
+        schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
+        file_id: None,
+        entity_pk: EntityPk::uuid_from_canonical(file_id)
+            .unwrap_or_else(|_| EntityPk::single(file_id)),
+    }
 }
 
 fn tracked_state_winner_identity_for_diff_parts(
@@ -6112,7 +6236,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_change_record_for_live_row_errors_clearly() {
+    async fn missing_packed_authority_for_live_row_errors_clearly() {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let row = row("entity-a", "change-a", "commit-1");
@@ -6126,15 +6250,26 @@ mod tests {
         .await
         .expect("root should write");
 
-        // Violate the GC contract: delete the change record while a live
-        // tree row still references its change id.
+        // Violate the GC contract: delete the owning packed commit delta while
+        // a live tree row still references its change id.
+        let commit_id = CommitId::for_test_label("commit-1");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("inventory read should open");
+        let inventory = storage::scan_commit_delta_inventory(&read)
+            .await
+            .expect("packed inventory should load");
         let mut writes = storage.new_write_set();
-        writes.delete(
-            crate::changelog::CHANGE_SPACE,
-            crate::storage_adapter::StorageKey(Bytes::from(crate::changelog::change_key(
-                row.change_id,
-            ))),
-        );
+        storage::stage_delete_commit_delta_inventory_entry(
+            &mut writes,
+            commit_id,
+            inventory
+                .commits
+                .get(&commit_id)
+                .expect("fixture commit should have packed authority"),
+        )
+        .expect("packed authority deletion should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -6149,9 +6284,9 @@ mod tests {
         let error = reader
             .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
-            .expect_err("materialization must reject a dangling change id");
+            .expect_err("materialization must reject missing packed authority");
         assert!(
-            error.message.contains("missing from the changelog"),
+            error.message.contains("missing from owning commit"),
             "unexpected error: {error}"
         );
     }
@@ -6503,23 +6638,6 @@ mod tests {
             .expect("rootless commit should commit");
     }
 
-    async fn overwrite_rootless_commit_deltas_for_test(
-        storage: &StorageAdapter,
-        rows: &[MaterializedTrackedStateRow],
-    ) {
-        let deltas = rows
-            .iter()
-            .map(delta_from_materialized_row)
-            .collect::<Vec<_>>();
-        let mut writes = storage.new_write_set();
-        storage::stage_commit_deltas(&mut writes, &deltas)
-            .expect("replacement rootless deltas should stage");
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("replacement rootless deltas should commit");
-    }
-
     #[tokio::test]
     async fn large_rootless_exact_batch_uses_encoded_replay_and_preserves_input_slots() {
         const COMMIT_ID: &str = "rootless-bulk-exact";
@@ -6661,87 +6779,6 @@ mod tests {
                 .expect("root probe should succeed")
                 .is_none(),
             "flat replay must not rebuild or consult a head tree"
-        );
-    }
-
-    #[tokio::test]
-    async fn rootless_diff_rejects_packed_delta_identity_mismatch() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_for_test(&storage, &tracked_state, "base", None, &[])
-            .await
-            .expect("base root should write");
-
-        let authoritative = row("authoritative", "rootless-change", "rootless");
-        write_rootless_commit_for_test(
-            &storage,
-            "rootless",
-            "base",
-            std::slice::from_ref(&authoritative),
-        )
-        .await;
-
-        // Keep the legitimate ChangeRecord id but forge the independently
-        // stored packed-delta identity. Rootless diff must bind the two before
-        // exposing the row or handing its payload to merge.
-        let mut forged = authoritative;
-        forged.entity_pk = EntityPk::single("forged");
-        overwrite_rootless_commit_deltas_for_test(&storage, std::slice::from_ref(&forged)).await;
-
-        let error = tracked_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("diff read should open"),
-            )
-            .diff_commits("base", "rootless", &test_schema_diff_request())
-            .await
-            .expect_err("packed-delta identity mismatch must fail");
-        assert!(
-            error
-                .message
-                .contains("does not match changelog change identity"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[tokio::test]
-    async fn rootless_diff_rejects_packed_delta_missing_change() {
-        let storage = StorageAdapter::new(Memory::new());
-        let tracked_state = TrackedStateContext::new();
-        write_root_for_test(&storage, &tracked_state, "base", None, &[])
-            .await
-            .expect("base root should write");
-
-        let authoritative = row("entity", "rootless-change", "rootless");
-        write_rootless_commit_for_test(
-            &storage,
-            "rootless",
-            "base",
-            std::slice::from_ref(&authoritative),
-        )
-        .await;
-
-        let mut forged = authoritative;
-        forged.change_id = ChangeId::for_test_label("missing-rootless-change");
-        overwrite_rootless_commit_deltas_for_test(&storage, std::slice::from_ref(&forged)).await;
-
-        let error = tracked_state
-            .reader(
-                storage
-                    .begin_read(StorageReadOptions::default())
-                    .await
-                    .expect("diff read should open"),
-            )
-            .diff_commits("base", "rootless", &test_schema_diff_request())
-            .await
-            .expect_err("missing packed-delta ChangeRecord must fail");
-        assert!(
-            error
-                .message
-                .contains("references missing changelog change"),
-            "unexpected error: {error}"
         );
     }
 

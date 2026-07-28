@@ -234,7 +234,6 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::binary_cas::kv::BINARY_CAS_CHUNK_SPACE,
         crate::changelog::COMMIT_SPACE,
         crate::changelog::CHANGE_SPACE,
-        crate::changelog::COMMIT_CHANGE_REF_CHUNK_SPACE,
         crate::changelog::COMMIT_CHANGE_ID_SPACE,
     ]
 }

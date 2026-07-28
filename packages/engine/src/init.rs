@@ -7,8 +7,8 @@ use crate::branch::{
     stage_branch_head_control,
 };
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet,
-    CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
+    CommitRecord,
 };
 use crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY;
 use crate::common::LixTimestamp;
@@ -28,7 +28,7 @@ use crate::storage_adapter::{
     StorageAdapter, StorageGetOptions, StorageKey, StorageProjectedValue, StorageSpace,
     StorageSpaceId, StorageWriteSet,
 };
-use crate::tracked_state::{TrackedStateContext, TrackedStateDeltaRef};
+use crate::tracked_state::{TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef};
 use bytes::Bytes;
 use serde_json::json;
 
@@ -39,14 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V17 combines the branch-control schema-presence summary with ordered raw
-/// UUID entity-key components in the hot current-state index and tracked-state
-/// trees. Opening an older store must fail closed rather than mixing either
-/// physical contract.
+/// V18 makes packed commit deltas the sole tracked commit-membership and
+/// payload authority. Opening an older store must fail closed rather than
+/// mixing the retired changelog ref layout with this physical contract.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v17";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-commit-authority.v18";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -333,16 +332,12 @@ where
         &mut read,
         &mut writes,
         &plan,
-        authored_changes
-            .iter()
-            .chain(&branch_ref_ledger_changes)
-            .cloned()
-            .collect(),
+        branch_ref_ledger_changes.clone(),
     )
     .await?;
 
     {
-        let deltas = authored_changes
+        let root_deltas = authored_changes
             .iter()
             .map(|change| TrackedStateDeltaRef {
                 schema_key: &change.schema_key,
@@ -355,9 +350,20 @@ where
                 updated_at: change.created_at,
             })
             .collect::<Vec<_>>();
+        let commit_deltas = authored_changes
+            .iter()
+            .zip(root_deltas.iter().copied())
+            .map(|(change, delta)| TrackedStateCommitDeltaRef {
+                delta,
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+                origin_key: change.origin_key.as_deref(),
+            })
+            .collect::<Vec<_>>();
+        crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
         tracked_state
             .writer(&read, &mut writes)
-            .stage_commit_root(&receipt.initial_commit_id, None, deltas)
+            .stage_commit_root(&receipt.initial_commit_id, None, root_deltas)
             .await?;
 
         // Seed both visible branches with a complete hot current-state generation.
@@ -541,16 +547,11 @@ async fn stage_init_changelog_commit(
         author_account_ids: plan.commit.author_account_ids.clone(),
         created_at: plan.commit.created_at,
     };
-    let commit_change_refs = CommitChangeRefSet {
-        commit_id: plan.commit.id,
-        entries: plan.changes.iter().map(|change| change.id).collect(),
-    };
     let mut writer = ChangelogContext::new().writer(read, writes);
     writer
         .stage_append(ChangelogAppend {
             commits: vec![commit],
             changes,
-            commit_change_refs: vec![commit_change_refs],
         })
         .await
 }
@@ -814,46 +815,57 @@ mod tests {
         let commits = reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &[CommitId::for_test_label(&receipt.initial_commit_id)],
-                projection: crate::changelog::CommitProjection::Full,
             })
             .await
             .expect("commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Full {
-            record,
-            change_ref_chunks,
-        }) = commits.entries.into_iter().next().flatten()
-        else {
+        let Some(record) = commits.entries.into_iter().next().flatten() else {
             panic!("initial commit should exist");
         };
 
         assert_eq!(record.commit_id, receipt.initial_commit_id);
         let commit_change_id = record.change_id.clone();
-        let change_refs = change_ref_chunks
-            .iter()
-            .flat_map(|chunk| chunk.entries.iter())
-            .collect::<Vec<_>>();
+        let membership_read = storage
+            .begin_read(crate::storage_adapter::StorageReadOptions::default())
+            .await
+            .expect("membership read should open");
+        let change_refs =
+            crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
+                .await
+                .expect("initial commit membership should load");
         assert_eq!(change_refs.len(), seed_schema_definitions().len() + 4);
         assert!(
             !change_refs
                 .iter()
-                .any(|change_id| **change_id == record.change_id),
-            "initial commit row is derived from changelog.commit, not stored in commit refs"
+                .any(|change_id| *change_id == record.change_id),
+            "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 
-        let sampled_change_id = *change_refs
+        let sampled_change_id = change_refs
             .first()
             .copied()
             .expect("initial commit should reference at least one change");
+        let packed_members = crate::tracked_state::load_commit_delta_members_with_payloads(
+            &membership_read,
+            record.commit_id,
+        )
+        .await
+        .expect("packed initial commit payloads should load");
+        assert!(
+            packed_members
+                .iter()
+                .any(|member| member.change.change_id == sampled_change_id),
+            "initial tracked changes are authoritative in the packed commit delta"
+        );
         let changes = reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[sampled_change_id],
             })
             .await
-            .expect("change index should load");
-        assert!(matches!(
-            changes.entries.as_slice(),
-            [Some(change)] if change.change_id == sampled_change_id
-        ));
+            .expect("standalone change index should load");
+        assert!(
+            matches!(changes.entries.as_slice(), [None]),
+            "packed tracked changes must not be duplicated in the standalone change space"
+        );
         let missing_derivable = reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[commit_change_id],
@@ -871,7 +883,7 @@ mod tests {
                 .root_rebuilder(&read, &mut writes)
                 .rebuild_commit_root_at(&receipt.initial_commit_id)
                 .await
-                .expect("initial commit root should rebuild from changelog refs");
+                .expect("initial commit root should rebuild from its packed delta");
             drop(read);
             storage
                 .commit_write_set(

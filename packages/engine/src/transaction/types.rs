@@ -2462,6 +2462,7 @@ impl Default for StagedCommitChangeRefs {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct StagedCommitChangeColumns {
     identities: Vec<TrackedStateDiffIdentity>,
+    source_commit_ids: Vec<CommitId>,
     change_ids: Vec<ChangeId>,
     deleted: Vec<bool>,
     created_at: Vec<LixTimestamp>,
@@ -2485,6 +2486,7 @@ pub(crate) struct StagedCommitChangeBatchBuilder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StagedCommitChangeRef<'a> {
     identity: &'a TrackedStateDiffIdentity,
+    pub(crate) source_commit_id: CommitId,
     pub(crate) change_id: ChangeId,
     pub(crate) deleted: bool,
     pub(crate) created_at: LixTimestamp,
@@ -2496,6 +2498,7 @@ impl StagedCommitChangeBatchBuilder {
         Self {
             columns: StagedCommitChangeColumns {
                 identities: Vec::with_capacity(row_count),
+                source_commit_ids: Vec::with_capacity(row_count),
                 change_ids: Vec::with_capacity(row_count),
                 deleted: Vec::with_capacity(row_count),
                 created_at: Vec::with_capacity(row_count),
@@ -2507,12 +2510,14 @@ impl StagedCommitChangeBatchBuilder {
     pub(crate) fn push(
         &mut self,
         identity: TrackedStateDiffIdentity,
+        source_commit_id: CommitId,
         change_id: ChangeId,
         deleted: bool,
         created_at: LixTimestamp,
         updated_at: LixTimestamp,
     ) {
         self.columns.identities.push(identity);
+        self.columns.source_commit_ids.push(source_commit_id);
         self.columns.change_ids.push(change_id);
         self.columns.deleted.push(deleted);
         self.columns.created_at.push(created_at);
@@ -2563,6 +2568,7 @@ impl StagedCommitChangeBatch {
             .map_or(row_index, |selection| selection[row_index] as usize);
         StagedCommitChangeRef {
             identity: &self.columns.identities[column_index],
+            source_commit_id: self.columns.source_commit_ids[column_index],
             change_id: self.columns.change_ids[column_index],
             deleted: self.columns.deleted[column_index],
             created_at: self.columns.created_at[column_index],
@@ -2589,6 +2595,7 @@ impl StagedCommitChangeBatch {
     #[cfg(test)]
     pub(crate) fn large_buffer_count(&self) -> usize {
         usize::from(!self.columns.identities.is_empty())
+            + usize::from(!self.columns.source_commit_ids.is_empty())
             + usize::from(!self.columns.change_ids.is_empty())
             + usize::from(!self.columns.deleted.is_empty())
             + usize::from(!self.columns.created_at.is_empty())
@@ -2750,6 +2757,7 @@ mod tests {
         for (index, identity) in identities.iter().enumerate() {
             builder.push(
                 identity.clone(),
+                CommitId::for_test_label(&format!("selected-owner-{index}")),
                 ChangeId::for_test_label(&format!("selected-change-{index}")),
                 false,
                 timestamp,
@@ -2759,7 +2767,7 @@ mod tests {
         let batch = builder.finish();
         let source = batch.clone();
 
-        assert_eq!(batch.large_buffer_count(), 5);
+        assert_eq!(batch.large_buffer_count(), 6);
         assert!(
             batch
                 .iter()

@@ -4,8 +4,7 @@ use serde_json::json;
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
-    CommitProjection, CommitScanRequest,
+    ChangeRecordProjection, ChangelogContext, ChangelogReader, CommitId, CommitScanRequest,
 };
 use crate::commit_graph::{
     CommitGraphChangeHistoryRequest, CommitGraphCommitRecord, CommitGraphReader,
@@ -73,17 +72,10 @@ where
             .scan_commits(CommitScanRequest {
                 start_after: start_after.as_deref(),
                 limit: Some(CHECKPOINT_RECORD_SCAN_PAGE_SIZE),
-                projection: CommitProjection::Record,
             })
             .await?;
         records.reserve(batch.entries.len());
-        for entry in batch.entries {
-            let CommitLoadEntry::Record(record) = entry else {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "checkpoint commit scan returned a non-record entry",
-                ));
-            };
+        for record in batch.entries {
             records.insert(
                 record.commit_id,
                 CommitGraphCommitRecord {
@@ -423,8 +415,7 @@ mod tests {
         scan_checkpoint_commit_records,
     };
     use crate::changelog::{
-        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
-        CommitRecord,
+        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
     };
     use crate::common::LixTimestamp;
     use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
@@ -462,10 +453,6 @@ mod tests {
         for index in 0..1_025 {
             let commit_id = CommitId::for_test_label(&format!("checkpoint-{index}"));
             append.commits.push(commit_record(commit_id, parent));
-            append.commit_change_refs.push(CommitChangeRefSet {
-                commit_id,
-                entries: Vec::new(),
-            });
             parent = Some(commit_id);
         }
         let latest_checkpoint = parent.expect("fixture should create checkpoints");
@@ -474,17 +461,9 @@ mod tests {
         append
             .commits
             .push(commit_record(first_auto, Some(latest_checkpoint)));
-        append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id: first_auto,
-            entries: Vec::new(),
-        });
         append
             .commits
             .push(commit_record(second_auto, Some(first_auto)));
-        append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id: second_auto,
-            entries: Vec::new(),
-        });
 
         ChangelogContext::new()
             .writer(&mut read, &mut writes)

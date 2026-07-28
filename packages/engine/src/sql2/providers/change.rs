@@ -10,7 +10,7 @@ use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest, ChangelogContext,
-    ChangelogReader, CommitLoadEntry, CommitProjection, CommitScanRequest,
+    ChangelogReader, CommitScanRequest,
 };
 use crate::serialize_row_metadata;
 
@@ -224,6 +224,8 @@ async fn scan_changelog_changes<S>(
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    let packed_changes =
+        crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
     let mut reader = ChangelogContext::new().reader(store);
     if let Some(point_lookup) = point_lookup {
         let loaded = reader
@@ -243,10 +245,25 @@ where
             })
             .map(LixChangeRow::Direct)
             .collect::<Vec<_>>();
+        changes.extend(
+            packed_changes
+                .into_iter()
+                .filter(|change| {
+                    point_lookup.change_ids.contains(&change.change_id)
+                        && change
+                            .file_id
+                            .as_deref()
+                            .is_some_and(|file_id| point_lookup.file_ids.contains(file_id))
+                })
+                .map(LixChangeRow::Direct),
+        );
         changes.sort_by_key(LixChangeRow::change_id);
         return Ok(changes);
     }
-    let mut changes = Vec::<LixChangeRow>::new();
+    let mut changes = packed_changes
+        .into_iter()
+        .map(LixChangeRow::Direct)
+        .collect::<Vec<_>>();
     let mut start_after = None::<String>;
     loop {
         let scan = reader
@@ -267,13 +284,9 @@ where
             .scan_commits(CommitScanRequest {
                 start_after: start_after.as_deref(),
                 limit: Some(1024),
-                projection: CommitProjection::Record,
             })
             .await?;
-        for entry in scan.entries {
-            let CommitLoadEntry::Record(commit) = entry else {
-                continue;
-            };
+        for commit in scan.entries {
             changes.push(LixChangeRow::DerivedCommit(commit_record_canonical_change(
                 &commit,
             )));

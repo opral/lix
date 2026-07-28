@@ -169,30 +169,25 @@ fn change_storage_keys(
         .collect())
 }
 
-/// Hydrates the JSON slots of change-backed rows without coupling callers to
-/// tracked-state tree values or sentinel commit ids.
-pub(crate) async fn materialize_change_payloads<S>(
+/// Hydrates records that a caller already retained from their authoritative
+/// storage owner. Packed commit deltas use this path so lifecycle and HOT
+/// publication never discard commit-local payloads and fall back to the
+/// standalone changelog namespace.
+pub(crate) async fn materialize_known_change_payloads<S>(
     store: &S,
-    change_ids: impl Iterator<Item = ChangeId>,
+    changes: impl Iterator<Item = ChangeRecord>,
     projection: ChangeRecordProjection,
-    owner: &str,
 ) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
 where
     S: StorageAdapterRead + ?Sized,
 {
-    let mut unique = Vec::new();
-    let mut seen = HashSet::new();
-    for change_id in change_ids {
-        if seen.insert(change_id) {
-            unique.push(change_id);
-        }
-    }
+    let changes = changes.collect::<Vec<_>>();
     if !projection.requires_payload() {
-        return Ok(unique
+        return Ok(changes
             .into_iter()
-            .map(|change_id| {
+            .map(|change| {
                 (
-                    change_id,
+                    change.change_id,
                     MaterializedChangePayload {
                         identity: None,
                         snapshot_content: None,
@@ -203,18 +198,10 @@ where
             .collect());
     }
 
-    let changes = load_unique_change_records_in_order(store, &unique).await?;
     let mut json_refs = Vec::new();
-    let mut plans = Vec::with_capacity(unique.len());
-    for (change_id, change) in unique.into_iter().zip(changes) {
-        let change = change.ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "{owner} references ChangeRecord '{change_id}' that is missing from the changelog"
-                ),
-            )
-        })?;
+    let mut plans = Vec::with_capacity(changes.len());
+    for change in changes {
+        let change_id = change.change_id;
         plans.push((
             change_id,
             MaterializedChangeIdentity {

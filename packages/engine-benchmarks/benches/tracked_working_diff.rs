@@ -40,6 +40,7 @@ const DEFAULT_COMMIT_COUNT: usize = 1_000;
 const DEFAULT_CHANGES_PER_COMMIT: usize = 10;
 const DEFAULT_MEASURE_REPETITIONS: usize = 11;
 const INSERT_BATCH_SIZE: usize = 500;
+const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
 const WORKING_DIFF_SQL: &str = "SELECT entity_pk, schema_key, change_kind, before_change_id, after_change_id \
     FROM lix_working_change ORDER BY schema_key, entity_pk";
 
@@ -616,14 +617,14 @@ async fn measure_merge_preview<StorageImpl>(
         .expect("checkpoint merge-preview base");
     target
         .create_branch(CreateBranchOptions {
-            id: Some("merge-source".to_string()),
+            id: Some(MERGE_PREVIEW_SOURCE_BRANCH_ID.to_string()),
             name: "Merge source".to_string(),
             from_commit_id: None,
         })
         .await
         .expect("create merge-preview source branch");
     let source = engine
-        .open_session("merge-source")
+        .open_session(MERGE_PREVIEW_SOURCE_BRANCH_ID)
         .await
         .expect("open merge-preview source session");
 
@@ -640,7 +641,7 @@ async fn measure_merge_preview<StorageImpl>(
     }
 
     let options = MergeBranchPreviewOptions {
-        source_branch_id: "merge-source".to_string(),
+        source_branch_id: MERGE_PREVIEW_SOURCE_BRANCH_ID.to_string(),
     };
     let warm = target
         .merge_branch_preview(options.clone())
@@ -704,7 +705,7 @@ async fn measure_merge_commit<StorageImpl>(
 
     let mut latencies = Vec::with_capacity(repetitions);
     for sample in 0..repetitions {
-        let source_branch_id = format!("merge-source-{sample:04}");
+        let source_branch_id = format!("01920000-0000-7000-8000-{sample:012x}");
         target
             .create_branch(CreateBranchOptions {
                 id: Some(source_branch_id.clone()),

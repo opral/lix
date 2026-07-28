@@ -225,8 +225,7 @@ mod tests {
 
     use crate::LixError;
     use crate::changelog::{
-        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitChangeRefSet, CommitId,
-        CommitRecord,
+        ChangeId, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId, CommitRecord,
     };
     use crate::commit_graph::CommitGraphChange;
     use crate::commit_graph::CommitGraphContext;
@@ -834,10 +833,6 @@ mod tests {
                 change_id: change.change.id,
                 author_account_ids: Vec::new(),
                 created_at: change.change.created_at,
-            });
-            append.commit_change_refs.push(CommitChangeRefSet {
-                commit_id: CommitId::for_test_label(&commit_id),
-                entries: Vec::new(),
             });
         }
         ChangelogContext::new()

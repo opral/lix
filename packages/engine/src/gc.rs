@@ -11,8 +11,14 @@ use std::time::Instant;
 use bytes::Bytes;
 
 use crate::branch::BranchHeadControlContext;
-use crate::changelog::{ChangelogContext, ChangelogWriter, CommitId, GcPlan, GcRoot};
-use crate::json_store::{JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate};
+use crate::changelog::{
+    CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeRecord, ChangeScanRequest,
+    ChangelogContext, ChangelogReader, CommitId, CommitRecord, CommitScanRequest, GcLiveSet,
+    GcPlan, GcRepairSet, GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
+};
+use crate::json_store::{
+    JsonRef, JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
+};
 use crate::live_state::{TrackedHeadContext, stage_collect_stale_working_diff_indexes};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StoragePrefix,
@@ -404,11 +410,7 @@ where
     let root_discovery_us = elapsed_micros(phase_started);
 
     let phase_started = Instant::now();
-    let mut changelog_store = store.clone();
-    let changelog_plan = ChangelogContext::new()
-        .writer(&mut changelog_store, writes)
-        .collect_garbage(&roots)
-        .await?;
+    let changelog_plan = plan_and_stage_authority_gc(&store, writes, &roots).await?;
     let changelog_us = elapsed_micros(phase_started);
     // Changelog reachability is the logical correctness boundary. A
     // tracked root has the same commit id, so dead root metadata can be
@@ -422,7 +424,6 @@ where
     let phase_started = Instant::now();
     for commit_id in &sweep_tracked_commit_roots {
         crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
-        crate::tracked_state::stage_delete_commit_deltas(&store, writes, *commit_id).await?;
     }
     // Old serving generations are derived data. Removing them in the same
     // atomic sweep as their untracked payload-root withdrawal prevents stale
@@ -479,7 +480,7 @@ where
     let reclaimable_untracked_refs = reclaimable_untracked_refs
         .into_iter()
         .filter(|hash| !live_payloads.contains(hash) && !changelog_swept_payloads.contains(hash))
-        .map(crate::json_store::JsonRef::from_hash_bytes)
+        .map(JsonRef::from_hash_bytes)
         .collect::<Vec<_>>();
     let json_writer = JsonStoreContext::new().writer();
     json_writer.stage_delete_refs(writes, reclaimable_untracked_refs);
@@ -504,6 +505,275 @@ where
     })
 }
 
+async fn plan_and_stage_authority_gc<S>(
+    store: &S,
+    writes: &mut StorageWriteSet,
+    roots: &[GcRoot],
+) -> Result<GcPlan, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync,
+{
+    let commits = scan_all_gc_commits(store.clone()).await?;
+    let standalone_changes = scan_all_gc_standalone_changes(store.clone()).await?;
+    let packed = crate::tracked_state::scan_commit_delta_inventory(store).await?;
+
+    if let Some(commit_id) = packed
+        .commits
+        .keys()
+        .find(|commit_id| !commits.contains_key(commit_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "garbage collection found packed commit-delta authority for missing commit '{commit_id}'"
+            ),
+        ));
+    }
+    if let Some(change_id) = standalone_changes.keys().find(|change_id| {
+        packed.commits.values().any(|entry| {
+            entry
+                .members
+                .iter()
+                .any(|member| member.value.change_id == **change_id)
+        })
+    }) {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "change '{change_id}' is stored as both a standalone fact and a packed commit member"
+            ),
+        ));
+    }
+
+    let mut live_commits = BTreeSet::new();
+    let mut pending = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::BranchHead(commit_id) => Some(*commit_id),
+            GcRoot::StandaloneChange(_) | GcRoot::CurrentPayload(_) => None,
+        })
+        .collect::<Vec<_>>();
+    while let Some(commit_id) = pending.pop() {
+        if !live_commits.insert(commit_id) {
+            continue;
+        }
+        let commit = commits.get(&commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("garbage-collection root references missing commit '{commit_id}'"),
+            )
+        })?;
+        pending.extend(commit.parent_commit_ids.iter().copied());
+    }
+
+    let standalone_root_ids = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::StandaloneChange(change_id) => Some(*change_id),
+            GcRoot::BranchHead(_) | GcRoot::CurrentPayload(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    if let Some(change_id) = standalone_root_ids
+        .iter()
+        .find(|change_id| !standalone_changes.contains_key(change_id))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("garbage-collection root references missing standalone change '{change_id}'"),
+        ));
+    }
+
+    let mut live_change_ids = standalone_root_ids.clone();
+    let mut live_payload_hashes = roots
+        .iter()
+        .filter_map(|root| match root {
+            GcRoot::CurrentPayload(json_ref) => Some(*json_ref.as_hash_array()),
+            GcRoot::BranchHead(_) | GcRoot::StandaloneChange(_) => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for change_id in &standalone_root_ids {
+        collect_change_payload_hashes(
+            standalone_changes
+                .get(change_id)
+                .expect("standalone GC root existence validated"),
+            &mut live_payload_hashes,
+        );
+    }
+    for commit_id in &live_commits {
+        if let Some(entry) = packed.commits.get(commit_id) {
+            for member in &entry.members {
+                live_change_ids.insert(member.value.change_id);
+                collect_change_payload_hashes(&member.change, &mut live_payload_hashes);
+            }
+        }
+    }
+
+    let sweep_commits = commits
+        .keys()
+        .filter(|commit_id| !live_commits.contains(commit_id))
+        .copied()
+        .collect::<Vec<_>>();
+    let sweep_commit_change_ids = sweep_commits
+        .iter()
+        .map(|commit_id| {
+            commits
+                .get(commit_id)
+                .expect("sweep commit came from commit inventory")
+                .change_id
+        })
+        .collect::<Vec<_>>();
+    let sweep_changes = standalone_changes
+        .keys()
+        .filter(|change_id| !standalone_root_ids.contains(change_id))
+        .copied()
+        .collect::<Vec<_>>();
+
+    let mut dead_payload_hashes = BTreeSet::new();
+    for commit_id in &sweep_commits {
+        if let Some(entry) = packed.commits.get(commit_id) {
+            for member in &entry.members {
+                collect_change_payload_hashes(&member.change, &mut dead_payload_hashes);
+            }
+        }
+    }
+    for change_id in &sweep_changes {
+        collect_change_payload_hashes(
+            standalone_changes
+                .get(change_id)
+                .expect("sweep change came from standalone inventory"),
+            &mut dead_payload_hashes,
+        );
+    }
+    let sweep_json_payloads = dead_payload_hashes
+        .difference(&live_payload_hashes)
+        .copied()
+        .map(JsonRef::from_hash_bytes)
+        .collect::<Vec<_>>();
+
+    for commit_id in &sweep_commits {
+        writes.delete(
+            COMMIT_SPACE,
+            StorageKey(Bytes::from(commit_key(*commit_id))),
+        );
+        if let Some(entry) = packed.commits.get(commit_id) {
+            crate::tracked_state::stage_delete_commit_delta_inventory_entry(
+                writes, *commit_id, entry,
+            )?;
+        }
+    }
+    for change_id in &sweep_commit_change_ids {
+        writes.delete(
+            COMMIT_CHANGE_ID_SPACE,
+            StorageKey(Bytes::from(commit_change_id_key(*change_id))),
+        );
+    }
+    for change_id in &sweep_changes {
+        writes.delete(
+            CHANGE_SPACE,
+            StorageKey(Bytes::from(change_key(*change_id))),
+        );
+    }
+    JsonStoreContext::new()
+        .writer()
+        .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
+    writes.seal_changelog_gc();
+
+    Ok(GcPlan {
+        roots: roots.to_vec(),
+        live: GcLiveSet {
+            commits: live_commits.into_iter().collect(),
+            changes: live_change_ids.into_iter().collect(),
+            payloads: live_payload_hashes
+                .into_iter()
+                .map(JsonRef::from_hash_bytes)
+                .collect(),
+        },
+        sweep: GcSweepSet {
+            commits: sweep_commits,
+            commit_change_ids: sweep_commit_change_ids,
+            changes: sweep_changes,
+            json_payloads: sweep_json_payloads,
+        },
+        repair: GcRepairSet::default(),
+    })
+}
+
+async fn scan_all_gc_commits<S>(store: S) -> Result<BTreeMap<CommitId, CommitRecord>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut reader = ChangelogContext::new().reader(store);
+    let mut commits = BTreeMap::new();
+    let mut start_after = None::<String>;
+    loop {
+        let batch = reader
+            .scan_commits(CommitScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1_024),
+            })
+            .await?;
+        for commit in batch.entries {
+            if commits.insert(commit.commit_id, commit.clone()).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "garbage collection found duplicate commit '{}'",
+                        commit.commit_id
+                    ),
+                ));
+            }
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    Ok(commits)
+}
+
+async fn scan_all_gc_standalone_changes<S>(
+    store: S,
+) -> Result<BTreeMap<ChangeId, ChangeRecord>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut reader = ChangelogContext::new().reader(store);
+    let mut changes = BTreeMap::new();
+    let mut start_after = None::<String>;
+    loop {
+        let batch = reader
+            .scan_changes(ChangeScanRequest {
+                start_after: start_after.as_deref(),
+                limit: Some(1_024),
+            })
+            .await?;
+        for change in batch.entries {
+            if changes.insert(change.change_id, change.clone()).is_some() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "garbage collection found duplicate standalone change '{}'",
+                        change.change_id
+                    ),
+                ));
+            }
+        }
+        let Some(next) = batch.next_start_after else {
+            break;
+        };
+        start_after = Some(next.to_string());
+    }
+    Ok(changes)
+}
+
+fn collect_change_payload_hashes(change: &ChangeRecord, hashes: &mut BTreeSet<[u8; 32]>) {
+    for slot in [&change.snapshot, &change.metadata] {
+        if let JsonSlot::Ref(json_ref) = slot {
+            hashes.insert(*json_ref.as_hash_array());
+        }
+    }
+}
+
 fn elapsed_micros(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
@@ -513,7 +783,10 @@ mod tests {
     use std::sync::Arc;
 
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
-    use crate::changelog::CommitId;
+    use crate::changelog::{
+        ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, ChangelogContext,
+        ChangelogReader, ChangelogWriter, CommitId, CommitLoadRequest, CommitRecord, GcRoot,
+    };
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::json_store::{
@@ -525,7 +798,10 @@ mod tests {
         Memory, PointReadPlan, SharedStorageAdapterRead, StorageAdapter, StorageGetOptions,
         StorageKey, StorageReadOptions, StorageSpace, StorageWriteOptions,
     };
-    use crate::tracked_state::TrackedStateContext;
+    use crate::tracked_state::{
+        TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
+        scan_commit_delta_inventory, stage_commit_deltas,
+    };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
 
@@ -843,6 +1119,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authority_gc_sweeps_dead_packed_and_standalone_facts_but_keeps_shared_payloads() {
+        let storage = Memory::new();
+        let storage_adapter = StorageAdapter::new(storage.clone());
+        let shared_ref = stage_bare_json(&storage, r#"{"payload":"shared"}"#).await;
+        let dead_only_ref = stage_bare_json(&storage, r#"{"payload":"dead-only"}"#).await;
+        let live_standalone_ref =
+            stage_bare_json(&storage, r#"{"payload":"live-standalone"}"#).await;
+
+        let live_parent = CommitId::for_test_label("authority-gc-live-parent");
+        let live_head = CommitId::for_test_label("authority-gc-live-head");
+        let dead_commit = CommitId::for_test_label("authority-gc-dead");
+        let live_member = packed_change(
+            "authority-gc-live-member",
+            "live-member",
+            JsonSlot::Ref(shared_ref),
+        );
+        let dead_shared_member = packed_change(
+            "authority-gc-dead-shared-member",
+            "dead-shared-member",
+            JsonSlot::Ref(shared_ref),
+        );
+        let dead_only_member = packed_change(
+            "authority-gc-dead-only-member",
+            "dead-only-member",
+            JsonSlot::Ref(dead_only_ref),
+        );
+        let live_standalone = packed_change(
+            "authority-gc-live-standalone",
+            "live-standalone",
+            JsonSlot::Ref(live_standalone_ref),
+        );
+        let dead_standalone = packed_change(
+            "authority-gc-dead-standalone",
+            "dead-standalone",
+            JsonSlot::Ref(dead_only_ref),
+        );
+        let timestamp =
+            LixTimestamp::expect_parse("authority GC timestamp", "2026-01-01T00:00:00.000Z");
+        let commits = vec![
+            CommitRecord {
+                format_version: 1,
+                commit_id: live_parent,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("authority-gc-live-parent-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+            CommitRecord {
+                format_version: 1,
+                commit_id: live_head,
+                parent_commit_ids: vec![live_parent],
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("authority-gc-live-head-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+            CommitRecord {
+                format_version: 1,
+                commit_id: dead_commit,
+                parent_commit_ids: Vec::new(),
+                tracked_state_rootless: true,
+                change_id: ChangeId::for_test_label("authority-gc-dead-header"),
+                author_account_ids: Vec::new(),
+                created_at: timestamp,
+            },
+        ];
+
+        let mut read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("fixture read should open");
+        let mut writes = storage_adapter.new_write_set();
+        let mut writer = ChangelogContext::new().writer(&mut read, &mut writes);
+        writer
+            .stage_append(ChangelogAppend {
+                commits,
+                changes: vec![live_standalone.clone(), dead_standalone.clone()],
+            })
+            .await
+            .expect("authority GC changelog fixture should stage");
+        drop(writer);
+        let live_deltas = commit_delta_refs(live_parent, std::slice::from_ref(&live_member));
+        stage_commit_deltas(&mut writes, &live_deltas).expect("live packed member should stage");
+        let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
+        let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
+        stage_commit_deltas(&mut writes, &dead_deltas).expect("dead packed members should stage");
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority GC fixture should commit");
+
+        let read = SharedStorageAdapterRead::new(
+            storage_adapter
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("GC read should open"),
+        );
+        let mut writes = storage_adapter.new_write_set();
+        let plan = super::plan_and_stage_authority_gc(
+            &read,
+            &mut writes,
+            &[
+                GcRoot::BranchHead(live_head),
+                GcRoot::StandaloneChange(live_standalone.change_id),
+            ],
+        )
+        .await
+        .expect("authority GC should plan");
+        assert_eq!(plan.sweep.commits, vec![dead_commit]);
+        assert_eq!(plan.sweep.changes, vec![dead_standalone.change_id]);
+        assert!(
+            !plan.sweep.json_payloads.contains(&shared_ref),
+            "a payload shared with live packed history must stay live"
+        );
+        assert!(
+            plan.sweep.json_payloads.contains(&dead_only_ref),
+            "a payload referenced only by dead packed and standalone facts must sweep"
+        );
+        storage_adapter
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("authority GC sweep should commit");
+
+        let read = storage_adapter
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("verification read should open");
+        let mut reader = ChangelogContext::new().reader(&read);
+        let commits = reader
+            .load_commits(CommitLoadRequest {
+                commit_ids: &[live_parent, live_head, dead_commit],
+            })
+            .await
+            .expect("commit headers should load");
+        assert!(commits.entries[0].is_some());
+        assert!(commits.entries[1].is_some());
+        assert!(commits.entries[2].is_none());
+        let changes = reader
+            .load_changes(ChangeLoadRequest {
+                change_ids: &[live_standalone.change_id, dead_standalone.change_id],
+            })
+            .await
+            .expect("standalone facts should load");
+        assert!(changes.entries[0].is_some());
+        assert!(changes.entries[1].is_none());
+        let inventory = scan_commit_delta_inventory(&read)
+            .await
+            .expect("post-GC packed inventory should scan");
+        assert!(inventory.commits.contains_key(&live_parent));
+        assert!(!inventory.commits.contains_key(&dead_commit));
+        drop(reader);
+        drop(read);
+        assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
+        assert!(
+            !json_ref_exists(
+                &storage,
+                crate::json_store::store::JSON_SPACE,
+                dead_only_ref,
+            )
+            .await
+        );
+        assert!(
+            json_ref_exists(
+                &storage,
+                crate::json_store::store::JSON_SPACE,
+                live_standalone_ref,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
     async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
@@ -999,6 +1448,47 @@ mod tests {
             .await
             .expect("bare JSON should persist");
         json_ref
+    }
+
+    fn packed_change(change_label: &str, entity_label: &str, snapshot: JsonSlot) -> ChangeRecord {
+        ChangeRecord {
+            format_version: 2,
+            change_id: ChangeId::for_test_label(change_label),
+            entity_pk: EntityPk::single(entity_label),
+            schema_key: "authority_gc".to_string(),
+            file_id: None,
+            snapshot,
+            metadata: JsonSlot::None,
+            created_at: LixTimestamp::expect_parse(
+                "authority GC change timestamp",
+                "2026-01-01T00:00:00.000Z",
+            ),
+            origin_key: None,
+        }
+    }
+
+    fn commit_delta_refs<'a>(
+        commit_id: CommitId,
+        changes: &'a [ChangeRecord],
+    ) -> Vec<TrackedStateCommitDeltaRef<'a>> {
+        changes
+            .iter()
+            .map(|change| TrackedStateCommitDeltaRef {
+                delta: TrackedStateDeltaRef {
+                    schema_key: &change.schema_key,
+                    file_id: change.file_id.as_deref(),
+                    entity_pk: &change.entity_pk,
+                    change_id: change.change_id,
+                    commit_id,
+                    deleted: change.snapshot.is_none(),
+                    created_at: change.created_at,
+                    updated_at: change.created_at,
+                },
+                snapshot: change.snapshot.as_ref_slot(),
+                metadata: change.metadata.as_ref_slot(),
+                origin_key: change.origin_key.as_deref(),
+            })
+            .collect()
     }
 
     async fn json_ref_exists(storage: &Memory, space: StorageSpace, json_ref: JsonRef) -> bool {

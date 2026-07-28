@@ -7691,7 +7691,6 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::NullableKeyFilter;
     use crate::branch::BranchContext;
-    use crate::changelog::ChangelogReader;
     use crate::functions::FunctionProvider;
     use crate::storage_adapter::{Memory, StorageReadOptions};
     use crate::tracked_state::{
@@ -7828,6 +7827,7 @@ mod tests {
                 file_id: Some("file-a".to_string()),
                 entity_pk: EntityPk::single("file-a"),
             }),
+            CommitId::default(),
             ChangeId::default(),
             false,
             LixTimestamp::from_unix_millis_utc_lossy(0),
@@ -8631,26 +8631,24 @@ mod tests {
             .as_ref()
             .expect("tracked row should have a change id")
             .clone();
-        let mut changelog_reader = crate::changelog::ChangelogContext::new().reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
-        );
-        let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[tracked_change_id],
-            })
+        let packed_read = storage
+            .begin_read(StorageReadOptions::default())
             .await
-            .expect("changelog should load tracked change");
+            .expect("packed payload read should open");
+        let inventory = crate::tracked_state::scan_commit_delta_inventory(&packed_read)
+            .await
+            .expect("packed authority should scan");
         assert!(
-            matches!(
-                changes.entries.as_slice(),
-                [Some(change)]
-                    if change.entity_pk.as_single_string_owned().as_deref()
-                        == Ok("tracked-programmatic")
-            ),
-            "tracked staged row should be appended to changelog"
+            inventory
+                .commits
+                .values()
+                .any(|entry| entry
+                    .members
+                    .iter()
+                    .any(|member| member.change.change_id == tracked_change_id
+                        && member.change.entity_pk.as_single_string_owned().as_deref()
+                            == Ok("tracked-programmatic"))),
+            "tracked staged row should be authoritative in a packed commit delta"
         );
 
         let head_commit_id = branch_ctx

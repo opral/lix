@@ -292,7 +292,6 @@ impl_uuid_id!(ChangeId, "change id");
 pub(crate) struct ChangelogAppend {
     pub(crate) commits: Vec<CommitRecord>,
     pub(crate) changes: Vec<ChangeRecord>,
-    pub(crate) commit_change_refs: Vec<CommitChangeRefSet>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Encode, musli::Decode)]
@@ -311,75 +310,26 @@ pub(crate) struct CommitRecord {
     pub(crate) created_at: LixTimestamp,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangeRefSet {
-    pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<ChangeId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CommitChangeRefChunk {
-    pub(crate) format_version: u32,
-    pub(crate) commit_id: CommitId,
-    pub(crate) entries: Vec<ChangeId>,
-}
-
-/// Stored ref chunk: the commit id lives in the storage key, the entries are
-/// the referenced change ids sorted ascending. Everything else about a change
-/// (schema key, file id, entity pk, payloads) lives in its change record and
-/// is point-read by change id when needed.
-#[derive(musli::Decode)]
-#[musli(packed)]
-pub(crate) struct CommitChangeRefChunkWire {
-    pub(crate) format_version: u32,
-    pub(crate) entries: Vec<ChangeId>,
-}
-
-/// Encode-only borrowed twin of [`CommitChangeRefChunkWire`].
-#[derive(musli::Encode)]
-#[musli(packed)]
-pub(crate) struct CommitChangeRefChunkWireRef<'a> {
-    pub(crate) format_version: u32,
-    pub(crate) entries: &'a [ChangeId],
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CommitProjection {
-    Record,
-    Full,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommitLoadRequest<'a> {
     pub(crate) commit_ids: &'a [CommitId],
-    pub(crate) projection: CommitProjection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitLoadBatch {
-    pub(crate) entries: Vec<Option<CommitLoadEntry>>,
+    pub(crate) entries: Vec<Option<CommitRecord>>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CommitScanRequest<'a> {
     pub(crate) start_after: Option<&'a str>,
     pub(crate) limit: Option<usize>,
-    pub(crate) projection: CommitProjection,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CommitScanBatch {
-    pub(crate) entries: Vec<CommitLoadEntry>,
+    pub(crate) entries: Vec<CommitRecord>,
     pub(crate) next_start_after: Option<CommitId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CommitLoadEntry {
-    Record(CommitRecord),
-    Full {
-        record: CommitRecord,
-        change_ref_chunks: Vec<CommitChangeRefChunk>,
-    },
 }
 
 /// In-memory change record. The stored form (`ChangeRecordRef` /
@@ -460,7 +410,6 @@ impl<'a> From<&'a ChangeRecord> for TransactionChangeRecordRef<'a> {
 pub(crate) struct TransactionChangelogAppend<'a> {
     pub(crate) commits: Vec<CommitRecord>,
     pub(crate) changes: Vec<TransactionChangeRecordRef<'a>>,
-    pub(crate) commit_change_refs: Vec<CommitChangeRefSet>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, musli::Decode)]
@@ -533,7 +482,6 @@ pub(crate) struct GcSweepSet {
     pub(crate) commits: Vec<CommitId>,
     pub(crate) commit_change_ids: Vec<ChangeId>,
     pub(crate) changes: Vec<ChangeId>,
-    pub(crate) commit_change_ref_chunks: Vec<(CommitId, u32)>,
     pub(crate) json_payloads: Vec<JsonRef>,
 }
 
