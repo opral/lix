@@ -30,6 +30,6 @@ pub(crate) use types::{
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_load_exact_batch, overlay_load_exact_rows, overlay_scan_batch, overlay_scan_rows,
-    overlay_scan_tracked_batch, resolve_visible_batch, resolve_visible_rows,
+    overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
+    resolve_visible_batch,
 };

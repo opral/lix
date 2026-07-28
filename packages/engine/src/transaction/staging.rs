@@ -1471,9 +1471,9 @@ impl PreparedStateRowOverlay {
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Ok(crate::live_state::resolve_visible_rows(
-            self.scan_parts(request)?.rows,
-            Vec::new(),
+        Ok(crate::live_state::resolve_visible_batch(
+            self.scan_batch(request)?,
+            MaterializedLiveStateBatch::default(),
             &crate::live_state::VisibilityRequest {
                 branch_scope: crate::live_state::VisibilityBranchScope::BranchIds {
                     branch_ids: request.filter.branch_ids.clone(),
@@ -1481,7 +1481,8 @@ impl PreparedStateRowOverlay {
                 include_tombstones: request.filter.include_tombstones,
                 limit: None,
             },
-        ))
+        )
+        .into_rows())
     }
 
     /// Returns staged rows and base-row identities hidden by staged rows in one pass.
