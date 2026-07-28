@@ -3370,8 +3370,7 @@ mod tests {
     use super::*;
     use crate::common::SharedStr;
     use crate::live_state::{
-        LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatchBuilder,
-        MaterializedLiveStateRow,
+        LiveStateScanRequest, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
     };
     use crate::schema::{schema_key_from_definition, seed_schema_definition};
     use crate::transaction::types::{
@@ -3410,13 +3409,6 @@ mod tests {
             _request: &LiveStateScanRequest,
         ) -> Result<MaterializedLiveStateBatch, LixError> {
             panic!("constraint validation must not project the shared batch into owned rows")
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
 
         async fn load_exact_batch(
@@ -3598,15 +3590,6 @@ mod tests {
                 .filter(|row| live_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
-        }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(test_file_descriptor_rows()
-                .into_iter()
-                .find(|row| live_state_row_matches_load(row, request)))
         }
     }
 
@@ -3792,23 +3775,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into())
         }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .rows
-                .iter()
-                .cloned()
-                .chain(test_file_descriptor_rows())
-                .find(|row| {
-                    row.schema_key == request.schema_key
-                        && row.branch_id.as_ref() == request.branch_id
-                        && row.entity_pk == request.entity_pk
-                        && request.file_id.matches(row.file_id.as_ref())
-                }))
-        }
     }
 
     struct OverlayingStaticLiveStateReader {
@@ -3849,25 +3815,6 @@ mod tests {
                 .collect::<Vec<_>>();
             Ok(overlay_untracked_rows_for_test(tracked_rows, untracked_rows).into())
         }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            let rows = self
-                .scan_batch(&LiveStateScanRequest {
-                    filter: LiveStateFilter {
-                        schema_keys: vec![request.schema_key.clone()],
-                        entity_pks: vec![request.entity_pk.clone()],
-                        branch_ids: vec![request.branch_id.clone()],
-                        file_ids: vec![request.file_id.clone()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                })
-                .await?;
-            Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
-        }
     }
 
     fn overlay_untracked_rows_for_test(
@@ -3901,13 +3848,6 @@ mod tests {
         ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(Vec::new().into())
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     struct StrictStaticLiveStateReader {
@@ -3934,17 +3874,6 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
                 .into())
-        }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .rows
-                .iter()
-                .find(|row| live_state_row_matches_load(row, request))
-                .cloned())
         }
     }
 
@@ -3975,18 +3904,6 @@ mod tests {
                 .filter(|row| live_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>()
                 .into())
-        }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .rows
-                .iter()
-                .cloned()
-                .chain(test_file_descriptor_rows())
-                .find(|row| live_state_row_matches_load(row, request)))
         }
     }
 
@@ -7316,16 +7233,6 @@ mod tests {
                     .file_ids
                     .iter()
                     .any(|filter| filter.matches(row.file_id.as_ref())))
-    }
-
-    fn live_state_row_matches_load(
-        row: &MaterializedLiveStateRow,
-        request: &LiveStateRowRequest,
-    ) -> bool {
-        row.schema_key == request.schema_key
-            && row.branch_id.as_ref() == request.branch_id
-            && row.entity_pk == request.entity_pk
-            && request.file_id.matches(row.file_id.as_ref())
     }
 
     fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {

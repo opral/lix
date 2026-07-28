@@ -385,7 +385,7 @@ mod tests {
     use crate::GLOBAL_BRANCH_ID;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
-    use crate::live_state::{LiveStateRowRequest, MaterializedLiveStateRow};
+    use crate::live_state::MaterializedLiveStateRow;
 
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
@@ -813,22 +813,6 @@ mod tests {
                     .cloned()
                     .collect(),
             ))
-        }
-
-        async fn load_row(
-            &self,
-            request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            let request_branch_id = request.branch_id.as_str();
-            Ok(self
-                .rows
-                .iter()
-                .find(|row| {
-                    row.schema_key == request.schema_key
-                        && row.branch_id.as_ref() == request_branch_id
-                        && row.entity_pk == request.entity_pk
-                })
-                .cloned())
         }
     }
 

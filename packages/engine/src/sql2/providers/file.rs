@@ -6822,9 +6822,8 @@ mod tests {
     };
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{
-        LiveStateExactBatchRequest, LiveStateFilter, LiveStateReader, LiveStateRowRequest,
-        LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-        MaterializedLiveStateRow,
+        LiveStateExactBatchRequest, LiveStateFilter, LiveStateReader, LiveStateScanRequest,
+        MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateRow,
     };
     use crate::plugin::{
         PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginContentType, PluginFileOwner, PluginRegistry,
@@ -8711,13 +8710,6 @@ mod tests {
             Ok(self.rows.clone().into())
         }
 
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
-
         async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
@@ -8831,15 +8823,6 @@ mod tests {
                 "descriptor-only scan should not read live state",
             ))
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Err(LixError::unknown(
-                "descriptor-only scan should not load live-state rows",
-            ))
-        }
     }
 
     struct StaticFilesystemPathIndexReader {
@@ -8888,13 +8871,6 @@ mod tests {
             _request: &LiveStateScanRequest,
         ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(self.rows.clone().into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 

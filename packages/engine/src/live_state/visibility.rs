@@ -429,7 +429,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::LiveStateRowRequest;
+
     use async_trait::async_trait;
 
     fn test_timestamp() -> LixTimestamp {
@@ -1274,13 +1274,6 @@ mod tests {
                 Ok(Vec::new().into())
             }
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     struct FilteringReader {
@@ -1307,13 +1300,6 @@ mod tests {
                     .cloned()
                     .collect(),
             ))
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 }

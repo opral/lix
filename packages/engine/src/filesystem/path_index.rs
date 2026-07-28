@@ -1444,13 +1444,6 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn load_row(
-            &self,
-            _request: &crate::live_state::LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            unreachable!("path-index construction only scans live state")
-        }
-
         async fn load_exact_batch(
             &self,
             _request: &crate::live_state::LiveStateExactBatchRequest,

@@ -691,9 +691,7 @@ mod tests {
         CommitGraphReader, ReachableCommitGraphCommit,
     };
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    };
+    use crate::live_state::{LiveStateReader, LiveStateScanRequest};
     use crate::sql2::HistoryQuerySource;
     use crate::sql2::catalog::{PublicCatalog, derive_entity_surface_spec_from_schema};
     use crate::storage_adapter::{
@@ -1139,13 +1137,6 @@ mod tests {
             _request: &LiveStateScanRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             Ok(Vec::new().into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 

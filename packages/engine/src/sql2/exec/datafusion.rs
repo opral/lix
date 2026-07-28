@@ -2208,9 +2208,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::functions::FunctionProviderHandle;
     use crate::json_store::JsonStoreContext;
-    use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
-    };
+    use crate::live_state::{LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow};
     use crate::sql2::{
         ChangelogQuerySource, EntitySnapshotReader, HistoryQuerySource, SqlChangelogQuerySource,
         SqlHistoryQuerySource,
@@ -2809,13 +2807,6 @@ mod tests {
         ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             Ok(vec![].into())
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     fn filter_live_state_rows(
@@ -2878,13 +2869,6 @@ mod tests {
         ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             Ok(filter_live_state_rows(&self.rows, request).into())
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     #[async_trait]
@@ -2906,13 +2890,6 @@ mod tests {
                 .push(request.clone());
             Ok(filter_live_state_rows(&self.rows, request).into())
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     #[async_trait]
@@ -2930,13 +2907,6 @@ mod tests {
         ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             self.scans.fetch_add(1, Ordering::SeqCst);
             Ok(filter_live_state_rows(&self.rows, request).into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 

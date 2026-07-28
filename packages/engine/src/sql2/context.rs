@@ -18,9 +18,8 @@ use crate::filesystem::{
 use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateExactBatch,
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
@@ -392,29 +391,6 @@ impl LiveStateReader for WriteContextLiveStateReader {
         request: &LiveStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         self.ctx.scan_live_state_batch(request).await
-    }
-
-    async fn load_row(
-        &self,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        let rows = self
-            .ctx
-            .scan_live_state_batch(&LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: vec![request.schema_key.clone()],
-                    entity_pks: vec![request.entity_pk.clone()],
-                    branch_ids: vec![request.branch_id.clone()],
-                    file_ids: vec![request.file_id.clone()],
-                    ..LiveStateFilter::default()
-                },
-                projection: LiveStateProjection::default(),
-                limit: Some(1),
-            })
-            .await?;
-        Ok(rows
-            .get(0)
-            .map(crate::live_state::MaterializedLiveStateRowRef::to_owned))
     }
 
     async fn load_exact_batch(

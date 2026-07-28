@@ -2129,8 +2129,7 @@ mod tests {
     };
     use crate::functions::FunctionProviderHandle;
     use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-        MaterializedLiveStateRow,
+        LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
     };
     use crate::sql2::{SqlWriteContext, SqlWriteExecutionContext};
     use crate::transaction::types::{
@@ -2202,15 +2201,6 @@ mod tests {
             self.scan_count.fetch_add(1, Ordering::SeqCst);
             Err(LixError::unknown(
                 "directory parent-id scan should not read live state",
-            ))
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Err(LixError::unknown(
-                "directory parent-id scan should not load live-state rows",
             ))
         }
     }
