@@ -2137,6 +2137,10 @@ enum DefaultValuePlan {
 }
 
 impl DefaultPlan {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.properties.is_empty()
+    }
+
     pub(crate) fn from_schema(schema: &JsonValue) -> Self {
         let Some(properties) = schema.get("properties").and_then(JsonValue::as_object) else {
             return Self::default();

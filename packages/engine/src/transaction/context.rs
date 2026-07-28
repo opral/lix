@@ -5092,6 +5092,10 @@ where
         self.sql_public_catalog()
     }
 
+    fn schema_catalog_snapshot(&self) -> Option<Arc<CatalogSnapshot>> {
+        Some(Arc::clone(&self.sql_schema_snapshot))
+    }
+
     fn plugin_host(&self) -> PluginRuntimeHost {
         self.plugin_host.clone()
     }

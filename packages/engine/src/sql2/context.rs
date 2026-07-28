@@ -124,6 +124,9 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             &self.list_visible_schemas()?,
         )?))
     }
+    fn schema_catalog_snapshot(&self) -> Option<Arc<crate::catalog::CatalogSnapshot>> {
+        None
+    }
     fn plugin_host(&self) -> PluginRuntimeHost {
         PluginRuntimeHost::new(Arc::new(UnsupportedWasmRuntime))
     }

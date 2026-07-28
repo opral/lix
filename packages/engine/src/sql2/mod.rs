@@ -56,7 +56,7 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result,
+    execute_write_logical_plan_with_mode_result, take_certified_entity_insert_batch_executions,
     take_certified_replacement_parameter_batch_executions,
     take_entity_update_parameter_batch_executions,
 };

@@ -6,7 +6,7 @@
 //! cursor, output-table, and transition handles created by that instance.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -343,6 +343,7 @@ enum WasmCanonicalJsonStorage {
         offsets: Box<[WasmCanonicalJsonOffset]>,
     },
     CertifiedRows {
+        decoded_values: OnceLock<Box<[OnceLock<JsonValue>]>>,
         entity_pks: Box<[EntityPk]>,
         schema_fingerprints: Box<[Arc<SchemaPlanFingerprint>]>,
         schema_fingerprint_indices: Box<[u32]>,
@@ -540,6 +541,7 @@ impl WasmCanonicalJson {
 
         Self::from_validated_batch(WasmCanonicalJsonBatch {
             storage: WasmCanonicalJsonStorage::CertifiedRows {
+                decoded_values: OnceLock::new(),
                 entity_pks: entity_pks.into_boxed_slice(),
                 schema_fingerprints: schema_fingerprints.into_boxed_slice(),
                 schema_fingerprint_indices: schema_fingerprint_indices.into_boxed_slice(),
@@ -570,9 +572,17 @@ impl WasmCanonicalJson {
             WasmCanonicalJsonStorage::Arena { values, .. } => values[self.row_index()]
                 .as_ref()
                 .expect("certified canonical JSON rows do not own decoded values"),
-            WasmCanonicalJsonStorage::CertifiedRows { .. } => {
-                panic!("certified canonical JSON rows do not own decoded values")
-            }
+            WasmCanonicalJsonStorage::CertifiedRows {
+                decoded_values,
+                normalized,
+                ..
+            } => decoded_values
+                .get_or_init(|| (0..normalized.len()).map(|_| OnceLock::new()).collect())
+                [self.row_index()]
+            .get_or_init(|| {
+                serde_json::from_str(normalized[self.row_index()].as_str())
+                    .expect("certified canonical JSON must parse")
+            }),
         }
     }
 
@@ -660,7 +670,10 @@ impl WasmCanonicalJson {
             WasmCanonicalJsonStorage::Arena { values, .. } => {
                 values.iter().filter(|value| value.is_some()).count()
             }
-            WasmCanonicalJsonStorage::CertifiedRows { .. } => 0,
+            WasmCanonicalJsonStorage::CertifiedRows { decoded_values, .. } => decoded_values
+                .get()
+                .map(|values| values.iter().filter(|value| value.get().is_some()).count())
+                .unwrap_or(0),
         }
     }
 
