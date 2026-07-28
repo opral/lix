@@ -1273,6 +1273,33 @@ fn apply_lifecycle_tracked_snapshot_row(
     mut next: MaterializedTrackedStateRow,
     require_absence: bool,
 ) -> Result<(), LixError> {
+    if next.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+        && next.file_id.is_none()
+        && next.snapshot_content.is_none()
+    {
+        let file_id = next.entity_pk.as_single_string().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("file descriptor tombstone has invalid identity: {error}"),
+            )
+        })?;
+        let cascade_keys = rows
+            .iter()
+            .filter(|(key, value)| key.file_id.as_deref() == Some(file_id) && !value.deleted)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        for key in cascade_keys {
+            let value = rows
+                .get_mut(&key)
+                .expect("cascade key was selected from this snapshot");
+            value.snapshot_content = None;
+            value.metadata = None;
+            value.deleted = true;
+            value.updated_at.clone_from(&next.updated_at);
+            value.change_id = next.change_id;
+            value.commit_id = next.commit_id;
+        }
+    }
     let key = TrackedStateKey {
         schema_key: next.schema_key.clone(),
         entity_pk: next.entity_pk.clone(),
@@ -2429,6 +2456,26 @@ async fn stage_tracked_roots(
         {
             let commit_id_text = root.commit_id.to_string();
             let parent_commit_id_text = root.parent_commit_id.map(|id| id.to_string());
+            let file_delete_cascades = state_row_indices
+                .iter()
+                .filter_map(|&row_index| {
+                    let row = &state_rows[row_index];
+                    (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+                        && row.file_id.is_none()
+                        && row.snapshot.is_none())
+                    .then_some(row)
+                })
+                .map(|row| {
+                    let delta = tracked_delta_from_state_row(row)?;
+                    let file_id = row.entity_pk.as_single_string().map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("file descriptor tombstone has invalid identity: {error}"),
+                        )
+                    })?;
+                    Ok((file_id.to_string(), delta))
+                })
+                .collect::<Result<BTreeMap<_, _>, LixError>>()?;
             let first_row = &state_rows[state_row_indices[0]];
             let first_mutation_key = encode_key_ref(TrackedStateKeyRef {
                 schema_key: &first_row.schema_key,
@@ -2441,6 +2488,7 @@ async fn stage_tracked_roots(
                     parent_commit_id_text.as_deref(),
                     state_row_indices.len(),
                     &first_mutation_key,
+                    &file_delete_cascades,
                     state_row_indices.iter().map(|&row_index| {
                         let row = &state_rows[row_index];
                         Ok(TrackedStateRootMutationRef {
@@ -2805,6 +2853,66 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[test]
+    fn lifecycle_file_delete_cascade_survives_descriptor_recreation() {
+        let semantic_key = TrackedStateKey {
+            schema_key: "semantic".to_string(),
+            entity_pk: EntityPk::single("line-1"),
+            file_id: Some("file-a".to_string()),
+        };
+        let semantic = MaterializedTrackedStateRow {
+            entity_pk: semantic_key.entity_pk.clone(),
+            schema_key: semantic_key.schema_key.clone(),
+            file_id: semantic_key.file_id.clone(),
+            snapshot_content: Some("{\"value\":1}".to_string()),
+            metadata: Some("{\"source\":\"plugin\"}".to_string()),
+            deleted: false,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            change_id: ChangeId::for_test_label("semantic-create"),
+            commit_id: CommitId::for_test_label("initial"),
+        };
+        let mut rows = BTreeMap::from([(semantic_key.clone(), semantic)]);
+        let descriptor_delete = MaterializedTrackedStateRow {
+            entity_pk: EntityPk::single("file-a"),
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            file_id: None,
+            snapshot_content: None,
+            metadata: None,
+            deleted: true,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-02T00:00:00Z".to_string(),
+            change_id: ChangeId::for_test_label("descriptor-delete"),
+            commit_id: CommitId::for_test_label("delete"),
+        };
+        apply_lifecycle_tracked_snapshot_row(&mut rows, descriptor_delete, false)
+            .expect("descriptor delete should cascade");
+
+        let mut descriptor_recreate = rows
+            .values()
+            .find(|row| row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY)
+            .expect("descriptor tombstone should exist")
+            .clone();
+        descriptor_recreate.snapshot_content = Some("{\"name\":\"a\"}".to_string());
+        descriptor_recreate.deleted = false;
+        descriptor_recreate.updated_at = "2026-01-03T00:00:00Z".to_string();
+        descriptor_recreate.change_id = ChangeId::for_test_label("descriptor-recreate");
+        descriptor_recreate.commit_id = CommitId::for_test_label("recreate");
+        apply_lifecycle_tracked_snapshot_row(&mut rows, descriptor_recreate, false)
+            .expect("descriptor recreation should apply");
+
+        let semantic = rows
+            .get(&semantic_key)
+            .expect("semantic cascade tombstone should remain");
+        assert!(semantic.deleted);
+        assert_eq!(semantic.snapshot_content, None);
+        assert_eq!(semantic.metadata, None);
+        assert_eq!(
+            semantic.change_id,
+            ChangeId::for_test_label("descriptor-delete")
+        );
     }
 
     const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
