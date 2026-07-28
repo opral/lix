@@ -1270,7 +1270,6 @@ mod tests {
             .expect("post-GC packed inventory should scan");
         assert!(inventory.commits.contains_key(&live_parent));
         assert!(!inventory.commits.contains_key(&dead_commit));
-        drop(reader);
         drop(read);
         assert!(json_ref_exists(&storage, crate::json_store::store::JSON_SPACE, shared_ref).await);
         assert!(

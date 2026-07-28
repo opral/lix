@@ -834,9 +834,7 @@ mod tests {
                 .expect("initial commit membership should load");
         assert_eq!(change_refs.len(), seed_schema_definitions().len() + 4);
         assert!(
-            !change_refs
-                .iter()
-                .any(|change_id| *change_id == record.change_id),
+            !change_refs.contains(&record.change_id),
             "initial commit row is derived from changelog.commit, not stored in its packed delta"
         );
 
