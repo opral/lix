@@ -6941,12 +6941,21 @@ mod tests {
             untracked: false,
             branch_id: "branch-a".into(),
         };
-        let upsert = |id: &str, snapshot: &[u8], effect| WasmEntityChange::Upsert {
-            entity: WasmEntity {
-                key: key(id),
-                snapshot_content: WasmHostBytes::Inline(snapshot.to_vec()),
-            },
-            effect,
+        let upsert = |id: &str, snapshot: &[u8], effect| {
+            let value = serde_json::from_slice::<JsonValue>(snapshot)
+                .expect("test snapshot must contain valid JSON");
+            let normalized =
+                String::from_utf8(snapshot.to_vec()).expect("test snapshot must be UTF-8");
+            WasmEntityChange::Upsert {
+                entity: WasmEntity {
+                    key: key(id),
+                    snapshot_content: WasmHostBytes::CanonicalJson {
+                        value: Arc::new(value),
+                        normalized: normalized.into(),
+                    },
+                },
+                effect,
+            }
         };
         let changes = WasmHostEntityChanges {
             changes: vec![

@@ -2939,10 +2939,17 @@ mod tests {
         let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[0] else {
             panic!("expected upsert")
         };
-        let WasmHostBytes::Inline(snapshot) = &entity.snapshot_content else {
-            panic!("resolved snapshots must be inline owned bytes")
+        let WasmHostBytes::CanonicalJson {
+            value, normalized, ..
+        } = &entity.snapshot_content
+        else {
+            panic!("resolved snapshots must retain parsed canonical JSON")
         };
-        assert_eq!(snapshot, br#"{"cells":[],"id":"row","order_key":"a"}"#);
+        assert_eq!(
+            normalized.as_ref(),
+            r#"{"cells":[],"id":"row","order_key":"a"}"#
+        );
+        assert_eq!(value["id"], "row");
         assert!(drained.counters.attachment_reads > 1);
         assert_eq!(drained.counters.source_read_calls, 2);
         assert!(actor.finished);

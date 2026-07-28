@@ -653,11 +653,6 @@ where
                 .iter()
                 .map(|delta| {
                     validated_absent_file_id.is_some_and(|file_id| delta.file_id == Some(file_id))
-                        || absence_guards.contains(&TrackedStateKey {
-                            schema_key: delta.schema_key.to_string(),
-                            file_id: delta.file_id.map(str::to_string),
-                            entity_pk: delta.entity_pk.clone(),
-                        })
                 })
                 .collect::<Vec<_>>()
         } else {
