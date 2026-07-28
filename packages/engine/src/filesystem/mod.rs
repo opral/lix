@@ -17,8 +17,6 @@ pub(crate) use self::path_index::{
 #[cfg(test)]
 pub(crate) use self::path_index::{full_rebuild_stats, reset_full_rebuild_stats};
 pub(crate) use self::planner::directory_path_resolvers_from_state_batch;
-#[cfg(test)]
-pub(crate) use self::planner::directory_path_resolvers_from_state_rows;
 pub(crate) use self::planner::{
     BlobRefRowInput, DerivedFileRefRowInput, DirectoryDescriptorWriteIntent, DirectoryPathResolver,
     FileDeleteInput, FileDescriptorWriteInput, FileDescriptorWriteIntent, FilesystemBlobRefKey,

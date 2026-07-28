@@ -2147,7 +2147,7 @@ mod tests {
         lix_directory_write_rows_from_batch_with_path_resolvers,
     };
     use crate::filesystem::{
-        FilesystemDescriptorKey, VisibleFilesystem, directory_path_resolvers_from_state_rows,
+        FilesystemDescriptorKey, VisibleFilesystem, directory_path_resolvers_from_state_batch,
     };
 
     fn path_index_from_rows(
@@ -2877,7 +2877,8 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
         )];
-        let mut resolvers = directory_path_resolvers_from_state_rows(existing_rows)
+        let existing_rows = MaterializedLiveStateBatch::from_rows(existing_rows);
+        let mut resolvers = directory_path_resolvers_from_state_batch(&existing_rows)
             .expect("existing directory rows should seed paths");
 
         let rows = lix_directory_write_rows_from_batch_with_path_resolvers(
