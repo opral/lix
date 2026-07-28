@@ -24,7 +24,7 @@ simulation_test!(
             .expect("target entity insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_label (id, name) VALUES ('label-a', 'Needs review')",
+                "INSERT INTO lix_label (id, name) VALUES ('01950000-0000-7000-8000-000000000006', 'Needs review')",
                 &[],
             )
             .await
@@ -33,7 +33,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_label_assignment \
                  (target_entity_pk, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, '01950000-0000-7000-8000-000000000006')",
                 &[],
             )
             .await
@@ -59,7 +59,7 @@ simulation_test!(
                 Value::Json(json!(["label-target"])),
                 Value::Text("lix_key_value".to_string()),
                 Value::Null,
-                Value::Text("label-a".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000006".to_string()),
             ]
         );
 
@@ -67,7 +67,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_label_assignment \
                  (target_entity_pk, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 VALUES (lix_json('[\"label-target\"]'), 'lix_key_value', NULL, '01950000-0000-7000-8000-000000000006')",
                 &[],
             )
             .await
@@ -84,7 +84,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_label (id, name) VALUES ('label-b', 'Needs review')",
+                "INSERT INTO lix_label (id, name) VALUES ('01950000-0000-7000-8000-000000000007', 'Needs review')",
                 &[],
             )
             .await
@@ -108,7 +108,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_label (id, name) VALUES ('label-a', 'Needs review')",
+                "INSERT INTO lix_label (id, name) VALUES ('01950000-0000-7000-8000-000000000006', 'Needs review')",
                 &[],
             )
             .await
@@ -118,7 +118,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_label_assignment \
                  (target_entity_pk, target_schema_key, target_file_id, label_id) \
-                 VALUES (lix_json('[\"missing-target\"]'), 'lix_key_value', NULL, 'label-a')",
+                 VALUES (lix_json('[\"missing-target\"]'), 'lix_key_value', NULL, '01950000-0000-7000-8000-000000000006')",
                 &[],
             )
             .await

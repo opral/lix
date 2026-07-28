@@ -25,6 +25,12 @@ use crate::storage_adapter::StorageAdapterRead;
 pub(crate) struct HistoryRoute {
     pub(crate) as_of_commit_ids: Vec<String>,
     pub(crate) entity_pks: Vec<String>,
+    /// Schema-resolved physical identities for traversal.
+    ///
+    /// `entity_pks` remains the canonical JSON surface representation used to
+    /// match projected rows. Keeping the typed form alongside it avoids
+    /// re-inferring component types from values after routing.
+    pub(crate) resolved_entity_pks: Vec<EntityPk>,
     pub(crate) schema_keys: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) min_depth: Option<i64>,
@@ -103,6 +109,10 @@ impl HistoryRoute {
 
     pub(crate) fn constrain_entity_pks(&mut self, entity_pks: Vec<String>) {
         self.contradictory |= apply_conjunctive_values_filter(&mut self.entity_pks, entity_pks);
+    }
+
+    pub(crate) fn set_resolved_entity_pks(&mut self, entity_pks: Vec<EntityPk>) {
+        self.resolved_entity_pks = entity_pks;
     }
 
     /// Checks filters that refer to the row exposed by a shaped history surface.
@@ -305,11 +315,15 @@ pub(crate) fn commit_graph_history_request(
 ) -> Option<CommitGraphChangeHistoryRequest> {
     let schema_keys = effective_schema_keys(route, schema_keys)?;
     Some(CommitGraphChangeHistoryRequest {
-        entity_pks: route
-            .entity_pks
-            .iter()
-            .filter_map(|entity_pk| EntityPk::from_json_array_text(entity_pk).ok())
-            .collect(),
+        entity_pks: if route.resolved_entity_pks.is_empty() {
+            route
+                .entity_pks
+                .iter()
+                .filter_map(|entity_pk| EntityPk::from_json_array_text(entity_pk).ok())
+                .collect()
+        } else {
+            route.resolved_entity_pks.clone()
+        },
         schema_keys,
         file_ids: route.file_ids.clone(),
         min_depth: route.min_depth.and_then(nonnegative_u32),

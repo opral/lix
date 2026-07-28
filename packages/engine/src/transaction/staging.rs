@@ -1549,7 +1549,7 @@ mod tests {
         assert_eq!(drained.state_rows.len(), 4);
         let refs = drained
             .commit_change_refs_by_branch
-            .get("branch-a")
+            .get("01920000-0000-7000-8000-0000000000a1")
             .expect("tracked branch should have commit refs");
         assert_eq!(refs.tracked_change_count, 4);
         assert!(
@@ -1595,7 +1595,7 @@ mod tests {
         assert_eq!(
             drained
                 .commit_change_refs_by_branch
-                .get("branch-a")
+                .get("01920000-0000-7000-8000-0000000000a1")
                 .expect("tracked branch should have commit refs")
                 .tracked_change_count,
             4
@@ -1685,14 +1685,20 @@ mod tests {
             .staging_overlay()
             .expect("overlay should build lazily");
         let row = overlay
-            .load_exact(&exact_request_for_branch_key("branch-a", "entity-b"))
+            .load_exact(&exact_request_for_branch_key(
+                "01920000-0000-7000-8000-0000000000a1",
+                "entity-b",
+            ))
             .expect("staged row should answer the exact read");
         assert!(matches!(row, StagedExactRow::Row(_)));
         assert!(staged_writes.uses_identity_index_for_tests());
 
         assert!(
             overlay
-                .load_exact(&exact_request_for_branch_key("branch-a", "entity-a"))
+                .load_exact(&exact_request_for_branch_key(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "entity-a"
+                ))
                 .is_some()
         );
         assert!(
@@ -1738,7 +1744,7 @@ mod tests {
         assert_eq!(
             drained
                 .commit_change_refs_by_branch
-                .get("branch-a")
+                .get("01920000-0000-7000-8000-0000000000a1")
                 .expect("branch commit refs should remain")
                 .tracked_change_count,
             2
@@ -1752,8 +1758,10 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
-                    tracked_append_row("entity-z", "first").with_file_id("file-a"),
-                    tracked_append_row("entity-a", "second").with_file_id("file-b"),
+                    tracked_append_row("entity-z", "first")
+                        .with_file_id("01920000-0000-7000-8000-0000000000a2"),
+                    tracked_append_row("entity-a", "second")
+                        .with_file_id("01920000-0000-7000-8000-0000000000b2"),
                 ],
             })
             .expect("tracked-tree order should accept file-before-entity rows");
@@ -1838,7 +1846,7 @@ mod tests {
         let row = overlay
             .load_exact(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                branch_id: "global".to_string(),
+                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: EntityPk::single("sql2-duplicate-key"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -1860,7 +1868,8 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
-                    state_row("entity-a", "cross-pair").with_file_id("file-b"),
+                    state_row("entity-a", "cross-pair")
+                        .with_file_id("01920000-0000-7000-8000-0000000000b2"),
                     tombstone_row("deleted").with_file_id("deleted"),
                 ],
             })
@@ -1870,18 +1879,18 @@ mod tests {
             .expect("overlay should build");
         let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
-            branch_id: "global".to_string(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             entity_pk: EntityPk::single(entity),
             file_id: Some(file_id.to_string()),
         };
-        let cross_pair = exact("entity-a", "file-b");
+        let cross_pair = exact("entity-a", "01920000-0000-7000-8000-0000000000b2");
         let rows = StagedLiveStateRows::load_exact_rows(
             &overlay,
             &LiveStateExactBatchRequest {
                 rows: vec![
                     cross_pair.clone(),
-                    exact("entity-a", "file-a"),
-                    exact("entity-b", "file-b"),
+                    exact("entity-a", "01920000-0000-7000-8000-0000000000a2"),
+                    exact("entity-b", "01920000-0000-7000-8000-0000000000b2"),
                     cross_pair,
                     exact("missing", "missing"),
                     exact("deleted", "deleted"),
@@ -2069,10 +2078,10 @@ mod tests {
             b"ll".to_vec(),
         );
         let mut file_data = TransactionFileData::new(
-            "file-readme".to_string(),
+            "01920000-0000-7000-8000-0000000000d2".to_string(),
             Some("/readme.md".to_string()),
             Some("readme.md".to_string()),
-            "global".to_string(),
+            "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             true,
             true,
             result,
@@ -2082,7 +2091,10 @@ mod tests {
         staged_writes
             .stage_write(PreparedTransactionWrite::RowsWithFileData {
                 mode: TransactionWriteMode::Replace,
-                rows: vec![state_row("file-readme", "descriptor")],
+                rows: vec![state_row(
+                    "01920000-0000-7000-8000-0000000000d2",
+                    "descriptor",
+                )],
                 file_data: vec![file_data],
                 count: 1,
             })
@@ -2092,7 +2104,10 @@ mod tests {
 
         assert_eq!(drained.state_rows.len(), 1);
         assert_eq!(drained.file_data_writes.len(), 1);
-        assert_eq!(drained.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(
+            drained.file_data_writes[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(drained.file_data_writes[0].data(), b"hello");
         assert_eq!(
             drained.file_data_writes[0].splice_provenance(),
@@ -2107,7 +2122,7 @@ mod tests {
             "requested-file".to_string(),
             Some("/requested.bin".to_string()),
             Some("requested.bin".to_string()),
-            "global".to_string(),
+            "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             true,
             true,
             b"requested-main".to_vec(),
@@ -2117,7 +2132,7 @@ mod tests {
             "unrelated-file".to_string(),
             Some("/unrelated.bin".to_string()),
             Some("unrelated.bin".to_string()),
-            "global".to_string(),
+            "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             true,
             true,
             b"unrelated-main".to_vec(),
@@ -2164,7 +2179,7 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
             .commit_change_refs_by_branch
-            .get("global")
+            .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.tracked_change_count, 1);
     }
@@ -2212,7 +2227,7 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
             .commit_change_refs_by_branch
-            .get("global")
+            .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.tracked_change_count, 1);
     }
@@ -2325,7 +2340,7 @@ mod tests {
                 rows: vec![
                     state_row("active-branch-key", "value")
                         .with_tracked()
-                        .with_branch("branch-a"),
+                        .with_branch("01920000-0000-7000-8000-0000000000a1"),
                 ],
             })
             .expect("active-branch tracked staging should accumulate change_refs");
@@ -2333,7 +2348,7 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
             .commit_change_refs_by_branch
-            .get("branch-a")
+            .get("01920000-0000-7000-8000-0000000000a1")
             .expect("active-branch commit change_refs should exist");
         assert_eq!(change_refs.tracked_change_count, 1);
     }
@@ -2347,7 +2362,7 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![{
                     let mut row = state_row("invalid-global-key", "value");
-                    row.branch_id = "branch-a".to_string();
+                    row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
                     row
                 }],
             })
@@ -2375,9 +2390,11 @@ mod tests {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
                     state_row("shared-entity", "latest"),
-                    state_row("shared-entity", "other-branch").with_branch("branch-b"),
+                    state_row("shared-entity", "other-branch")
+                        .with_branch("01920000-0000-7000-8000-0000000000b1"),
                     state_row("shared-entity", "other-schema").with_schema("other_schema"),
-                    state_row("shared-entity", "other-file").with_file_id("file-a"),
+                    state_row("shared-entity", "other-file")
+                        .with_file_id("01920000-0000-7000-8000-0000000000a2"),
                 ],
             })
             .expect("staging rows should succeed");
@@ -2400,7 +2417,7 @@ mod tests {
         assert_eq!(
             rows.iter()
                 .filter(|row| row.entity_pk == EntityPk::single("shared-entity")
-                    && row.branch_id.as_ref() == "global"
+                    && row.branch_id.as_ref() == "ffffffff-ffff-7fff-bfff-ffffffffffff"
                     && row.schema_key == "lix_key_value"
                     && row.file_id.is_none())
                 .count(),
@@ -2415,10 +2432,12 @@ mod tests {
             .stage_write(PreparedTransactionWrite::Rows {
                 mode: TransactionWriteMode::Replace,
                 rows: vec![
-                    state_row("selected", "global"),
+                    state_row("selected", "ffffffff-ffff-7fff-bfff-ffffffffffff"),
                     state_row("other", "other-entity"),
-                    state_row("selected", "active").with_branch("branch-a"),
-                    state_row("selected", "other-file").with_file_id("file-a"),
+                    state_row("selected", "active")
+                        .with_branch("01920000-0000-7000-8000-0000000000a1"),
+                    state_row("selected", "other-file")
+                        .with_file_id("01920000-0000-7000-8000-0000000000a2"),
                     state_row("selected", "other-schema").with_schema("other_schema"),
                 ],
             })
@@ -2432,7 +2451,7 @@ mod tests {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![EntityPk::single("selected")],
-                    branch_ids: vec!["branch-a".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     file_ids: vec![NullableKeyFilter::Null],
                     include_tombstones: true,
                     ..LiveStateFilter::default()
@@ -2451,7 +2470,10 @@ mod tests {
             row.schema_key == "lix_key_value"
                 && row.entity_pk == EntityPk::single("selected")
                 && row.file_id.is_none()
-                && matches!(row.branch_id.as_ref(), "branch-a" | GLOBAL_BRANCH_ID)
+                && matches!(
+                    row.branch_id.as_ref(),
+                    "01920000-0000-7000-8000-0000000000a1" | GLOBAL_BRANCH_ID
+                )
         }));
     }
 
@@ -2497,7 +2519,7 @@ mod tests {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 entity_pks: vec![EntityPk::single("selected")],
-                branch_ids: vec!["branch-a".to_string()],
+                branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones: true,
                 ..LiveStateFilter::default()
@@ -2534,7 +2556,10 @@ mod tests {
             .rows;
         assert_eq!(rows.len(), 1);
         assert!(rows[0].deleted);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
     }
 
     #[tokio::test]
@@ -2551,7 +2576,7 @@ mod tests {
         let drained = staged_writes.drain().expect("drain should succeed");
         let change_refs = drained
             .commit_change_refs_by_branch
-            .get("global")
+            .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
             .expect("global commit change_refs should exist");
         assert_eq!(change_refs.commit_id, test_commit_id(1));
         assert_eq!(change_refs.commit_change_id, test_change_id(2));
@@ -2578,7 +2603,7 @@ mod tests {
         assert_eq!(
             drained
                 .commit_change_refs_by_branch
-                .get("global")
+                .get("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .expect("global commit change_refs should exist")
                 .commit_id,
             test_commit_id(1)
@@ -2657,7 +2682,7 @@ mod tests {
             change_id: None,
             commit_id: None,
             untracked: true,
-            branch_id: "global".to_string(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
         }
     }
 
@@ -2670,7 +2695,7 @@ mod tests {
     fn exact_request_for_key(key: &str) -> LiveStateRowRequest {
         LiveStateRowRequest {
             schema_key: "lix_key_value".to_string(),
-            branch_id: "global".to_string(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             entity_pk: EntityPk::single(key),
             file_id: NullableKeyFilter::Null,
         }
@@ -2688,7 +2713,7 @@ mod tests {
     fn tracked_append_row(key: &str, value: &str) -> PreparedStateRow {
         state_row(key, value)
             .with_tracked()
-            .with_branch("branch-a")
+            .with_branch("01920000-0000-7000-8000-0000000000a1")
             .with_change_id(&format!("append-{key}"))
     }
 
@@ -2697,7 +2722,7 @@ mod tests {
             filter: LiveStateFilter {
                 schema_keys: vec!["lix_key_value".to_string()],
                 entity_pks: vec![EntityPk::single(key)],
-                branch_ids: vec!["global".to_string()],
+                branch_ids: vec!["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()],
                 file_ids: vec![NullableKeyFilter::Null],
                 include_tombstones,
                 ..LiveStateFilter::default()

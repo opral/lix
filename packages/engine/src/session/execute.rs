@@ -3320,9 +3320,16 @@ mod tests {
     fn exact_lix_file_read_recognizes_only_the_narrow_shapes() {
         let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
-            exact_lix_file_read_route(&data_by_id, &[Value::Text("file-a".to_string())]),
+            exact_lix_file_read_route(
+                &data_by_id,
+                &[Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                )]
+            ),
             Some(ExactLixFileRead::Point(
-                sql2::ExactLixFileReadSelector::Id("file-a".to_string()),
+                sql2::ExactLixFileReadSelector::Id(
+                    "01920000-0000-7000-8000-0000000000a2".to_string()
+                ),
                 sql2::ExactLixFileReadColumn::Data,
             ))
         );
@@ -3400,38 +3407,55 @@ mod tests {
         for (sql, params) in [
             (
                 "SELECT id FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data AS bytes FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM lix_file AS file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
-            ("SELECT data FROM lix_file WHERE id = 'file-a'", vec![]),
+            (
+                "SELECT data FROM lix_file WHERE id = '01920000-0000-7000-8000-0000000000a2'",
+                vec![],
+            ),
             (
                 "SELECT data FROM lix_file WHERE id = $1 LIMIT 1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT \"DATA\" FROM lix_file WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM \"LIX_FILE\" WHERE id = $1",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             (
                 "SELECT data FROM lix_file WHERE id = $1 AND true",
-                vec![Value::Text("file-a".to_string())],
+                vec![Value::Text(
+                    "01920000-0000-7000-8000-0000000000a2".to_string(),
+                )],
             ),
             ("SELECT data FROM lix_file WHERE id = $1", vec![Value::Null]),
             (
                 "SELECT data FROM lix_file WHERE id = $1",
                 vec![
-                    Value::Text("file-a".to_string()),
+                    Value::Text("01920000-0000-7000-8000-0000000000a2".to_string()),
                     Value::Text("extra".to_string()),
                 ],
             ),
@@ -4630,7 +4654,7 @@ mod tests {
             .expect("transaction should begin");
         transaction
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('selected-provider-file', '/selected.txt')",
+                "INSERT INTO lix_file (id, path) VALUES ('01920000-0000-7000-8000-000000000422', '/selected.txt')",
                 &[],
             )
             .await
@@ -4639,7 +4663,7 @@ mod tests {
         let result = transaction
             .execute(
                 "WITH selected AS (\
-                     SELECT id FROM lix_file WHERE id = 'selected-provider-file'\
+                     SELECT id FROM lix_file WHERE id = '01920000-0000-7000-8000-000000000422'\
                  ) \
                  SELECT id FROM selected",
                 &[],
@@ -4648,7 +4672,7 @@ mod tests {
             .expect("selected overlay provider should expose staged writes");
         assert_eq!(
             result.rows()[0].get::<String>("id").unwrap(),
-            "selected-provider-file"
+            "01920000-0000-7000-8000-000000000422"
         );
 
         transaction

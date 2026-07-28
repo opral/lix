@@ -23,7 +23,7 @@ use tempfile::TempDir;
 
 /// Format v2: one table per storage space instead of a single interleaved
 /// entries table. Hard cut; v1 files are rejected without migration.
-pub const SQLITE_FORMAT_VERSION: u32 = 3;
+pub const SQLITE_FORMAT_VERSION: u32 = 4;
 const LEGACY_ENTRIES_TABLE: &str = "lix_internal_entries";
 /// Keys per point-read chunk; each key binds 2 parameters (ordinal + key),
 /// so a full chunk uses 800 of SQLite's historical 999-parameter floor.
@@ -641,8 +641,8 @@ fn initialize_database(path: &Path) -> Result<Connection, StorageError> {
             "sqlite storage format version {user_version} is newer than supported version {SQLITE_FORMAT_VERSION}"
         )));
     }
-    // v3 changed the engine value layouts (identity-only tree values,
-    // JsonSlot change records); v1 and v2 files cannot be decoded.
+    // v3 changed engine value layouts; v4 changed tracked-state entity-key
+    // encoding. Older files cannot be decoded and are intentionally rejected.
     if (1..SQLITE_FORMAT_VERSION).contains(&user_version) || legacy_table_exists(&conn)? {
         return Err(StorageError::Io(format!(
             "sqlite storage format version {user_version} is not supported by version \

@@ -153,7 +153,10 @@ mod tests {
         .expect("canonical plugin should produce one install plan");
 
         assert_eq!(plan.plugin_key, "plugin_test");
-        assert_eq!(plan.archive_file_id, "lix_plugin_archive::plugin_test");
+        assert_eq!(
+            plan.archive_file_id,
+            crate::plugin::plugin_storage_archive_file_id("plugin_test")
+        );
         assert_eq!(plan.parsed.manifest.key, "plugin_test");
         assert_eq!(plan.parsed.schema_keys, ["plugin_test_note"]);
         assert_eq!(plan.parsed.wasm_bytes, WASM);

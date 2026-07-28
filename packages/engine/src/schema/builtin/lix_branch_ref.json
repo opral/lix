@@ -32,6 +32,7 @@
   "properties": {
     "id": {
       "type": "string",
+      "format": "uuid",
       "x-lix-default": "lix_uuid_v7()",
       "description": "Branch identifier whose head pointer is being stored; matches `lix_branch_descriptor.id`."
     },

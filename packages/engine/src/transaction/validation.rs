@@ -429,7 +429,8 @@ pub(crate) fn fresh_plugin_file_import_certificate(
         match row.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
                 if row.file_id.is_some()
-                    || row.entity_pk.as_single_string().ok() != Some(file_data.file_id.as_str())
+                    || row.entity_pk.as_single_string_owned().ok().as_deref()
+                        != Some(file_data.file_id.as_str())
                     || !filesystem_planner_validated_insert(&PreparedValidationRow::State(row))
                     || descriptor.replace(row).is_some()
                 {
@@ -442,7 +443,8 @@ pub(crate) fn fresh_plugin_file_import_certificate(
                 // replacement deliberately has no public SQL origin, but it
                 // remains a public INSERT under the outer file INSERT mode.
                 if row.file_id.as_deref() != Some(file_data.file_id.as_str())
-                    || row.entity_pk.as_single_string().ok() != Some(file_data.file_id.as_str())
+                    || row.entity_pk.as_single_string_owned().ok().as_deref()
+                        != Some(file_data.file_id.as_str())
                     || row.origin.is_some()
                     || row.facts.requires_transaction_validation
                     || blob_ref.replace(row).is_some()
@@ -919,7 +921,7 @@ fn filesystem_planner_validated_insert(row: &PreparedValidationRow<'_>) -> bool 
         && primary_key.values.len() == 1
         && row
             .entity_pk()
-            .as_single_string()
+            .as_single_string_owned()
             .is_ok_and(|entity_pk| primary_key.values[0] == entity_pk)
 }
 
@@ -1451,11 +1453,12 @@ impl PendingFileDescriptorIndex {
         domain: &Domain,
         file_id: &str,
     ) -> Option<PendingFileDescriptorState> {
+        let entity_pk = EntityPk::uuid_from_canonical(file_id).ok()?;
         self.by_identity
             .get(&DomainRowIdentity::in_domain(
                 domain.with_exact_file_scope(None),
                 FILE_DESCRIPTOR_SCHEMA_KEY,
-                EntityPk::single(file_id),
+                entity_pk,
             ))
             .copied()
     }
@@ -1540,11 +1543,14 @@ async fn committed_file_descriptor_exists_in_domain(
     descriptor_domain: &Domain,
     file_id: &str,
 ) -> Result<bool, LixError> {
+    let Ok(entity_pk) = EntityPk::uuid_from_canonical(file_id) else {
+        return Ok(false);
+    };
     let Some(row) = load_committed_constraint_row(
         live_state,
         descriptor_domain,
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        EntityPk::single(file_id),
+        entity_pk.clone(),
         false,
     )
     .await?
@@ -1553,7 +1559,7 @@ async fn committed_file_descriptor_exists_in_domain(
     };
     Ok(row.snapshot_content.is_some()
         && row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-        && row.entity_pk == EntityPk::single(file_id)
+        && row.entity_pk == entity_pk
         && row.file_id.is_none())
 }
 
@@ -1743,7 +1749,11 @@ fn validate_primary_key_identity(
     let Some(primary_key_paths) = schema_plan.primary_key.as_ref() else {
         return Ok(());
     };
-    let derived = EntityPk::from_primary_key_paths(snapshot, primary_key_paths)
+    let component_types = schema_plan
+        .primary_key_component_types
+        .as_deref()
+        .expect("primary-key paths and component types are compiled together");
+    let derived = EntityPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
         .map_err(|error| primary_key_identity_error(row, primary_key_paths, error))?;
     if row.entity_pk() != &derived {
         return Err(LixError::new(
@@ -2592,13 +2602,13 @@ fn primary_key_entity_pk_for_target(
     if target_plan.primary_key.as_ref()? != &target.pointer_group {
         return None;
     }
-    let parts = target
+    let values = target
         .value
         .0
         .iter()
-        .map(|value| serde_json::from_str::<String>(value).ok())
+        .map(|value| serde_json::from_str::<JsonValue>(value).ok())
         .collect::<Option<Vec<_>>>()?;
-    EntityPk::from_parts(parts).ok()
+    EntityPk::from_json_values(&values, target_plan.primary_key_component_types.as_deref()?).ok()
 }
 
 async fn committed_state_surface_foreign_key_target_exists(
@@ -2906,9 +2916,9 @@ impl UniqueConstraintValue {
     fn from_entity_pk(identity: &EntityPk) -> Self {
         Self(
             identity
-                .parts
+                .components
                 .iter()
-                .map(|part| format!("{part:?}"))
+                .map(|component| format!("{:?}", component.external_json()))
                 .collect(),
         )
     }
@@ -2982,7 +2992,11 @@ fn primary_key_identity_error(
         }
         EntityPkError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("non-string value at primary-key pointer '{pointer}'")
+            format!("unsupported value at primary-key pointer '{pointer}'")
+        }
+        EntityPkError::InvalidPrimaryKeyValue { index, expected } => {
+            let pointer = format_json_pointer(&primary_key_paths[index]);
+            format!("value at primary-key pointer '{pointer}' must be a valid {expected}")
         }
         EntityPkError::InvalidEncodedEntityPk => "invalid encoded entity primary key".to_string(),
     };
@@ -3679,18 +3693,35 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_namespace_change_detection_skips_unchanged_exact_occupants() {
-        let mut tracked = staged_file_descriptor_row("file-a", "branch-a");
+        let mut tracked = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         tracked.metadata = Some(test_stage_json(r#"{"revision":2}"#));
-        let mut untracked = staged_file_descriptor_row("file-u", "branch-a");
+        let mut untracked = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000182",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked);
-        let mut committed_untracked = committed_file_descriptor_row("file-u", "branch-a");
+        let mut committed_untracked = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000182",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_live_row_untracked(&mut committed_untracked);
-        let directory = directory_descriptor_row("dir-a", None, "dir", "branch-a");
+        let directory = directory_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a3",
+            None,
+            "dir",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
 
         let cases = vec![
             (
                 vec![tracked],
-                vec![committed_file_descriptor_row("file-a", "branch-a")],
+                vec![committed_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )],
                 "tracked descriptor",
             ),
             (
@@ -3700,11 +3731,11 @@ mod tests {
             ),
             (
                 vec![staged_file_descriptor_row(
-                    "global-file",
+                    "01920000-0000-7000-8000-000000000192",
                     crate::GLOBAL_BRANCH_ID,
                 )],
                 vec![committed_file_descriptor_row(
-                    "global-file",
+                    "01920000-0000-7000-8000-000000000192",
                     crate::GLOBAL_BRANCH_ID,
                 )],
                 "global descriptor",
@@ -3722,22 +3753,39 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_namespace_change_detection_falls_back_for_namespace_mutations() {
-        let committed_file = committed_file_descriptor_row("file-a", "branch-a");
+        let committed_file = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
 
-        let mut renamed = staged_file_descriptor_row("file-a", "branch-a");
+        let mut renamed = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         renamed.snapshot = Some(test_stage_json(
-            r#"{"id":"file-a","directory_id":null,"name":"renamed"}"#,
+            r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":null,"name":"renamed"}"#,
         ));
-        let mut moved = staged_file_descriptor_row("file-a", "branch-a");
+        let mut moved = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         moved.snapshot = Some(test_stage_json(
-            r#"{"id":"file-a","directory_id":"dir-a","name":"file-a"}"#,
+            r#"{"id":"01920000-0000-7000-8000-0000000000a2","directory_id":"01920000-0000-7000-8000-0000000000a3","name":"01920000-0000-7000-8000-0000000000a2"}"#,
         ));
-        let mut untracked = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked);
-        let mut renamed_directory = directory_descriptor_row("dir-a", None, "before", "branch-a");
+        let mut renamed_directory = directory_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a3",
+            None,
+            "before",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let committed_directory = MaterializedLiveStateRow::from(renamed_directory.clone());
         renamed_directory.snapshot = Some(test_stage_json(
-            r#"{"id":"dir-a","parent_id":null,"name":"after"}"#,
+            r#"{"id":"01920000-0000-7000-8000-0000000000a3","parent_id":null,"name":"after"}"#,
         ));
 
         let cases = vec![
@@ -3745,20 +3793,35 @@ mod tests {
             (vec![moved], vec![committed_file.clone()], "move"),
             (
                 vec![
-                    staged_file_descriptor_row("file-a", "branch-a"),
-                    staged_file_descriptor_row("file-new", "branch-a"),
+                    staged_file_descriptor_row(
+                        "01920000-0000-7000-8000-0000000000a2",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ),
+                    staged_file_descriptor_row(
+                        "01920000-0000-7000-8000-000000000172",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ),
                 ],
                 vec![committed_file.clone()],
                 "mixed existing/new descriptors",
             ),
             (
                 vec![
-                    staged_file_descriptor_row("file-a", "branch-a"),
-                    staged_file_descriptor_row("file-b", "branch-a"),
+                    staged_file_descriptor_row(
+                        "01920000-0000-7000-8000-0000000000a2",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ),
+                    staged_file_descriptor_row(
+                        "01920000-0000-7000-8000-0000000000b2",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ),
                 ],
                 vec![
                     committed_file.clone(),
-                    committed_file_descriptor_row("file-b", "branch-a"),
+                    committed_file_descriptor_row(
+                        "01920000-0000-7000-8000-0000000000b2",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ),
                 ],
                 "multiple unchanged descriptors",
             ),
@@ -3776,7 +3839,10 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_namespace_tombstone_only_batches_skip_full_scan() {
-        let mut deleted = staged_file_descriptor_row("file-a", "branch-a");
+        let mut deleted = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         deleted.snapshot = None;
         let delete_write = PreparedWriteSet {
             state_rows: vec![deleted.clone()],
@@ -3791,7 +3857,13 @@ mod tests {
         );
 
         let mixed_write = PreparedWriteSet {
-            state_rows: vec![deleted, staged_file_descriptor_row("file-new", "branch-a")],
+            state_rows: vec![
+                deleted,
+                staged_file_descriptor_row(
+                    "01920000-0000-7000-8000-000000000172",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
+            ],
             ..empty_staged_write_set()
         };
         assert_eq!(
@@ -3805,18 +3877,39 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_planner_inserts_skip_redundant_namespace_scan() {
-        for (surface, schema_key) in [
-            ("lix_file", FILE_DESCRIPTOR_SCHEMA_KEY),
-            ("lix_file_by_branch", FILE_DESCRIPTOR_SCHEMA_KEY),
-            ("lix_directory", DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
-            ("lix_directory_by_branch", DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+        for (surface, schema_key, entity_id) in [
+            (
+                "lix_file",
+                FILE_DESCRIPTOR_SCHEMA_KEY,
+                "01920000-0000-7000-8000-000000000202",
+            ),
+            (
+                "lix_file_by_branch",
+                FILE_DESCRIPTOR_SCHEMA_KEY,
+                "01920000-0000-7000-8000-000000000212",
+            ),
+            (
+                "lix_directory",
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                "01920000-0000-7000-8000-000000000203",
+            ),
+            (
+                "lix_directory_by_branch",
+                DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+                "01920000-0000-7000-8000-000000000213",
+            ),
         ] {
             let mut logical_insert = if schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
-                staged_file_descriptor_row(surface, "branch-a")
+                staged_file_descriptor_row(entity_id, "01920000-0000-7000-8000-0000000000a1")
             } else {
-                directory_descriptor_row(surface, None, surface, "branch-a")
+                directory_descriptor_row(
+                    entity_id,
+                    None,
+                    surface,
+                    "01920000-0000-7000-8000-0000000000a1",
+                )
             };
-            logical_insert.origin = Some(filesystem_insert_origin(surface, surface));
+            logical_insert.origin = Some(filesystem_insert_origin(surface, entity_id));
             let untrusted_transaction_write = PreparedWriteSet {
                 state_rows: vec![logical_insert.clone()],
                 ..empty_staged_write_set()
@@ -3847,23 +3940,47 @@ mod tests {
 
     #[tokio::test]
     async fn filesystem_planner_certificate_must_match_final_descriptor() {
-        let mut wrong_surface = staged_file_descriptor_row("wrong-surface", "branch-a");
-        wrong_surface.origin = Some(filesystem_insert_origin("lix_directory", "wrong-surface"));
-        let mut missing_key = staged_file_descriptor_row("missing-key", "branch-a");
+        let mut wrong_surface = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000222",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        wrong_surface.origin = Some(filesystem_insert_origin(
+            "lix_directory",
+            "01920000-0000-7000-8000-000000000222",
+        ));
+        let mut missing_key = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000232",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         missing_key.origin = Some(TransactionWriteOrigin {
             surface: "lix_file".to_string(),
             operation: TransactionWriteOperation::Insert,
             primary_key: None,
         });
-        let mut wrong_key = staged_file_descriptor_row("wrong-key", "branch-a");
-        wrong_key.origin = Some(filesystem_insert_origin("lix_file", "different-id"));
-        let mut update = staged_file_descriptor_row("update", "branch-a");
+        let mut wrong_key = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000242",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        wrong_key.origin = Some(filesystem_insert_origin(
+            "lix_file",
+            "01920000-0000-7000-8000-000000000252",
+        ));
+        let mut update = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000262",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         update.origin = Some(TransactionWriteOrigin {
             operation: TransactionWriteOperation::Update,
-            ..filesystem_insert_origin("lix_file", "update")
+            ..filesystem_insert_origin("lix_file", "01920000-0000-7000-8000-000000000262")
         });
-        let mut near_match = staged_file_descriptor_row("near-match", "branch-a");
-        near_match.origin = Some(filesystem_insert_origin("lix_file_internal", "near-match"));
+        let mut near_match = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000272",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        near_match.origin = Some(filesystem_insert_origin(
+            "lix_file_internal",
+            "01920000-0000-7000-8000-000000000272",
+        ));
 
         for (row, scenario) in [
             (wrong_surface, "wrong schema/surface pair"),
@@ -3888,7 +4005,10 @@ mod tests {
 
     #[tokio::test]
     async fn direct_and_mixed_descriptor_inserts_keep_namespace_scan() {
-        let explicit_insert = staged_file_descriptor_row("explicit-insert", "branch-a");
+        let explicit_insert = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000282",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let mut explicit_write = PreparedWriteSet {
             state_rows: vec![explicit_insert.clone()],
             ..empty_staged_write_set()
@@ -3902,8 +4022,14 @@ mod tests {
             "direct descriptor inserts have no trusted planner certificate"
         );
 
-        let mut logical_insert = staged_file_descriptor_row("logical-insert", "branch-a");
-        logical_insert.origin = Some(filesystem_insert_origin("lix_file", "logical-insert"));
+        let mut logical_insert = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000292",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        logical_insert.origin = Some(filesystem_insert_origin(
+            "lix_file",
+            "01920000-0000-7000-8000-000000000292",
+        ));
         let mixed_write = PreparedWriteSet {
             state_rows: vec![logical_insert, explicit_insert],
             ..empty_staged_write_set()
@@ -3919,7 +4045,10 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_committed_unique_scan_defers_to_namespace_validation() {
-        let mut inserted = staged_file_descriptor_row("file-new", "branch-a");
+        let mut inserted = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000172",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         inserted.origin = Some(TransactionWriteOrigin {
             surface: "lix_file".to_string(),
             operation: TransactionWriteOperation::Insert,
@@ -3951,7 +4080,10 @@ mod tests {
         ])
         .expect("descriptor catalog should compile");
         let live_state = CountingStaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
+            rows: vec![committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             scan_count: AtomicUsize::new(0),
         };
         let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
@@ -3969,23 +4101,29 @@ mod tests {
 
     #[tokio::test]
     async fn descriptor_namespace_still_rejects_same_kind_and_cross_kind_conflicts() {
-        let mut inserted = staged_file_descriptor_row("file-new", "branch-a");
+        let mut inserted = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000172",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         inserted.snapshot = Some(test_stage_json(
-            r#"{"id":"file-new","directory_id":null,"name":"occupied"}"#,
+            r#"{"id":"01920000-0000-7000-8000-000000000172","directory_id":null,"name":"occupied"}"#,
         ));
         let staged_writes = PreparedWriteSet {
             state_rows: vec![inserted],
             ..empty_staged_write_set()
         };
         let visible_schemas = vec![file_descriptor_schema(), directory_descriptor_schema()];
-        let mut committed_file = committed_file_descriptor_row("file-existing", "branch-a");
+        let mut committed_file = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-000000000162",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         committed_file.snapshot_content =
-            Some(r#"{"id":"file-existing","directory_id":null,"name":"occupied"}"#.to_string());
+            Some(r#"{"id":"01920000-0000-7000-8000-000000000162","directory_id":null,"name":"occupied"}"#.to_string());
         let committed_directory = MaterializedLiveStateRow::from(directory_descriptor_row(
-            "dir-existing",
+            "01920000-0000-7000-8000-000000000163",
             None,
             "occupied",
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
         ));
 
         for (committed, scenario) in [
@@ -4322,7 +4460,7 @@ mod tests {
     fn pending_schema_domain_covers_file_scoped_rows_in_the_same_catalog() {
         let mut pending_schema = pending_registered_schema_row("pending_file_schema");
         pending_schema.global = false;
-        pending_schema.branch_id = "branch-a".to_string();
+        pending_schema.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         let pending_rows = [PreparedValidationRow::State(&pending_schema)];
         let domains = PendingSchemaDomains::from_staged_rows(&pending_rows)
             .expect("pending schema domains should build");
@@ -4332,8 +4470,8 @@ mod tests {
             Some(json!({ "id": "entity-1" }).to_string()),
         );
         file_row.global = false;
-        file_row.branch_id = "branch-a".to_string();
-        file_row.file_id = Some("file-a".to_string());
+        file_row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
+        file_row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
 
         domains
             .validate_row_schema_domain(PreparedValidationRow::State(&file_row))
@@ -4430,7 +4568,10 @@ mod tests {
         ];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                staged_file_descriptor_row("file-a", "branch-a"),
+                staged_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
                 unique_row("post-1", "hello-world", "first"),
             ],
             ..empty_staged_write_set()
@@ -4452,7 +4593,10 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -4485,7 +4629,10 @@ mod tests {
         mark_prepared_row_untracked(&mut untracked_row);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                staged_file_descriptor_row("file-a", "branch-a"),
+                staged_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
                 untracked_row,
             ],
             ..empty_staged_write_set()
@@ -4507,7 +4654,10 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -4538,7 +4688,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
+            rows: vec![committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -4583,7 +4736,10 @@ mod tests {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let mut untracked_file_descriptor = committed_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_live_row_untracked(&mut untracked_file_descriptor);
         let live_state = StrictStaticLiveStateReader {
             rows: vec![untracked_file_descriptor],
@@ -4612,7 +4768,10 @@ mod tests {
             ..empty_staged_write_set()
         };
         let live_state = StrictStaticLiveStateReader {
-            rows: vec![committed_file_descriptor_row("file-a", "branch-a")],
+            rows: vec![committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
         };
 
         validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
@@ -4631,8 +4790,14 @@ mod tests {
             state_rows: vec![unique_row("post-1", "hello-world", "first")],
             ..empty_staged_write_set()
         };
-        let tracked_file_descriptor = committed_file_descriptor_row("file-a", "branch-a");
-        let mut untracked_tombstone = committed_file_descriptor_row("file-a", "branch-a");
+        let tracked_file_descriptor = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        let mut untracked_tombstone = committed_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         untracked_tombstone.snapshot_content = None;
         mark_live_row_untracked(&mut untracked_tombstone);
         let live_state = OverlayingStaticLiveStateReader {
@@ -4655,7 +4820,10 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
@@ -4681,7 +4849,10 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut file_descriptor_delete = staged_file_descriptor_row("file-a", "branch-a");
+        let mut file_descriptor_delete = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         file_descriptor_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![file_descriptor_delete],
@@ -4692,7 +4863,10 @@ mod tests {
         mark_live_row_untracked(&mut untracked_row);
         let live_state = StrictStaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "branch-a"),
+                committed_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
                 untracked_row,
             ],
         };
@@ -4709,9 +4883,18 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_untracked_directory_parent_to_tracked_directory() {
         let visible_schemas = vec![directory_descriptor_schema()];
-        let tracked_parent = directory_descriptor_row("dir-parent", None, "parent", "branch-a");
-        let mut untracked_child =
-            directory_descriptor_row("dir-child", Some("dir-parent"), "child", "branch-a");
+        let tracked_parent = directory_descriptor_row(
+            "01920000-0000-7000-8000-000000000173",
+            None,
+            "parent",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        let mut untracked_child = directory_descriptor_row(
+            "01920000-0000-7000-8000-000000000183",
+            Some("01920000-0000-7000-8000-000000000173"),
+            "child",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![tracked_parent, untracked_child],
@@ -4732,7 +4915,7 @@ mod tests {
         };
         let live_state = StrictStaticLiveStateReader {
             rows: vec![committed_file_descriptor_row(
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
                 crate::GLOBAL_BRANCH_ID,
             )],
         };
@@ -4806,7 +4989,7 @@ mod tests {
     async fn validation_rejects_pending_unique_same_value_in_same_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut duplicate = unique_row("post-2", "hello-world", "second");
-        duplicate.branch_id = "branch-a".to_string();
+        duplicate.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), duplicate],
             ..empty_staged_write_set()
@@ -4823,7 +5006,7 @@ mod tests {
     async fn validation_allows_pending_unique_same_value_in_different_branches() {
         let visible_schemas = vec![unique_schema()];
         let mut branch_b = unique_row("post-2", "hello-world", "second");
-        branch_b.branch_id = "branch-b".to_string();
+        branch_b.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![unique_row("post-1", "hello-world", "first"), branch_b],
             ..empty_staged_write_set()
@@ -4869,9 +5052,9 @@ mod tests {
     async fn validation_scopes_pending_unique_values_by_file_and_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut different_file = unique_row("post-2", "hello-world", "second");
-        different_file.file_id = Some("file-b".to_string());
+        different_file.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
         let mut different_branch = unique_row("post-3", "hello-world", "third");
-        different_branch.branch_id = "branch-b".to_string();
+        different_branch.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 unique_row("post-1", "hello-world", "first"),
@@ -5015,7 +5198,7 @@ mod tests {
     async fn validation_allows_committed_unique_same_value_in_different_branches() {
         let visible_schemas = vec![unique_schema()];
         let mut branch_b = unique_row("post-2", "hello-world", "second");
-        branch_b.branch_id = "branch-b".to_string();
+        branch_b.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![branch_b],
             ..empty_staged_write_set()
@@ -5041,7 +5224,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         let mut projected_overlay_row = committed_unique_row("post-1", "hello-world", "first");
-        projected_overlay_row.branch_id = "branch-a".into();
+        projected_overlay_row.branch_id = "01920000-0000-7000-8000-0000000000a1".into();
         projected_overlay_row.global = true;
         let live_state = StaticLiveStateReader {
             rows: vec![projected_overlay_row],
@@ -5193,9 +5376,9 @@ mod tests {
     async fn validation_allows_committed_unique_same_value_in_different_file_or_branch() {
         let visible_schemas = vec![unique_schema()];
         let mut different_file = unique_row("post-2", "hello-world", "second");
-        different_file.file_id = Some("file-b".to_string());
+        different_file.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
         let mut different_branch = unique_row("post-3", "hello-world", "third");
-        different_branch.branch_id = "branch-b".to_string();
+        different_branch.branch_id = "01920000-0000-7000-8000-0000000000b1".to_string();
         let staged_writes = PreparedWriteSet {
             state_rows: vec![different_file, different_branch],
             ..empty_staged_write_set()
@@ -5217,7 +5400,11 @@ mod tests {
     async fn validation_rejects_foreign_key_target_missing_in_same_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
+            state_rows: vec![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             ..empty_staged_write_set()
         };
 
@@ -5233,8 +5420,12 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                fk_parent_row("parent-1", "branch-a"),
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
@@ -5252,15 +5443,23 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_parent = fk_parent_row("parent-1", "branch-a");
+        let mut untracked_parent =
+            fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         mark_prepared_row_untracked(&mut untracked_parent);
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 untracked_file_descriptor,
                 untracked_parent,
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
@@ -5280,11 +5479,21 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let tracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
-        let tracked_parent = fk_parent_row("parent-1", "branch-a");
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let tracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
+        let tracked_parent = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row("child-1", "parent-1", "branch-a");
+        let mut untracked_child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
@@ -5306,8 +5515,12 @@ mod tests {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
-                fk_parent_row("parent-1", "branch-b"),
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000b1"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
@@ -5323,18 +5536,27 @@ mod tests {
     async fn validation_primary_key_fk_point_lookup_ignores_unrelated_rows() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
+            state_rows: vec![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![
                 {
-                    let mut unrelated =
-                        MaterializedLiveStateRow::from(fk_parent_row("unrelated", "branch-a"));
+                    let mut unrelated = MaterializedLiveStateRow::from(fk_parent_row(
+                        "unrelated",
+                        "01920000-0000-7000-8000-0000000000a1",
+                    ));
                     unrelated.snapshot_content = Some("{invalid".to_string());
                     unrelated
                 },
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
             ],
         };
 
@@ -5351,11 +5573,17 @@ mod tests {
     async fn validation_rejects_tracked_foreign_key_target_committed_only_as_untracked() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
+            state_rows: vec![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             ..empty_staged_write_set()
         };
-        let mut untracked_parent =
-            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
+        let mut untracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_parent);
         let live_state = StaticLiveStateReader {
             rows: vec![untracked_parent],
@@ -5381,9 +5609,16 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_child = fk_child_row("child-1", "parent-1", "branch-a");
+        let mut untracked_child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_child);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_file_descriptor, untracked_child],
@@ -5391,8 +5626,14 @@ mod tests {
         };
         let live_state = StaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "branch-a"),
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
+                committed_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
             ],
         };
 
@@ -5409,12 +5650,21 @@ mod tests {
     async fn validation_allows_tracked_foreign_key_target_committed_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
+            state_rows: vec![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
-        let mut untracked_overlay =
-            MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
+        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_parent, untracked_overlay],
@@ -5434,17 +5684,26 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_deleting_tracked_fk_target_referenced_behind_untracked_overlay() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
-        let tracked_child =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a"));
-        let mut untracked_child_overlay =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "other-parent", "branch-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
+        let tracked_child = MaterializedLiveStateRow::from(fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
+        let mut untracked_child_overlay = MaterializedLiveStateRow::from(fk_child_row(
+            "child-1",
+            "other-parent",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_child_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_parent, tracked_child, untracked_child_overlay],
@@ -5465,15 +5724,21 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_deleting_tracked_fk_target_referenced_by_committed_untracked_row() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![parent_delete],
             ..empty_staged_write_set()
         };
-        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a"));
-        let mut untracked_child =
-            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a"));
+        let tracked_parent = MaterializedLiveStateRow::from(fk_parent_row(
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
+        let mut untracked_child = MaterializedLiveStateRow::from(fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_child);
         let live_state = StaticLiveStateReader {
             rows: vec![tracked_parent, untracked_child],
@@ -5495,12 +5760,17 @@ mod tests {
     async fn validation_rejects_foreign_key_target_committed_only_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
         let staged_writes = PreparedWriteSet {
-            state_rows: vec![fk_child_row("child-1", "parent-1", "branch-a")],
+            state_rows: vec![fk_child_row(
+                "child-1",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
+            )],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-b",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000b1",
             ))],
         };
 
@@ -5521,18 +5791,23 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_foreign_key_target_tombstoned_by_transaction() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-a",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -5551,19 +5826,25 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_tracked_fk_target_when_untracked_tombstone_shadows_same_identity() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut untracked_parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut untracked_parent_delete =
+            fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         untracked_parent_delete.snapshot = None;
         mark_prepared_row_untracked(&mut untracked_parent_delete);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 untracked_parent_delete,
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-a",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -5579,18 +5860,23 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_pending_reference_to_deleted_identity() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_child_row("child-1", "parent-1", "branch-a"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-a",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -5609,13 +5895,17 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_delete_with_pending_reference_in_different_branch() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 parent_delete,
-                fk_parent_row("parent-1", "branch-b"),
-                fk_child_row("child-1", "parent-1", "branch-b"),
+                fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000b1"),
+                fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000b1",
+                ),
             ],
             ..empty_staged_write_set()
         };
@@ -5633,13 +5923,14 @@ mod tests {
                 "ref-1",
                 "target-1",
                 "fk_parent_schema",
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
             )],
             ..empty_staged_write_set()
         };
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1", "branch-a",
+                "target-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -5660,15 +5951,24 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_target = fk_parent_row("target-1", "branch-a");
+        let mut untracked_target =
+            fk_parent_row("target-1", "01920000-0000-7000-8000-0000000000a1");
         mark_prepared_row_untracked(&mut untracked_target);
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![
                 untracked_file_descriptor,
                 untracked_target,
-                state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a"),
+                state_surface_ref_row(
+                    "ref-1",
+                    "target-1",
+                    "fk_parent_schema",
+                    "01920000-0000-7000-8000-0000000000a2",
+                ),
             ],
             ..empty_staged_write_set()
         };
@@ -5690,12 +5990,14 @@ mod tests {
                 "ref-1",
                 "target-1",
                 "fk_parent_schema",
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
             )],
             ..empty_staged_write_set()
         };
-        let mut untracked_target =
-            MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
+        let mut untracked_target = MaterializedLiveStateRow::from(fk_parent_row(
+            "target-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_target);
         let live_state = StaticLiveStateReader {
             rows: vec![untracked_target],
@@ -5723,10 +6025,17 @@ mod tests {
             file_descriptor_schema(),
             directory_descriptor_schema(),
         ];
-        let mut untracked_file_descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut untracked_file_descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         mark_prepared_row_untracked(&mut untracked_file_descriptor);
-        let mut untracked_ref =
-            state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
+        let mut untracked_ref = state_surface_ref_row(
+            "ref-1",
+            "target-1",
+            "fk_parent_schema",
+            "01920000-0000-7000-8000-0000000000a2",
+        );
         mark_prepared_row_untracked(&mut untracked_ref);
         let staged_writes = PreparedWriteSet {
             state_rows: vec![untracked_file_descriptor, untracked_ref],
@@ -5734,8 +6043,14 @@ mod tests {
         };
         let live_state = StaticLiveStateReader {
             rows: vec![
-                committed_file_descriptor_row("file-a", "branch-a"),
-                MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a")),
+                committed_file_descriptor_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "target-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
             ],
         };
 
@@ -5757,13 +6072,18 @@ mod tests {
                 "ref-1",
                 "target-1",
                 "fk_parent_schema",
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
             )],
             ..empty_staged_write_set()
         };
-        let tracked_target = MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
-        let mut untracked_overlay =
-            MaterializedLiveStateRow::from(fk_parent_row("target-1", "branch-a"));
+        let tracked_target = MaterializedLiveStateRow::from(fk_parent_row(
+            "target-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
+        let mut untracked_overlay = MaterializedLiveStateRow::from(fk_parent_row(
+            "target-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        ));
         mark_live_row_untracked(&mut untracked_overlay);
         let live_state = OverlayingStaticLiveStateReader {
             rows: vec![tracked_target, untracked_overlay],
@@ -5788,7 +6108,7 @@ mod tests {
                 "ref-1",
                 json!(["welcome.title", "en"]),
                 "composite_message_schema",
-                "file-a",
+                "01920000-0000-7000-8000-0000000000a2",
             )],
             ..empty_staged_write_set()
         };
@@ -5796,7 +6116,7 @@ mod tests {
             rows: vec![MaterializedLiveStateRow::from(composite_message_row(
                 "welcome.title",
                 "en",
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -5812,12 +6132,19 @@ mod tests {
     #[tokio::test]
     async fn validation_rejects_delete_when_same_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
+                MaterializedLiveStateRow::from(fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -5840,12 +6167,19 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_delete_when_only_different_branch_reference_exists() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-b")),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
+                MaterializedLiveStateRow::from(fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000b1",
+                )),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -5865,14 +6199,25 @@ mod tests {
     #[tokio::test]
     async fn validation_allows_delete_when_committed_reference_is_also_deleted() {
         let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
-        let mut child_delete = fk_child_row("child-1", "parent-1", "branch-a");
+        let mut child_delete = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         child_delete.snapshot = None;
         let live_state = StaticLiveStateReader {
             rows: vec![
-                MaterializedLiveStateRow::from(fk_parent_row("parent-1", "branch-a")),
-                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", "branch-a")),
+                MaterializedLiveStateRow::from(fk_parent_row(
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
+                MaterializedLiveStateRow::from(fk_child_row(
+                    "child-1",
+                    "parent-1",
+                    "01920000-0000-7000-8000-0000000000a1",
+                )),
             ],
         };
         let staged_writes = PreparedWriteSet {
@@ -5910,7 +6255,7 @@ mod tests {
     #[test]
     fn pending_indexes_record_primary_key_fk_targets_by_exact_scope() {
         let mut indexes = PendingConstraintIndexes::default();
-        let row = fk_parent_row("parent-1", "branch-a");
+        let row = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -5931,8 +6276,8 @@ mod tests {
             indexes
                 .has_fk_target(
                     "fk_parent_schema",
-                    "branch-a",
-                    Some("file-a"),
+                    "01920000-0000-7000-8000-0000000000a1",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     &["/id"],
                     UniqueConstraintValue::string_values(["parent-1"]),
                 )
@@ -5942,8 +6287,8 @@ mod tests {
             !indexes
                 .has_fk_target(
                     "fk_parent_schema",
-                    "branch-b",
-                    Some("file-a"),
+                    "01920000-0000-7000-8000-0000000000b1",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     &["/id"],
                     UniqueConstraintValue::string_values(["parent-1"]),
                 )
@@ -5975,8 +6320,8 @@ mod tests {
             indexes
                 .has_fk_target(
                     "unique_schema",
-                    "branch-a",
-                    Some("file-a"),
+                    "01920000-0000-7000-8000-0000000000a1",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     &["/slug"],
                     UniqueConstraintValue::string_values(["hello-world"]),
                 )
@@ -5987,7 +6332,11 @@ mod tests {
     #[test]
     fn pending_indexes_record_normal_fk_references_by_exact_scope() {
         let mut indexes = PendingConstraintIndexes::default();
-        let row = fk_child_row("child-1", "parent-1", "branch-a");
+        let row = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -6012,8 +6361,8 @@ mod tests {
             indexes
                 .has_fk_reference_to_key(
                     "fk_parent_schema",
-                    "branch-a",
-                    Some("file-a"),
+                    "01920000-0000-7000-8000-0000000000a1",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     &["/id"],
                     UniqueConstraintValue::string_values(["parent-1"]),
                 )
@@ -6023,8 +6372,8 @@ mod tests {
             !indexes
                 .has_fk_reference_to_key(
                     "fk_parent_schema",
-                    "branch-b",
-                    Some("file-a"),
+                    "01920000-0000-7000-8000-0000000000b1",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     &["/id"],
                     UniqueConstraintValue::string_values(["parent-1"]),
                 )
@@ -6035,7 +6384,12 @@ mod tests {
     #[test]
     fn pending_indexes_record_state_surface_fk_references_by_exact_identity() {
         let mut indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
+        let row = state_surface_ref_row(
+            "ref-1",
+            "target-1",
+            "fk_parent_schema",
+            "01920000-0000-7000-8000-0000000000a2",
+        );
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -6058,9 +6412,9 @@ mod tests {
 
         assert!(
             indexes.has_fk_reference_to_identity(DomainRowIdentity::exact(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
-                Some("file-a".to_string()),
+                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 "fk_parent_schema",
                 EntityPk::single("target-1"),
             ))
@@ -6070,11 +6424,15 @@ mod tests {
     #[test]
     fn pending_delete_restrictions_ignore_tombstoned_referencing_rows() {
         let mut indexes = PendingConstraintIndexes::default();
-        let mut parent_delete = fk_parent_row("parent-1", "branch-a");
+        let mut parent_delete = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         parent_delete.snapshot = None;
         indexes.remember_tombstone(PreparedValidationRow::State(&parent_delete));
 
-        let child = fk_child_row("child-1", "parent-1", "branch-a");
+        let child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -6095,7 +6453,11 @@ mod tests {
             )
             .expect("child row should index FK reference");
 
-        let mut child_delete = fk_child_row("child-1", "parent-1", "branch-a");
+        let mut child_delete = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         child_delete.snapshot = None;
         indexes.remember_tombstone(PreparedValidationRow::State(&child_delete));
 
@@ -6106,7 +6468,11 @@ mod tests {
     #[test]
     fn pending_fk_validation_collects_unresolved_normal_fk_check() {
         let indexes = PendingConstraintIndexes::default();
-        let row = fk_child_row("child-1", "parent-1", "branch-a");
+        let row = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -6133,9 +6499,9 @@ mod tests {
         assert_eq!(
             unresolved[0].source_identity,
             DomainRowIdentity::exact(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
-                Some("file-a".to_string()),
+                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 "fk_child_schema",
                 EntityPk::single("child-1"),
             )
@@ -6149,10 +6515,13 @@ mod tests {
             panic!("normal FK should produce key target");
         };
         assert_eq!(target.schema_key, "fk_parent_schema");
-        assert_eq!(target.domain.branch_id(), "branch-a");
+        assert_eq!(
+            target.domain.branch_id(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(
             target.domain.file_scope(),
-            &DomainFileScope::Exact(Some("file-a".to_string()))
+            &DomainFileScope::Exact(Some("01920000-0000-7000-8000-0000000000a2".to_string()))
         );
         assert_eq!(target.pointer_group, vec![vec!["id".to_string()]]);
         assert_eq!(
@@ -6167,7 +6536,11 @@ mod tests {
             .expect("unique schema catalog should build");
         let mut target = PendingForeignKeyTargetKey {
             schema_key: "unique_schema".to_string(),
-            domain: Domain::exact_file("branch-a", false, Some("file-a".to_string())),
+            domain: Domain::exact_file(
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
+            ),
             pointer_group: vec![vec!["id".to_string()]],
             value: UniqueConstraintValue::string_values(["entity-1"]),
         };
@@ -6188,7 +6561,7 @@ mod tests {
     #[test]
     fn pending_fk_validation_resolves_normal_fk_against_pending_target() {
         let mut indexes = PendingConstraintIndexes::default();
-        let parent = fk_parent_row("parent-1", "branch-a");
+        let parent = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000a1");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
                 .snapshot
@@ -6205,7 +6578,11 @@ mod tests {
             )
             .expect("parent should index as pending FK target");
 
-        let child = fk_child_row("child-1", "parent-1", "branch-a");
+        let child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -6238,7 +6615,7 @@ mod tests {
     #[test]
     fn pending_fk_validation_keeps_normal_fk_unresolved_across_branches() {
         let mut indexes = PendingConstraintIndexes::default();
-        let parent = fk_parent_row("parent-1", "branch-b");
+        let parent = fk_parent_row("parent-1", "01920000-0000-7000-8000-0000000000b1");
         let parent_snapshot = serde_json::from_str::<JsonValue>(
             parent
                 .snapshot
@@ -6255,7 +6632,11 @@ mod tests {
             )
             .expect("parent should index as pending FK target");
 
-        let child = fk_child_row("child-1", "parent-1", "branch-a");
+        let child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -6285,7 +6666,7 @@ mod tests {
         };
         assert_eq!(
             target.domain.branch_id(),
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "FK checks are exact-branch scoped, not overlay scoped"
         );
     }
@@ -6293,7 +6674,12 @@ mod tests {
     #[test]
     fn pending_fk_validation_collects_unresolved_state_surface_check() {
         let indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
+        let row = state_surface_ref_row(
+            "ref-1",
+            "target-1",
+            "fk_parent_schema",
+            "01920000-0000-7000-8000-0000000000a2",
+        );
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -6320,9 +6706,9 @@ mod tests {
         assert_eq!(
             unresolved[0].source_identity,
             DomainRowIdentity::exact(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
-                Some("file-a".to_string()),
+                Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 "state_surface_ref_schema",
                 EntityPk::single("ref-1"),
             )
@@ -6339,19 +6725,26 @@ mod tests {
         let UnresolvedForeignKeyTarget::StateSurfaceIdentity(target) = &unresolved[0].target else {
             panic!("state FK should produce state-surface identity target");
         };
-        assert_eq!(target.domain().branch_id(), "branch-a");
+        assert_eq!(
+            target.domain().branch_id(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(target.schema_key(), "fk_parent_schema");
         assert_eq!(target.entity_pk(), &EntityPk::single("target-1"));
         assert_eq!(
             target.domain().file_scope(),
-            &DomainFileScope::Exact(Some("file-a".to_string()))
+            &DomainFileScope::Exact(Some("01920000-0000-7000-8000-0000000000a2".to_string()))
         );
     }
 
     #[tokio::test]
     async fn committed_fk_lookup_resolves_normal_fk_in_exact_scope() {
         let indexes = PendingConstraintIndexes::default();
-        let child = fk_child_row("child-1", "parent-1", "branch-a");
+        let child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -6375,7 +6768,8 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-a",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -6400,7 +6794,11 @@ mod tests {
     #[tokio::test]
     async fn committed_fk_lookup_keeps_normal_fk_unresolved_across_branches() {
         let indexes = PendingConstraintIndexes::default();
-        let child = fk_child_row("child-1", "parent-1", "branch-a");
+        let child = fk_child_row(
+            "child-1",
+            "parent-1",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         let child_snapshot = serde_json::from_str::<JsonValue>(
             child
                 .snapshot
@@ -6424,7 +6822,8 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "parent-1", "branch-b",
+                "parent-1",
+                "01920000-0000-7000-8000-0000000000b1",
             ))],
         };
 
@@ -6450,7 +6849,12 @@ mod tests {
     #[tokio::test]
     async fn committed_fk_lookup_resolves_state_surface_fk_by_exact_identity() {
         let indexes = PendingConstraintIndexes::default();
-        let row = state_surface_ref_row("ref-1", "target-1", "fk_parent_schema", "file-a");
+        let row = state_surface_ref_row(
+            "ref-1",
+            "target-1",
+            "fk_parent_schema",
+            "01920000-0000-7000-8000-0000000000a2",
+        );
         let snapshot = serde_json::from_str::<JsonValue>(
             row.snapshot
                 .as_ref()
@@ -6473,7 +6877,8 @@ mod tests {
         .expect("pending FK validation should collect unresolved check");
         let live_state = StaticLiveStateReader {
             rows: vec![MaterializedLiveStateRow::from(fk_parent_row(
-                "target-1", "branch-a",
+                "target-1",
+                "01920000-0000-7000-8000-0000000000a1",
             ))],
         };
 
@@ -6546,10 +6951,22 @@ mod tests {
 
     fn test_file_descriptor_rows() -> Vec<MaterializedLiveStateRow> {
         vec![
-            committed_file_descriptor_row("file-a", "branch-a"),
-            committed_file_descriptor_row("file-a", "branch-b"),
-            committed_file_descriptor_row("file-b", "branch-a"),
-            committed_file_descriptor_row("file-b", "branch-b"),
+            committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                "01920000-0000-7000-8000-0000000000a1",
+            ),
+            committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                "01920000-0000-7000-8000-0000000000b1",
+            ),
+            committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000b2",
+                "01920000-0000-7000-8000-0000000000a1",
+            ),
+            committed_file_descriptor_row(
+                "01920000-0000-7000-8000-0000000000b2",
+                "01920000-0000-7000-8000-0000000000b1",
+            ),
         ]
     }
 
@@ -6740,8 +7157,8 @@ mod tests {
             ),
         );
         row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("file-a".to_string());
-        row.branch_id = "branch-a".to_string();
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         row.global = false;
         row
     }
@@ -6759,8 +7176,8 @@ mod tests {
             ),
         );
         row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("file-a".to_string());
-        row.branch_id = "branch-a".to_string();
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         row.global = false;
         row
     }
@@ -6771,7 +7188,7 @@ mod tests {
             Some(json!({ "id": entity_pk }).to_string()),
         );
         row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("file-a".to_string());
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
         row.branch_id = branch_id.to_string();
         row.global = false;
         row
@@ -6783,7 +7200,7 @@ mod tests {
             Some(json!({ "id": entity_pk, "parent_id": parent_id }).to_string()),
         );
         row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("file-a".to_string());
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
         row.branch_id = branch_id.to_string();
         row.global = false;
         row
@@ -6801,7 +7218,7 @@ mod tests {
             &[vec!["key".to_string()], vec!["locale".to_string()]],
         )
         .expect("composite message identity should derive");
-        row.file_id = Some("file-a".to_string());
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
         row.branch_id = branch_id.to_string();
         row.global = false;
         row
@@ -6840,8 +7257,8 @@ mod tests {
             ),
         );
         row.entity_pk = EntityPk::single(entity_pk);
-        row.file_id = Some("file-a".to_string());
-        row.branch_id = "branch-a".to_string();
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        row.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         row.global = false;
         row
     }
@@ -6870,7 +7287,8 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = EntityPk::single(file_id);
+        row.entity_pk =
+            EntityPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
         row.file_id = None;
         row.branch_id = branch_id.to_string();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -6898,7 +7316,8 @@ mod tests {
                 .to_string(),
             ),
         );
-        row.entity_pk = EntityPk::single(directory_id);
+        row.entity_pk = EntityPk::uuid_from_canonical(directory_id)
+            .expect("fixture directory ID should be a UUID");
         row.file_id = None;
         row.branch_id = branch_id.to_string();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
@@ -6962,28 +7381,35 @@ mod tests {
     }
 
     fn fresh_plugin_file_import_write_set() -> PreparedWriteSet {
-        let mut descriptor = staged_file_descriptor_row("file-a", "branch-a");
+        let mut descriptor = staged_file_descriptor_row(
+            "01920000-0000-7000-8000-0000000000a2",
+            "01920000-0000-7000-8000-0000000000a1",
+        );
         descriptor.facts.row_content_validated = true;
         // File descriptors intentionally retain the ordinary FK/namespace
         // fact. The certificate admits this exact trusted-planner shape and
         // keeps its public INSERT absence check below.
         descriptor.facts.requires_transaction_validation = true;
-        descriptor.origin = Some(filesystem_insert_origin("lix_file", "file-a"));
+        descriptor.origin = Some(filesystem_insert_origin(
+            "lix_file",
+            "01920000-0000-7000-8000-0000000000a2",
+        ));
 
         let mut blob_ref = staged_row(
             BLOB_REF_SCHEMA_KEY,
             Some(
                 json!({
-                    "id": "file-a",
+                    "id": "01920000-0000-7000-8000-0000000000a2",
                     "blob_hash": "a".repeat(64),
                     "size_bytes": 2,
                 })
                 .to_string(),
             ),
         );
-        blob_ref.entity_pk = EntityPk::single("file-a");
-        blob_ref.file_id = Some("file-a".to_string());
-        blob_ref.branch_id = "branch-a".to_string();
+        blob_ref.entity_pk = EntityPk::uuid_from_canonical("01920000-0000-7000-8000-0000000000a2")
+            .expect("fixture file ID should be a UUID");
+        blob_ref.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        blob_ref.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         blob_ref.global = false;
         blob_ref.facts.row_content_validated = true;
         // Reconciliation replaces the provisional planner blob ref with this
@@ -7007,16 +7433,16 @@ mod tests {
             ),
         );
         owner.entity_pk = EntityPk::single(PLUGIN_OWNER_KEY);
-        owner.file_id = Some("file-a".to_string());
-        owner.branch_id = "branch-a".to_string();
+        owner.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        owner.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         owner.global = false;
         owner.facts.row_content_validated = true;
         owner.origin = Some(plugin_reconciliation_update_origin());
 
         let mut semantic = staged_row("json_root", Some(json!({ "kind": "object" }).to_string()));
         semantic.entity_pk = EntityPk::single("root");
-        semantic.file_id = Some("file-a".to_string());
-        semantic.branch_id = "branch-a".to_string();
+        semantic.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
+        semantic.branch_id = "01920000-0000-7000-8000-0000000000a1".to_string();
         semantic.global = false;
         semantic.facts.row_content_validated = true;
         semantic.origin = Some(plugin_reconciliation_update_origin());
@@ -7024,10 +7450,10 @@ mod tests {
         let mut writes = PreparedWriteSet {
             state_rows: vec![descriptor.clone(), blob_ref.clone(), owner, semantic],
             file_data_writes: vec![crate::transaction::types::TransactionFileData::new(
-                "file-a".to_string(),
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
                 Some("/a.json".to_string()),
                 Some("a.json".to_string()),
-                "branch-a".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
                 false,
                 false,
                 b"{}".to_vec(),
@@ -7035,7 +7461,7 @@ mod tests {
             ..empty_staged_write_set()
         };
         writes.commit_change_refs_by_branch.insert(
-            "branch-a".to_string(),
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
             crate::transaction::types::StagedCommitChangeRefs::default(),
         );
         writes.remember_insert_identity_for_tests(&descriptor);
@@ -7066,7 +7492,7 @@ mod tests {
         ]));
 
         let mut file_scoped = row.clone();
-        file_scoped.file_id = Some("file-a".to_string());
+        file_scoped.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
         assert!(!prepared_tracked_rows_have_row_local_certificates(&[
             file_scoped
         ]));

@@ -1579,9 +1579,21 @@ fn partial_state_row(
     snapshot: Option<JsonValue>,
     context: FilesystemRowContext,
 ) -> TransactionWriteRow {
+    let derived_entity_pk = entity_pk.map(|value| {
+        if snapshot.is_none() {
+            EntityPk::uuid_from_canonical(&value)
+                .expect("filesystem tombstones target validated UUID identities")
+        } else {
+            // These builders are schema-aware: filesystem descriptor and
+            // materialization IDs are declared UUID primary keys. Preserve an
+            // invalid caller value only until normalization can return the
+            // public schema-validation error instead of panicking.
+            EntityPk::uuid_from_canonical(&value).unwrap_or_else(|_| EntityPk::single(value))
+        }
+    });
     let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
     TransactionWriteRow {
-        entity_pk: entity_pk.map(EntityPk::single),
+        entity_pk: derived_entity_pk,
         schema_key: schema_key.to_string(),
         file_id: context.file_id,
         snapshot,
@@ -1682,6 +1694,10 @@ mod tests {
         move || ids.next().expect("test id should exist").to_string()
     }
 
+    fn uuid_pk(value: &str) -> EntityPk {
+        EntityPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
+    }
+
     fn parsed_file_path(path: &str) -> LixPath {
         LixPath::try_from_file_path(path).expect("test file path should parse")
     }
@@ -1761,17 +1777,20 @@ mod tests {
     #[test]
     fn directory_descriptor_row_builds_state_row() {
         let row = directory_descriptor_row(DirectoryDescriptorRowInput {
-            id: "dir-docs".to_string(),
+            id: "01920000-0000-7000-8000-0000000000d3".to_string(),
             parent_id: None,
             name: "docs".to_string(),
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
-        assert_eq!(row.entity_pk.as_ref(), Some(&EntityPk::single("dir-docs")));
+        assert_eq!(
+            row.entity_pk,
+            Some(uuid_pk("01920000-0000-7000-8000-0000000000d3"))
+        );
         assert_eq!(row.schema_key, "lix_directory_descriptor");
-        assert_eq!(row.branch_id, "branch-a");
+        assert_eq!(row.branch_id, "01920000-0000-7000-8000-0000000000a1");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d3");
         assert_eq!(snapshot["parent_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "docs");
     }
@@ -1779,40 +1798,46 @@ mod tests {
     #[test]
     fn file_descriptor_row_builds_state_row() {
         let row = file_descriptor_row(FileDescriptorRowInput {
-            id: "file-readme".to_string(),
-            directory_id: Some("dir-docs".to_string()),
+            id: "01920000-0000-7000-8000-0000000000d2".to_string(),
+            directory_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             name: "readme.md".to_string(),
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
         assert_eq!(
-            row.entity_pk.as_ref(),
-            Some(&EntityPk::single("file-readme"))
+            row.entity_pk,
+            Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(row.schema_key, "lix_file_descriptor");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "readme.md");
     }
 
     #[test]
     fn blob_ref_row_builds_state_row() {
         let row = blob_ref_row(BlobRefRowInput {
-            file_id: "file-readme".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             blob_hash: BlobHash::from_content(b"Hello"),
             size_bytes: 5,
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         })
         .expect("blob ref row should build");
 
         assert_eq!(
-            row.entity_pk.as_ref(),
-            Some(&EntityPk::single("file-readme"))
+            row.entity_pk,
+            Some(uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(row.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(
+            row.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(row.schema_key, "lix_binary_blob_ref");
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(snapshot["size_bytes"], 5);
         assert_eq!(
             snapshot["blob_hash"].as_str(),
@@ -1823,16 +1848,16 @@ mod tests {
     #[test]
     fn derived_file_ref_row_binds_renderer_path() {
         let row = derived_file_ref_row(DerivedFileRefRowInput {
-            file_id: "file-readme".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             path: "/docs/readme.txt".to_string(),
             sha256: "a".repeat(64),
             size_bytes: 5,
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         })
         .expect("derived ref row should build");
 
         let snapshot: JsonValue = row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(snapshot["path"], "/docs/readme.txt");
         assert_eq!(snapshot["sha256"], JsonValue::String("a".repeat(64)));
         assert_eq!(snapshot["size_bytes"], 5);
@@ -1846,7 +1871,7 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/",
-                FilesystemRowContext::active_branch("branch-a"),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect("root directory ensure should be a no-op");
@@ -1856,7 +1881,7 @@ mod tests {
             &mut resolver,
             "/",
             Some("dir-root".to_string()),
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect_err("explicit root directory create should be rejected");
@@ -1865,20 +1890,25 @@ mod tests {
 
     #[test]
     fn directory_path_resolver_reuses_existing_ancestor() {
-        let mut resolver =
-            DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
-                .expect("existing directories should parse");
+        let mut resolver = DirectoryPathResolver::from_existing([(
+            "/docs/".to_string(),
+            "01920000-0000-7000-8000-0000000000d3".to_string(),
+        )])
+        .expect("existing directories should parse");
 
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_branch("branch-a"),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("directory path should plan");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(resolver.directory_id("/docs/").unwrap(), Some("dir-docs"));
+        assert_eq!(
+            resolver.directory_id("/docs/").unwrap(),
+            Some("01920000-0000-7000-8000-0000000000d3")
+        );
         assert_eq!(
             resolver.directory_id("/docs/nested/").unwrap(),
             Some("dir-generated-nested")
@@ -1886,7 +1916,10 @@ mod tests {
 
         let snapshot: JsonValue = rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-generated-nested");
-        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -1898,8 +1931,8 @@ mod tests {
         let docs_rows = resolver
             .ensure_directory_path(
                 "/docs/",
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&["dir-generated-docs"]),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+                &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
             )
             .expect("top-level directory should plan");
         assert_eq!(docs_rows.len(), 1);
@@ -1907,7 +1940,7 @@ mod tests {
         let nested_rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_branch("branch-a"),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("nested directory should plan");
@@ -1915,7 +1948,10 @@ mod tests {
         assert_eq!(nested_rows.len(), 1);
         let snapshot: JsonValue = nested_rows[0].snapshot.as_ref().unwrap().value().clone();
         assert_eq!(snapshot["id"], "dir-generated-nested");
-        assert_eq!(snapshot["parent_id"], "dir-generated-docs");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-000000000353"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -1927,25 +1963,28 @@ mod tests {
         let rows = create_directory_path_with_leaf_id(
             &mut resolver,
             "/docs/nested/",
-            Some("dir-nested".to_string()),
-            FilesystemRowContext::active_branch("branch-a"),
-            &mut test_id_generator(&["dir-generated-docs"]),
+            Some("01920000-0000-7000-8000-000000000343".to_string()),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+            &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
         )
         .expect("directory path should plan");
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
             resolver.directory_id("/docs/").unwrap(),
-            Some("dir-generated-docs")
+            Some("01920000-0000-7000-8000-000000000353")
         );
         assert_eq!(
             resolver.directory_id("/docs/nested/").unwrap(),
-            Some("dir-nested")
+            Some("01920000-0000-7000-8000-000000000343")
         );
 
         let snapshot: JsonValue = rows[1].snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "dir-nested");
-        assert_eq!(snapshot["parent_id"], "dir-generated-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-000000000343");
+        assert_eq!(
+            snapshot["parent_id"],
+            "01920000-0000-7000-8000-000000000353"
+        );
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -1957,8 +1996,11 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&["dir-generated-docs", "dir-generated-nested"]),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+                &mut test_id_generator(&[
+                    "01920000-0000-7000-8000-000000000353",
+                    "dir-generated-nested",
+                ]),
             )
             .expect("directory path should plan");
         assert_eq!(rows.len(), 2);
@@ -1966,7 +2008,7 @@ mod tests {
         let rows = resolver
             .ensure_directory_path(
                 "/docs/nested/",
-                FilesystemRowContext::active_branch("branch-a"),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect("directory path should plan");
@@ -1983,7 +2025,7 @@ mod tests {
             parsed_file_path("/readme.md"),
             None,
             None,
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["file-generated-readme"]),
         )
         .expect("root file path write should plan");
@@ -2006,17 +2048,26 @@ mod tests {
         let plan = plan_parsed_file_path_write(
             &mut resolver,
             parsed_file_path("/docs/guides/readme.md"),
-            Some("file-readme".to_string()),
+            Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             Some(b"hello".to_vec()),
-            FilesystemRowContext::active_branch("branch-a"),
-            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+            &mut test_id_generator(&[
+                "01920000-0000-7000-8000-000000000353",
+                "dir-generated-guides",
+            ]),
         )
         .expect("file path write should plan");
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.file_data.len(), 1);
-        assert_eq!(plan.file_data[0].file_id, "file-readme");
-        assert_eq!(plan.file_data[0].branch_id, "branch-a");
+        assert_eq!(
+            plan.file_data[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(
+            plan.file_data[0].branch_id,
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(plan.file_data[0].data(), b"hello");
         assert_eq!(plan.rows.len(), 4);
         assert_eq!(
@@ -2038,7 +2089,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
         let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme.md");
     }
@@ -2046,17 +2097,23 @@ mod tests {
     #[test]
     fn file_path_write_reuses_existing_parent_directory() {
         let mut resolver = DirectoryPathResolver::from_existing([
-            ("/docs/".to_string(), "dir-docs".to_string()),
-            ("/docs/guides/".to_string(), "dir-guides".to_string()),
+            (
+                "/docs/".to_string(),
+                "01920000-0000-7000-8000-0000000000d3".to_string(),
+            ),
+            (
+                "/docs/guides/".to_string(),
+                "01920000-0000-7000-8000-000000000313".to_string(),
+            ),
         ])
         .expect("existing directories should seed");
 
         let plan = plan_parsed_file_path_write(
             &mut resolver,
             parsed_file_path("/docs/guides/readme.md"),
-            Some("file-readme".to_string()),
+            Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             Some(b"hello".to_vec()),
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("file path write should plan");
@@ -2075,23 +2132,30 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
         let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["directory_id"], "dir-guides");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-000000000313"
+        );
     }
 
     #[test]
     fn file_descriptor_write_renders_payload_path_from_parent_descriptor() {
-        let mut resolver =
-            DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
-                .expect("resolver should build");
+        let mut resolver = DirectoryPathResolver::from_existing([(
+            "/docs/".to_string(),
+            "01920000-0000-7000-8000-0000000000d3".to_string(),
+        )])
+        .expect("resolver should build");
 
         let plan = plan_file_descriptor_write(
             &mut resolver,
             FileDescriptorWriteInput {
-                id: Some("file-readme".to_string()),
-                directory_id: Some("dir-docs".to_string()),
+                id: Some("01920000-0000-7000-8000-0000000000d2".to_string()),
+                directory_id: Some("01920000-0000-7000-8000-0000000000d3".to_string()),
                 name: "readme.md".to_string(),
                 data: Some(b"hello".to_vec()),
-                context: FilesystemRowContext::active_branch("branch-a"),
+                context: FilesystemRowContext::active_branch(
+                    "01920000-0000-7000-8000-0000000000a1",
+                ),
             },
             &mut test_id_generator(&[]),
         )
@@ -2099,7 +2163,10 @@ mod tests {
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.file_data.len(), 1);
-        assert_eq!(plan.file_data[0].file_id, "file-readme");
+        assert_eq!(
+            plan.file_data[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
         assert_eq!(plan.file_data[0].path.as_deref(), Some("/docs/readme.md"));
         assert_eq!(plan.file_data[0].data(), b"hello");
         assert_eq!(plan.rows.len(), 2);
@@ -2109,8 +2176,11 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor row should be planned");
         let snapshot: JsonValue = file_row.snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "readme.md");
     }
 
@@ -2125,7 +2195,7 @@ mod tests {
         let directory_error = directory_resolver
             .ensure_directory_path(
                 "/docs",
-                FilesystemRowContext::active_branch("branch-a"),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect_err("file-looking path should not plan as a directory");
@@ -2137,27 +2207,33 @@ mod tests {
     fn directory_path_resolver_rejects_namespace_conflicts() {
         let mut existing_file_resolver = DirectoryPathResolver::from_existing_filesystem(
             std::iter::empty(),
-            [(None, "docs".to_string(), "file-docs".to_string())],
+            [(
+                None,
+                "docs".to_string(),
+                "01920000-0000-7000-8000-0000000000f2".to_string(),
+            )],
         )
         .expect("resolver should seed existing file");
         let error = existing_file_resolver
             .ensure_directory_path(
                 "/docs/",
-                FilesystemRowContext::active_branch("branch-a"),
-                &mut test_id_generator(&["dir-docs"]),
+                FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+                &mut test_id_generator(&["01920000-0000-7000-8000-0000000000d3"]),
             )
             .expect_err("existing file should block directory with same name");
         assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
 
-        let mut existing_directory_resolver =
-            DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
-                .expect("resolver should seed existing directory");
+        let mut existing_directory_resolver = DirectoryPathResolver::from_existing([(
+            "/docs/".to_string(),
+            "01920000-0000-7000-8000-0000000000d3".to_string(),
+        )])
+        .expect("resolver should seed existing directory");
         let error = plan_parsed_file_path_write(
             &mut existing_directory_resolver,
             parsed_file_path("/docs"),
-            Some("file-docs".to_string()),
+            Some("01920000-0000-7000-8000-0000000000f2".to_string()),
             None,
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect_err("existing directory should block file with same name");
@@ -2170,7 +2246,7 @@ mod tests {
             parsed_file_path("/readme.md"),
             Some("file-first".to_string()),
             None,
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
         )
         .expect("first file should plan");
@@ -2179,7 +2255,7 @@ mod tests {
             parsed_file_path("/readme.md"),
             Some("file-second".to_string()),
             None,
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
         )
         .expect_err("same path with different file id should conflict");
@@ -2194,8 +2270,8 @@ mod tests {
         create_directory_path_with_leaf_id(
             &mut resolver,
             "/docs/",
-            Some("dir-docs".to_string()),
-            FilesystemRowContext::active_branch("branch-a"),
+            Some("01920000-0000-7000-8000-0000000000d3".to_string()),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
         )
         .expect("first explicit directory create should plan");
@@ -2203,8 +2279,8 @@ mod tests {
         let error = create_directory_path_with_leaf_id(
             &mut resolver,
             "/docs/",
-            Some("dir-docs-again".to_string()),
-            FilesystemRowContext::active_branch("branch-a"),
+            Some("01920000-0000-7000-8000-0000000000d3-again".to_string()),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
         )
         .expect_err("duplicate explicit directory create should be rejected");
@@ -2213,15 +2289,17 @@ mod tests {
 
     #[test]
     fn file_path_update_reuses_existing_parent_and_preserves_data() {
-        let mut resolver =
-            DirectoryPathResolver::from_existing([("/docs/".to_string(), "dir-docs".to_string())])
-                .expect("existing directories should seed");
+        let mut resolver = DirectoryPathResolver::from_existing([(
+            "/docs/".to_string(),
+            "01920000-0000-7000-8000-0000000000d3".to_string(),
+        )])
+        .expect("existing directories should seed");
 
         let plan = plan_parsed_file_path_update(
             &mut resolver,
-            "file-readme".to_string(),
+            "01920000-0000-7000-8000-0000000000d2".to_string(),
             parsed_file_path("/docs/renamed.md"),
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("file path update should plan");
@@ -2236,8 +2314,11 @@ mod tests {
         );
 
         let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
-        assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
+        assert_eq!(
+            snapshot["directory_id"],
+            "01920000-0000-7000-8000-0000000000d3"
+        );
         assert_eq!(snapshot["name"], "renamed.md");
     }
 
@@ -2248,10 +2329,13 @@ mod tests {
 
         let plan = plan_parsed_file_path_update(
             &mut resolver,
-            "file-readme".to_string(),
+            "01920000-0000-7000-8000-0000000000d2".to_string(),
             parsed_file_path("/docs/guides/readme.md"),
-            FilesystemRowContext::active_branch("branch-a"),
-            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
+            &mut test_id_generator(&[
+                "01920000-0000-7000-8000-000000000353",
+                "dir-generated-guides",
+            ]),
         )
         .expect("file path update should plan");
 
@@ -2285,7 +2369,7 @@ mod tests {
     fn filesystem_rows_propagate_partial_ids_and_context() {
         let metadata = TransactionJson::from_value_for_test(json!({"source":"filesystem-test"}));
         let context = FilesystemRowContext {
-            branch_id: "branch-a".to_string(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             global: true,
             untracked: true,
             file_id: Some("context-file".to_string()),
@@ -2339,10 +2423,10 @@ mod tests {
         let plan = plan_parsed_file_path_write(
             &mut resolver,
             parsed_file_path("/docs/readme.md"),
-            Some("file-readme".to_string()),
+            Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             Some(b"hello".to_vec()),
             context,
-            &mut test_id_generator(&["dir-docs"]),
+            &mut test_id_generator(&["01920000-0000-7000-8000-0000000000d3"]),
         )
         .expect("file path write should plan");
 
@@ -2373,12 +2457,21 @@ mod tests {
             .expect("blob ref should be planned");
         assert_eq!(blob.global, true);
         assert_eq!(blob.untracked, true);
-        assert_eq!(blob.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(
+            blob.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(blob.metadata, None);
 
         assert_eq!(plan.file_data.len(), 1);
-        assert_eq!(plan.file_data[0].file_id, "file-readme");
-        assert_eq!(plan.file_data[0].branch_id, "branch-a");
+        assert_eq!(
+            plan.file_data[0].file_id,
+            "01920000-0000-7000-8000-0000000000d2"
+        );
+        assert_eq!(
+            plan.file_data[0].branch_id,
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(plan.file_data[0].untracked, true);
         assert_eq!(plan.file_data[0].data(), b"hello");
     }
@@ -2392,7 +2485,7 @@ mod tests {
             parsed_file_path("/empty.txt"),
             Some("file-empty".to_string()),
             Some(Vec::new()),
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
         )
         .expect("empty file path write should plan");
@@ -2418,27 +2511,33 @@ mod tests {
     fn directory_path_resolvers_from_state_rows_derives_nested_paths() {
         let resolvers = super::directory_path_resolvers_from_state_rows(vec![
             live_directory_row(
-                "dir-docs",
-                "branch-a",
-                "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                "01920000-0000-7000-8000-0000000000d3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row(
-                "dir-guides",
-                "branch-a",
-                "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+                "01920000-0000-7000-8000-000000000313",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
             ),
         ])
         .expect("state rows should seed directory resolvers");
 
         let resolver = resolvers
             .get(&super::filesystem_storage_scope_key(
-                "branch-a", false, false, None,
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+                false,
+                None,
             ))
             .expect("storage-scope resolver should exist");
-        assert_eq!(resolver.directory_id("/docs/").unwrap(), Some("dir-docs"));
+        assert_eq!(
+            resolver.directory_id("/docs/").unwrap(),
+            Some("01920000-0000-7000-8000-0000000000d3")
+        );
         assert_eq!(
             resolver.directory_id("/docs/guides/").unwrap(),
-            Some("dir-guides")
+            Some("01920000-0000-7000-8000-000000000313")
         );
     }
 
@@ -2446,14 +2545,14 @@ mod tests {
     fn directory_path_resolvers_from_state_rows_handles_parent_cycles() {
         let error = super::directory_path_resolvers_from_state_rows(vec![
             live_directory_row(
-                "dir-a",
-                "branch-a",
-                "{\"id\":\"dir-a\",\"parent_id\":\"dir-b\",\"name\":\"a\"}",
+                "01920000-0000-7000-8000-0000000000a3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000a3\",\"parent_id\":\"01920000-0000-7000-8000-0000000000b3\",\"name\":\"a\"}",
             ),
             live_directory_row(
-                "dir-b",
-                "branch-a",
-                "{\"id\":\"dir-b\",\"parent_id\":\"dir-a\",\"name\":\"b\"}",
+                "01920000-0000-7000-8000-0000000000b3",
+                "01920000-0000-7000-8000-0000000000a1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000b3\",\"parent_id\":\"01920000-0000-7000-8000-0000000000a3\",\"name\":\"b\"}",
             ),
         ])
         .expect_err("cyclic directory parent graph should be rejected");
@@ -2466,40 +2565,40 @@ mod tests {
     fn directory_path_resolvers_from_state_rows_separates_storage_scopes() {
         let rows = vec![
             live_directory_row_with_scope(
-                "dir-branch-a",
-                "branch-a",
+                "dir-01920000-0000-7000-8000-0000000000a1",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
                 false,
                 None,
-                "{\"id\":\"dir-branch-a\",\"parent_id\":null,\"name\":\"docs\"}",
+                "{\"id\":\"dir-01920000-0000-7000-8000-0000000000a1\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row_with_scope(
-                "dir-branch-b",
-                "branch-b",
+                "dir-01920000-0000-7000-8000-0000000000b1",
+                "01920000-0000-7000-8000-0000000000b1",
                 false,
                 false,
                 None,
-                "{\"id\":\"dir-branch-b\",\"parent_id\":null,\"name\":\"docs\"}",
+                "{\"id\":\"dir-01920000-0000-7000-8000-0000000000b1\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row_with_scope(
-                "dir-global",
-                "branch-a",
+                "01920000-0000-7000-8000-000000000363",
+                "01920000-0000-7000-8000-0000000000a1",
                 true,
                 false,
                 None,
-                "{\"id\":\"dir-global\",\"parent_id\":null,\"name\":\"docs\"}",
+                "{\"id\":\"01920000-0000-7000-8000-000000000363\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row_with_scope(
-                "dir-untracked",
-                "branch-a",
+                "01920000-0000-7000-8000-000000000413",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
                 true,
                 None,
-                "{\"id\":\"dir-untracked\",\"parent_id\":null,\"name\":\"docs\"}",
+                "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
             live_directory_row_with_scope(
                 "dir-file-scoped",
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
                 false,
                 Some("scope-file".to_string()),
@@ -2510,14 +2609,37 @@ mod tests {
         let resolvers = super::directory_path_resolvers_from_state_rows(rows)
             .expect("scoped rows should seed distinct resolvers");
 
-        let branch_a_key = super::filesystem_storage_scope_key("branch-a", false, false, None);
-        let branch_b_key = super::filesystem_storage_scope_key("branch-b", false, false, None);
+        let branch_a_key = super::filesystem_storage_scope_key(
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+            false,
+            None,
+        );
+        let branch_b_key = super::filesystem_storage_scope_key(
+            "01920000-0000-7000-8000-0000000000b1",
+            false,
+            false,
+            None,
+        );
         let global_key = super::filesystem_storage_scope_key(GLOBAL_BRANCH_ID, true, false, None);
-        let untracked_key = super::filesystem_storage_scope_key("branch-a", false, true, None);
-        let file_scoped_key =
-            super::filesystem_storage_scope_key("branch-a", false, false, Some("scope-file"));
-        let literal_null_file_id_key =
-            super::filesystem_storage_scope_key("branch-a", false, false, Some("<null>"));
+        let untracked_key = super::filesystem_storage_scope_key(
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+            true,
+            None,
+        );
+        let file_scoped_key = super::filesystem_storage_scope_key(
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+            false,
+            Some("scope-file"),
+        );
+        let literal_null_file_id_key = super::filesystem_storage_scope_key(
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+            false,
+            Some("<null>"),
+        );
 
         assert_ne!(branch_a_key, branch_b_key);
         assert_ne!(branch_a_key, global_key);
@@ -2531,7 +2653,7 @@ mod tests {
                 .unwrap()
                 .directory_id("/docs/")
                 .unwrap(),
-            Some("dir-branch-a")
+            Some("dir-01920000-0000-7000-8000-0000000000a1")
         );
         assert_eq!(
             resolvers
@@ -2539,7 +2661,7 @@ mod tests {
                 .unwrap()
                 .directory_id("/docs/")
                 .unwrap(),
-            Some("dir-branch-b")
+            Some("dir-01920000-0000-7000-8000-0000000000b1")
         );
         assert_eq!(
             resolvers
@@ -2547,7 +2669,7 @@ mod tests {
                 .unwrap()
                 .directory_id("/docs/")
                 .unwrap(),
-            Some("dir-global")
+            Some("01920000-0000-7000-8000-000000000363")
         );
         assert_eq!(
             resolvers
@@ -2555,7 +2677,7 @@ mod tests {
                 .unwrap()
                 .directory_id("/docs/")
                 .unwrap(),
-            Some("dir-untracked")
+            Some("01920000-0000-7000-8000-000000000413")
         );
         assert_eq!(
             resolvers
@@ -2570,10 +2692,10 @@ mod tests {
     #[test]
     fn file_delete_plans_descriptor_and_blob_ref_tombstones() {
         let plan = super::plan_file_delete(FileDeleteInput {
-            file_id: "file-readme".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             has_blob_ref: true,
             has_derived_file_ref: false,
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
         assert_eq!(plan.count, 1);
@@ -2585,7 +2707,7 @@ mod tests {
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
             descriptor.entity_pk.as_ref(),
-            Some(&EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(descriptor.file_id, None);
         assert_eq!(descriptor.snapshot, None);
@@ -2597,19 +2719,22 @@ mod tests {
             .expect("blob ref tombstone should be planned");
         assert_eq!(
             blob_ref.entity_pk.as_ref(),
-            Some(&EntityPk::single("file-readme"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(
+            blob_ref.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(blob_ref.snapshot, None);
     }
 
     #[test]
     fn file_delete_without_blob_ref_plans_only_descriptor_tombstone() {
         let plan = super::plan_file_delete(FileDeleteInput {
-            file_id: "file-readme".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000d2".to_string(),
             has_blob_ref: false,
             has_derived_file_ref: false,
-            context: FilesystemRowContext::active_branch("branch-a"),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
         assert_eq!(plan.count, 1);
@@ -2621,15 +2746,15 @@ mod tests {
     #[test]
     fn directory_delete_plans_descriptor_tombstone() {
         let plan = super::plan_directory_delete(DirectoryDeleteInput {
-            directory_id: "dir-docs".to_string(),
-            context: FilesystemRowContext::active_branch("branch-a"),
+            directory_id: "01920000-0000-7000-8000-0000000000d3".to_string(),
+            context: FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         });
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
             plan.rows[0].entity_pk.as_ref(),
-            Some(&EntityPk::single("dir-docs"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(plan.rows[0].file_id, None);
@@ -2639,9 +2764,9 @@ mod tests {
     #[test]
     fn recursive_directory_delete_handles_empty_directory() {
         let plan = super::plan_recursive_directory_delete(
-            "dir-empty",
+            "01920000-0000-7000-8000-0000000000e3",
             &VisibleFilesystem::default(),
-            FilesystemRowContext::active_branch("branch-a"),
+            FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
         );
 
         assert_eq!(plan.count, 1);
@@ -2649,31 +2774,37 @@ mod tests {
         assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
         assert_eq!(
             plan.rows[0].entity_pk.as_ref(),
-            Some(&EntityPk::single("dir-empty"))
+            Some(&uuid_pk("01920000-0000-7000-8000-0000000000e3"))
         );
         assert_eq!(plan.rows[0].snapshot, None);
     }
 
     #[test]
     fn recursive_directory_delete_plans_files_blobs_and_deepest_directories_first() {
-        let context = FilesystemRowContext::active_branch("branch-a");
+        let context = FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1");
         let mut directory_children_by_parent_id = BTreeMap::new();
         directory_children_by_parent_id.insert(
-            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
-            BTreeSet::from(["dir-guides".to_string()]),
+            Some(FilesystemDescriptorKey::from_context(
+                &context,
+                "01920000-0000-7000-8000-0000000000d3",
+            )),
+            BTreeSet::from(["01920000-0000-7000-8000-000000000103".to_string()]),
         );
 
         let mut files_by_directory_id = BTreeMap::new();
         files_by_directory_id.insert(
             Some(FilesystemDescriptorKey::from_context(
                 &context,
-                "dir-guides",
+                "01920000-0000-7000-8000-000000000103",
             )),
-            BTreeSet::from(["file-readme".to_string()]),
+            BTreeSet::from(["01920000-0000-7000-8000-0000000000d2".to_string()]),
         );
         files_by_directory_id.insert(
-            Some(FilesystemDescriptorKey::from_context(&context, "dir-docs")),
-            BTreeSet::from(["file-index".to_string()]),
+            Some(FilesystemDescriptorKey::from_context(
+                &context,
+                "01920000-0000-7000-8000-0000000000d3",
+            )),
+            BTreeSet::from(["01920000-0000-7000-8000-000000000152".to_string()]),
         );
 
         let visible_filesystem = VisibleFilesystem {
@@ -2681,12 +2812,16 @@ mod tests {
             files_by_directory_id,
             blob_refs_by_key: BTreeSet::from([FilesystemBlobRefKey::from_context(
                 &context,
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
             )]),
             derived_file_refs_by_key: BTreeSet::new(),
         };
 
-        let plan = super::plan_recursive_directory_delete("dir-docs", &visible_filesystem, context);
+        let plan = super::plan_recursive_directory_delete(
+            "01920000-0000-7000-8000-0000000000d3",
+            &visible_filesystem,
+            context,
+        );
 
         assert_eq!(plan.count, 4);
         assert_eq!(
@@ -2704,11 +2839,26 @@ mod tests {
                 })
                 .collect::<Vec<_>>(),
             vec![
-                ("lix_file_descriptor", "file-readme".to_string()),
-                ("lix_binary_blob_ref", "file-readme".to_string()),
-                ("lix_directory_descriptor", "dir-guides".to_string()),
-                ("lix_file_descriptor", "file-index".to_string()),
-                ("lix_directory_descriptor", "dir-docs".to_string()),
+                (
+                    "lix_file_descriptor",
+                    "01920000-0000-7000-8000-0000000000d2".to_string()
+                ),
+                (
+                    "lix_binary_blob_ref",
+                    "01920000-0000-7000-8000-0000000000d2".to_string()
+                ),
+                (
+                    "lix_directory_descriptor",
+                    "01920000-0000-7000-8000-000000000103".to_string()
+                ),
+                (
+                    "lix_file_descriptor",
+                    "01920000-0000-7000-8000-000000000152".to_string()
+                ),
+                (
+                    "lix_directory_descriptor",
+                    "01920000-0000-7000-8000-0000000000d3".to_string()
+                ),
             ]
         );
         assert!(plan.rows.iter().all(|row| row.snapshot.is_none()));

@@ -6,8 +6,8 @@ use lix_rocksdb_storage::RocksDB;
 #[tokio::test]
 async fn native_file_read_works_with_rocksdb() {
     let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
-    let storage =
-        RocksDB::open(temp_dir.path().join("native-file-read")).expect("open RocksDB storage");
+    let storage = RocksDB::open(temp_dir.path().join("6e617469-7665-8d66-896c-652d72656100"))
+        .expect("open RocksDB storage");
     assert_native_file_read(storage).await;
 }
 
@@ -57,9 +57,9 @@ where
         .execute(
             "INSERT INTO lix_file_by_branch \
              (id, path, data, lixcol_global, lixcol_branch_id) \
-             VALUES ($1, $2, $3, true, 'global')",
+             VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
             &[
-                Value::Text("native-read-overlap".to_string()),
+                Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_string()),
                 Value::Text("/native/overlap.bin".to_string()),
                 Value::Blob(b"global".to_vec().into()),
             ],
@@ -72,7 +72,7 @@ where
              (id, path, data, lixcol_branch_id) \
              VALUES ($1, $2, $3, $4)",
             &[
-                Value::Text("native-read-overlap".to_string()),
+                Value::Text("630c8282-b934-7fd8-89df-6b093f08f3e3".to_string()),
                 Value::Text("/native/overlap.bin".to_string()),
                 Value::Blob(b"local".to_vec().into()),
                 Value::Text(active_branch_id),

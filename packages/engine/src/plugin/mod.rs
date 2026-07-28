@@ -47,7 +47,8 @@ pub(crate) use registry::{
 #[cfg(test)]
 pub(crate) use storage::plugin_storage_archive_path;
 pub(crate) use storage::{
-    is_plugin_storage_path, plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+    is_plugin_storage_path, plugin_archive_delete_origin, plugin_archive_file_id_matches,
+    plugin_key_from_archive_delete_origin, plugin_key_from_archive_path,
     plugin_storage_archive_file_id, reject_normal_plugin_storage_mutation,
 };
 

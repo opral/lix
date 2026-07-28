@@ -37,22 +37,16 @@ fn rows(count: usize) -> Vec<BenchTransactionRow> {
         .map(|index| {
             let entity_pk = format!("01920000-0000-7000-8000-{index:012x}");
             BenchTransactionRow {
-                schema_key: "json_pointer".to_string(),
+                schema_key: "lix_account".to_string(),
                 file_id: None,
                 entity_pk: entity_pk.clone(),
                 value: json!({
-                    "path": entity_pk.clone(),
-                    "value": {
-                        "cells": ["alpha", "beta", "gamma", "delta"],
-                        "ordinal": index,
-                    }
+                    "id": entity_pk.clone(),
+                    "name": format!("account-{index}"),
                 }),
                 updated_value: json!({
-                    "path": entity_pk,
-                    "value": {
-                        "cells": ["alpha", "beta", "gamma", "updated"],
-                        "ordinal": index,
-                    }
+                    "id": entity_pk,
+                    "name": format!("updated-account-{index}"),
                 }),
             }
         })

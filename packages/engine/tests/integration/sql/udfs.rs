@@ -52,7 +52,7 @@ simulation_test!(
             &engine,
         );
         main.create_branch(CreateBranchOptions {
-            id: Some("udf-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000016".to_string()),
             name: "UDF draft".to_string(),
             from_commit_id: None,
         })
@@ -60,7 +60,7 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("udf-draft")
+                .open_session("01930000-0000-7000-8000-000000000016")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -80,7 +80,7 @@ simulation_test!(
             .expect("draft branch UDF should execute");
         assert_eq!(
             draft_result.rows()[0].get::<String>("branch_id").unwrap(),
-            "udf-draft"
+            "01930000-0000-7000-8000-000000000016"
         );
 
         let mut transaction = draft
@@ -95,12 +95,12 @@ simulation_test!(
             transaction_result.rows()[0]
                 .get::<String>("branch_id")
                 .unwrap(),
-            "udf-draft"
+            "01930000-0000-7000-8000-000000000016"
         );
         transaction
             .execute(
                 "INSERT INTO lix_key_value (key, value) \
-                 VALUES ('active-branch-udf', lix_active_branch_id())",
+                 VALUES ('61637469-7665-8d62-8261-6e63682d7500', lix_active_branch_id())",
                 &[],
             )
             .await
@@ -112,14 +112,14 @@ simulation_test!(
 
         let stored = draft
             .execute(
-                "SELECT value FROM lix_key_value WHERE key = 'active-branch-udf'",
+                "SELECT value FROM lix_key_value WHERE key = '61637469-7665-8d62-8261-6e63682d7500'",
                 &[],
             )
             .await
             .expect("stored branch should read");
         assert_eq!(
             stored.rows()[0].value("value").unwrap(),
-            &Value::Json(json!("udf-draft"))
+            &Value::Json(json!("01930000-0000-7000-8000-000000000016"))
         );
     }
 );

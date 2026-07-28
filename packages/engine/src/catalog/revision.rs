@@ -356,6 +356,7 @@ mod tests {
     }
 
     async fn run_schema_merge_case(diverge_target: bool, expected: MergeBranchOutcome) {
+        let draft_branch_id = "01920000-0000-7000-8000-0000000000d1";
         let storage = Memory::new();
         let receipt = Engine::initialize(storage.clone())
             .await
@@ -368,7 +369,7 @@ mod tests {
             .expect("main session should open");
         let revision_before_branch = current_revision(&adapter).await;
         main.create_branch(CreateBranchOptions {
-            id: Some("catalog-revision-draft".to_string()),
+            id: Some(draft_branch_id.to_string()),
             name: "Catalog revision draft".to_string(),
             from_commit_id: None,
         })
@@ -376,7 +377,7 @@ mod tests {
         .expect("draft branch should be created");
         assert_ne!(current_revision(&adapter).await, revision_before_branch);
         let draft = engine
-            .open_session("catalog-revision-draft")
+            .open_session(draft_branch_id)
             .await
             .expect("draft session should open");
         if diverge_target {
@@ -397,7 +398,7 @@ mod tests {
         let revision_before_merge = current_revision(&adapter).await;
         let receipt = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "catalog-revision-draft".to_string(),
+                source_branch_id: draft_branch_id.to_string(),
             })
             .await
             .expect("schema branch should merge");
@@ -415,7 +416,7 @@ mod tests {
         let no_op_revision = current_revision(&adapter).await;
         let no_op = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "catalog-revision-draft".to_string(),
+                source_branch_id: draft_branch_id.to_string(),
             })
             .await
             .expect("repeated merge should be a no-op");

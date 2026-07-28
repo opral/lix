@@ -356,16 +356,16 @@ mod tests {
     #[test]
     fn routes_exact_branch_and_tracked_identity_filters() {
         let route = WorkingChangeRoute::from_filters(&[
-            col("lixcol_branch_id").eq(lit("branch-a")),
+            col("lixcol_branch_id").eq(lit("01920000-0000-7000-8000-0000000000a1")),
             col("schema_key").eq(lit("acme_task")),
             col("entity_pk").eq(lit("[\"task-a\"]")),
-            col("file_id").eq(lit("file-a")),
+            col("file_id").eq(lit("01920000-0000-7000-8000-0000000000a2")),
         ])
         .expect("exact working-change filters should route");
 
         assert_eq!(
             route.branch_ids,
-            FileIdConstraint::Ids(["branch-a".to_string()].into())
+            FileIdConstraint::Ids(["01920000-0000-7000-8000-0000000000a1".to_string()].into())
         );
         assert_eq!(
             route.diff_request.filter.schema_keys,
@@ -379,7 +379,9 @@ mod tests {
         );
         assert_eq!(
             route.diff_request.filter.file_ids,
-            vec![NullableKeyFilter::Value("file-a".to_string())]
+            vec![NullableKeyFilter::Value(
+                "01920000-0000-7000-8000-0000000000a2".to_string()
+            )]
         );
         assert!(!route.contradictory);
     }

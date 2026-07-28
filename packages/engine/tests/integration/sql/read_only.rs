@@ -105,7 +105,7 @@ simulation_test!(read_only_history_views_reject_dml, |sim| async move {
     assert_read_only_error(
         session
             .execute(
-                "INSERT INTO lix_file_history (id, path) VALUES ('history-file', '/x.txt')",
+                "INSERT INTO lix_file_history (id, path) VALUES ('68697374-6f72-892d-8669-6c6500000000', '/x.txt')",
                 &[],
             )
             .await
@@ -179,7 +179,9 @@ simulation_test!(
             &engine,
         );
         let select_sql = "SELECT data FROM lix_file WHERE id = $1";
-        let params = [Value::Text("fresh-snapshot-file".to_string())];
+        let params = [Value::Text(
+            "66726573-682d-836e-8170-73686f742d00".to_string(),
+        )];
 
         let before = reader
             .execute(select_sql, &params)
@@ -191,7 +193,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
                 &[
-                    Value::Text("fresh-snapshot-file".to_string()),
+                    Value::Text("66726573-682d-836e-8170-73686f742d00".to_string()),
                     Value::Text("/fresh-snapshot.txt".to_string()),
                     Value::Blob(b"fresh".to_vec().into()),
                 ],

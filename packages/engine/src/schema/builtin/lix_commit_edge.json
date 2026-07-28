@@ -39,6 +39,7 @@
     },
     "child_id": {
       "type": "string",
+      "format": "uuid",
       "description": "Identifier of the child commit."
     },
     "parent_order": {

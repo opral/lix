@@ -403,8 +403,7 @@ pub(crate) struct ChangeRecord {
 pub(crate) struct ChangeRecordRef<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
-    #[musli(with = crate::storage_codec::id_string_seq)]
-    pub(crate) entity_pk: &'a [String],
+    pub(crate) entity_pk: &'a EntityPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<&'a str>,
     #[musli(with = crate::json_store::json_slot_storage_ref)]
@@ -469,8 +468,7 @@ pub(crate) struct TransactionChangelogAppend<'a> {
 pub(crate) struct ChangeRecordView<'a> {
     pub(crate) format_version: u32,
     pub(crate) schema_key: &'a str,
-    #[musli(with = crate::storage_codec::id_string_seq)]
-    pub(crate) entity_pk: Vec<String>,
+    pub(crate) entity_pk: EntityPk,
     #[musli(with = crate::storage_codec::option_id_string)]
     pub(crate) file_id: Option<String>,
     #[musli(with = crate::json_store::json_slot_storage)]

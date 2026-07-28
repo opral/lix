@@ -435,8 +435,16 @@ mod tests {
     #[tokio::test]
     async fn diff_commits_distinguishes_same_entity_with_different_file_id() {
         let (storage, tracked_state) = seed_parent_child_delta(
-            &[row("entity-a", Some("file-a"), "before-a")],
-            &[row("entity-a", Some("file-b"), "after-b")],
+            &[row(
+                "entity-a",
+                Some("01920000-0000-7000-8000-0000000000a2"),
+                "before-a",
+            )],
+            &[row(
+                "entity-a",
+                Some("01920000-0000-7000-8000-0000000000b2"),
+                "after-b",
+            )],
         )
         .await;
 
@@ -451,7 +459,10 @@ mod tests {
             .expect("diff should load");
 
         assert_eq!(diff.entries.len(), 1);
-        assert_eq!(diff.entries[0].identity.file_id.as_deref(), Some("file-b"));
+        assert_eq!(
+            diff.entries[0].identity.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000b2")
+        );
         assert_eq!(diff.entries[0].kind, TrackedStateDiffKind::Added);
     }
 
@@ -460,8 +471,18 @@ mod tests {
         let (storage, tracked_state) = seed_roots(
             &[],
             &[
-                row_with_schema("entity-a", Some("file-a"), "schema-a", "change-a"),
-                row_with_schema("entity-b", Some("file-b"), "schema-b", "change-b"),
+                row_with_schema(
+                    "entity-a",
+                    Some("01920000-0000-7000-8000-0000000000a2"),
+                    "schema-a",
+                    "change-a",
+                ),
+                row_with_schema(
+                    "entity-b",
+                    Some("01920000-0000-7000-8000-0000000000b2"),
+                    "schema-b",
+                    "change-b",
+                ),
             ],
         )
         .await;
@@ -478,7 +499,9 @@ mod tests {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema-b".to_string()],
                         entity_pks: vec![EntityPk::single("entity-b")],
-                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000b2".to_string(),
+                        )],
                         ..Default::default()
                     },
                 },

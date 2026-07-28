@@ -103,17 +103,24 @@ mod tests {
     #[tokio::test]
     async fn repeated_load_head_uses_underlying_reader_once() {
         let inner = Arc::new(CountingBranchRefReader::new(vec![head(
-            "branch-a", "commit-a",
+            "01920000-0000-7000-8000-0000000000a1",
+            "commit-a",
         )]));
         let cached = CachingBranchRefReader::new(inner.clone());
 
         assert_eq!(
-            cached.load_head("branch-a").await.unwrap(),
-            Some(head("branch-a", "commit-a"))
+            cached
+                .load_head("01920000-0000-7000-8000-0000000000a1")
+                .await
+                .unwrap(),
+            Some(head("01920000-0000-7000-8000-0000000000a1", "commit-a"))
         );
         assert_eq!(
-            cached.load_head("branch-a").await.unwrap(),
-            Some(head("branch-a", "commit-a"))
+            cached
+                .load_head("01920000-0000-7000-8000-0000000000a1")
+                .await
+                .unwrap(),
+            Some(head("01920000-0000-7000-8000-0000000000a1", "commit-a"))
         );
         assert_eq!(inner.load_count.load(Ordering::Relaxed), 1);
     }
@@ -131,17 +138,21 @@ mod tests {
     #[tokio::test]
     async fn scan_heads_seeds_load_head_cache() {
         let inner = Arc::new(CountingBranchRefReader::new(vec![head(
-            "branch-a", "commit-a",
+            "01920000-0000-7000-8000-0000000000a1",
+            "commit-a",
         )]));
         let cached = CachingBranchRefReader::new(inner.clone());
 
         assert_eq!(
             cached.scan_heads().await.unwrap(),
-            vec![head("branch-a", "commit-a")]
+            vec![head("01920000-0000-7000-8000-0000000000a1", "commit-a")]
         );
         assert_eq!(
-            cached.load_head("branch-a").await.unwrap(),
-            Some(head("branch-a", "commit-a"))
+            cached
+                .load_head("01920000-0000-7000-8000-0000000000a1")
+                .await
+                .unwrap(),
+            Some(head("01920000-0000-7000-8000-0000000000a1", "commit-a"))
         );
         assert_eq!(inner.scan_count.load(Ordering::Relaxed), 1);
         assert_eq!(inner.load_count.load(Ordering::Relaxed), 0);

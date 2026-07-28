@@ -1,8 +1,8 @@
-//! V15 row-addressable current state.
+//! V16 row-addressable current state with compact UUIDv7 entity keys.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
-//! decode, merge, and rewrite each predecessor group. V15 keeps the same
+//! decode, merge, and rewrite each predecessor group. V16 keeps the same
 //! fixed row value codec and branch-control publication fence, while making a
 //! full row identity the physical mutation unit.
 
@@ -13,9 +13,9 @@ use tracing::Instrument as _;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v15";
-pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v15";
-pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v15";
+pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v16";
+pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v16";
+pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v16";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
 /// File-id-first projection. The primary hot row remains authoritative.

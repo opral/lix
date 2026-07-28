@@ -6,8 +6,8 @@ use lix_rocksdb_storage::RocksDB;
 #[tokio::test]
 async fn native_file_upsert_works_with_rocksdb() {
     let temp_dir = tempfile::tempdir().expect("create RocksDB temp directory");
-    let storage =
-        RocksDB::open(temp_dir.path().join("native-file-upsert")).expect("open RocksDB storage");
+    let storage = RocksDB::open(temp_dir.path().join("6e617469-7665-8d66-896c-652d75707300"))
+        .expect("open RocksDB storage");
     assert_native_file_upsert(storage).await;
 }
 
@@ -138,9 +138,9 @@ where
         .execute(
             "INSERT INTO lix_file_by_branch \
              (id, path, data, lixcol_global, lixcol_branch_id) \
-             VALUES ($1, $2, $3, true, 'global')",
+             VALUES ($1, $2, $3, true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
             &[
-                Value::Text("native-overlap".to_string()),
+                Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_string()),
                 Value::Text("/native/overlap.bin".to_string()),
                 Value::Blob(b"g".to_vec().into()),
             ],
@@ -153,7 +153,7 @@ where
              (id, path, data, lixcol_branch_id) \
              VALUES ($1, $2, $3, $4)",
             &[
-                Value::Text("native-overlap".to_string()),
+                Value::Text("abc1de5c-4b72-748d-84df-8fc7b1beedda".to_string()),
                 Value::Text("/native/overlap.bin".to_string()),
                 Value::Blob(b"l".to_vec().into()),
                 Value::Text(active_branch_id.clone()),
@@ -174,8 +174,20 @@ where
         2
     );
     assert_active_branch_head_parent(&session, &overlay_batch_parent).await;
-    assert_file_data_by_branch(&session, "native-overlap", &active_branch_id, b"updated").await;
-    assert_file_data_by_branch(&session, "native-overlap", "global", b"g").await;
+    assert_file_data_by_branch(
+        &session,
+        "abc1de5c-4b72-748d-84df-8fc7b1beedda",
+        &active_branch_id,
+        b"updated",
+    )
+    .await;
+    assert_file_data_by_branch(
+        &session,
+        "abc1de5c-4b72-748d-84df-8fc7b1beedda",
+        "ffffffff-ffff-7fff-bfff-ffffffffffff",
+        b"g",
+    )
+    .await;
     assert_file_data(
         &session,
         "/native/batch/overlay-companion.bin",

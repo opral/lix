@@ -106,7 +106,8 @@ impl FilesystemPathEntry {
             }),
         };
         MaterializedLiveStateRow {
-            entity_pk: EntityPk::single(self.id()),
+            entity_pk: EntityPk::uuid_from_canonical(self.id())
+                .expect("filesystem descriptor IDs are validated canonical UUIDs"),
             schema_key: match self.kind {
                 FilesystemPathKind::File => FILE_DESCRIPTOR_SCHEMA_KEY,
                 FilesystemPathKind::Directory => DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -1432,17 +1433,41 @@ mod tests {
     #[test]
     fn exact_range_and_order_preserve_path_buckets() {
         let index = FilesystemPathIndex::from_live_rows(vec![
-            directory_row("dir-docs", None, "docs", "branch-a", false),
-            file_row("file-a", Some("dir-docs"), "a.md", "branch-a", false),
-            file_row("file-b", Some("dir-docs"), "b.md", "branch-a", false),
+            directory_row(
+                "01920000-0000-7000-8000-0000000000d3",
+                None,
+                "docs",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
             file_row(
-                "file-a-global",
-                Some("dir-docs-global"),
+                "01920000-0000-7000-8000-0000000000a2",
+                Some("01920000-0000-7000-8000-0000000000d3"),
                 "a.md",
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "01920000-0000-7000-8000-0000000000b2",
+                Some("01920000-0000-7000-8000-0000000000d3"),
+                "b.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "01920000-0000-7000-8000-0000000000a2-global",
+                Some("01920000-0000-7000-8000-0000000000d3-global"),
+                "a.md",
+                "01920000-0000-7000-8000-0000000000a1",
                 true,
             ),
-            directory_row("dir-docs-global", None, "docs", "branch-a", true),
+            directory_row(
+                "01920000-0000-7000-8000-0000000000d3-global",
+                None,
+                "docs",
+                "01920000-0000-7000-8000-0000000000a1",
+                true,
+            ),
         ])
         .expect("path index should build");
 
@@ -1471,10 +1496,34 @@ mod tests {
     #[test]
     fn exact_file_id_entries_keep_every_file_lane_and_exclude_directories() {
         let index = FilesystemPathIndex::from_live_rows(vec![
-            directory_row("shared", None, "directory", "branch-a", false),
-            file_row("shared", None, "z-tracked.md", "branch-a", false),
-            file_row("shared", None, "a-global.md", "branch-a", true),
-            file_row("other", None, "other.md", "branch-a", false),
+            directory_row(
+                "shared",
+                None,
+                "directory",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "shared",
+                None,
+                "z-tracked.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "shared",
+                None,
+                "a-global.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                true,
+            ),
+            file_row(
+                "other",
+                None,
+                "other.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
         ])
         .expect("path index should build");
 
@@ -1498,7 +1547,9 @@ mod tests {
     #[test]
     fn cache_supersedes_older_revision_for_the_same_scope() {
         let cache = FilesystemPathIndexCache::default();
-        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+        ]);
         let first = Arc::new(FilesystemPathIndex::default());
         let second = Arc::new(FilesystemPathIndex::default());
 
@@ -1539,16 +1590,18 @@ mod tests {
     #[test]
     fn cache_advances_matching_generation_from_descriptor_delta() {
         let cache = FilesystemPathIndexCache::default();
-        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+        ]);
         let prior = cache.insert(
             &request,
             Some(&[1]),
             Arc::new(
                 FilesystemPathIndex::from_live_rows(vec![file_row(
-                    "file-a",
+                    "01920000-0000-7000-8000-0000000000a2",
                     None,
                     "before.md",
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     false,
                 )])
                 .expect("prior index should build"),
@@ -1558,7 +1611,13 @@ mod tests {
         cache.advance_committed(
             Some(&[1]),
             Some(&[2]),
-            &[file_row("file-a", None, "after.md", "branch-a", false)],
+            &[file_row(
+                "01920000-0000-7000-8000-0000000000a2",
+                None,
+                "after.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            )],
         );
 
         let next = cache.get(&request, Some(&[2])).expect("advanced index");
@@ -1677,12 +1736,14 @@ mod tests {
 
     #[test]
     fn committed_file_delta_advances_generation_without_mutating_prior_snapshot() {
-        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+        ]);
         let prior = FilesystemPathIndex::from_live_rows(vec![file_row(
-            "file-a",
+            "01920000-0000-7000-8000-0000000000a2",
             None,
             "before.md",
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             false,
         )])
         .expect("prior index should build")
@@ -1691,7 +1752,13 @@ mod tests {
         let next = prior
             .apply_committed_rows(
                 &request,
-                &[file_row("file-a", None, "after.md", "branch-a", false)],
+                &[file_row(
+                    "01920000-0000-7000-8000-0000000000a2",
+                    None,
+                    "after.md",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    false,
+                )],
                 Some(&[2]),
             )
             .expect("descriptor delta should apply");
@@ -1702,23 +1769,46 @@ mod tests {
         assert!(prior.exact_entries("/after.md").is_empty());
         assert!(next.exact_entries("/before.md").is_empty());
         assert_eq!(next.exact_entries("/after.md").len(), 1);
-        assert_eq!(next.exact_file_id_entries("file-a")[0].path, "/after.md");
+        assert_eq!(
+            next.exact_file_id_entries("01920000-0000-7000-8000-0000000000a2")[0].path,
+            "/after.md"
+        );
     }
 
     #[test]
     fn committed_branch_delta_preserves_another_branch_lane() {
-        let request =
-            FilesystemPathIndexRequest::new(vec!["branch-a".to_string(), "branch-b".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+            "01920000-0000-7000-8000-0000000000b1".to_string(),
+        ]);
         let prior = FilesystemPathIndex::from_live_rows(vec![
-            file_row("shared", None, "a.md", "branch-a", false),
-            file_row("shared", None, "b.md", "branch-b", false),
+            file_row(
+                "shared",
+                None,
+                "a.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "shared",
+                None,
+                "b.md",
+                "01920000-0000-7000-8000-0000000000b1",
+                false,
+            ),
         ])
         .expect("prior index should build");
 
         let next = prior
             .apply_committed_rows(
                 &request,
-                &[file_row("shared", None, "a2.md", "branch-a", false)],
+                &[file_row(
+                    "shared",
+                    None,
+                    "a2.md",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    false,
+                )],
                 Some(&[2]),
             )
             .expect("descriptor delta should apply");
@@ -1730,19 +1820,51 @@ mod tests {
 
     #[test]
     fn committed_directory_delta_rewrites_only_its_descendants() {
-        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+        ]);
         let prior = FilesystemPathIndex::from_live_rows(vec![
-            directory_row("docs", None, "docs", "branch-a", false),
-            directory_row("nested", Some("docs"), "nested", "branch-a", false),
-            file_row("inside", Some("nested"), "inside.md", "branch-a", false),
-            file_row("outside", None, "outside.md", "branch-a", false),
+            directory_row(
+                "docs",
+                None,
+                "docs",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            directory_row(
+                "nested",
+                Some("docs"),
+                "nested",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "inside",
+                Some("nested"),
+                "inside.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "outside",
+                None,
+                "outside.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
         ])
         .expect("prior index should build");
 
         let next = prior
             .apply_committed_rows(
                 &request,
-                &[directory_row("docs", None, "archive", "branch-a", false)],
+                &[directory_row(
+                    "docs",
+                    None,
+                    "archive",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    false,
+                )],
                 Some(&[2]),
             )
             .expect("subtree delta should apply");
@@ -1756,14 +1878,40 @@ mod tests {
 
     #[test]
     fn committed_directory_tombstone_does_not_resurrect_removed_children() {
-        let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
+        let request = FilesystemPathIndexRequest::new(vec![
+            "01920000-0000-7000-8000-0000000000a1".to_string(),
+        ]);
         let prior = FilesystemPathIndex::from_live_rows(vec![
-            directory_row("docs", None, "docs", "branch-a", false),
-            directory_row("nested", Some("docs"), "nested", "branch-a", false),
-            file_row("inside", Some("nested"), "inside.md", "branch-a", false),
+            directory_row(
+                "docs",
+                None,
+                "docs",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            directory_row(
+                "nested",
+                Some("docs"),
+                "nested",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
+            file_row(
+                "inside",
+                Some("nested"),
+                "inside.md",
+                "01920000-0000-7000-8000-0000000000a1",
+                false,
+            ),
         ])
         .expect("prior index should build");
-        let mut tombstone = directory_row("docs", None, "docs", "branch-a", false);
+        let mut tombstone = directory_row(
+            "docs",
+            None,
+            "docs",
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+        );
         tombstone.snapshot_content = None;
         tombstone.deleted = true;
         let deleted = prior
@@ -1774,7 +1922,13 @@ mod tests {
         let recreated = deleted
             .apply_committed_rows(
                 &request,
-                &[directory_row("docs", None, "recreated", "branch-a", false)],
+                &[directory_row(
+                    "docs",
+                    None,
+                    "recreated",
+                    "01920000-0000-7000-8000-0000000000a1",
+                    false,
+                )],
                 Some(&[3]),
             )
             .expect("root recreation should apply");

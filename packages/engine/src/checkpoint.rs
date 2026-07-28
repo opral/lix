@@ -35,7 +35,7 @@ pub(crate) struct CheckpointHistoryEntry {
 
 pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(branch_id)),
+        entity_pk: None,
         schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
@@ -121,7 +121,12 @@ where
             &[TrackedStateKey {
                 schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
                 file_id: None,
-                entity_pk: EntityPk::single(branch_id),
+                entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("checkpoint branch_id must be a canonical UUID: {error}"),
+                    )
+                })?,
             }],
             &ChangeRecordProjection::from_columns(&["commit_id".to_string()]),
         )

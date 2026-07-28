@@ -49,16 +49,16 @@ fn primary_key_tombstone_value(
             "failed to decode history tombstone entity primary key: {error}"
         ))
     })?;
-    if identity.parts.len() != primary_key_paths.len() {
+    if identity.components.len() != primary_key_paths.len() {
         return Err(LixError::unknown(format!(
             "history tombstone entity primary key has {} part(s), but its schema declares {} primary-key path(s)",
-            identity.parts.len(),
+            identity.components.len(),
             primary_key_paths.len()
         )));
     }
 
     let mut projected = JsonValue::Null;
-    for (path, part) in primary_key_paths.iter().zip(&identity.parts) {
+    for (path, component) in primary_key_paths.iter().zip(&identity.components) {
         let Some((root, nested_path)) = path.split_first() else {
             return Err(LixError::unknown(
                 "history tombstone schema contains an empty primary-key path",
@@ -67,11 +67,7 @@ fn primary_key_tombstone_value(
         if root != column_name {
             continue;
         }
-        insert_tombstone_identity_part(
-            &mut projected,
-            nested_path,
-            JsonValue::String(part.clone()),
-        )?;
+        insert_tombstone_identity_part(&mut projected, nested_path, component.external_json())?;
     }
     Ok(Some(projected))
 }

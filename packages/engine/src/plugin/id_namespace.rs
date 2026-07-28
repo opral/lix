@@ -472,7 +472,7 @@ mod tests {
     fn actor_key() -> PluginActorKey {
         PluginActorKey {
             branch_id: "main".to_string(),
-            file_id: "file-a".to_string(),
+            file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),
             path: "/a.csv".to_string(),
             owner_change_id: "owner-a".to_string(),
             plugin_key: "plugin_csv_v2".to_string(),
@@ -491,7 +491,7 @@ mod tests {
             schema_keys: vec!["csv_row".to_string()],
             host_allocated_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"key":"plugin_csv_v2","runtime":"wasm-component-v2","api_version":"2.1.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
-            archive_file_id: "lix_plugin_archive::plugin_csv_v2".to_string(),
+            archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
             archive_blob_hash: "a".repeat(64),
             wasm_blob_hash: "b".repeat(64),
@@ -513,9 +513,10 @@ mod tests {
     }
 
     fn row_for(bound: BoundIdNamespace) -> MaterializedLiveStateRow {
-        let write = reserve_namespace_row(None, bound, "file-a", "main")
-            .expect("reserve")
-            .expect("new row");
+        let write =
+            reserve_namespace_row(None, bound, "01920000-0000-7000-8000-0000000000a2", "main")
+                .expect("reserve")
+                .expect("new row");
         MaterializedLiveStateRow {
             entity_pk: write.entity_pk.expect("pk"),
             schema_key: write.schema_key,
@@ -601,9 +602,14 @@ mod tests {
         );
         let existing = row_for(first);
         assert!(
-            reserve_namespace_row(Some(&existing), first, "file-a", "main")
-                .expect("same proof")
-                .is_none()
+            reserve_namespace_row(
+                Some(&existing),
+                first,
+                "01920000-0000-7000-8000-0000000000a2",
+                "main"
+            )
+            .expect("same proof")
+            .is_none()
         );
 
         let collision = BoundIdNamespace::bind(
@@ -614,8 +620,13 @@ mod tests {
             &actor_key(),
         );
         assert_eq!(first.namespace, collision.namespace);
-        let error = reserve_namespace_row(Some(&existing), collision, "file-a", "main")
-            .expect_err("different proof must fail");
+        let error = reserve_namespace_row(
+            Some(&existing),
+            collision,
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+        )
+        .expect_err("different proof must fail");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
     }
 
@@ -637,8 +648,13 @@ mod tests {
             &actor_key(),
         );
 
-        let error = validate_namespace_reservation(Some(&existing), collision, "file-a", "main")
-            .expect_err("preflight must reject a reused seed before entering the guest");
+        let error = validate_namespace_reservation(
+            Some(&existing),
+            collision,
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+        )
+        .expect_err("preflight must reject a reused seed before entering the guest");
         assert_eq!(error.code, LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(error.message.contains("different operation proof"));
     }
@@ -665,7 +681,7 @@ mod tests {
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_namespace_row(None, cold, "file-a", "main")
+            reserve_namespace_row(None, cold, "01920000-0000-7000-8000-0000000000a2", "main")
                 .expect("cold reservation")
                 .into_iter()
                 .count(),
@@ -695,7 +711,7 @@ mod tests {
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_namespace_row(None, edit, "file-a", "main")
+            reserve_namespace_row(None, edit, "01920000-0000-7000-8000-0000000000a2", "main")
                 .expect("insert reservation")
                 .into_iter()
                 .count(),

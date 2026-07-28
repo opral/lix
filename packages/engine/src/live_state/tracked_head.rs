@@ -1,6 +1,6 @@
 //! Unified, materialized live state for one branch head.
 //!
-//! The V15 hot index has one row per full identity. Each row is tagged
+//! The V16 hot index has one row per full identity. Each row is tagged
 //! `tracked` or `untracked`: tracked mutations also enter history, while
 //! untracked mutations exist only in this serving plane. Normal reads consult
 //! this single index rather than merging a tracked snapshot with an untracked
@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::LixError;
 use crate::NullableKeyFilter;
@@ -42,7 +43,7 @@ use crate::tracked_state::{
     TrackedStateKey, TrackedStateScanRequest,
 };
 
-pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v15";
+pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_001e),
     TRACKED_WORKING_DIFF_MARKER_NAMESPACE,
@@ -794,6 +795,11 @@ const KEY_PART_MORE: u8 = 0x01;
 const FILE_ID_NONE: u8 = 0x00;
 const FILE_ID_SOME: u8 = 0x01;
 const GENERATION_BYTES: usize = 16;
+const ENTITY_PK_CODEC_V1: u8 = 0x01;
+const ENTITY_PK_UUID: u8 = 0x00;
+const ENTITY_PK_INTEGER: u8 = 0x01;
+const ENTITY_PK_STRING: u8 = 0x02;
+const ENTITY_PK_BYTES: u8 = 0x03;
 
 /// Order-preserving tracked-head key encoding.
 ///
@@ -812,16 +818,37 @@ fn encode_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
 
 fn write_entity_pk(out: &mut Vec<u8>, entity_pk: &EntityPk) {
     debug_assert!(
-        !entity_pk.parts.is_empty(),
+        !entity_pk.components.is_empty(),
         "tracked-head entity primary keys must be non-empty"
     );
-    for (index, part) in entity_pk.parts.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.parts.len() {
+    out.push(ENTITY_PK_CODEC_V1);
+    for (index, component) in entity_pk.components.iter().enumerate() {
+        let terminator = if index + 1 == entity_pk.components.len() {
             KEY_PART_FINAL
         } else {
             KEY_PART_MORE
         };
-        write_key_string(out, part, terminator);
+        match component {
+            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
+                out.push(ENTITY_PK_UUID);
+                out.extend_from_slice(bytes);
+                out.push(terminator);
+            }
+            crate::entity_pk::EntityPkComponent::Integer(value) => {
+                out.push(ENTITY_PK_INTEGER);
+                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
+                out.extend_from_slice(&ordered.to_be_bytes());
+                out.push(terminator);
+            }
+            crate::entity_pk::EntityPkComponent::String(value) => {
+                out.push(ENTITY_PK_STRING);
+                write_key_bytes(out, value.as_bytes(), terminator);
+            }
+            crate::entity_pk::EntityPkComponent::Bytes(value) => {
+                out.push(ENTITY_PK_BYTES);
+                write_key_bytes(out, value, terminator);
+            }
+        }
     }
 }
 
@@ -836,7 +863,11 @@ fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
 }
 
 fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
-    for &byte in value.as_bytes() {
+    write_key_bytes(out, value.as_bytes(), terminator);
+}
+
+fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
+    for &byte in value {
         if byte == KEY_PART_FINAL {
             out.extend_from_slice(&[KEY_PART_FINAL, KEY_ESCAPE]);
         } else {
@@ -860,10 +891,20 @@ fn read_generation(bytes: &[u8], offset: &mut usize) -> Result<CommitId, LixErro
 }
 
 fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError> {
-    let mut parts = Vec::new();
+    let version = bytes
+        .get(*offset)
+        .copied()
+        .ok_or_else(|| key_codec_error("is truncated before entity primary key version"))?;
+    *offset += 1;
+    if version != ENTITY_PK_CODEC_V1 {
+        return Err(key_codec_error(&format!(
+            "has unsupported entity primary key codec version {version}"
+        )));
+    }
+    let mut components = SmallVec::new();
     loop {
-        let (part, terminator) = read_key_string(bytes, offset, "entity primary key")?;
-        parts.push(part);
+        let (part, terminator) = read_entity_pk_part(bytes, offset)?;
+        components.push(part);
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
@@ -874,9 +915,91 @@ fn read_entity_pk(bytes: &[u8], offset: &mut usize) -> Result<EntityPk, LixError
             }
         }
     }
-    EntityPk::from_parts(parts).map_err(|error| {
+    EntityPk::from_components(components).map_err(|error| {
         key_codec_error(&format!("contains an invalid entity primary key: {error}"))
     })
+}
+
+fn read_entity_pk_part(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<(crate::entity_pk::EntityPkComponent, u8), LixError> {
+    let tag = bytes
+        .get(*offset)
+        .copied()
+        .ok_or_else(|| key_codec_error("is truncated before entity primary key part tag"))?;
+    *offset += 1;
+    match tag {
+        ENTITY_PK_STRING => {
+            let (value, terminator) = read_key_string(bytes, offset, "entity primary key")?;
+            Ok((
+                crate::entity_pk::EntityPkComponent::String(value.into_boxed_str()),
+                terminator,
+            ))
+        }
+        ENTITY_PK_BYTES => {
+            let (value, terminator) = read_key_bytes(bytes, offset, "entity primary key bytes")?;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Bytes(value.into_boxed_slice()),
+                terminator,
+            ))
+        }
+        ENTITY_PK_UUID => {
+            let uuid_end = offset
+                .checked_add(16)
+                .ok_or_else(|| key_codec_error("UUIDv7 entity primary key offset overflow"))?;
+            let uuid_bytes: [u8; 16] = bytes
+                .get(*offset..uuid_end)
+                .ok_or_else(|| key_codec_error("is truncated in UUIDv7 entity primary key"))?
+                .try_into()
+                .expect("UUIDv7 slice has fixed length");
+            let terminator = bytes
+                .get(uuid_end)
+                .copied()
+                .ok_or_else(|| key_codec_error("is truncated after UUIDv7 entity primary key"))?;
+            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                return Err(key_codec_error(
+                    "UUIDv7 entity primary key has an invalid terminator",
+                ));
+            }
+            *offset = uuid_end + 1;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Uuid(uuid_bytes),
+                terminator,
+            ))
+        }
+        ENTITY_PK_INTEGER => {
+            let integer_end = offset
+                .checked_add(8)
+                .ok_or_else(|| key_codec_error("integer entity primary key offset overflow"))?;
+            let ordered = u64::from_be_bytes(
+                bytes
+                    .get(*offset..integer_end)
+                    .ok_or_else(|| key_codec_error("is truncated in integer entity primary key"))?
+                    .try_into()
+                    .expect("integer slice has fixed length"),
+            );
+            let terminator = bytes
+                .get(integer_end)
+                .copied()
+                .ok_or_else(|| key_codec_error("is truncated after integer entity primary key"))?;
+            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                return Err(key_codec_error(
+                    "integer entity primary key has an invalid terminator",
+                ));
+            }
+            *offset = integer_end + 1;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
+                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
+                )),
+                terminator,
+            ))
+        }
+        _ => Err(key_codec_error(
+            "has an unknown entity primary key part tag",
+        )),
+    }
 }
 
 fn read_file_id(bytes: &[u8], offset: &mut usize) -> Result<Option<String>, LixError> {
@@ -902,6 +1025,18 @@ fn read_key_string(
     offset: &mut usize,
     field: &str,
 ) -> Result<(String, u8), LixError> {
+    let (value, terminator) = read_key_bytes(bytes, offset, field)?;
+    let value = String::from_utf8(value).map_err(|error| {
+        key_codec_error(&format!("{field} is not UTF-8: {}", error.utf8_error()))
+    })?;
+    Ok((value, terminator))
+}
+
+fn read_key_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+    field: &str,
+) -> Result<(Vec<u8>, u8), LixError> {
     let start = *offset;
     let mut cursor = start;
     // The normal generated IDs do not contain the escaped NUL byte. Decode
@@ -920,10 +1055,8 @@ fn read_key_string(
             .ok_or_else(|| key_codec_error(&format!("is truncated after {field}")))?;
         cursor += 1;
         if terminator != KEY_ESCAPE {
-            let value = std::str::from_utf8(&bytes[start..cursor - 2])
-                .map_err(|error| key_codec_error(&format!("{field} is not UTF-8: {error}")))?;
             *offset = cursor;
-            return Ok((value.to_owned(), terminator));
+            return Ok((bytes[start..cursor - 2].to_vec(), terminator));
         }
         break;
     }
@@ -950,11 +1083,8 @@ fn read_key_string(
             out.push(KEY_PART_FINAL);
             continue;
         }
-        let value = String::from_utf8(out).map_err(|error| {
-            key_codec_error(&format!("{field} is not UTF-8: {}", error.utf8_error()))
-        })?;
         *offset = cursor;
-        return Ok((value, terminator));
+        return Ok((out, terminator));
     }
 }
 
@@ -2951,9 +3081,9 @@ mod tests {
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
-                file_id: Some("file-a"),
+                file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                 entity_pk: &entity_pk,
-                change_id: ChangeId::for_test_label("file-a"),
+                change_id: ChangeId::for_test_label("01920000-0000-7000-8000-0000000000a2"),
                 commit_id: head,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -2963,9 +3093,9 @@ mod tests {
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
-                file_id: Some("file-b"),
+                file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                 entity_pk: &entity_pk,
-                change_id: ChangeId::for_test_label("file-b"),
+                change_id: ChangeId::for_test_label("01920000-0000-7000-8000-0000000000b2"),
                 commit_id: head,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -2975,9 +3105,9 @@ mod tests {
             },
             TrackedHeadDeltaRef {
                 schema_key: "schema",
-                file_id: Some("file-b"),
+                file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                 entity_pk: &second_entity_pk,
-                change_id: ChangeId::for_test_label("second-file-b"),
+                change_id: ChangeId::for_test_label("second-01920000-0000-7000-8000-0000000000b2"),
                 commit_id: head,
                 deleted: false,
                 created_at: ts("2026-01-01T00:00:00Z"),
@@ -3045,7 +3175,11 @@ mod tests {
             rows.iter()
                 .map(|row| row.file_id.as_deref())
                 .collect::<Vec<_>>(),
-            vec![None, Some("file-a"), Some("file-b")]
+            vec![
+                None,
+                Some("01920000-0000-7000-8000-0000000000a2"),
+                Some("01920000-0000-7000-8000-0000000000b2")
+            ]
         );
 
         // A null-file predicate selects only the null-file hot row.
@@ -3117,7 +3251,9 @@ mod tests {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
                         entity_pks: vec![entity_pk.clone()],
-                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000b2".to_string(),
+                        )],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3127,7 +3263,10 @@ mod tests {
             .expect("filtered file scan should execute")
             .expect("marker should match");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].file_id.as_deref(), Some("file-b"));
+        assert_eq!(
+            rows[0].file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000b2")
+        );
 
         // A schema-scoped `file_id = ?` query also stays on the file-first
         // projection. This is the access pattern used by filesystem-backed
@@ -3144,7 +3283,9 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000b2".to_string(),
+                        )],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3162,12 +3303,12 @@ mod tests {
         );
         assert!(
             rows.iter()
-                .all(|row| row.file_id.as_deref() == Some("file-b"))
+                .all(|row| row.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000b2"))
         );
 
         // The branch control validates the published hot generation. Exact
         // file identity and schema-scoped file-id reads still route to the
-        // V15 file projection even when every primary row is absent.
+        // V16 file projection even when every primary row is absent.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3180,7 +3321,9 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
                         schema_keys: vec!["schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-b".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000b2".to_string(),
+                        )],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3191,7 +3334,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(
             rows.iter()
-                .all(|row| row.file_id.as_deref() == Some("file-b"))
+                .all(|row| row.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000b2"))
         );
 
         let read = storage
@@ -3206,7 +3349,7 @@ mod tests {
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
                     entity_pk,
-                    file_id: Some("file-b".to_string()),
+                    file_id: Some("01920000-0000-7000-8000-0000000000b2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
             )
@@ -3215,7 +3358,10 @@ mod tests {
             .expect("marker should match");
         assert_eq!(rows.len(), 1);
         let row = rows[0].as_ref().expect("explicit file row should resolve");
-        assert_eq!(row.file_id.as_deref(), Some("file-b"));
+        assert_eq!(
+            row.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000b2")
+        );
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
 
         let read = storage
@@ -3230,7 +3376,7 @@ mod tests {
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
                     entity_pk: EntityPk::single("row"),
-                    file_id: Some("file-b".to_string()),
+                    file_id: Some("01920000-0000-7000-8000-0000000000b2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
             )
@@ -3240,7 +3386,10 @@ mod tests {
         let row = rows[0]
             .as_ref()
             .expect("explicit file row should resolve through its projection");
-        assert_eq!(row.file_id.as_deref(), Some("file-b"));
+        assert_eq!(
+            row.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000b2")
+        );
         assert_eq!(row.snapshot_content.as_deref(), Some("{\"value\":\"b\"}"));
     }
 
@@ -3262,7 +3411,7 @@ mod tests {
                 generation,
                 schema_key: "schema-a".to_string(),
                 entity_pk: EntityPk::single("entity-z"),
-                file_id: Some("file-a".to_string()),
+                file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             },
             HeadIdentity {
                 branch_id: "branch".to_string(),
@@ -3490,8 +3639,14 @@ mod tests {
         let mut writes = StorageWriteSet::new();
         for (file_id, change_id) in [
             (None, "none-first"),
-            (Some("file-a"), "file-a-first"),
-            (Some("file-b"), "file-b-first"),
+            (
+                Some("01920000-0000-7000-8000-0000000000a2"),
+                "01920000-0000-7000-8000-0000000000a2-first",
+            ),
+            (
+                Some("01920000-0000-7000-8000-0000000000b2"),
+                "01920000-0000-7000-8000-0000000000b2-first",
+            ),
         ] {
             stage_put(
                 &mut writes,
@@ -3526,9 +3681,11 @@ mod tests {
                 second_head,
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
-                    file_id: Some("file-a"),
+                    file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                     entity_pk: &entity_pk,
-                    change_id: ChangeId::for_test_label("file-a-second"),
+                    change_id: ChangeId::for_test_label(
+                        "01920000-0000-7000-8000-0000000000a2-second",
+                    ),
                     commit_id: second_head,
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
@@ -3568,20 +3725,24 @@ mod tests {
             .expect("null-file row remains");
         let file_a = rows
             .iter()
-            .find(|row| row.file_id.as_deref() == Some("file-a"))
+            .find(|row| row.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000a2"))
             .expect("changed file row remains");
         let file_b = rows
             .iter()
-            .find(|row| row.file_id.as_deref() == Some("file-b"))
+            .find(|row| row.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000b2"))
             .expect("untouched file row remains");
         assert_eq!(none.change_id, Some(ChangeId::for_test_label("none-first")));
         assert_eq!(
             file_a.change_id,
-            Some(ChangeId::for_test_label("file-a-second"))
+            Some(ChangeId::for_test_label(
+                "01920000-0000-7000-8000-0000000000a2-second"
+            ))
         );
         assert_eq!(
             file_b.change_id,
-            Some(ChangeId::for_test_label("file-b-first"))
+            Some(ChangeId::for_test_label(
+                "01920000-0000-7000-8000-0000000000b2-first"
+            ))
         );
         assert_eq!(file_a.created_at, ts("2026-01-01T00:00:00Z"));
         assert_eq!(file_a.updated_at, ts("2026-01-02T00:00:00Z"));
@@ -3612,8 +3773,12 @@ mod tests {
                     .expect("tracked projection has a change id")
             })
             .collect::<Vec<_>>();
-        assert!(projection_changes.contains(&ChangeId::for_test_label("file-a-second")));
-        assert!(projection_changes.contains(&ChangeId::for_test_label("file-b-first")));
+        assert!(projection_changes.contains(&ChangeId::for_test_label(
+            "01920000-0000-7000-8000-0000000000a2-second"
+        )));
+        assert!(projection_changes.contains(&ChangeId::for_test_label(
+            "01920000-0000-7000-8000-0000000000b2-first"
+        )));
     }
 
     #[tokio::test]
@@ -3633,9 +3798,9 @@ mod tests {
                 generation,
                 schema_key: "schema".to_string(),
                 entity_pk: entity_pk.clone(),
-                file_id: Some("file-a".to_string()),
+                file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
             },
-            &head_value("file-a-first", generation),
+            &head_value("01920000-0000-7000-8000-0000000000a2-first", generation),
         )
         .expect("stage target hot row");
         stage_put(
@@ -3706,9 +3871,11 @@ mod tests {
                 second_head,
                 &[TrackedHeadDeltaRef {
                     schema_key: "schema",
-                    file_id: Some("file-a"),
+                    file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                     entity_pk: &entity_pk,
-                    change_id: ChangeId::for_test_label("file-a-second"),
+                    change_id: ChangeId::for_test_label(
+                        "01920000-0000-7000-8000-0000000000a2-second",
+                    ),
                     commit_id: second_head,
                     deleted: false,
                     created_at: ts("2026-01-02T00:00:00Z"),
@@ -3739,7 +3906,7 @@ mod tests {
                 &[TrackedStateKey {
                     schema_key: "schema".to_string(),
                     entity_pk,
-                    file_id: Some("file-a".to_string()),
+                    file_id: Some("01920000-0000-7000-8000-0000000000a2".to_string()),
                 }],
                 &ChangeRecordProjection::full(),
             )
@@ -3751,7 +3918,9 @@ mod tests {
                 .as_ref()
                 .expect("target file row survives")
                 .change_id,
-            Some(ChangeId::for_test_label("file-a-second"))
+            Some(ChangeId::for_test_label(
+                "01920000-0000-7000-8000-0000000000a2-second"
+            ))
         );
     }
 
