@@ -2188,17 +2188,17 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RejectingLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::SeqCst);
             Err(LixError::unknown(
                 "directory parent-id scan should not read live state",

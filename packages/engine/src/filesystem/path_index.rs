@@ -1444,17 +1444,17 @@ mod tests {
             Ok(self.rows.clone())
         }
 
-        async fn scan_rows(
-            &self,
-            _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            panic!("production path-index construction must not lower its batch to owned rows")
-        }
-
         async fn load_row(
             &self,
             _request: &crate::live_state::LiveStateRowRequest,
         ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            unreachable!("path-index construction only scans live state")
+        }
+
+        async fn load_exact_batch(
+            &self,
+            _request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             unreachable!("path-index construction only scans live state")
         }
     }

@@ -3405,10 +3405,10 @@ mod tests {
                 .expect("constraint batch should be consumed once"))
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             panic!("constraint validation must not project the shared batch into owned rows")
         }
 
@@ -3419,11 +3419,14 @@ mod tests {
             Ok(None)
         }
 
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            Ok(vec![None; request.rows.len()])
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::MaterializedLiveStateExactBatch::new(
+                MaterializedLiveStateBatch::default(),
+                vec![None; request.rows.len()],
+            )
         }
     }
 
@@ -3579,21 +3582,22 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(test_file_descriptor_rows()
                 .into_iter()
                 .filter(|row| live_state_row_matches_scan(row, request))
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(
@@ -3768,24 +3772,25 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StaticLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
                 .cloned()
                 .chain(test_file_descriptor_rows())
                 .filter(|row| live_state_row_matches_scan(row, request))
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(
@@ -3812,17 +3817,17 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for OverlayingStaticLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             let rows = self
                 .rows
                 .iter()
@@ -3831,7 +3836,7 @@ mod tests {
                 .filter(|row| live_state_row_matches_scan(row, request))
                 .collect::<Vec<_>>();
             if request.filter.untracked.is_some() {
-                return Ok(rows);
+                return Ok(rows.into());
             }
             let tracked_rows = rows
                 .iter()
@@ -3842,18 +3847,15 @@ mod tests {
                 .into_iter()
                 .filter(|row| row.untracked)
                 .collect::<Vec<_>>();
-            Ok(overlay_untracked_rows_for_test(
-                tracked_rows,
-                untracked_rows,
-            ))
+            Ok(overlay_untracked_rows_for_test(tracked_rows, untracked_rows).into())
         }
 
         async fn load_row(
             &self,
             request: &LiveStateRowRequest,
         ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .scan_rows(&LiveStateScanRequest {
+            let rows = self
+                .scan_batch(&LiveStateScanRequest {
                     filter: LiveStateFilter {
                         schema_keys: vec![request.schema_key.clone()],
                         entity_pks: vec![request.entity_pk.clone()],
@@ -3863,9 +3865,8 @@ mod tests {
                     },
                     ..Default::default()
                 })
-                .await?
-                .into_iter()
-                .next())
+                .await?;
+            Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
         }
     }
 
@@ -3887,18 +3888,18 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StrictEmptyLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(Vec::new())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(Vec::new().into())
         }
 
         async fn load_row(
@@ -3915,23 +3916,24 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for StrictStaticLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(self
                 .rows
                 .iter()
                 .filter(|row| live_state_row_matches_scan(row, request))
                 .cloned()
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(
@@ -3953,17 +3955,17 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CountingStaticLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
             Ok(self
                 .rows
@@ -3971,7 +3973,8 @@ mod tests {
                 .cloned()
                 .chain(test_file_descriptor_rows())
                 .filter(|row| live_state_row_matches_scan(row, request))
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(

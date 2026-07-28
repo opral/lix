@@ -551,16 +551,6 @@ where
         MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
 
-    #[cfg(test)]
-    pub(crate) async fn scan_tracked_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_tracked_batch(request)
-            .await
-            .map(MaterializedLiveStateBatch::into_rows)
-    }
-
     pub(crate) async fn scan_tracked_batch(
         &self,
         request: &LiveStateScanRequest,
@@ -687,14 +677,6 @@ where
         Self::scan_batch(self, request).await
     }
 
-    #[cfg(test)]
-    async fn scan_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Self::scan_rows(self, request).await
-    }
-
     async fn load_row(
         &self,
         request: &LiveStateRowRequest,
@@ -707,14 +689,6 @@ where
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         Self::load_exact_batch(self, request).await
-    }
-
-    #[cfg(test)]
-    async fn scan_tracked_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        Self::scan_tracked_rows(self, request).await
     }
 
     async fn scan_tracked_batch(

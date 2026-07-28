@@ -9,7 +9,7 @@ pub(crate) use context::{LiveStateContext, LiveStateStoreReader};
 #[allow(unused_imports)]
 pub(crate) use reader::LiveStateReader;
 #[cfg(test)]
-pub(crate) use reader::load_exact_rows_via_scan_for_test;
+pub(crate) use reader::load_exact_batch_via_scan_for_test;
 #[cfg(test)]
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[allow(unused_imports)]
