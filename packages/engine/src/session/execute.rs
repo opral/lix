@@ -1789,42 +1789,63 @@ where
         let file_view_collector = acknowledge_file_views.then(sql2::SessionFileViews::default);
         let active_branch_id = self.active_branch_id_from_reader(&read_store).await?;
         if let Some(exact_lix_file_read) = exact_lix_file_read {
-            let live_state: Arc<dyn crate::live_state::LiveStateReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let filesystem_path_index: Arc<dyn crate::filesystem::FilesystemPathIndexReader> =
-                Arc::new(self.live_state.reader(read_store.clone()));
-            let branch_ref: Arc<dyn BranchRefReader> =
-                Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
-            let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
-                Arc::new(self.binary_cas.reader(read_store));
             let query = match exact_lix_file_read {
-                ExactLixFileRead::Point(selector, column) => {
-                    sql2::execute_exact_lix_file_read(
+                ExactLixFileRead::RootListing => {
+                    let filesystem_path_index: Arc<
+                        dyn crate::filesystem::FilesystemPathIndexReader,
+                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    let branch_ref: Arc<dyn BranchRefReader> =
+                        Arc::new(self.branch_ctx.ref_reader(read_store));
+                    sql2::execute_exact_lix_file_root_listing(
                         &active_branch_id,
-                        live_state,
                         filesystem_path_index,
                         branch_ref,
-                        blob_reader,
-                        self.plugin_host.clone(),
-                        file_view_collector.clone(),
-                        &selector,
-                        column,
                     )
                     .await?
                 }
-                ExactLixFileRead::PathDataBatch(paths) => {
-                    sql2::execute_exact_lix_file_batch_read(
-                        &active_branch_id,
-                        live_state,
-                        filesystem_path_index,
-                        branch_ref,
-                        blob_reader,
-                        self.plugin_host.clone(),
-                        file_view_collector.clone(),
-                        None,
-                        &paths,
-                    )
-                    .await?
+                exact_lix_file_read => {
+                    let live_state: Arc<dyn crate::live_state::LiveStateReader> =
+                        Arc::new(self.live_state.reader(read_store.clone()));
+                    let filesystem_path_index: Arc<
+                        dyn crate::filesystem::FilesystemPathIndexReader,
+                    > = Arc::new(self.live_state.reader(read_store.clone()));
+                    let branch_ref: Arc<dyn BranchRefReader> =
+                        Arc::new(self.branch_ctx.ref_reader(read_store.clone()));
+                    let blob_reader: Arc<dyn crate::binary_cas::BlobDataReader> =
+                        Arc::new(self.binary_cas.reader(read_store));
+                    match exact_lix_file_read {
+                        ExactLixFileRead::Point(selector, column) => {
+                            sql2::execute_exact_lix_file_read(
+                                &active_branch_id,
+                                live_state,
+                                filesystem_path_index,
+                                branch_ref,
+                                blob_reader,
+                                self.plugin_host.clone(),
+                                file_view_collector.clone(),
+                                &selector,
+                                column,
+                            )
+                            .await?
+                        }
+                        ExactLixFileRead::PathDataBatch(paths) => {
+                            sql2::execute_exact_lix_file_batch_read(
+                                &active_branch_id,
+                                live_state,
+                                filesystem_path_index,
+                                branch_ref,
+                                blob_reader,
+                                self.plugin_host.clone(),
+                                file_view_collector.clone(),
+                                None,
+                                &paths,
+                            )
+                            .await?
+                        }
+                        ExactLixFileRead::RootListing => {
+                            unreachable!("root listing handled before file data readers")
+                        }
+                    }
                 }
             };
             let file_view_mutations = file_view_collector
@@ -2746,6 +2767,7 @@ impl Visitor for ColumnReferenceVisitor<'_> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExactLixFileRead {
+    RootListing,
     Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
     PathDataBatch(BTreeSet<String>),
 }
@@ -2754,6 +2776,9 @@ fn exact_lix_file_read_route(
     statement: &DataFusionStatement,
     params: &[Value],
 ) -> Option<ExactLixFileRead> {
+    if exact_lix_file_root_listing(statement, params) {
+        return Some(ExactLixFileRead::RootListing);
+    }
     if let Some((selector, column)) = exact_lix_file_point_read(statement, params) {
         return Some(ExactLixFileRead::Point(selector, column));
     }
@@ -2763,6 +2788,61 @@ fn exact_lix_file_read_route(
         return None;
     }
     exact_path_data_batch(point_read.select, params).map(ExactLixFileRead::PathDataBatch)
+}
+
+fn exact_lix_file_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
+    if !params.is_empty() {
+        return false;
+    }
+    let Some(simple) = simple_single_table_select(statement) else {
+        return false;
+    };
+    if simple.table_name != "lix_file"
+        || !simple.unqualified_unquoted_table
+        || simple.alias.is_some()
+        || simple.query.limit_clause.is_some()
+        || simple.query.fetch.is_some()
+    {
+        return false;
+    }
+    let expected = ["id", "path", "name", "lixcol_metadata", "lixcol_updated_at"];
+    if simple.select.projection.len() != expected.len()
+        || !simple
+            .select
+            .projection
+            .iter()
+            .zip(expected)
+            .all(|(item, expected)| {
+                let SelectItem::UnnamedExpr(expression) = item else {
+                    return false;
+                };
+                exact_point_column(expression).as_deref() == Some(expected)
+            })
+    {
+        return false;
+    }
+    let Some(Expr::IsNull(directory_id)) = simple.select.selection.as_ref() else {
+        return false;
+    };
+    if exact_point_column(directory_id).as_deref() != Some("directory_id") {
+        return false;
+    }
+    let Some(order_by) = &simple.query.order_by else {
+        return false;
+    };
+    if order_by.interpolate.is_some() {
+        return false;
+    }
+    let OrderByKind::Expressions(expressions) = &order_by.kind else {
+        return false;
+    };
+    let [order] = expressions.as_slice() else {
+        return false;
+    };
+    order.with_fill.is_none()
+        && order.options.asc != Some(false)
+        && order.options.nulls_first.is_none()
+        && exact_point_column(&order.expr).as_deref() == Some("name")
 }
 
 fn exact_lix_file_point_read(
@@ -3318,6 +3398,16 @@ mod tests {
 
     #[test]
     fn exact_lix_file_read_recognizes_only_the_narrow_shapes() {
+        let root_listing = sql2::parse_statement(
+            "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+             FROM lix_file WHERE directory_id IS NULL ORDER BY name",
+        )
+        .unwrap();
+        assert_eq!(
+            exact_lix_file_read_route(&root_listing, &[]),
+            Some(ExactLixFileRead::RootListing)
+        );
+
         let data_by_id = sql2::parse_statement("SELECT data FROM lix_file WHERE id = $1").unwrap();
         assert_eq!(
             exact_lix_file_read_route(
@@ -3363,6 +3453,31 @@ mod tests {
         );
 
         for (sql, params) in [
+            (
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file AS file WHERE directory_id IS NULL ORDER BY name",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file WHERE directory_id IS NULL ORDER BY path",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file WHERE directory_id IS NULL ORDER BY name DESC",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file WHERE directory_id IS NULL ORDER BY name LIMIT 1",
+                vec![],
+            ),
+            (
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file WHERE directory_id IS NULL ORDER BY name",
+                vec![Value::Text("unused".to_string())],
+            ),
             (
                 "SELECT data, path FROM lix_file WHERE path IN ($1, $2)",
                 vec![
@@ -3467,6 +3582,61 @@ mod tests {
                 "unexpected fast-path match for {sql}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn exact_root_file_listing_matches_the_relational_path() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_directory (id, path) VALUES ('nested-dir', '/nested/')",
+                &[],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES \
+                 ('root-b', '/b.txt', $1, lix_json('{\"rank\":2}')), \
+                 ('nested', '/nested/a.txt', $2, NULL), \
+                 ('root-a', '/a.txt', $3, NULL)",
+                &[
+                    Value::Blob(b"bravo".to_vec().into()),
+                    Value::Blob(b"nested".to_vec().into()),
+                    Value::Blob(b"alpha".to_vec().into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let exact = session
+            .execute(
+                "SELECT id, path, name, lixcol_metadata, lixcol_updated_at \
+                 FROM lix_file WHERE directory_id IS NULL ORDER BY name",
+                &[],
+            )
+            .await
+            .unwrap();
+        let relational = session
+            .execute(
+                "SELECT file.id AS id, file.path AS path, file.name AS name, \
+                        file.lixcol_metadata AS lixcol_metadata, \
+                        file.lixcol_updated_at AS lixcol_updated_at \
+                 FROM lix_file AS file \
+                 WHERE file.directory_id IS NULL ORDER BY file.name",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(exact, relational);
+        assert_eq!(exact.rows().len(), 2);
+        assert_eq!(exact.rows()[0].get::<String>("id").unwrap(), "root-a");
+        assert_eq!(exact.rows()[1].get::<String>("id").unwrap(), "root-b");
+        assert_eq!(
+            exact.rows()[1].value("lixcol_metadata").unwrap(),
+            &Value::Json(serde_json::json!({"rank": 2}))
+        );
     }
 
     #[test]
