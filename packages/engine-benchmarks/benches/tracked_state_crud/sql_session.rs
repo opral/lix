@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use lix_engine::{Engine, ExecuteResult, SessionContext, Storage, Value};
+use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
 
 use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, sql_string};
@@ -42,7 +42,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     select_one_by_pk_sql: String,
     update_one_by_pk_sql: String,
     update_all_sql_rows: Vec<String>,
-    bound_update_all_params: Vec<Vec<Value>>,
+    bound_update_all_batch: Vec<ExecuteBatchStatement>,
     delete_all_sql: String,
     delete_one_by_pk_sql: String,
     // Keep the storage path alive until after the session/storage is dropped.
@@ -275,23 +275,15 @@ where
 
     #[expect(clippy::cast_possible_truncation)]
     async fn update_all_bound(&self) -> usize {
-        let mut transaction = self
+        let results = self
             .session
-            .begin_transaction()
+            .execute_batch(&self.bound_update_all_batch)
             .await
-            .expect("begin tracked-state CRUD bound transaction");
-        let mut affected = 0;
-        for params in &self.bound_update_all_params {
-            affected += transaction
-                .execute(BOUND_UPDATE_ALL_SQL, params)
-                .await
-                .expect("execute tracked-state CRUD bound transaction SQL")
-                .rows_affected();
-        }
-        transaction
-            .commit()
-            .await
-            .expect("commit tracked-state CRUD bound transaction");
+            .expect("execute tracked-state CRUD bound update batch");
+        let affected = results
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -361,13 +353,14 @@ where
         select_one_by_pk_sql: select_by_pk_sql(&tracked_rows[mid..][..1]),
         update_one_by_pk_sql: update_row_sql(&tracked_rows[mid]),
         update_all_sql_rows: tracked_rows.iter().map(update_row_sql).collect(),
-        bound_update_all_params: tracked_rows
+        bound_update_all_batch: tracked_rows
             .iter()
-            .map(|row| {
-                vec![
+            .map(|row| ExecuteBatchStatement {
+                sql: BOUND_UPDATE_ALL_SQL.to_string(),
+                params: vec![
                     Value::Text(row.updated_value_json.clone()),
                     Value::Text(row.path.clone()),
-                ]
+                ],
             })
             .collect(),
         delete_all_sql: "DELETE FROM json_pointer".to_string(),
