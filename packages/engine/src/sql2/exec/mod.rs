@@ -56,6 +56,7 @@ pub(crate) enum SqlLogicalPlan {
 
 #[cfg(test)]
 pub(crate) use bound_public_write::{
+    take_certified_entity_insert_batch_executions,
     take_certified_replacement_parameter_batch_executions,
     take_entity_update_parameter_batch_executions,
 };

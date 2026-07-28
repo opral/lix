@@ -3994,6 +3994,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn entity_insert_values_use_one_certified_canonical_batch() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "certified_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        sql2::take_certified_entity_insert_batch_executions();
+        session
+            .execute(
+                "INSERT INTO certified_insert_probe (value, id) VALUES \
+                 ('value-a', 'a'), ('value-b', 'b')",
+                &[],
+            )
+            .await
+            .expect("certified insert batch should commit");
+
+        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        let rows = session
+            .execute(
+                "SELECT id, value FROM certified_insert_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .expect("certified rows should be readable");
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-b");
+    }
+
+    #[tokio::test]
+    async fn conflict_insert_filters_rows_before_snapshot_validation() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "conflict_validation_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string", "minLength": 3 }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("schema registration should succeed");
+        session
+            .execute(
+                "INSERT INTO conflict_validation_probe (id, value) VALUES ('a', 'valid')",
+                &[],
+            )
+            .await
+            .expect("seed row should commit");
+
+        sql2::take_certified_entity_insert_batch_executions();
+        session
+            .execute(
+                "INSERT INTO conflict_validation_probe (id, value) VALUES ('a', 'x') \
+                 ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .await
+            .expect("conflicting invalid payload should be discarded before validation");
+
+        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 0);
+        let rows = session
+            .execute(
+                "SELECT value FROM conflict_validation_probe WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .expect("seed row should remain readable");
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "valid");
+    }
+
+    #[tokio::test]
+    async fn certified_insert_compares_explicit_uuid_keys_by_external_value() {
+        const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
+
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "explicit_uuid_key_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "format": "uuid" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        sql2::take_certified_entity_insert_batch_executions();
+        session
+            .execute(
+                "INSERT INTO explicit_uuid_key_probe (id, value, lixcol_entity_pk) \
+                 VALUES ($1, 'value', lix_json($2))",
+                &[
+                    Value::Text(UUID.to_string()),
+                    Value::Text(format!("[\"{UUID}\"]")),
+                ],
+            )
+            .await
+            .expect("matching typed and external UUID keys should commit");
+
+        assert_eq!(sql2::take_certified_entity_insert_batch_executions(), 1);
+        let rows = session
+            .execute(
+                "SELECT value FROM explicit_uuid_key_probe WHERE id = $1",
+                &[Value::Text(UUID.to_string())],
+            )
+            .await
+            .expect("inserted UUID row should be readable");
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value");
+    }
+
+    #[tokio::test]
     async fn execute_batch_certifies_complete_path_value_replacements() {
         let session = open_session().await;
         let schema = serde_json::json!({

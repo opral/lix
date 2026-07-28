@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
@@ -28,6 +29,7 @@ use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
     RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
+use crate::wasm::{WasmCanonicalJson, WasmEntityKey};
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 
 use super::SqlWriteResult;
@@ -37,6 +39,8 @@ std::thread_local! {
     static ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
     static CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static CERTIFIED_ENTITY_INSERT_BATCH_EXECUTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -48,6 +52,11 @@ pub(crate) fn take_entity_update_parameter_batch_executions() -> usize {
 #[cfg(test)]
 pub(crate) fn take_certified_replacement_parameter_batch_executions() -> usize {
     CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_entity_insert_batch_executions() -> usize {
+    CERTIFIED_ENTITY_INSERT_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -1231,6 +1240,17 @@ fn entity_insert_batch(
         ));
     };
     let layout = InsertRowLayout::from_values(spec, values)?;
+    if let Some(rows) = certified_entity_insert_batch(
+        ctx,
+        plan,
+        spec,
+        &layout,
+        values,
+        params,
+        active_branch_commit_id,
+    )? {
+        return Ok(rows);
+    }
     let mut write_rows = RawWriteBatch::with_capacity(values.rows.len());
     for row in &values.rows {
         append_entity_insert_row(
@@ -2098,6 +2118,337 @@ impl InsertRowLayout {
             columns,
         })
     }
+}
+
+struct CertifiedInsertRow {
+    file_id: Option<SharedStr>,
+    metadata: Option<TransactionJson>,
+    global: bool,
+    untracked: bool,
+    branch_id: SharedStr,
+}
+
+fn certified_entity_insert_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    spec: &EntitySurfaceSpec,
+    layout: &InsertRowLayout,
+    values: &BoundInsertValues,
+    params: &[Value],
+    active_branch_commit_id: Option<&CommitId>,
+) -> Result<Option<RawWriteBatch>, LixError> {
+    if plan.bound.conflict.is_some() {
+        return Ok(None);
+    }
+    if layout.columns.iter().any(|target| {
+        matches!(
+            target,
+            InsertColumnTarget::FileId
+                | InsertColumnTarget::Visible {
+                    column_type: EntityColumnType::Json
+                        | EntityColumnType::Integer
+                        | EntityColumnType::Number,
+                    ..
+                }
+        )
+    }) {
+        return Ok(None);
+    }
+    let Some(schema_catalog) = ctx.schema_catalog_snapshot() else {
+        return Ok(None);
+    };
+    let Some((_, schema_plan)) = schema_catalog.plan_for_key(&layout.schema_key) else {
+        return Ok(None);
+    };
+    if !schema_plan.accepts_v2_canonical_certificate() || !spec.defaults.is_empty() {
+        return Ok(None);
+    }
+    if spec.columns.iter().any(|column| {
+        column.insert_required
+            && !layout.columns.iter().any(|target| {
+                matches!(
+                    target,
+                    InsertColumnTarget::Visible { name, .. } if name == &column.name
+                )
+            })
+    }) {
+        return Ok(None);
+    }
+
+    let mut visible_indices = layout
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, target)| match target {
+            InsertColumnTarget::Visible { name, .. } => Some((index, name.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    visible_indices.sort_unstable_by_key(|(_, name)| *name);
+    let primary_key_indices = spec
+        .primary_key_paths
+        .iter()
+        .map(|path| {
+            let [name] = path.as_slice() else {
+                return None;
+            };
+            layout
+                .columns
+                .iter()
+                .position(|target| matches!(target, InsertColumnTarget::Visible { name: candidate, .. } if candidate == name))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(primary_key_indices) = primary_key_indices else {
+        return Ok(None);
+    };
+
+    let estimated_row_bytes = visible_indices
+        .iter()
+        .map(|(_, name)| name.len().saturating_add(35))
+        .sum::<usize>()
+        .saturating_add(2);
+    let estimated_batch_bytes = values
+        .rows
+        .len()
+        .checked_mul(estimated_row_bytes)
+        .ok_or_else(|| LixError::unknown("certified INSERT batch size overflowed"))?;
+    let mut normalized = Vec::with_capacity(estimated_batch_bytes);
+    let mut offsets = Vec::with_capacity(values.rows.len());
+    let mut entity_pks = Vec::with_capacity(values.rows.len());
+    let mut row_parts = Vec::with_capacity(values.rows.len());
+    let mut row_values = (0..layout.columns.len())
+        .map(|_| None)
+        .collect::<Vec<Option<JsonValue>>>();
+    let context = EntityEvalContext::insert(&JsonValue::Null, &layout.visible_columns);
+
+    for row in &values.rows {
+        if row.len() != layout.columns.len() {
+            return Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "entity INSERT rows must have a consistent column layout",
+            ));
+        }
+
+        let mut explicit_entity_pk = None;
+        let mut file_id = None;
+        let mut metadata = None;
+        let mut global = None;
+        let mut untracked = None;
+        let mut explicit_branch_id = None;
+        for (index, (expr, target)) in row.iter().zip(layout.columns.iter()).enumerate() {
+            if let InsertColumnTarget::Visible { column_type, .. } = target {
+                reject_direct_blob_json_value(expr, *column_type, params)?;
+            }
+            let eval_value = eval_expr_value(expr, &context, ctx, params, active_branch_commit_id)?;
+            if matches!(
+                target,
+                InsertColumnTarget::Global | InsertColumnTarget::Untracked
+            ) && entity_eval_value_is_null(&eval_value)
+            {
+                let column_name = match target {
+                    InsertColumnTarget::Global => "lixcol_global",
+                    InsertColumnTarget::Untracked => "lixcol_untracked",
+                    _ => unreachable!("matched defaulted boolean system column"),
+                };
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!(
+                        "INSERT into {} column '{column_name}' may be omitted to use its default, but explicit NULL is not allowed",
+                        layout.schema_key
+                    ),
+                ));
+            }
+            if matches!(target, InsertColumnTarget::Metadata) {
+                metadata = optional_metadata_from_eval_value(
+                    eval_value,
+                    "lixcol_metadata",
+                    &layout.schema_key,
+                )?;
+                continue;
+            }
+            if let InsertColumnTarget::Visible {
+                name,
+                column_type,
+                read_nullable,
+            } = target
+            {
+                if !read_nullable && entity_eval_value_is_null(&eval_value) {
+                    return Err(LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "INSERT into {} column '{name}' does not allow explicit NULL",
+                            layout.schema_key
+                        ),
+                    ));
+                }
+                row_values[index] = Some(entity_json_value(
+                    expr,
+                    eval_value,
+                    *column_type,
+                    &layout.schema_key,
+                    name,
+                )?);
+                continue;
+            }
+            let value = eval_value.into_json();
+            match target {
+                InsertColumnTarget::Visible { .. } => unreachable!("visible columns handled above"),
+                InsertColumnTarget::EntityPk => {
+                    explicit_entity_pk = Some(entity_pk_from_value(&value, "lixcol_entity_pk")?);
+                }
+                InsertColumnTarget::FileId => {
+                    file_id = text_value(value, "lixcol_file_id")?;
+                }
+                InsertColumnTarget::Metadata => {
+                    unreachable!("metadata handled before JSON value coercion")
+                }
+                InsertColumnTarget::Global => {
+                    global = bool_value(value, "lixcol_global")?;
+                }
+                InsertColumnTarget::Untracked => {
+                    untracked = bool_value(value, "lixcol_untracked")?;
+                }
+                InsertColumnTarget::BranchId => {
+                    explicit_branch_id = text_value(value, "lixcol_branch_id")?;
+                }
+            }
+        }
+
+        let primary_key_values = primary_key_indices
+            .iter()
+            .map(|index| {
+                row_values[*index].as_ref().ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_SCHEMA_VALIDATION,
+                        format!(
+                            "INSERT failed to derive entity primary key for schema '{}': missing primary-key value",
+                            layout.schema_key
+                        ),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let derived_entity_pk = EntityPk::from_json_values(
+            &primary_key_values
+                .iter()
+                .map(|value| (*value).clone())
+                .collect::<Vec<_>>(),
+            &spec.primary_key_component_types,
+        )
+        .map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "INSERT failed to derive entity primary key for schema '{}': {error}",
+                    layout.schema_key
+                ),
+            )
+        })?;
+        if explicit_entity_pk.as_ref().is_some_and(|explicit| {
+            explicit.clone().into_parts() != derived_entity_pk.clone().into_parts()
+        }) {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "INSERT into {} has lixcol_entity_pk that does not match its public primary-key columns",
+                    layout.schema_key
+                ),
+            ));
+        }
+
+        let start = normalized.len();
+        normalized.push(b'{');
+        for (field_index, (value_index, name)) in visible_indices.iter().enumerate() {
+            if field_index != 0 {
+                normalized.push(b',');
+            }
+            serde_json::to_writer(&mut normalized, name).map_err(|error| {
+                LixError::unknown(format!(
+                    "certified INSERT key serialization failed: {error}"
+                ))
+            })?;
+            normalized.push(b':');
+            serde_json::to_writer(
+                &mut normalized,
+                row_values[*value_index]
+                    .as_ref()
+                    .expect("visible INSERT value was evaluated"),
+            )
+            .map_err(|error| {
+                LixError::unknown(format!(
+                    "certified INSERT value serialization failed: {error}"
+                ))
+            })?;
+        }
+        normalized.push(b'}');
+        let key = WasmEntityKey::from_owned_parts(
+            layout.schema_key.clone(),
+            derived_entity_pk.clone().into_parts(),
+        );
+        let certified = schema_plan
+            .certify_or_normalize_v2_plugin_row(&normalized[start..], &key)?
+            .ok_or_else(|| {
+                LixError::unknown("eligible certified INSERT row declined its schema certificate")
+            })?;
+        if let Some(canonical) = certified.normalized {
+            normalized.truncate(start);
+            normalized.extend_from_slice(&canonical);
+        }
+        let end = normalized.len();
+        offsets.push((start, end));
+        entity_pks.push(certified.entity_pk);
+        let global = global.unwrap_or(false);
+        row_parts.push(CertifiedInsertRow {
+            file_id: file_id.map(Into::into),
+            metadata,
+            global,
+            untracked: untracked.unwrap_or(false),
+            branch_id: entity_row_branch_id(plan, explicit_branch_id, global)?.into(),
+        });
+        for value in &mut row_values {
+            *value = None;
+        }
+    }
+
+    let normalized = Bytes::from(normalized);
+    let normalized_rows = offsets
+        .into_iter()
+        .map(|(start, end)| {
+            SharedStr::from_utf8(normalized.slice(start..end))
+                .map_err(|_| LixError::unknown("certified INSERT row is not UTF-8"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let row_count = normalized_rows.len();
+    let snapshots = WasmCanonicalJson::from_certified_batch_parts(
+        normalized_rows,
+        entity_pks.clone(),
+        vec![schema_plan.shared_fingerprint()],
+        vec![0; row_count],
+        row_count,
+    )?;
+    let mut rows = RawWriteBatch::with_capacity(row_count);
+    for ((entity_pk, snapshot), row) in entity_pks.into_iter().zip(snapshots).zip(row_parts) {
+        rows.push_parts(
+            Some(entity_pk),
+            layout.schema_key.as_str().into(),
+            row.file_id,
+            Some(TransactionJson::from_canonical_batch(snapshot)),
+            row.metadata,
+            None,
+            None,
+            None,
+            row.global,
+            None,
+            None,
+            row.untracked,
+            row.branch_id,
+        );
+    }
+    #[cfg(test)]
+    CERTIFIED_ENTITY_INSERT_BATCH_EXECUTIONS.with(|executions| {
+        executions.set(executions.get().saturating_add(1));
+    });
+    Ok(Some(rows))
 }
 
 fn append_entity_insert_row(
