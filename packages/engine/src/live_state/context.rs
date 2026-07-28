@@ -12,9 +12,9 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowIdentity,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope,
-    VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateReplacementOwner, LiveStateRowFilter,
+    LiveStateRowIdentity, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -150,6 +150,53 @@ where
                 )
                 .await?,
         ))
+    }
+
+    /// Returns the minimal predecessor evidence for a certified full-row
+    /// replacement, or `None` when generic visibility semantics are required.
+    pub(crate) async fn scan_direct_replacement_owners(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+    ) -> Result<Option<Vec<Option<LiveStateReplacementOwner>>>, LixError> {
+        let request = LiveStateScanRequest {
+            filter: crate::live_state::LiveStateFilter {
+                branch_ids: vec![branch_id.to_string()],
+                schema_keys: vec![schema_key.to_string()],
+                entity_pks: entity_pks.to_vec(),
+                include_tombstones: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let scope = scan_scope(&self.store, &request, true).await?;
+        let [requested_branch_id] = scope.projection_branch_ids.as_slice() else {
+            return Ok(None);
+        };
+        if requested_branch_id != branch_id
+            || scope
+                .storage_branch_ids
+                .iter()
+                .any(|candidate| candidate != branch_id && candidate != GLOBAL_BRANCH_ID)
+        {
+            return Ok(None);
+        }
+        let Some(requested_control) = scope.branch_heads.get(branch_id).copied() else {
+            return Ok(None);
+        };
+        let tracked_head = self.tracked_head.reader(&self.store);
+        if branch_id != GLOBAL_BRANCH_ID
+            && let Some(global_control) = scope.branch_heads.get(GLOBAL_BRANCH_ID).copied()
+            && tracked_head
+                .has_schema_rows(GLOBAL_BRANCH_ID, global_control, schema_key)
+                .await?
+        {
+            return Ok(None);
+        }
+        tracked_head
+            .scan_replacement_owners(branch_id, requested_control, schema_key, entity_pks)
+            .await
     }
 
     pub(crate) async fn scan_rows(

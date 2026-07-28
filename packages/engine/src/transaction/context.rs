@@ -4739,6 +4739,25 @@ where
         self.load_visible_exact_live_state_rows(request).await
     }
 
+    async fn load_certified_replacement_owners(
+        &mut self,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+    ) -> Result<Option<Vec<Option<crate::live_state::LiveStateReplacementOwner>>>, LixError> {
+        if !self.staged_writes.state_rows_are_empty()? {
+            return Ok(None);
+        }
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        self.live_state
+            .reader(read)
+            .scan_direct_replacement_owners(&self.active_branch_id, schema_key, entity_pks)
+            .await
+    }
+
     async fn filesystem_path_index(
         &mut self,
         request: &FilesystemPathIndexRequest,

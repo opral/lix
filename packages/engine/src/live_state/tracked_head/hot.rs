@@ -106,6 +106,22 @@ where
         .await
     }
 
+    pub(crate) async fn scan_replacement_owners(
+        &self,
+        branch_id: &str,
+        control: BranchHeadControl,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+    ) -> Result<Option<Vec<Option<LiveStateReplacementOwner>>>, LixError> {
+        self.scan_replacement_owners_for_generation(
+            branch_id,
+            control.generation,
+            schema_key,
+            entity_pks,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub(crate) async fn scan_live_rows_if_current(
         &self,
@@ -375,6 +391,102 @@ where
             }
         }
         materialize_entity_snapshot_refs(&self.store, snapshots, json_refs, deferred).await
+    }
+
+    async fn scan_replacement_owners_for_generation(
+        &self,
+        branch_id: &str,
+        generation: CommitId,
+        schema_key: &str,
+        entity_pks: &[EntityPk],
+    ) -> Result<Option<Vec<Option<LiveStateReplacementOwner>>>, LixError> {
+        if entity_pks.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Ok(None);
+        }
+        let entries = hot_scan_entries(
+            &self.store,
+            branch_id,
+            generation,
+            &TrackedStateFilter {
+                schema_keys: vec![schema_key.to_string()],
+                entity_pks: entity_pks.to_vec(),
+                include_tombstones: false,
+                ..TrackedStateFilter::default()
+            },
+            None,
+        )
+        .await?;
+        let mut owners = vec![None; entity_pks.len()];
+        let mut requested_index = 0;
+        let mut json_refs = Vec::new();
+        let mut deferred = Vec::new();
+        for (identity, bytes) in entries {
+            let value = decode_head_value(&bytes)?;
+            if value.deleted {
+                continue;
+            }
+            if value.untracked || identity.file_id.is_some() {
+                return Ok(None);
+            }
+            while requested_index < entity_pks.len()
+                && entity_pks[requested_index] < identity.entity_pk
+            {
+                requested_index += 1;
+            }
+            if requested_index == entity_pks.len() {
+                break;
+            }
+            if entity_pks[requested_index] != identity.entity_pk {
+                continue;
+            }
+            let metadata = match value.metadata {
+                HeadSlotView::None => None,
+                HeadSlotView::Inline(metadata) => Some(metadata.to_string()),
+                HeadSlotView::Ref(json_ref) => {
+                    json_refs.push(json_ref);
+                    deferred.push((requested_index, json_ref));
+                    None
+                }
+            };
+            owners[requested_index] = Some(LiveStateReplacementOwner { metadata });
+            requested_index += 1;
+        }
+        if json_refs.is_empty() {
+            return Ok(Some(owners));
+        }
+        let mut json_values = JsonStoreContext::new()
+            .load_bytes_many(
+                &self.store,
+                JsonLoadRequestRef {
+                    refs: &json_refs,
+                    scope: JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await?
+            .into_values();
+        for (index, (owner_index, json_ref)) in deferred.into_iter().enumerate() {
+            let bytes = json_values
+                .get_mut(index)
+                .ok_or_else(|| head_value_error("lost replacement metadata value index"))?
+                .take()
+                .ok_or_else(|| {
+                    head_value_error(&format!(
+                        "replacement owner is missing metadata payload '{}'",
+                        json_ref.to_hex()
+                    ))
+                })?;
+            let metadata = String::from_utf8(bytes).map_err(|error| {
+                head_value_error(&format!(
+                    "replacement owner metadata payload is not UTF-8: {error}"
+                ))
+            })?;
+            owners
+                .get_mut(owner_index)
+                .and_then(Option::as_mut)
+                .ok_or_else(|| head_value_error("lost replacement metadata owner index"))?
+                .metadata = Some(metadata);
+        }
+        Ok(Some(owners))
     }
 }
 

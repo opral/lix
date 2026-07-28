@@ -3715,8 +3715,9 @@ mod tests {
             .unwrap();
         session
             .execute(
-                "INSERT INTO certified_replacement_probe (path, value) VALUES \
-                 ('/a', lix_json('\"old-a\"')), ('/b', lix_json('\"old-b\"'))",
+                "INSERT INTO certified_replacement_probe (path, value, lixcol_metadata) VALUES \
+                 ('/a', lix_json('\"old-a\"'), lix_json('{\"owner\":\"a\"}')), \
+                 ('/b', lix_json('\"old-b\"'), NULL)",
                 &[],
             )
             .await
@@ -3740,6 +3741,13 @@ mod tests {
                         Value::Text("/b".to_string()),
                     ],
                 },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text(r#""not-inserted""#.to_string()),
+                        Value::Text("/missing".to_string()),
+                    ],
+                },
             ])
             .await
             .unwrap();
@@ -3753,19 +3761,29 @@ mod tests {
                 .iter()
                 .map(ExecuteResult::rows_affected)
                 .collect::<Vec<_>>(),
-            vec![1, 1]
+            vec![1, 1, 0]
         );
         let rows = session
             .execute(
-                "SELECT path, value FROM certified_replacement_probe ORDER BY path",
+                "SELECT path, value, lixcol_metadata \
+                 FROM certified_replacement_probe ORDER BY path",
                 &[],
             )
             .await
             .unwrap();
+        assert_eq!(rows.len(), 2);
         assert_eq!(rows.rows()[0].value("value").unwrap(), &Value::Null);
+        assert_eq!(
+            rows.rows()[0].value("lixcol_metadata").unwrap(),
+            &Value::Json(serde_json::json!({"owner": "a"}))
+        );
         assert_eq!(
             rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
             serde_json::json!({"nested": [1, true, "x"]})
+        );
+        assert_eq!(
+            rows.rows()[1].value("lixcol_metadata").unwrap(),
+            &Value::Null
         );
     }
 

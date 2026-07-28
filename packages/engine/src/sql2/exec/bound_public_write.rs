@@ -137,6 +137,69 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         entity_pks.push(entity_pk);
     }
 
+    if let Some(replacement) = &direct_replacement {
+        let unique_entity_pks = unique_entity_pks.iter().cloned().collect::<Vec<_>>();
+        if let Some(owners) = ctx
+            .load_certified_replacement_owners(&spec.schema_key, &unique_entity_pks)
+            .await?
+        {
+            if owners.len() != unique_entity_pks.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "certified replacement owner read expected {} result slots, got {}",
+                        unique_entity_pks.len(),
+                        owners.len()
+                    ),
+                ));
+            }
+            let mut owners_by_pk = unique_entity_pks
+                .into_iter()
+                .zip(owners)
+                .filter_map(|(entity_pk, owner)| owner.map(|owner| (entity_pk, owner)))
+                .collect::<std::collections::HashMap<_, _>>();
+            let branch_id = ctx.active_branch_id().to_string();
+            let mut affected_by_statement = Vec::with_capacity(entity_pks.len());
+            let mut write_rows = Vec::with_capacity(owners_by_pk.len());
+            for (row_index, (entity_pk, params)) in
+                entity_pks.into_iter().zip(&parameter_rows).enumerate()
+            {
+                let Some(owner) = owners_by_pk.remove(&entity_pk) else {
+                    affected_by_statement.push(0);
+                    continue;
+                };
+                write_rows.push(
+                    direct_path_value_replacement_row_without_candidate(
+                        &spec,
+                        entity_pk,
+                        params,
+                        replacement,
+                        &branch_id,
+                        owner,
+                    )
+                    .map_err(|error| with_parameter_batch_statement_index(error, row_index))?,
+                );
+                affected_by_statement.push(1);
+            }
+            stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
+            #[cfg(test)]
+            {
+                ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+                    executions.set(executions.get() + 1);
+                });
+                CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+                    executions.set(executions.get() + 1);
+                });
+            }
+            return Ok(Some(
+                affected_by_statement
+                    .into_iter()
+                    .map(SqlWriteResult::affected)
+                    .collect(),
+            ));
+        }
+    }
+
     let candidates = scan_entity_candidates_for_pks(
         ctx,
         plan,
@@ -210,6 +273,38 @@ struct DirectPathValueReplacement {
     value_param_index: usize,
 }
 
+fn direct_path_value_replacement_row_without_candidate(
+    spec: &EntitySurfaceSpec,
+    entity_pk: EntityPk,
+    params: &[Value],
+    replacement: &DirectPathValueReplacement,
+    branch_id: &str,
+    owner: crate::live_state::LiveStateReplacementOwner,
+) -> Result<TransactionWriteRow, LixError> {
+    let snapshot = normalized_path_value_replacement(&entity_pk, params, replacement)?;
+    Ok(TransactionWriteRow {
+        entity_pk: Some(entity_pk),
+        schema_key: spec.schema_key.clone(),
+        file_id: None,
+        snapshot: Some(snapshot),
+        metadata: owner
+            .metadata
+            .map(|metadata| {
+                let metadata = parse_row_metadata_value(&metadata, &spec.schema_key)?;
+                TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
+            })
+            .transpose()?,
+        origin: None,
+        created_at: None,
+        updated_at: None,
+        global: false,
+        change_id: None,
+        commit_id: None,
+        untracked: false,
+        branch_id: branch_id.to_string(),
+    })
+}
+
 fn direct_path_value_replacement(
     spec: &EntitySurfaceSpec,
     plan: &LogicalWritePlan,
@@ -247,6 +342,33 @@ fn direct_path_value_replacement_row(
     params: &[Value],
     replacement: &DirectPathValueReplacement,
 ) -> Result<TransactionWriteRow, LixError> {
+    let snapshot = normalized_path_value_replacement(&candidate.entity_pk, params, replacement)?;
+    Ok(TransactionWriteRow {
+        entity_pk: Some(candidate.entity_pk.clone()),
+        schema_key: spec.schema_key.clone(),
+        file_id: candidate.file_id.clone(),
+        snapshot: Some(snapshot),
+        metadata: inherited_metadata(candidate, spec)?,
+        origin: None,
+        created_at: None,
+        updated_at: None,
+        global: candidate.global,
+        change_id: None,
+        commit_id: None,
+        untracked: candidate.untracked,
+        branch_id: if candidate.global {
+            crate::GLOBAL_BRANCH_ID.to_string()
+        } else {
+            candidate.branch_id.to_string()
+        },
+    })
+}
+
+fn normalized_path_value_replacement(
+    entity_pk: &EntityPk,
+    params: &[Value],
+    replacement: &DirectPathValueReplacement,
+) -> Result<TransactionJson, LixError> {
     let value = match params.get(replacement.value_param_index) {
         Some(Value::Null) => JsonValue::Null,
         Some(Value::Text(raw)) => serde_json::from_str(raw).map_err(|error| {
@@ -277,34 +399,16 @@ fn direct_path_value_replacement_row(
             format!("certified replacement value failed to serialize: {error}"),
         )
     })?;
-    let path = serde_json::to_string(candidate.entity_pk.as_single_string()?).map_err(|error| {
+    let path = serde_json::to_string(entity_pk.as_single_string()?).map_err(|error| {
         LixError::new(
             LixError::CODE_UNKNOWN,
             format!("certified replacement identity failed to serialize: {error}"),
         )
     })?;
     let normalized = format!(r#"{{"path":{path},"value":{value}}}"#);
-    Ok(TransactionWriteRow {
-        entity_pk: Some(candidate.entity_pk.clone()),
-        schema_key: spec.schema_key.clone(),
-        file_id: candidate.file_id.clone(),
-        snapshot: Some(TransactionJson::from_certified_normalized_row_content(
-            normalized.into(),
-        )),
-        metadata: inherited_metadata(candidate, spec)?,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global: candidate.global,
-        change_id: None,
-        commit_id: None,
-        untracked: candidate.untracked,
-        branch_id: if candidate.global {
-            crate::GLOBAL_BRANCH_ID.to_string()
-        } else {
-            candidate.branch_id.to_string()
-        },
-    })
+    Ok(TransactionJson::from_certified_normalized_row_content(
+        normalized.into(),
+    ))
 }
 
 fn bound_single_text_primary_key_param(

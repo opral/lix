@@ -27,6 +27,17 @@ pub(crate) struct MaterializedLiveStateRow {
     pub(crate) branch_id: Arc<str>,
 }
 
+/// Minimal visible-row evidence needed by a certified full entity replacement.
+///
+/// Identity and target branch are supplied by the caller. A present value
+/// proves that the corresponding live row exists as an ordinary branch-local
+/// tracked member; inherited metadata is the only predecessor payload the
+/// replacement lowerer still needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LiveStateReplacementOwner {
+    pub(crate) metadata: Option<String>,
+}
+
 impl TryFrom<&MaterializedLiveStateRow> for MaterializedTrackedStateRow {
     type Error = crate::LixError;
 

@@ -11,6 +11,7 @@ use crate::binary_cas::{BlobBytesBatch, BlobDataReader, BlobHash};
 use crate::branch::{BranchHead, BranchRefReader};
 use crate::changelog::CommitId;
 use crate::commit_graph::CommitGraphReader;
+use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     FilesystemPathIndex, FilesystemPathIndexReader, FilesystemPathIndexRequest,
     UncachedFilesystemPathIndexReader,
@@ -19,7 +20,7 @@ use crate::functions::FunctionProviderHandle;
 use crate::json_store::JsonStoreReader;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateFilter, LiveStateProjection, LiveStateReader,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateReplacementOwner, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow,
 };
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
@@ -152,6 +153,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
             );
         }
         Ok(rows)
+    }
+
+    async fn load_certified_replacement_owners(
+        &mut self,
+        _schema_key: &str,
+        _entity_pks: &[EntityPk],
+    ) -> Result<Option<Vec<Option<LiveStateReplacementOwner>>>, LixError> {
+        Ok(None)
     }
 
     async fn filesystem_path_index(

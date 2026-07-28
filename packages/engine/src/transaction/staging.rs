@@ -424,6 +424,19 @@ impl TransactionWriteBuffer {
         }
     }
 
+    pub(crate) fn state_rows_are_empty(&self) -> Result<bool, LixError> {
+        let rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        Ok(match &*rows {
+            StagedPreparedRows::AppendOnly { rows, .. } => rows.is_empty(),
+            StagedPreparedRows::Indexed { rows, .. } => rows.iter().all(Option::is_none),
+        })
+    }
+
     /// Promotes the compact ordered journal into the existing identity overlay
     /// only when a read or an irregular write needs read-your-writes lookup.
     fn ensure_identity_index(&self, materialize_empty: bool) -> Result<(), LixError> {

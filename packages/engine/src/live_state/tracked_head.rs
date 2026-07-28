@@ -29,7 +29,7 @@ use crate::json_store::JsonSlot;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlotRef, JsonStoreContext, JsonStoreWriter,
 };
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{LiveStateReplacementOwner, MaterializedLiveStateRow};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,

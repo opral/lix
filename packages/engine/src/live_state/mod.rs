@@ -22,8 +22,9 @@ pub(crate) use tracked_head::{
 #[allow(unused_imports)]
 pub(crate) use types::{
     Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentity, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField, ScanOperator,
+    LiveStateProjection, LiveStateReplacementOwner, LiveStateRowFilter, LiveStateRowIdentity,
+    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField,
+    ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{
