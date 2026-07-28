@@ -265,65 +265,6 @@ fn insert_exact_overlay_candidate<'a>(
     }
 }
 
-/// Resolves raw tracked/untracked candidates into the rows visible for a scan.
-///
-/// Global rows are projected into each requested branch scope, but keep
-/// `global = true`. Branch-scoped rows win over projected global rows for the
-/// same identity. Tombstones participate in winning and are filtered only after
-/// visibility is resolved. This projection is a read concern; constraint
-/// validation remains exact storage-scope local unless a validator explicitly
-/// opts into overlay semantics.
-#[cfg(test)]
-fn resolve_scan_rows(
-    rows: Vec<MaterializedLiveStateRow>,
-    requested_branch_ids: &[String],
-    include_tombstones: bool,
-) -> Vec<MaterializedLiveStateRow> {
-    resolve_live_state_batch(
-        &MaterializedLiveStateBatch::from_rows(rows),
-        &MaterializedLiveStateBatch::default(),
-        requested_branch_ids,
-        include_tombstones,
-        None,
-    )
-    .into_rows()
-}
-
-#[cfg(test)]
-fn resolve_live_state_rows(
-    base_rows: Vec<MaterializedLiveStateRow>,
-    staged_rows: Vec<MaterializedLiveStateRow>,
-    requested_branch_ids: &[String],
-    include_tombstones: bool,
-    limit: Option<usize>,
-) -> Vec<MaterializedLiveStateRow> {
-    resolve_live_state_batch(
-        &MaterializedLiveStateBatch::from_rows(base_rows),
-        &MaterializedLiveStateBatch::from_rows(staged_rows),
-        requested_branch_ids,
-        include_tombstones,
-        limit,
-    )
-    .into_rows()
-}
-
-#[cfg(test)]
-fn resolve_live_state_rows_via_overlay(
-    base_rows: Vec<MaterializedLiveStateRow>,
-    staged_rows: Vec<MaterializedLiveStateRow>,
-    requested_branch_ids: &[String],
-    include_tombstones: bool,
-    limit: Option<usize>,
-) -> Vec<MaterializedLiveStateRow> {
-    resolve_live_state_rows(
-        base_rows,
-        staged_rows,
-        requested_branch_ids,
-        include_tombstones,
-        limit,
-    )
-}
-
 #[derive(Clone, Copy)]
 struct OverlayCandidate<'a> {
     row: MaterializedLiveStateRowRef<'a>,
@@ -475,45 +416,6 @@ fn append_projected_candidates<'a>(
     }
 }
 
-#[cfg(test)]
-fn can_resolve_uncontested_single_branch_rows(
-    base_rows: &[MaterializedLiveStateRow],
-    staged_rows: &[MaterializedLiveStateRow],
-    requested_branch_ids: &[String],
-) -> bool {
-    let [requested_branch_id] = requested_branch_ids else {
-        return false;
-    };
-    staged_rows.is_empty()
-        && base_rows
-            .iter()
-            .all(|row| !row.global && row.branch_id.as_ref() == requested_branch_id)
-}
-
-/// Resolves candidates which are already scoped to one nonglobal branch.
-///
-/// The general overlay path builds two `BTreeMap`s and clones every row while
-/// projecting it. With no global or staged candidates, tier arbitration is a
-/// no-op. A stable in-place sort followed by deduplication preserves the
-/// general path's identity order and "last input row wins" behavior without
-/// cloning row payloads. Reversing before the stable sort makes the last input
-/// candidate the first equal-key candidate retained by `dedup_by`.
-#[cfg(test)]
-fn resolve_uncontested_single_branch_rows(
-    rows: Vec<MaterializedLiveStateRow>,
-    include_tombstones: bool,
-    limit: Option<usize>,
-) -> Vec<MaterializedLiveStateRow> {
-    resolve_live_state_batch(
-        &MaterializedLiveStateBatch::from_rows(rows),
-        &MaterializedLiveStateBatch::default(),
-        &[],
-        include_tombstones,
-        limit,
-    )
-    .into_rows()
-}
-
 fn requested_branch_ids(branch_scope: &VisibilityBranchScope) -> Vec<String> {
     match branch_scope {
         VisibilityBranchScope::BranchIds { branch_ids } => branch_ids.clone(),
@@ -595,17 +497,20 @@ mod tests {
 
     #[test]
     fn committed_scan_projects_global_row_into_requested_branch() {
-        let rows = resolve_scan_rows(
-            vec![row_at(
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![row_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 "global-value",
                 true,
                 Some("change-global"),
-            )],
+            )]),
+            &MaterializedLiveStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
-        );
+            None,
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -621,8 +526,8 @@ mod tests {
 
     #[test]
     fn committed_scan_prefers_requested_branch_row_over_projected_global_row() {
-        let rows = resolve_scan_rows(
-            vec![
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -637,10 +542,13 @@ mod tests {
                     false,
                     Some("change-branch"),
                 ),
-            ],
+            ]),
+            &MaterializedLiveStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
-        );
+            None,
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -674,7 +582,14 @@ mod tests {
         untracked.untracked = true;
         untracked.commit_id = None;
 
-        let rows = resolve_scan_rows(vec![tracked, untracked], &[], false);
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
+            &MaterializedLiveStateBatch::default(),
+            &[],
+            false,
+            None,
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].untracked);
@@ -701,7 +616,14 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_rows(vec![base], vec![staged], &[], false, None);
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![staged]),
+            &[],
+            false,
+            None,
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -711,172 +633,9 @@ mod tests {
     }
 
     #[test]
-    fn uncontested_single_branch_fast_path_matches_overlay_semantics() {
-        let rows = vec![
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "b",
-                "B",
-                false,
-                Some("change-b"),
-            ),
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "duplicate",
-                "first",
-                false,
-                Some("change-first"),
-            ),
-            tombstone_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "deleted",
-                false,
-                Some("change-deleted"),
-            ),
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "a",
-                "A",
-                false,
-                Some("change-a"),
-            ),
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "duplicate",
-                "last",
-                false,
-                Some("change-last"),
-            ),
-        ];
-        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
-
-        let expected =
-            resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, false, None);
-        let actual = resolve_live_state_rows(rows, Vec::new(), &requested, false, None);
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 3);
-        assert_eq!(
-            actual[2].snapshot_content.as_deref(),
-            Some("{\"value\":\"last\"}")
-        );
-    }
-
-    #[test]
-    fn uncontested_single_branch_fast_path_applies_tombstones_and_limit_after_deduplication() {
-        let rows = vec![
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "a",
-                "first",
-                false,
-                Some("change-first"),
-            ),
-            tombstone_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "a",
-                false,
-                Some("change-delete"),
-            ),
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "b",
-                "B",
-                false,
-                Some("change-b"),
-            ),
-            row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "c",
-                "C",
-                false,
-                Some("change-c"),
-            ),
-        ];
-
-        let actual = resolve_uncontested_single_branch_rows(rows, false, Some(1));
-
-        assert_eq!(actual.len(), 1);
-        assert_eq!(actual[0].entity_pk, EntityPk::single("b"));
-    }
-
-    #[test]
-    fn uncontested_single_branch_fast_path_keeps_distinct_file_identities() {
-        let rows = vec![
-            file_row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "same",
-                "01920000-0000-7000-8000-0000000000a2",
-                false,
-                "schema",
-                "01920000-0000-7000-8000-0000000000a2",
-            ),
-            file_row_at(
-                "01920000-0000-7000-8000-0000000000a1",
-                "same",
-                "01920000-0000-7000-8000-0000000000b2",
-                false,
-                "schema",
-                "01920000-0000-7000-8000-0000000000b2",
-            ),
-        ];
-        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
-
-        let expected =
-            resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, true, None);
-        let actual = resolve_live_state_rows(rows, Vec::new(), &requested, true, None);
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual.len(), 2);
-    }
-
-    #[test]
-    fn uncontested_single_branch_fast_path_requires_exact_scope() {
-        let branch_row = row_at(
-            "01920000-0000-7000-8000-0000000000a1",
-            "a",
-            "A",
-            false,
-            Some("change-a"),
-        );
-        let global_row = row_at(
-            "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            "a",
-            "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            true,
-            Some("change-global"),
-        );
-        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
-
-        assert!(can_resolve_uncontested_single_branch_rows(
-            std::slice::from_ref(&branch_row),
-            &[],
-            &requested,
-        ));
-        assert!(!can_resolve_uncontested_single_branch_rows(
-            std::slice::from_ref(&global_row),
-            &[],
-            &requested,
-        ));
-        assert!(!can_resolve_uncontested_single_branch_rows(
-            std::slice::from_ref(&branch_row),
-            std::slice::from_ref(&branch_row),
-            &requested,
-        ));
-        assert!(!can_resolve_uncontested_single_branch_rows(
-            std::slice::from_ref(&branch_row),
-            &[],
-            &[
-                "01920000-0000-7000-8000-0000000000a1".to_string(),
-                "01920000-0000-7000-8000-0000000000b1".to_string()
-            ],
-        ));
-    }
-
-    #[test]
     fn branch_tombstone_hides_global_row_after_visibility_resolution() {
-        let rows = resolve_scan_rows(
-            vec![
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -890,10 +649,13 @@ mod tests {
                     false,
                     Some("change-tombstone"),
                 ),
-            ],
+            ]),
+            &MaterializedLiveStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
-        );
+            None,
+        )
+        .into_rows();
 
         assert!(rows.is_empty());
     }
@@ -918,13 +680,14 @@ mod tests {
         untracked.untracked = true;
         untracked.commit_id = None;
 
-        let rows = resolve_live_state_rows(
-            Vec::new(),
-            vec![untracked.clone(), tracked.clone()],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::default(),
+            &MaterializedLiveStateBatch::from_rows(vec![untracked.clone(), tracked.clone()]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].untracked);
@@ -933,13 +696,14 @@ mod tests {
             Some("{\"value\":\"tracked\"}")
         );
 
-        let rows = resolve_live_state_rows(
-            Vec::new(),
-            vec![tracked, untracked],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::default(),
+            &MaterializedLiveStateBatch::from_rows(vec![tracked, untracked]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(rows[0].untracked);
@@ -969,13 +733,14 @@ mod tests {
         );
         staged.untracked = false;
 
-        let rows = resolve_live_state_rows(
-            vec![base],
-            vec![staged],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].untracked);
@@ -996,18 +761,19 @@ mod tests {
         );
         base.global = true;
 
-        let rows = resolve_live_state_rows(
-            vec![base],
-            vec![tombstone_at(
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![tombstone_at(
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 true,
                 Some("change-staged"),
-            )],
+            )]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert!(rows.is_empty());
     }
@@ -1028,13 +794,14 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_rows(
-            vec![base],
-            vec![staged],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert!(rows.is_empty());
     }
@@ -1057,13 +824,14 @@ mod tests {
         staged.untracked = true;
         staged.commit_id = None;
 
-        let rows = resolve_live_state_rows(
-            vec![base],
-            vec![staged],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert!(rows.is_empty());
     }
@@ -1084,13 +852,14 @@ mod tests {
             Some("change-staged"),
         );
 
-        let rows = resolve_live_state_rows(
-            vec![base],
-            vec![staged],
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![base]),
+            &MaterializedLiveStateBatch::from_rows(vec![staged]),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
-        );
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].deleted);
@@ -1098,8 +867,8 @@ mod tests {
 
     #[test]
     fn tombstone_can_be_returned_when_requested() {
-        let rows = resolve_scan_rows(
-            vec![
+        let rows = resolve_live_state_batch(
+            &MaterializedLiveStateBatch::from_rows(vec![
                 row_at(
                     "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
@@ -1113,10 +882,13 @@ mod tests {
                     false,
                     Some("change-tombstone"),
                 ),
-            ],
+            ]),
+            &MaterializedLiveStateBatch::default(),
             &["01920000-0000-7000-8000-0000000000a1".to_string()],
             true,
-        );
+            None,
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -1374,21 +1146,6 @@ mod tests {
             commit_id: Some(CommitId::for_test_label("commit")),
             untracked: false,
             branch_id: branch_id.into(),
-        }
-    }
-
-    fn file_row_at(
-        branch_id: &str,
-        entity_pk: &str,
-        value: &str,
-        global: bool,
-        schema_key: &str,
-        file_id: &str,
-    ) -> MaterializedLiveStateRow {
-        MaterializedLiveStateRow {
-            schema_key: schema_key.to_string(),
-            file_id: Some(file_id.to_string()),
-            ..row_at(branch_id, entity_pk, value, global, Some("change"))
         }
     }
 
