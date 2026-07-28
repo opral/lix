@@ -389,6 +389,7 @@ pub struct SlateDBRead {
 pub struct SlateDBWrite {
     worker: SlateDBWorker,
     write_pipeline: WritePipeline,
+    point_cache: SnapshotPointCache,
     _writer_permit: OwnedMutexGuard<()>,
     await_durable: bool,
     base: Option<Arc<DbSnapshot>>,
@@ -412,6 +413,7 @@ struct SnapshotPointCacheState {
     entries: HashMap<u64, HashMap<Key, SnapshotPointCacheValue>>,
     eviction_order: VecDeque<SnapshotPointCacheKey>,
     used_bytes: usize,
+    current_sequence: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -790,6 +792,80 @@ impl SnapshotPointCache {
             .or_default()
             .insert(key, SnapshotPointCacheValue { value, weight });
     }
+
+    fn observe_snapshot(&self, sequence: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.current_sequence == Some(sequence) {
+            return;
+        }
+        if !state.entries.contains_key(&sequence) {
+            state.entries.clear();
+            state.eviction_order.clear();
+            state.used_bytes = 0;
+        }
+        state.current_sequence = Some(sequence);
+    }
+
+    fn advance_local_write(&self, sequence: u64, overlays: &[Arc<BTreeMap<Key, Option<Bytes>>>]) {
+        let mut latest_values = BTreeMap::new();
+        for overlay in overlays {
+            latest_values.extend(
+                overlay
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match state.current_sequence {
+                Some(current) if current.checked_add(1) == Some(sequence) => {
+                    if let Some(entries) = state.entries.remove(&current) {
+                        state.entries.insert(sequence, entries);
+                    }
+                    for key in &mut state.eviction_order {
+                        if key.sequence == current {
+                            key.sequence = sequence;
+                        }
+                    }
+                }
+                Some(current) if sequence == current => {}
+                _ => {
+                    state.entries.clear();
+                    state.eviction_order.clear();
+                    state.used_bytes = 0;
+                }
+            }
+            state.current_sequence = Some(sequence);
+
+            for key in latest_values.keys() {
+                let removed_weight = state
+                    .entries
+                    .get_mut(&sequence)
+                    .and_then(|entries| entries.remove(key))
+                    .map(|entry| entry.weight);
+                if let Some(weight) = removed_weight {
+                    state.used_bytes = state.used_bytes.saturating_sub(weight);
+                }
+            }
+            state.eviction_order.retain(|entry| {
+                entry.sequence != sequence || !latest_values.contains_key(&entry.key)
+            });
+            if state.entries.get(&sequence).is_some_and(HashMap::is_empty) {
+                state.entries.remove(&sequence);
+            }
+        }
+
+        for (key, value) in latest_values {
+            self.insert(sequence, key, value);
+        }
+    }
 }
 
 impl Default for SlateDBFactory {
@@ -928,6 +1004,7 @@ impl Storage for SlateDB {
         async move {
             self.write_pipeline.terminal_error()?;
             let snapshot = self.write_pipeline.snapshot(&self.worker).await?;
+            self.point_cache.observe_snapshot(snapshot.seq());
             let publication_view = if opts.durability == ReadDurability::Visible {
                 Some(self.write_pipeline.capture(snapshot.seq()))
             } else {
@@ -961,6 +1038,7 @@ impl Storage for SlateDB {
             Ok(SlateDBWrite {
                 worker: self.worker.clone(),
                 write_pipeline: self.write_pipeline.clone(),
+                point_cache: self.point_cache.clone(),
                 _writer_permit: writer_permit,
                 // The engine sets this only for the atomic mutation plus
                 // idempotency-receipt commit. Its replay contract requires a
@@ -991,6 +1069,7 @@ async fn check_preconditions(
         .call_read(move |db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
             let snapshot_sequence = snapshot.seq();
+            point_cache.observe_snapshot(snapshot_sequence);
             let publication_view = read_pipeline.capture(snapshot_sequence);
             let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
@@ -1483,6 +1562,7 @@ impl StorageWrite for SlateDBWrite {
             let Self {
                 worker,
                 write_pipeline,
+                point_cache,
                 _writer_permit: writer_permit,
                 await_durable,
                 overlay,
@@ -1537,7 +1617,7 @@ impl StorageWrite for SlateDBWrite {
             drop(writer_permit);
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
-                worker.spawn(move |db| drain_write_queue(db, task_pipeline));
+                worker.spawn(move |db| drain_write_queue(db, task_pipeline, point_cache));
             }
 
             // The writer gate protects precondition evaluation plus publication
@@ -1558,7 +1638,7 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
-async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline) {
+async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: SnapshotPointCache) {
     loop {
         let writes = {
             let mut state = pipeline
@@ -1605,6 +1685,13 @@ async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline) {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .terminal_error = Some(error.clone());
+        }
+        if let Ok(sequence) = &result {
+            let overlays = writes
+                .iter()
+                .map(|write| Arc::clone(&write.overlay))
+                .collect::<Vec<_>>();
+            point_cache.advance_local_write(*sequence, &overlays);
         }
         for write in writes {
             if let Ok(sequence) = &result {
@@ -3043,6 +3130,60 @@ mod tests {
 
         blocker.complete(Ok(0));
         block_on(storage.flush()).expect("flush released pending write");
+    }
+
+    #[test]
+    fn snapshot_point_cache_advances_only_across_contiguous_local_sequences() {
+        let cache = SnapshotPointCache::new();
+        let unchanged = Key(Bytes::from_static(b"unchanged"));
+        let updated = Key(Bytes::from_static(b"updated"));
+        let deleted = Key(Bytes::from_static(b"deleted"));
+        cache.observe_snapshot(7);
+        cache.insert(7, unchanged.clone(), Some(Bytes::from_static(b"stable")));
+        cache.insert(7, updated.clone(), Some(Bytes::from_static(b"old")));
+        cache.insert(7, deleted.clone(), Some(Bytes::from_static(b"present")));
+
+        let overlay = Arc::new(BTreeMap::from([
+            (updated.clone(), Some(Bytes::from_static(b"new"))),
+            (deleted.clone(), None),
+        ]));
+        cache.advance_local_write(8, &[overlay]);
+
+        assert_eq!(
+            cache.get(8, &unchanged),
+            Some(Some(Bytes::from_static(b"stable")))
+        );
+        assert_eq!(
+            cache.get(8, &updated),
+            Some(Some(Bytes::from_static(b"new")))
+        );
+        assert_eq!(cache.get(8, &deleted), Some(None));
+        assert_eq!(cache.get(7, &unchanged), None);
+    }
+
+    #[test]
+    fn snapshot_point_cache_clears_unchanged_values_on_external_sequence_jump() {
+        let cache = SnapshotPointCache::new();
+        let stale = Key(Bytes::from_static(b"stale"));
+        let locally_written = Key(Bytes::from_static(b"local"));
+        cache.observe_snapshot(11);
+        cache.insert(11, stale.clone(), Some(Bytes::from_static(b"old")));
+
+        cache.observe_snapshot(15);
+        assert_eq!(cache.get(15, &stale), None);
+
+        cache.advance_local_write(
+            16,
+            &[Arc::new(BTreeMap::from([(
+                locally_written.clone(),
+                Some(Bytes::from_static(b"new")),
+            )]))],
+        );
+        assert_eq!(cache.get(16, &stale), None);
+        assert_eq!(
+            cache.get(16, &locally_written),
+            Some(Some(Bytes::from_static(b"new")))
+        );
     }
 
     #[test]

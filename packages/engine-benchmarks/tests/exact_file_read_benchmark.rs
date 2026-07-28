@@ -22,6 +22,10 @@ const DEFAULT_FILE_COUNT: usize = 2;
 const CORPUS_INSERT_CHUNK_SIZE: usize = 500;
 const CORPUS_FILE_DATA_HEX: &str = "43434343434343434343434343434343";
 
+fn benchmark_file_id(index: usize) -> String {
+    format!("01920000-0000-7000-8000-{index:012x}")
+}
+
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "manual performance probe; run with --ignored --nocapture"]
 async fn exact_file_read_benchmark_probe() {
@@ -81,9 +85,13 @@ where
         .expect("begin exact-file benchmark seed transaction");
     let mut inserted = 0_u64;
     for (file_id, path, bytes) in [
-        ("exact-read-4k", "/exact-read-4k.bin", vec![0x41; 4 * 1024]),
         (
-            "exact-read-1m",
+            benchmark_file_id(0),
+            "/exact-read-4k.bin",
+            vec![0x41; 4 * 1024],
+        ),
+        (
+            benchmark_file_id(1),
             "/exact-read-1m.bin",
             vec![0x42; 1024 * 1024],
         ),
@@ -92,7 +100,7 @@ where
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
                 &[
-                    Value::Text(file_id.to_string()),
+                    Value::Text(file_id),
                     Value::Text(path.to_string()),
                     Value::Blob(bytes.into()),
                 ],
@@ -110,7 +118,8 @@ where
             }
             write!(
                 &mut sql,
-                "('exact-read-corpus-{index:05}','/exact-read-corpus/{index:05}.bin',X'{CORPUS_FILE_DATA_HEX}')"
+                "('{}','/exact-read-corpus/{index:05}.bin',X'{CORPUS_FILE_DATA_HEX}')",
+                benchmark_file_id(index)
             )
             .expect("format corpus file insert");
         }
@@ -135,12 +144,12 @@ where
         (
             "id_by_id_4k",
             "SELECT id FROM lix_file WHERE id = $1",
-            "exact-read-4k".to_string(),
+            benchmark_file_id(0),
         ),
         (
             "data_by_id_4k",
             "SELECT data FROM lix_file WHERE id = $1",
-            "exact-read-4k".to_string(),
+            benchmark_file_id(0),
         ),
         (
             "data_by_path_4k",
@@ -150,12 +159,12 @@ where
         (
             "change_id_by_id_4k",
             "SELECT lixcol_change_id FROM lix_file WHERE id = $1",
-            "exact-read-4k".to_string(),
+            benchmark_file_id(0),
         ),
         (
             "data_by_id_1m",
             "SELECT data FROM lix_file WHERE id = $1",
-            "exact-read-1m".to_string(),
+            benchmark_file_id(1),
         ),
         (
             "data_by_path_1m",
@@ -168,17 +177,17 @@ where
         shapes.push((
             "id_by_id_corpus_tail",
             "SELECT id FROM lix_file WHERE id = $1",
-            format!("exact-read-corpus-{target:05}"),
+            benchmark_file_id(target),
         ));
         shapes.push((
             "data_by_id_corpus_tail",
             "SELECT data FROM lix_file WHERE id = $1",
-            format!("exact-read-corpus-{target:05}"),
+            benchmark_file_id(target),
         ));
         shapes.push((
             "change_id_by_id_corpus_tail",
             "SELECT lixcol_change_id FROM lix_file WHERE id = $1",
-            format!("exact-read-corpus-{target:05}"),
+            benchmark_file_id(target),
         ));
     }
 
