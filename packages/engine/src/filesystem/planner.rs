@@ -602,23 +602,21 @@ impl DirectoryPathResolver {
     /// deterministic ids so repeated planning of the same transaction-visible
     /// path resolves to the same descriptor identity.
     #[cfg(test)]
-    pub(crate) fn ensure_directory_path(
+    pub(crate) fn ensure_directory_path_batch(
         &mut self,
         directory_path: &str,
         context: FilesystemRowContext,
         generate_directory_id: &mut dyn FnMut() -> String,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
+    ) -> Result<RawWriteBatch, LixError> {
         let parsed = LixPath::try_from_directory_path(directory_path)?;
-        Ok(self
-            .plan_directory_segments_with_fallback(
-                None,
-                parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>(),
-                None,
-                context,
-                generate_directory_id,
-                None,
-            )?
-            .into_rows())
+        self.plan_directory_segments_with_fallback(
+            None,
+            parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>(),
+            None,
+            context,
+            generate_directory_id,
+            None,
+        )
     }
 
     fn plan_directory_segments_with_fallback(
@@ -1479,14 +1477,6 @@ pub(crate) fn plan_recursive_directory_delete(
     FilesystemDeletePlan { rows, count }
 }
 
-#[cfg(test)]
-pub(crate) fn directory_path_resolvers_from_state_rows(
-    rows: Vec<MaterializedLiveStateRow>,
-) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
-    let rows = crate::live_state::MaterializedLiveStateBatch::from_rows(rows);
-    directory_path_resolvers_from_state_batch(&rows)
-}
-
 pub(crate) fn directory_path_resolvers_from_state_batch(
     rows: &crate::live_state::MaterializedLiveStateBatch,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
@@ -1805,7 +1795,10 @@ mod tests {
     };
     use crate::common::LixPath;
     use crate::filesystem::VisibleFilesystem;
-    use crate::{entity_pk::EntityPk, live_state::MaterializedLiveStateRow};
+    use crate::{
+        entity_pk::EntityPk,
+        live_state::{MaterializedLiveStateBatch, MaterializedLiveStateRow},
+    };
 
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
@@ -2026,7 +2019,7 @@ mod tests {
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
         let rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
@@ -2054,12 +2047,13 @@ mod tests {
         .expect("existing directories should parse");
 
         let rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
-            .expect("directory path should plan");
+            .expect("directory path should plan")
+            .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -2086,7 +2080,7 @@ mod tests {
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
         let docs_rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
@@ -2095,12 +2089,13 @@ mod tests {
         assert_eq!(docs_rows.len(), 1);
 
         let nested_rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
-            .expect("nested directory should plan");
+            .expect("nested directory should plan")
+            .into_rows();
 
         assert_eq!(nested_rows.len(), 1);
         let snapshot: JsonValue = nested_rows[0].snapshot.as_ref().unwrap().value().clone();
@@ -2151,7 +2146,7 @@ mod tests {
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
 
         let rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&[
@@ -2163,7 +2158,7 @@ mod tests {
         assert_eq!(rows.len(), 2);
 
         let rows = resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/nested/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
@@ -2362,7 +2357,7 @@ mod tests {
         let mut directory_resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
         let directory_error = directory_resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
@@ -2384,7 +2379,7 @@ mod tests {
         )
         .expect("resolver should seed existing file");
         let error = existing_file_resolver
-            .ensure_directory_path(
+            .ensure_directory_path_batch(
                 "/docs/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["01920000-0000-7000-8000-0000000000d3"]),
@@ -2680,8 +2675,8 @@ mod tests {
     }
 
     #[test]
-    fn directory_path_resolvers_from_state_rows_derives_nested_paths() {
-        let resolvers = super::directory_path_resolvers_from_state_rows(vec![
+    fn directory_path_resolvers_from_state_batch_derives_nested_paths() {
+        let rows = MaterializedLiveStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2692,8 +2687,9 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a1",
                 "{\"id\":\"01920000-0000-7000-8000-000000000313\",\"parent_id\":\"01920000-0000-7000-8000-0000000000d3\",\"name\":\"guides\"}",
             ),
-        ])
-        .expect("state rows should seed directory resolvers");
+        ]);
+        let resolvers = super::directory_path_resolvers_from_state_batch(&rows)
+            .expect("state rows should seed directory resolvers");
 
         let resolver = resolvers
             .get(&super::filesystem_storage_scope_key(
@@ -2714,8 +2710,8 @@ mod tests {
     }
 
     #[test]
-    fn directory_path_resolvers_from_state_rows_handles_parent_cycles() {
-        let error = super::directory_path_resolvers_from_state_rows(vec![
+    fn directory_path_resolvers_from_state_batch_handles_parent_cycles() {
+        let rows = MaterializedLiveStateBatch::from_rows(vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000a3",
                 "01920000-0000-7000-8000-0000000000a1",
@@ -2726,15 +2722,16 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a1",
                 "{\"id\":\"01920000-0000-7000-8000-0000000000b3\",\"parent_id\":\"01920000-0000-7000-8000-0000000000a3\",\"name\":\"b\"}",
             ),
-        ])
-        .expect_err("cyclic directory parent graph should be rejected");
+        ]);
+        let error = super::directory_path_resolvers_from_state_batch(&rows)
+            .expect_err("cyclic directory parent graph should be rejected");
 
         assert_eq!(error.code, crate::LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(error.message.contains("parent_id cycle"));
     }
 
     #[test]
-    fn directory_path_resolvers_from_state_rows_separates_storage_scopes() {
+    fn directory_path_resolvers_from_state_batch_separates_storage_scopes() {
         let rows = vec![
             live_directory_row_with_scope(
                 "dir-01920000-0000-7000-8000-0000000000a1",
@@ -2778,7 +2775,8 @@ mod tests {
             ),
         ];
 
-        let resolvers = super::directory_path_resolvers_from_state_rows(rows)
+        let rows = MaterializedLiveStateBatch::from_rows(rows);
+        let resolvers = super::directory_path_resolvers_from_state_batch(&rows)
             .expect("scoped rows should seed distinct resolvers");
 
         let branch_a_key = super::filesystem_storage_scope_key(
