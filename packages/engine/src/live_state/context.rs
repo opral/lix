@@ -156,9 +156,20 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        self.scan_rows_with_schema_presence(request, false).await
+    }
+
+    async fn scan_rows_with_schema_presence(
+        &self,
+        request: &LiveStateScanRequest,
+        skip_proven_empty_schema: bool,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, request, reads_tracked).await?;
+        if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
+            return Ok(Vec::new());
+        }
         if let Some(rows) = self.scan_direct_entity_pk_rows(request, &scope).await? {
             return Ok(rows);
         }
@@ -476,9 +487,21 @@ where
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        self.scan_tracked_rows_with_schema_presence(request, false)
+            .await
+    }
+
+    async fn scan_tracked_rows_with_schema_presence(
+        &self,
+        request: &LiveStateScanRequest,
+        skip_proven_empty_schema: bool,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, request, reads_tracked).await?;
+        if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
+            return Ok(Vec::new());
+        }
         let commit_derived_rows =
             scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
         let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
@@ -563,6 +586,19 @@ impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    async fn scan_constraint_rows(
+        &self,
+        request: &LiveStateScanRequest,
+        tracked_only: bool,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if tracked_only {
+            self.scan_tracked_rows_with_schema_presence(request, true)
+                .await
+        } else {
+            self.scan_rows_with_schema_presence(request, true).await
+        }
+    }
+
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
@@ -942,6 +978,25 @@ fn current_row_matches_retention(
     requested_untracked: Option<bool>,
 ) -> bool {
     requested_untracked.is_none_or(|untracked| row.untracked == untracked)
+}
+
+/// Proves a single-schema hot-state scan empty from the atomic branch
+/// publication metadata. Missing controls and Bloom false positives fall back
+/// to the storage scan; only a negative result from every selected generation
+/// can skip it.
+fn scope_may_have_schema_rows(request: &LiveStateScanRequest, scope: &LiveStateScanScope) -> bool {
+    let [schema_key] = request.filter.schema_keys.as_slice() else {
+        return true;
+    };
+    if schema_key == BRANCH_REF_SCHEMA_KEY || request_may_include_commit_derived(request) {
+        return true;
+    }
+    scope.storage_branch_ids.iter().any(|branch_id| {
+        scope
+            .branch_heads
+            .get(branch_id)
+            .is_none_or(|control| control.may_have_schema(schema_key))
+    })
 }
 
 async fn scan_scope(
@@ -1877,6 +1932,11 @@ mod tests {
                     metadata: metadata.as_ref_slot(),
                 })
                 .collect::<Vec<_>>();
+            let schema_keys = parent_rows
+                .iter()
+                .map(|row| row.schema_key.clone())
+                .chain(branch_rows.iter().map(|row| row.schema_key.clone()))
+                .collect::<Vec<_>>();
             let mut working_diff_coverage = WorkingDiffIndexCoverage::default();
             let generation = TrackedHeadContext::new()
                 .writer(&read, &mut writes)
@@ -1893,22 +1953,19 @@ mod tests {
                 )
                 .await
                 .expect("test current-state generation should stage");
-            crate::branch::stage_branch_head_control(
-                &mut writes,
-                &branch_id,
-                BranchHeadControl {
-                    head_commit_id,
-                    generation,
-                    current_state_revision: 0,
-                    working_diff_checkpoint_commit_id: None,
-                    created_at,
-                    updated_at,
-                    ref_change_id: ChangeId::for_test_label(&format!(
-                        "test-branch-ref-{branch_id}"
-                    )),
-                },
-            )
-            .expect("test branch-head control should stage");
+            let mut control = BranchHeadControl {
+                head_commit_id,
+                generation,
+                current_state_revision: 0,
+                schema_presence_bloom: [0; 4],
+                working_diff_checkpoint_commit_id: None,
+                created_at,
+                updated_at,
+                ref_change_id: ChangeId::for_test_label(&format!("test-branch-ref-{branch_id}")),
+            };
+            control.note_schemas(schema_keys.iter().map(String::as_str));
+            crate::branch::stage_branch_head_control(&mut writes, &branch_id, control)
+                .expect("test branch-head control should stage");
         }
 
         // A pure untracked write mutates the active generation in place and

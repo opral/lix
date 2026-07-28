@@ -122,11 +122,9 @@ async fn scan_committed_constraint_rows(
         },
         ..Default::default()
     };
-    let rows = if domain.untracked() {
-        live_state.scan_rows(&request).await?
-    } else {
-        live_state.scan_tracked_rows(&request).await?
-    };
+    let rows = live_state
+        .scan_constraint_rows(&request, !domain.untracked())
+        .await?;
     Ok(rows
         .into_iter()
         .filter(|row| {

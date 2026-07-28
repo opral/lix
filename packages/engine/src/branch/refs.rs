@@ -194,6 +194,7 @@ mod tests {
                 head_commit_id: commit_id,
                 generation: commit_id,
                 current_state_revision: 0,
+                schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: None,
                 created_at: LixTimestamp::expect_parse(
                     "test branch ref created_at",

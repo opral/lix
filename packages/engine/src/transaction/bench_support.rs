@@ -49,6 +49,7 @@ pub struct BenchTransactionFixture<StorageImpl: Storage> {
     branch_ctx: Arc<BranchContext>,
     catalog_context: Arc<CatalogContext>,
     rows: Vec<BenchTransactionRow>,
+    delete_one_offset: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -104,6 +105,7 @@ where
             branch_ctx,
             catalog_context: Arc::new(CatalogContext::new()),
             rows,
+            delete_one_offset: 0,
         }
     }
 
@@ -161,7 +163,9 @@ where
     }
 
     pub async fn delete_one_by_pk_accounting(&mut self) -> BenchWriteAccounting {
-        let row = &self.rows[self.rows.len() / 2];
+        let row_index = (self.rows.len() / 2 + self.delete_one_offset) % self.rows.len();
+        self.delete_one_offset += 1;
+        let row = &self.rows[row_index];
         self.commit_rows(vec![transaction_delete_row(row)]).await
     }
 
@@ -552,20 +556,19 @@ async fn seed_visible_schema_rows<StorageImpl>(
     // branch refs are synthesized from controls rather than duplicated in
     // current-state rows.
     for (branch_id, _, _, change_id) in &branch_refs {
-        stage_branch_head_control(
-            &mut writes,
-            branch_id,
-            BranchHeadControl {
-                head_commit_id: commit_id,
-                generation: commit_id,
-                current_state_revision: 0,
-                working_diff_checkpoint_commit_id: None,
-                created_at: timestamp,
-                updated_at: timestamp,
-                ref_change_id: *change_id,
-            },
-        )
-        .expect("schema fixture branch control should stage");
+        let mut control = BranchHeadControl {
+            head_commit_id: commit_id,
+            generation: commit_id,
+            current_state_revision: 0,
+            working_diff_checkpoint_commit_id: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+            ref_change_id: *change_id,
+            schema_presence_bloom: [0; 4],
+        };
+        control.note_schemas(rows.iter().map(|row| row.schema_key.as_str()));
+        stage_branch_head_control(&mut writes, branch_id, control)
+            .expect("schema fixture branch control should stage");
     }
     // A branch ref can change the registered-schema catalog reachable from a
     // branch, so it rotates the same cache revision in production commits.

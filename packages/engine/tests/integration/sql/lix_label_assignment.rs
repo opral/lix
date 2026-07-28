@@ -76,6 +76,13 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_UNIQUE);
 
         let error = session
+            .execute("DELETE FROM lix_key_value WHERE key = 'label-target'", &[])
+            .await
+            .expect_err("referenced target state row should remain delete-restricted");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+
+        let error = session
             .execute(
                 "INSERT INTO lix_label (id, name) VALUES ('label-b', 'Needs review')",
                 &[],

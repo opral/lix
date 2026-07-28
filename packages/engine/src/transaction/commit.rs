@@ -1545,7 +1545,7 @@ async fn stage_tracked_head(
             let generation =
                 lifecycle_generation(&root.branch_id, root.commit_id, root.ref_change_id);
             let mut coverage = WorkingDiffIndexCoverage::default();
-            let final_tracked = tracked_head
+            let (final_tracked, schema_keys) = tracked_head
                 .writer(read, writes)
                 .stage_complete_current_state_with_working_diff(
                     &root.branch_id,
@@ -1559,12 +1559,11 @@ async fn stage_tracked_head(
                     &mut coverage,
                 )
                 .await?;
+            let mut control =
+                normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?;
+            control.note_schemas(schema_keys.iter().map(String::as_str));
             tracked_snapshots.insert(root.commit_id, final_tracked);
-            insert_direct_branch_control(
-                &mut controls,
-                &root.branch_id,
-                normal_branch_head_control(root, parent_control, generation, checkpoint_commit_id)?,
-            )?;
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
             continue;
         }
 
@@ -1637,16 +1636,14 @@ async fn stage_tracked_head(
                 stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
             }
         }
-        insert_direct_branch_control(
-            &mut controls,
-            &root.branch_id,
-            normal_branch_head_control(
-                root,
-                parent_control,
-                generation,
-                working_diff_checkpoint_commit_id,
-            )?,
+        let mut control = normal_branch_head_control(
+            root,
+            parent_control,
+            generation,
+            working_diff_checkpoint_commit_id,
         )?;
+        control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
+        insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
     }
 
     // An untracked-only transaction touches the same hot rows without
@@ -1726,11 +1723,9 @@ async fn stage_tracked_head(
                 &mut coverage,
             )
             .await?;
-        insert_direct_branch_control(
-            &mut controls,
-            branch_id,
-            control.next_current_state_revision()?,
-        )?;
+        let mut control = control.next_current_state_revision()?;
+        control.note_schemas(deltas.iter().map(|delta| delta.schema_key));
+        insert_direct_branch_control(&mut controls, branch_id, control)?;
     }
     Ok(StagedHotHeads {
         controls,
@@ -1948,6 +1943,7 @@ fn normal_branch_head_control(
         created_at: previous.map_or(root.ref_updated_at, |control| control.created_at),
         updated_at: root.ref_updated_at,
         ref_change_id: root.ref_change_id,
+        schema_presence_bloom: previous.map_or([0; 4], |control| control.schema_presence_bloom),
     })
 }
 
@@ -2065,7 +2061,7 @@ async fn stage_branch_head_control_publications(
                 let generation =
                     lifecycle_generation(&branch_id, head_commit_id, target.ref_change_id);
                 let mut coverage = WorkingDiffIndexCoverage::default();
-                tracked_head
+                let (_, schema_keys) = tracked_head
                     .writer(read, writes)
                     .stage_complete_current_state_with_working_diff(
                         &branch_id,
@@ -2079,7 +2075,7 @@ async fn stage_branch_head_control_publications(
                         &mut coverage,
                     )
                     .await?;
-                Some(BranchHeadControl {
+                let mut control = BranchHeadControl {
                     head_commit_id,
                     generation,
                     current_state_revision: match existing {
@@ -2100,7 +2096,10 @@ async fn stage_branch_head_control_publications(
                     created_at: existing.map_or(target.created_at, |control| control.created_at),
                     updated_at: target.updated_at,
                     ref_change_id: target.ref_change_id,
-                })
+                    schema_presence_bloom: [0; 4],
+                };
+                control.note_schemas(schema_keys.iter().map(String::as_str));
+                Some(control)
             }
         };
         publications.insert(branch_id, desired);

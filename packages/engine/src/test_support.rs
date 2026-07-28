@@ -170,6 +170,7 @@ pub(crate) async fn seed_branch_head_with_rows(
             head_commit_id: commit_id,
             generation,
             current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: test_timestamp(),
             updated_at: test_timestamp(),

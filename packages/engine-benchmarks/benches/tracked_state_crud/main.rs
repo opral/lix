@@ -356,6 +356,12 @@ fn profile_hot_transaction_operations(
     profile: StorageProfile,
 ) {
     operation.assert_supports_hot_repeats();
+    if matches!(operation, TransactionBenchOp::DeleteOneByPk) {
+        assert!(
+            repeats <= rows.len(),
+            "delete_one hot repeats must not exceed the seeded row count"
+        );
+    }
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
     let mut fixture = runtime.block_on(transaction_api::seeded_fixture(profile, rows));
@@ -1033,8 +1039,9 @@ impl TransactionBenchOp {
                     | Self::ReadManyByPk
                     | Self::UpdateAll
                     | Self::UpdateOneByPk
+                    | Self::DeleteOneByPk
             ),
-            "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS only supports read_all, read_one, read_many, update_all, or update_one"
+            "LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS only supports read_all, read_one, read_many, update_all, update_one, or delete_one"
         );
     }
 
