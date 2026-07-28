@@ -777,7 +777,12 @@ fn direct_branch_ref_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::single(branch_id),
+        entity_pk: EntityPk::uuid_from_canonical(branch_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("direct branch-ref id is not a canonical UUID: {error}"),
+            )
+        })?,
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
@@ -844,7 +849,14 @@ fn commit_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk::single(commit.commit_id),
+        entity_pk: EntityPk::uuid_from_canonical(&commit.commit_id.to_string()).map_err(
+            |error| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("derived commit id is not a canonical UUID: {error}"),
+                )
+            },
+        )?,
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
@@ -876,12 +888,11 @@ fn commit_edge_row(
         )
     })?;
     Ok(MaterializedLiveStateRow {
-        entity_pk: EntityPk {
-            parts: vec![
-                edge.parent_commit_id.to_string(),
-                edge.child_commit_id.to_string(),
-            ],
-        },
+        entity_pk: EntityPk::from_components(smallvec::smallvec![
+            crate::entity_pk::EntityPkComponent::Uuid(*edge.child_commit_id.as_uuid().as_bytes()),
+            crate::entity_pk::EntityPkComponent::Integer(i64::from(edge.parent_order)),
+        ])
+        .expect("commit edge primary key has two components"),
         schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot_content: Some(snapshot_content),
@@ -1357,9 +1368,9 @@ mod tests {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
             rows: vec![tracked_row_at_with_commit(
                 GLOBAL_BRANCH_ID,
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 None,
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )],
             ordered_unique: true,
         };
@@ -1405,7 +1416,7 @@ mod tests {
             CommitId::for_test_label("global-head"),
             schema_key,
             &EntityPk::single("global-row"),
-            r#"{"value":"global"}"#,
+            r#"{"value":"ffffffff-ffff-7fff-bfff-ffffffffffff"}"#,
         )
         .await;
 
@@ -1525,14 +1536,14 @@ mod tests {
             DirectTrackedHeadRow {
                 schema_key: "schema",
                 entity_pk: &entity_pk,
-                file_id: Some("file-a"),
+                file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                 snapshot: Some(r#"{"value":"a"}"#),
                 deleted: false,
             },
             DirectTrackedHeadRow {
                 schema_key: "schema",
                 entity_pk: &entity_pk,
-                file_id: Some("file-b"),
+                file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                 snapshot: Some(r#"{"value":"b"}"#),
                 deleted: false,
             },
@@ -1557,8 +1568,14 @@ mod tests {
         assert_eq!(
             file_values,
             std::collections::BTreeMap::from([
-                (Some("file-a"), Some(r#"{"value":"a"}"#)),
-                (Some("file-b"), Some(r#"{"value":"b"}"#)),
+                (
+                    Some("01920000-0000-7000-8000-0000000000a2"),
+                    Some(r#"{"value":"a"}"#)
+                ),
+                (
+                    Some("01920000-0000-7000-8000-0000000000b2"),
+                    Some(r#"{"value":"b"}"#)
+                ),
             ])
         );
 
@@ -1581,14 +1598,14 @@ mod tests {
                 schema_key: "schema",
                 entity_pk: &entity_pk,
                 file_id: None,
-                snapshot: Some(r#"{"value":"global"}"#),
+                snapshot: Some(r#"{"value":"ffffffff-ffff-7fff-bfff-ffffffffffff"}"#),
                 deleted: false,
             }],
         )
         .await;
         stage_direct_tracked_head_rows(
             &storage,
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             CommitId::for_test_label("branch-head"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
@@ -1600,13 +1617,20 @@ mod tests {
         )
         .await;
 
-        let request = finite_pk_scan_request("branch-a", "schema", vec![entity_pk.clone()]);
+        let request = finite_pk_scan_request(
+            "01920000-0000-7000-8000-0000000000a1",
+            "schema",
+            vec![entity_pk.clone()],
+        );
         let direct = scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
             .await
             .expect("direct hot-state scan should execute")
             .expect("current branch and global controls should use the hot route");
         assert_eq!(direct.len(), 1);
-        assert_eq!(direct[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            direct[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(!direct[0].global);
         assert_eq!(
             direct[0].snapshot_content.as_deref(),
@@ -1621,7 +1645,7 @@ mod tests {
 
         stage_direct_tracked_head_rows(
             &storage,
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             CommitId::for_test_label("branch-tombstone"),
             &[DirectTrackedHeadRow {
                 schema_key: "schema",
@@ -1655,7 +1679,10 @@ mod tests {
         assert_eq!(tombstones.len(), 1);
         assert!(tombstones[0].deleted);
         assert!(!tombstones[0].global);
-        assert_eq!(tombstones[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            tombstones[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
     }
 
     #[tokio::test]
@@ -1755,14 +1782,14 @@ mod tests {
                 DirectTrackedHeadRow {
                     schema_key: "schema",
                     entity_pk: &entity_pk,
-                    file_id: Some("file-a"),
+                    file_id: Some("01920000-0000-7000-8000-0000000000a2"),
                     snapshot: Some(r#"{"value":"a"}"#),
                     deleted: false,
                 },
                 DirectTrackedHeadRow {
                     schema_key: "schema",
                     entity_pk: &entity_pk,
-                    file_id: Some("file-b"),
+                    file_id: Some("01920000-0000-7000-8000-0000000000b2"),
                     snapshot: Some(r#"{"value":"b"}"#),
                     deleted: false,
                 },
@@ -1771,7 +1798,9 @@ mod tests {
         .await;
 
         let mut request = finite_pk_scan_request(GLOBAL_BRANCH_ID, "schema", vec![entity_pk]);
-        request.filter.file_ids = vec![NullableKeyFilter::Value("file-a".to_string())];
+        request.filter.file_ids = vec![NullableKeyFilter::Value(
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+        )];
         assert!(
             scan_direct_entity_pk_rows_for_test(&live_state, &storage, &request)
                 .await
@@ -1783,7 +1812,10 @@ mod tests {
             .await
             .expect("file-filtered normal scan should execute");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].file_id.as_deref(), Some("file-a"));
+        assert_eq!(
+            rows[0].file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000a2")
+        );
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some(r#"{"value":"a"}"#)
@@ -2281,15 +2313,20 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-tracked"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-tracked"),
                 untracked_row("untracked-value"),
             ],
         )
         .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "global", false)
-            .await
-            .expect("scan should succeed");
+        let rows = scan_selected_tab_at(
+            &live_state,
+            &storage,
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            false,
+        )
+        .await
+        .expect("scan should succeed");
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -2307,7 +2344,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                branch_id: "global".to_string(),
+                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -2348,7 +2385,7 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-tracked"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-tracked"),
                 untracked_row("untracked-value"),
             ],
         )
@@ -2356,7 +2393,7 @@ mod tests {
 
         let selected = LiveStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
-            branch_id: "global".to_string(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             entity_pk: identity("selected-tab"),
             file_id: None,
         };
@@ -2373,7 +2410,7 @@ mod tests {
                     selected,
                     LiveStateExactRowRequest {
                         schema_key: "lix_key_value".to_string(),
-                        branch_id: "global".to_string(),
+                        branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                         entity_pk: identity("missing"),
                         file_id: None,
                     },
@@ -2432,7 +2469,10 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[branch_ref_row("global", "commit-tracked")],
+            &[branch_ref_row(
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
+                "commit-tracked",
+            )],
         )
         .await;
 
@@ -2479,19 +2519,34 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch-a"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "commit-01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
         )
         .await;
-        write_empty_commits_to_store(&storage, &read, &["commit-branch-a"]).await;
+        write_empty_commits_to_store(
+            &storage,
+            &read,
+            &["commit-01920000-0000-7000-8000-0000000000a1"],
+        )
+        .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
-            .await
-            .expect("load should succeed")
-            .expect("global row should be visible for requested branch");
+        let loaded = load_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+        )
+        .await
+        .expect("load should succeed")
+        .expect("global row should be visible for requested branch");
 
-        assert_eq!(loaded.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            loaded.branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(loaded.global);
         assert!(!loaded.untracked);
         assert_eq!(
@@ -2532,7 +2587,7 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
                 branch_ref_row("main", "commit-main"),
             ],
         )
@@ -2570,7 +2625,7 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "branch-tracked",
                     Some("change-branch"),
                     "commit-branch",
@@ -2592,18 +2647,25 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row("01920000-0000-7000-8000-0000000000a1", "commit-branch"),
             ],
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
-            .await
-            .expect("load should succeed")
-            .expect("branch row should be visible");
+        let loaded = load_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+        )
+        .await
+        .expect("load should succeed")
+        .expect("branch row should be visible");
 
-        assert_eq!(loaded.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            loaded.branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(!loaded.untracked);
         assert_eq!(
             loaded.snapshot_content.as_deref(),
@@ -2646,7 +2708,7 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
                 branch_ref_row("main", "commit-main"),
             ],
         )
@@ -2678,7 +2740,7 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tracked_row_at_with_commit(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "branch-tracked",
                     Some("change-branch"),
                     "commit-branch",
@@ -2700,18 +2762,26 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row("01920000-0000-7000-8000-0000000000a1", "commit-branch"),
             ],
         )
         .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
-            .await
-            .expect("scan should succeed");
+        let rows = scan_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+        )
+        .await
+        .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"branch-tracked\"}")
@@ -2749,19 +2819,35 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch-a"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "commit-01920000-0000-7000-8000-0000000000a1",
+                ),
             ],
         )
         .await;
-        write_empty_commits_to_store(&storage, &read, &["commit-branch-a"]).await;
+        write_empty_commits_to_store(
+            &storage,
+            &read,
+            &["commit-01920000-0000-7000-8000-0000000000a1"],
+        )
+        .await;
 
-        let rows = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
-            .await
-            .expect("scan should succeed");
+        let rows = scan_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+        )
+        .await
+        .expect("scan should succeed");
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -2799,7 +2885,10 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[branch_ref_row("global", "commit-global")],
+            &[branch_ref_row(
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
+                "commit-global",
+            )],
         )
         .await;
 
@@ -2827,7 +2916,7 @@ mod tests {
             let rows = [
                 tracked_row_with_commit("global-tracked", Some("change-global"), "commit-global"),
                 tombstone_tracked_row_at_with_commit(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     Some("change-tombstone"),
                     "commit-branch",
                 ),
@@ -2848,22 +2937,35 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row("01920000-0000-7000-8000-0000000000a1", "commit-branch"),
             ],
         )
         .await;
 
-        let hidden = scan_selected_tab_at(&live_state, &storage, "branch-a", false)
-            .await
-            .expect("scan should succeed");
+        let hidden = scan_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+        )
+        .await
+        .expect("scan should succeed");
         assert_eq!(hidden.len(), 0);
 
-        let with_tombstone = scan_selected_tab_at(&live_state, &storage, "branch-a", true)
-            .await
-            .expect("scan should succeed");
+        let with_tombstone = scan_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+            true,
+        )
+        .await
+        .expect("scan should succeed");
         assert_eq!(with_tombstone.len(), 1);
-        assert_eq!(with_tombstone[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            with_tombstone[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(with_tombstone[0].snapshot_content, None);
     }
 
@@ -2901,7 +3003,7 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
                 branch_ref_row("main", "commit-main"),
             ],
         )
@@ -2940,7 +3042,7 @@ mod tests {
         global_overridden.entity_pk = identity("overridden");
         global_overridden.file_id = Some("overridden".to_string());
         let mut branch_override = tracked_row_at_with_commit(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "branch-new",
             Some("change-branch-new"),
             "commit-branch",
@@ -2952,7 +3054,7 @@ mod tests {
         global_hidden.entity_pk = identity("hidden");
         global_hidden.file_id = Some("hidden".to_string());
         let mut branch_tombstone = tombstone_tracked_row_at_with_commit(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             Some("change-tombstone"),
             "commit-branch",
         );
@@ -2961,7 +3063,7 @@ mod tests {
         let mut malformed_cross_pair =
             tracked_row_with_commit("cross-pair", Some("change-cross"), "commit-global");
         malformed_cross_pair.entity_pk = identity("entity-a");
-        malformed_cross_pair.file_id = Some("file-b".to_string());
+        malformed_cross_pair.file_id = Some("01920000-0000-7000-8000-0000000000b2".to_string());
 
         let rows = [
             global_fallback,
@@ -2984,15 +3086,15 @@ mod tests {
             &storage,
             &read,
             &[
-                branch_ref_row("global", "commit-global"),
-                branch_ref_row("branch-a", "commit-branch"),
+                branch_ref_row("ffffffff-ffff-7fff-bfff-ffffffffffff", "commit-global"),
+                branch_ref_row("01920000-0000-7000-8000-0000000000a1", "commit-branch"),
             ],
         )
         .await;
 
         let exact = |entity: &str, file_id: &str| LiveStateExactRowRequest {
             schema_key: "lix_key_value".to_string(),
-            branch_id: "branch-a".to_string(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             entity_pk: identity(entity),
             file_id: Some(file_id.to_string()),
         };
@@ -3008,9 +3110,9 @@ mod tests {
                     exact("fallback", "fallback"),
                     exact("overridden", "overridden"),
                     exact("hidden", "hidden"),
-                    exact("entity-a", "file-a"),
-                    exact("entity-b", "file-b"),
-                    exact("entity-a", "file-b"),
+                    exact("entity-a", "01920000-0000-7000-8000-0000000000a2"),
+                    exact("entity-b", "01920000-0000-7000-8000-0000000000b2"),
+                    exact("entity-a", "01920000-0000-7000-8000-0000000000b2"),
                     exact("missing", "missing"),
                 ],
                 projection: LiveStateProjection {
@@ -3023,7 +3125,10 @@ mod tests {
 
         let fallback = loaded[0].as_ref().expect("global fallback should load");
         assert!(fallback.global);
-        assert_eq!(fallback.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            fallback.branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(
             fallback.snapshot_content.as_deref(),
             Some("{\"value\":\"global-fallback\"}")
@@ -3073,7 +3178,7 @@ mod tests {
         {
             let rows = [
                 tracked_row_at_with_commit(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "branch-row",
                     Some("change-branch"),
                     "commit-branch",
@@ -3095,14 +3200,21 @@ mod tests {
         write_untracked_rows_to_store(
             &storage,
             &read,
-            &[branch_ref_row("branch-a", "commit-branch")],
+            &[branch_ref_row(
+                "01920000-0000-7000-8000-0000000000a1",
+                "commit-branch",
+            )],
         )
         .await;
 
-        let loaded = load_selected_tab_at(&live_state, &storage, "branch-a")
-            .await
-            .expect("load should succeed")
-            .expect("branch row should be visible");
+        let loaded = load_selected_tab_at(
+            &live_state,
+            &storage,
+            "01920000-0000-7000-8000-0000000000a1",
+        )
+        .await
+        .expect("load should succeed")
+        .expect("branch row should be visible");
         assert_eq!(
             loaded.snapshot_content.as_deref(),
             Some("{\"value\":\"branch-row\"}")
@@ -3136,7 +3248,7 @@ mod tests {
         {
             let rows = [
                 tracked_row_at_with_commit(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "branch-row",
                     Some("change-branch"),
                     "commit-merge",
@@ -3232,7 +3344,7 @@ mod tests {
             )
             .load_row(&LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
-                branch_id: "global".to_string(),
+                branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
                 entity_pk: crate::entity_pk::EntityPk::single("selected-tab"),
                 file_id: NullableKeyFilter::Null,
             })
@@ -3318,7 +3430,12 @@ mod tests {
         change_id: Option<&str>,
         commit_id: &str,
     ) -> MaterializedLiveStateRow {
-        tracked_row_at_with_commit("global", value, change_id, commit_id)
+        tracked_row_at_with_commit(
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            value,
+            change_id,
+            commit_id,
+        )
     }
 
     fn tracked_row_at_with_commit(
@@ -3337,7 +3454,7 @@ mod tests {
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
             updated_at: ts("2026-01-01T00:00:00Z"),
-            global: branch_id == "global",
+            global: branch_id == "ffffffff-ffff-7fff-bfff-ffffffffffff",
             change_id: change_id.map(ChangeId::for_test_label),
             commit_id: Some(commit_id),
             untracked: false,
@@ -3358,7 +3475,7 @@ mod tests {
     }
 
     fn untracked_row(value: &str) -> MaterializedUntrackedStateRow {
-        untracked_row_at("global", value)
+        untracked_row_at("ffffffff-ffff-7fff-bfff-ffffffffffff", value)
     }
 
     fn untracked_row_at(branch_id: &str, value: &str) -> MaterializedUntrackedStateRow {
@@ -3392,7 +3509,7 @@ mod tests {
             deleted: false,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
-            branch_id: "global".to_string(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
         }
     }
 
@@ -3443,7 +3560,7 @@ mod tests {
             change_id: Some(ChangeId::for_test_label(&format!("change-{commit_id}"))),
             commit_id: Some(commit_id),
             untracked: false,
-            branch_id: "global".into(),
+            branch_id: "ffffffff-ffff-7fff-bfff-ffffffffffff".into(),
         }
     }
 

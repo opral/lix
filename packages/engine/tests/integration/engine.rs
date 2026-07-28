@@ -19,7 +19,7 @@ simulation_test!(
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
             engine
-                .open_session("global")
+                .open_session("ffffffff-ffff-7fff-bfff-ffffffffffff")
                 .await
                 .expect("initialized storage should open global session"),
             &engine,
@@ -49,7 +49,7 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(branch_values.contains(&vec![
-            Value::Text("global".to_string()),
+            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Text("global".to_string()),
             Value::Boolean(true),
         ]));
@@ -82,7 +82,7 @@ simulation_test!(
             .map(|row| row.values().to_vec())
             .collect::<Vec<_>>();
         assert!(ref_values.contains(&vec![
-            Value::Text("global".to_string()),
+            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Text(sim.initial_commit_id().to_string()),
             Value::Boolean(true),
         ]));
@@ -220,7 +220,7 @@ simulation_test!(
         assert_closed(
             session
                 .create_branch(CreateBranchOptions {
-                    id: Some("closed-branch".to_string()),
+                    id: Some("01930000-0000-7000-8000-000000000005".to_string()),
                     name: "Closed".to_string(),
                     from_commit_id: None,
                 })

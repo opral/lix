@@ -271,18 +271,27 @@ mod tests {
     #[tokio::test]
     async fn explicit_scope_keeps_requested_branches() {
         let branch_ref = RowsBranchRefReader::new(vec![BranchHead {
-            branch_id: "branch-a".to_string(),
-            commit_id: CommitId::for_test_label("commit-branch-a"),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+            commit_id: CommitId::for_test_label("commit-01920000-0000-7000-8000-0000000000a1"),
         }]);
         let ids = resolve_provider_branch_ids(
             &branch_ref,
             &BranchBinding::explicit(),
-            vec!["branch-a".to_string(), "global".to_string()],
+            vec![
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
+            ],
         )
         .await
         .expect("scope should resolve");
 
-        assert_eq!(ids, vec!["branch-a".to_string(), "global".to_string()]);
+        assert_eq!(
+            ids,
+            vec![
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -308,12 +317,12 @@ mod tests {
     async fn all_visible_scope_loads_branch_refs_and_global() {
         let branch_ref = RowsBranchRefReader::new(vec![
             BranchHead {
-                branch_id: "branch-b".to_string(),
-                commit_id: CommitId::for_test_label("commit-branch-b"),
+                branch_id: "01920000-0000-7000-8000-0000000000b1".to_string(),
+                commit_id: CommitId::for_test_label("commit-01920000-0000-7000-8000-0000000000b1"),
             },
             BranchHead {
-                branch_id: "branch-a".to_string(),
-                commit_id: CommitId::for_test_label("commit-branch-a"),
+                branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
+                commit_id: CommitId::for_test_label("commit-01920000-0000-7000-8000-0000000000a1"),
             },
         ]);
         let ids = resolve_provider_branch_ids(&branch_ref, &BranchBinding::explicit(), Vec::new())
@@ -323,9 +332,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "branch-a".to_string(),
-                "branch-b".to_string(),
-                "global".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000b1".to_string(),
+                "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string(),
             ]
         );
     }
@@ -404,7 +413,7 @@ mod tests {
     fn write_scope_rejects_global_with_non_global_branch_id() {
         let error = resolve_write_branch_scope(
             Some(true),
-            Some("branch-a".to_string()),
+            Some("01920000-0000-7000-8000-0000000000a1".to_string()),
             None,
             "INSERT into surface",
             "surface",

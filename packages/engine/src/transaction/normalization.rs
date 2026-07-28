@@ -270,10 +270,14 @@ fn resolve_entity_pk(
             )
         });
     };
-    let derived = EntityPk::from_primary_key_paths(snapshot, primary_key_paths)
+    let component_types = schema_plan
+        .primary_key_component_types
+        .as_deref()
+        .expect("primary-key paths and component types are compiled together");
+    let derived = EntityPk::from_primary_key_plan(snapshot, primary_key_paths, component_types)
         .map_err(|error| entity_pk_derivation_error(row, primary_key_paths, error))?;
     if let Some(entity_pk) = row.entity_pk.as_ref() {
-        if entity_pk != &derived {
+        if entity_pk.as_json_array_value()? != derived.as_json_array_value()? {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
@@ -304,7 +308,11 @@ fn entity_pk_derivation_error(
         }
         EntityPkError::UnsupportedPrimaryKeyValue { index } => {
             let pointer = format_json_pointer(&primary_key_paths[index]);
-            format!("non-string value at primary-key pointer '{pointer}'")
+            format!("unsupported value at primary-key pointer '{pointer}'")
+        }
+        EntityPkError::InvalidPrimaryKeyValue { index, expected } => {
+            let pointer = format_json_pointer(&primary_key_paths[index]);
+            format!("value at primary-key pointer '{pointer}' must be a valid {expected}")
         }
         EntityPkError::InvalidEncodedEntityPk => "invalid encoded entity primary key".to_string(),
     };
@@ -559,7 +567,7 @@ mod tests {
         assert!(
             error
                 .message
-                .contains("non-string value at primary-key pointer '/key'")
+                .contains("value at primary-key pointer '/key' must be a valid string")
         );
     }
 
@@ -695,7 +703,7 @@ mod tests {
             entity_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             snapshot: Some(transaction_json(json!({
-                "id": "file-cafe",
+                "id": "01920000-0000-7000-8000-0000000000c1",
                 "directory_id": null,
                 "name": "Cafe\u{301}.txt",
             }))),
@@ -711,7 +719,7 @@ mod tests {
             entity_pk: None,
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             snapshot: Some(transaction_json(json!({
-                "id": "dir-cafe",
+                "id": "01920000-0000-7000-8000-0000000000c2",
                 "parent_id": null,
                 "name": "Cafe\u{301}",
             }))),
@@ -727,7 +735,7 @@ mod tests {
             entity_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             snapshot: Some(transaction_json(json!({
-                "id": "file-bidi",
+                "id": "01920000-0000-7000-8000-0000000000c3",
                 "directory_id": null,
                 "name": "safe\u{202E}txt",
             }))),
@@ -743,7 +751,7 @@ mod tests {
             entity_pk: None,
             schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
             snapshot: Some(transaction_json(json!({
-                "id": "dir-zero-width",
+                "id": "01920000-0000-7000-8000-0000000000d6",
                 "parent_id": null,
                 "name": "zero\u{200D}width",
             }))),
@@ -759,7 +767,7 @@ mod tests {
             entity_pk: None,
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
             snapshot: Some(transaction_json(json!({
-                "id": "file-dotdot",
+                "id": "01920000-0000-7000-8000-0000000000e6",
                 "directory_id": null,
                 "name": "..",
             }))),
@@ -806,7 +814,7 @@ mod tests {
                 entity_pk: None,
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 snapshot: Some(transaction_json(json!({
-                    "id": "file-opaque-name",
+                    "id": "01920000-0000-7000-8000-0000000000c5",
                     "directory_id": null,
                     "name": "foo.bar",
                 }))),
@@ -825,7 +833,7 @@ mod tests {
     #[test]
     fn normalization_supports_checkpoint_markers_in_legacy_catalogs() {
         let mut catalog = catalog_with(Vec::new());
-        let branch_id = "legacy-main";
+        let branch_id = "01920000-0000-7000-8000-0000000000c6";
         let row = TransactionWriteRow {
             entity_pk: None,
             schema_key: crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
@@ -839,7 +847,10 @@ mod tests {
         let normalized = normalize_transaction_write_row(row, &mut catalog, functions())
             .expect("legacy catalog should use the fixed internal checkpoint schema");
 
-        assert_eq!(normalized.row.entity_pk, Some(EntityPk::single(branch_id)));
+        assert_eq!(
+            normalized.row.entity_pk,
+            Some(EntityPk::uuid_from_canonical(branch_id).expect("fixture branch ID"))
+        );
         assert!(
             catalog
                 .snapshot()

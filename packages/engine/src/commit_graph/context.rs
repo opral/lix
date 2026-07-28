@@ -499,7 +499,8 @@ fn commit_record_canonical_change(record: &CommitRecord) -> CommitGraphChange {
             .expect("lix_commit snapshot serialization should not fail");
     CommitGraphChange {
         id: record.change_id,
-        entity_pk: EntityPk::single(record.commit_id),
+        entity_pk: EntityPk::uuid_from_canonical(&record.commit_id.to_string())
+            .expect("commit IDs are canonical UUIDs"),
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
@@ -839,25 +840,33 @@ mod tests {
             &storage,
             &[
                 entity_change_with_file(
-                    "change-file-a",
+                    "change-01920000-0000-7000-8000-0000000000a2",
                     "entity-1",
                     "test_schema",
-                    Some("file-a"),
+                    Some("01920000-0000-7000-8000-0000000000a2"),
                     "{}",
                 ),
                 entity_tombstone("change-tombstone", "entity-1", "test_schema"),
                 entity_change_with_file(
-                    "change-file-b",
+                    "change-01920000-0000-7000-8000-0000000000b2",
                     "entity-2",
                     "test_schema",
-                    Some("file-b"),
+                    Some("01920000-0000-7000-8000-0000000000b2"),
                     "{}",
                 ),
-                commit_change("commit-root-change", "commit-root", &["change-file-a"], &[]),
+                commit_change(
+                    "commit-root-change",
+                    "commit-root",
+                    &["change-01920000-0000-7000-8000-0000000000a2"],
+                    &[],
+                ),
                 commit_change(
                     "commit-head-change",
                     "commit-head",
-                    &["change-tombstone", "change-file-b"],
+                    &[
+                        "change-tombstone",
+                        "change-01920000-0000-7000-8000-0000000000b2",
+                    ],
                     &["commit-root"],
                 ),
             ],
@@ -876,7 +885,7 @@ mod tests {
                 &commit_head,
                 &CommitGraphChangeHistoryRequest {
                     entity_pks: vec![crate::entity_pk::EntityPk::single("entity-1")],
-                    file_ids: vec!["file-a".to_string()],
+                    file_ids: vec!["01920000-0000-7000-8000-0000000000a2".to_string()],
                     min_depth: Some(1),
                     max_depth: Some(1),
                     include_tombstones: false,
@@ -887,7 +896,10 @@ mod tests {
             .expect("history should resolve");
 
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].change.id, change_id("change-file-a"));
+        assert_eq!(
+            history[0].change.id,
+            change_id("change-01920000-0000-7000-8000-0000000000a2")
+        );
         assert_eq!(history[0].depth, 1);
     }
 

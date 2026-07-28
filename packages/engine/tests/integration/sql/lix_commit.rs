@@ -102,7 +102,7 @@ simulation_test!(
         ]));
         assert!(by_branch_rows.contains(&vec![
             Value::Text(initial_head),
-            Value::Text("global".to_string()),
+            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
@@ -114,7 +114,7 @@ simulation_test!(
         ]));
         assert!(by_branch_rows.contains(&vec![
             Value::Text(first_head.clone()),
-            Value::Text("global".to_string()),
+            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
@@ -126,7 +126,7 @@ simulation_test!(
         ]));
         assert!(by_branch_rows.contains(&vec![
             Value::Text(second_head.clone()),
-            Value::Text("global".to_string()),
+            Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             Value::Boolean(true),
             Value::Boolean(false),
         ]));
@@ -156,7 +156,7 @@ simulation_test!(
                     Value::Text(first_head),
                     Value::Text(second_head),
                     Value::Integer(0),
-                    Value::Text("global".to_string()),
+                    Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
@@ -185,7 +185,7 @@ simulation_test!(
         .expect("main write should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("commit-branch".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000006".to_string()),
             name: "Commit branch".to_string(),
             from_commit_id: None,
         })
@@ -194,21 +194,21 @@ simulation_test!(
 
         let branch = sim.wrap_session(
             engine
-                .open_session("commit-branch")
+                .open_session("01930000-0000-7000-8000-000000000006")
                 .await
                 .expect("branch session should open"),
             &engine,
         );
         branch
             .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES ('branch-only', 'branch')",
+                "INSERT INTO lix_key_value (key, value) VALUES ('6272616e-6368-8d6f-8e6c-790000000000', 'branch')",
                 &[],
             )
             .await
             .expect("branch write should succeed");
 
         let branch_head = engine
-            .load_branch_head_commit_id("commit-branch")
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000006")
             .await
             .expect("branch head should load")
             .expect("branch head should exist");
@@ -270,25 +270,25 @@ simulation_test!(
         .expect("main write should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("edge-probe-a".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000007".to_string()),
             name: "Edge Probe A".to_string(),
             from_commit_id: Some(sim.initial_commit_id().to_string()),
         })
         .await
-        .expect("edge-probe-a should be created from the initial commit");
+        .expect("01930000-0000-7000-8000-000000000007 should be created from the initial commit");
         main.create_branch(CreateBranchOptions {
-            id: Some("edge-probe-b".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000008".to_string()),
             name: "Edge Probe B".to_string(),
             from_commit_id: Some(sim.initial_commit_id().to_string()),
         })
         .await
-        .expect("edge-probe-b should be created from the initial commit");
+        .expect("01930000-0000-7000-8000-000000000008 should be created from the initial commit");
 
         let branch_a = sim.wrap_session(
             engine
-                .open_session("edge-probe-a")
+                .open_session("01930000-0000-7000-8000-000000000007")
                 .await
-                .expect("edge-probe-a session should open"),
+                .expect("01930000-0000-7000-8000-000000000007 session should open"),
             &engine,
         );
         branch_a
@@ -297,13 +297,13 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("edge-probe-a write should succeed");
+            .expect("01930000-0000-7000-8000-000000000007 write should succeed");
 
         let branch_b = sim.wrap_session(
             engine
-                .open_session("edge-probe-b")
+                .open_session("01930000-0000-7000-8000-000000000008")
                 .await
-                .expect("edge-probe-b session should open"),
+                .expect("01930000-0000-7000-8000-000000000008 session should open"),
             &engine,
         );
         branch_b
@@ -312,10 +312,15 @@ simulation_test!(
                 &[],
             )
             .await
-            .expect("edge-probe-b write should succeed");
+            .expect("01930000-0000-7000-8000-000000000008 write should succeed");
 
-        let global_edges = commit_edges_by_branch(&main, "global").await;
-        for branch_id in [sim.main_branch_id(), "edge-probe-a", "edge-probe-b"] {
+        let global_edges =
+            commit_edges_by_branch(&main, "ffffffff-ffff-7fff-bfff-ffffffffffff").await;
+        for branch_id in [
+            sim.main_branch_id(),
+            "01930000-0000-7000-8000-000000000007",
+            "01930000-0000-7000-8000-000000000008",
+        ] {
             let actual_edges = commit_edges_by_branch(&main, branch_id).await;
             assert_eq!(
                 actual_edges, global_edges,

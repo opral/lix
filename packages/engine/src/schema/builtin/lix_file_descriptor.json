@@ -26,6 +26,7 @@
   "properties": {
     "id": {
       "type": "string",
+      "format": "uuid",
       "x-lix-default": "lix_uuid_v7()"
     },
     "directory_id": {

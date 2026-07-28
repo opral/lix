@@ -4,7 +4,6 @@ use super::types::{
     TransactionChangeRecordRef,
 };
 use crate::common::LixError;
-use crate::entity_pk::EntityPk;
 use crate::storage_codec;
 
 pub(crate) fn encode_commit_record(record: &CommitRecord) -> Result<Vec<u8>, LixError> {
@@ -15,7 +14,7 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
         schema_key: &record.schema_key,
-        entity_pk: &record.entity_pk.parts,
+        entity_pk: &record.entity_pk,
         file_id: record.file_id.as_deref(),
         snapshot: record.snapshot.as_ref_slot(),
         metadata: record.metadata.as_ref_slot(),
@@ -30,7 +29,7 @@ pub(crate) fn encode_transaction_change_record(
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
         schema_key: record.schema_key,
-        entity_pk: &record.entity_pk.parts,
+        entity_pk: record.entity_pk,
         file_id: record.file_id,
         snapshot: record.snapshot,
         metadata: record.metadata,
@@ -53,7 +52,7 @@ pub(crate) fn decode_change_record(
         format_version: view.format_version,
         change_id,
         schema_key: view.schema_key.to_string(),
-        entity_pk: entity_pk_from_parts(view.entity_pk)?,
+        entity_pk: view.entity_pk,
         file_id: view.file_id,
         snapshot: view.snapshot,
         metadata: view.metadata,
@@ -95,20 +94,12 @@ pub(crate) fn decode_commit_change_ref_chunk(
     })
 }
 
-fn entity_pk_from_parts(parts: Vec<String>) -> Result<EntityPk, LixError> {
-    EntityPk::from_parts(parts).map_err(|error| {
-        LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!("changelog entity primary key is invalid: {error}"),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
+    use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonSlot};
 
     fn ref_chunk(entries: Vec<ChangeId>) -> CommitChangeRefChunk {
@@ -259,36 +250,29 @@ mod tests {
 
     #[test]
     fn change_record_packs_canonical_uuid_ids_and_round_trips() {
-        // Canonical lowercase UUID entity pks and file ids take the 16-byte
-        // arm; the record must round-trip to the identical text form and be
-        // smaller than the unpacked text encoding.
+        let uuid = "019eb805-60d0-71c0-ade3-b0f0efab9d9a";
         let record = ChangeRecord {
-            entity_pk: EntityPk::from_parts(vec![
-                "019eb805-60d0-71c0-ade3-b0f0efab9d9a".to_string(),
+            entity_pk: EntityPk::from_components(smallvec::smallvec![
+                crate::entity_pk::EntityPkComponent::Uuid(
+                    storage_codec::id_string::uuid_bytes_from_canonical(uuid)
+                        .expect("canonical UUID"),
+                ),
             ])
             .expect("entity pk should build"),
             file_id: Some("019eb805-5e65-7270-861d-cb341bc904c8".to_string()),
             ..full_record()
         };
         let encoded = encode_change_record(&record).expect("record should encode");
-        let text_only = ChangeRecord {
-            entity_pk: EntityPk::from_parts(vec![
-                "019EB805-60D0-71C0-ADE3-B0F0EFAB9D9A".to_string(),
-            ])
-            .expect("entity pk should build"),
-            file_id: Some("019EB805-5E65-7270-861D-CB341BC904C8".to_string()),
-            ..full_record()
-        };
-        let text_encoded = encode_change_record(&text_only).expect("record should encode");
-        assert!(
-            encoded.len() + 40 <= text_encoded.len(),
-            "uuid arm should save 20 bytes per id ({} vs {})",
-            encoded.len(),
-            text_encoded.len()
-        );
         let decoded =
             decode_change_record(&encoded, record.change_id).expect("record should decode");
         assert_eq!(decoded, record);
+        assert_eq!(
+            decoded
+                .entity_pk
+                .as_single_string_owned()
+                .expect("one UUID"),
+            uuid
+        );
     }
 
     #[test]

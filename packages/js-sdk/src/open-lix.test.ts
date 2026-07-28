@@ -25,6 +25,10 @@ import {
 } from "./index.js";
 import { registerMemoryStorageContract } from "../tests/memory-storage-contract.js";
 
+const NATIVE_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000401";
+const EXPLICIT_COMMIT_BRANCH_ID = "01920000-0000-7000-8000-000000000402";
+const CONFLICT_DRAFT_BRANCH_ID = "01920000-0000-7000-8000-000000000403";
+
 registerMemoryStorageContract({
 	name: "Node native",
 	loadSdk: async () => await import("./index.js"),
@@ -88,11 +92,11 @@ test("openLix exposes the lix-sdk e2e flow", async () => {
 	expect(typeof mainHeadCommitId).toBe("string");
 
 	const draft = await lix.createBranch({
-		id: "native-draft-branch",
+		id: NATIVE_DRAFT_BRANCH_ID,
 		name: "Native draft",
 	});
 	expect(draft).toMatchObject({
-		id: "native-draft-branch",
+		id: NATIVE_DRAFT_BRANCH_ID,
 		name: "Native draft",
 		hidden: false,
 		commitId: mainHeadCommitId,
@@ -403,7 +407,7 @@ test("fs storage imports local files and materializes lix_file writes", async ()
 
 test("execute originKey is exposed on change and history surfaces without metadata", async () => {
 	const lix = await openLix();
-	const fileId = "origin-key-file";
+	const fileId = "01920000-0000-7000-8000-000000000411";
 	const metadata = { purpose: "metadata-only" };
 
 	await lix.execute(
@@ -461,8 +465,8 @@ test("execute originKey is exposed on change and history surfaces without metada
 
 test("executeBatch propagates originKey to every write", async () => {
 	const lix = await openLix();
-	const firstFileId = "batch-origin-file-1";
-	const secondFileId = "batch-origin-file-2";
+	const firstFileId = "01920000-0000-7000-8000-000000000412";
+	const secondFileId = "01920000-0000-7000-8000-000000000413";
 
 	const results = await lix.executeBatch(
 		[
@@ -1029,8 +1033,8 @@ test("SQL plugin archive upsert installs bundled plugin archive schemas", async 
 	for (const plugin of plugins) {
 		await upsertPluginArchive(lix, plugin.key, plugin.archiveBytes);
 		const stored = await lix.execute(
-			"SELECT data FROM lix_file WHERE id = $1",
-			[`lix_plugin_archive::${plugin.key}`],
+			"SELECT data FROM lix_file WHERE path = $1",
+			[`/.lix/plugins/${plugin.key}.lixplugin`],
 		);
 		expectBytesEqual(get(stored, "data"), plugin.archiveBytes);
 	}
@@ -1062,8 +1066,8 @@ test("SQL plugin archive upsert stores the archive and installs schemas", async 
 
 	await upsertPluginArchive(lix, csvPlugin.key, csvPlugin.archiveBytes);
 	const stored = await lix.execute(
-		"SELECT name, data FROM lix_file WHERE id = $1",
-		[`lix_plugin_archive::${csvPlugin.key}`],
+		"SELECT name, data FROM lix_file WHERE path = $1",
+		[`/.lix/plugins/${csvPlugin.key}.lixplugin`],
 	);
 	expect(get(stored, "name")).toBe(`${csvPlugin.key}.lixplugin`);
 	expectBytesEqual(get(stored, "data"), csvPlugin.archiveBytes);
@@ -1150,7 +1154,7 @@ test("INSERT SELECT UNION ALL executes without trapping", async () => {
 	const lix = await openLix();
 
 	const result = await lix.execute(
-		"INSERT INTO lix_directory (id, name) SELECT 'u1' AS id, 'u1' AS name UNION ALL SELECT 'u2' AS id, 'u2' AS name",
+		"INSERT INTO lix_directory (id, name) SELECT '01920000-0000-7000-8000-000000000421' AS id, 'u1' AS name UNION ALL SELECT '01920000-0000-7000-8000-000000000422' AS id, 'u2' AS name",
 	);
 
 	expect(result.rowsAffected).toBe(2);
@@ -1371,12 +1375,12 @@ test("createBranch can start from an explicit commit id", async () => {
 	);
 
 	const branch = await lix.createBranch({
-		id: "native-from-explicit-commit",
+		id: EXPLICIT_COMMIT_BRANCH_ID,
 		name: "Native from explicit commit",
 		fromCommitId: fromCommitId as string,
 	});
 	expect(branch).toMatchObject({
-		id: "native-from-explicit-commit",
+		id: EXPLICIT_COMMIT_BRANCH_ID,
 		name: "Native from explicit commit",
 		hidden: false,
 		commitId: fromCommitId,
@@ -1419,7 +1423,7 @@ test("merge conflicts expose structured preview details and merge error", async 
 		["conflict-task", "Base", false, JSON.stringify({ priority: "normal" })],
 	);
 	const draft = await lix.createBranch({
-		id: "native-conflict-draft",
+		id: CONFLICT_DRAFT_BRANCH_ID,
 		name: "Native conflict draft",
 	});
 
@@ -1816,13 +1820,13 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 	await lix.execute(
 		"INSERT INTO lix_directory (id, parent_id, name) VALUES ($1, $2, $3)",
-		["history-binary-dir", null, "history"],
+		["01920000-0000-7000-8000-000000000431", null, "history"],
 	);
 	await lix.execute(
 		"INSERT INTO lix_file (id, directory_id, name, data) VALUES ($1, $2, $3, $4)",
 		[
-			"history-binary-native-repro",
-			"history-binary-dir",
+			"01920000-0000-7000-8000-000000000432",
+			"01920000-0000-7000-8000-000000000431",
 			"native-repro.bin",
 			new Uint8Array([0x80, 0xff, 0x00]),
 		],
@@ -1835,7 +1839,7 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 		   AND lixcol_as_of_commit_id = lix_active_branch_commit_id() \
 		 ORDER BY lixcol_depth \
 		 LIMIT 1",
-		["history-binary-dir"],
+		["01920000-0000-7000-8000-000000000431"],
 	);
 	const sourceChanges = get(result, "lixcol_source_changes") as Array<{
 		schema_key: string;

@@ -159,12 +159,15 @@ fn entity_history_route_from_filters(
 ) -> Result<HistoryRoute> {
     let mut route = HistoryRoute::from_filters(filters);
     if let Some(entity_pks) = entity_pks_from_primary_key_filters(spec, filters)? {
-        let entity_pks = entity_pks
-            .into_iter()
-            .map(|entity_pk| entity_pk.as_json_array_text())
+        let surface_entity_pks = entity_pks
+            .iter()
+            .map(crate::entity_pk::EntityPk::as_json_array_text)
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(lix_error_to_datafusion_error)?;
-        route.constrain_entity_pks(entity_pks);
+        route.constrain_entity_pks(surface_entity_pks);
+        if !route.is_contradictory() {
+            route.set_resolved_entity_pks(entity_pks);
+        }
     }
     Ok(route)
 }

@@ -1,8 +1,8 @@
-//! V15 row-addressable current state.
+//! V16 row-addressable current state with compact UUIDv7 entity keys.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
-//! decode, merge, and rewrite each predecessor group. V15 keeps the same
+//! decode, merge, and rewrite each predecessor group. V16 keeps the same
 //! fixed row value codec and branch-control publication fence, while making a
 //! full row identity the physical mutation unit.
 
@@ -13,9 +13,9 @@ use tracing::Instrument as _;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v15";
-pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v15";
-pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v15";
+pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v16";
+pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v16";
+pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v16";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
 /// File-id-first projection. The primary hot row remains authoritative.
@@ -977,7 +977,7 @@ async fn stage_incremental_file_delete_cascades(
         let Some(file_id) = file_delete_cascade_id(cascade)? else {
             continue;
         };
-        cascades.insert(file_id.to_string(), cascade);
+        cascades.insert(file_id, cascade);
     }
     if cascades.is_empty() {
         return Ok(());
@@ -1275,7 +1275,7 @@ fn apply_complete_file_delete_cascade(
     };
     let identities = rows
         .keys()
-        .filter(|identity| identity.file_id.as_deref() == Some(file_id))
+        .filter(|identity| identity.file_id.as_deref() == Some(file_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     for identity in identities {
@@ -1309,15 +1309,13 @@ fn apply_complete_file_delete_cascade(
     Ok(())
 }
 
-fn file_delete_cascade_id<'a>(
-    delta: &'a CurrentStateDeltaRef<'_>,
-) -> Result<Option<&'a str>, LixError> {
+fn file_delete_cascade_id(delta: &CurrentStateDeltaRef<'_>) -> Result<Option<String>, LixError> {
     if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || delta.file_id.is_some() || !delta.deleted {
         return Ok(None);
     }
     delta
         .entity_pk
-        .as_single_string()
+        .as_single_string_owned()
         .map(Some)
         .map_err(|error| {
             head_value_error(&format!(

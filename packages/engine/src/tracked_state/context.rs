@@ -1407,7 +1407,10 @@ where
                 .await?;
             let descriptor_keys = unresolved_keys
                 .iter()
-                .filter_map(file_descriptor_key_for_file_scoped_key)
+                .map(file_descriptor_key_for_file_scoped_key)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
                 .collect::<BTreeSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -1869,13 +1872,13 @@ where
                 {
                     continue;
                 }
-                let file_id = delta.entity_pk.as_single_string().map_err(|error| {
+                let file_id = delta.entity_pk.as_single_string_owned().map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("file descriptor tombstone has invalid identity: {error}"),
                     )
                 })?;
-                cascades.insert(file_id.to_string(), delta);
+                cascades.insert(file_id, delta);
             }
             if !cascades.is_empty() {
                 let rows = self
@@ -2226,12 +2229,24 @@ fn schema_keys_with_file_descriptors(schema_keys: &[String]) -> Vec<String> {
     schema_keys
 }
 
-fn file_descriptor_key_for_file_scoped_key(key: &TrackedStateKey) -> Option<TrackedStateKey> {
-    key.file_id.as_ref().map(|file_id| TrackedStateKey {
-        schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-        file_id: None,
-        entity_pk: EntityPk::single(file_id),
-    })
+fn file_descriptor_key_for_file_scoped_key(
+    key: &TrackedStateKey,
+) -> Result<Option<TrackedStateKey>, LixError> {
+    key.file_id
+        .as_ref()
+        .map(|file_id| {
+            Ok(TrackedStateKey {
+                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+                file_id: None,
+                entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("validated file ID is not a canonical UUID: {error}"),
+                    )
+                })?,
+            })
+        })
+        .transpose()
 }
 
 fn file_delete_cascade(
@@ -2268,7 +2283,7 @@ fn cascade_tombstone(
 }
 
 /// Materializes an exact point set only when every identity component is
-/// specified. An unconstrained file id could match arbitrary file-local rows,
+/// specified. An unconstrained file id could match arbitrary 01920000-0000-7000-8000-000000000442 rows,
 /// so it deliberately retains the cold full-replay scan path.
 fn exact_keys_for_request(request: &TrackedStateTreeScanRequest) -> Option<Vec<TrackedStateKey>> {
     if request.schema_keys.is_empty()
@@ -2352,13 +2367,13 @@ fn tracked_state_winner_identity_for_diff_row(
         && change.snapshot.is_none()
         && row.deleted
     {
-        let file_id = change.entity_pk.as_single_string().map_err(|error| {
+        let file_id = change.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::unknown(format!(
                 "tracked-state cascade change '{}' has invalid file descriptor identity: {error}",
                 row.change_id
             ))
         })?;
-        if row.file_id.as_deref() == Some(file_id) {
+        if row.file_id.as_deref() == Some(file_id.as_str()) {
             return Ok(TrackedStateRowWinner {
                 identity: TrackedStateIdentity {
                     schema_key: change.schema_key.clone(),
@@ -3639,9 +3654,9 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut file_a = row("entity-a", "change-a", "commit-1");
-        file_a.file_id = Some("file-a.json".to_string());
+        file_a.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         let mut file_b = row("entity-b", "change-b", "commit-1");
-        file_b.file_id = Some("file-b.json".to_string());
+        file_b.file_id = Some("01920000-0000-7000-8000-0000000000b2.json".to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -3663,7 +3678,9 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
-                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                        )],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3680,7 +3697,10 @@ mod tests {
                 .expect("entity pk"),
             "entity-a"
         );
-        assert_eq!(rows[0].file_id.as_deref(), Some("file-a.json"));
+        assert_eq!(
+            rows[0].file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000a2.json")
+        );
     }
 
     #[tokio::test]
@@ -3688,7 +3708,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut row = row("entity-a", "change-a", "commit-1");
-        row.file_id = Some("file-a.json".to_string());
+        row.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         let expected_snapshot = row.snapshot_content.clone();
         write_root_for_test(
             &storage,
@@ -3711,7 +3731,9 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
-                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                        )],
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
@@ -3727,7 +3749,9 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
-                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                        )],
                         ..Default::default()
                     },
                     ..Default::default()
@@ -3792,7 +3816,7 @@ mod tests {
         let tracked_state = TrackedStateContext::new();
         let null_row = row("entity-null", "change-null", "commit-1");
         let mut file_row = row("entity-file", "change-file", "commit-2");
-        file_row.file_id = Some("file-a.json".to_string());
+        file_row.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -3826,7 +3850,9 @@ mod tests {
                         schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![
                             NullableKeyFilter::Null,
-                            NullableKeyFilter::Value("file-a.json".to_string()),
+                            NullableKeyFilter::Value(
+                                "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                            ),
                         ],
                         ..Default::default()
                     },
@@ -3849,9 +3875,9 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut live = row("entity-live", "change-live", "commit-1");
-        live.file_id = Some("file-a.json".to_string());
+        live.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         let mut deleted = tombstone("entity-deleted", "change-delete", "commit-1");
-        deleted.file_id = Some("file-a.json".to_string());
+        deleted.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(&storage, &tracked_state, "commit-1", None, &[live, deleted])
             .await
             .expect("root should write");
@@ -3867,7 +3893,9 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
-                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                        )],
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
@@ -4046,9 +4074,9 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         let mut deleted = tombstone("entity-a", "change-delete", "commit-1");
-        deleted.file_id = Some("file-a.json".to_string());
+        deleted.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         let mut live = row("entity-b", "change-live", "commit-1");
-        live.file_id = Some("file-a.json".to_string());
+        live.file_id = Some("01920000-0000-7000-8000-0000000000a2.json".to_string());
         write_root_for_test(&storage, &tracked_state, "commit-1", None, &[deleted, live])
             .await
             .expect("root should write");
@@ -4064,7 +4092,9 @@ mod tests {
                 "commit-1",
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
-                        file_ids: vec![NullableKeyFilter::Value("file-a.json".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(
+                            "01920000-0000-7000-8000-0000000000a2.json".to_string(),
+                        )],
                         ..Default::default()
                     },
                     read_columns: crate::tracked_state::TrackedStateReadColumns {
@@ -4215,7 +4245,7 @@ mod tests {
         let by_pk = |pk: &str| {
             scanned
                 .iter()
-                .find(|row| row.entity_pk.parts.first().map(String::as_str) == Some(pk))
+                .find(|row| row.entity_pk.as_single_string().ok() == Some(pk))
                 .expect("row should exist")
                 .snapshot_content
                 .clone()
@@ -4520,12 +4550,15 @@ mod tests {
 
     #[tokio::test]
     async fn rootless_descriptor_cascade_drives_point_scan_diff_and_merge_reads() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000521";
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut descriptor = row("file-a", "descriptor-create", "initial");
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.entity_pk =
+            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         let mut semantic = row("line-1", "semantic-create", "initial");
-        semantic.file_id = Some("file-a".to_string());
+        semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -4578,7 +4611,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key.clone()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         include_tombstones: true,
                         ..Default::default()
                     },
@@ -4598,7 +4631,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key.clone()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4638,7 +4671,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec![semantic.schema_key],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4659,12 +4692,15 @@ mod tests {
 
     #[tokio::test]
     async fn file_descriptor_delete_cascade_survives_root_rebuild_and_recreate() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000522";
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
-        let mut descriptor = row("file-a", "descriptor-create", "initial");
+        let mut descriptor = row(FILE_ID, "descriptor-create", "initial");
+        descriptor.entity_pk =
+            EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         let mut semantic = row("line-1", "semantic-create", "initial");
-        semantic.file_id = Some("file-a".to_string());
+        semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -4741,7 +4777,7 @@ mod tests {
                 &TrackedStateDiffRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
                 },
@@ -4759,7 +4795,7 @@ mod tests {
                 &TrackedStateScanRequest {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
-                        file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                        file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         include_tombstones: true,
                         ..Default::default()
                     },

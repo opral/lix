@@ -1363,8 +1363,15 @@ where
     let entity_pks = lookup_ids
         .0
         .iter()
-        .map(EntityPk::single)
-        .collect::<Vec<_>>();
+        .map(|file_id| {
+            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history id must be a canonical UUID: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let file_ids = selected_file_id_filters(lookup_ids);
     let mut entries = scan_file_history_observed_entries(
         reader,
@@ -1443,7 +1450,19 @@ where
             observed_commit_id,
             TrackedStateFilter {
                 schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
-                entity_pks: ids.iter().map(EntityPk::single).collect(),
+                entity_pks: ids
+                    .iter()
+                    .map(|directory_id| {
+                        EntityPk::uuid_from_canonical(directory_id).map_err(|error| {
+                            LixError::new(
+                                LixError::CODE_INTERNAL_ERROR,
+                                format!(
+                                    "file history directory ID is not a canonical UUID: {error}"
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
                 file_ids: file_ids.clone(),
                 include_tombstones: true,
             },
@@ -1619,6 +1638,18 @@ fn file_history_descriptor_blob_route(
 ) -> Result<HistoryRoute, LixError> {
     let mut route = route.clone();
     route.entity_pks = lookup_ids.entity_pks()?;
+    route.resolved_entity_pks = lookup_ids
+        .0
+        .iter()
+        .map(|file_id| {
+            EntityPk::uuid_from_canonical(file_id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!("file history id must be a canonical UUID: {error}"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(route)
 }
 
@@ -1680,7 +1711,9 @@ where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
     let mut owner_route = file_history_plugin_route(event_route, lookup_ids);
-    owner_route.entity_pks = vec![EntityPk::single(PLUGIN_OWNER_KEY).as_json_array_text()?];
+    let owner_pk = EntityPk::single(PLUGIN_OWNER_KEY);
+    owner_route.entity_pks = vec![owner_pk.as_json_array_text()?];
+    owner_route.resolved_entity_pks = vec![owner_pk];
     let entries = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -1887,7 +1920,9 @@ where
     }
 
     let mut registry_route = event_route.clone();
-    registry_route.entity_pks = vec![EntityPk::single(PLUGIN_REGISTRY_KEY).as_json_array_text()?];
+    let registry_pk = EntityPk::single(PLUGIN_REGISTRY_KEY);
+    registry_route.entity_pks = vec![registry_pk.as_json_array_text()?];
+    registry_route.resolved_entity_pks = vec![registry_pk];
     let registry_events = load_history_entries(
         HistoryViewDescriptor {
             view_name: "lix_file_history",
@@ -2722,8 +2757,8 @@ mod tests {
     #[test]
     fn public_id_and_path_filters_prune_before_hydration() {
         let hash = BlobHash::from_content(b"content");
-        let live_a = descriptor("file-a", Some("a.md"), 0);
-        let live_b = descriptor("file-b", Some("b.md"), 0);
+        let live_a = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
+        let live_b = descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0);
         let tombstone = descriptor("file-deleted", None, 0);
         let events = [&live_a, &live_b, &tombstone]
             .into_iter()
@@ -2734,12 +2769,15 @@ mod tests {
         let context = filesystem_context(
             vec![live_a, live_b, tombstone],
             vec![
-                blob_record("file-a", hash, 0),
-                blob_record("file-b", hash, 0),
+                blob_record("01920000-0000-7000-8000-0000000000a2", hash, 0),
+                blob_record("01920000-0000-7000-8000-0000000000b2", hash, 0),
             ],
         );
 
-        let id_predicate = FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-a")]);
+        let id_predicate = FileHistoryPublicPredicate::from_filters(&[eq_filter(
+            "id",
+            "01920000-0000-7000-8000-0000000000a2",
+        )]);
         let by_id = prepare_file_history_rows(
             &observed_states(&context),
             events.clone(),
@@ -2748,7 +2786,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(by_id.len(), 1);
-        assert_eq!(by_id[0].id, "file-a");
+        assert_eq!(by_id[0].id, "01920000-0000-7000-8000-0000000000a2");
 
         let path_predicate =
             FileHistoryPublicPredicate::from_filters(&[eq_filter("path", "/b.md")]);
@@ -2760,7 +2798,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(by_path.len(), 1);
-        assert_eq!(by_path[0].id, "file-b");
+        assert_eq!(by_path[0].id, "01920000-0000-7000-8000-0000000000b2");
 
         let tombstone_predicate =
             FileHistoryPublicPredicate::from_filters(&[eq_filter("id", "file-deleted")]);
@@ -2776,7 +2814,7 @@ mod tests {
         assert_eq!(deleted[0].path, None);
 
         let unsafe_or = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "file-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
             Operator::Or,
             Box::new(eq_filter("name", "b.md")),
         ));
@@ -2785,29 +2823,35 @@ mod tests {
             "one supported OR arm must not prune rows needed by the other arm"
         );
         let mixed_and = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "file-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
             Operator::And,
             Box::new(eq_filter("name", "a.md")),
         ));
         assert!(
             FileHistoryPublicPredicate::extract_conjuncts(&mixed_and)
-                .matches("file-a", Some("/a.md")),
+                .matches("01920000-0000-7000-8000-0000000000a2", Some("/a.md")),
             "a guaranteed public conjunct remains safe for early pruning"
         );
     }
 
     #[test]
     fn equal_depth_sibling_revisions_are_not_deduplicated() {
-        let mut left = history_entry("file-a", 1, None);
+        let mut left = history_entry("01920000-0000-7000-8000-0000000000a2", 1, None);
         left.observed_commit_id = "commit-left".to_string();
         left.change.id = "change-left".to_string();
-        let mut right = history_entry("file-a", 1, None);
+        let mut right = history_entry("01920000-0000-7000-8000-0000000000a2", 1, None);
         right.observed_commit_id = "commit-right".to_string();
         right.change.id = "change-right".to_string();
 
         let events = sorted_grouped_file_history_events([
-            file_history_event_from_entry("file-a".to_string(), &left),
-            file_history_event_from_entry("file-a".to_string(), &right),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &left,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &right,
+            ),
         ]);
 
         assert_eq!(events.len(), 2);
@@ -2822,14 +2866,20 @@ mod tests {
 
     #[test]
     fn same_commit_sources_form_one_logical_revision() {
-        let descriptor = history_entry("file-a", 0, None);
+        let descriptor = history_entry("01920000-0000-7000-8000-0000000000a2", 0, None);
         let mut blob = descriptor.clone();
-        blob.change.id = "change-file-a-blob".to_string();
+        blob.change.id = "change-01920000-0000-7000-8000-0000000000a2-blob".to_string();
         blob.change.schema_key = super::BLOB_REF_SCHEMA_KEY.to_string();
 
         let events = sorted_grouped_file_history_events([
-            file_history_event_from_entry("file-a".to_string(), &descriptor),
-            file_history_event_from_entry("file-a".to_string(), &blob),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &descriptor,
+            ),
+            file_history_event_from_entry(
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
+                &blob,
+            ),
         ]);
 
         assert_eq!(events.len(), 1);
@@ -2850,18 +2900,18 @@ mod tests {
     #[test]
     fn derived_file_ref_snapshots_and_tombstones_parse_as_history_records() {
         let sha256 = "a".repeat(64);
-        let live = derived_file_ref_record("file-a", &sha256, 42, 0);
-        let mut tombstone = history_entry("file-a", 1, None);
-        tombstone.change.id = "derived-file-a-tombstone".to_string();
+        let live = derived_file_ref_record("01920000-0000-7000-8000-0000000000a2", &sha256, 42, 0);
+        let mut tombstone = history_entry("01920000-0000-7000-8000-0000000000a2", 1, None);
+        tombstone.change.id = "derived-01920000-0000-7000-8000-0000000000a2-tombstone".to_string();
         tombstone.change.schema_key = super::DERIVED_FILE_REF_SCHEMA_KEY.to_string();
 
         let refs = parse_file_history_derived_file_refs(&[live.entry, tombstone]).unwrap();
 
         assert_eq!(refs.len(), 2);
-        assert_eq!(refs[0].file_id, "file-a");
+        assert_eq!(refs[0].file_id, "01920000-0000-7000-8000-0000000000a2");
         assert_eq!(refs[0].sha256.as_deref(), Some(sha256.as_str()));
         assert_eq!(refs[0].size_bytes, Some(42));
-        assert_eq!(refs[1].file_id, "file-a");
+        assert_eq!(refs[1].file_id, "01920000-0000-7000-8000-0000000000a2");
         assert_eq!(refs[1].sha256, None);
         assert_eq!(refs[1].size_bytes, None);
     }
@@ -2869,8 +2919,8 @@ mod tests {
     #[test]
     fn derived_materializations_produce_history_rows_without_binary_blob_refs() {
         let sha256 = "b".repeat(64);
-        let descriptor = descriptor("file-a", Some("a.txt"), 0);
-        let proof = derived_file_ref_record("file-a", &sha256, 42, 0);
+        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.txt"), 0);
+        let proof = derived_file_ref_record("01920000-0000-7000-8000-0000000000a2", &sha256, 42, 0);
         let context = FileHistoryFilesystemContext {
             event_descriptors: Vec::new(),
             event_directories: Vec::new(),
@@ -2890,7 +2940,7 @@ mod tests {
             &BTreeMap::new(),
         );
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].file_id, "file-a");
+        assert_eq!(events[0].file_id, "01920000-0000-7000-8000-0000000000a2");
         assert_eq!(
             events[0]
                 .source_changes
@@ -2920,9 +2970,13 @@ mod tests {
     #[test]
     fn history_rejects_simultaneous_binary_and_derived_materializations() {
         let sha256 = "c".repeat(64);
-        let descriptor = descriptor("file-a", Some("a.txt"), 0);
-        let blob = blob_record("file-a", BlobHash::from_content(b"raw"), 0);
-        let proof = derived_file_ref_record("file-a", &sha256, 3, 0);
+        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.txt"), 0);
+        let blob = blob_record(
+            "01920000-0000-7000-8000-0000000000a2",
+            BlobHash::from_content(b"raw"),
+            0,
+        );
+        let proof = derived_file_ref_record("01920000-0000-7000-8000-0000000000a2", &sha256, 3, 0);
         let states = BTreeMap::from([(
             "commit-0".to_string(),
             FileHistoryObservedState {
@@ -2935,7 +2989,10 @@ mod tests {
                 plugin_registry: PluginRegistry::empty(),
             },
         )]);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+        let event = file_history_event_from_entry(
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+            &descriptor.entry,
+        );
 
         let error = prepare_file_history_rows(
             &states,
@@ -2955,9 +3012,18 @@ mod tests {
 
     #[test]
     fn derived_proof_tombstone_does_not_conflict_with_successor_blob_history() {
-        let descriptor = descriptor("file-a", Some("a.txt"), 0);
-        let blob = blob_record("file-a", BlobHash::from_content(b"raw"), 0);
-        let mut proof_tombstone = derived_file_ref_record("file-a", &"d".repeat(64), 3, 0);
+        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.txt"), 0);
+        let blob = blob_record(
+            "01920000-0000-7000-8000-0000000000a2",
+            BlobHash::from_content(b"raw"),
+            0,
+        );
+        let mut proof_tombstone = derived_file_ref_record(
+            "01920000-0000-7000-8000-0000000000a2",
+            &"d".repeat(64),
+            3,
+            0,
+        );
         proof_tombstone.sha256 = None;
         proof_tombstone.size_bytes = None;
         proof_tombstone.entry.change.snapshot_content = None;
@@ -2973,7 +3039,10 @@ mod tests {
                 plugin_registry: PluginRegistry::empty(),
             },
         )]);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+        let event = file_history_event_from_entry(
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+            &descriptor.entry,
+        );
 
         let prepared = prepare_file_history_rows(
             &states,
@@ -3150,8 +3219,13 @@ mod tests {
 
     #[test]
     fn exact_public_ids_route_only_descriptor_and_blob_history() {
-        let predicate =
-            FileHistoryPublicPredicate::from_filters(&[in_filter("id", &["file-b", "file-a"])]);
+        let predicate = FileHistoryPublicPredicate::from_filters(&[in_filter(
+            "id",
+            &[
+                "01920000-0000-7000-8000-0000000000b2",
+                "01920000-0000-7000-8000-0000000000a2",
+            ],
+        )]);
         let ids = FileHistoryLookupIds::from_public_predicate(&predicate)
             .expect("literal public ID IN filter should be routable");
         let route = file_history_descriptor_blob_route(
@@ -3165,7 +3239,10 @@ mod tests {
 
         assert_eq!(
             route.entity_pks,
-            vec![r#"["file-a"]"#.to_string(), r#"["file-b"]"#.to_string()]
+            vec![
+                r#"["01920000-0000-7000-8000-0000000000a2"]"#.to_string(),
+                r#"["01920000-0000-7000-8000-0000000000b2"]"#.to_string()
+            ]
         );
         assert_eq!(route.as_of_commit_ids, vec!["commit-start".to_string()]);
     }
@@ -3173,9 +3250,9 @@ mod tests {
     #[test]
     fn public_id_pushdown_declines_or_nonliteral_and_mixed_predicates() {
         let disjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "file-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
             Operator::Or,
-            Box::new(eq_filter("id", "file-b")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000b2")),
         ));
         assert!(
             FileHistoryLookupIds::from_public_predicate(&FileHistoryPublicPredicate::from_filters(
@@ -3199,7 +3276,7 @@ mod tests {
         );
 
         let mixed_conjunction = Expr::BinaryExpr(BinaryExpr::new(
-            Box::new(eq_filter("id", "file-a")),
+            Box::new(eq_filter("id", "01920000-0000-7000-8000-0000000000a2")),
             Operator::And,
             Box::new(eq_filter("path", "/a.md")),
         ));
@@ -3216,8 +3293,11 @@ mod tests {
     async fn blob_hydration_batches_deduplicates_and_preserves_missing_values() {
         let present_hash = BlobHash::from_content(b"present");
         let missing_hash = BlobHash::from_content(b"missing");
-        let descriptor = descriptor("file-a", Some("a.md"), 0);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
+        let event = file_history_event_from_entry(
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+            &descriptor.entry,
+        );
         let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
@@ -3230,9 +3310,9 @@ mod tests {
             event: event.clone(),
         };
         let rows = vec![
-            row("file-a", present_hash),
-            row("file-b", present_hash),
-            row("file-c", missing_hash),
+            row("01920000-0000-7000-8000-0000000000a2", present_hash),
+            row("01920000-0000-7000-8000-0000000000b2", present_hash),
+            row("01920000-0000-7000-8000-0000000000c2", missing_hash),
         ];
         let reader = Arc::new(RecordingBlobReader {
             calls: StdMutex::new(Vec::new()),
@@ -3256,8 +3336,11 @@ mod tests {
 
     #[tokio::test]
     async fn blob_hydration_rejects_malformed_batch_lengths() {
-        let descriptor = descriptor("file-a", Some("a.md"), 0);
-        let event = file_history_event_from_entry("file-a".to_string(), &descriptor.entry);
+        let descriptor = descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0);
+        let event = file_history_event_from_entry(
+            "01920000-0000-7000-8000-0000000000a2".to_string(),
+            &descriptor.entry,
+        );
         let row = |id: &str, hash: BlobHash| PreparedFileHistoryRow {
             id: id.to_string(),
             path: Some(format!("/{id}.md")),
@@ -3270,8 +3353,14 @@ mod tests {
             event: event.clone(),
         };
         let rows = vec![
-            row("file-a", BlobHash::from_content(b"first")),
-            row("file-b", BlobHash::from_content(b"second")),
+            row(
+                "01920000-0000-7000-8000-0000000000a2",
+                BlobHash::from_content(b"first"),
+            ),
+            row(
+                "01920000-0000-7000-8000-0000000000b2",
+                BlobHash::from_content(b"second"),
+            ),
         ];
 
         for malformed in [
@@ -3292,8 +3381,8 @@ mod tests {
         let first_hash = BlobHash::from_content(b"first");
         let second_hash = BlobHash::from_content(b"second");
         let descriptors = vec![
-            descriptor("file-a", Some("a.md"), 0),
-            descriptor("file-b", Some("b.md"), 0),
+            descriptor("01920000-0000-7000-8000-0000000000a2", Some("a.md"), 0),
+            descriptor("01920000-0000-7000-8000-0000000000b2", Some("b.md"), 0),
         ];
         let events = descriptors
             .iter()
@@ -3304,8 +3393,8 @@ mod tests {
         let context = filesystem_context(
             descriptors,
             vec![
-                blob_record("file-a", first_hash, 0),
-                blob_record("file-b", second_hash, 0),
+                blob_record("01920000-0000-7000-8000-0000000000a2", first_hash, 0),
+                blob_record("01920000-0000-7000-8000-0000000000b2", second_hash, 0),
             ],
         );
         let rows = prepare_file_history_rows(
@@ -3337,7 +3426,7 @@ mod tests {
     async fn identical_event_and_context_routes_load_history_once() {
         let route = HistoryRoute {
             as_of_commit_ids: vec!["cid-start".to_string()],
-            file_ids: vec!["file-a".to_string()],
+            file_ids: vec!["01920000-0000-7000-8000-0000000000a2".to_string()],
             ..HistoryRoute::default()
         };
         let event_route = route.traversal_only();

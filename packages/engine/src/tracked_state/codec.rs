@@ -166,15 +166,11 @@ pub(crate) fn hash_bytes(bytes: &[u8]) -> [u8; TRACKED_STATE_HASH_BYTES] {
 }
 
 pub(crate) fn encode_key(key: &TrackedStateKey) -> Vec<u8> {
-    encode_key_parts(
-        &key.schema_key,
-        key.file_id.as_deref(),
-        &key.entity_pk.parts,
-    )
+    encode_key_parts(&key.schema_key, key.file_id.as_deref(), &key.entity_pk)
 }
 
 pub(crate) fn encode_key_ref(key: TrackedStateKeyRef<'_>) -> Vec<u8> {
-    encode_key_parts(key.schema_key, key.file_id, &key.entity_pk.parts)
+    encode_key_parts(key.schema_key, key.file_id, key.entity_pk)
 }
 
 pub(crate) fn encode_schema_key_prefix(schema_key: &str) -> Vec<u8> {
@@ -241,27 +237,55 @@ const KEY_PART_FINAL: u8 = 0x00;
 const KEY_PART_MORE: u8 = 0x01;
 const FILE_ID_NONE: u8 = 0x00;
 const FILE_ID_SOME: u8 = 0x01;
+const ENTITY_PK_CODEC_V1: u8 = 0x01;
+const ENTITY_PK_UUID: u8 = 0x00;
+const ENTITY_PK_INTEGER: u8 = 0x01;
+const ENTITY_PK_STRING: u8 = 0x02;
+const ENTITY_PK_BYTES: u8 = 0x03;
 
 /// Order-preserving tracked-state key encoding.
 ///
-/// NUL bytes are escaped as `00 ff`. Strings end in `00 00`, except a
-/// non-final entity-pk part which ends in `00 01`. File ids have a one-byte
-/// None/Some tag. The distinct entity terminators make complete keys
-/// prefix-free while preserving the derived tuple ordering byte-for-byte.
-fn encode_key_parts(schema_key: &str, file_id: Option<&str>, entity_pk: &[String]) -> Vec<u8> {
-    let strings_len = schema_key.len()
-        + file_id.map_or(0, str::len)
-        + entity_pk.iter().map(String::len).sum::<usize>();
-    let mut out = Vec::with_capacity(strings_len + 5 + entity_pk.len() * 2);
+/// NUL bytes are escaped as `00 ff`. Tags match [`EntityPk`]'s cross-type
+/// order. UUIDs use raw bytes and signed integers use sign-bit-flipped big
+/// endian, preserving logical order.
+fn encode_key_parts(
+    schema_key: &str,
+    file_id: Option<&str>,
+    entity_pk: &crate::entity_pk::EntityPk,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(
+        schema_key.len() + file_id.map_or(0, str::len) + 6 + entity_pk.components.len() * 18,
+    );
     write_key_string(&mut out, schema_key, KEY_PART_FINAL);
     write_file_id(&mut out, file_id);
-    for (index, part) in entity_pk.iter().enumerate() {
-        let terminator = if index + 1 == entity_pk.len() {
+    out.push(ENTITY_PK_CODEC_V1);
+    for (index, component) in entity_pk.components.iter().enumerate() {
+        let terminator = if index + 1 == entity_pk.components.len() {
             KEY_PART_FINAL
         } else {
             KEY_PART_MORE
         };
-        write_key_string(&mut out, part, terminator);
+        match component {
+            crate::entity_pk::EntityPkComponent::Uuid(bytes) => {
+                out.push(ENTITY_PK_UUID);
+                out.extend_from_slice(bytes);
+                out.push(terminator);
+            }
+            crate::entity_pk::EntityPkComponent::Integer(value) => {
+                out.push(ENTITY_PK_INTEGER);
+                let ordered = u64::from_be_bytes(value.to_be_bytes()) ^ (1_u64 << 63);
+                out.extend_from_slice(&ordered.to_be_bytes());
+                out.push(terminator);
+            }
+            crate::entity_pk::EntityPkComponent::String(value) => {
+                out.push(ENTITY_PK_STRING);
+                write_key_bytes(&mut out, value.as_bytes(), terminator);
+            }
+            crate::entity_pk::EntityPkComponent::Bytes(value) => {
+                out.push(ENTITY_PK_BYTES);
+                write_key_bytes(&mut out, value, terminator);
+            }
+        }
     }
     out
 }
@@ -277,7 +301,11 @@ fn write_file_id(out: &mut Vec<u8>, file_id: Option<&str>) {
 }
 
 fn write_key_string(out: &mut Vec<u8>, value: &str, terminator: u8) {
-    for &byte in value.as_bytes() {
+    write_key_bytes(out, value.as_bytes(), terminator);
+}
+
+fn write_key_bytes(out: &mut Vec<u8>, value: &[u8], terminator: u8) {
+    for &byte in value {
         if byte == 0 {
             out.extend_from_slice(&[0, KEY_ESCAPE]);
         } else {
@@ -309,33 +337,125 @@ fn read_entity_pk(
     bytes: &[u8],
     offset: &mut usize,
 ) -> Result<crate::entity_pk::EntityPk, LixError> {
+    let version = bytes
+        .get(*offset)
+        .copied()
+        .ok_or_else(|| key_codec_error("entity primary key is empty or truncated"))?;
+    *offset += 1;
+    if version != ENTITY_PK_CODEC_V1 {
+        return Err(key_codec_error(format!(
+            "entity primary key has unsupported codec version {version}"
+        )));
+    }
     if *offset >= bytes.len() {
         return Err(key_codec_error("entity primary key is empty or truncated"));
     }
-    let (first, terminator) = read_key_string(bytes, offset, "entity primary-key part")?;
+    let (first, terminator) = read_entity_pk_part(bytes, offset)?;
     if terminator == KEY_PART_FINAL {
-        return Ok(crate::entity_pk::EntityPk::single(first));
+        return crate::entity_pk::EntityPk::from_components(smallvec::smallvec![first])
+            .map_err(|error| key_codec_error(error.to_string()));
     }
 
-    let mut parts = Vec::with_capacity(2);
-    parts.push(first);
+    let mut components = smallvec::smallvec![first];
     loop {
         if *offset >= bytes.len() {
             return Err(key_codec_error("entity primary key is empty or truncated"));
         }
-        let (part, terminator) = read_key_string(bytes, offset, "entity primary-key part")?;
-        parts.push(part);
+        let (part, terminator) = read_entity_pk_part(bytes, offset)?;
+        components.push(part);
         match terminator {
             KEY_PART_FINAL => break,
             KEY_PART_MORE => {}
             _ => unreachable!("read_key_string validates terminators"),
         }
     }
-    crate::entity_pk::EntityPk::from_parts(parts).map_err(|error| {
+    crate::entity_pk::EntityPk::from_components(components).map_err(|error| {
         key_codec_error(format!(
             "entity primary key decoded from storage is invalid: {error}"
         ))
     })
+}
+
+fn read_entity_pk_part(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<(crate::entity_pk::EntityPkComponent, u8), LixError> {
+    let tag = bytes
+        .get(*offset)
+        .copied()
+        .ok_or_else(|| key_codec_error("entity primary-key part tag is truncated"))?;
+    *offset += 1;
+    match tag {
+        ENTITY_PK_STRING => {
+            let (value, terminator) = read_key_string(bytes, offset, "entity primary-key part")?;
+            Ok((
+                crate::entity_pk::EntityPkComponent::String(value.into_boxed_str()),
+                terminator,
+            ))
+        }
+        ENTITY_PK_BYTES => {
+            let (value, terminator) = read_key_bytes(bytes, offset, "entity primary-key bytes")?;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Bytes(value.into_boxed_slice()),
+                terminator,
+            ))
+        }
+        ENTITY_PK_UUID => {
+            let uuid_end = offset
+                .checked_add(16)
+                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?;
+            let uuid_bytes: [u8; 16] = bytes
+                .get(*offset..uuid_end)
+                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key part is truncated"))?
+                .try_into()
+                .expect("UUIDv7 slice has fixed length");
+            let terminator = bytes
+                .get(uuid_end)
+                .copied()
+                .ok_or_else(|| key_codec_error("UUIDv7 entity primary-key ending is truncated"))?;
+            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                return Err(key_codec_error(format!(
+                    "UUIDv7 entity primary-key part has invalid terminator {terminator}"
+                )));
+            }
+            *offset = uuid_end + 1;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Uuid(uuid_bytes),
+                terminator,
+            ))
+        }
+        ENTITY_PK_INTEGER => {
+            let integer_end = offset
+                .checked_add(8)
+                .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?;
+            let ordered = u64::from_be_bytes(
+                bytes
+                    .get(*offset..integer_end)
+                    .ok_or_else(|| key_codec_error("integer entity primary-key part is truncated"))?
+                    .try_into()
+                    .expect("integer slice has fixed length"),
+            );
+            let terminator = bytes
+                .get(integer_end)
+                .copied()
+                .ok_or_else(|| key_codec_error("integer entity primary-key ending is truncated"))?;
+            if !matches!(terminator, KEY_PART_FINAL | KEY_PART_MORE) {
+                return Err(key_codec_error(format!(
+                    "integer entity primary-key part has invalid terminator {terminator}"
+                )));
+            }
+            *offset = integer_end + 1;
+            Ok((
+                crate::entity_pk::EntityPkComponent::Integer(i64::from_be_bytes(
+                    (ordered ^ (1_u64 << 63)).to_be_bytes(),
+                )),
+                terminator,
+            ))
+        }
+        other => Err(key_codec_error(format!(
+            "entity primary-key part has unknown tag {other}"
+        ))),
+    }
 }
 
 fn read_key_string(
@@ -343,6 +463,17 @@ fn read_key_string(
     offset: &mut usize,
     field: &str,
 ) -> Result<(String, u8), LixError> {
+    let (value, terminator) = read_key_bytes(bytes, offset, field)?;
+    let value =
+        String::from_utf8(value).map_err(|_| key_codec_error(format!("{field} is not UTF-8")))?;
+    Ok((value, terminator))
+}
+
+fn read_key_bytes(
+    bytes: &[u8],
+    offset: &mut usize,
+    field: &str,
+) -> Result<(Vec<u8>, u8), LixError> {
     let start = *offset;
     let mut segment_start = start;
     let mut decoded: Option<Vec<u8>> = None;
@@ -374,8 +505,6 @@ fn read_key_string(
                         out
                     },
                 );
-                let value = String::from_utf8(value)
-                    .map_err(|_| key_codec_error(format!("{field} is not UTF-8")))?;
                 return Ok((value, escape));
             }
             other => {
@@ -1572,13 +1701,11 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk {
-                parts: vec![
-                    "namespace".to_string(),
-                    "true".to_string(),
-                    "42".to_string(),
-                ],
-            },
+            entity_pk: EntityPk::from_parts_unchecked(vec![
+                "namespace".to_string(),
+                "true".to_string(),
+                "42".to_string(),
+            ]),
         };
 
         let encoded = encode_key(&key);
@@ -1591,9 +1718,10 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: Some("file".to_string()),
-            entity_pk: EntityPk {
-                parts: vec!["namespace".to_string(), "id".to_string()],
-            },
+            entity_pk: EntityPk::from_parts_unchecked(vec![
+                "namespace".to_string(),
+                "id".to_string(),
+            ]),
         };
         let encoded = encode_key(&key);
         let prefix = encode_schema_file_prefix("schema", Some("file"));
@@ -1610,9 +1738,7 @@ mod tests {
         let mut encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk {
-                parts: vec!["true".to_string()],
-            },
+            entity_pk: EntityPk::single("true"),
         });
         encoded.truncate(encoded.len() - 1);
 
@@ -1625,7 +1751,7 @@ mod tests {
         let encoded = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk { parts: Vec::new() },
+            entity_pk: EntityPk::from_parts_unchecked(Vec::new()),
         });
 
         let error = decode_key(&encoded).expect_err("empty entity pk should reject");
@@ -1638,16 +1764,12 @@ mod tests {
         let prefix = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk {
-                parts: vec!["a".to_string()],
-            },
+            entity_pk: EntityPk::single("a"),
         });
         let extended = encode_key(&TrackedStateKey {
             schema_key: "schema".to_string(),
             file_id: None,
-            entity_pk: EntityPk {
-                parts: vec!["a".to_string(), "b".to_string()],
-            },
+            entity_pk: EntityPk::from_parts_unchecked(vec!["a".to_string(), "b".to_string()]),
         });
 
         assert!(prefix < extended);
@@ -1659,9 +1781,7 @@ mod tests {
         let key = TrackedStateKey {
             schema_key: "s\0".to_string(),
             file_id: Some(String::new()),
-            entity_pk: EntityPk {
-                parts: vec!["a\0".to_string(), String::new()],
-            },
+            entity_pk: EntityPk::from_parts_unchecked(vec!["a\0".to_string(), String::new()]),
         };
         let encoded = encode_key(&key);
 
@@ -1670,8 +1790,9 @@ mod tests {
             vec![
                 b's', 0, 0xff, 0, 0, // schema "s\\0"
                 1, 0, 0, // Some("")
-                b'a', 0, 0xff, 0, 1, // non-final PK part "a\\0"
-                0, 0, // final empty PK part
+                1, // entity-pk codec v1
+                2, b'a', 0, 0xff, 0, 1, // string non-final PK component "a\\0"
+                2, 0, 0, // string final empty PK component
             ]
         );
         assert_eq!(decode_key(&encoded).expect("key should decode"), key);
@@ -1686,8 +1807,113 @@ mod tests {
     }
 
     #[test]
+    fn key_codec_packs_canonical_uuid_v7_as_raw_bytes() {
+        let uuid = "019eb805-60d0-71c0-ade3-b0f0efab9d9a";
+        let key = TrackedStateKey {
+            schema_key: "s".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::from_components(smallvec::smallvec![
+                crate::entity_pk::EntityPkComponent::Uuid(
+                    crate::storage_codec::id_string::uuid_bytes_from_canonical(uuid)
+                        .expect("canonical UUID"),
+                ),
+            ])
+            .expect("one UUID component"),
+        };
+
+        let encoded = encode_key(&key);
+        let prefix = encode_schema_file_prefix("s", None);
+        assert_eq!(
+            &encoded[prefix.len()..],
+            &[
+                ENTITY_PK_CODEC_V1,
+                ENTITY_PK_UUID,
+                0x01,
+                0x9e,
+                0xb8,
+                0x05,
+                0x60,
+                0xd0,
+                0x71,
+                0xc0,
+                0xad,
+                0xe3,
+                0xb0,
+                0xf0,
+                0xef,
+                0xab,
+                0x9d,
+                0x9a,
+                KEY_PART_FINAL,
+            ]
+        );
+        assert_eq!(decode_key(&encoded).expect("UUIDv7 key"), key);
+        assert_eq!(encoded.len(), prefix.len() + 19);
+    }
+
+    #[test]
+    fn key_codec_packs_any_schema_typed_uuid() {
+        let uuid_v4 = "550e8400-e29b-41d4-a716-446655440000";
+        let key = TrackedStateKey {
+            schema_key: "s".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::from_components(smallvec::smallvec![
+                crate::entity_pk::EntityPkComponent::Uuid(
+                    crate::storage_codec::id_string::uuid_bytes_from_canonical(uuid_v4)
+                        .expect("canonical UUID"),
+                ),
+            ])
+            .expect("one UUID component"),
+        };
+        let encoded = encode_key(&key);
+        let prefix = encode_schema_file_prefix("s", None);
+
+        assert_eq!(encoded[prefix.len()], ENTITY_PK_CODEC_V1);
+        assert_eq!(encoded[prefix.len() + 1], ENTITY_PK_UUID);
+        assert_eq!(decode_key(&encoded).expect("UUID key"), key);
+    }
+
+    #[test]
+    fn key_codec_rejects_truncated_uuid_component() {
+        let key = TrackedStateKey {
+            schema_key: "s".to_string(),
+            file_id: None,
+            entity_pk: EntityPk::from_components(smallvec::smallvec![
+                crate::entity_pk::EntityPkComponent::Uuid([7; 16]),
+            ])
+            .expect("one UUID component"),
+        };
+        let mut encoded = encode_key(&key);
+        encoded.truncate(encoded.len() - 2);
+
+        let error = decode_key(&encoded).expect_err("truncated UUID must reject");
+        assert!(error.message.contains("truncated"));
+    }
+
+    #[test]
+    fn key_codec_rejects_pre_v1_entity_key_bytes() {
+        let mut legacy = encode_schema_file_prefix("s", None);
+        legacy.extend_from_slice(b"entity");
+        legacy.extend_from_slice(&[KEY_PART_FINAL, KEY_PART_FINAL]);
+
+        let error = decode_key(&legacy).expect_err("legacy key must reject");
+        assert!(error.message.contains("unsupported codec version"));
+    }
+
+    #[test]
     fn key_codec_byte_order_matches_logical_order_and_is_prefix_free() {
-        let strings = ["", "\0", "a", "a\0", "a\u{1}", "z", "é"];
+        let strings = [
+            "",
+            "\0",
+            "a",
+            "a\0",
+            "a\u{1}",
+            "z",
+            "é",
+            "019eb805-60d0-71c0-ade3-b0f0efab9d9a",
+            "019eb805-60d1-71c0-ade3-b0f0efab9d9a",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ];
         let mut keys = Vec::new();
         for schema in strings {
             for file_id in [None, Some(""), Some("a"), Some("a\0")] {
@@ -1700,12 +1926,30 @@ mod tests {
                     keys.push(TrackedStateKey {
                         schema_key: schema.to_string(),
                         file_id: file_id.map(str::to_string),
-                        entity_pk: EntityPk {
-                            parts: vec![first.to_string(), "tail".to_string()],
-                        },
+                        entity_pk: EntityPk::from_parts_unchecked(vec![
+                            first.to_string(),
+                            "tail".to_string(),
+                        ]),
                     });
                 }
             }
+        }
+        for component in [
+            crate::entity_pk::EntityPkComponent::Uuid([0; 16]),
+            crate::entity_pk::EntityPkComponent::Uuid([u8::MAX; 16]),
+            crate::entity_pk::EntityPkComponent::Integer(i64::MIN),
+            crate::entity_pk::EntityPkComponent::Integer(-1),
+            crate::entity_pk::EntityPkComponent::Integer(0),
+            crate::entity_pk::EntityPkComponent::Integer(i64::MAX),
+            crate::entity_pk::EntityPkComponent::Bytes(Box::from([])),
+            crate::entity_pk::EntityPkComponent::Bytes(Box::from([0, 1, 255])),
+        ] {
+            keys.push(TrackedStateKey {
+                schema_key: "typed".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::from_components(smallvec::smallvec![component])
+                    .expect("one typed component"),
+            });
         }
         keys.sort();
         keys.dedup();

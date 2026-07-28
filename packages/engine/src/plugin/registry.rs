@@ -1364,7 +1364,7 @@ mod tests {
     #[test]
     fn owner_rows_share_one_entity_key_and_use_file_id_identity() {
         let owner = PluginFileOwner::new(
-            "file-a",
+            "01920000-0000-7000-8000-0000000000a2",
             "plugin_a",
             vec!["plugin_a_note".to_string(), "plugin_a_meta".to_string()],
         )
@@ -1374,7 +1374,10 @@ mod tests {
             row.entity_pk.unwrap().as_single_string().unwrap(),
             PLUGIN_OWNER_KEY
         );
-        assert_eq!(row.file_id.as_deref(), Some("file-a"));
+        assert_eq!(
+            row.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000a2")
+        );
         assert!(!row.global);
         assert!(!row.untracked);
         assert_eq!(row.branch_id, "main");

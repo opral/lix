@@ -121,7 +121,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let branch_ref = BranchRefContext::new();
 
-        stage_branch_head(&storage, "branch-a", "commit-a")
+        stage_branch_head(&storage, "01920000-0000-7000-8000-0000000000a1", "commit-a")
             .await
             .expect("branch head should advance");
 
@@ -131,11 +131,11 @@ mod tests {
             .expect("read should open");
         let head = branch_ref
             .reader(read)
-            .load_head("branch-a")
+            .load_head("01920000-0000-7000-8000-0000000000a1")
             .await
             .expect("branch head should load")
             .expect("branch head should exist");
-        assert_eq!(head.branch_id, "branch-a");
+        assert_eq!(head.branch_id, "01920000-0000-7000-8000-0000000000a1");
         assert_eq!(head.commit_id, "commit-a");
     }
 
@@ -144,12 +144,12 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let branch_ref = test_branch_ref();
 
-        stage_branch_head(&storage, "branch-b", "commit-b")
+        stage_branch_head(&storage, "01920000-0000-7000-8000-0000000000b1", "commit-b")
             .await
-            .expect("branch-b should advance");
-        stage_branch_head(&storage, "branch-a", "commit-a")
+            .expect("01920000-0000-7000-8000-0000000000b1 should advance");
+        stage_branch_head(&storage, "01920000-0000-7000-8000-0000000000a1", "commit-a")
             .await
-            .expect("branch-a should advance");
+            .expect("01920000-0000-7000-8000-0000000000a1 should advance");
 
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -165,11 +165,11 @@ mod tests {
             heads,
             vec![
                 BranchHead {
-                    branch_id: "branch-a".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
                     commit_id: CommitId::for_test_label("commit-a"),
                 },
                 BranchHead {
-                    branch_id: "branch-b".to_string(),
+                    branch_id: "01920000-0000-7000-8000-0000000000b1".to_string(),
                     commit_id: CommitId::for_test_label("commit-b"),
                 },
             ]

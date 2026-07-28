@@ -208,7 +208,7 @@ fn validate_lix_schema_definition_rejects_missing_primary_key_properties() {
 }
 
 #[test]
-fn validate_lix_schema_definition_rejects_non_string_primary_key_properties() {
+fn validate_lix_schema_definition_rejects_number_primary_key_properties() {
     let schema = json!({
         "x-lix-key": "numeric_pk",
         "type": "object",
@@ -224,8 +224,24 @@ fn validate_lix_schema_definition_rejects_non_string_primary_key_properties() {
     let err = validate_lix_schema_definition(&schema).unwrap_err();
     assert!(
         err.to_string()
-            .contains("x-lix-primary-key property \"/id\" must have type \"string\"")
+            .contains("x-lix-primary-key property \"/id\" must be a non-null integer or string")
     );
+}
+
+#[test]
+fn validate_lix_schema_definition_accepts_integer_primary_key_properties() {
+    let schema = json!({
+        "x-lix-key": "integer_pk",
+        "type": "object",
+        "properties": {
+            "id": { "type": "integer" }
+        },
+        "required": ["id"],
+        "x-lix-primary-key": ["/id"],
+        "additionalProperties": false
+    });
+
+    validate_lix_schema_definition(&schema).expect("integer primary key should be valid");
 }
 
 #[test]

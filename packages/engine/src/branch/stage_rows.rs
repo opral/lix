@@ -14,7 +14,7 @@ pub(crate) fn branch_descriptor_stage_row(
     hidden: bool,
 ) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(branch_id)),
+        entity_pk: None,
         schema_key: BRANCH_DESCRIPTOR_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
@@ -36,7 +36,7 @@ pub(crate) fn branch_descriptor_stage_row(
 
 pub(crate) fn branch_ref_stage_row(branch_id: &str, commit_id: &CommitId) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(branch_id)),
+        entity_pk: None,
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
@@ -57,13 +57,20 @@ pub(crate) fn branch_ref_stage_row(branch_id: &str, commit_id: &CommitId) -> Tra
 
 pub(crate) fn branch_descriptor_tombstone_row(branch_id: &str) -> TransactionWriteRow {
     let mut row = branch_descriptor_stage_row(branch_id, "", false);
+    row.entity_pk = Some(
+        EntityPk::uuid_from_canonical(branch_id)
+            .expect("branch tombstones target validated UUID identities"),
+    );
     row.snapshot = None;
     row
 }
 
 pub(crate) fn branch_ref_tombstone_row(branch_id: &str) -> TransactionWriteRow {
     TransactionWriteRow {
-        entity_pk: Some(EntityPk::single(branch_id)),
+        entity_pk: Some(
+            EntityPk::uuid_from_canonical(branch_id)
+                .expect("branch tombstones target validated UUID identities"),
+        ),
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         file_id: None,
         snapshot: None,

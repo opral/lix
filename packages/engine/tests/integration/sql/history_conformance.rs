@@ -502,21 +502,21 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-conformance-file', '/docs/conformance.txt', X'6F6E65')",
+                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/docs/conformance.txt', X'6F6E65')",
                 &[],
             )
             .await
             .expect("file insert should succeed");
         session
             .execute(
-                "UPDATE lix_file SET data = X'74776F' WHERE id = 'history-conformance-file'",
+                "UPDATE lix_file SET data = X'74776F' WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await
             .expect("file update should succeed");
         session
             .execute(
-                "DELETE FROM lix_file WHERE id = 'history-conformance-file'",
+                "DELETE FROM lix_file WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await
@@ -527,18 +527,18 @@ simulation_test!(
             "SELECT id, path, name, data, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_file_history \
              WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND id = 'history-conformance-file' \
+               AND id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
         .await;
         assert_eq!(
             file_rows,
             vec![vec![
-                Value::Text("history-conformance-file".to_string()),
+                Value::Text("68697374-6f72-892d-836f-6e666f726d00".to_string()),
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["history-conformance-file"])),
+                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"])),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -561,7 +561,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-conformance-dir', '/conformance/')",
+                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/conformance/')",
                 &[],
             )
             .await
@@ -569,14 +569,14 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_directory SET name = 'conformance-updated' \
-                 WHERE id = 'history-conformance-dir'",
+                 WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await
             .expect("directory update should succeed");
         session
             .execute(
-                "DELETE FROM lix_directory WHERE id = 'history-conformance-dir'",
+                "DELETE FROM lix_directory WHERE id = '68697374-6f72-892d-836f-6e666f726d00'",
                 &[],
             )
             .await
@@ -587,18 +587,18 @@ simulation_test!(
             "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
              FROM lix_directory_history \
              WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND id = 'history-conformance-dir' \
+               AND id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
         .await;
         assert_eq!(
             directory_rows,
             vec![vec![
-                Value::Text("history-conformance-dir".to_string()),
+                Value::Text("68697374-6f72-892d-836f-6e666f726d00".to_string()),
                 Value::Null,
                 Value::Null,
                 Value::Null,
-                Value::Json(serde_json::json!(["history-conformance-dir"])),
+                Value::Json(serde_json::json!(["68697374-6f72-892d-836f-6e666f726d00"])),
                 Value::Boolean(true),
                 Value::Integer(0),
             ]]
@@ -671,7 +671,7 @@ simulation_test!(
                      LEFT JOIN lix_key_value_history AS h \
                        ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
                       AND h.key = 'history-join-anchor' \
-                     WHERE b.id = 'global'"
+                     WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
                 ),
                 &[],
             )
@@ -697,7 +697,7 @@ simulation_test!(
                      RIGHT JOIN lix_branch AS b \
                        ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
                       AND h.key = 'history-join-anchor' \
-                     WHERE b.id = 'global'"
+                     WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
                 ),
                 &[],
             )

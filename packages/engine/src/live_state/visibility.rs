@@ -476,12 +476,15 @@ mod tests {
     #[test]
     fn expands_requested_branch_with_global_candidates() {
         assert_eq!(
-            expanded_branch_ids(&["branch-a".to_string()]),
-            vec!["branch-a".to_string(), "global".to_string()]
+            expanded_branch_ids(&["01920000-0000-7000-8000-0000000000a1".to_string()]),
+            vec![
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()
+            ]
         );
         assert_eq!(
-            expanded_branch_ids(&["global".to_string()]),
-            vec!["global".to_string()]
+            expanded_branch_ids(&["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()]),
+            vec!["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()]
         );
     }
 
@@ -489,18 +492,21 @@ mod tests {
     fn committed_scan_projects_global_row_into_requested_branch() {
         let rows = resolve_scan_rows(
             vec![row_at(
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 "global-value",
                 true,
                 Some("change-global"),
             )],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -513,26 +519,29 @@ mod tests {
         let rows = resolve_scan_rows(
             vec![
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "entity",
                     "branch-value",
                     false,
                     Some("change-branch"),
                 ),
             ],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(!rows[0].global);
         assert_eq!(
             rows[0].snapshot_content.as_deref(),
@@ -543,7 +552,7 @@ mod tests {
     #[test]
     fn empty_branch_filter_uses_last_base_row_for_duplicate_identity() {
         let mut tracked = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "tracked",
             false,
@@ -551,7 +560,7 @@ mod tests {
         );
         tracked.untracked = false;
         let mut untracked = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "untracked",
             false,
@@ -572,8 +581,20 @@ mod tests {
 
     #[test]
     fn empty_branch_filter_dedupes_duplicate_base_and_staged_overlay_identity() {
-        let base = row_at("branch-a", "entity", "base", false, Some("change-base"));
-        let staged = row_at("branch-a", "entity", "staged", false, Some("change-staged"));
+        let base = row_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            "base",
+            false,
+            Some("change-base"),
+        );
+        let staged = row_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            "staged",
+            false,
+            Some("change-staged"),
+        );
 
         let rows = resolve_live_state_rows(vec![base], vec![staged], &[], false, None);
 
@@ -587,19 +608,42 @@ mod tests {
     #[test]
     fn uncontested_single_branch_fast_path_matches_overlay_semantics() {
         let rows = vec![
-            row_at("branch-a", "b", "B", false, Some("change-b")),
             row_at(
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
+                "b",
+                "B",
+                false,
+                Some("change-b"),
+            ),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
                 "duplicate",
                 "first",
                 false,
                 Some("change-first"),
             ),
-            tombstone_at("branch-a", "deleted", false, Some("change-deleted")),
-            row_at("branch-a", "a", "A", false, Some("change-a")),
-            row_at("branch-a", "duplicate", "last", false, Some("change-last")),
+            tombstone_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "deleted",
+                false,
+                Some("change-deleted"),
+            ),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "a",
+                "A",
+                false,
+                Some("change-a"),
+            ),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "duplicate",
+                "last",
+                false,
+                Some("change-last"),
+            ),
         ];
-        let requested = vec!["branch-a".to_string()];
+        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
 
         let expected =
             resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, false, None);
@@ -616,10 +660,33 @@ mod tests {
     #[test]
     fn uncontested_single_branch_fast_path_applies_tombstones_and_limit_after_deduplication() {
         let rows = vec![
-            row_at("branch-a", "a", "first", false, Some("change-first")),
-            tombstone_at("branch-a", "a", false, Some("change-delete")),
-            row_at("branch-a", "b", "B", false, Some("change-b")),
-            row_at("branch-a", "c", "C", false, Some("change-c")),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "a",
+                "first",
+                false,
+                Some("change-first"),
+            ),
+            tombstone_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "a",
+                false,
+                Some("change-delete"),
+            ),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "b",
+                "B",
+                false,
+                Some("change-b"),
+            ),
+            row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "c",
+                "C",
+                false,
+                Some("change-c"),
+            ),
         ];
 
         let actual = resolve_uncontested_single_branch_rows(rows, false, Some(1));
@@ -631,10 +698,24 @@ mod tests {
     #[test]
     fn uncontested_single_branch_fast_path_keeps_distinct_file_identities() {
         let rows = vec![
-            file_row_at("branch-a", "same", "file-a", false, "schema", "file-a"),
-            file_row_at("branch-a", "same", "file-b", false, "schema", "file-b"),
+            file_row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "same",
+                "01920000-0000-7000-8000-0000000000a2",
+                false,
+                "schema",
+                "01920000-0000-7000-8000-0000000000a2",
+            ),
+            file_row_at(
+                "01920000-0000-7000-8000-0000000000a1",
+                "same",
+                "01920000-0000-7000-8000-0000000000b2",
+                false,
+                "schema",
+                "01920000-0000-7000-8000-0000000000b2",
+            ),
         ];
-        let requested = vec!["branch-a".to_string()];
+        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
 
         let expected =
             resolve_live_state_rows_via_overlay(rows.clone(), Vec::new(), &requested, true, None);
@@ -646,9 +727,21 @@ mod tests {
 
     #[test]
     fn uncontested_single_branch_fast_path_requires_exact_scope() {
-        let branch_row = row_at("branch-a", "a", "A", false, Some("change-a"));
-        let global_row = row_at("global", "a", "global", true, Some("change-global"));
-        let requested = vec!["branch-a".to_string()];
+        let branch_row = row_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "a",
+            "A",
+            false,
+            Some("change-a"),
+        );
+        let global_row = row_at(
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            "a",
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            true,
+            Some("change-global"),
+        );
+        let requested = vec!["01920000-0000-7000-8000-0000000000a1".to_string()];
 
         assert!(can_resolve_uncontested_single_branch_rows(
             std::slice::from_ref(&branch_row),
@@ -668,7 +761,10 @@ mod tests {
         assert!(!can_resolve_uncontested_single_branch_rows(
             std::slice::from_ref(&branch_row),
             &[],
-            &["branch-a".to_string(), "branch-b".to_string()],
+            &[
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000b1".to_string()
+            ],
         ));
     }
 
@@ -677,15 +773,20 @@ mod tests {
         let rows = resolve_scan_rows(
             vec![
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
-                tombstone_at("branch-a", "entity", false, Some("change-tombstone")),
+                tombstone_at(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "entity",
+                    false,
+                    Some("change-tombstone"),
+                ),
             ],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
         );
 
@@ -695,7 +796,7 @@ mod tests {
     #[test]
     fn staged_duplicate_identity_uses_last_mutation_without_tracking_lane_preference() {
         let mut tracked = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "tracked",
             false,
@@ -703,7 +804,7 @@ mod tests {
         );
         tracked.untracked = false;
         let mut untracked = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "untracked",
             false,
@@ -715,7 +816,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             Vec::new(),
             vec![untracked.clone(), tracked.clone()],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -730,7 +831,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             Vec::new(),
             vec![tracked, untracked],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -746,7 +847,7 @@ mod tests {
     #[test]
     fn staged_row_replaces_base_row_for_same_visible_identity() {
         let mut base = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "base-untracked",
             false,
@@ -755,7 +856,7 @@ mod tests {
         base.untracked = true;
         base.commit_id = None;
         let mut staged = row_at(
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             "entity",
             "staged-tracked",
             false,
@@ -766,7 +867,7 @@ mod tests {
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -781,18 +882,24 @@ mod tests {
 
     #[test]
     fn staged_global_tombstone_hides_projected_base_global_row() {
-        let mut base = row_at("branch-a", "entity", "base", true, Some("change-base"));
+        let mut base = row_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            "base",
+            true,
+            Some("change-base"),
+        );
         base.global = true;
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![tombstone_at(
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 true,
                 Some("change-staged"),
             )],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -802,13 +909,24 @@ mod tests {
 
     #[test]
     fn base_branch_tombstone_hides_staged_global_row() {
-        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
-        let staged = row_at("global", "entity", "staged", true, Some("change-staged"));
+        let base = tombstone_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            false,
+            Some("change-base"),
+        );
+        let staged = row_at(
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            "entity",
+            "staged",
+            true,
+            Some("change-staged"),
+        );
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -818,15 +936,26 @@ mod tests {
 
     #[test]
     fn base_branch_tombstone_hides_staged_global_row_regardless_of_tracking_state() {
-        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
-        let mut staged = row_at("global", "entity", "staged", true, Some("change-staged"));
+        let base = tombstone_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            false,
+            Some("change-base"),
+        );
+        let mut staged = row_at(
+            "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            "entity",
+            "staged",
+            true,
+            Some("change-staged"),
+        );
         staged.untracked = true;
         staged.commit_id = None;
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -836,13 +965,24 @@ mod tests {
 
     #[test]
     fn staged_branch_row_overrides_base_branch_tombstone() {
-        let base = tombstone_at("branch-a", "entity", false, Some("change-base"));
-        let staged = row_at("branch-a", "entity", "staged", false, Some("change-staged"));
+        let base = tombstone_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            false,
+            Some("change-base"),
+        );
+        let staged = row_at(
+            "01920000-0000-7000-8000-0000000000a1",
+            "entity",
+            "staged",
+            false,
+            Some("change-staged"),
+        );
 
         let rows = resolve_live_state_rows(
             vec![base],
             vec![staged],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             false,
             None,
         );
@@ -856,20 +996,28 @@ mod tests {
         let rows = resolve_scan_rows(
             vec![
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "entity",
                     "global-value",
                     true,
                     Some("change-global"),
                 ),
-                tombstone_at("branch-a", "entity", false, Some("change-tombstone")),
+                tombstone_at(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "entity",
+                    false,
+                    Some("change-tombstone"),
+                ),
             ],
-            &["branch-a".to_string()],
+            &["01920000-0000-7000-8000-0000000000a1".to_string()],
             true,
         );
 
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            rows[0].branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert_eq!(rows[0].snapshot_content, None);
     }
 
@@ -877,15 +1025,27 @@ mod tests {
     fn resolve_visible_rows_maps_branch_scope_and_applies_limit() {
         let request = VisibilityRequest {
             branch_scope: VisibilityBranchScope::BranchIds {
-                branch_ids: vec!["branch-a".to_string()],
+                branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
             },
             include_tombstones: false,
             limit: Some(1),
         };
         let rows = resolve_visible_rows(
             vec![
-                row_at("branch-a", "a", "A", false, Some("change-a")),
-                row_at("branch-a", "b", "B", false, Some("change-b")),
+                row_at(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "a",
+                    "A",
+                    false,
+                    Some("change-a"),
+                ),
+                row_at(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "b",
+                    "B",
+                    false,
+                    Some("change-b"),
+                ),
             ],
             Vec::new(),
             &request,
@@ -898,7 +1058,7 @@ mod tests {
     async fn overlay_scan_fetches_base_global_candidates_for_staged_only_branch_scope() {
         let base = ExistingGlobalOnlyReader {
             rows: vec![row_at(
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 "entity",
                 "global-value",
                 true,
@@ -935,36 +1095,41 @@ mod tests {
         let base = FilteringReader {
             rows: vec![
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "base-branch",
                     "base-branch",
                     false,
                     Some("base-branch"),
                 ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "base-global",
                     "base-global",
                     true,
                     Some("base-global"),
                 ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "stage-branch",
                     "base-before-stage",
                     false,
                     Some("base-before-stage"),
                 ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "stage-delete",
                     "base-before-delete",
                     true,
                     Some("base-before-delete"),
                 ),
-                tombstone_at("branch-a", "base-tombstone", false, Some("base-tombstone")),
+                tombstone_at(
+                    "01920000-0000-7000-8000-0000000000a1",
+                    "base-tombstone",
+                    false,
+                    Some("base-tombstone"),
+                ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "global-delete",
                     "global-before-delete",
                     true,
@@ -975,48 +1140,48 @@ mod tests {
         let staged = FilteringStagedRows {
             rows: vec![
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "base-branch",
                     "staged-global-loses",
                     true,
                     Some("staged-global-loses"),
                 ),
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "base-global",
                     "staged-global-wins",
                     true,
                     Some("staged-global-wins"),
                 ),
                 row_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "stage-branch",
                     "staged-branch-wins",
                     false,
                     Some("staged-branch-wins"),
                 ),
                 tombstone_at(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     "stage-delete",
                     false,
                     Some("staged-branch-delete"),
                 ),
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "stage-global",
                     "staged-global-only",
                     true,
                     Some("staged-global-only"),
                 ),
                 row_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "base-tombstone",
                     "staged-global-hidden",
                     true,
                     Some("staged-global-hidden"),
                 ),
                 tombstone_at(
-                    "global",
+                    "ffffffff-ffff-7fff-bfff-ffffffffffff",
                     "global-delete",
                     true,
                     Some("staged-global-delete"),
@@ -1025,7 +1190,7 @@ mod tests {
         };
         let exact = |entity: &str| LiveStateExactRowRequest {
             schema_key: "schema".to_string(),
-            branch_id: "branch-a".to_string(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             entity_pk: EntityPk::single(entity),
             file_id: None,
         };

@@ -637,7 +637,7 @@ async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
     let main_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("markdown-derived-blob-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-000000000507".to_owned()),
             name: "Markdown derived blob source".to_owned(),
             from_commit_id: None,
         })
@@ -722,7 +722,7 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("markdown-paragraph-conflict-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-000000000508".to_owned()),
             name: "Markdown paragraph conflict source".to_owned(),
             from_commit_id: None,
         })
@@ -799,7 +799,7 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("csv-row-conflict-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-000000000509".to_owned()),
             name: "CSV row conflict source".to_owned(),
             from_commit_id: None,
         })
@@ -882,7 +882,7 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("csv-row-canonical-b-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-00000000050a".to_owned()),
             name: "CSV row canonical B source".to_owned(),
             from_commit_id: None,
         })
@@ -970,7 +970,7 @@ async fn v2_csv_delete_vs_edit_remains_a_file_lifecycle_conflict() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("csv-delete-vs-edit-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-00000000050b".to_owned()),
             name: "CSV delete versus edit source".to_owned(),
             from_commit_id: None,
         })
@@ -1070,7 +1070,7 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("csv-rename-vs-edit-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-00000000050c".to_owned()),
             name: "CSV rename versus same-row edit source".to_owned(),
             from_commit_id: None,
         })
@@ -2807,7 +2807,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("excalidraw-element-conflict-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-00000000050d".to_owned()),
             name: "Excalidraw element conflict source".to_owned(),
             from_commit_id: None,
         })
@@ -3168,7 +3168,7 @@ async fn v2_csv_actor_state_isolated_by_branch_root() {
 
     let branch = lix
         .create_branch(CreateBranchOptions {
-            id: Some("v2-actor-isolation".to_string()),
+            id: Some("01920000-0000-7000-8000-00000000050e".to_string()),
             name: "v2 actor isolation".to_string(),
             from_commit_id: None,
         })
@@ -3311,7 +3311,7 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("csv-generation-conflict-source".to_owned()),
+            id: Some("01920000-0000-7000-8000-00000000050f".to_owned()),
             name: "CSV generation conflict source".to_owned(),
             from_commit_id: None,
         })

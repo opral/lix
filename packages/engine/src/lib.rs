@@ -96,4 +96,5 @@ pub use storage::{
     StoredValue, WriteOptions, WriteStats,
 };
 
-pub(crate) const GLOBAL_BRANCH_ID: &str = "global";
+/// Reserved high UUID sentinel for repository-global state.
+pub const GLOBAL_BRANCH_ID: &str = "ffffffff-ffff-7fff-bfff-ffffffffffff";

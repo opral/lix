@@ -363,7 +363,7 @@ mod tests {
     #[tokio::test]
     async fn compiled_catalog_for_domain_hits_cache_without_decoding() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("global", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
         let reader = RowsLiveStateReader::new(vec![
             registered_schema_row("alpha_schema"),
             registered_schema_row("beta_schema"),
@@ -401,7 +401,7 @@ mod tests {
     #[tokio::test]
     async fn transaction_opening_revision_skips_catalog_row_scans_until_it_changes() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("global", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
         let revision = CatalogRevision::for_test(b"revision-one");
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
@@ -442,8 +442,8 @@ mod tests {
     #[tokio::test]
     async fn transaction_opening_revision_caches_tracked_and_sql_catalogs_separately() {
         let context = CatalogContext::new();
-        let sql_domain = Domain::schema_catalog("global", true);
-        let tracked_domain = Domain::schema_catalog("global", false);
+        let sql_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
+        let tracked_domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false);
         let revision = CatalogRevision::for_test(b"revision-one");
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
@@ -479,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn missing_transaction_opening_revision_conservatively_rescans() {
         let context = CatalogContext::new();
-        let domain = Domain::schema_catalog("global", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
         let reader = RowsLiveStateReader::new(vec![registered_schema_row("alpha_schema")]);
 
         context
@@ -547,7 +547,7 @@ mod tests {
                     registered_schema_row("lix_registered_schema"),
                     registered_schema_row("lix_key_value"),
                 ]),
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )
             .await
             .expect("schema visibility should load");
@@ -569,10 +569,10 @@ mod tests {
             registered_schema_row("alpha_untracked_schema"),
             tracked,
         ]);
-        let domain = Domain::schema_catalog("global", true);
+        let domain = Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true);
 
         let durable_projection = context
-            .schema_jsons_for_sql_read_planning(&reader, "global")
+            .schema_jsons_for_sql_read_planning(&reader, "ffffffff-ffff-7fff-bfff-ffffffffffff")
             .await
             .expect("SQL schema visibility should load");
         let compiled_projection = context
@@ -591,7 +591,7 @@ mod tests {
         let schemas = context
             .schema_jsons_for_sql_read_planning(
                 &RowsLiveStateReader::new(vec![registered_schema_row("engine_dynamic_schema")]),
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )
             .await
             .expect("schema visibility should load");
@@ -610,7 +610,7 @@ mod tests {
                     registered_schema_row("engine_dynamic_schema"),
                     registered_schema_row("engine_dynamic_schema"),
                 ]),
-                "global",
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
             )
             .await
             .expect_err("SQL surfaces must not choose a schema identity implicitly");
@@ -631,7 +631,7 @@ mod tests {
                     seed_schema,
                     registered_schema_row("engine_dynamic_schema"),
                 ]),
-                &Domain::schema_catalog("global", false),
+                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
             )
             .await
             .expect("schema visibility should load");
@@ -655,7 +655,7 @@ mod tests {
         let facts = context
             .schema_facts_for_domain(
                 &RowsLiveStateReader::new(vec![registered_schema_row("lix_key_value")]),
-                &Domain::schema_catalog("global", false),
+                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", false),
             )
             .await
             .expect("schema visibility should load");
@@ -692,7 +692,7 @@ mod tests {
         let context = CatalogContext::new();
         let valid_schema = registered_schema_row("valid_schema");
         let mut file_scoped_schema = registered_schema_row("file_scoped_schema");
-        file_scoped_schema.file_id = Some("file-a".to_string());
+        file_scoped_schema.file_id = Some("01920000-0000-7000-8000-0000000000a2".to_string());
         let mut tombstoned_schema = registered_schema_row("tombstoned_schema");
         tombstoned_schema.snapshot_content = None;
 
@@ -703,7 +703,7 @@ mod tests {
                     file_scoped_schema,
                     tombstoned_schema,
                 ]),
-                &Domain::schema_catalog("global", true),
+                &Domain::schema_catalog("ffffffff-ffff-7fff-bfff-ffffffffffff", true),
             )
             .await
             .expect("schema facts should load");
@@ -720,7 +720,10 @@ mod tests {
         let context = CatalogContext::new();
 
         let schemas = context
-            .schema_jsons_for_sql_read_planning(&RowsLiveStateReader::new(Vec::new()), "global")
+            .schema_jsons_for_sql_read_planning(
+                &RowsLiveStateReader::new(Vec::new()),
+                "ffffffff-ffff-7fff-bfff-ffffffffffff",
+            )
             .await
             .expect("schema visibility should load");
 

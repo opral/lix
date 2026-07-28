@@ -20,7 +20,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-dir-docs', '/docs/')",
+                 VALUES ('68697374-6f72-892d-8469-722d646f6300', '/docs/')",
                 &[],
             )
             .await
@@ -34,7 +34,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-dir-guides', '/docs/guides/')",
+                 VALUES ('68697374-6f72-892d-8469-722d67756900', '/docs/guides/')",
                 &[],
             )
             .await
@@ -53,7 +53,7 @@ simulation_test!(
                     "SELECT id, path, parent_id, name, lixcol_as_of_commit_id, lixcol_depth \
                      FROM lix_directory_history \
                      WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id IN ('history-dir-docs', 'history-dir-guides') \
+                       AND id IN ('68697374-6f72-892d-8469-722d646f6300', '68697374-6f72-892d-8469-722d67756900') \
                      ORDER BY lixcol_depth, id"
                 ),
                 &[],
@@ -65,15 +65,15 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("history-dir-guides".to_string()),
+                    Value::Text("68697374-6f72-892d-8469-722d67756900".to_string()),
                     Value::Text("/docs/guides/".to_string()),
-                    Value::Text("history-dir-docs".to_string()),
+                    Value::Text("68697374-6f72-892d-8469-722d646f6300".to_string()),
                     Value::Text("guides".to_string()),
                     Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Text("history-dir-docs".to_string()),
+                    Value::Text("68697374-6f72-892d-8469-722d646f6300".to_string()),
                     Value::Text("/docs/".to_string()),
                     Value::Null,
                     Value::Text("docs".to_string()),
@@ -89,7 +89,7 @@ simulation_test!(
                     "SELECT lixcol_source_changes \
                      FROM lix_directory_history \
                      WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id = 'history-dir-guides' \
+                       AND id = '68697374-6f72-892d-8469-722d67756900' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -109,7 +109,7 @@ simulation_test!(
         );
         assert_eq!(
             source_changes[0]["snapshot_content"]["parent_id"],
-            json!("history-dir-docs")
+            json!("68697374-6f72-892d-8469-722d646f6300")
         );
         assert_eq!(
             source_changes[0]["snapshot_content"]["name"],
@@ -151,7 +151,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-default-dir', '/history-default/')",
+                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default/')",
                 &[],
             )
             .await
@@ -166,7 +166,7 @@ simulation_test!(
             .execute(
                 "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
                  FROM lix_directory_history \
-                 WHERE id = 'history-default-dir'",
+                 WHERE id = '68697374-6f72-892d-8465-6661756c7401'",
                 &[],
             )
             .await
@@ -175,7 +175,7 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("history-default-dir".to_string()),
+                Value::Text("68697374-6f72-892d-8465-6661756c7401".to_string()),
                 Value::Text(active_head),
                 Value::Integer(0),
             ]],
@@ -195,13 +195,13 @@ simulation_test!(
             &engine,
         );
         main.execute(
-            "INSERT INTO lix_directory (id, path) VALUES ('diamond-dir', '/before/')",
+            "INSERT INTO lix_directory (id, path) VALUES ('6469616d-6f6e-842d-8469-720000000000', '/before/')",
             &[],
         )
         .await
         .expect("base directory should insert");
         main.create_branch(CreateBranchOptions {
-            id: Some("diamond-dir-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000009".to_string()),
             name: "Diamond directory draft".to_string(),
             from_commit_id: None,
         })
@@ -209,14 +209,14 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("diamond-dir-draft")
+                .open_session("01930000-0000-7000-8000-000000000009")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
 
         main.execute(
-            "UPDATE lix_directory SET name = 'same' WHERE id = 'diamond-dir'",
+            "UPDATE lix_directory SET name = 'same' WHERE id = '6469616d-6f6e-842d-8469-720000000000'",
             &[],
         )
         .await
@@ -228,19 +228,19 @@ simulation_test!(
             .expect("main sibling should exist");
         draft
             .execute(
-                "UPDATE lix_directory SET name = 'same' WHERE id = 'diamond-dir'",
+                "UPDATE lix_directory SET name = 'same' WHERE id = '6469616d-6f6e-842d-8469-720000000000'",
                 &[],
             )
             .await
             .expect("draft rename should succeed");
         let draft_sibling = engine
-            .load_branch_head_commit_id("diamond-dir-draft")
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000009")
             .await
             .expect("draft sibling should load")
             .expect("draft sibling should exist");
         let receipt = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "diamond-dir-draft".to_string(),
+                source_branch_id: "01930000-0000-7000-8000-000000000009".to_string(),
             })
             .await
             .expect("convergent sibling renames should merge");
@@ -254,7 +254,7 @@ simulation_test!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth \
                      FROM lix_directory_history \
                      WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
-                       AND id = 'diamond-dir' \
+                       AND id = '6469616d-6f6e-842d-8469-720000000000' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
                 ),
@@ -308,7 +308,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-delete-docs', '/docs/')",
+                 VALUES ('01940000-0000-7000-8000-000000000001', '/docs/')",
                 &[],
             )
             .await
@@ -316,7 +316,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-delete-guides', '/docs/guides/')",
+                 VALUES ('01940000-0000-7000-8000-000000000002', '/docs/guides/')",
                 &[],
             )
             .await
@@ -324,7 +324,7 @@ simulation_test!(
 
         session
             .execute(
-                "DELETE FROM lix_directory WHERE id = 'history-delete-docs'",
+                "DELETE FROM lix_directory WHERE id = '01940000-0000-7000-8000-000000000001'",
                 &[],
             )
             .await
@@ -341,7 +341,7 @@ simulation_test!(
 					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_as_of_commit_id, lixcol_depth \
 	                 FROM lix_directory_history \
 	                 WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
-	                   AND lixcol_entity_pk IN (lix_json('[\"history-delete-docs\"]'), lix_json('[\"history-delete-guides\"]')) \
+	                   AND lixcol_entity_pk IN (lix_json('[\"01940000-0000-7000-8000-000000000001\"]'), lix_json('[\"01940000-0000-7000-8000-000000000002\"]')) \
 	                   AND lixcol_depth = 0 \
 	                 ORDER BY lixcol_entity_pk"
 				),
@@ -351,11 +351,10 @@ simulation_test!(
             .expect("directory delete history read should succeed");
 
         assert_eq!(result.len(), 2);
-        for (row, expected_id) in result
-            .rows()
-            .iter()
-            .zip(["history-delete-docs", "history-delete-guides"])
-        {
+        for (row, expected_id) in result.rows().iter().zip([
+            "01940000-0000-7000-8000-000000000001",
+            "01940000-0000-7000-8000-000000000002",
+        ]) {
             assert_eq!(
                 &row.values()[..4],
                 &[
@@ -371,10 +370,13 @@ simulation_test!(
             let source_changes = source_changes
                 .as_array()
                 .expect("delete source changes should be an array");
-            let expected_source_ids = if expected_id == "history-delete-docs" {
-                BTreeSet::from(["history-delete-docs"])
+            let expected_source_ids = if expected_id == "01940000-0000-7000-8000-000000000001" {
+                BTreeSet::from(["01940000-0000-7000-8000-000000000001"])
             } else {
-                BTreeSet::from(["history-delete-docs", "history-delete-guides"])
+                BTreeSet::from([
+                    "01940000-0000-7000-8000-000000000001",
+                    "01940000-0000-7000-8000-000000000002",
+                ])
             };
             let actual_source_ids = source_changes
                 .iter()

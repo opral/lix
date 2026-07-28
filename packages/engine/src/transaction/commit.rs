@@ -374,7 +374,7 @@ async fn stage_changelog_commits(
     let changes = state_rows
         .iter()
         // Ordinary untracked members are intentionally current-state only in
-        // V15. `lix_branch_ref` is the one control-plane exception: its
+        // V16. `lix_branch_ref` is the one control-plane exception: its
         // published control retains a public ref_change_id, so that immutable
         // ledger fact must remain available to `lix_change` and GC even
         // though it is not a commit member.
@@ -578,7 +578,12 @@ fn branch_ref_change_record(root: &PendingTrackedRoot) -> Result<ChangeRecord, L
         format_version: 2,
         change_id: root.ref_change_id,
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
-        entity_pk: EntityPk::single(&root.branch_id),
+        entity_pk: EntityPk::uuid_from_canonical(&root.branch_id).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("committed branch ID is not a canonical UUID: {error}"),
+            )
+        })?,
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot),
         metadata: crate::json_store::JsonSlot::None,
@@ -1023,7 +1028,9 @@ fn validate_lifecycle_derived_materialization_paths(
                             "branch '{branch_id}' commit '{commit_id}' has an invalid directory descriptor: {error}"
                         ))
                     })?;
-                if row.entity_pk.as_single_string().ok() != Some(descriptor.id.as_str()) {
+                if row.entity_pk.as_single_string_owned().ok().as_deref()
+                    != Some(descriptor.id.as_str())
+                {
                     return Err(lifecycle_derived_materialization_error(format!(
                         "branch '{branch_id}' commit '{commit_id}' has a directory descriptor whose id does not match its primary key"
                     )));
@@ -1045,7 +1052,9 @@ fn validate_lifecycle_derived_materialization_paths(
                         ))
                     },
                 )?;
-                if row.entity_pk.as_single_string().ok() != Some(descriptor.id.as_str()) {
+                if row.entity_pk.as_single_string_owned().ok().as_deref()
+                    != Some(descriptor.id.as_str())
+                {
                     return Err(lifecycle_derived_materialization_error(format!(
                         "branch '{branch_id}' commit '{commit_id}' has a file descriptor whose id does not match its primary key"
                     )));
@@ -1064,7 +1073,7 @@ fn validate_lifecycle_derived_materialization_paths(
                         ))
                     },
                 )?;
-                if row.entity_pk.as_single_string().ok() != Some(proof.id.as_str())
+                if row.entity_pk.as_single_string_owned().ok().as_deref() != Some(proof.id.as_str())
                     || row.file_id.as_deref() != Some(proof.id.as_str())
                 {
                     return Err(lifecycle_derived_materialization_error(format!(
@@ -1282,7 +1291,7 @@ fn apply_lifecycle_tracked_snapshot_row(
         && next.file_id.is_none()
         && next.snapshot_content.is_none()
     {
-        let file_id = next.entity_pk.as_single_string().map_err(|error| {
+        let file_id = next.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("file descriptor tombstone has invalid identity: {error}"),
@@ -1290,7 +1299,9 @@ fn apply_lifecycle_tracked_snapshot_row(
         })?;
         let cascade_keys = rows
             .iter()
-            .filter(|(key, value)| key.file_id.as_deref() == Some(file_id) && !value.deleted)
+            .filter(|(key, value)| {
+                key.file_id.as_deref() == Some(file_id.as_str()) && !value.deleted
+            })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in cascade_keys {
@@ -2522,13 +2533,13 @@ async fn stage_tracked_roots(
                 })
                 .map(|row| {
                     let delta = tracked_delta_from_state_row(row)?;
-                    let file_id = row.entity_pk.as_single_string().map_err(|error| {
+                    let file_id = row.entity_pk.as_single_string_owned().map_err(|error| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!("file descriptor tombstone has invalid identity: {error}"),
                         )
                     })?;
-                    Ok((file_id.to_string(), delta))
+                    Ok((file_id, delta))
                 })
                 .collect::<Result<BTreeMap<_, _>, LixError>>()?;
             let first_row = &state_rows[state_row_indices[0]];
@@ -3253,7 +3264,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        let branch_id = "branch-ref-unknown-target";
+        let branch_id = "01960000-0000-7000-8000-000000000001";
         crate::test_support::seed_branch_head(storage.clone(), branch_id, "branch-ref-known-head")
             .await;
 
@@ -3284,7 +3295,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        let branch_id = "branch-ref-pending-untracked";
+        let branch_id = "01960000-0000-7000-8000-000000000002";
         crate::test_support::seed_branch_head(storage.clone(), branch_id, "branch-ref-head").await;
 
         let mut branch_ref_delete = untracked_global_row("delete-branch-ref");
@@ -3327,7 +3338,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        let branch_id = "branch-ref-persisted-untracked";
+        let branch_id = "01960000-0000-7000-8000-000000000003";
         crate::test_support::seed_branch_head(storage.clone(), branch_id, "branch-ref-head").await;
 
         let mut persisted_untracked = tracked_branch_row(branch_id, "persisted-untracked-row");
@@ -3521,7 +3532,7 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
-        let branch_id = "branch-ref-race";
+        let branch_id = "01960000-0000-7000-8000-000000000004";
         crate::test_support::seed_branch_head(
             storage.clone(),
             branch_id,
@@ -4316,7 +4327,8 @@ mod tests {
         let binary_cas = BinaryCasContext::new();
         let branch_ctx = BranchContext::new();
 
-        let mut first = tracked_branch_row("branch-a", "first-local-change");
+        let mut first =
+            tracked_branch_row("01920000-0000-7000-8000-0000000000a1", "first-local-change");
         first.commit_id = Some(commit_id("first-local-commit"));
         let mut first_read = storage
             .begin_read(StorageReadOptions::default())
@@ -4331,7 +4343,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![first],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["first-local-change"],
                         "first-local-commit",
@@ -4360,7 +4372,10 @@ mod tests {
                 .expect("second counted read should open"),
             counts: Arc::clone(&counts),
         });
-        let mut second = tracked_branch_row("branch-a", "second-local-change");
+        let mut second = tracked_branch_row(
+            "01920000-0000-7000-8000-0000000000a1",
+            "second-local-change",
+        );
         second.commit_id = Some(commit_id("second-local-commit"));
         let (_writes, _) = commit_prepared_writes(
             &binary_cas,
@@ -4371,7 +4386,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![second],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["second-local-change"],
                         "second-local-commit",
@@ -4407,7 +4422,8 @@ mod tests {
         let branch_ctx = BranchContext::new();
         let first_commit = commit_id("epoch-first-commit");
 
-        let mut first = tracked_branch_row("branch-a", "epoch-first-change");
+        let mut first =
+            tracked_branch_row("01920000-0000-7000-8000-0000000000a1", "epoch-first-change");
         first.commit_id = Some(first_commit);
         let mut first_read = storage
             .begin_read(StorageReadOptions::default())
@@ -4422,7 +4438,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![first],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["epoch-first-change"],
                         "epoch-first-commit",
@@ -4450,7 +4466,7 @@ mod tests {
         let mut stale_epoch_writes = StorageWriteSet::new();
         stage_tracked_working_diff_epoch(
             &mut stale_epoch_writes,
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: commit_id("wrong-checkpoint"),
                 generation: first_commit,
@@ -4464,7 +4480,10 @@ mod tests {
             .expect("persist stale epoch");
 
         let second_commit = commit_id("epoch-second-commit");
-        let mut second = tracked_branch_row("branch-a", "epoch-second-change");
+        let mut second = tracked_branch_row(
+            "01920000-0000-7000-8000-0000000000a1",
+            "epoch-second-change",
+        );
         second.commit_id = Some(second_commit);
         let mut second_read = storage
             .begin_read(StorageReadOptions::default())
@@ -4479,7 +4498,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![second],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["epoch-second-change"],
                         "epoch-second-commit",
@@ -4506,7 +4525,7 @@ mod tests {
             .expect("open direct-diff verification read");
         let control = BranchHeadControlContext::new()
             .reader(&read)
-            .load("branch-a")
+            .load("01920000-0000-7000-8000-0000000000a1")
             .await
             .expect("load branch control")
             .expect("branch control must exist");
@@ -4515,7 +4534,7 @@ mod tests {
             TrackedHeadContext::new()
                 .reader(read)
                 .working_diff_for_control(
-                    "branch-a",
+                    "01920000-0000-7000-8000-0000000000a1",
                     control,
                     &crate::tracked_state::TrackedStateDiffRequest::default(),
                 )
@@ -4572,7 +4591,10 @@ mod tests {
             .await
             .expect("global tracked commit should persist");
 
-        let mut branch_override = tracked_branch_row("branch-a", "branch-override-change");
+        let mut branch_override = tracked_branch_row(
+            "01920000-0000-7000-8000-0000000000a1",
+            "branch-override-change",
+        );
         branch_override.commit_id = Some(commit_id("branch-head"));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
@@ -4587,7 +4609,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![branch_override],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["branch-override-change"],
                         "branch-head",
@@ -4614,7 +4636,10 @@ mod tests {
             .expect("control read should open");
         let controls = BranchHeadControlContext::new()
             .reader(&control_read)
-            .load_many(&[GLOBAL_BRANCH_ID.to_string(), "branch-a".to_string()])
+            .load_many(&[
+                GLOBAL_BRANCH_ID.to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+            ])
             .await
             .expect("branch controls should load");
         let global_control = controls[0].expect("global control must exist");
@@ -4635,7 +4660,7 @@ mod tests {
             }))
             .scan_rows(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
-                    branch_ids: vec!["branch-a".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
                     untracked: Some(false),
                     ..Default::default()
@@ -4657,7 +4682,10 @@ mod tests {
             branch_row.change_id,
             Some(change_id("branch-override-change"))
         );
-        assert_eq!(branch_row.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            branch_row.branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(!branch_row.global);
         let fallback_row = scanned
             .iter()
@@ -4667,10 +4695,16 @@ mod tests {
             fallback_row.change_id,
             Some(change_id("global-fallback-change"))
         );
-        assert_eq!(fallback_row.branch_id.as_ref(), "branch-a");
+        assert_eq!(
+            fallback_row.branch_id.as_ref(),
+            "01920000-0000-7000-8000-0000000000a1"
+        );
         assert!(fallback_row.global);
 
-        let mut branch_tombstone = tracked_branch_row("branch-a", "branch-tombstone-change");
+        let mut branch_tombstone = tracked_branch_row(
+            "01920000-0000-7000-8000-0000000000a1",
+            "branch-tombstone-change",
+        );
         branch_tombstone.entity_pk = EntityPk::single("entity-2");
         branch_tombstone.snapshot = None;
         branch_tombstone.commit_id = Some(commit_id("branch-tombstone-head"));
@@ -4687,7 +4721,7 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows: vec![branch_tombstone],
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
                     change_refs_with(
                         ["branch-tombstone-change"],
                         "branch-tombstone-head",
@@ -4718,7 +4752,7 @@ mod tests {
             }))
             .scan_rows(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
-                    branch_ids: vec!["branch-a".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
                     untracked: Some(false),
                     ..Default::default()
@@ -5199,13 +5233,21 @@ mod tests {
         let branch_ctx = BranchContext::new();
         crate::test_support::seed_branch_head(storage.clone(), GLOBAL_BRANCH_ID, "global-before")
             .await;
-        crate::test_support::seed_branch_head(storage.clone(), "branch-a", "branch-a-before").await;
+        crate::test_support::seed_branch_head(
+            storage.clone(),
+            "01920000-0000-7000-8000-0000000000a1",
+            "01920000-0000-7000-8000-0000000000a1-before",
+        )
+        .await;
 
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
             .expect("read should open");
-        let state_rows = vec![tracked_branch_row("branch-a", "change-branch-a")];
+        let state_rows = vec![tracked_branch_row(
+            "01920000-0000-7000-8000-0000000000a1",
+            "change-01920000-0000-7000-8000-0000000000a1",
+        )];
         let (writes, _) = commit_prepared_writes(
             &binary_cas,
             &branch_ctx,
@@ -5215,8 +5257,8 @@ mod tests {
                 insert_identities: BTreeMap::new(),
                 state_rows,
                 commit_change_refs_by_branch: BTreeMap::from([(
-                    "branch-a".to_string(),
-                    change_refs(["change-branch-a"]),
+                    "01920000-0000-7000-8000-0000000000a1".to_string(),
+                    change_refs(["change-01920000-0000-7000-8000-0000000000a1"]),
                 )]),
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
@@ -5252,7 +5294,9 @@ mod tests {
         assert_eq!(commit.change_id, change_id("test-uuid-2"));
         assert_eq!(
             commit.parent_commit_ids,
-            vec![CommitId::for_test_label("branch-a-before")]
+            vec![CommitId::for_test_label(
+                "01920000-0000-7000-8000-0000000000a1-before"
+            )]
         );
 
         let global_head = branch_ctx
@@ -5272,7 +5316,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .load_head_commit_id("branch-a")
+            .load_head_commit_id("01920000-0000-7000-8000-0000000000a1")
             .await
             .expect("branch head should load");
         let expected_global_head = commit_id("global-before");
@@ -5335,11 +5379,14 @@ mod tests {
     #[tokio::test]
     async fn finalize_commit_rows_uses_existing_branch_ref_as_parent() {
         let rows = finalize_commit_rows(
-            BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::from([(
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                change_refs(["change-a"]),
+            )]),
             BTreeMap::new(),
             BTreeMap::new(),
             &BTreeMap::from([(
-                "branch-a".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("previous-commit")),
             )]),
         )
@@ -5350,20 +5397,26 @@ mod tests {
             rows.commit_rows[0].parent_commit_ids,
             vec![CommitId::for_test_label("previous-commit")]
         );
-        assert_eq!(rows.tracked_roots[0].branch_id, "branch-a");
+        assert_eq!(
+            rows.tracked_roots[0].branch_id,
+            "01920000-0000-7000-8000-0000000000a1"
+        );
     }
 
     #[tokio::test]
     async fn finalize_commit_rows_appends_extra_merge_parent_after_target_head() {
         let rows = finalize_commit_rows(
-            BTreeMap::from([("branch-a".to_string(), change_refs(["change-a"]))]),
+            BTreeMap::from([(
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                change_refs(["change-a"]),
+            )]),
             BTreeMap::new(),
             BTreeMap::from([(
-                "branch-a".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
                 vec![CommitId::for_test_label("source-head")],
             )]),
             &BTreeMap::from([(
-                "branch-a".to_string(),
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("target-head")),
             )]),
         )

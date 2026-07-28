@@ -1861,7 +1861,12 @@ fn normalize_status(value: char) -> char {
 }
 
 fn stable_file_id(path: &GitPath) -> String {
-    path.lix_path()
+    let lix_path = path.lix_path();
+    uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("https://lix.dev/git-replay/file/v1{lix_path}").as_bytes(),
+    )
+    .to_string()
 }
 
 fn encode_git_path_bytes(path: &[u8]) -> String {
@@ -2246,14 +2251,11 @@ mod tests {
 
     #[test]
     fn prepare_commit_changes_typechange_blob_to_gitlink_preserves_file_identity() {
+        let path = git_path(b"artifact/spa-prerender-repro");
+        let file_id = stable_file_id(&path);
         let mut state = ReplayState::default();
-        state.path_to_file_id.insert(
-            git_path(b"artifact/spa-prerender-repro"),
-            "/artifact/spa-prerender-repro".to_string(),
-        );
-        state
-            .known_file_ids
-            .insert("/artifact/spa-prerender-repro".to_string());
+        state.path_to_file_id.insert(path, file_id.clone());
+        state.known_file_ids.insert(file_id);
 
         let changes = vec![Change {
             status: 'T',
@@ -2283,11 +2285,13 @@ mod tests {
     fn prepare_commit_changes_rename_rebinds_path_bound_semantic_proof() {
         let old_path = git_path(b"src/old.ts");
         let new_path = git_path(b"src/new.ts");
+        let old_file_id = stable_file_id(&old_path);
+        let new_file_id = stable_file_id(&new_path);
         let mut state = ReplayState::default();
         state
             .path_to_file_id
-            .insert(old_path.clone(), "/src/old.ts".to_string());
-        state.known_file_ids.insert("/src/old.ts".to_string());
+            .insert(old_path.clone(), old_file_id.clone());
+        state.known_file_ids.insert(old_file_id.clone());
         let oid = "a".repeat(40);
         let changes = vec![Change {
             status: 'R',
@@ -2302,14 +2306,14 @@ mod tests {
         let prepared =
             prepare_commit_changes(&mut state, &changes, &blobs).expect("rename should prepare");
 
-        assert_eq!(prepared.deletes, vec!["/src/old.ts"]);
+        assert_eq!(prepared.deletes, vec![old_file_id]);
         assert_eq!(prepared.inserts.len(), 1);
         assert!(prepared.updates.is_empty());
-        assert_eq!(prepared.inserts[0].id, "/src/new.ts");
+        assert_eq!(prepared.inserts[0].id, new_file_id);
         assert_eq!(prepared.inserts[0].path, "/src/new.ts");
         assert_eq!(
             state.path_to_file_id.get(&new_path),
-            Some(&"/src/new.ts".to_string())
+            Some(&stable_file_id(&new_path))
         );
     }
 
@@ -2735,7 +2739,7 @@ mod tests {
             .expect("replay Lix should reopen with installed plugin");
         let text_rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
-            &[Value::Text("/docs/renamed.txt".to_string())],
+            &[Value::Text(stable_file_id(&git_path(b"docs/renamed.txt")))],
         ))
         .expect("Git text rows should be queryable after replay");
         assert!(
@@ -2744,7 +2748,7 @@ mod tests {
         );
         let binary_rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
-            &[Value::Text("/binary.bin".to_string())],
+            &[Value::Text(stable_file_id(&git_path(b"binary.bin")))],
         ))
         .expect("Git text rows should query for binary fixture");
         assert!(
@@ -2910,7 +2914,9 @@ mod tests {
 
             let semantic_rows = db::block_on(lix.execute(
                 "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
-                &[Value::Text(path.clone())],
+                &[Value::Text(stable_file_id(&git_path(
+                    path.trim_start_matches('/').as_bytes(),
+                )))],
             ))
             .expect("reopened Git-text rows should query");
             assert!(
@@ -3001,7 +3007,7 @@ mod tests {
 
         let semantic_rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
-            &[Value::Text("/src/index.ts".to_string())],
+            &[Value::Text(stable_file_id(&git_path(b"src/index.ts")))],
         ))
         .expect("replayed Git-text rows should query");
         assert_eq!(semantic_rows.rows().len(), 2);

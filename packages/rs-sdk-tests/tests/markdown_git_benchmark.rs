@@ -687,7 +687,7 @@ async fn semantic_table_merge_quality(archive: &[u8]) {
     let main_branch_id = lix.active_branch_id().await.expect("resolve main branch");
     let source = lix
         .create_branch(CreateBranchOptions {
-            id: Some("markdown-table-source".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000504".to_string()),
             name: "Markdown table source".to_string(),
             from_commit_id: None,
         })

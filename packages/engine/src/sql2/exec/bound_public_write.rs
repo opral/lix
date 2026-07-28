@@ -1809,13 +1809,15 @@ impl BoundPrimaryKeyConstraint {
                 Self::Full(
                     ids.into_iter()
                         .filter(|identity| {
-                            identity.parts.len() == primary_key_columns.len()
+                            identity.components.len() == primary_key_columns.len()
                                 && primary_key_columns
                                     .iter()
                                     .enumerate()
                                     .all(|(index, column)| {
                                         parts.get(*column).is_none_or(|values| {
-                                            values.contains(&identity.parts[index])
+                                            values.contains(
+                                                &identity.components[index].external_string(),
+                                            )
                                         })
                                     })
                         })

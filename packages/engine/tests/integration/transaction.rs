@@ -11,7 +11,7 @@ use lix_engine::storage::{
 use lix_engine::{CreateBranchOptions, Engine};
 
 const TEST_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-const UNTRACKED_RACE_BRANCH_ID: &str = "untracked-race";
+const UNTRACKED_RACE_BRANCH_ID: &str = "01930000-0000-7000-8000-000000000018";
 
 async fn setup_untracked_race_branch<StorageImpl>(engine: &Engine<StorageImpl>)
 where
@@ -125,7 +125,7 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .expect("setup workspace session should open");
     setup_session
         .create_branch(CreateBranchOptions {
-            id: Some("deferred-branch".to_string()),
+            id: Some("01930000-0000-7000-8000-000000000017".to_string()),
             name: "Deferred branch".to_string(),
             from_commit_id: None,
         })
@@ -141,7 +141,7 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("delete engine should open");
     let branch_session = branch_engine
-        .open_session("deferred-branch")
+        .open_session("01930000-0000-7000-8000-000000000017")
         .await
         .expect("local branch session should open");
     let delete_session = delete_engine
@@ -154,13 +154,16 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
         .await
         .expect("local transaction should begin");
     delete_session
-        .execute("DELETE FROM lix_branch WHERE id = 'deferred-branch'", &[])
+        .execute(
+            "DELETE FROM lix_branch WHERE id = '01930000-0000-7000-8000-000000000017'",
+            &[],
+        )
         .await
         .expect("branch delete should commit");
 
     transaction
         .execute(
-            "INSERT INTO lix_key_value (key, value) VALUES ('deferred-branch-key', 'value')",
+            "INSERT INTO lix_key_value (key, value) VALUES ('64656665-7272-8564-8d62-72616e636801', 'value')",
             &[],
         )
         .await
@@ -172,7 +175,7 @@ async fn deferred_active_branch_check_rejects_deleted_branch_at_commit() {
     assert_eq!(error.code, "LIX_BRANCH_NOT_FOUND");
     assert_eq!(
         delete_engine
-            .load_branch_head_commit_id("deferred-branch")
+            .load_branch_head_commit_id("01930000-0000-7000-8000-000000000017")
             .await
             .expect("branch head lookup should succeed"),
         None,
@@ -297,7 +300,7 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = 'missing-branch' \
+            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
              WHERE key = 'lix_workspace_branch_id'",
             &[],
         )
@@ -310,7 +313,9 @@ async fn read_sql_does_not_open_write_when_pre_plan_setup_fails() {
         .await
         .expect_err("missing active branch should fail read pre-plan");
     assert!(
-        error.message.contains("missing-branch"),
+        error
+            .message
+            .contains("6d697373-696e-872d-8272-616e63680000"),
         "unexpected error: {error:?}"
     );
 
@@ -338,7 +343,7 @@ async fn write_setup_failure_does_not_open_storage_write() {
 
     session
         .execute(
-            "UPDATE lix_key_value SET value = 'missing-branch' \
+            "UPDATE lix_key_value SET value = '6d697373-696e-872d-8272-616e63680000' \
              WHERE key = 'lix_workspace_branch_id'",
             &[],
         )

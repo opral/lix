@@ -916,7 +916,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name, hidden) \
-                 VALUES ('excluded-default-branch', 'before', true)",
+                 VALUES ('6578636c-7564-8564-8d64-656661756c00', 'before', true)",
                 &[],
             )
             .await
@@ -932,7 +932,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_branch (id, name) \
-                 VALUES ('excluded-default-branch', 'after') \
+                 VALUES ('6578636c-7564-8564-8d64-656661756c00', 'after') \
                  ON CONFLICT (id) DO UPDATE \
                  SET name = excluded.name, \
                      hidden = excluded.hidden, \
@@ -945,7 +945,7 @@ simulation_test!(
             session
                 .execute(
                     "SELECT name, hidden, commit_id FROM lix_branch \
-                     WHERE id = 'excluded-default-branch'",
+                     WHERE id = '6578636c-7564-8564-8d64-656661756c00'",
                     &[],
                 )
                 .await
@@ -1071,9 +1071,9 @@ simulation_test!(
 
         for sql in [
             "INSERT INTO lix_branch (id, name, hidden) \
-             VALUES ('null-hidden-branch', 'Null hidden', NULL)",
+             VALUES ('6e756c6c-2d68-8964-8465-6e2d62726100', 'Null hidden', NULL)",
             "INSERT INTO lix_branch (id, name, commit_id) \
-             VALUES ('null-commit-branch', 'Null commit', NULL)",
+             VALUES ('6e756c6c-2d63-8f6d-8d69-742d62726100', 'Null commit', NULL)",
             "INSERT INTO lix_file (path, lixcol_global) \
              VALUES ('/null-global-file.txt', NULL)",
             "INSERT INTO lix_file (path, lixcol_untracked) \

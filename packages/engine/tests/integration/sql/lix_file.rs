@@ -20,14 +20,14 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('guarded-file', '/guarded.txt', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('67756172-6465-842d-8669-6c6500000000', '/guarded.txt', X'6265666F7265')",
                 &[],
             )
             .await
             .expect("guarded file insert should succeed");
         let current = session
             .execute(
-                "SELECT lixcol_change_id FROM lix_file WHERE id = 'guarded-file'",
+                "SELECT lixcol_change_id FROM lix_file WHERE id = '67756172-6465-842d-8669-6c6500000000'",
                 &[],
             )
             .await
@@ -59,7 +59,10 @@ simulation_test!(
         assert_eq!(stale.rows_affected(), 0);
 
         let content = session
-            .execute("SELECT data FROM lix_file WHERE id = 'guarded-file'", &[])
+            .execute(
+                "SELECT data FROM lix_file WHERE id = '67756172-6465-842d-8669-6c6500000000'",
+                &[],
+            )
             .await
             .expect("guarded file read should succeed");
         assert_rows_eq(content, vec![vec![Value::Blob(b"after".to_vec().into())]]);
@@ -80,7 +83,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('readme-file', '/Readme.md')",
+                "INSERT INTO lix_file (id, path) VALUES ('72656164-6d65-8d66-896c-650000000000', '/Readme.md')",
                 &[],
             )
             .await
@@ -94,7 +97,12 @@ simulation_test!(
             .await
             .expect("path should behave as an opaque text column in predicates");
 
-        assert_rows_eq(result, vec![vec![Value::Text("readme-file".to_string())]]);
+        assert_rows_eq(
+            result,
+            vec![vec![Value::Text(
+                "72656164-6d65-8d66-896c-650000000000".to_string(),
+            )]],
+        );
     }
 );
 
@@ -136,21 +144,21 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('guarded-search-file', '/Docs/Guarded-Readme.md', X'6265666F7265')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('67756172-6465-842d-8365-617263682d00', '/Docs/Guarded-Readme.md', X'6265666F7265')",
                 &[],
             )
             .await
             .expect("search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('other-search-file', '/Docs/other.md', X'6F74686572')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('6f746865-722d-8365-8172-63682d666900', '/Docs/other.md', X'6F74686572')",
                 &[],
             )
             .await
             .expect("non-matching search fixture insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path, data) VALUES ('unicode-search-file', '/Ä/Readme.md', X'756E69636F6465')",
+                "INSERT INTO lix_file (id, path, data) VALUES ('756e6963-6f64-852d-8365-617263682d00', '/Ä/Readme.md', X'756E69636F6465')",
                 &[],
             )
             .await
@@ -206,7 +214,7 @@ simulation_test!(
 
         let content = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = 'guarded-search-file'",
+                "SELECT data FROM lix_file WHERE id = '67756172-6465-842d-8365-617263682d00'",
                 &[],
             )
             .await
@@ -267,7 +275,7 @@ simulation_test!(
         let long_segment = "a".repeat(256);
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-long-segment', $1)",
+                "INSERT INTO lix_file (id, path) VALUES ('66696c65-2d6c-8f6e-872d-7365676d6500', $1)",
                 &[Value::Text(format!("/{long_segment}"))],
             )
             .await
@@ -276,7 +284,7 @@ simulation_test!(
         let long_path = format!("/{}", ["abcd"; 820].join("/"));
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-long-path', $1)",
+                "INSERT INTO lix_file (id, path) VALUES ('66696c65-2d6c-8f6e-872d-706174680000', $1)",
                 &[Value::Text(long_path.clone())],
             )
             .await
@@ -285,7 +293,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT id, path FROM lix_file \
-                 WHERE id IN ('file-long-segment', 'file-long-path') \
+                 WHERE id IN ('66696c65-2d6c-8f6e-872d-7365676d6500', '66696c65-2d6c-8f6e-872d-706174680000') \
                  ORDER BY id",
                 &[],
             )
@@ -295,11 +303,11 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("file-long-path".to_string()),
+                    Value::Text("66696c65-2d6c-8f6e-872d-706174680000".to_string()),
                     Value::Text(long_path),
                 ],
                 vec![
-                    Value::Text("file-long-segment".to_string()),
+                    Value::Text("66696c65-2d6c-8f6e-872d-7365676d6500".to_string()),
                     Value::Text(format!("/{long_segment}")),
                 ],
             ],
@@ -337,7 +345,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('safe-file', '/safe.bin', X'6F6B')",
+                 VALUES ('73616665-2d66-896c-8500-000000000000', '/safe.bin', X'6F6B')",
                 &[],
             )
             .await
@@ -347,7 +355,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file \
                  SET path = '/.lix/plugins/plugin_sentinel.lixplugin' \
-                 WHERE id = 'safe-file'",
+                 WHERE id = '73616665-2d66-896c-8500-000000000000'",
                 &[],
             )
             .await
@@ -373,9 +381,12 @@ simulation_test!(
         );
 
         for (id, path) in [
-            ("file-percent-a", "/docs/%61.txt"),
-            ("file-percent-nul", "/docs/%00evil.txt"),
-            ("file-percent-bidi", "/docs/%E2%80%AEevil.txt"),
+            ("66696c65-2d70-8572-8365-6e742d610000", "/docs/%61.txt"),
+            ("66696c65-2d70-8572-8365-6e742d6e7500", "/docs/%00evil.txt"),
+            (
+                "66696c65-2d70-8572-8365-6e742d626900",
+                "/docs/%E2%80%AEevil.txt",
+            ),
         ] {
             session
                 .execute(
@@ -389,7 +400,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT id, path, name FROM lix_file \
-                 WHERE id IN ('file-percent-a', 'file-percent-bidi', 'file-percent-nul') \
+                 WHERE id IN ('66696c65-2d70-8572-8365-6e742d610000', '66696c65-2d70-8572-8365-6e742d626900', '66696c65-2d70-8572-8365-6e742d6e7500') \
                  ORDER BY id",
                 &[],
             )
@@ -399,17 +410,17 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("file-percent-a".to_string()),
+                    Value::Text("66696c65-2d70-8572-8365-6e742d610000".to_string()),
                     Value::Text("/docs/%61.txt".to_string()),
                     Value::Text("%61.txt".to_string()),
                 ],
                 vec![
-                    Value::Text("file-percent-bidi".to_string()),
+                    Value::Text("66696c65-2d70-8572-8365-6e742d626900".to_string()),
                     Value::Text("/docs/%E2%80%AEevil.txt".to_string()),
                     Value::Text("%E2%80%AEevil.txt".to_string()),
                 ],
                 vec![
-                    Value::Text("file-percent-nul".to_string()),
+                    Value::Text("66696c65-2d70-8572-8365-6e742d6e7500".to_string()),
                     Value::Text("/docs/%00evil.txt".to_string()),
                     Value::Text("%00evil.txt".to_string()),
                 ],
@@ -431,12 +442,12 @@ simulation_test!(
         );
 
         for (id, path) in [
-            ("file-foo-dot", "/foo."),
-            ("file-foo-dot-dot", "/foo.."),
-            ("file-foo-dot-dot-dot", "/foo..."),
-            ("file-archive", "/archive.tar.gz"),
-            ("file-dotenv", "/.env"),
-            ("file-hidden-in-docs", "/docs/.hidden"),
+            ("66696c65-2d66-8f6f-8d64-6f7400000000", "/foo."),
+            ("66696c65-2d66-8f6f-8d64-6f742d646f01", "/foo.."),
+            ("66696c65-2d66-8f6f-8d64-6f742d646f02", "/foo..."),
+            ("66696c65-2d61-8263-8869-766500000000", "/archive.tar.gz"),
+            ("66696c65-2d64-8f74-856e-760000000000", "/.env"),
+            ("66696c65-2d68-8964-8465-6e2d696e2d00", "/docs/.hidden"),
         ] {
             session
                 .execute(
@@ -452,12 +463,12 @@ simulation_test!(
                 "SELECT id, path, name \
                  FROM lix_file \
                  WHERE id IN (\
-                   'file-foo-dot',\
-                   'file-foo-dot-dot',\
-                   'file-foo-dot-dot-dot',\
-                   'file-archive',\
-                   'file-dotenv',\
-                   'file-hidden-in-docs'\
+                   '66696c65-2d66-8f6f-8d64-6f7400000000',\
+                   '66696c65-2d66-8f6f-8d64-6f742d646f01',\
+                   '66696c65-2d66-8f6f-8d64-6f742d646f02',\
+                   '66696c65-2d61-8263-8869-766500000000',\
+                   '66696c65-2d64-8f74-856e-760000000000',\
+                   '66696c65-2d68-8964-8465-6e2d696e2d00'\
                  ) \
                  ORDER BY id",
                 &[],
@@ -469,32 +480,32 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("file-archive".to_string()),
+                    Value::Text("66696c65-2d61-8263-8869-766500000000".to_string()),
                     Value::Text("/archive.tar.gz".to_string()),
                     Value::Text("archive.tar.gz".to_string()),
                 ],
                 vec![
-                    Value::Text("file-dotenv".to_string()),
+                    Value::Text("66696c65-2d64-8f74-856e-760000000000".to_string()),
                     Value::Text("/.env".to_string()),
                     Value::Text(".env".to_string()),
                 ],
                 vec![
-                    Value::Text("file-foo-dot".to_string()),
+                    Value::Text("66696c65-2d66-8f6f-8d64-6f7400000000".to_string()),
                     Value::Text("/foo.".to_string()),
                     Value::Text("foo.".to_string()),
                 ],
                 vec![
-                    Value::Text("file-foo-dot-dot".to_string()),
+                    Value::Text("66696c65-2d66-8f6f-8d64-6f742d646f01".to_string()),
                     Value::Text("/foo..".to_string()),
                     Value::Text("foo..".to_string()),
                 ],
                 vec![
-                    Value::Text("file-foo-dot-dot-dot".to_string()),
+                    Value::Text("66696c65-2d66-8f6f-8d64-6f742d646f02".to_string()),
                     Value::Text("/foo...".to_string()),
                     Value::Text("foo...".to_string()),
                 ],
                 vec![
-                    Value::Text("file-hidden-in-docs".to_string()),
+                    Value::Text("66696c65-2d68-8964-8465-6e2d696e2d00".to_string()),
                     Value::Text("/docs/.hidden".to_string()),
                     Value::Text(".hidden".to_string()),
                 ],
@@ -518,7 +529,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, directory_id, name) \
-                 VALUES ('file-slash', NULL, 'nested/name')",
+                 VALUES ('66696c65-2d73-8c61-8368-000000000000', NULL, 'nested/name')",
                 &[],
             )
             .await
@@ -544,7 +555,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, directory_id, name) \
-                 VALUES ('file-descriptor-dot', NULL, 'foo.')",
+                 VALUES ('66696c65-2d64-8573-8372-6970746f7200', NULL, 'foo.')",
                 &[],
             )
             .await
@@ -554,7 +565,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, name \
                  FROM lix_file \
-                 WHERE id = 'file-descriptor-dot'",
+                 WHERE id = '66696c65-2d64-8573-8372-6970746f7200'",
                 &[],
             )
             .await
@@ -563,7 +574,7 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("file-descriptor-dot".to_string()),
+                Value::Text("66696c65-2d64-8573-8372-6970746f7200".to_string()),
                 Value::Text("/foo.".to_string()),
                 Value::Text("foo.".to_string()),
             ]],
@@ -586,7 +597,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, directory_id, name, extension) \
-                 VALUES ('file-extension-write', NULL, 'readme', 'md')",
+                 VALUES ('66696c65-2d65-8874-856e-73696f6e2d00', NULL, 'readme', 'md')",
                 &[],
             )
             .await
@@ -608,14 +619,14 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                "INSERT INTO lix_file (id, path) VALUES ('66696c65-2d66-8f6f-8000-000000000000', '/foo')",
                 &[],
             )
             .await
             .expect("plain file insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-foo-dot', '/foo.')",
+                "INSERT INTO lix_file (id, path) VALUES ('66696c65-2d66-8f6f-8d64-6f7400000000', '/foo.')",
                 &[],
             )
             .await
@@ -625,7 +636,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, name \
                  FROM lix_file \
-                 WHERE id IN ('file-foo', 'file-foo-dot') \
+                 WHERE id IN ('66696c65-2d66-8f6f-8000-000000000000', '66696c65-2d66-8f6f-8d64-6f7400000000') \
                  ORDER BY id",
                 &[],
             )
@@ -636,12 +647,12 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("file-foo".to_string()),
+                    Value::Text("66696c65-2d66-8f6f-8000-000000000000".to_string()),
                     Value::Text("/foo".to_string()),
                     Value::Text("foo".to_string()),
                 ],
                 vec![
-                    Value::Text("file-foo-dot".to_string()),
+                    Value::Text("66696c65-2d66-8f6f-8d64-6f7400000000".to_string()),
                     Value::Text("/foo.".to_string()),
                     Value::Text("foo.".to_string()),
                 ],
@@ -665,7 +676,7 @@ simulation_test!(
         let file_result = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F')",
+             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -676,7 +687,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, data, lixcol_schema_key \
              FROM lix_file \
-             WHERE id = 'file-readme'",
+             WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
             )
             .await
@@ -686,7 +697,7 @@ simulation_test!(
         assert_eq!(
             row_set.rows()[0].values(),
             &[
-                Value::Text("file-readme".to_string()),
+                Value::Text("66696c65-2d72-8561-846d-650000000000".to_string()),
                 Value::Text("/docs/guides/readme.md".to_string()),
                 Value::Blob(b"hello".to_vec().into()),
                 Value::Text("lix_file_descriptor".to_string()),
@@ -697,7 +708,7 @@ simulation_test!(
             .execute(
                 "SELECT schema_key \
              FROM lix_change \
-             WHERE entity_pk = lix_json('[\"file-readme\"]') \
+             WHERE entity_pk = lix_json('[\"66696c65-2d72-8561-846d-650000000000\"]') \
                AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
              ORDER BY schema_key",
                 &[],
@@ -742,7 +753,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_directory (id, parent_id, name) \
-             VALUES ('dir-docs', NULL, 'docs')",
+             VALUES ('6469722d-646f-8373-8000-000000000000', NULL, 'docs')",
             &[],
         )
         .await
@@ -751,7 +762,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     let insert_result = session
         .execute(
             "INSERT INTO lix_file (directory_id, name) \
-             VALUES ('dir-docs', 'readme.md')",
+             VALUES ('6469722d-646f-8373-8000-000000000000', 'readme.md')",
             &[],
         )
         .await
@@ -781,7 +792,7 @@ simulation_test!(lix_file_insert_applies_defaulted_id, |sim| async move {
     };
     assert!(!id.is_empty(), "defaulted file id should be non-empty");
     assert_eq!(path, "/docs/readme.md");
-    assert_eq!(directory_id, "dir-docs");
+    assert_eq!(directory_id, "6469722d-646f-8373-8000-000000000000");
     assert_eq!(name, "readme.md");
 });
 
@@ -923,7 +934,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
     let error = session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('null-data-file', '/null.bin', NULL)",
+             VALUES ('6e756c6c-2d64-8174-812d-66696c650000', '/null.bin', NULL)",
             &[],
         )
         .await
@@ -934,7 +945,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
     let parameter_error = session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('null-param-data-file', '/null-param.bin', $1)",
+             VALUES ('6e756c6c-2d70-8172-816d-2d6461746100', '/null-param.bin', $1)",
             &[Value::Null],
         )
         .await
@@ -945,7 +956,7 @@ simulation_test!(lix_file_insert_rejects_null_data, |sim| async move {
     let result = session
         .execute(
             "SELECT id FROM lix_file \
-             WHERE id IN ('null-data-file', 'null-param-data-file')",
+             WHERE id IN ('6e756c6c-2d64-8174-812d-66696c650000', '6e756c6c-2d70-8172-816d-2d6461746100')",
             &[],
         )
         .await
@@ -967,30 +978,30 @@ simulation_test!(
 
         for (id, sql) in [
             (
-                "text-data-file",
+                "74657874-2d64-8174-812d-66696c650000",
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('text-data-file', '/text.bin', 'hello')",
+                 VALUES ('74657874-2d64-8174-812d-66696c650000', '/text.bin', 'hello')",
             ),
             (
-                "int-data-file",
+                "696e742d-6461-8461-8d66-696c65000000",
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('int-data-file', '/int.bin', 12345)",
+                 VALUES ('696e742d-6461-8461-8d66-696c65000000', '/int.bin', 12345)",
             ),
             (
-                "float-data-file",
+                "666c6f61-742d-8461-8461-2d66696c6500",
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('float-data-file', '/float.bin', 1.5)",
+                 VALUES ('666c6f61-742d-8461-8461-2d66696c6500', '/float.bin', 1.5)",
             ),
             (
-                "bool-data-file",
+                "626f6f6c-2d64-8174-812d-66696c650000",
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('bool-data-file', '/bool.bin', true)",
+                 VALUES ('626f6f6c-2d64-8174-812d-66696c650000', '/bool.bin', true)",
             ),
             (
-                "text-function-data-file",
+                "74657874-2d66-856e-8374-696f6e2d6400",
                 "INSERT INTO lix_file (id, path, data) \
                  VALUES (\
-                   'text-function-data-file',\
+                   '74657874-2d66-856e-8374-696f6e2d6400',\
                    '/text-function.bin',\
                    lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')\
                  )",
@@ -1008,11 +1019,11 @@ simulation_test!(
             .execute(
                 "SELECT id FROM lix_file \
                  WHERE id IN (\
-                   'text-data-file',\
-                   'text-function-data-file',\
-                   'int-data-file',\
-                   'float-data-file',\
-                   'bool-data-file'\
+                   '74657874-2d64-8174-812d-66696c650000',\
+                   '74657874-2d66-856e-8374-696f6e2d6400',\
+                   '696e742d-6461-8461-8d66-696c65000000',\
+                   '666c6f61-742d-8461-8461-2d66696c6500',\
+                   '626f6f6c-2d64-8174-812d-66696c650000'\
                  )",
                 &[],
             )
@@ -1037,7 +1048,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 SELECT 'select-text-data-file', '/select-text.bin', 'hello'",
+                 SELECT '73656c65-6374-8d74-8578-742d64617400', '/select-text.bin', 'hello'",
                 &[],
             )
             .await
@@ -1046,7 +1057,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id FROM lix_file WHERE id = 'select-text-data-file'",
+                "SELECT id FROM lix_file WHERE id = '73656c65-6374-8d74-8578-742d64617400'",
                 &[],
             )
             .await
@@ -1068,8 +1079,14 @@ simulation_test!(
         );
 
         for (id, value) in [
-            ("text-param-data-file", Value::Text("hello".to_string())),
-            ("int-param-data-file", Value::Integer(12345)),
+            (
+                "74657874-2d70-8172-816d-2d6461746100",
+                Value::Text("hello".to_string()),
+            ),
+            (
+                "696e742d-7061-8261-8d2d-646174612d00",
+                Value::Integer(12345),
+            ),
         ] {
             let error = session
                 .execute(
@@ -1101,7 +1118,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('cast-binary-file', $1, CAST($2 AS BYTEA))",
+                 VALUES ('63617374-2d62-896e-8172-792d66696c00', $1, CAST($2 AS BYTEA))",
                 &[
                     Value::Text("/cast-binary.txt".to_string()),
                     Value::Text("inserted".to_string()),
@@ -1113,7 +1130,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_file SET data = CAST($1 AS BYTEA) \
-                 WHERE id = 'cast-binary-file'",
+                 WHERE id = '63617374-2d62-896e-8172-792d66696c00'",
                 &[Value::Text("updated".to_string())],
             )
             .await
@@ -1121,7 +1138,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = 'cast-binary-file'",
+                "SELECT data FROM lix_file WHERE id = '63617374-2d62-896e-8172-792d66696c00'",
                 &[],
             )
             .await
@@ -1146,7 +1163,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
                 &[
-                    Value::Text("anonymous-param-file".to_string()),
+                    Value::Text("616e6f6e-796d-8f75-832d-706172616d00".to_string()),
                     Value::Text("/anonymous-param.bin".to_string()),
                     Value::Blob(b"anonymous".to_vec().into()),
                 ],
@@ -1158,7 +1175,9 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT path, data FROM lix_file WHERE id = ?",
-                &[Value::Text("anonymous-param-file".to_string())],
+                &[Value::Text(
+                    "616e6f6e-796d-8f75-832d-706172616d00".to_string(),
+                )],
             )
             .await
             .expect("anonymous parameter read should succeed");
@@ -1188,7 +1207,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
                 &[
-                    Value::Text("anonymous-text-data-file".to_string()),
+                    Value::Text("616e6f6e-796d-8f75-832d-746578742d00".to_string()),
                     Value::Text("/anonymous-text-data.bin".to_string()),
                     Value::Text("not binary".to_string()),
                 ],
@@ -1212,7 +1231,7 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
     let insert_result = session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('empty-data-file', '/empty.bin', X'')",
+             VALUES ('656d7074-792d-8461-8461-2d66696c6500', '/empty.bin', X'')",
             &[],
         )
         .await
@@ -1221,7 +1240,7 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE id = 'empty-data-file'",
+            "SELECT data FROM lix_file WHERE id = '656d7074-792d-8461-8461-2d66696c6500'",
             &[],
         )
         .await
@@ -1234,7 +1253,7 @@ simulation_test!(lix_file_insert_accepts_empty_blob_data, |sim| async move {
             "SELECT id \
              FROM lix_change \
              WHERE schema_key = 'lix_binary_blob_ref' \
-               AND entity_pk = lix_json('[\"empty-data-file\"]')",
+               AND entity_pk = lix_json('[\"656d7074-792d-8461-8461-2d66696c6500\"]')",
             &[],
         )
         .await
@@ -1289,7 +1308,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('same-file', '/a.bin', X'01')",
+                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01')",
                 &[],
             )
             .await
@@ -1298,7 +1317,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('same-file', '/b.bin', X'02')",
+                 VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
                 &[],
             )
             .await
@@ -1307,7 +1326,9 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
             error.message.contains("table 'lix_file'")
-                && error.message.contains("id 'same-file'")
+                && error
+                    .message
+                    .contains("id '73616d65-2d66-896c-8500-000000000000'")
                 && !error.message.contains("lix_binary_blob_ref"),
             "unexpected error: {error:?}"
         );
@@ -1328,7 +1349,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('same-file', '/a.bin')",
+                "INSERT INTO lix_file (id, path) VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin')",
                 &[],
             )
             .await
@@ -1336,7 +1357,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('same-file', '/b.bin')",
+                "INSERT INTO lix_file (id, path) VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin')",
                 &[],
             )
             .await
@@ -1345,7 +1366,9 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
             error.message.contains("table 'lix_file'")
-                && error.message.contains("id 'same-file'")
+                && error
+                    .message
+                    .contains("id '73616d65-2d66-896c-8500-000000000000'")
                 && !error.message.contains("lix_file_descriptor"),
             "unexpected error: {error:?}"
         );
@@ -1367,8 +1390,8 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-                 ('same-file', '/a.bin', X'01'), \
-                 ('same-file', '/b.bin', X'02')",
+                 ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01'), \
+                 ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02')",
                 &[],
             )
             .await
@@ -1377,7 +1400,9 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
             error.message.contains("table 'lix_file'")
-                && error.message.contains("id 'same-file'")
+                && error
+                    .message
+                    .contains("id '73616d65-2d66-896c-8500-000000000000'")
                 && !error.message.contains("lix_binary_blob_ref"),
             "unexpected error: {error:?}"
         );
@@ -1402,7 +1427,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, data, lixcol_branch_id) \
-                     VALUES ('same-file', '/a.bin', X'01', '{branch_id}')"
+                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/a.bin', X'01', '{branch_id}')"
                 ),
                 &[],
             )
@@ -1414,7 +1439,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, data, lixcol_branch_id) \
-                     VALUES ('same-file', '/b.bin', X'02', '{branch_id}')"
+                     VALUES ('73616d65-2d66-896c-8500-000000000000', '/b.bin', X'02', '{branch_id}')"
                 ),
                 &[],
             )
@@ -1424,7 +1449,9 @@ simulation_test!(
         assert_eq!(error.code, LixError::CODE_UNIQUE);
         assert!(
             error.message.contains("table 'lix_file_by_branch'")
-                && error.message.contains("id 'same-file'")
+                && error
+                    .message
+                    .contains("id '73616d65-2d66-896c-8500-000000000000'")
                 && !error.message.contains("table 'lix_file':")
                 && !error.message.contains("lix_binary_blob_ref"),
             "unexpected error: {error:?}"
@@ -1537,7 +1564,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, parent_id, name) VALUES ('dir-foo', NULL, 'foo')",
+                "INSERT INTO lix_directory (id, parent_id, name) VALUES ('6469722d-666f-8f00-8000-000000000000', NULL, 'foo')",
                 &[],
             )
             .await
@@ -1546,7 +1573,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, directory_id, name) \
-                 VALUES ('file-foo', NULL, 'foo')",
+                 VALUES ('66696c65-2d66-8f6f-8000-000000000000', NULL, 'foo')",
                 &[],
             )
             .await
@@ -1570,7 +1597,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_file (id, path) VALUES ('file-foo', '/foo')",
+                "INSERT INTO lix_file (id, path) VALUES ('66696c65-2d66-8f6f-8000-000000000000', '/foo')",
                 &[],
             )
             .await
@@ -1582,7 +1609,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "UPDATE lix_file SET path = '/bar' WHERE id = 'file-foo'",
+                "UPDATE lix_file SET path = '/bar' WHERE id = '66696c65-2d66-8f6f-8000-000000000000'",
                 &[],
             )
             .await
@@ -1607,7 +1634,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (directory_id, name) \
-                 VALUES ('missing-dir', 'readme.md')",
+                 VALUES ('6d697373-696e-872d-8469-720000000000', 'readme.md')",
                 &[],
             )
             .await
@@ -1631,7 +1658,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/')",
                 &[],
             )
             .await
@@ -1639,7 +1666,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, directory_id, name) \
-                 VALUES ('file-readme', 'dir-docs', 'readme.md')",
+                 VALUES ('66696c65-2d72-8561-846d-650000000000', '6469722d-646f-8373-8000-000000000000', 'readme.md')",
                 &[],
             )
             .await
@@ -1647,7 +1674,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "UPDATE lix_file SET directory_id = 'missing-dir' WHERE id = 'file-readme'",
+                "UPDATE lix_file SET directory_id = '6d697373-696e-872d-8469-720000000000' WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
             )
             .await
@@ -1657,7 +1684,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT path, directory_id FROM lix_file WHERE id = 'file-readme'",
+                "SELECT path, directory_id FROM lix_file WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
             )
             .await
@@ -1666,7 +1693,7 @@ simulation_test!(
             result.rows()[0].values(),
             &[
                 Value::Text("/docs/readme.md".to_string()),
-                Value::Text("dir-docs".to_string())
+                Value::Text("6469722d-646f-8373-8000-000000000000".to_string())
             ]
         );
     }
@@ -1723,7 +1750,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, parent_id, name) \
-             VALUES ('dir-docs', NULL, 'docs')",
+             VALUES ('6469722d-646f-8373-8000-000000000000', NULL, 'docs')",
                 &[],
             )
             .await
@@ -1732,7 +1759,7 @@ simulation_test!(
         let insert_result = session
             .execute(
                 "INSERT INTO lix_file (directory_id, name, data) \
-             VALUES ('dir-docs', 'readme.md', X'68656C6C6F')",
+             VALUES ('6469722d-646f-8373-8000-000000000000', 'readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -1773,7 +1800,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
     let insert_result = session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('file-readme', '/docs/guides/readme.md', X'68656C6C6F')",
+             VALUES ('66696c65-2d72-8561-846d-650000000000', '/docs/guides/readme.md', X'68656C6C6F')",
             &[],
         )
         .await
@@ -1784,7 +1811,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         .execute(
             "UPDATE lix_file \
              SET path = '/docs/readme-renamed.md' \
-             WHERE id = 'file-readme'",
+             WHERE id = '66696c65-2d72-8561-846d-650000000000'",
             &[],
         )
         .await
@@ -1795,7 +1822,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
         .execute(
             "SELECT id, path, data \
              FROM lix_file \
-             WHERE id = 'file-readme'",
+             WHERE id = '66696c65-2d72-8561-846d-650000000000'",
             &[],
         )
         .await
@@ -1805,7 +1832,7 @@ simulation_test!(lix_file_path_update_preserves_data, |sim| async move {
     assert_eq!(
         file_rows.rows()[0].values(),
         &[
-            Value::Text("file-readme".to_string()),
+            Value::Text("66696c65-2d72-8561-846d-650000000000".to_string()),
             Value::Text("/docs/readme-renamed.md".to_string()),
             Value::Blob(b"hello".to_vec().into()),
         ]
@@ -1844,8 +1871,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-             ('file-target', '/docs/target.md', X'746172676574'), \
-             ('file-other', '/docs/other.md', X'6F74686572')",
+             ('66696c65-2d74-8172-8765-740000000000', '/docs/target.md', X'746172676574'), \
+             ('66696c65-2d6f-8468-8572-000000000000', '/docs/other.md', X'6F74686572')",
                 &[],
             )
             .await
@@ -1861,7 +1888,7 @@ simulation_test!(
         assert_rows_eq(
             warm,
             vec![vec![
-                Value::Text("file-target".to_string()),
+                Value::Text("66696c65-2d74-8172-8765-740000000000".to_string()),
                 Value::Text("/docs/target.md".to_string()),
             ]],
         );
@@ -1896,7 +1923,7 @@ simulation_test!(
         assert_rows_eq(
             renamed,
             vec![vec![
-                Value::Text("file-target".to_string()),
+                Value::Text("66696c65-2d74-8172-8765-740000000000".to_string()),
                 Value::Text("/archive/renamed.md".to_string()),
                 Value::Blob(b"target".to_vec().into()),
             ]],
@@ -1904,7 +1931,7 @@ simulation_test!(
 
         let unrelated = session
             .execute(
-                "SELECT path, data FROM lix_file WHERE id = 'file-other'",
+                "SELECT path, data FROM lix_file WHERE id = '66696c65-2d6f-8468-8572-000000000000'",
                 &[],
             )
             .await
@@ -1934,7 +1961,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('branch-head-file', '/branch-head.txt', X'68656164')",
+                 VALUES ('6272616e-6368-8d68-8561-642d66696c00', '/branch-head.txt', X'68656164')",
                 &[],
             )
             .await
@@ -1962,7 +1989,9 @@ simulation_test!(
             .expect("exact path lookup should warm the filesystem index");
         assert_rows_eq(
             warm,
-            vec![vec![Value::Text("branch-head-file".to_string())]],
+            vec![vec![Value::Text(
+                "6272616e-6368-8d68-8561-642d66696c00".to_string(),
+            )]],
         );
 
         let reset = session
@@ -2012,7 +2041,9 @@ simulation_test!(
             .expect("path lookup after branch restore should succeed");
         assert_rows_eq(
             restored_lookup,
-            vec![vec![Value::Text("branch-head-file".to_string())]],
+            vec![vec![Value::Text(
+                "6272616e-6368-8d68-8561-642d66696c00".to_string(),
+            )]],
         );
     }
 );
@@ -2032,10 +2063,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-             ('extension-a', '/.lix/app_data/atelier/extensions/demo/a.js', X'61'), \
-             ('extension-b', '/.lix/app_data/atelier/extensions/demo/b.js', X'62'), \
-             ('extension-upper', '/.lix/app_data/atelier/extensions0/out.js', X'78'), \
-             ('unrelated', '/docs/readme.md', X'72')",
+             ('01950000-0000-7000-8000-000000000008', '/.lix/app_data/atelier/extensions/demo/a.js', X'61'), \
+             ('01950000-0000-7000-8000-000000000009', '/.lix/app_data/atelier/extensions/demo/b.js', X'62'), \
+             ('01950000-0000-7000-8000-00000000000a', '/.lix/app_data/atelier/extensions0/out.js', X'78'), \
+             ('01940000-0000-7000-8000-000000000003', '/docs/readme.md', X'72')",
                 &[],
             )
             .await
@@ -2135,7 +2166,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('update-null-file', '/update-null.bin', X'68656C6C6F')",
+                 VALUES ('75706461-7465-8d6e-856c-6c2d66696c00', '/update-null.bin', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -2143,7 +2174,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "UPDATE lix_file SET data = NULL WHERE id = 'update-null-file'",
+                "UPDATE lix_file SET data = NULL WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[],
             )
             .await
@@ -2153,7 +2184,7 @@ simulation_test!(
 
         let parameter_error = session
             .execute(
-                "UPDATE lix_file SET data = $1 WHERE id = 'update-null-file'",
+                "UPDATE lix_file SET data = $1 WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[Value::Null],
             )
             .await
@@ -2163,7 +2194,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT data FROM lix_file WHERE id = 'update-null-file'",
+                "SELECT data FROM lix_file WHERE id = '75706461-7465-8d6e-856c-6c2d66696c00'",
                 &[],
             )
             .await
@@ -2189,14 +2220,14 @@ simulation_test!(
         );
 
         for (id, assignment) in [
-            ("update-text-file", "'hello'"),
+            ("75706461-7465-8d74-8578-742d66696c00", "'hello'"),
             (
-                "update-text-function-file",
+                "75706461-7465-8d74-8578-742d66756e00",
                 "lix_json_get_text(lix_json('{\"value\":\"hello\"}'), 'value')",
             ),
-            ("update-int-file", "12345"),
-            ("update-float-file", "1.5"),
-            ("update-bool-file", "true"),
+            ("75706461-7465-8d69-8e74-2d66696c6500", "12345"),
+            ("75706461-7465-8d66-8c6f-61742d666900", "1.5"),
+            ("75706461-7465-8d62-8f6f-6c2d66696c00", "true"),
         ] {
             session
                 .execute(
@@ -2224,11 +2255,11 @@ simulation_test!(
             .execute(
                 "SELECT id, data FROM lix_file \
                  WHERE id IN (\
-                   'update-text-file',\
-                   'update-text-function-file',\
-                   'update-int-file',\
-                   'update-float-file',\
-                   'update-bool-file'\
+                   '75706461-7465-8d74-8578-742d66696c00',\
+                   '75706461-7465-8d74-8578-742d66756e00',\
+                   '75706461-7465-8d69-8e74-2d66696c6500',\
+                   '75706461-7465-8d66-8c6f-61742d666900',\
+                   '75706461-7465-8d62-8f6f-6c2d66696c00'\
                  ) \
                  ORDER BY id",
                 &[],
@@ -2240,23 +2271,23 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("update-bool-file".to_string()),
+                    Value::Text("75706461-7465-8d62-8f6f-6c2d66696c00".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
-                    Value::Text("update-float-file".to_string()),
+                    Value::Text("75706461-7465-8d66-8c6f-61742d666900".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
-                    Value::Text("update-int-file".to_string()),
+                    Value::Text("75706461-7465-8d69-8e74-2d66696c6500".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
-                    Value::Text("update-text-file".to_string()),
+                    Value::Text("75706461-7465-8d74-8578-742d66696c00".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
-                    Value::Text("update-text-function-file".to_string()),
+                    Value::Text("75706461-7465-8d74-8578-742d66756e00".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
             ],
@@ -2277,8 +2308,14 @@ simulation_test!(
         );
 
         for (id, value) in [
-            ("update-text-param-file", Value::Text("hello".to_string())),
-            ("update-int-param-file", Value::Integer(12345)),
+            (
+                "75706461-7465-8d74-8578-742d70617200",
+                Value::Text("hello".to_string()),
+            ),
+            (
+                "75706461-7465-8d69-8e74-2d7061726100",
+                Value::Integer(12345),
+            ),
         ] {
             session
                 .execute(
@@ -2304,7 +2341,7 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT id, data FROM lix_file \
-                 WHERE id IN ('update-text-param-file', 'update-int-param-file') \
+                 WHERE id IN ('75706461-7465-8d74-8578-742d70617200', '75706461-7465-8d69-8e74-2d7061726100') \
                  ORDER BY id",
                 &[],
             )
@@ -2314,11 +2351,11 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("update-int-param-file".to_string()),
+                    Value::Text("75706461-7465-8d69-8e74-2d7061726100".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
                 vec![
-                    Value::Text("update-text-param-file".to_string()),
+                    Value::Text("75706461-7465-8d74-8578-742d70617200".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
                 ],
             ],
@@ -2339,7 +2376,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('empty-update-file', '/empty-update.bin', X'68656C6C6F')",
+             VALUES ('656d7074-792d-8570-8461-74652d666900', '/empty-update.bin', X'68656C6C6F')",
             &[],
         )
         .await
@@ -2347,7 +2384,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
 
     let update_result = session
         .execute(
-            "UPDATE lix_file SET data = X'' WHERE id = 'empty-update-file'",
+            "UPDATE lix_file SET data = X'' WHERE id = '656d7074-792d-8570-8461-74652d666900'",
             &[],
         )
         .await
@@ -2356,7 +2393,7 @@ simulation_test!(lix_file_update_accepts_empty_blob_data, |sim| async move {
 
     let result = session
         .execute(
-            "SELECT data FROM lix_file WHERE id = 'empty-update-file'",
+            "SELECT data FROM lix_file WHERE id = '656d7074-792d-8570-8461-74652d666900'",
             &[],
         )
         .await
@@ -2607,7 +2644,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path) \
-                 VALUES ('already-empty-file', '/already-empty.bin')",
+                 VALUES ('616c7265-6164-892d-856d-7074792d6600', '/already-empty.bin')",
                 &[],
             )
             .await
@@ -2615,7 +2652,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_file SET data = X'' WHERE id = 'already-empty-file'",
+                "UPDATE lix_file SET data = X'' WHERE id = '616c7265-6164-892d-856d-7074792d6600'",
                 &[],
             )
             .await
@@ -2625,7 +2662,7 @@ simulation_test!(
                 "SELECT id \
                  FROM lix_change \
                  WHERE schema_key = 'lix_binary_blob_ref' \
-                   AND entity_pk = lix_json('[\"already-empty-file\"]')",
+                   AND entity_pk = lix_json('[\"616c7265-6164-892d-856d-7074792d6600\"]')",
                 &[],
             )
             .await
@@ -2647,7 +2684,7 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, data, lixcol_global, lixcol_untracked) \
-             VALUES ('file-global-overlay', '/global.txt', X'67', true, false)",
+             VALUES ('66696c65-2d67-8c6f-8261-6c2d6f766500', '/global.txt', X'67', true, false)",
             &[],
         )
         .await
@@ -2657,7 +2694,7 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
         .execute(
             "SELECT id, path, lixcol_branch_id, lixcol_global, lixcol_untracked \
              FROM lix_file_by_branch \
-             WHERE id = 'file-global-overlay' \
+             WHERE id = '66696c65-2d67-8c6f-8261-6c2d6f766500' \
              ORDER BY lixcol_branch_id",
             &[],
         )
@@ -2667,16 +2704,16 @@ simulation_test!(lix_file_by_branch_expands_global_rows, |sim| async move {
         result,
         vec![
             vec![
-                Value::Text("file-global-overlay".to_string()),
+                Value::Text("66696c65-2d67-8c6f-8261-6c2d6f766500".to_string()),
                 Value::Text("/global.txt".to_string()),
                 Value::Text(sim.main_branch_id().to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],
             vec![
-                Value::Text("file-global-overlay".to_string()),
+                Value::Text("66696c65-2d67-8c6f-8261-6c2d6f766500".to_string()),
                 Value::Text("/global.txt".to_string()),
-                Value::Text("global".to_string()),
+                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                 Value::Boolean(true),
                 Value::Boolean(false),
             ],
@@ -2699,7 +2736,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_global) \
-                 VALUES ('global-shared-dir-for-file', '/shared/', true)",
+                 VALUES ('676c6f62-616c-8d73-8861-7265642d6401', '/shared/', true)",
                 &[],
             )
             .await
@@ -2708,7 +2745,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) \
-                 VALUES ('global-shared-file', '/shared/a.txt', CAST('a' AS BYTEA), true)",
+                 VALUES ('676c6f62-616c-8d73-8861-7265642d6600', '/shared/a.txt', CAST('a' AS BYTEA), true)",
                 &[],
             )
             .await
@@ -2716,7 +2753,7 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT path FROM lix_file WHERE id = 'global-shared-file'",
+                "SELECT path FROM lix_file WHERE id = '676c6f62-616c-8d73-8861-7265642d6600'",
                 &[],
             )
             .await
@@ -2740,7 +2777,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('dir-scratch', '/scratch/', true)",
+                 VALUES ('6469722d-7363-8261-8463-680000000000', '/scratch/', true)",
                 &[],
             )
             .await
@@ -2749,7 +2786,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-readme', '/scratch/readme.md', CAST('hello' AS BYTEA))",
+                 VALUES ('66696c65-2d72-8561-846d-650000000000', '/scratch/readme.md', CAST('hello' AS BYTEA))",
                 &[],
             )
             .await
@@ -2768,7 +2805,7 @@ simulation_test!(
         assert_rows_eq(
             directories,
             vec![vec![
-                Value::Text("dir-scratch".to_string()),
+                Value::Text("6469722d-7363-8261-8463-680000000000".to_string()),
                 Value::Text("/scratch/".to_string()),
                 Value::Boolean(true),
             ]],
@@ -2778,7 +2815,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, directory_id, data \
                  FROM lix_file \
-                 WHERE id = 'file-readme'",
+                 WHERE id = '66696c65-2d72-8561-846d-650000000000'",
                 &[],
             )
             .await
@@ -2801,7 +2838,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('dir-docs', '/docs/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/')",
                 &[],
             )
             .await
@@ -2809,7 +2846,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_untracked) \
-                 VALUES ('file-draft', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
+                 VALUES ('66696c65-2d64-8261-8674-000000000000', '/docs/draft.md', CAST('draft' AS BYTEA), true)",
                 &[],
             )
             .await
@@ -2827,7 +2864,7 @@ simulation_test!(
         assert_rows_eq(
             directories,
             vec![vec![
-                Value::Text("dir-docs".to_string()),
+                Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
                 Value::Text("/docs/".to_string()),
                 Value::Boolean(false),
             ]],
@@ -2837,7 +2874,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, directory_id, lixcol_untracked \
                  FROM lix_file \
-                 WHERE id = 'file-draft'",
+                 WHERE id = '66696c65-2d64-8261-8674-000000000000'",
                 &[],
             )
             .await
@@ -2845,9 +2882,9 @@ simulation_test!(
         assert_rows_eq(
             files,
             vec![vec![
-                Value::Text("file-draft".to_string()),
+                Value::Text("66696c65-2d64-8261-8674-000000000000".to_string()),
                 Value::Text("/docs/draft.md".to_string()),
-                Value::Text("dir-docs".to_string()),
+                Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
                 Value::Boolean(true),
             ]],
         );
@@ -2869,7 +2906,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-upsert', '/docs/upsert.md', X'6F6C64')",
+                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6F6C64')",
                 &[],
             )
             .await
@@ -2878,7 +2915,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-upsert', '/docs/upsert.md', X'6E6577') \
+                 VALUES ('66696c65-2d75-8073-8572-740000000000', '/docs/upsert.md', X'6E6577') \
                  ON CONFLICT (id) DO UPDATE SET data = excluded.data",
                 &[],
             )
@@ -2888,7 +2925,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = 'file-upsert'",
+                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d75-8073-8572-740000000000'",
                 &[],
             )
             .await
@@ -2896,7 +2933,7 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-upsert".to_string()),
+                Value::Text("66696c65-2d75-8073-8572-740000000000".to_string()),
                 Value::Text("/docs/upsert.md".to_string()),
                 Value::Blob(b"new".to_vec().into()),
             ]],
@@ -2919,7 +2956,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-nothing', '/docs/nothing.md', X'6B656570')",
+                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6B656570')",
                 &[],
             )
             .await
@@ -2928,7 +2965,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-nothing', '/docs/nothing.md', X'6967') \
+                 VALUES ('66696c65-2d6e-8f74-8869-6e6700000000', '/docs/nothing.md', X'6967') \
                  ON CONFLICT (id) DO NOTHING",
                 &[],
             )
@@ -2938,7 +2975,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = 'file-nothing'",
+                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d6e-8f74-8869-6e6700000000'",
                 &[],
             )
             .await
@@ -2946,7 +2983,7 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-nothing".to_string()),
+                Value::Text("66696c65-2d6e-8f74-8869-6e6700000000".to_string()),
                 Value::Text("/docs/nothing.md".to_string()),
                 Value::Blob(b"keep".to_vec().into()),
             ]],
@@ -2969,7 +3006,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-fresh', '/docs/fresh.md', X'6E6577') \
+                 VALUES ('66696c65-2d66-8265-8368-000000000000', '/docs/fresh.md', X'6E6577') \
                  ON CONFLICT (id) DO UPDATE SET data = excluded.data",
                 &[],
             )
@@ -2979,7 +3016,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path, data FROM lix_file WHERE id = 'file-fresh'",
+                "SELECT id, path, data FROM lix_file WHERE id = '66696c65-2d66-8265-8368-000000000000'",
                 &[],
             )
             .await
@@ -2987,7 +3024,7 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-fresh".to_string()),
+                Value::Text("66696c65-2d66-8265-8368-000000000000".to_string()),
                 Value::Text("/docs/fresh.md".to_string()),
                 Value::Blob(b"new".to_vec().into()),
             ]],
@@ -3050,7 +3087,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-path-upsert', '/docs/path-upsert.md', X'6F6C64')",
+                 VALUES ('66696c65-2d70-8174-882d-757073657200', '/docs/path-upsert.md', X'6F6C64')",
                 &[],
             )
             .await
@@ -3077,7 +3114,7 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-path-upsert".to_string()),
+                Value::Text("66696c65-2d70-8174-882d-757073657200".to_string()),
                 Value::Text("/docs/path-upsert.md".to_string()),
                 Value::Blob(b"new".to_vec().into()),
             ]],
@@ -3112,7 +3149,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, data, lixcol_branch_id) \
-                     VALUES ('file-branch-path-upsert', '/docs/branch.md', X'6F6C64', '{branch_id}')"
+                     VALUES ('66696c65-2d62-8261-8e63-682d70617400', '/docs/branch.md', X'6F6C64', '{branch_id}')"
                 ),
                 &[],
             )
@@ -3143,7 +3180,7 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-branch-path-upsert".to_string()),
+                Value::Text("66696c65-2d62-8261-8e63-682d70617400".to_string()),
                 Value::Blob(b"new".to_vec().into()),
             ]],
         );
@@ -3198,7 +3235,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_file (id, data) \
-                 VALUES ('file-missing-path-upsert', X'00') \
+                 VALUES ('66696c65-2d6d-8973-8369-6e672d706100', X'00') \
                  ON CONFLICT (path) DO UPDATE SET data = excluded.data",
                 &[],
             )
@@ -3223,7 +3260,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('file-tracked-collision', '/docs/collision.md', X'00')",
+                 VALUES ('66696c65-2d74-8261-836b-65642d636f00', '/docs/collision.md', X'00')",
                 &[],
             )
             .await
@@ -3258,7 +3295,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data, lixcol_global) \
-                 VALUES ('file-global-path-upsert', '/docs/global.md', X'6F6C64', true)",
+                 VALUES ('66696c65-2d67-8c6f-8261-6c2d70617400', '/docs/global.md', X'6F6C64', true)",
                 &[],
             )
             .await
@@ -3279,7 +3316,7 @@ simulation_test!(
             .execute(
                 "SELECT id, data, lixcol_global, lixcol_branch_id \
                  FROM lix_file_by_branch \
-                 WHERE id = 'file-global-path-upsert' AND lixcol_branch_id = 'global'",
+                 WHERE id = '66696c65-2d67-8c6f-8261-6c2d70617400' AND lixcol_branch_id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'",
                 &[],
             )
             .await
@@ -3287,10 +3324,10 @@ simulation_test!(
         assert_rows_eq(
             read,
             vec![vec![
-                Value::Text("file-global-path-upsert".to_string()),
+                Value::Text("66696c65-2d67-8c6f-8261-6c2d70617400".to_string()),
                 Value::Blob(b"new".to_vec().into()),
                 Value::Boolean(true),
-                Value::Text("global".to_string()),
+                Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
             ]],
         );
     }
@@ -3341,7 +3378,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('transaction-target', '/docs/target.md', X'6265666F7265')",
+                 VALUES ('01950000-0000-7000-8000-000000000002', '/docs/target.md', X'6265666F7265')",
                 &[],
             )
             .await
@@ -3349,7 +3386,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('transaction-conflict-directory', '/conflict/')",
+                 VALUES ('7472616e-7361-8374-896f-6e2d636f6e00', '/conflict/')",
                 &[],
             )
             .await
@@ -3362,7 +3399,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('transaction-anchor', '/transaction-anchor.md', X'01')",
+                 VALUES ('01950000-0000-7000-8000-00000000000b', '/01950000-0000-7000-8000-00000000000b.md', X'01')",
                 &[],
             )
             .await
@@ -3388,7 +3425,7 @@ simulation_test!(
         assert_rows_eq(
             first_read,
             vec![vec![
-                Value::Text("transaction-target".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000002".to_string()),
                 Value::Blob(b"after".to_vec().into()),
             ]],
         );
@@ -3415,7 +3452,7 @@ simulation_test!(
 
         let error = transaction
             .execute(
-                "UPDATE lix_file SET path = '/conflict' WHERE id = 'transaction-target'",
+                "UPDATE lix_file SET path = '/conflict' WHERE id = '01950000-0000-7000-8000-000000000002'",
                 &[],
             )
             .await
@@ -3432,7 +3469,7 @@ simulation_test!(
         assert_rows_eq(
             after_failure,
             vec![vec![
-                Value::Text("transaction-target".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000002".to_string()),
                 Value::Text("/docs/target.md".to_string()),
                 Value::Blob(b"again".to_vec().into()),
             ]],
@@ -3453,13 +3490,13 @@ simulation_test!(
         assert_rows_eq(
             rolled_back,
             vec![vec![
-                Value::Text("transaction-target".to_string()),
+                Value::Text("01950000-0000-7000-8000-000000000002".to_string()),
                 Value::Blob(b"before".to_vec().into()),
             ]],
         );
         let anchor = session
             .execute(
-                "SELECT id FROM lix_file WHERE path = '/transaction-anchor.md'",
+                "SELECT id FROM lix_file WHERE path = '/01950000-0000-7000-8000-00000000000b.md'",
                 &[],
             )
             .await
@@ -3485,7 +3522,7 @@ simulation_test!(
             .execute(
                 "INSERT INTO lix_file_by_branch \
                  (id, path, data, lixcol_global, lixcol_branch_id) \
-                 VALUES ('lane-file', '/global.md', X'01', true, 'global')",
+                 VALUES ('6c616e65-2d66-896c-8500-000000000000', '/global.md', X'01', true, 'ffffffff-ffff-7fff-bfff-ffffffffffff')",
                 &[],
             )
             .await
@@ -3495,7 +3532,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_file_by_branch \
                      (id, path, data, lixcol_branch_id) \
-                     VALUES ('lane-file', '/branch.md', X'02', '{branch_id}')"
+                     VALUES ('6c616e65-2d66-896c-8500-000000000000', '/branch.md', X'02', '{branch_id}')"
                 ),
                 &[],
             )
@@ -3509,20 +3546,23 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('lane-anchor', '/lane-anchor.md', X'03')",
+                 VALUES ('01950000-0000-7000-8000-000000000003', '/01950000-0000-7000-8000-000000000003.md', X'03')",
                 &[],
             )
             .await
             .expect("transaction descriptor anchor should stage");
 
         let local = transaction
-            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE id = '6c616e65-2d66-896c-8500-000000000000'",
+                &[],
+            )
             .await
             .expect("branch-local lane file should be visible");
         assert_rows_eq(
             local,
             vec![vec![
-                Value::Text("lane-file".to_string()),
+                Value::Text("6c616e65-2d66-896c-8500-000000000000".to_string()),
                 Value::Text("/branch.md".to_string()),
             ]],
         );
@@ -3531,7 +3571,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "DELETE FROM lix_file_by_branch \
-                     WHERE id = 'lane-file' AND lixcol_branch_id = '{branch_id}'"
+                     WHERE id = '6c616e65-2d66-896c-8500-000000000000' AND lixcol_branch_id = '{branch_id}'"
                 ),
                 &[],
             )
@@ -3540,7 +3580,10 @@ simulation_test!(
         assert_eq!(deleted.rows_affected(), 1);
 
         let hidden_by_tombstone = transaction
-            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE id = '6c616e65-2d66-896c-8500-000000000000'",
+                &[],
+            )
             .await
             .expect("lane lookup should succeed after the local tombstone");
         assert_eq!(
@@ -3554,13 +3597,16 @@ simulation_test!(
             .await
             .expect("transaction rollback should succeed");
         let restored = session
-            .execute("SELECT id, path FROM lix_file WHERE id = 'lane-file'", &[])
+            .execute(
+                "SELECT id, path FROM lix_file WHERE id = '6c616e65-2d66-896c-8500-000000000000'",
+                &[],
+            )
             .await
             .expect("branch-local lane should be restored after rollback");
         assert_rows_eq(
             restored,
             vec![vec![
-                Value::Text("lane-file".to_string()),
+                Value::Text("6c616e65-2d66-896c-8500-000000000000".to_string()),
                 Value::Text("/branch.md".to_string()),
             ]],
         );
@@ -3596,7 +3642,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('revision-anchor', '/revision-anchor.md', X'01')",
+                 VALUES ('01950000-0000-7000-8000-000000000004', '/01950000-0000-7000-8000-000000000004.md', X'01')",
                 &[],
             )
             .await
@@ -3614,7 +3660,7 @@ simulation_test!(
         other_session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('other-session-file', '/other-session.md', X'02')",
+                 VALUES ('6f746865-722d-8365-8373-696f6e2d6600', '/other-session.md', X'02')",
                 &[],
             )
             .await
@@ -3648,7 +3694,7 @@ simulation_test!(
         assert_rows_eq(
             visible_after_commit,
             vec![vec![
-                Value::Text("other-session-file".to_string()),
+                Value::Text("6f746865-722d-8365-8373-696f6e2d6600".to_string()),
                 Value::Text("/other-session.md".to_string()),
             ]],
         );
@@ -3675,7 +3721,7 @@ simulation_test!(
             &engine,
         );
         main.create_branch(CreateBranchOptions {
-            id: Some("path-index-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000a".to_string()),
             name: "Path index draft".to_string(),
             from_commit_id: None,
         })
@@ -3683,7 +3729,7 @@ simulation_test!(
         .expect("draft branch should create");
         let draft = main.wrap_session(
             engine
-                .open_session("path-index-draft")
+                .open_session("01930000-0000-7000-8000-00000000000a")
                 .await
                 .expect("draft session should open"),
             &engine,
@@ -3691,7 +3737,7 @@ simulation_test!(
 
         main.execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('merge-main-file', '/main.md', X'01')",
+             VALUES ('6d657267-652d-8d61-896e-2d66696c6500', '/main.md', X'01')",
             &[],
         )
         .await
@@ -3699,7 +3745,7 @@ simulation_test!(
         draft
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('merge-draft-file', '/merged.md', X'02')",
+                 VALUES ('6d657267-652d-8472-8166-742d66696c00', '/merged.md', X'02')",
                 &[],
             )
             .await
@@ -3719,7 +3765,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('merge-revision-anchor', '/merge-revision-anchor.md', X'03')",
+                 VALUES ('01950000-0000-7000-8000-000000000005', '/01950000-0000-7000-8000-000000000005.md', X'03')",
                 &[],
             )
             .await
@@ -3732,7 +3778,7 @@ simulation_test!(
 
         let receipt = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "path-index-draft".to_string(),
+                source_branch_id: "01930000-0000-7000-8000-00000000000a".to_string(),
             })
             .await
             .expect("merge should succeed");
@@ -3766,7 +3812,7 @@ simulation_test!(
         assert_rows_eq(
             visible_after_merge,
             vec![vec![
-                Value::Text("merge-draft-file".to_string()),
+                Value::Text("6d657267-652d-8472-8166-742d66696c00".to_string()),
                 Value::Text("/merged.md".to_string()),
             ]],
         );

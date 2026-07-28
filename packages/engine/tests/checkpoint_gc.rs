@@ -127,7 +127,7 @@ simulation_test!(
             .expect("checkpoint retaining the first interval should succeed");
 
         main.create_branch(CreateBranchOptions {
-            id: Some("gc-protected-branch".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000510".to_string()),
             name: "GC protected branch".to_string(),
             from_commit_id: Some(protected_head.clone()),
         })
@@ -148,7 +148,7 @@ simulation_test!(
 
         let protected = sim.wrap_session(
             engine
-                .open_session("gc-protected-branch")
+                .open_session("01920000-0000-7000-8000-000000000510")
                 .await
                 .expect("protected branch session should open"),
             &engine,
@@ -179,7 +179,7 @@ simulation_test!(
             &engine,
         );
         main.create_branch(CreateBranchOptions {
-            id: Some("gc-other-branch".to_string()),
+            id: Some("01920000-0000-7000-8000-000000000511".to_string()),
             name: "GC other branch".to_string(),
             from_commit_id: None,
         })
@@ -187,7 +187,7 @@ simulation_test!(
         .expect("other branch should be created");
         let other = sim.wrap_session(
             engine
-                .open_session("gc-other-branch")
+                .open_session("01920000-0000-7000-8000-000000000511")
                 .await
                 .expect("other branch session should open"),
             &engine,
@@ -214,7 +214,8 @@ simulation_test!(
             )
             .await
             .expect("other interval write should succeed");
-        let other_auto_commit = branch_head(&engine, "gc-other-branch").await;
+        let other_auto_commit =
+            branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
         other
             .create_checkpoint()
             .await

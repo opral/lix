@@ -245,21 +245,37 @@ mod tests {
         let catalog_a = "catalog-a".to_string();
         let catalog_b = "catalog-b".to_string();
         let sql = "DELETE FROM lix_file WHERE id = $1";
-        let plan = write_plan(sql, "branch-a");
-        cache.remember_write_plan(sql, catalog_a.clone(), "branch-a", &plan);
+        let plan = write_plan(sql, "01920000-0000-7000-8000-0000000000a1");
+        cache.remember_write_plan(
+            sql,
+            catalog_a.clone(),
+            "01920000-0000-7000-8000-0000000000a1",
+            &plan,
+        );
 
-        assert_eq!(cache.write_plan(sql, &catalog_a, "branch-a"), Some(plan));
+        assert_eq!(
+            cache.write_plan(sql, &catalog_a, "01920000-0000-7000-8000-0000000000a1"),
+            Some(plan)
+        );
         assert!(
             cache
                 .write_plan(
                     "DELETE  FROM lix_file WHERE id = $1",
                     &catalog_a,
-                    "branch-a"
+                    "01920000-0000-7000-8000-0000000000a1"
                 )
                 .is_none()
         );
-        assert!(cache.write_plan(sql, &catalog_b, "branch-a").is_none());
-        assert!(cache.write_plan(sql, &catalog_a, "branch-b").is_none());
+        assert!(
+            cache
+                .write_plan(sql, &catalog_b, "01920000-0000-7000-8000-0000000000a1")
+                .is_none()
+        );
+        assert!(
+            cache
+                .write_plan(sql, &catalog_a, "01920000-0000-7000-8000-0000000000b1")
+                .is_none()
+        );
     }
 
     #[test]
@@ -267,16 +283,21 @@ mod tests {
         let cache = test_cache(2);
         let catalog = "catalog-a".to_string();
         let sql = "DELETE FROM lix_file WHERE id = $1";
-        let plan = write_plan(sql, "branch-a");
-        cache.remember_write_plan(sql, catalog.clone(), "branch-a", &plan);
+        let plan = write_plan(sql, "01920000-0000-7000-8000-0000000000a1");
+        cache.remember_write_plan(
+            sql,
+            catalog.clone(),
+            "01920000-0000-7000-8000-0000000000a1",
+            &plan,
+        );
 
         let mut first = cache
-            .write_plan(sql, &catalog, "branch-a")
+            .write_plan(sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
             .expect("first cache hit");
         first.bound.branch_scope = BranchScope::Empty;
 
         let second = cache
-            .write_plan(sql, &catalog, "branch-a")
+            .write_plan(sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
             .expect("second cache hit");
         assert_eq!(second, plan);
     }
@@ -292,22 +313,34 @@ mod tests {
             cache.remember_write_plan(
                 sql,
                 catalog.clone(),
-                "branch-a",
-                &write_plan(sql, "branch-a"),
+                "01920000-0000-7000-8000-0000000000a1",
+                &write_plan(sql, "01920000-0000-7000-8000-0000000000a1"),
             );
         }
         cache
-            .write_plan(first_sql, &catalog, "branch-a")
+            .write_plan(first_sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
             .expect("first entry is promoted");
         cache.remember_write_plan(
             third_sql,
             catalog.clone(),
-            "branch-a",
-            &write_plan(third_sql, "branch-a"),
+            "01920000-0000-7000-8000-0000000000a1",
+            &write_plan(third_sql, "01920000-0000-7000-8000-0000000000a1"),
         );
 
-        assert!(cache.write_plan(first_sql, &catalog, "branch-a").is_some());
-        assert!(cache.write_plan(second_sql, &catalog, "branch-a").is_none());
-        assert!(cache.write_plan(third_sql, &catalog, "branch-a").is_some());
+        assert!(
+            cache
+                .write_plan(first_sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
+                .is_some()
+        );
+        assert!(
+            cache
+                .write_plan(second_sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
+                .is_none()
+        );
+        assert!(
+            cache
+                .write_plan(third_sql, &catalog, "01920000-0000-7000-8000-0000000000a1")
+                .is_some()
+        );
     }
 }

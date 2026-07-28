@@ -3397,9 +3397,10 @@ mod tests {
                 let entity_pk = if index % 2 == 0 {
                     EntityPk::single(format!("entity\0{index:03}"))
                 } else {
-                    EntityPk {
-                        parts: vec![format!("entity-{index:03}"), "尾\0".to_string()],
-                    }
+                    EntityPk::from_parts_unchecked(vec![
+                        format!("entity-{index:03}"),
+                        "尾\0".to_string(),
+                    ])
                 };
                 let key = TrackedStateKey {
                     schema_key: schema_key.to_string(),
@@ -3557,19 +3558,35 @@ mod tests {
             None,
             vec![
                 mutation_owned(
-                    key("schema-a", Some("file-a"), "entity-a"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-a",
+                    ),
                     value("c1", Some("{}")),
                 ),
                 mutation_owned(
-                    key("schema-a", Some("file-b"), "entity-a"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000b2"),
+                        "entity-a",
+                    ),
                     value("c2", Some("{}")),
                 ),
                 mutation_owned(
-                    key("schema-a", Some("file-a"), "entity-b"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-b",
+                    ),
                     value("c3", Some("{}")),
                 ),
                 mutation_owned(
-                    key("schema-b", Some("file-a"), "entity-a"),
+                    key(
+                        "schema-b",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-a",
+                    ),
                     value("c4", Some("{}")),
                 ),
             ],
@@ -3589,7 +3606,9 @@ mod tests {
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
                     entity_pks: vec![EntityPk::single("entity-a")],
-                    file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                    file_ids: vec![NullableKeyFilter::Value(
+                        "01920000-0000-7000-8000-0000000000a2".to_string(),
+                    )],
                     ..Default::default()
                 },
             )
@@ -3606,7 +3625,10 @@ mod tests {
                 .expect("identity"),
             "entity-a"
         );
-        assert_eq!(rows[0].0.file_id.as_deref(), Some("file-a"));
+        assert_eq!(
+            rows[0].0.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000a2")
+        );
 
         // With no schema predicate there is no encoded scan range or trusted
         // prefix. This exercises the decoded-key filter path directly.
@@ -3623,7 +3645,10 @@ mod tests {
             .expect("entity-only scan should succeed");
         assert_eq!(entity_only_rows.len(), 1);
         assert_eq!(entity_only_rows[0].0.schema_key, "schema-a");
-        assert_eq!(entity_only_rows[0].0.file_id.as_deref(), Some("file-a"));
+        assert_eq!(
+            entity_only_rows[0].0.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000a2")
+        );
     }
 
     #[tokio::test]
@@ -3636,19 +3661,35 @@ mod tests {
             None,
             vec![
                 mutation_owned(
-                    key("schema-a", Some("file-a"), "entity-a"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-a",
+                    ),
                     value("c1", Some("{}")),
                 ),
                 mutation_owned(
-                    key("schema-a", Some("file-a"), "entity-b"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-b",
+                    ),
                     value("c2", None),
                 ),
                 mutation_owned(
-                    key("schema-a", Some("file-a"), "entity-c"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000a2"),
+                        "entity-c",
+                    ),
                     value("c3", Some("{}")),
                 ),
                 mutation_owned(
-                    key("schema-a", Some("file-b"), "entity-d"),
+                    key(
+                        "schema-a",
+                        Some("01920000-0000-7000-8000-0000000000b2"),
+                        "entity-d",
+                    ),
                     value("c4", Some("{}")),
                 ),
             ],
@@ -3667,7 +3708,9 @@ mod tests {
                 &result.root_id,
                 &TrackedStateTreeScanRequest {
                     schema_keys: vec!["schema-a".to_string()],
-                    file_ids: vec![NullableKeyFilter::Value("file-a".to_string())],
+                    file_ids: vec![NullableKeyFilter::Value(
+                        "01920000-0000-7000-8000-0000000000a2".to_string(),
+                    )],
                     include_tombstones: false,
                     limit: Some(2),
                     ..Default::default()
@@ -3677,9 +3720,8 @@ mod tests {
             .expect("scan should succeed");
 
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(
-            |(key, _)| key.schema_key == "schema-a" && key.file_id.as_deref() == Some("file-a")
-        ));
+        assert!(rows.iter().all(|(key, _)| key.schema_key == "schema-a"
+            && key.file_id.as_deref() == Some("01920000-0000-7000-8000-0000000000a2")));
         assert_eq!(
             rows.iter()
                 .map(|(key, _)| key.entity_pk.as_single_string_owned().expect("identity"))
@@ -3746,11 +3788,17 @@ mod tests {
         let storage = StorageAdapter::new(Memory::new());
         let tree = TrackedStateTree::new();
         let shared_key = key("schema", None, "shared");
-        let branch_a_key = key("schema", None, "branch-a");
-        let branch_b_key = key("schema", None, "branch-b");
+        let branch_a_key = key("schema", None, "01920000-0000-7000-8000-0000000000a1");
+        let branch_b_key = key("schema", None, "01920000-0000-7000-8000-0000000000b1");
         let shared_value = value("shared-change", Some("{\"shared\":true}"));
-        let branch_a_value = value("branch-a-change", Some("{\"branch\":\"a\"}"));
-        let branch_b_value = value("branch-b-change", Some("{\"branch\":\"b\"}"));
+        let branch_a_value = value(
+            "01920000-0000-7000-8000-0000000000a1-change",
+            Some("{\"branch\":\"a\"}"),
+        );
+        let branch_b_value = value(
+            "01920000-0000-7000-8000-0000000000b1-change",
+            Some("{\"branch\":\"b\"}"),
+        );
         let base = apply_mutations_for_test(
             &tree,
             &storage,
@@ -3882,7 +3930,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let inserted_key = key("schema", None, "entity-050a");
+        let inserted_key = key("schema", None, "entity-050b");
         let inserted_value = value("inserted", Some("{\"v\":\"inserted\"}"));
         let base = apply_mutations_for_test(&tree, &storage, None, rows, None)
             .await

@@ -8,6 +8,7 @@
   "properties": {
     "id": {
       "type": "string",
+      "format": "uuid",
       "description": "File primary-key value (matches lix_file.id) for this binary reference row."
     },
     "blob_hash": {

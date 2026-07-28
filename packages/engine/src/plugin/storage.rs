@@ -3,10 +3,12 @@ use crate::LixError;
 pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
 const PLUGIN_STORAGE_ROOT_PATH: &str = "/.lix/plugins";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
-const PLUGIN_ARCHIVE_FILE_ID_PREFIX: &str = "lix_plugin_archive::";
+const PLUGIN_ARCHIVE_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x6c69782d_706c_7567_696e_2d6172636869);
+const PLUGIN_ARCHIVE_DELETE_ORIGIN_PREFIX: &str = "plugin_archive_delete:";
 
 pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
-    format!("{PLUGIN_ARCHIVE_FILE_ID_PREFIX}{plugin_key}")
+    uuid::Uuid::new_v5(&PLUGIN_ARCHIVE_ID_NAMESPACE, plugin_key.as_bytes()).to_string()
 }
 
 pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
@@ -22,17 +24,17 @@ pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     Some(plugin_key.to_string())
 }
 
-/// Extracts the plugin key from its canonical deterministic archive file ID.
-///
-/// This is deliberately stricter than accepting an arbitrary descriptor ID:
-/// lifecycle code can use it to distinguish plugin install/update/delete
-/// operations without consulting the visible filesystem.
-pub fn plugin_key_from_archive_file_id(file_id: &str) -> Option<String> {
-    let plugin_key = file_id.strip_prefix(PLUGIN_ARCHIVE_FILE_ID_PREFIX)?;
-    if !is_valid_plugin_key(plugin_key) {
-        return None;
-    }
-    Some(plugin_key.to_string())
+pub fn plugin_archive_file_id_matches(file_id: &str, plugin_key: &str) -> bool {
+    is_valid_plugin_key(plugin_key) && file_id == plugin_storage_archive_file_id(plugin_key)
+}
+
+pub(crate) fn plugin_archive_delete_origin(plugin_key: &str) -> String {
+    format!("{PLUGIN_ARCHIVE_DELETE_ORIGIN_PREFIX}{plugin_key}")
+}
+
+pub(crate) fn plugin_key_from_archive_delete_origin(surface: &str) -> Option<&str> {
+    let plugin_key = surface.strip_prefix(PLUGIN_ARCHIVE_DELETE_ORIGIN_PREFIX)?;
+    is_valid_plugin_key(plugin_key).then_some(plugin_key)
 }
 
 fn is_valid_plugin_key(plugin_key: &str) -> bool {
@@ -67,7 +69,7 @@ mod tests {
     use crate::LixError;
 
     use super::{
-        plugin_key_from_archive_file_id, plugin_key_from_archive_path,
+        plugin_archive_file_id_matches, plugin_key_from_archive_path,
         plugin_storage_archive_file_id, plugin_storage_archive_path,
         reject_normal_plugin_storage_mutation,
     };
@@ -100,10 +102,7 @@ mod tests {
     fn archive_file_id_round_trips_only_canonical_plugin_keys() {
         for key in ["plugin_json", "a", "plugin-2"] {
             let file_id = plugin_storage_archive_file_id(key);
-            assert_eq!(
-                plugin_key_from_archive_file_id(&file_id).as_deref(),
-                Some(key)
-            );
+            assert!(plugin_archive_file_id_matches(&file_id, key));
         }
 
         for file_id in [
@@ -113,7 +112,7 @@ mod tests {
             "lix_plugin_archive::plugin_json::suffix",
             "arbitrary-file-id",
         ] {
-            assert_eq!(plugin_key_from_archive_file_id(file_id), None);
+            assert!(!plugin_archive_file_id_matches(file_id, "plugin_json"));
         }
     }
 

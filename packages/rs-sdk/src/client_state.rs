@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 
 use crate::lix::Lix;
-use lix_engine::{LixError, Memory, Storage, Value};
+use lix_engine::{GLOBAL_BRANCH_ID, LixError, Memory, Storage, Value};
 
 // Client-state rows deliberately use ordinary `lix_key_value` entities. The
 // private physical prefix keeps their key identity disjoint from built-in and
@@ -11,24 +11,24 @@ const CLIENT_STATE_KEY_PREFIX: &str = "lix_client_state:";
 const GET_SQL: &str = "SELECT value \
     FROM lix_key_value_by_branch \
     WHERE key = $1 \
-      AND lixcol_branch_id = 'global' \
+      AND lixcol_branch_id = $2 \
       AND lixcol_untracked = true";
 
 const ENTRIES_SQL: &str = "SELECT key, value \
     FROM lix_key_value_by_branch \
-    WHERE lixcol_branch_id = 'global' \
+    WHERE lixcol_branch_id = $1 \
       AND lixcol_untracked = true \
     ORDER BY key";
 
 const SET_SQL: &str = "INSERT INTO lix_key_value_by_branch \
     (key, value, lixcol_branch_id, lixcol_global, lixcol_untracked) \
-    VALUES ($1, $2, 'global', true, true) \
+    VALUES ($1, $2, $3, true, true) \
     ON CONFLICT (key, lixcol_branch_id) \
     DO UPDATE SET value = excluded.value";
 
 const DELETE_SQL: &str = "DELETE FROM lix_key_value_by_branch \
     WHERE key = $1 \
-      AND lixcol_branch_id = 'global' \
+      AND lixcol_branch_id = $2 \
       AND lixcol_untracked = true";
 
 /// A borrowed handle to client-local JSON state stored by Lix.
@@ -57,7 +57,10 @@ where
 {
     /// Reads every logical client-state entry in key order.
     pub async fn entries(&self) -> Result<Vec<(String, JsonValue)>, LixError> {
-        let result = self.lix.execute(ENTRIES_SQL, &[]).await?;
+        let result = self
+            .lix
+            .execute(ENTRIES_SQL, &[Value::Text(GLOBAL_BRANCH_ID.to_string())])
+            .await?;
         let mut entries = Vec::new();
         for row in result.rows() {
             let key = row.get::<String>("key")?;
@@ -80,7 +83,13 @@ where
     pub async fn get(&self, key: &str) -> Result<Option<JsonValue>, LixError> {
         let result = self
             .lix
-            .execute(GET_SQL, &[Value::Text(physical_key(key)?)])
+            .execute(
+                GET_SQL,
+                &[
+                    Value::Text(physical_key(key)?),
+                    Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
             .await?;
 
         if result.len() > 1 {
@@ -100,7 +109,11 @@ where
         self.lix
             .execute(
                 SET_SQL,
-                &[Value::Text(physical_key(key)?), Value::Json(value)],
+                &[
+                    Value::Text(physical_key(key)?),
+                    Value::Json(value),
+                    Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                ],
             )
             .await?;
         Ok(())
@@ -109,7 +122,13 @@ where
     /// Deletes one logical client-state key. Missing keys are a no-op.
     pub async fn delete(&self, key: &str) -> Result<(), LixError> {
         self.lix
-            .execute(DELETE_SQL, &[Value::Text(physical_key(key)?)])
+            .execute(
+                DELETE_SQL,
+                &[
+                    Value::Text(physical_key(key)?),
+                    Value::Text(GLOBAL_BRANCH_ID.to_string()),
+                ],
+            )
             .await?;
         Ok(())
     }

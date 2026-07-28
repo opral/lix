@@ -402,16 +402,16 @@ mod tests {
     fn from_live_rows_attaches_blob_refs_by_storage_scope() {
         let index = FilesystemIndex::from_live_rows(vec![
             file_row(
-                "file-readme",
-                r#"{"id":"file-readme","directory_id":null,"name":"readme.md"}"#,
+                "01920000-0000-7000-8000-0000000000d2",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","directory_id":null,"name":"readme.md"}"#,
             ),
             live_row_with_scope(
-                "file-readme",
+                "01920000-0000-7000-8000-0000000000d2",
                 BLOB_REF_SCHEMA_KEY,
-                r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
-                "branch-b",
+                r#"{"id":"01920000-0000-7000-8000-0000000000d2","blob_hash":"abc123","size_bytes":5}"#,
+                "01920000-0000-7000-8000-0000000000b1",
                 false,
-                Some("file-readme".to_string()),
+                Some("01920000-0000-7000-8000-0000000000d2".to_string()),
             ),
         ])
         .expect("filesystem index should load");
@@ -433,21 +433,21 @@ mod tests {
                 "dir-shared",
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                 r#"{"id":"dir-shared","parent_id":null,"name":"scoped"}"#,
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
-                Some("owner-file".to_string()),
+                Some("01920000-0000-7000-8000-000000000342".to_string()),
             ),
             file_row(
-                "file-root",
-                r#"{"id":"file-root","directory_id":"dir-shared","name":"root.txt"}"#,
+                "01920000-0000-7000-8000-000000000142",
+                r#"{"id":"01920000-0000-7000-8000-000000000142","directory_id":"dir-shared","name":"root.txt"}"#,
             ),
             live_row_with_scope(
                 "file-scoped",
                 FILE_DESCRIPTOR_SCHEMA_KEY,
                 r#"{"id":"file-scoped","directory_id":"dir-shared","name":"scoped.txt"}"#,
-                "branch-a",
+                "01920000-0000-7000-8000-0000000000a1",
                 false,
-                Some("owner-file".to_string()),
+                Some("01920000-0000-7000-8000-000000000342".to_string()),
             ),
         ])
         .expect("filesystem index should keep scoped directories distinct");
@@ -482,7 +482,7 @@ mod tests {
             entity_pk,
             schema_key,
             snapshot_content,
-            "branch-a",
+            "01920000-0000-7000-8000-0000000000a1",
             false,
             None,
         )
@@ -532,7 +532,7 @@ mod tests {
 
     fn row_scope() -> RowScope {
         RowScope {
-            branch_id: "branch-a".to_string(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".to_string(),
             global: false,
             untracked: false,
             file_id: None,

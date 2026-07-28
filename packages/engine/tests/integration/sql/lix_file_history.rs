@@ -122,7 +122,9 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
 
     let unrelated_values = (0..UNRELATED_FILE_COUNT)
         .map(|index| {
-            format!("('unrelated-history-{index:03}', '/unrelated-history-{index:03}.txt', X'78')")
+            format!(
+                "('01940000-0000-7000-8000-{index:012x}', '/unrelated-history-{index:03}.txt', X'78')"
+            )
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -135,7 +137,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .expect("unrelated files should insert in one commit");
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {
-            format!("('unrelated-directory-{index:03}', '/unrelated-directory-{index:03}/')")
+            format!("('01940001-0000-7000-8000-{index:012x}', '/unrelated-directory-{index:03}/')")
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -149,7 +151,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     let unrelated_additional_files = (0..UNRELATED_ADDITIONAL_FILE_COUNT)
         .map(|index| {
             format!(
-                "('unrelated-additional-{index:03}', '/unrelated-additional-{index:03}.bin', X'78')"
+                "('01940002-0000-7000-8000-{index:012x}', '/unrelated-additional-{index:03}.bin', X'78')"
             )
         })
         .collect::<Vec<_>>()
@@ -164,7 +166,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('history-point-target', '/history-point-target.txt', X'746172676574')",
+             VALUES ('3faa577b-02e3-7c30-8b7d-30a9698cba93', '/3faa577b-02e3-7c30-8b7d-30a9698cba93.txt', X'746172676574')",
             &[],
         )
         .await
@@ -188,7 +190,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
                  FROM lix_file_history \
                  WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND lixcol_depth = 0 \
-                   AND id = 'history-point-target'"
+                   AND id = '3faa577b-02e3-7c30-8b7d-30a9698cba93'"
             ),
             &[],
         )
@@ -198,8 +200,8 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
     assert_rows_eq(
         result,
         vec![vec![
-            Value::Text("history-point-target".to_string()),
-            Value::Text("/history-point-target.txt".to_string()),
+            Value::Text("3faa577b-02e3-7c30-8b7d-30a9698cba93".to_string()),
+            Value::Text("/3faa577b-02e3-7c30-8b7d-30a9698cba93.txt".to_string()),
         ]],
     );
     let (requested_keys, scan_calls, scanned_rows) = storage.counters();
@@ -238,7 +240,9 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         .expect("workspace session should open");
 
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
-        .map(|index| format!("('ancestor-noise-{index:03}', '/ancestor-noise-{index:03}/')"))
+        .map(|index| {
+            format!("('01940003-0000-7000-8000-{index:012x}', '/ancestor-noise-{index:03}/')")
+        })
         .collect::<Vec<_>>()
         .join(",");
     session
@@ -251,8 +255,8 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     session
         .execute(
             "INSERT INTO lix_directory (id, path) VALUES \
-             ('bounded-root', '/bounded/'), \
-             ('bounded-child', '/bounded/child/')",
+             ('863f406b-3ce8-724d-8548-6dc1e41d451d', '/bounded/'), \
+             ('2b6a56e8-13dc-763d-8686-3f21011153ed', '/bounded/child/')",
             &[],
         )
         .await
@@ -260,14 +264,14 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('bounded-file', '/bounded/child/target.txt', X'78')",
+             VALUES ('626f756e-6465-842d-8669-6c6500000000', '/bounded/child/target.txt', X'78')",
             &[],
         )
         .await
         .expect("target file should insert");
     session
         .execute(
-            "UPDATE lix_directory SET name = 'renamed' WHERE id = 'bounded-root'",
+            "UPDATE lix_directory SET name = 'renamed' WHERE id = '863f406b-3ce8-724d-8548-6dc1e41d451d'",
             &[],
         )
         .await
@@ -288,7 +292,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
                  FROM lix_file_history \
                  WHERE lixcol_as_of_commit_id = '{commit_id}' \
                    AND lixcol_depth = 0 \
-                   AND id = 'bounded-file'"
+                   AND id = '626f756e-6465-842d-8669-6c6500000000'"
             ),
             &[],
         )
@@ -306,7 +310,10 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     else {
         panic!("ancestor source changes should be JSON");
     };
-    assert_eq!(sources[0]["entity_pk"], json!(["bounded-root"]));
+    assert_eq!(
+        sources[0]["entity_pk"],
+        json!(["863f406b-3ce8-724d-8548-6dc1e41d451d"])
+    );
 
     let (requested_keys, scan_calls, scanned_rows) = storage.counters();
     assert!(
@@ -338,10 +345,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('projection-root', '/workspace/'), \
-                 ('projection-docs', '/workspace/docs/'), \
-                 ('projection-guides', '/workspace/docs/guides/'), \
-                 ('projection-destination', '/destination/')",
+                 ('7813628c-6493-7241-80fe-c63337c5d3f9', '/workspace/'), \
+                 ('e93d7695-7bde-7b9c-8fa1-e84cc0642112', '/workspace/docs/'), \
+                 ('f6105c07-3ce2-7baf-884d-30da343db297', '/workspace/docs/guides/'), \
+                 ('9ddb5236-2a85-74a2-8ae1-1d34ac01b82f', '/destination/')",
                 &[],
             )
             .await
@@ -349,7 +356,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('projection-file', '/workspace/docs/guides/readme.md', X'78')",
+                 VALUES ('70726f6a-6563-8469-8f6e-2d66696c6500', '/workspace/docs/guides/readme.md', X'78')",
                 &[],
             )
             .await
@@ -357,7 +364,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_directory SET name = 'archive' WHERE id = 'projection-root'",
+                "UPDATE lix_directory SET name = 'archive' WHERE id = '7813628c-6493-7241-80fe-c63337c5d3f9'",
                 &[],
             )
             .await
@@ -375,7 +382,7 @@ simulation_test!(
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'projection-file'"
+                       AND id = '70726f6a-6563-8469-8f6e-2d66696c6500'"
                 ),
                 &[],
             )
@@ -393,7 +400,10 @@ simulation_test!(
             panic!("rename sources should be JSON");
         };
         assert_eq!(rename_sources.as_array().map(Vec::len), Some(1));
-        assert_eq!(rename_sources[0]["entity_pk"], json!(["projection-root"]));
+        assert_eq!(
+            rename_sources[0]["entity_pk"],
+            json!(["7813628c-6493-7241-80fe-c63337c5d3f9"])
+        );
 
         let renamed_directory = session
             .execute(
@@ -402,7 +412,7 @@ simulation_test!(
                      FROM lix_directory_history \
                      WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'projection-guides'"
+                       AND id = 'f6105c07-3ce2-7baf-884d-30da343db297'"
                 ),
                 &[],
             )
@@ -418,7 +428,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_directory \
                  SET path = '/destination/archive/' \
-                 WHERE id = 'projection-root'",
+                 WHERE id = '7813628c-6493-7241-80fe-c63337c5d3f9'",
                 &[],
             )
             .await
@@ -435,7 +445,7 @@ simulation_test!(
                     "SELECT path FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{move_commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'projection-file'"
+                       AND id = '70726f6a-6563-8469-8f6e-2d66696c6500'"
                 ),
                 &[],
             )
@@ -465,8 +475,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('grouped-root', '/grouped/'), \
-                 ('grouped-child', '/grouped/child/')",
+                 ('945ddc79-6ca8-7a97-8ece-ecbde7f1358e', '/grouped/'), \
+                 ('46d97a70-d3ec-7d27-8b28-8c62f72869dd', '/grouped/child/')",
                 &[],
             )
             .await
@@ -474,7 +484,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('grouped-file', '/grouped/child/file.txt', X'78')",
+                 VALUES ('67726f75-7065-842d-8669-6c6500000000', '/grouped/child/file.txt', X'78')",
                 &[],
             )
             .await
@@ -486,21 +496,21 @@ simulation_test!(
             .expect("grouped transaction should begin");
         transaction
             .execute(
-                "UPDATE lix_directory SET name = 'renamed-root' WHERE id = 'grouped-root'",
+                "UPDATE lix_directory SET name = 'renamed-root' WHERE id = '945ddc79-6ca8-7a97-8ece-ecbde7f1358e'",
                 &[],
             )
             .await
             .expect("root rename should stage");
         transaction
             .execute(
-                "UPDATE lix_directory SET name = 'renamed-child' WHERE id = 'grouped-child'",
+                "UPDATE lix_directory SET name = 'renamed-child' WHERE id = '46d97a70-d3ec-7d27-8b28-8c62f72869dd'",
                 &[],
             )
             .await
             .expect("child rename should stage");
         transaction
             .execute(
-                "UPDATE lix_file SET name = 'renamed.txt' WHERE id = 'grouped-file'",
+                "UPDATE lix_file SET name = 'renamed.txt' WHERE id = '67726f75-7065-842d-8669-6c6500000000'",
                 &[],
             )
             .await
@@ -522,7 +532,7 @@ simulation_test!(
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'grouped-file'"
+                       AND id = '67726f75-7065-842d-8669-6c6500000000'"
                 ),
                 &[],
             )
@@ -547,7 +557,11 @@ simulation_test!(
             .collect::<BTreeSet<_>>();
         assert_eq!(
             source_ids,
-            BTreeSet::from(["grouped-root", "grouped-child", "grouped-file"])
+            BTreeSet::from([
+                "945ddc79-6ca8-7a97-8ece-ecbde7f1358e",
+                "46d97a70-d3ec-7d27-8b28-8c62f72869dd",
+                "67726f75-7065-842d-8669-6c6500000000"
+            ])
         );
 
         let directory_row = session
@@ -557,7 +571,7 @@ simulation_test!(
                      FROM lix_directory_history \
                      WHERE lixcol_as_of_commit_id = '{commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'grouped-child'"
+                       AND id = '46d97a70-d3ec-7d27-8b28-8c62f72869dd'"
                 ),
                 &[],
             )
@@ -587,21 +601,21 @@ simulation_test!(
         );
         main.execute(
             "INSERT INTO lix_directory (id, path) VALUES \
-             ('ancestor-sibling-root', '/before/'), \
-             ('ancestor-sibling-child', '/before/child/')",
+             ('7afd096d-2680-7fd4-8467-c866b7474f8d', '/before/'), \
+             ('dd2d37ad-1bd0-7592-855e-9fcd50a55e1a', '/before/child/')",
             &[],
         )
         .await
         .expect("sibling directories should insert");
         main.execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('ancestor-sibling-file', '/before/child/file.txt', X'78')",
+             VALUES ('616e6365-7374-8f72-8d73-69626c696e00', '/before/child/file.txt', X'78')",
             &[],
         )
         .await
         .expect("sibling file should insert");
         main.create_branch(CreateBranchOptions {
-            id: Some("ancestor-sibling-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000b".to_string()),
             name: "Ancestor sibling draft".to_string(),
             from_commit_id: None,
         })
@@ -609,14 +623,14 @@ simulation_test!(
         .expect("sibling branch should create");
         let draft = sim.wrap_session(
             engine
-                .open_session("ancestor-sibling-draft")
+                .open_session("01930000-0000-7000-8000-00000000000b")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
 
         main.execute(
-            "UPDATE lix_directory SET name = 'same' WHERE id = 'ancestor-sibling-root'",
+            "UPDATE lix_directory SET name = 'same' WHERE id = '7afd096d-2680-7fd4-8467-c866b7474f8d'",
             &[],
         )
         .await
@@ -628,19 +642,19 @@ simulation_test!(
             .expect("main sibling should exist");
         draft
             .execute(
-                "UPDATE lix_directory SET name = 'same' WHERE id = 'ancestor-sibling-root'",
+                "UPDATE lix_directory SET name = 'same' WHERE id = '7afd096d-2680-7fd4-8467-c866b7474f8d'",
                 &[],
             )
             .await
             .expect("draft ancestor rename should succeed");
         let draft_sibling = engine
-            .load_branch_head_commit_id("ancestor-sibling-draft")
+            .load_branch_head_commit_id("01930000-0000-7000-8000-00000000000b")
             .await
             .expect("draft sibling should load")
             .expect("draft sibling should exist");
         let receipt = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "ancestor-sibling-draft".to_string(),
+                source_branch_id: "01930000-0000-7000-8000-00000000000b".to_string(),
             })
             .await
             .expect("convergent ancestor renames should merge");
@@ -655,7 +669,7 @@ simulation_test!(
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
                        AND lixcol_depth = 1 \
-                       AND id = 'ancestor-sibling-file' \
+                       AND id = '616e6365-7374-8f72-8d73-69626c696e00' \
                      ORDER BY lixcol_observed_commit_id"
                 ),
                 &[],
@@ -699,8 +713,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('restore-root', '/restore/'), \
-                 ('restore-child', '/restore/child/')",
+                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restore/'), \
+                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restore/child/')",
                 &[],
             )
             .await
@@ -708,13 +722,16 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('restore-file', '/restore/child/file.txt', X'78')",
+                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restore/child/file.txt', X'78')",
                 &[],
             )
             .await
             .expect("restore file should insert");
         session
-            .execute("DELETE FROM lix_directory WHERE id = 'restore-root'", &[])
+            .execute(
+                "DELETE FROM lix_directory WHERE id = 'e800ebc8-3b94-759f-8aa3-07fcaadc46a3'",
+                &[],
+            )
             .await
             .expect("recursive delete should succeed");
         let delete_commit_id = engine
@@ -730,7 +747,7 @@ simulation_test!(
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'restore-file'"
+                       AND id = '72657374-6f72-852d-8669-6c6500000000'"
                 ),
                 &[],
             )
@@ -753,7 +770,10 @@ simulation_test!(
             .collect::<BTreeSet<_>>();
         assert_eq!(
             deleted_directory_ids,
-            BTreeSet::from(["restore-root", "restore-child"])
+            BTreeSet::from([
+                "e800ebc8-3b94-759f-8aa3-07fcaadc46a3",
+                "262b5268-af6a-7225-8de7-5619a47c547a"
+            ])
         );
 
         let mut transaction = session
@@ -763,8 +783,8 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('restore-root', '/restored/'), \
-                 ('restore-child', '/restored/child/')",
+                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restored/'), \
+                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restored/child/')",
                 &[],
             )
             .await
@@ -772,7 +792,7 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('restore-file', '/restored/child/file.txt', X'79')",
+                 VALUES ('72657374-6f72-852d-8669-6c6500000000', '/restored/child/file.txt', X'79')",
                 &[],
             )
             .await
@@ -793,7 +813,7 @@ simulation_test!(
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{restore_commit_id}' \
                        AND lixcol_depth = 0 \
-                       AND id = 'restore-file'"
+                       AND id = '72657374-6f72-852d-8669-6c6500000000'"
                 ),
                 &[],
             )
@@ -823,7 +843,10 @@ simulation_test!(
             .collect::<BTreeSet<_>>();
         assert_eq!(
             restored_directory_ids,
-            BTreeSet::from(["restore-root", "restore-child"])
+            BTreeSet::from([
+                "e800ebc8-3b94-759f-8aa3-07fcaadc46a3",
+                "262b5268-af6a-7225-8de7-5619a47c547a"
+            ])
         );
     }
 );
@@ -843,7 +866,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-file', '/docs/guides/readme.md', X'68656C6C6F')",
+                 VALUES ('68697374-6f72-892d-8669-6c6500000000', '/docs/guides/readme.md', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -858,7 +881,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file \
                  SET path = '/docs/readme-renamed.md' \
-                 WHERE id = 'history-file'",
+                 WHERE id = '68697374-6f72-892d-8669-6c6500000000'",
                 &[],
             )
             .await
@@ -881,7 +904,7 @@ simulation_test!(
                  ORDER BY lixcol_depth",
                 &[
                     Value::Text(second_commit_id.clone()),
-                    Value::Text("history-file".to_string()),
+                    Value::Text("68697374-6f72-892d-8669-6c6500000000".to_string()),
                     Value::Text("/docs/%".to_string()),
                 ],
             )
@@ -896,7 +919,7 @@ simulation_test!(
             result,
             vec![
                 vec![
-                    Value::Text("history-file".to_string()),
+                    Value::Text("68697374-6f72-892d-8669-6c6500000000".to_string()),
                     Value::Text("/docs/readme-renamed.md".to_string()),
                     Value::Text("readme-renamed.md".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
@@ -904,7 +927,7 @@ simulation_test!(
                     Value::Integer(0),
                 ],
                 vec![
-                    Value::Text("history-file".to_string()),
+                    Value::Text("68697374-6f72-892d-8669-6c6500000000".to_string()),
                     Value::Text("/docs/guides/readme.md".to_string()),
                     Value::Text("readme.md".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
@@ -928,7 +951,7 @@ simulation_test!(
         assert_rows_eq(
             old_path_result,
             vec![vec![
-                Value::Text("history-file".to_string()),
+                Value::Text("68697374-6f72-892d-8669-6c6500000000".to_string()),
                 Value::Text("/docs/guides/readme.md".to_string()),
                 Value::Integer(1),
             ]],
@@ -940,7 +963,7 @@ simulation_test!(
                     "SELECT lixcol_source_changes \
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id = 'history-file' \
+                       AND id = '68697374-6f72-892d-8669-6c6500000000' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -1041,13 +1064,13 @@ simulation_test!(
         );
         main.execute(
             "INSERT INTO lix_file (id, path, data) \
-             VALUES ('diamond-file', '/before.md', X'62617365')",
+             VALUES ('6469616d-6f6e-842d-8669-6c6500000000', '/before.md', X'62617365')",
             &[],
         )
         .await
         .expect("base file should insert");
         main.create_branch(CreateBranchOptions {
-            id: Some("diamond-draft".to_string()),
+            id: Some("01930000-0000-7000-8000-00000000000c".to_string()),
             name: "Diamond draft".to_string(),
             from_commit_id: None,
         })
@@ -1055,14 +1078,14 @@ simulation_test!(
         .expect("draft branch should be created");
         let draft = sim.wrap_session(
             engine
-                .open_session("diamond-draft")
+                .open_session("01930000-0000-7000-8000-00000000000c")
                 .await
                 .expect("draft session should open"),
             &engine,
         );
 
         main.execute(
-            "UPDATE lix_file SET path = '/same.md' WHERE id = 'diamond-file'",
+            "UPDATE lix_file SET path = '/same.md' WHERE id = '6469616d-6f6e-842d-8669-6c6500000000'",
             &[],
         )
         .await
@@ -1074,20 +1097,20 @@ simulation_test!(
             .expect("main sibling should exist");
         draft
             .execute(
-                "UPDATE lix_file SET path = '/same.md' WHERE id = 'diamond-file'",
+                "UPDATE lix_file SET path = '/same.md' WHERE id = '6469616d-6f6e-842d-8669-6c6500000000'",
                 &[],
             )
             .await
             .expect("draft path update should succeed");
         let draft_sibling = engine
-            .load_branch_head_commit_id("diamond-draft")
+            .load_branch_head_commit_id("01930000-0000-7000-8000-00000000000c")
             .await
             .expect("draft sibling should load")
             .expect("draft sibling should exist");
 
         let receipt = main
             .merge_branch(MergeBranchOptions {
-                source_branch_id: "diamond-draft".to_string(),
+                source_branch_id: "01930000-0000-7000-8000-00000000000c".to_string(),
             })
             .await
             .expect("convergent sibling updates should merge");
@@ -1101,7 +1124,7 @@ simulation_test!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth, lixcol_source_changes \
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
-                       AND id = 'diamond-file' \
+                       AND id = '6469616d-6f6e-842d-8669-6c6500000000' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
                 ),
@@ -1166,7 +1189,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('history-join-dir', '/joined/')",
+                 VALUES ('68697374-6f72-892d-8a6f-696e2d646900', '/joined/')",
                 &[],
             )
             .await
@@ -1174,7 +1197,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-join-file', '/joined/old.txt', X'6F6E65')",
+                 VALUES ('68697374-6f72-892d-8a6f-696e2d666900', '/joined/old.txt', X'6F6E65')",
                 &[],
             )
             .await
@@ -1183,7 +1206,7 @@ simulation_test!(
             .execute(
                 "UPDATE lix_file \
                  SET path = '/joined/new.txt' \
-                 WHERE id = 'history-join-file'",
+                 WHERE id = '68697374-6f72-892d-8a6f-696e2d666900'",
                 &[],
             )
             .await
@@ -1210,9 +1233,9 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("history-join-file".to_string()),
+                Value::Text("68697374-6f72-892d-8a6f-696e2d666900".to_string()),
                 Value::Text("/joined/old.txt".to_string()),
-                Value::Text("history-join-dir".to_string()),
+                Value::Text("68697374-6f72-892d-8a6f-696e2d646900".to_string()),
             ]],
         );
     }
@@ -1231,8 +1254,8 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, data) VALUES \
-                    ('history-in-a', '/history/in-a.txt', X'61'), \
-                    ('history-in-b', '/history/in-b.txt', X'62')",
+                    ('01940000-0000-7000-8000-000000000004', '/history/in-a.txt', X'61'), \
+                    ('01940000-0000-7000-8000-000000000005', '/history/in-b.txt', X'62')",
             &[],
         )
         .await
@@ -1252,8 +1275,8 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
                  ORDER BY id",
             &[
                 Value::Text(commit_id),
-                Value::Text("history-in-b".to_string()),
-                Value::Text("history-in-a".to_string()),
+                Value::Text("01940000-0000-7000-8000-000000000005".to_string()),
+                Value::Text("01940000-0000-7000-8000-000000000004".to_string()),
             ],
         )
         .await
@@ -1263,12 +1286,12 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
         result,
         vec![
             vec![
-                Value::Text("history-in-a".to_string()),
+                Value::Text("01940000-0000-7000-8000-000000000004".to_string()),
                 Value::Text("/history/in-a.txt".to_string()),
                 Value::Blob(b"a".to_vec().into()),
             ],
             vec![
-                Value::Text("history-in-b".to_string()),
+                Value::Text("01940000-0000-7000-8000-000000000005".to_string()),
                 Value::Text("/history/in-b.txt".to_string()),
                 Value::Blob(b"b".to_vec().into()),
             ],
@@ -1291,7 +1314,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('aaa-older-history-file', '/older.txt', X'6F6C646572')",
+                 VALUES ('6161612d-6f6c-8465-822d-686973746f00', '/older.txt', X'6F6C646572')",
                 &[],
             )
             .await
@@ -1299,7 +1322,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('zzz-newer-history-file', '/newer.txt', X'6E65776572')",
+                 VALUES ('7a7a7a2d-6e65-8765-822d-686973746f00', '/newer.txt', X'6E65776572')",
                 &[],
             )
             .await
@@ -1327,7 +1350,7 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("zzz-newer-history-file".to_string()),
+                Value::Text("7a7a7a2d-6e65-8765-822d-686973746f00".to_string()),
                 Value::Text("/newer.txt".to_string()),
                 Value::Integer(0),
             ]],
@@ -1350,9 +1373,9 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) VALUES \
-                    ('aaa-history-noise-1', '/noise/one.txt', X'6F6E65'), \
-                    ('aaa-history-noise-2', '/noise/two.txt', X'74776F'), \
-                    ('zzz-history-target', '/target/three.txt', X'7468726565')",
+                    ('a71ca839-a7d4-7529-899d-470f3e2d56eb', '/noise/one.txt', X'6F6E65'), \
+                    ('4fa4f740-1d46-781f-87b7-8d6347ada462', '/noise/two.txt', X'74776F'), \
+                    ('74242a12-7491-7df8-8cfc-0a484bbfd0cb', '/target/three.txt', X'7468726565')",
                 &[],
             )
             .await
@@ -1380,7 +1403,7 @@ simulation_test!(
         assert_rows_eq(
             result,
             vec![vec![
-                Value::Text("zzz-history-target".to_string()),
+                Value::Text("74242a12-7491-7df8-8cfc-0a484bbfd0cb".to_string()),
                 Value::Text("/target/three.txt".to_string()),
                 Value::Blob(b"three".to_vec().into()),
             ]],
@@ -1401,7 +1424,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
     session
         .execute(
             "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-default-file', '/history-default.txt', X'64656661756C74')",
+                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default.txt', X'64656661756C74')",
             &[],
         )
         .await
@@ -1416,7 +1439,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
         .execute(
             "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
                  FROM lix_file_history \
-                 WHERE id = 'history-default-file'",
+                 WHERE id = '68697374-6f72-892d-8465-6661756c7401'",
             &[],
         )
         .await
@@ -1425,7 +1448,7 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
     assert_rows_eq(
         result,
         vec![vec![
-            Value::Text("history-default-file".to_string()),
+            Value::Text("68697374-6f72-892d-8465-6661756c7401".to_string()),
             Value::Text(active_head),
             Value::Integer(0),
         ]],
@@ -1447,7 +1470,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('ordinary-history-file', '/ordinary-history.txt', X'68656C6C6F')",
+                 VALUES ('6f726469-6e61-8279-8d68-6973746f7200', '/ordinary-history.txt', X'68656C6C6F')",
                 &[],
             )
             .await
@@ -1455,7 +1478,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_key_value (key, value, lixcol_file_id) \
-                 VALUES ('ordinary-sidecar', 'noise', 'ordinary-history-file')",
+                 VALUES ('ordinary-sidecar', 'noise', '6f726469-6e61-8279-8d68-6973746f7200')",
                 &[],
             )
             .await
@@ -1472,7 +1495,7 @@ simulation_test!(
                     "SELECT path, data, lixcol_depth \
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND id = 'ordinary-history-file' \
+                       AND id = '6f726469-6e61-8279-8d68-6973746f7200' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -1506,7 +1529,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('history-file-blob-filter', '/blob-filter.txt', X'626C6F62')",
+                 VALUES ('68697374-6f72-892d-8669-6c652d626c00', '/blob-filter.txt', X'626C6F62')",
                 &[],
             )
             .await
@@ -1514,7 +1537,7 @@ simulation_test!(
         session
             .execute(
                 "UPDATE lix_file SET data = X'626C6F6232' \
-                 WHERE id = 'history-file-blob-filter'",
+                 WHERE id = '68697374-6f72-892d-8669-6c652d626c00'",
                 &[],
             )
             .await
@@ -1531,7 +1554,7 @@ simulation_test!(
                     "SELECT id, path, data, lixcol_source_changes \
                      FROM lix_file_history \
                      WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND id = 'history-file-blob-filter' \
+                       AND id = '68697374-6f72-892d-8669-6c652d626c00' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -1544,7 +1567,7 @@ simulation_test!(
         assert_eq!(
             &latest[..3],
             &[
-                Value::Text("history-file-blob-filter".to_string()),
+                Value::Text("68697374-6f72-892d-8669-6c652d626c00".to_string()),
                 Value::Text("/blob-filter.txt".to_string()),
                 Value::Blob(b"blob2".to_vec().into()),
             ]

@@ -18,7 +18,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_file (id, path, lixcol_metadata) \
-                     VALUES ('metadata-file-insert', '/metadata-file-insert.txt', '{bad')",
+                     VALUES ('6d657461-6461-8461-8d66-696c652d6900', '/6d657461-6461-8461-8d66-696c652d6900.txt', '{bad')",
                     &[],
                 )
                 .await
@@ -28,7 +28,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_file (id, path) \
-                 VALUES ('metadata-file-update', '/metadata-file-update.txt')",
+                 VALUES ('6d657461-6461-8461-8d66-696c652d7500', '/6d657461-6461-8461-8d66-696c652d7500.txt')",
                 &[],
             )
             .await
@@ -39,7 +39,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_file \
                      SET lixcol_metadata = '{bad' \
-                     WHERE id = 'metadata-file-update'",
+                     WHERE id = '6d657461-6461-8461-8d66-696c652d7500'",
                     &[],
                 )
                 .await
@@ -64,7 +64,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                     VALUES ('metadata-dir-insert', '/metadata-dir-insert/', '{bad')",
+                     VALUES ('6d657461-6461-8461-8d64-69722d696e00', '/6d657461-6461-8461-8d64-69722d696e00/', '{bad')",
                     &[],
                 )
                 .await
@@ -74,7 +74,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('metadata-dir-update', '/metadata-dir-update/')",
+                 VALUES ('6d657461-6461-8461-8d64-69722d757000', '/6d657461-6461-8461-8d64-69722d757000/')",
                 &[],
             )
             .await
@@ -85,7 +85,7 @@ simulation_test!(
                 .execute(
                     "UPDATE lix_directory \
                      SET lixcol_metadata = '{bad' \
-                     WHERE id = 'metadata-dir-update'",
+                     WHERE id = '6d657461-6461-8461-8d64-69722d757000'",
                     &[],
                 )
                 .await
@@ -106,11 +106,11 @@ simulation_test!(
             &engine,
         );
 
-        let file_metadata = json!({"source": "file-narrow"});
+        let file_metadata = json!({"source": "66696c65-2d6e-8172-826f-770000000000"});
         session
             .execute(
                 "INSERT INTO lix_file (id, path, lixcol_metadata) \
-                 VALUES ('metadata-narrow-file', '/metadata-narrow-file.txt', $1)",
+                 VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700.txt', $1)",
                 &[Value::Json(file_metadata.clone())],
             )
             .await
@@ -120,18 +120,18 @@ simulation_test!(
             .execute(
                 "SELECT id, lixcol_metadata \
                  FROM lix_file \
-                 WHERE id = 'metadata-narrow-file'",
+                 WHERE id = '6d657461-6461-8461-8d6e-6172726f7700'",
                 &[],
             )
             .await
             .expect("narrow file metadata read should succeed");
         assert_metadata_value(file_result, "lixcol_metadata", &file_metadata);
 
-        let directory_metadata = json!({"source": "directory-narrow"});
+        let directory_metadata = json!({"source": "64697265-6374-8f72-892d-6e6172726f00"});
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                 VALUES ('metadata-narrow-dir', '/metadata-narrow-dir/', $1)",
+                 VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700/', $1)",
                 &[Value::Json(directory_metadata.clone())],
             )
             .await
@@ -141,7 +141,7 @@ simulation_test!(
             .execute(
                 "SELECT path, lixcol_metadata \
                  FROM lix_directory \
-                 WHERE id = 'metadata-narrow-dir'",
+                 WHERE id = '6d657461-6461-8461-8d6e-6172726f7700'",
                 &[],
             )
             .await

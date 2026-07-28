@@ -600,7 +600,12 @@ pub(super) fn entity_pks_from_primary_key_filters(
     }
 
     Ok(constraint
-        .and_then(|constraint| constraint.into_entity_pks(&analyzer.primary_key_columns))
+        .and_then(|constraint| {
+            constraint.into_entity_pks(
+                &analyzer.primary_key_columns,
+                &analyzer.primary_key_component_types,
+            )
+        })
         .map(|ids| ids.into_iter().collect()))
 }
 
@@ -647,6 +652,7 @@ fn apply_exact_branch_id_filter(
 
 pub(super) struct EntityPrimaryKeyFilterAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
+    primary_key_component_types: Vec<crate::entity_pk::EntityPkComponentType>,
 }
 
 struct EntityRowFilterAnalyzer<'a> {
@@ -740,6 +746,7 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
     pub(super) fn new(spec: &'a EntitySurfaceSpec) -> Self {
         Self {
             primary_key_columns: string_primary_key_columns(spec),
+            primary_key_component_types: spec.primary_key_component_types.clone(),
         }
     }
 
@@ -760,7 +767,10 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
         let Some(constraint) = self.analyze_constraint(expr)? else {
             return Ok(None);
         };
-        Ok(constraint.into_entity_pks(&self.primary_key_columns))
+        Ok(
+            constraint
+                .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types),
+        )
     }
 
     /// Extracts identity constraints that are guaranteed conjuncts while
@@ -805,10 +815,14 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
                 let Some(right) = self.analyze_constraint(&binary_expr.right)? else {
                     return Ok(None);
                 };
-                let Some(left_ids) = left.into_entity_pks(&self.primary_key_columns) else {
+                let Some(left_ids) = left
+                    .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                else {
                     return Ok(None);
                 };
-                let Some(mut right_ids) = right.into_entity_pks(&self.primary_key_columns) else {
+                let Some(mut right_ids) = right
+                    .into_entity_pks(&self.primary_key_columns, &self.primary_key_component_types)
+                else {
                     return Ok(None);
                 };
                 right_ids.extend(left_ids);
@@ -817,10 +831,12 @@ impl<'a> EntityPrimaryKeyFilterAnalyzer<'a> {
             Expr::BinaryExpr(binary_expr) => Ok(entity_pk_constraint_from_binary_filter(
                 binary_expr,
                 &self.primary_key_columns,
+                &self.primary_key_component_types,
             )),
             Expr::InList(in_list) => Ok(entity_pk_constraint_from_in_list_filter(
                 in_list,
                 &self.primary_key_columns,
+                &self.primary_key_component_types,
             )),
             _ => Ok(None),
         }
@@ -862,10 +878,16 @@ impl EntityPkConstraint {
         }
     }
 
-    fn into_entity_pks(self, primary_key_columns: &[&str]) -> Option<BTreeSet<EntityPk>> {
+    fn into_entity_pks(
+        self,
+        primary_key_columns: &[&str],
+        component_types: &[crate::entity_pk::EntityPkComponentType],
+    ) -> Option<BTreeSet<EntityPk>> {
         match self {
             Self::Full(ids) => Some(ids),
-            Self::Parts(parts) => entity_pks_from_primary_key_parts(primary_key_columns, parts),
+            Self::Parts(parts) => {
+                entity_pks_from_primary_key_parts(primary_key_columns, component_types, parts)
+            }
         }
     }
 }
@@ -1131,6 +1153,7 @@ fn string_primary_key_columns(spec: &EntitySurfaceSpec) -> Vec<&str> {
 fn entity_pk_constraint_from_binary_filter(
     binary_expr: &BinaryExpr,
     primary_key_columns: &[&str],
+    component_types: &[crate::entity_pk::EntityPkComponentType],
 ) -> Option<EntityPkConstraint> {
     if binary_expr.op != Operator::Eq {
         return None;
@@ -1139,12 +1162,14 @@ fn entity_pk_constraint_from_binary_filter(
         &binary_expr.left,
         &binary_expr.right,
         primary_key_columns,
+        component_types,
     )
     .or_else(|| {
         entity_pk_constraint_from_column_literal_filter(
             &binary_expr.right,
             &binary_expr.left,
             primary_key_columns,
+            component_types,
         )
     })
 }
@@ -1152,6 +1177,7 @@ fn entity_pk_constraint_from_binary_filter(
 fn entity_pk_constraint_from_in_list_filter(
     in_list: &InList,
     primary_key_columns: &[&str],
+    component_types: &[crate::entity_pk::EntityPkComponentType],
 ) -> Option<EntityPkConstraint> {
     if in_list.negated {
         return None;
@@ -1170,7 +1196,10 @@ fn entity_pk_constraint_from_in_list_filter(
     match column.name.as_str() {
         "lixcol_entity_pk" => values
             .into_iter()
-            .map(|value| EntityPk::from_json_array_text(&value).ok())
+            .map(|value| {
+                let parts = EntityPk::from_json_array_text(&value).ok()?.into_parts();
+                EntityPk::from_external_parts(parts, component_types).ok()
+            })
             .collect::<Option<BTreeSet<_>>>()
             .map(EntityPkConstraint::Full),
         column_name if primary_key_columns.contains(&column_name) => {
@@ -1187,6 +1216,7 @@ fn entity_pk_constraint_from_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
     primary_key_columns: &[&str],
+    component_types: &[crate::entity_pk::EntityPkComponentType],
 ) -> Option<EntityPkConstraint> {
     let Expr::Column(column) = column_expr else {
         return None;
@@ -1195,6 +1225,9 @@ fn entity_pk_constraint_from_column_literal_filter(
     match column.name.as_str() {
         "lixcol_entity_pk" => EntityPk::from_json_array_text(&value)
             .ok()
+            .and_then(|identity| {
+                EntityPk::from_external_parts(identity.into_parts(), component_types).ok()
+            })
             .map(|identity| EntityPkConstraint::Full(BTreeSet::from([identity]))),
         column_name if primary_key_columns.contains(&column_name) => {
             Some(EntityPkConstraint::Parts(BTreeMap::from([(
@@ -1208,6 +1241,7 @@ fn entity_pk_constraint_from_column_literal_filter(
 
 fn entity_pks_from_primary_key_parts(
     primary_key_columns: &[&str],
+    component_types: &[crate::entity_pk::EntityPkComponentType],
     parts: BTreeMap<String, BTreeSet<String>>,
 ) -> Option<BTreeSet<EntityPk>> {
     if primary_key_columns
@@ -1234,7 +1268,10 @@ fn entity_pks_from_primary_key_parts(
     Some(
         identities
             .into_iter()
-            .map(|parts| EntityPk { parts })
+            .map(|parts| {
+                EntityPk::from_external_parts(parts, component_types)
+                    .expect("schema primary-key projection contains at least one part")
+            })
             .collect(),
     )
 }
@@ -1244,17 +1281,16 @@ fn identity_matches_parts(
     primary_key_columns: &[&str],
     parts: &BTreeMap<String, BTreeSet<String>>,
 ) -> bool {
-    let identity_parts = identity.parts.as_slice();
-    if identity_parts.len() != primary_key_columns.len() {
+    if identity.components.len() != primary_key_columns.len() {
         return false;
     }
     primary_key_columns
         .iter()
-        .zip(identity_parts.iter())
-        .all(|(column, value)| {
+        .zip(identity.components.iter())
+        .all(|(column, component)| {
             parts
                 .get(*column)
-                .is_none_or(|values| values.contains(value))
+                .is_none_or(|values| values.contains(&component.external_string()))
         })
 }
 
@@ -1685,7 +1721,7 @@ mod tests {
     impl crate::sql2::SqlWriteExecutionContext for DummyWriteContext {
         #[expect(clippy::unnecessary_literal_bound)]
         fn active_branch_id(&self) -> &str {
-            "branch-a"
+            "01920000-0000-7000-8000-0000000000a1"
         }
 
         fn functions(&self) -> crate::functions::FunctionProviderHandle {
@@ -1786,7 +1822,7 @@ mod tests {
             ),
             metadata: Some(json!({"source": "test"}).to_string()),
             deleted: false,
-            branch_id: "branch-a".into(),
+            branch_id: "01920000-0000-7000-8000-0000000000a1".into(),
             change_id: Some(ChangeId::for_test_label("change-a")),
             commit_id: Some(CommitId::for_test_label("commit-a")),
             global: false,
@@ -2151,7 +2187,7 @@ mod tests {
                 .downcast_ref::<datafusion::arrow::array::StringArray>()
                 .expect("branch id is string")
                 .value(0),
-            "branch-a"
+            "01920000-0000-7000-8000-0000000000a1"
         );
     }
 

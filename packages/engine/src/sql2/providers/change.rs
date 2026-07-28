@@ -312,7 +312,8 @@ fn commit_record_canonical_change(
             .expect("lix_commit snapshot serialization should not fail");
     crate::commit_graph::CommitGraphChange {
         id: commit.change_id,
-        entity_pk: crate::entity_pk::EntityPk::single(commit.commit_id),
+        entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(&commit.commit_id.to_string())
+            .expect("commit IDs are canonical UUIDs"),
         schema_key: "lix_commit".to_string(),
         file_id: None,
         snapshot: crate::json_store::JsonSlot::from_json(&snapshot_content),
