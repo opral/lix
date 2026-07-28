@@ -153,16 +153,6 @@ where
         ))
     }
 
-    #[cfg(test)]
-    pub(crate) async fn scan_rows(
-        &self,
-        request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_batch(request)
-            .await
-            .map(MaterializedLiveStateBatch::into_rows)
-    }
-
     pub(crate) async fn scan_batch(
         &self,
         request: &LiveStateScanRequest,
@@ -340,17 +330,6 @@ where
             })
             .await?;
         Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
-    }
-
-    /// Loads exact visible identities without lowering correlated row keys to
-    /// independent scan dimensions.
-    pub(crate) async fn load_exact_rows(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        self.load_exact_batch(request)
-            .await
-            .map(MaterializedLiveStateExactBatch::into_rows)
     }
 
     pub(crate) async fn load_exact_batch(
@@ -1421,8 +1400,9 @@ mod tests {
                     .await
                     .expect("open normal scan read"),
             )
-            .scan_rows(request)
+            .scan_batch(request)
             .await
+            .map(MaterializedLiveStateBatch::into_rows)
     }
 
     async fn scan_direct_entity_snapshots_for_test(
@@ -2537,7 +2517,7 @@ mod tests {
                     .await
                     .expect("read should reopen"),
             )
-            .load_exact_rows(&LiveStateExactBatchRequest {
+            .load_exact_batch(&LiveStateExactBatchRequest {
                 rows: vec![
                     selected.clone(),
                     selected,
@@ -2554,7 +2534,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("exact batch should load");
+            .expect("exact batch should load")
+            .into_rows();
 
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0], rows[1]);
@@ -3238,7 +3219,7 @@ mod tests {
                 .expect("read should reopen"),
         );
         let loaded = reader
-            .load_exact_rows(&LiveStateExactBatchRequest {
+            .load_exact_batch(&LiveStateExactBatchRequest {
                 rows: vec![
                     exact("fallback", "fallback"),
                     exact("overridden", "overridden"),
@@ -3254,7 +3235,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("exact tracked batch should load");
+            .expect("exact tracked batch should load")
+            .into_rows();
 
         let fallback = loaded[0].as_ref().expect("global fallback should load");
         assert!(fallback.global);
@@ -3285,13 +3267,14 @@ mod tests {
         assert_eq!(loaded[6], None);
 
         let tombstone = reader
-            .load_exact_rows(&LiveStateExactBatchRequest {
+            .load_exact_batch(&LiveStateExactBatchRequest {
                 rows: vec![exact("hidden", "hidden")],
                 include_tombstones: true,
                 ..Default::default()
             })
             .await
             .expect("exact tombstone read should load")
+            .into_rows()
             .pop()
             .flatten()
             .expect("tombstone should be returned when requested");
@@ -3518,7 +3501,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows(&LiveStateScanRequest {
+            .scan_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec!["lix_key_value".to_string()],
                     entity_pks: vec![crate::entity_pk::EntityPk::single("selected-tab")],
@@ -3530,6 +3513,7 @@ mod tests {
                 ..LiveStateScanRequest::default()
             })
             .await
+            .map(MaterializedLiveStateBatch::into_rows)
     }
 
     async fn scan_tracked_root(

@@ -51,9 +51,9 @@ pub(crate) async fn load_workspace_branch_id_from_index(
     branch_ctx: &BranchContext,
     reader: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<String, LixError> {
-    let mut rows = live_state
+    let rows = live_state
         .reader(reader)
-        .load_exact_rows(&LiveStateExactBatchRequest {
+        .load_exact_batch(&LiveStateExactBatchRequest {
             rows: vec![LiveStateExactRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -67,18 +67,21 @@ pub(crate) async fn load_workspace_branch_id_from_index(
             include_tombstones: false,
         })
         .await?;
-    let row = rows.pop().flatten().ok_or_else(|| {
+    let row = rows.row(0).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "workspace branch selector is missing lix_key_value:lix_workspace_branch_id",
         )
     })?;
-    let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "workspace branch selector is missing snapshot_content",
-        )
-    })?;
+    let snapshot_content = row
+        .snapshot_content()
+        .map(|value| value.as_ref())
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "workspace branch selector is missing snapshot_content",
+            )
+        })?;
     let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",

@@ -3411,7 +3411,7 @@ mod tests {
                     .await
                     .expect("read should open"),
             )
-            .scan_rows(&crate::live_state::LiveStateScanRequest {
+            .scan_batch(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec!["lix_commit".to_string()],
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
@@ -3420,7 +3420,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("derived commit rows should scan");
+            .expect("derived commit rows should scan")
+            .into_rows();
         assert!(
             derived_commit_rows
                 .iter()
@@ -4383,7 +4384,7 @@ mod tests {
                     .expect("counted scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_rows(&crate::live_state::LiveStateScanRequest {
+            .scan_batch(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
                     schema_keys: vec!["test_schema".to_string()],
@@ -4393,7 +4394,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("tracked scan should succeed");
+            .expect("tracked scan should succeed")
+            .into_rows();
         assert_eq!(scanned.len(), 1);
         assert_eq!(scanned[0].change_id, Some(change_id("tracked-head-change")));
         assert!(
@@ -4456,7 +4458,7 @@ mod tests {
                     .expect("counted exact batch read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .load_exact_rows(&LiveStateExactBatchRequest {
+            .load_exact_batch(&LiveStateExactBatchRequest {
                 rows: vec![LiveStateExactRowRequest {
                     schema_key: "test_schema".to_string(),
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
@@ -4468,7 +4470,8 @@ mod tests {
                 include_tombstones: false,
             })
             .await
-            .expect("exact tracked batch should succeed");
+            .expect("exact tracked batch should succeed")
+            .into_rows();
         assert!(matches!(
             exact_rows.as_slice(),
             [Some(row)] if row.change_id == Some(change_id("tracked-head-change"))
@@ -4833,7 +4836,7 @@ mod tests {
                     .expect("counted branch scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_rows(&crate::live_state::LiveStateScanRequest {
+            .scan_batch(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
@@ -4843,7 +4846,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("branch tracked scan should succeed");
+            .expect("branch tracked scan should succeed")
+            .into_rows();
         assert_eq!(
             scanned.len(),
             2,
@@ -4925,7 +4929,7 @@ mod tests {
                     .expect("counted tombstone scan read should open"),
                 counts: Arc::clone(&counts),
             }))
-            .scan_rows(&crate::live_state::LiveStateScanRequest {
+            .scan_batch(&crate::live_state::LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
                     schema_keys: vec!["test_schema".to_string()],
@@ -4935,7 +4939,8 @@ mod tests {
                 ..Default::default()
             })
             .await
-            .expect("branch tombstone scan should succeed");
+            .expect("branch tombstone scan should succeed")
+            .into_rows();
         assert_eq!(
             scanned.len(),
             1,
