@@ -4720,16 +4720,6 @@ where
         Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
     }
 
-    #[cfg(test)]
-    async fn load_exact_rows(
-        &self,
-        request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        Ok(overlay_load_exact_batch(&self.base, &self.staged, request)
-            .await?
-            .into_rows())
-    }
-
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,

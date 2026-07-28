@@ -483,7 +483,7 @@ async fn load_branch_rows_scoped(
 ) -> Result<Vec<BranchRow>, LixError> {
     let entity_pks = match descriptor_scope {
         BranchDescriptorScope::All => Vec::new(),
-        BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new()),
+        BranchDescriptorScope::Ids(ids) if ids.is_empty() => return Ok(Vec::new().into()),
         BranchDescriptorScope::Ids(ids) => ids
             .into_iter()
             .map(|id| {
@@ -1005,18 +1005,18 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self.rows.clone())
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            Ok(self.rows.clone().into())
         }
 
         async fn load_row(
@@ -1042,17 +1042,17 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RoutingLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             self.requests.lock().unwrap().push(request.clone());
             Ok(self
                 .rows
@@ -1062,7 +1062,8 @@ mod tests {
                         || request.filter.entity_pks.contains(&row.entity_pk)
                 })
                 .cloned()
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(

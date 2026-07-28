@@ -172,31 +172,33 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for SplitCurrentAndTrackedReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(row_matches(&self.canonical, request)
                 .then(|| self.canonical.clone())
                 .into_iter()
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
-        async fn scan_tracked_rows(
+        async fn scan_tracked_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(row_matches(&self.tracked, request)
                 .then(|| self.tracked.clone())
                 .into_iter()
-                .collect())
+                .collect::<Vec<_>>()
+                .into())
         }
 
         async fn load_row(

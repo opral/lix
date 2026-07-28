@@ -777,41 +777,42 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::Relaxed);
-            Ok(self
-                .rows
-                .iter()
-                .filter(|row| {
-                    request.filter.schema_keys.is_empty()
-                        || request.filter.schema_keys.contains(&row.schema_key)
-                })
-                .filter(|row| {
-                    request.filter.branch_ids.is_empty()
-                        || request
+            Ok(MaterializedLiveStateBatch::from_rows(
+                self.rows
+                    .iter()
+                    .filter(|row| {
+                        request.filter.schema_keys.is_empty()
+                            || request.filter.schema_keys.contains(&row.schema_key)
+                    })
+                    .filter(|row| {
+                        request.filter.branch_ids.is_empty()
+                            || request
+                                .filter
+                                .branch_ids
+                                .iter()
+                                .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
+                    })
+                    .filter(|row| {
+                        request
                             .filter
-                            .branch_ids
-                            .iter()
-                            .any(|branch_id| branch_id.as_str() == row.branch_id.as_ref())
-                })
-                .filter(|row| {
-                    request
-                        .filter
-                        .untracked
-                        .is_none_or(|untracked| row.untracked == untracked)
-                })
-                .cloned()
-                .collect())
+                            .untracked
+                            .is_none_or(|untracked| row.untracked == untracked)
+                    })
+                    .cloned()
+                    .collect(),
+            ))
         }
 
         async fn load_row(

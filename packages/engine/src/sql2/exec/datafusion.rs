@@ -1598,7 +1598,7 @@ fn datafusion_filters_from_predicate(
     params: &[Value],
 ) -> Result<Vec<Expr>, LixError> {
     match predicate {
-        BoundPredicate::True => Ok(Vec::new()),
+        BoundPredicate::True => Ok(Vec::new().into()),
         BoundPredicate::False => Ok(vec![Expr::Literal(ScalarValue::Boolean(Some(false)), None)]),
         BoundPredicate::And(predicates) => {
             let mut filters = Vec::new();
@@ -1612,7 +1612,7 @@ fn datafusion_filters_from_predicate(
         BoundPredicate::Or(predicates) => {
             let mut iter = predicates.iter();
             let Some(first) = iter.next() else {
-                return Ok(Vec::new());
+                return Ok(Vec::new().into());
             };
             let mut expr = datafusion_single_filter_from_predicate(session, schema, first, params)?;
             for predicate in iter {
@@ -2782,7 +2782,7 @@ mod tests {
             &mut self,
             _head_commit_id: &CommitId,
         ) -> Result<Vec<ReachableCommitGraphCommit>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
 
         async fn change_history_from_commit(
@@ -2790,24 +2790,24 @@ mod tests {
             _start_commit_id: &CommitId,
             _request: &CommitGraphChangeHistoryRequest,
         ) -> Result<Vec<CommitGraphChangeHistoryEntry>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
     }
 
     #[async_trait]
     impl LiveStateReader for DummyLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(vec![])
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            Ok(vec![].into())
         }
 
         async fn load_row(
@@ -2865,18 +2865,18 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(filter_live_state_rows(&self.rows, request))
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            Ok(filter_live_state_rows(&self.rows, request).into())
         }
 
         async fn load_row(
@@ -2889,22 +2889,22 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CapturingRowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             self.requests
                 .lock()
                 .expect("captured live-state requests lock")
                 .push(request.clone());
-            Ok(filter_live_state_rows(&self.rows, request))
+            Ok(filter_live_state_rows(&self.rows, request).into())
         }
 
         async fn load_row(
@@ -2917,19 +2917,19 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for CountingRowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             self.scans.fetch_add(1, Ordering::SeqCst);
-            Ok(filter_live_state_rows(&self.rows, request))
+            Ok(filter_live_state_rows(&self.rows, request).into())
         }
 
         async fn load_row(

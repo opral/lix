@@ -8497,7 +8497,7 @@ mod tests {
         }
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
 
         async fn load_bytes_many(
@@ -8602,7 +8602,7 @@ mod tests {
         }
 
         fn list_visible_schemas(&self) -> Result<Vec<JsonValue>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
 
         async fn load_bytes_many(
@@ -8700,15 +8700,15 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for RecordingLiveStateReader {
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             self.scan_requests
                 .lock()
                 .expect("live-state request mutex should not be poisoned")
                 .push(request.clone());
-            Ok(self.rows.clone())
+            Ok(self.rows.clone().into())
         }
 
         async fn load_row(
@@ -8718,10 +8718,10 @@ mod tests {
             Ok(None)
         }
 
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
             let mut recorded = LiveStateScanRequest {
                 filter: LiveStateFilter {
                     branch_ids: request
@@ -8770,59 +8770,62 @@ mod tests {
                 .expect("live-state request mutex should not be poisoned")
                 .push(recorded);
 
-            Ok(request
-                .rows
-                .iter()
-                .map(|requested| {
-                    let exact_match = |row: &&MaterializedLiveStateRow| {
-                        row.schema_key == requested.schema_key
-                            && row.entity_pk == requested.entity_pk
-                            && row.file_id == requested.file_id
-                            && request
-                                .untracked
-                                .is_none_or(|untracked| row.untracked == untracked)
-                    };
-                    let mut row = self
+            Ok(
+                crate::live_state::MaterializedLiveStateExactBatch::from_rows(
+                    request
                         .rows
                         .iter()
-                        .filter(exact_match)
-                        .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
-                        .or_else(|| {
-                            self.rows
+                        .map(|requested| {
+                            let exact_match = |row: &&MaterializedLiveStateRow| {
+                                row.schema_key == requested.schema_key
+                                    && row.entity_pk == requested.entity_pk
+                                    && row.file_id == requested.file_id
+                                    && request
+                                        .untracked
+                                        .is_none_or(|untracked| row.untracked == untracked)
+                            };
+                            let mut row = self
+                                .rows
                                 .iter()
                                 .filter(exact_match)
-                                .find(|row| row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID)
-                        })?
-                        .clone();
-                    if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
-                        && requested.branch_id != crate::GLOBAL_BRANCH_ID
-                    {
-                        row.branch_id = requested.branch_id.clone().into();
-                        row.global = true;
-                    }
-                    if row.deleted && !request.include_tombstones {
-                        None
-                    } else {
-                        Some(row)
-                    }
-                })
-                .collect())
+                                .find(|row| row.branch_id.as_ref() == requested.branch_id.as_str())
+                                .or_else(|| {
+                                    self.rows.iter().filter(exact_match).find(|row| {
+                                        row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
+                                    })
+                                })?
+                                .clone();
+                            if row.branch_id.as_ref() == crate::GLOBAL_BRANCH_ID
+                                && requested.branch_id != crate::GLOBAL_BRANCH_ID
+                            {
+                                row.branch_id = requested.branch_id.clone().into();
+                                row.global = true;
+                            }
+                            if row.deleted && !request.include_tombstones {
+                                None
+                            } else {
+                                Some(row)
+                            }
+                        })
+                        .collect(),
+                ),
+            )
         }
     }
 
     #[async_trait]
     impl LiveStateReader for RejectingLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             self.scan_count.fetch_add(1, Ordering::SeqCst);
             Err(LixError::unknown(
                 "descriptor-only scan should not read live state",
@@ -8867,24 +8870,24 @@ mod tests {
         }
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
     }
 
     #[async_trait]
     impl LiveStateReader for RowsLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self.rows.clone())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(self.rows.clone().into())
         }
 
         async fn load_row(

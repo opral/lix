@@ -1829,18 +1829,18 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for EmptyLiveStateReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &crate::live_state::LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             _request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(vec![])
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(vec![].into())
         }
 
         async fn load_row(
@@ -1858,7 +1858,7 @@ mod tests {
         }
 
         async fn scan_heads(&self) -> Result<Vec<BranchHead>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
     }
 
@@ -1881,7 +1881,7 @@ mod tests {
         }
 
         fn list_visible_schemas(&self) -> Result<Vec<serde_json::Value>, LixError> {
-            Ok(Vec::new())
+            Ok(Vec::new().into())
         }
 
         async fn load_bytes_many(

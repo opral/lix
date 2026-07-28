@@ -1495,26 +1495,26 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for ExistingGlobalOnlyReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
             if request
                 .filter
                 .branch_ids
                 .iter()
                 .any(|branch_id| branch_id == GLOBAL_BRANCH_ID)
             {
-                Ok(self.rows.clone())
+                Ok(self.rows.clone().into())
             } else {
-                Ok(Vec::new())
+                Ok(Vec::new().into())
             }
         }
 
@@ -1532,23 +1532,24 @@ mod tests {
 
     #[async_trait]
     impl LiveStateReader for FilteringReader {
-        async fn load_exact_rows(
+        async fn load_exact_batch(
             &self,
             request: &LiveStateExactBatchRequest,
-        ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-            crate::live_state::load_exact_rows_via_scan_for_test(self, request).await
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            crate::live_state::load_exact_batch_via_scan_for_test(self, request).await
         }
 
-        async fn scan_rows(
+        async fn scan_batch(
             &self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            Ok(self
-                .rows
-                .iter()
-                .filter(|row| matches_scan_request(row, request))
-                .cloned()
-                .collect())
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::from_rows(
+                self.rows
+                    .iter()
+                    .filter(|row| matches_scan_request(row, request))
+                    .cloned()
+                    .collect(),
+            ))
         }
 
         async fn load_row(
