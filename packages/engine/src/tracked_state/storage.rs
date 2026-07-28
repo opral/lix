@@ -181,6 +181,11 @@ pub(crate) struct CommitDeltaInventory {
     pub(crate) commits: BTreeMap<CommitId, CommitDeltaInventoryEntry>,
 }
 
+struct CommitDeltaPlane {
+    manifests: BTreeMap<CommitId, CommitDeltaManifest>,
+    segments: BTreeMap<CommitId, BTreeMap<usize, Bytes>>,
+}
+
 // Version the root metadata independently of storage backends. Version 3 is a
 // hard cut for derived commit rows, prefix-friendly keys, and compact tree
 // nodes. Reject older roots before their differently ordered state can be
@@ -1071,16 +1076,43 @@ pub(crate) async fn scan_commit_delta_values(
 pub(crate) async fn scan_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
-    let mut records = BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
-    let inventory = scan_commit_delta_inventory(store).await?;
-    for entry in inventory.commits.into_values() {
-        for member in entry.members {
-            records
-                .entry(member.change.change_id)
-                .or_insert(member.change);
+    let CommitDeltaPlane {
+        manifests,
+        mut segments,
+    } = scan_commit_delta_plane(store).await?;
+    let mut records =
+        BTreeMap::<crate::changelog::ChangeId, (CommitId, crate::changelog::ChangeRecord)>::new();
+    for (commit_id, manifest) in manifests {
+        let physical_segments = segments.remove(&commit_id).unwrap_or_default();
+        if let Some(inline_segment) = manifest.inline_segment() {
+            if !physical_segments.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state inline commit_delta for commit '{commit_id}' has external segments"
+                    ),
+                ));
+            }
+            collect_validated_commit_delta_change_records(
+                inline_segment,
+                None,
+                commit_id,
+                &mut records,
+            )?;
+        } else {
+            validate_physical_commit_delta_segments(commit_id, &manifest, &physical_segments)?;
+            for (segment_index, bounds) in manifest.segments.iter().enumerate() {
+                collect_validated_commit_delta_change_records(
+                    &physical_segments[&segment_index],
+                    Some(bounds),
+                    commit_id,
+                    &mut records,
+                )?;
+            }
         }
     }
-    Ok(records.into_values().collect())
+    debug_assert!(segments.is_empty());
+    Ok(records.into_values().map(|(_, change)| change).collect())
 }
 
 /// Inventories the complete packed commit-delta plane in one manifest scan and
@@ -1090,6 +1122,68 @@ pub(crate) async fn scan_change_records_from_commit_deltas(
 pub(crate) async fn scan_commit_delta_inventory(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<CommitDeltaInventory, LixError> {
+    let CommitDeltaPlane {
+        manifests,
+        mut segments,
+    } = scan_commit_delta_plane(store).await?;
+    let mut inventory = CommitDeltaInventory::default();
+    let mut authoritative_changes =
+        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
+    for (commit_id, manifest) in manifests {
+        let physical_segments = segments.remove(&commit_id).unwrap_or_default();
+        let segment_count = manifest.segments.len();
+        let mut members = Vec::new();
+        if let Some(inline_segment) = manifest.inline_segment() {
+            if !physical_segments.is_empty() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state inline commit_delta for commit '{commit_id}' has external segments"
+                    ),
+                ));
+            }
+            collect_strict_commit_delta_members(inline_segment, None, commit_id, &mut members)?;
+        } else {
+            validate_physical_commit_delta_segments(commit_id, &manifest, &physical_segments)?;
+            for (segment_index, bounds) in manifest.segments.iter().enumerate() {
+                collect_strict_commit_delta_members(
+                    &physical_segments[&segment_index],
+                    Some(bounds),
+                    commit_id,
+                    &mut members,
+                )?;
+            }
+        }
+        validate_commit_delta_member_order_and_ids(commit_id, &members)?;
+        for member in &members {
+            if let Some(existing) =
+                authoritative_changes.insert(member.change.change_id, member.change.clone())
+                && existing != member.change
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state change '{}' has conflicting authoritative packed payloads",
+                        member.change.change_id
+                    ),
+                ));
+            }
+        }
+        inventory.commits.insert(
+            commit_id,
+            CommitDeltaInventoryEntry {
+                members,
+                segment_count,
+            },
+        );
+    }
+    debug_assert!(segments.is_empty());
+    Ok(inventory)
+}
+
+async fn scan_commit_delta_plane(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<CommitDeltaPlane, LixError> {
     let manifest_rows = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE).await?;
     let segment_rows = scan_full_space(store, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE).await?;
 
@@ -1155,71 +1249,38 @@ pub(crate) async fn scan_commit_delta_inventory(
         ));
     }
 
-    let mut inventory = CommitDeltaInventory::default();
-    let mut authoritative_changes =
-        BTreeMap::<crate::changelog::ChangeId, crate::changelog::ChangeRecord>::new();
-    for (commit_id, manifest) in manifests {
-        let physical_segments = segments.remove(&commit_id).unwrap_or_default();
-        let segment_count = manifest.segments.len();
-        let mut members = Vec::new();
-        if let Some(inline_segment) = manifest.inline_segment() {
-            if !physical_segments.is_empty() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state inline commit_delta for commit '{commit_id}' has external segments"
-                    ),
-                ));
-            }
-            collect_strict_commit_delta_members(inline_segment, None, commit_id, &mut members)?;
-        } else {
-            if physical_segments.len() != manifest.segments.len() {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state commit_delta for commit '{commit_id}' has {} physical segments but its manifest declares {}",
-                        physical_segments.len(),
-                        manifest.segments.len(),
-                    ),
-                ));
-            }
-            for (segment_index, bounds) in manifest.segments.iter().enumerate() {
-                let bytes = physical_segments.get(&segment_index).ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state commit_delta for commit '{commit_id}' is missing segment {segment_index}"
-                        ),
-                    )
-                })?;
-                collect_strict_commit_delta_members(bytes, Some(bounds), commit_id, &mut members)?;
-            }
-        }
-        validate_commit_delta_member_order_and_ids(commit_id, &members)?;
-        for member in &members {
-            if let Some(existing) =
-                authoritative_changes.insert(member.change.change_id, member.change.clone())
-                && existing != member.change
-            {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "tracked_state change '{}' has conflicting authoritative packed payloads",
-                        member.change.change_id
-                    ),
-                ));
-            }
-        }
-        inventory.commits.insert(
-            commit_id,
-            CommitDeltaInventoryEntry {
-                members,
-                segment_count,
-            },
-        );
+    Ok(CommitDeltaPlane {
+        manifests,
+        segments,
+    })
+}
+
+fn validate_physical_commit_delta_segments(
+    commit_id: CommitId,
+    manifest: &CommitDeltaManifest,
+    physical_segments: &BTreeMap<usize, Bytes>,
+) -> Result<(), LixError> {
+    if physical_segments.len() != manifest.segments.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state commit_delta for commit '{commit_id}' has {} physical segments but its manifest declares {}",
+                physical_segments.len(),
+                manifest.segments.len(),
+            ),
+        ));
     }
-    debug_assert!(segments.is_empty());
-    Ok(inventory)
+    if let Some(segment_index) =
+        (0..manifest.segments.len()).find(|index| !physical_segments.contains_key(index))
+    {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state commit_delta for commit '{commit_id}' is missing segment {segment_index}"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn stage_delete_commit_delta_inventory_entry(
@@ -1337,6 +1398,61 @@ fn collect_strict_commit_delta_members(
         members.push(CommitDeltaMember { key, value, change });
     }
     Ok(())
+}
+
+fn collect_validated_commit_delta_change_records(
+    bytes: &[u8],
+    expected_bounds: Option<&CommitDeltaSegmentBounds>,
+    expected_commit_id: CommitId,
+    records: &mut BTreeMap<crate::changelog::ChangeId, (CommitId, crate::changelog::ChangeRecord)>,
+) -> Result<(), LixError> {
+    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
+    visit_commit_delta_leaf(
+        &leaf,
+        expected_commit_id,
+        |entry_index, encoded_key, value| {
+            let payload = payloads.decode(entry_index)?;
+            let key = decode_key(encoded_key)?;
+            let change = crate::changelog::ChangeRecord {
+                format_version: 2,
+                change_id: value.change_id,
+                schema_key: key.schema_key,
+                entity_pk: key.entity_pk,
+                file_id: key.file_id,
+                snapshot: payload.snapshot,
+                metadata: payload.metadata,
+                created_at: value.updated_at,
+                origin_key: payload.origin_key,
+            };
+            match records.entry(change.change_id) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert((expected_commit_id, change));
+                }
+                std::collections::btree_map::Entry::Occupied(entry)
+                    if entry.get().0 == expected_commit_id =>
+                {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state commit_delta for commit '{expected_commit_id}' contains duplicate change id '{}'",
+                            change.change_id
+                        ),
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get().1 != change => {
+                    return Err(LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "tracked_state change '{}' has conflicting authoritative packed payloads",
+                            change.change_id
+                        ),
+                    ));
+                }
+                std::collections::btree_map::Entry::Occupied(_) => {}
+            }
+            Ok(())
+        },
+    )
 }
 
 fn validate_commit_delta_member_order_and_ids(
@@ -2124,9 +2240,9 @@ mod tests {
         encode_commit_delta_segment_with_payloads, encode_commit_root, key,
         load_commit_delta_change_ids, load_commit_delta_change_records,
         load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
-        load_owned_commit_delta_entries, scan_commit_delta_inventory, scan_commit_delta_members,
-        scan_commit_delta_values, stage_commit_deltas, stage_delete_commit_delta_inventory_entry,
-        value,
+        load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
+        scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
+        stage_commit_deltas, stage_delete_commit_delta_inventory_entry, value,
     };
 
     #[derive(Clone)]
@@ -2318,6 +2434,10 @@ mod tests {
             .await
             .expect_err("global authority must reject duplicate change ids");
         assert!(error.to_string().contains("contains duplicate change id"));
+        let error = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect_err("streaming authority must reject duplicate change ids");
+        assert!(error.to_string().contains("contains duplicate change id"));
     }
 
     #[tokio::test]
@@ -2371,6 +2491,10 @@ mod tests {
             .await
             .expect_err("orphan segments must fail inventory");
         assert!(error.to_string().contains("found orphan segments"));
+        let error = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect_err("orphan segments must fail streaming scan");
+        assert!(error.to_string().contains("found orphan segments"));
 
         let storage = StorageAdapter::new(Memory::new());
         let commit_id = CommitId::for_test_label("noncontiguous-segments");
@@ -2417,6 +2541,10 @@ mod tests {
             .await
             .expect_err("noncontiguous physical suffixes must fail inventory");
         assert!(error.to_string().contains("missing segment 1"));
+        let error = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect_err("noncontiguous physical suffixes must fail streaming scan");
+        assert!(error.to_string().contains("missing segment 1"));
     }
 
     #[tokio::test]
@@ -2462,6 +2590,11 @@ mod tests {
                 .len(),
             2
         );
+        let changes = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("streaming scan should deduplicate identical shared authority");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_id, fixture.change_id);
         drop(read);
 
         let conflicting_commit = CommitId::for_test_label("shared-authority-conflict");
@@ -2485,6 +2618,14 @@ mod tests {
         let error = scan_commit_delta_inventory(&read)
             .await
             .expect_err("conflicting payloads for one change id must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("conflicting authoritative packed payloads")
+        );
+        let error = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect_err("streaming scan must reject conflicting packed payloads");
         assert!(
             error
                 .to_string()
