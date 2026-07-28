@@ -1,4 +1,5 @@
 #[macro_use]
+#[path = "integration/support/mod.rs"]
 mod support;
 
 use lix_engine::{CreateBranchOptions, Value};
@@ -214,8 +215,7 @@ simulation_test!(
             )
             .await
             .expect("other interval write should succeed");
-        let other_auto_commit =
-            branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
+        let other_auto_commit = branch_head(&engine, "01920000-0000-7000-8000-000000000511").await;
         other
             .create_checkpoint()
             .await

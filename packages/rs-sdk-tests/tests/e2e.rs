@@ -1,3 +1,5 @@
+mod benchmark_metrics;
+
 use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
@@ -21,6 +23,11 @@ use tracing::subscriber::Interest;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
+
+use benchmark_metrics::{
+    AllocationScope, BenchmarkFixture, BenchmarkGate, BenchmarkMeasurement, emit_sample,
+    emit_summary,
+};
 
 #[derive(Clone, Default)]
 struct PerfSpanCollector {
@@ -1652,6 +1659,7 @@ async fn v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded() {
 async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
+    const BENCHMARK: &str = "v2_json_ten_mib_ordinary_sql_byte_edit_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON benchmark directory");
     let archive = build_json_v2_plugin_archive();
@@ -1676,14 +1684,30 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
     );
 
     let mut elapsed_ms = Vec::with_capacity(SAMPLES);
+    let mut measurements = Vec::with_capacity(SAMPLES);
+    let fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: 1,
+    };
     for sample in 0..SAMPLES {
         bytes[edit_offset] = alternate_ascii_hex(bytes[edit_offset]);
         lix.reset_plugin_v2_transition_counters();
+        let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         write_file(&lix, path, bytes.clone())
             .await
             .expect("ordinary SQL full-byte JSON edit should succeed");
-        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        elapsed_ms.push(measurement.elapsed_ms);
+        measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "sparse_plugin_update",
+            sample,
+            fixture,
+            BenchmarkGate::ElapsedRegression,
+            measurement,
+        );
 
         let counters = lix.plugin_v2_transition_counters();
         assert_eq!(counters.packet_records, 1, "sample {sample}");
@@ -1710,6 +1734,13 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
         "v2_json_ordinary_sql_hot_edit bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
          p50_ms={p50_ms:.3} p95_ms={p95_ms:.3}"
     );
+    emit_summary(
+        BENCHMARK,
+        "sparse_plugin_update",
+        fixture,
+        BenchmarkGate::ElapsedRegression,
+        &measurements,
+    );
 
     lix.close().await.expect("JSON benchmark should close");
 }
@@ -1719,6 +1750,7 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
 async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
+    const BENCHMARK: &str = "v2_json_ten_mib_unrelated_entity_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON merge benchmark directory");
     let archive = build_json_v2_plugin_archive();
@@ -1739,11 +1771,16 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     let file_id = file_id_at_path(&lix, path).await;
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let mut elapsed_ms = Vec::with_capacity(SAMPLES);
+    let mut measurements = Vec::with_capacity(SAMPLES);
+    let fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
 
     for sample in 0..SAMPLES {
         let source = lix
             .create_branch(CreateBranchOptions {
-                id: Some(format!("json-merge-source-{sample}")),
+                id: Some(format!("01900000-0000-7000-8100-{sample:012x}")),
                 name: format!("JSON merge source {sample}"),
                 from_commit_id: None,
             })
@@ -1787,13 +1824,24 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
         .await
         .unwrap();
 
+        let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         lix.merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
         })
         .await
         .expect("unrelated JSON properties should merge cleanly");
-        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        elapsed_ms.push(measurement.elapsed_ms);
+        measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "unrelated_entity",
+            sample,
+            fixture,
+            BenchmarkGate::Reference,
+            measurement,
+        );
 
         let merged = lix
             .execute(
@@ -1830,6 +1878,13 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
         "v2_json_ten_mib_unrelated_entity_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
          p50_ms={p50_ms:.3} p95_ms={p95_ms:.3}"
     );
+    emit_summary(
+        BENCHMARK,
+        "unrelated_entity",
+        fixture,
+        BenchmarkGate::Reference,
+        &measurements,
+    );
 
     lix.close().await.expect("JSON benchmark should close");
 }
@@ -1844,6 +1899,7 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
 async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
+    const BENCHMARK: &str = "v2_json_ten_mib_same_entity_canonical_b_merge_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON conflict benchmark directory");
     let archive = build_json_v2_plugin_archive();
@@ -1865,11 +1921,16 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let mut elapsed_ms = Vec::with_capacity(SAMPLES);
     let mut resolver_boundary_bytes = Vec::with_capacity(SAMPLES);
+    let mut measurements = Vec::with_capacity(SAMPLES);
+    let fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
 
     for sample in 0..SAMPLES {
         let source = lix
             .create_branch(CreateBranchOptions {
-                id: Some(format!("json-conflict-merge-source-{sample}")),
+                id: Some(format!("01900000-0000-7000-8200-{sample:012x}")),
                 name: format!("JSON conflict merge source {sample}"),
                 from_commit_id: None,
             })
@@ -1911,13 +1972,24 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
         .unwrap();
 
         lix.reset_plugin_v2_transition_counters();
+        let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         lix.merge_branch(MergeBranchOptions {
             source_branch_id: source.id,
         })
         .await
         .expect("same JSON member should resolve deterministically");
-        elapsed_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        elapsed_ms.push(measurement.elapsed_ms);
+        measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "same_entity_conflict",
+            sample,
+            fixture,
+            BenchmarkGate::Reference,
+            measurement,
+        );
 
         let counters = lix.plugin_v2_transition_counters();
         assert_eq!(counters.conflict_resolution_calls, 1, "sample {sample}");
@@ -1940,6 +2012,13 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
         p50_ms(&elapsed_ms),
         p95_ms(&elapsed_ms),
     );
+    emit_summary(
+        BENCHMARK,
+        "same_entity_conflict",
+        fixture,
+        BenchmarkGate::Reference,
+        &measurements,
+    );
 
     lix.close()
         .await
@@ -1961,8 +2040,9 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     init_perf_tracing();
     const SAMPLES: usize = 7;
     const SQL_CHUNK_ROWS: usize = 500;
-    const FILE_ID: &str = "native-json-semantic-control";
+    const FILE_ID: &str = "01900000-0000-7000-8000-000000000701";
     const FILE_PATH: &str = "/native-json-semantic-control.json";
+    const BENCHMARK: &str = "v2_json_ten_mib_rocksdb_import_parity_benchmark";
 
     let archive = build_json_v2_plugin_archive();
     let (source, _, _) = json_ten_mib_flat_fixture();
@@ -1980,6 +2060,15 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
     let mut plugin_ms = Vec::with_capacity(SAMPLES);
+    let mut plugin_measurements = Vec::with_capacity(SAMPLES);
+    let file_fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
+    let no_file_fixture = BenchmarkFixture {
+        input_bytes: 0,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
     for sample in 0..SAMPLES {
         let root = tempfile::tempdir().expect("create plugin import benchmark directory");
         let lix = open_lix_with_rocksdb(root.path()).await;
@@ -1997,6 +2086,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         let input = source.clone();
         lix.reset_plugin_v2_transition_counters();
         collector.clear();
+        let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         let inserted = lix
             .execute(
@@ -2009,9 +2099,19 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             )
             .await
             .expect("real JSON v2 plugin import should succeed");
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
         assert_eq!(inserted.rows_affected(), 1, "plugin sample {sample}");
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let elapsed_ms = measurement.elapsed_ms;
         plugin_ms.push(elapsed_ms);
+        plugin_measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "plugin",
+            sample,
+            file_fixture,
+            BenchmarkGate::BulkWrite,
+            measurement,
+        );
         eprintln!(
             "v2_json_import_phases sample={sample} elapsed_ms={elapsed_ms:.3} phases_ms={:?}",
             collector.take_aggregate_millis()
@@ -2035,13 +2135,16 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
 
     let mut direct_no_file_ms = Vec::with_capacity(SAMPLES);
     let mut direct_file_scoped_ms = Vec::with_capacity(SAMPLES);
-    for (label, file_scoped, root_statement, member_statements, samples) in [
+    let mut direct_no_file_measurements = Vec::with_capacity(SAMPLES);
+    let mut direct_file_scoped_measurements = Vec::with_capacity(SAMPLES);
+    for (label, file_scoped, root_statement, member_statements, samples, measurements) in [
         (
             "direct_no_file",
             false,
             &no_file_root_statement,
             &no_file_member_statements,
             &mut direct_no_file_ms,
+            &mut direct_no_file_measurements,
         ),
         (
             "direct_file_scoped",
@@ -2049,6 +2152,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             &file_scoped_root_statement,
             &file_scoped_member_statements,
             &mut direct_file_scoped_ms,
+            &mut direct_file_scoped_measurements,
         ),
     ] {
         for sample in 0..SAMPLES {
@@ -2060,6 +2164,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             // have been prebuilt before timing. The transaction below stays
             // exclusively on the public typed entity surface.
             let file_input = file_scoped.then(|| source.clone());
+            let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             let mut transaction = lix
                 .begin_transaction()
@@ -2100,7 +2205,22 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
                 .commit()
                 .await
                 .expect("commit direct semantic rows");
-            samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            samples.push(measurement.elapsed_ms);
+            measurements.push(measurement);
+            emit_sample(
+                BENCHMARK,
+                label,
+                sample,
+                if file_scoped {
+                    file_fixture
+                } else {
+                    no_file_fixture
+                },
+                BenchmarkGate::ElapsedRegression,
+                measurement,
+            );
 
             let member_count = lix
                 .execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
@@ -2146,6 +2266,27 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
         p95_ms(&plugin_ms),
         plugin_p50_ms / direct_file_scoped_p50_ms,
     );
+    emit_summary(
+        BENCHMARK,
+        "plugin",
+        file_fixture,
+        BenchmarkGate::BulkWrite,
+        &plugin_measurements,
+    );
+    emit_summary(
+        BENCHMARK,
+        "direct_no_file",
+        no_file_fixture,
+        BenchmarkGate::ElapsedRegression,
+        &direct_no_file_measurements,
+    );
+    emit_summary(
+        BENCHMARK,
+        "direct_file_scoped",
+        file_fixture,
+        BenchmarkGate::ElapsedRegression,
+        &direct_file_scoped_measurements,
+    );
     assert!(
         plugin_p50_ms <= direct_file_scoped_p50_ms * 1.5,
         "10 MiB JSON plugin import p50 {plugin_p50_ms:.3} ms exceeds the 1.5x direct file-scoped semantic-row gate ({direct_file_scoped_p50_ms:.3} ms)"
@@ -2165,6 +2306,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     const CSV_ROW_COUNT: usize = 220_000;
     const FILE_ID: &str = "019a0000-0000-7000-8000-000000000220";
     const FILE_PATH: &str = "/native-csv-semantic-control.csv";
+    const BENCHMARK: &str = "v2_csv_ten_mib_rocksdb_import_parity_benchmark";
 
     let archive = build_csv_v2_plugin_archive();
     let source = csv_ten_mib_fixture();
@@ -2178,6 +2320,12 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     let mut direct_ms = Vec::with_capacity(PAIRS);
     let mut paired_samples_ms = Vec::with_capacity(PAIRS);
     let mut paired_ratios = Vec::with_capacity(PAIRS);
+    let mut plugin_measurements = Vec::with_capacity(PAIRS);
+    let mut direct_measurements = Vec::with_capacity(PAIRS);
+    let fixture = BenchmarkFixture {
+        input_bytes: source.len(),
+        logical_rows: CSV_ROW_COUNT + 1,
+    };
 
     for sample in 0..PAIRS {
         let lanes = if sample % 2 == 0 {
@@ -2205,6 +2353,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
             let file_input = source.clone();
             lix.reset_plugin_v2_transition_counters();
             collector.clear();
+            let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             if plugin_lane {
                 let inserted = lix
@@ -2262,7 +2411,9 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     .await
                     .expect("commit direct CSV semantic rows");
             }
-            let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let elapsed_ms = measurement.elapsed_ms;
             let phases_ms = collector.take_aggregate_millis();
             eprintln!(
                 "v2_csv_import_phases sample={sample} lane={} elapsed_ms={elapsed_ms:.3} phases_ms={phases_ms:?}",
@@ -2276,7 +2427,16 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     "plugin sample {sample} must commit one table plus every row"
                 );
                 plugin_ms.push(elapsed_ms);
+                plugin_measurements.push(measurement);
                 plugin_sample_ms = Some(elapsed_ms);
+                emit_sample(
+                    BENCHMARK,
+                    "plugin",
+                    sample,
+                    fixture,
+                    BenchmarkGate::BulkWrite,
+                    measurement,
+                );
             } else {
                 let row_count = lix
                     .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
@@ -2287,7 +2447,16 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
                     .expect("CSV row count must be an integer");
                 assert_eq!(row_count, CSV_ROW_COUNT as i64, "direct sample {sample}");
                 direct_ms.push(elapsed_ms);
+                direct_measurements.push(measurement);
                 direct_sample_ms = Some(elapsed_ms);
+                emit_sample(
+                    BENCHMARK,
+                    "direct_file_scoped",
+                    sample,
+                    fixture,
+                    BenchmarkGate::ElapsedRegression,
+                    measurement,
+                );
             }
             assert_eq!(
                 read_file(&lix, FILE_PATH)
@@ -2325,6 +2494,20 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
         CSV_ROW_COUNT + 1,
         plugin_p50_ms / direct_p50_ms,
     );
+    emit_summary(
+        BENCHMARK,
+        "plugin",
+        fixture,
+        BenchmarkGate::BulkWrite,
+        &plugin_measurements,
+    );
+    emit_summary(
+        BENCHMARK,
+        "direct_file_scoped",
+        fixture,
+        BenchmarkGate::ElapsedRegression,
+        &direct_measurements,
+    );
     assert!(
         paired_p50_ratio <= 1.5,
         "10 MiB CSV plugin import paired p50 ratio {paired_p50_ratio:.3} exceeds the 1.5x direct semantic-row gate"
@@ -2336,6 +2519,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
 async fn v2_json_ten_mib_rocksdb_read_benchmark() {
     const WARM_SAMPLES: usize = 20;
     const COLD_SAMPLES: usize = 7;
+    const BENCHMARK: &str = "v2_json_ten_mib_rocksdb_read_benchmark";
 
     let root = tempfile::tempdir().expect("create JSON read benchmark directory");
     let archive = build_json_v2_plugin_archive();
@@ -2364,13 +2548,29 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
     }
 
     let mut warm_ms = Vec::with_capacity(WARM_SAMPLES);
-    for _ in 0..WARM_SAMPLES {
+    let mut warm_measurements = Vec::with_capacity(WARM_SAMPLES);
+    let fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
+    for sample in 0..WARM_SAMPLES {
+        let allocation_scope = AllocationScope::start();
         let started = Instant::now();
         let read = read_file(&lix, path)
             .await
             .expect("warm materialized JSON should read")
             .expect("warm materialized JSON should exist");
-        warm_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        warm_ms.push(measurement.elapsed_ms);
+        warm_measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "warm_read",
+            sample,
+            fixture,
+            BenchmarkGate::Reference,
+            measurement,
+        );
         assert_eq!(read.len(), JSON_TEN_MIB_BYTES);
         black_box(read);
     }
@@ -2380,7 +2580,9 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
     let mut cold_storage_open_ms = Vec::with_capacity(COLD_SAMPLES);
     let mut cold_engine_open_ms = Vec::with_capacity(COLD_SAMPLES);
     let mut cold_read_ms = Vec::with_capacity(COLD_SAMPLES);
-    for _ in 0..COLD_SAMPLES {
+    let mut cold_measurements = Vec::with_capacity(COLD_SAMPLES);
+    for sample in 0..COLD_SAMPLES {
+        let allocation_scope = AllocationScope::start();
         let total_started = Instant::now();
         let storage_started = Instant::now();
         let storage =
@@ -2405,7 +2607,18 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
             .close()
             .await
             .expect("cold JSON benchmark should close");
-        cold_total_ms.push(total_started.elapsed().as_secs_f64() * 1_000.0);
+        let measurement =
+            BenchmarkMeasurement::new(total_started.elapsed(), allocation_scope.finish());
+        cold_total_ms.push(measurement.elapsed_ms);
+        cold_measurements.push(measurement);
+        emit_sample(
+            BENCHMARK,
+            "cold_open_read",
+            sample,
+            fixture,
+            BenchmarkGate::Reference,
+            measurement,
+        );
     }
 
     for samples in [
@@ -2429,6 +2642,20 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
         p50_ms(&cold_storage_open_ms),
         p50_ms(&cold_engine_open_ms),
         p50_ms(&cold_read_ms),
+    );
+    emit_summary(
+        BENCHMARK,
+        "warm_read",
+        fixture,
+        BenchmarkGate::Reference,
+        &warm_measurements,
+    );
+    emit_summary(
+        BENCHMARK,
+        "cold_open_read",
+        fixture,
+        BenchmarkGate::Reference,
+        &cold_measurements,
     );
 }
 
