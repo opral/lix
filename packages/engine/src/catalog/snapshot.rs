@@ -658,6 +658,8 @@ struct DefaultPropertyPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DefaultValuePlan {
     Json(JsonValue),
+    UuidV7,
+    Timestamp,
     Cel(String),
 }
 
@@ -676,9 +678,14 @@ impl DefaultPlan {
                     .get("x-lix-default")
                     .and_then(JsonValue::as_str)
                 {
+                    let default = match expression.trim() {
+                        "lix_uuid_v7()" => DefaultValuePlan::UuidV7,
+                        "lix_timestamp()" => DefaultValuePlan::Timestamp,
+                        _ => DefaultValuePlan::Cel(expression.to_string()),
+                    };
                     return Some(DefaultPropertyPlan {
                         field_name: field_name.clone(),
-                        default: DefaultValuePlan::Cel(expression.to_string()),
+                        default,
                     });
                 }
                 field_schema
@@ -706,6 +713,10 @@ impl DefaultPlan {
             }
             let value = match &property.default {
                 DefaultValuePlan::Json(value) => value.clone(),
+                DefaultValuePlan::UuidV7 => JsonValue::String(functions.call_uuid_v7().to_string()),
+                DefaultValuePlan::Timestamp => {
+                    JsonValue::String(functions.call_timestamp().to_string())
+                }
                 DefaultValuePlan::Cel(expression) => {
                     let context = cel_context.get_or_insert_with(|| snapshot.clone());
                     crate::cel::shared_runtime()
@@ -1286,6 +1297,28 @@ mod tests {
             "additionalProperties": false
         });
         assert!(FastObjectValidationPlan::compile(&schema).is_none());
+    }
+
+    #[test]
+    fn default_plan_compiles_uuid_and_timestamp_intrinsics_without_cel() {
+        let plan = DefaultPlan::from_schema(&json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "x-lix-default": " lix_uuid_v7() "},
+                "created_at": {"type": "string", "x-lix-default": "lix_timestamp()"},
+                "label": {"type": "string", "x-lix-default": r#""row-" + id"#}
+            }
+        }));
+
+        assert_eq!(plan.properties[0].field_name, "created_at");
+        assert_eq!(plan.properties[0].default, DefaultValuePlan::Timestamp);
+        assert_eq!(plan.properties[1].field_name, "id");
+        assert_eq!(plan.properties[1].default, DefaultValuePlan::UuidV7);
+        assert_eq!(plan.properties[2].field_name, "label");
+        assert_eq!(
+            plan.properties[2].default,
+            DefaultValuePlan::Cel(r#""row-" + id"#.to_string())
+        );
     }
 
     #[test]

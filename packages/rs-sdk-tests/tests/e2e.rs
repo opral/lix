@@ -275,7 +275,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 1);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     let first = lix.open_workspace_session().await.unwrap();
     let second = lix.open_workspace_session().await.unwrap();
@@ -388,7 +388,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         .unwrap();
     transaction.rollback().await.unwrap();
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(one_row));
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 1);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
     write_file(&rollback_session, path, b"first,COMMITTED\n".to_vec())
         .await
         .unwrap();
@@ -396,7 +396,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
         read_file(&lix, path).await.unwrap(),
         Some(b"first,COMMITTED\n".to_vec())
     );
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 1);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     let insert_session = lix.open_workspace_session().await.unwrap();
     assert_eq!(
@@ -410,7 +410,7 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     )
     .await
     .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 2);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
 
     for session in [
         first,
@@ -425,6 +425,61 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     ] {
         session.close().await.unwrap();
     }
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_edit() {
+    let archive = build_csv_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v2",
+        &archive,
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/concurrent-create.csv";
+    let initial = b"first,one\n".to_vec();
+    write_file(&lix, path, initial.clone()).await.unwrap();
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    let edit_session = lix.open_workspace_session().await.unwrap();
+    let create_session = lix.open_workspace_session().await.unwrap();
+    assert_eq!(
+        read_file(&edit_session, path).await.unwrap(),
+        Some(initial.clone())
+    );
+    assert_eq!(
+        read_file(&create_session, path).await.unwrap(),
+        Some(initial)
+    );
+
+    write_file(&edit_session, path, b"first,ONE\n".to_vec())
+        .await
+        .unwrap();
+    write_file(&create_session, path, b"first,one\nsecond,two\n".to_vec())
+        .await
+        .expect("a keyless create from a stale observation should render onto current bytes");
+
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"first,ONE\nsecond,two\n".to_vec())
+    );
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
+
+    edit_session.close().await.unwrap();
+    create_session.close().await.unwrap();
     lix.close().await.unwrap();
 }
 
@@ -564,8 +619,10 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
         nodes
             .rows()
             .iter()
-            .all(|row| row.get::<String>("id").is_ok_and(|id| id.len() == 32)),
-        "every Markdown v2 node, including the document root, must use the host namespace"
+            .all(|row| row.get::<String>("id").is_ok_and(|id| {
+                uuid::Uuid::parse_str(&id).is_ok_and(|id| id.get_version_num() == 7)
+            })),
+        "every Markdown v2 node, including the document root, must use a UUIDv7"
     );
     let paragraph = nodes
         .rows()
@@ -576,7 +633,7 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
         })
         .unwrap();
     let paragraph_id = paragraph.get::<String>("id").unwrap();
-    assert_eq!(paragraph_id.len(), 32);
+    assert_eq!(paragraph_id.len(), 36);
 
     let payload_json =
         serde_json::json!({"inline":[{"type":"text","value":"Edited paragraph."}]}).to_string();
@@ -2106,7 +2163,7 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     const PAIRS: usize = 5;
     const SQL_CHUNK_ROWS: usize = 500;
     const CSV_ROW_COUNT: usize = 220_000;
-    const FILE_ID: &str = "native-csv-semantic-control";
+    const FILE_ID: &str = "019a0000-0000-7000-8000-000000000220";
     const FILE_PATH: &str = "/native-csv-semantic-control.csv";
 
     let archive = build_csv_v2_plugin_archive();
@@ -2875,7 +2932,7 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
 }
 
 #[tokio::test]
-async fn v2_id_namespace_reservations_survive_restart_and_tombstone_with_file() {
+async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
     let tempdir = tempfile::tempdir().unwrap();
     let archive = build_csv_v2_plugin_archive();
     let path = "/durable-ids.csv";
@@ -2897,9 +2954,11 @@ async fn v2_id_namespace_reservations_survive_restart_and_tombstone_with_file() 
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 1);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
     let inserted_identity = MutationIdentity {
-        namespace_seed: [0x31; 16],
+        namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000031")
+            .expect("fixture UUIDv7")
+            .into_bytes(),
         operation_proof: [0x41; 32],
     };
     write_file_with_mutation_identity(
@@ -2910,11 +2969,11 @@ async fn v2_id_namespace_reservations_survive_restart_and_tombstone_with_file() 
     )
     .await
     .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 2);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     lix.close().await.unwrap();
 
     let lix = open_lix_with_filesystem(tempdir.path()).await;
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 2);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     assert_eq!(
         read_file(&lix, path).await.unwrap(),
         Some(b"first,one\nsecond,two\n".to_vec())
@@ -2927,7 +2986,7 @@ async fn v2_id_namespace_reservations_survive_restart_and_tombstone_with_file() 
     )
     .await
     .expect("an exact same-proof retry after reopen should be accepted");
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 2);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
 
     let collision = write_file_with_mutation_identity(
         &lix,
@@ -2949,14 +3008,14 @@ async fn v2_id_namespace_reservations_survive_restart_and_tombstone_with_file() 
         read_file(&lix, path).await.unwrap(),
         Some(b"first,one\nsecond,two\n".to_vec())
     );
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 2);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
     lix.execute(
         "DELETE FROM lix_file WHERE path = $1",
         &[Value::Text(path.to_string())],
     )
     .await
     .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 0);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 0);
     lix.close().await.unwrap();
 }
 
@@ -3410,7 +3469,7 @@ async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
         .rows()[0]
         .get::<String>("id")
         .unwrap();
-    assert_eq!(plugin_namespace_reservation_count(&lix, &file_id).await, 1);
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
 
     // This reader must become stale solely because the accepted actor moves
     // to the descriptor-successor key, not because file bytes changed.
@@ -3747,7 +3806,7 @@ fn csv_v2_row_id(rows: &[CsvV2Row], cells: &[&str]) -> String {
     ids[0].clone()
 }
 
-async fn plugin_namespace_reservation_count<StorageImpl>(
+async fn plugin_create_reservation_count<StorageImpl>(
     lix: &Lix<StorageImpl>,
     file_id: &str,
 ) -> usize
@@ -3765,7 +3824,7 @@ where
     .filter(|row| {
         row.get::<String>("key")
             .ok()
-            .is_some_and(|key| key.starts_with("lix_plugin_id_namespace_v2:"))
+            .is_some_and(|key| key.starts_with("lix_plugin_create_v1:"))
     })
     .count()
 }
@@ -4176,7 +4235,7 @@ fn native_csv_control_row_insert_chunks(
                     let order_rank = u64::try_from(numerator / denominator)
                         .expect("CSV order rank fits u64")
                         | 1;
-                    params.push(Value::Text(format!("{index:032x}")));
+                    params.push(Value::Text(format!("019a0000-0000-7000-8000-{index:012x}")));
                     params.push(Value::Text(format!("{order_rank:016x}")));
                     params.push(Value::Json(serde_json::json!([
                         if *index < LONG_ROW_COUNT {

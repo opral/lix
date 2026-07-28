@@ -20,11 +20,12 @@ impl sdk::FormatPlugin for JsonPlugin {
 
     fn open_file(input: sdk::OpenFile<'_>) -> sdk::Result<(Self::Document, sdk::Changes)> {
         let bytes = input.source.read_all()?;
-        let namespace = core_namespace(input.ids)?;
+        let creates = input.creates;
+        let namespace = core_namespace(creates)?;
         let (document, changes) =
             CoreDocument::open_file(bytes, input.file.path.as_deref(), namespace)
                 .map_err(sdk::Error::invalid_input)?;
-        Ok((document, core_changes(changes)))
+        Ok((document, core_changes(changes, creates)))
     }
 
     fn open_entities(
@@ -74,11 +75,12 @@ impl sdk::FormatPlugin for JsonPlugin {
                 insert,
             })
             .collect::<Vec<_>>();
-        let namespace = core_namespace(update.ids)?;
+        let creates = update.creates;
+        let namespace = core_namespace(creates)?;
         let (document, changes) = document
             .file_changed(&splices, namespace)
             .map_err(sdk::Error::invalid_input)?;
-        Ok((document, core_changes(changes.into_iter().map(Ok))))
+        Ok((document, core_changes(changes.into_iter().map(Ok), creates)))
     }
 
     fn entities_changed(
@@ -96,8 +98,8 @@ impl sdk::FormatPlugin for JsonPlugin {
     }
 }
 
-fn core_namespace(ids: sdk::IdNamespace) -> sdk::Result<CoreIdNamespace> {
-    CoreIdNamespace::from_generated_id(&ids.id(0)).map_err(sdk::Error::internal)
+fn core_namespace(creates: sdk::CreateContext) -> sdk::Result<CoreIdNamespace> {
+    CoreIdNamespace::from_generated_id(&creates.id(0)?).map_err(sdk::Error::internal)
 }
 
 fn core_record(record: sdk::EntityRecord) -> CoreEntityRecord {
@@ -112,6 +114,7 @@ fn sdk_change(change: CoreEntityChange) -> sdk::EntityChange {
     sdk::EntityChange {
         schema_key: change.schema_key,
         entity_pk: change.entity_pk,
+        local_ref: None,
         snapshot: change.snapshot,
         effect: match change.effect {
             CoreChangeEffect::Content => sdk::ChangeEffect::Content,
@@ -140,13 +143,16 @@ fn sdk_edit(edit: CoreByteEdit) -> sdk::ByteEdit {
     }
 }
 
-fn core_changes<I>(changes: I) -> sdk::Changes
+fn core_changes<I>(changes: I, creates: sdk::CreateContext) -> sdk::Changes
 where
     I: Iterator<Item = std::result::Result<CoreEntityChange, String>> + 'static,
 {
-    sdk::try_changes(
-        changes.map(|change| change.map(sdk_change).map_err(sdk::Error::invalid_input)),
-    )
+    sdk::try_changes(changes.map(move |change| {
+        change
+            .map(sdk_change)
+            .map_err(sdk::Error::invalid_input)
+            .and_then(|change| creates.keyless(change))
+    }))
 }
 
 fn core_edits(edits: Vec<CoreByteEdit>) -> sdk::Edits {

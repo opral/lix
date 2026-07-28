@@ -7,7 +7,7 @@ Git uses before choosing text-oriented behavior.
 Each LF-delimited byte segment becomes one durable `git_text_line_v2` row. The
 line's bytes, including a trailing LF when present, are URL-safe base64 encoded
 so NUL-free but invalid UTF-8 Git text remains lossless. Rows have stable
-host-allocated IDs and fractional order keys: a localized line update changes
+schema-defaulted UUIDv7 IDs and fractional order keys: a localized line update changes
 that row only, an insertion adds one row, and a reorder updates only the rows
 whose order must move.
 

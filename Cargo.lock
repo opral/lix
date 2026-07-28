@@ -3393,6 +3393,8 @@ version = "0.8.4"
 name = "lix_plugin_api_v2"
 version = "0.8.4"
 dependencies = [
+ "serde_json",
+ "uuid",
  "wit-bindgen 0.57.1",
 ]
 
@@ -3459,6 +3461,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wasmtime",
  "wasmtime-wasi",
  "zip",
@@ -4264,6 +4267,7 @@ dependencies = [
  "base64 0.22.1",
  "lix_plugin_api_v2",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4274,6 +4278,7 @@ dependencies = [
  "lix_order_key",
  "lix_plugin_api_v2",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -4295,6 +4300,7 @@ dependencies = [
  "blake3",
  "lix_plugin_api_v2",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]

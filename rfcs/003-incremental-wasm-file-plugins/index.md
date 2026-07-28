@@ -203,13 +203,15 @@ and alignment contract.
 
 ## Identity
 
-Schemas that declare `x-lix-id-allocation: "host-allocated"` receive a
-mutation-scoped namespace for new IDs. The plugin derives IDs from
-deterministic ordinals in that namespace and preserves acknowledged IDs for
-existing entities.
+Schemas whose `/id` primary-key string property declares both
+`"format": "uuid"` and `"x-lix-default": "lix_uuid_v7()"` permit keyless
+creates. The plugin emits a transition-local `u32` reference and an ID-free
+snapshot. The host derives the canonical UUIDv7, completes and validates the
+snapshot, and converts the create to an ordinary keyed entity before storage.
+Plugins preserve acknowledged IDs for existing entities.
 
-The namespace is bound to the mutation, file incarnation, plugin, and
-generation. The engine durably reserves it before accepting new IDs. Remote
+The create context is bound to the mutation, file incarnation, plugin, and
+generation. The engine durably reserves it before accepting creates. Remote
 transport retry and exactly-once replay are separate protocol concerns and are
 not introduced by this API.
 
@@ -227,7 +229,7 @@ to hash equally.
 Transitions are serialized per actor, while unrelated files can proceed in
 parallel. Plugin replacement takes an exclusive generation fence through
 preflight and commit. Existing owned files permit only a compatible v2
-generation replacement: API version, matcher, schema set, and ID-allocation
+generation replacement: API version, matcher, schema set, and create-default
 contract must remain stable.
 
 ## Host responsibilities
@@ -236,7 +238,7 @@ The engine, not the plugin, owns:
 
 - transaction acceptance, rollback, retry, and durable merge;
 - schema and packet validation;
-- stable namespace reservation;
+- stable create-context reservation;
 - observation authority and stale-view rejection;
 - actor scheduling, generation fencing, and eviction;
 - source/read/output limits, fuel, deadlines, and linear-memory limits; and
@@ -295,7 +297,7 @@ A plugin declares it with:
 The exact API version is checked at installation. CSV/TSV, JSON, Markdown, and
 Excalidraw are the in-tree production references. Replacing an owned plugin is
 a compatible generation update: API version, matcher, schema set, and
-ID-allocation contract remain stable.
+create-default contract remain stable.
 
 The rollout gate is end-to-end: format round-trip and stable-identity tests,
 rollback and multiplayer authority tests, bounded-host validation, and

@@ -176,7 +176,7 @@ impl Document {
 
         // The splice result and each constructed line were validated above.
         // Reconciled order keys follow successor byte order, while reused and
-        // host-allocated IDs are already collision checked. Preserve that
+        // Schema-defaulted UUIDs are already collision checked. Preserve that
         // exact owned state instead of sorting, rendering, and validating the
         // complete document a second time.
         let document = Self(Arc::new(DocumentInner {

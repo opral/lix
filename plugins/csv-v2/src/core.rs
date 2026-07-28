@@ -21,15 +21,17 @@ impl IdNamespace {
     pub fn from_halves(high: u64, low: u64) -> Self {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&high.to_be_bytes());
-        bytes[8..].copy_from_slice(&low.to_be_bytes());
+        bytes[8..12].copy_from_slice(&low.to_be_bytes()[4..]);
         Self(bytes)
     }
 
     pub fn encode(self, ordinal: u64) -> String {
-        let mut bytes = [0; 24];
-        bytes[..16].copy_from_slice(&self.0);
-        bytes[16..].copy_from_slice(&ordinal.to_be_bytes());
-        URL_SAFE_NO_PAD.encode(bytes)
+        let ordinal = u32::try_from(ordinal)
+            .expect("one CSV mutation cannot allocate more than u32::MAX rows");
+        let mut bytes = [0; 16];
+        bytes[..12].copy_from_slice(&self.0[..12]);
+        bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
+        uuid::Uuid::from_bytes(bytes).to_string()
     }
 
     /// Converts one API-generated ID back into the compact namespace retained
@@ -936,15 +938,13 @@ fn identity_lookup_insert(
 }
 
 fn decode_generated_id(id: &[u8]) -> Option<([u8; 16], u64)> {
-    if id.len() != 32 {
-        return None;
-    }
-    let mut decoded = [0u8; 24];
-    if URL_SAFE_NO_PAD.decode_slice(id, &mut decoded).ok()? != decoded.len() {
-        return None;
-    }
-    let namespace = decoded[..16].try_into().ok()?;
-    let ordinal = u64::from_be_bytes(decoded[16..].try_into().ok()?);
+    let id = std::str::from_utf8(id).ok()?;
+    let decoded = uuid::Uuid::parse_str(id).ok()?;
+    let mut namespace = [0_u8; 16];
+    namespace[..12].copy_from_slice(&decoded.as_bytes()[..12]);
+    let ordinal = u64::from(u32::from_be_bytes(
+        decoded.as_bytes()[12..].try_into().ok()?,
+    ));
     Some((namespace, ordinal))
 }
 

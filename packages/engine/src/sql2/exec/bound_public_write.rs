@@ -1699,16 +1699,21 @@ fn bound_entity_pks_from_primary_key_predicate(
     }
     let analyzer = BoundPrimaryKeyAnalyzer {
         primary_key_columns,
+        primary_key_component_types: &spec.primary_key_component_types,
         params,
     };
     analyzer
         .analyze_conjunctive_constraint(predicate)?
-        .into_entity_pks(&analyzer.primary_key_columns)
+        .into_entity_pks(
+            &analyzer.primary_key_columns,
+            analyzer.primary_key_component_types,
+        )
         .map(|entity_pks| entity_pks.into_iter().collect())
 }
 
 struct BoundPrimaryKeyAnalyzer<'a> {
     primary_key_columns: Vec<&'a str>,
+    primary_key_component_types: &'a [crate::entity_pk::EntityPkComponentType],
     params: &'a [Value],
 }
 
@@ -1744,7 +1749,10 @@ impl BoundPrimaryKeyAnalyzer<'_> {
                 for predicate in predicates {
                     entity_pks.extend(
                         self.analyze_conjunctive_constraint(predicate)?
-                            .into_entity_pks(&self.primary_key_columns)?,
+                            .into_entity_pks(
+                                &self.primary_key_columns,
+                                self.primary_key_component_types,
+                            )?,
                     );
                 }
                 Some(BoundPrimaryKeyConstraint::Full(entity_pks))
@@ -1841,6 +1849,7 @@ impl BoundPrimaryKeyConstraint {
     fn into_entity_pks(
         self,
         primary_key_columns: &[&str],
+        component_types: &[crate::entity_pk::EntityPkComponentType],
     ) -> Option<std::collections::BTreeSet<EntityPk>> {
         match self {
             Self::Full(entity_pks) => Some(entity_pks),
@@ -1860,7 +1869,7 @@ impl BoundPrimaryKeyConstraint {
                 }
                 combinations
                     .into_iter()
-                    .map(EntityPk::from_parts)
+                    .map(|parts| EntityPk::from_external_parts(parts, component_types))
                     .collect::<Result<std::collections::BTreeSet<_>, _>>()
                     .ok()
             }
@@ -3664,6 +3673,7 @@ mod primary_key_route_tests {
     fn routes_literal_and_parameter_primary_keys() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
+            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
             params: &[Value::Text("from-param".to_string())],
         };
         let predicate = BoundPredicate::Or(vec![
@@ -3675,7 +3685,10 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("identity predicate should route")
-                .into_entity_pks(&analyzer.primary_key_columns)
+                .into_entity_pks(
+                    &analyzer.primary_key_columns,
+                    analyzer.primary_key_component_types,
+                )
                 .expect("identity predicate should be complete"),
             std::collections::BTreeSet::from([
                 EntityPk::single("from-param"),
@@ -3688,6 +3701,7 @@ mod primary_key_route_tests {
     fn routes_guaranteed_conjunct_but_not_partial_disjunction() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
+            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
             params: &[],
         };
         let conjunct = BoundPredicate::And(vec![
@@ -3698,7 +3712,10 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&conjunct)
                 .expect("guaranteed identity conjunct should route")
-                .into_entity_pks(&analyzer.primary_key_columns)
+                .into_entity_pks(
+                    &analyzer.primary_key_columns,
+                    analyzer.primary_key_component_types,
+                )
                 .expect("identity conjunct should be complete"),
             std::collections::BTreeSet::from([EntityPk::single("entity-a")])
         );
@@ -3719,6 +3736,10 @@ mod primary_key_route_tests {
     fn routes_composite_primary_key_in_declared_order() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["namespace", "id"],
+            primary_key_component_types: &[
+                crate::entity_pk::EntityPkComponentType::String,
+                crate::entity_pk::EntityPkComponentType::String,
+            ],
             params: &[],
         };
         let predicate = BoundPredicate::And(vec![
@@ -3733,7 +3754,10 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("composite predicate should route")
-                .into_entity_pks(&analyzer.primary_key_columns)
+                .into_entity_pks(
+                    &analyzer.primary_key_columns,
+                    analyzer.primary_key_component_types,
+                )
                 .expect("composite predicate should be complete"),
             std::collections::BTreeSet::from([
                 EntityPk::from_parts(vec!["docs".to_string(), "one".to_string()])
@@ -3748,6 +3772,7 @@ mod primary_key_route_tests {
     fn contradictory_primary_key_conjunct_routes_empty() {
         let analyzer = BoundPrimaryKeyAnalyzer {
             primary_key_columns: vec!["id"],
+            primary_key_component_types: &[crate::entity_pk::EntityPkComponentType::String],
             params: &[],
         };
         let predicate = BoundPredicate::And(vec![
@@ -3759,7 +3784,10 @@ mod primary_key_route_tests {
             analyzer
                 .analyze_conjunctive_constraint(&predicate)
                 .expect("contradictory identity should still route")
-                .into_entity_pks(&analyzer.primary_key_columns)
+                .into_entity_pks(
+                    &analyzer.primary_key_columns,
+                    analyzer.primary_key_component_types,
+                )
                 .expect("identity predicate should be complete")
                 .is_empty()
         );

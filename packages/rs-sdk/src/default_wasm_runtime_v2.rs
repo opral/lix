@@ -8,13 +8,14 @@ use lix_engine::wasm::v2::{
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmComponentV2Actor,
     WasmComponentV2Factory, WasmConflictResolution, WasmConflictResolutionDrainValidator,
     WasmConflictResolutionPage, WasmConflictTake, WasmConflictTransition, WasmConflictUpdate,
-    WasmDocumentHandle, WasmEditCursorHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity,
-    WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityKey, WasmEntityPage, WasmEntitySource,
-    WasmEntityTransition, WasmEntityUpdate, WasmFileDescriptor, WasmFileTransition, WasmFileUpdate,
-    WasmGuestBytes, WasmHostBytes, WasmIdNamespace, WasmInputBytes, WasmOpenEntitiesInput,
-    WasmOpenFileInput, WasmOutputRange, WasmOutputSplice, WasmResolutionCursorHandle,
-    WasmSourceSlice, WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    WasmCreateContext, WasmDocumentHandle, WasmEditCursorHandle, WasmEditDrainValidator,
+    WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges,
+    WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityKey, WasmEntityPage,
+    WasmEntitySource, WasmEntityTransition, WasmEntityUpdate, WasmFileDescriptor,
+    WasmFileTransition, WasmFileUpdate, WasmGuestBytes, WasmHostBytes, WasmInputBytes,
+    WasmOpenEntitiesInput, WasmOpenFileInput, WasmOutputRange, WasmOutputSplice,
+    WasmResolutionCursorHandle, WasmSourceSlice, WasmTransitionCounters, WasmTransitionHandle,
+    WasmTransitionLimits,
 };
 use wasmtime::component::{Resource, ResourceAny};
 
@@ -267,15 +268,19 @@ fn encode_change_packet(
     let mut records = Vec::with_capacity(page.changes.len());
     let mut attachments = Vec::new();
     for change in page.changes {
-        let key = change.key();
-        if !seen_keys.insert(key.clone()) {
-            return Err(v2_invalid_plugin(
-                "v2 change source repeated an entity key across its transition",
-            ));
-        }
         let mut record = Vec::new();
         match change {
+            WasmEntityChange::Create { .. } => {
+                return Err(v2_invalid_plugin(
+                    "host-to-guest change streams cannot contain keyless creates",
+                ));
+            }
             WasmEntityChange::Upsert { entity, effect } => {
+                if !seen_keys.insert(entity.key.clone()) {
+                    return Err(v2_invalid_plugin(
+                        "v2 change source repeated an entity key across its transition",
+                    ));
+                }
                 record.push(0);
                 encode_entity_key(&entity.key, &mut record)?;
                 record.push(match effect {
@@ -285,6 +290,11 @@ fn encode_change_packet(
                 encode_host_blob(entity.snapshot_content, &mut record, &mut attachments)?;
             }
             WasmEntityChange::Delete(key) => {
+                if !seen_keys.insert(key.clone()) {
+                    return Err(v2_invalid_plugin(
+                        "v2 change source repeated an entity key across its transition",
+                    ));
+                }
                 record.push(1);
                 encode_entity_key(&key, &mut record)?;
             }
@@ -486,9 +496,9 @@ fn decode_change_packet(
         let record_bytes = framed.read_exact(record_len)?;
         let mut record = PacketReader::new(record_bytes);
         let change_tag = record.read_u8()?;
-        let key = decode_entity_key(&mut record)?;
         let change = match change_tag {
             0 => {
+                let key = decode_entity_key(&mut record)?;
                 let effect = match record.read_u8()? {
                     0 => WasmChangeEffect::Content,
                     1 => WasmChangeEffect::FormatOnly,
@@ -503,7 +513,17 @@ fn decode_change_packet(
                     effect,
                 }
             }
-            1 => WasmEntityChange::Delete(key),
+            1 => WasmEntityChange::Delete(decode_entity_key(&mut record)?),
+            2 => {
+                let schema_key = record.read_text()?;
+                let local_ref = record.read_u64()?;
+                let snapshot_content = decode_guest_blob(&mut record, &mut output_ranges)?;
+                WasmEntityChange::Create {
+                    schema_key,
+                    local_ref,
+                    snapshot_content,
+                }
+            }
             _ => return Err(v2_invalid_plugin("unknown v2 change tag")),
         };
         record.finish()?;
@@ -1931,16 +1951,17 @@ mod tests {
         actor: &mut dyn WasmComponentV2Actor,
     ) -> (WasmDocumentHandle, WasmEntity<WasmHostBytes>) {
         let limits = WasmTransitionLimits::default();
+        let creates = WasmCreateContext {
+            high: 0x4c49_5832,
+            low: 7,
+        };
         let transition = actor
             .open_file(
                 limits,
                 WasmOpenFileInput {
                     descriptor: memory_probe_descriptor(),
                     file: Arc::new(TestByteSource(Arc::new(b"a,b\n".to_vec()))),
-                    ids: WasmIdNamespace {
-                        high: 0x4c49_5832,
-                        low: 7,
-                    },
+                    creates,
                 },
             )
             .await
@@ -1957,19 +1978,50 @@ mod tests {
         {
             assert!(page.outputs.is_none());
             for change in page.changes.changes {
-                if let WasmEntityChange::Upsert { entity, .. } = change
-                    && entity.key.schema_key == "csv_v2_row"
-                {
-                    let snapshot_content = match entity.snapshot_content {
-                        WasmGuestBytes::Inline(bytes) => WasmHostBytes::Inline(bytes),
-                        WasmGuestBytes::Output(_) => {
-                            panic!("small CSV row snapshot must stay inline")
-                        }
-                    };
-                    row = Some(WasmEntity {
-                        key: entity.key,
+                match change {
+                    WasmEntityChange::Create {
+                        schema_key,
+                        local_ref,
                         snapshot_content,
-                    });
+                    } if schema_key == "csv_v2_row" => {
+                        let snapshot_content = match snapshot_content {
+                            WasmGuestBytes::Inline(bytes) => bytes,
+                            WasmGuestBytes::Output(_) => {
+                                panic!("small CSV row snapshot must stay inline")
+                            }
+                        };
+                        let id = creates.component(local_ref).expect("test create UUID");
+                        let mut snapshot: serde_json::Value =
+                            serde_json::from_slice(&snapshot_content).expect("row snapshot JSON");
+                        snapshot
+                            .as_object_mut()
+                            .expect("row snapshot object")
+                            .insert("id".to_string(), serde_json::Value::String(id.clone()));
+                        row = Some(WasmEntity {
+                            key: WasmEntityKey {
+                                schema_key,
+                                entity_pk: vec![id],
+                            },
+                            snapshot_content: WasmHostBytes::Inline(
+                                serde_json::to_vec(&snapshot).expect("completed row snapshot"),
+                            ),
+                        });
+                    }
+                    WasmEntityChange::Upsert { entity, .. }
+                        if entity.key.schema_key == "csv_v2_row" =>
+                    {
+                        let snapshot_content = match entity.snapshot_content {
+                            WasmGuestBytes::Inline(bytes) => WasmHostBytes::Inline(bytes),
+                            WasmGuestBytes::Output(_) => {
+                                panic!("small CSV row snapshot must stay inline")
+                            }
+                        };
+                        row = Some(WasmEntity {
+                            key: entity.key,
+                            snapshot_content,
+                        });
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2086,7 +2138,7 @@ mod tests {
                         bytes: Arc::new(b"a,b\n".to_vec()),
                         delay: Duration::from_millis(750),
                     }),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 8,
                     },
@@ -2114,7 +2166,7 @@ mod tests {
                 WasmOpenFileInput {
                     descriptor: memory_probe_descriptor(),
                     file: Arc::new(TestByteSource(Arc::new(b"a,b\n".to_vec()))),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 9,
                     },
@@ -2156,7 +2208,7 @@ mod tests {
                         insert: WasmInputBytes::Inline(vec![0xff]),
                     }],
                     after: Arc::new(TestByteSource(Arc::new(vec![0xff, b',', b'b', b'\n']))),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 8,
                     },
@@ -2323,7 +2375,7 @@ mod tests {
                         insert: WasmInputBytes::Inline(vec![b'x']),
                     }],
                     after: Arc::new(TestByteSource(Arc::new(b"x,b\n".to_vec()))),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 9,
                     },
@@ -2565,7 +2617,7 @@ mod tests {
                 WasmOpenFileInput {
                     descriptor: memory_probe_descriptor(),
                     file: Arc::new(TestByteSource(bytes)),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 0,
                     },
@@ -2739,7 +2791,7 @@ mod tests {
                         insert: WasmInputBytes::Inline(vec![b'x']),
                     }],
                     after: Arc::new(TestByteSource(after.clone())),
-                    ids: WasmIdNamespace {
+                    creates: WasmCreateContext {
                         high: 0x4c49_5832,
                         low: 1,
                     },
@@ -2764,6 +2816,23 @@ mod tests {
                 .changes
                 .into_iter()
                 .map(|change| match change {
+                    WasmEntityChange::Create {
+                        schema_key,
+                        local_ref,
+                        snapshot_content,
+                    } => {
+                        let snapshot_content = match snapshot_content {
+                            WasmGuestBytes::Inline(bytes) => WasmHostBytes::Inline(bytes),
+                            WasmGuestBytes::Output(_) => {
+                                panic!("one-row CSV snapshot should stay inline")
+                            }
+                        };
+                        WasmEntityChange::Create {
+                            schema_key,
+                            local_ref,
+                            snapshot_content,
+                        }
+                    }
                     WasmEntityChange::Upsert { entity, effect } => {
                         let snapshot_content = match entity.snapshot_content {
                             WasmGuestBytes::Inline(bytes) => WasmHostBytes::Inline(bytes),
@@ -2956,10 +3025,10 @@ fn descriptor_to_binding(
     }
 }
 
-fn ids_to_binding(ids: WasmIdNamespace) -> bindings::lix::plugin::host::IdNamespace {
-    bindings::lix::plugin::host::IdNamespace {
-        high: ids.high,
-        low: ids.low,
+fn creates_to_binding(creates: WasmCreateContext) -> bindings::lix::plugin::host::CreateContext {
+    bindings::lix::plugin::host::CreateContext {
+        high: creates.high,
+        low: creates.low,
     }
 }
 
@@ -2998,7 +3067,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         let binding_input = bindings::exports::lix::plugin::api::OpenFileInput {
             descriptor: descriptor_to_binding(&input.descriptor),
             file,
-            ids: ids_to_binding(input.ids),
+            creates: creates_to_binding(input.creates),
         };
         let guest = self.guest.clone();
         let budget_rep = match self.prepare_nested_call(transition) {
@@ -3111,7 +3180,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             before,
             edits,
             after,
-            ids: ids_to_binding(update.ids),
+            creates: creates_to_binding(update.creates),
         };
         let guest = self.guest.clone();
         let budget_rep = match self.prepare_nested_call(transition) {

@@ -93,24 +93,20 @@ interface host {
     ) -> result<option<packet-page>, source-error>;
   }
 
-  /// Mutation-scoped generated-ID namespace for one top-level file transition.
-  /// The host binds it to an explicit mutation identity, file incarnation, and
-  /// plugin generation. Reusing the same explicit mutation identity reproduces
-  /// the namespace; distinct operations receive collision-checked values.
-  /// Transport replay needs a separate protocol identity and is not implied by
-  /// this interface. The SDK serializes `high` and `low` as big-endian bytes,
-  /// appends a deterministic big-endian `u64` ordinal, and base64url-encodes the
-  /// 24 bytes without padding into one 32-character PK component. Parentage and
-  /// order remain snapshot fields. Generated IDs therefore require no host
-  /// import and stay file/schema-global.
-  record id-namespace {
+  /// Mutation-scoped UUIDv7 creation context. The 96-bit prefix contains the
+  /// stable mutation timestamp, UUID version/variant bits, and collision-resistant
+  /// allocation bits. Appending a big-endian u32 local reference produces the
+  /// canonical UUID assigned to one keyless create. Plugins never report that
+  /// UUID in a create packet; the SDK uses this context only to retain the same
+  /// identity in a warm document.
+  record create-context {
     high: u64,
-    low: u64,
+    low: u32,
   }
 }
 
 interface api {
-  use host.{byte-source, packet-source, id-namespace, transition-budget};
+  use host.{byte-source, packet-source, create-context, transition-budget};
 
   type bytes = list<u8>;
 
@@ -279,7 +275,7 @@ interface api {
     edits: list<input-splice>,
     /// Lazy complete-result fallback. Optimized plugins need not read it.
     after: own<byte-source>,
-    ids: id-namespace,
+    creates: create-context,
   }
 
   record entity-update {
@@ -330,7 +326,7 @@ interface api {
   record open-file-input {
     descriptor: file-descriptor,
     file: own<byte-source>,
-    ids: id-namespace,
+    creates: create-context,
   }
 
   /// Cold restart/eviction from durable entities. When `accepted` is present,

@@ -31,6 +31,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["std"] }
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 wasmtime-wasi = { version = "45", default-features = false, features = ["p2"] }
 zip = { version = "8", default-features = false }

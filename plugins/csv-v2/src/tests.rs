@@ -1,7 +1,5 @@
 use super::*;
 use crate::core::{RowConflictResolution, resolve_row_conflict};
-use base64::Engine as _;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::Value;
 
 fn namespace() -> IdNamespace {
@@ -55,12 +53,12 @@ fn has_number(value: &Value) -> bool {
 }
 
 #[test]
-fn generated_id_is_namespace_plus_big_endian_ordinal() {
-    let id = namespace().encode(0x0102_0304_0506_0708);
-    assert_eq!(id.len(), 32);
-    let bytes = URL_SAFE_NO_PAD.decode(id).unwrap();
-    assert_eq!(&bytes[..16], &namespace().0);
-    assert_eq!(&bytes[16..], &0x0102_0304_0506_0708u64.to_be_bytes());
+fn generated_id_is_uuid_prefix_plus_big_endian_local_ref() {
+    let id = namespace().encode(0x0506_0708);
+    assert_eq!(id.len(), 36);
+    let id = uuid::Uuid::parse_str(&id).unwrap();
+    assert_eq!(&id.as_bytes()[..12], &namespace().0[..12]);
+    assert_eq!(&id.as_bytes()[12..], &0x0506_0708u32.to_be_bytes());
 }
 
 #[test]
@@ -775,7 +773,7 @@ fn file_change_reorder_with_inserted_row_discards_stale_rank_anchor() {
         .collect::<Vec<_>>();
     assert_eq!(changed_rows[0].1, noncompact_ids[1]);
     assert_eq!(changed_rows[2].1, noncompact_ids[0]);
-    assert_eq!(changed_rows[1].1.len(), 32);
+    assert_eq!(changed_rows[1].1.len(), 36);
 }
 
 #[test]

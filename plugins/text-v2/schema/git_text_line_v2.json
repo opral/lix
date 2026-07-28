@@ -1,13 +1,14 @@
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-lix-key": "git_text_line_v2",
   "x-lix-primary-key": ["/id"],
-  "x-lix-id-allocation": "host-allocated",
   "description": "One byte-exact Git-style text line. Newline bytes remain part of content_base64.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1
+      "format": "uuid",
+      "x-lix-default": "lix_uuid_v7()"
     },
     "order_key": {
       "type": "string",

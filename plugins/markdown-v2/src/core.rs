@@ -51,35 +51,30 @@ pub struct DetectedChange {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IdNamespace {
     high: u64,
-    low: u64,
+    low: u32,
 }
 
 impl IdNamespace {
-    pub const fn from_halves(high: u64, low: u64) -> Self {
+    pub const fn from_halves(high: u64, low: u32) -> Self {
         Self { high, low }
     }
 
     /// Reconstructs the core's compact namespace from one canonical ID minted
     /// by the opaque public API namespace.
     pub fn from_generated_id(id: &str) -> Result<Self, String> {
-        let mut decoded = [0_u8; 24];
-        let decoded_len = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode_slice(id.as_bytes(), &mut decoded)
+        let decoded = uuid::Uuid::parse_str(id)
             .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?;
-        if decoded_len != decoded.len() {
-            return Err("plugin API generated an invalid Markdown identity".to_owned());
-        }
         let high = u64::from_be_bytes(
-            decoded[..8]
+            decoded.as_bytes()[..8]
                 .try_into()
                 .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?,
         );
-        let low = u64::from_be_bytes(
-            decoded[8..16]
+        let low = u32::from_be_bytes(
+            decoded.as_bytes()[8..12]
                 .try_into()
                 .map_err(|_| "plugin API generated an invalid Markdown identity".to_owned())?,
         );
-        Ok(Self::from_halves(high, low))
+        Ok(Self { high, low })
     }
 }
 
@@ -98,15 +93,17 @@ impl IdAllocator {
     }
 
     fn next(&mut self) -> String {
-        let mut bytes = [0_u8; 24];
+        let ordinal = u32::try_from(self.ordinal)
+            .expect("one Markdown transition cannot allocate more than u32::MAX nodes");
+        let mut bytes = [0_u8; 16];
         bytes[..8].copy_from_slice(&self.namespace.high.to_be_bytes());
-        bytes[8..16].copy_from_slice(&self.namespace.low.to_be_bytes());
-        bytes[16..].copy_from_slice(&self.ordinal.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.namespace.low.to_be_bytes());
+        bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
         self.ordinal = self
             .ordinal
             .checked_add(1)
-            .expect("one Markdown transition cannot allocate more than u64::MAX IDs");
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+            .expect("Markdown allocation counter overflowed");
+        uuid::Uuid::from_bytes(bytes).to_string()
     }
 }
 

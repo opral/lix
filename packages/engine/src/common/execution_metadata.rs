@@ -266,6 +266,10 @@ fn splice_result_len(
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MutationIdentity {
+    /// RFC 9562 UUIDv7 bytes minted when the retryable mutation begins.
+    ///
+    /// The timestamp field supplies chronological locality for IDs generated
+    /// by the mutation and must remain unchanged across retries.
     pub namespace_seed: [u8; 16],
     pub operation_proof: [u8; 32],
 }

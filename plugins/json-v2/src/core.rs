@@ -21,31 +21,27 @@ impl IdNamespace {
     pub fn from_halves(high: u64, low: u64) -> Self {
         let mut bytes = [0; 16];
         bytes[..8].copy_from_slice(&high.to_be_bytes());
-        bytes[8..].copy_from_slice(&low.to_be_bytes());
+        bytes[8..12].copy_from_slice(&low.to_be_bytes()[4..]);
         Self(bytes)
     }
 
     pub fn encode(self, ordinal: u64) -> String {
-        let mut bytes = [0; 24];
-        bytes[..16].copy_from_slice(&self.0);
-        bytes[16..].copy_from_slice(&ordinal.to_be_bytes());
-        URL_SAFE_NO_PAD.encode(bytes)
+        let ordinal = u32::try_from(ordinal)
+            .expect("one JSON mutation cannot allocate more than u32::MAX items");
+        let mut bytes = [0; 16];
+        bytes[..12].copy_from_slice(&self.0[..12]);
+        bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
+        uuid::Uuid::from_bytes(bytes).to_string()
     }
 
     /// Converts one API-generated ID back into the namespace retained by the
     /// JSON parser. The public author API intentionally keeps that namespace
     /// opaque.
     pub fn from_generated_id(id: &str) -> Result<Self, String> {
-        let mut decoded = [0_u8; 24];
-        let decoded_len = URL_SAFE_NO_PAD
-            .decode_slice(id.as_bytes(), &mut decoded)
+        let decoded = uuid::Uuid::parse_str(id)
             .map_err(|_| "plugin API generated an invalid JSON identity".to_owned())?;
-        if decoded_len != decoded.len() {
-            return Err("plugin API generated an invalid JSON identity".to_owned());
-        }
-        let namespace = decoded[..16]
-            .try_into()
-            .map_err(|_| "plugin API generated an invalid JSON identity".to_owned())?;
+        let mut namespace = [0_u8; 16];
+        namespace[..12].copy_from_slice(&decoded.as_bytes()[..12]);
         Ok(Self(namespace))
     }
 }

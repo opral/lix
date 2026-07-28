@@ -19,8 +19,10 @@ fn exposes_one_self_referencing_markdown_node_v2_schema() {
         Some(&serde_json::json!(["/id"]))
     );
     assert_eq!(
-        schemas[0].get("x-lix-id-allocation"),
-        Some(&serde_json::json!("host-allocated"))
+        schemas[0]
+            .pointer("/properties/id/x-lix-default")
+            .and_then(serde_json::Value::as_str),
+        Some("lix_uuid_v7()")
     );
     let raw = node_schema_json();
     assert!(raw.contains("\"document\""));
