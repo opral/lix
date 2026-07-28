@@ -6857,6 +6857,12 @@ mod tests {
             .expect("fixture ID should be a canonical UUID")
     }
 
+    fn path_index_from_rows(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<FilesystemPathIndex, LixError> {
+        FilesystemPathIndex::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
     fn test_functions() -> FunctionProviderHandle {
         FunctionProviderHandle::system()
     }
@@ -6944,8 +6950,7 @@ mod tests {
         match operation.as_str() {
             "lookup" => {
                 let index = Arc::new(
-                    FilesystemPathIndex::from_live_rows(rows)
-                        .expect("benchmark path index should build"),
+                    path_index_from_rows(rows).expect("benchmark path index should build"),
                 );
                 heap_bytes = index.estimated_heap_bytes();
                 let target_ids = BTreeSet::from([target_id]);
@@ -6967,8 +6972,8 @@ mod tests {
                 for iteration in 0..warmups.saturating_add(rounds) {
                     let input = rows.clone();
                     let started = Instant::now();
-                    let index = FilesystemPathIndex::from_live_rows(input)
-                        .expect("benchmark path index should build");
+                    let index =
+                        path_index_from_rows(input).expect("benchmark path index should build");
                     let elapsed = started.elapsed();
                     heap_bytes = index.estimated_heap_bytes();
                     assert_eq!(
@@ -7026,7 +7031,7 @@ mod tests {
     #[test]
     fn indexed_file_id_matches_restores_path_order_and_applies_path_predicate() {
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_file_row(
                     "01920000-0000-7000-8000-000000000532",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7426,7 +7431,7 @@ mod tests {
         );
         file.metadata = Some(r#"{"source":"index"}"#.into());
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7514,7 +7519,7 @@ mod tests {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_file_row(
                     "01920000-0000-7000-8000-0000000000c2",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7602,7 +7607,7 @@ mod tests {
         target.file_id = Some("remote-01920000-0000-7000-8000-000000000522".to_string());
         target.untracked = true;
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_file_row(
                     "01920000-0000-7000-8000-000000000482",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -7700,7 +7705,7 @@ mod tests {
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_file_row(
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7775,7 +7780,7 @@ mod tests {
         );
         selected_blob.change_id = Some(selected_change_id);
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -7923,7 +7928,7 @@ mod tests {
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -8118,10 +8123,8 @@ mod tests {
             untracked_blob.clone(),
             misplaced_blob.clone(),
         ]);
-        let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(index_rows)
-                .expect("filesystem path index should build"),
-        );
+        let index =
+            Arc::new(path_index_from_rows(index_rows).expect("filesystem path index should build"));
         let matches =
             super::indexed_file_matches(Arc::clone(&index), &super::FilePathPredicate::All);
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
@@ -8217,7 +8220,7 @@ mod tests {
         let live_state_requests = Arc::new(Mutex::new(Vec::new()));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -8564,9 +8567,7 @@ mod tests {
             _request: &FilesystemPathIndexRequest,
         ) -> Result<Arc<FilesystemPathIndex>, LixError> {
             self.path_index_count += 1;
-            Ok(Arc::new(FilesystemPathIndex::from_live_rows(
-                self.rows.clone(),
-            )?))
+            Ok(Arc::new(path_index_from_rows(self.rows.clone())?))
         }
 
         async fn load_branch_head(
@@ -9561,7 +9562,7 @@ mod tests {
         let data = b"indexed contents";
         let blob_hash = BlobHash::from_content(data);
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_file_row(
                     file_id,
                     branch_id,
@@ -11493,7 +11494,7 @@ mod tests {
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let scan_requests = Arc::new(Mutex::new(Vec::new()));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_directory_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000b1",

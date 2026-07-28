@@ -300,11 +300,6 @@ impl Default for FilesystemPathIndex {
 }
 
 impl FilesystemPathIndex {
-    #[cfg(test)]
-    pub(crate) fn from_live_rows(rows: Vec<MaterializedLiveStateRow>) -> Result<Self, LixError> {
-        Self::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
-    }
-
     pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectoryRecord>::new();
         let mut file_rows = Vec::<(FilesystemDescriptorKey, FileRecord)>::new();
@@ -1427,6 +1422,12 @@ mod tests {
     use crate::entity_pk::EntityPk;
     use crate::live_state::MaterializedLiveStateBatchBuilder;
 
+    fn path_index_from_rows(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<FilesystemPathIndex, LixError> {
+        FilesystemPathIndex::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
     #[derive(Clone)]
     struct BatchOnlyLiveStateReader {
         rows: MaterializedLiveStateBatch,
@@ -1535,7 +1536,7 @@ mod tests {
 
     #[test]
     fn exact_range_and_order_preserve_path_buckets() {
-        let index = FilesystemPathIndex::from_live_rows(vec![
+        let index = path_index_from_rows(vec![
             directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 None,
@@ -1598,7 +1599,7 @@ mod tests {
 
     #[test]
     fn exact_file_id_entries_keep_every_file_lane_and_exclude_directories() {
-        let index = FilesystemPathIndex::from_live_rows(vec![
+        let index = path_index_from_rows(vec![
             directory_row(
                 "shared",
                 None,
@@ -1700,7 +1701,7 @@ mod tests {
             &request,
             Some(&[1]),
             Arc::new(
-                FilesystemPathIndex::from_live_rows(vec![file_row(
+                path_index_from_rows(vec![file_row(
                     "01920000-0000-7000-8000-0000000000a2",
                     None,
                     "before.md",
@@ -1735,7 +1736,7 @@ mod tests {
     #[test]
     fn blob_refs_build_and_advance_with_their_file_entry() {
         let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             file_row("file-a", None, "a.md", "branch-a", false),
             blob_row("file-a", "hash-before", "branch-a"),
         ])
@@ -1786,7 +1787,7 @@ mod tests {
         let request = FilesystemPathIndexRequest::new(vec!["branch-a".to_string()]);
         let mut projected_blob = blob_row("global-file", "hash-before", "branch-a");
         projected_blob.global = true;
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             file_row("global-file", None, "global.md", "branch-a", true),
             projected_blob,
         ])
@@ -1814,7 +1815,7 @@ mod tests {
     fn global_descriptor_delta_updates_only_unshadowed_branch_entries() {
         let request =
             FilesystemPathIndexRequest::new(vec!["branch-a".to_string(), "branch-b".to_string()]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             file_row("global-file", None, "local.md", "branch-a", false),
             file_row("global-file", None, "global.md", "branch-b", true),
         ])
@@ -1842,7 +1843,7 @@ mod tests {
         let request = FilesystemPathIndexRequest::new(vec![
             "01920000-0000-7000-8000-0000000000a1".to_string(),
         ]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![file_row(
+        let prior = path_index_from_rows(vec![file_row(
             "01920000-0000-7000-8000-0000000000a2",
             None,
             "before.md",
@@ -1884,7 +1885,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1".to_string(),
             "01920000-0000-7000-8000-0000000000b1".to_string(),
         ]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             file_row(
                 "shared",
                 None,
@@ -1926,7 +1927,7 @@ mod tests {
         let request = FilesystemPathIndexRequest::new(vec![
             "01920000-0000-7000-8000-0000000000a1".to_string(),
         ]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             directory_row(
                 "docs",
                 None,
@@ -1984,7 +1985,7 @@ mod tests {
         let request = FilesystemPathIndexRequest::new(vec![
             "01920000-0000-7000-8000-0000000000a1".to_string(),
         ]);
-        let prior = FilesystemPathIndex::from_live_rows(vec![
+        let prior = path_index_from_rows(vec![
             directory_row(
                 "docs",
                 None,

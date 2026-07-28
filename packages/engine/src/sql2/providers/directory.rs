@@ -2150,6 +2150,18 @@ mod tests {
         FilesystemDescriptorKey, VisibleFilesystem, directory_path_resolvers_from_state_rows,
     };
 
+    fn path_index_from_rows(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<FilesystemPathIndex, LixError> {
+        FilesystemPathIndex::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
+    fn visible_filesystem_from_rows(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<VisibleFilesystem, LixError> {
+        VisibleFilesystem::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
     fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
         let mut ids = ids.iter();
         move || ids.next().expect("test id should exist").to_string()
@@ -2646,7 +2658,7 @@ mod tests {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -2720,7 +2732,7 @@ mod tests {
         let live_state_scans = Arc::new(AtomicUsize::new(0));
         let path_index_requests = Arc::new(AtomicUsize::new(0));
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![
+            path_index_from_rows(vec![
                 live_row(
                     "01920000-0000-7000-8000-0000000000d3",
                     "01920000-0000-7000-8000-0000000000a1",
@@ -2889,7 +2901,7 @@ mod tests {
 
     #[test]
     fn recursive_directory_delete_deletes_nested_dirs_files_and_blob_refs() {
-        let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
+        let visible_filesystem = visible_filesystem_from_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
         visible_filesystems.insert(
@@ -2946,7 +2958,7 @@ mod tests {
 
     #[test]
     fn recursive_directory_delete_dedupes_overlapping_parent_and_child() {
-        let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
+        let visible_filesystem = visible_filesystem_from_rows(filesystem_rows())
             .expect("visible filesystem should build");
         let mut visible_filesystems = BTreeMap::new();
         visible_filesystems.insert(
@@ -3059,7 +3071,7 @@ mod tests {
     #[tokio::test]
     async fn directory_path_insert_uses_indexed_resolver_without_live_state_fallback() {
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![live_row(
+            path_index_from_rows(vec![live_row(
                 "01920000-0000-7000-8000-0000000000d3",
                 "01920000-0000-7000-8000-0000000000a1",
                 "{\"id\":\"01920000-0000-7000-8000-0000000000d3\",\"parent_id\":null,\"name\":\"docs\"}",
@@ -3163,7 +3175,7 @@ mod tests {
             "{\"id\":\"01920000-0000-7000-8000-000000000383\",\"parent_id\":null,\"name\":\"other\"}",
         );
         let index = Arc::new(
-            FilesystemPathIndex::from_live_rows(vec![tracked, untracked, global, other])
+            path_index_from_rows(vec![tracked, untracked, global, other])
                 .expect("filesystem path index should build"),
         );
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
@@ -3299,7 +3311,7 @@ mod tests {
         let filesystem_path_index: Arc<dyn FilesystemPathIndexReader> =
             Arc::new(StaticFilesystemPathIndexReader {
                 index: Arc::new(
-                    FilesystemPathIndex::from_live_rows(vec![indexed])
+                    path_index_from_rows(vec![indexed])
                         .expect("filesystem path index should build"),
                 ),
                 request_count: Arc::new(AtomicUsize::new(0)),
