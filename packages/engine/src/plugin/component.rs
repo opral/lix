@@ -6,7 +6,7 @@ use crate::common::LixError;
 use crate::wasm::{WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters};
 
 use super::{
-    CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS, InstalledPlugin, PluginActorCache,
+    CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
     PluginCatalogCache, PluginRegistry,
 };
 
@@ -72,7 +72,7 @@ impl PluginRuntimeHost {
         Self::new_with_v2_limits(
             wasm_runtime,
             DEFAULT_PLUGIN_V2_MEMORY_BYTES,
-            DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS,
+            DEFAULT_MAX_LIVE_PLUGIN_STORES,
         )
         .expect("default plugin resource limits are valid")
     }
@@ -80,13 +80,13 @@ impl PluginRuntimeHost {
     pub(crate) fn new_with_v2_limits(
         wasm_runtime: Arc<dyn WasmRuntime>,
         max_memory_bytes: u64,
-        max_live_file_actors: usize,
+        max_live_stores: usize,
     ) -> Result<Self, LixError> {
         Ok(Self {
             wasm_runtime,
             plugin_v2_factory_cache: Arc::new(Mutex::new(BTreeMap::new())),
             plugin_v2_wasm_limits: plugin_v2_wasm_limits(max_memory_bytes)?,
-            plugin_actor_cache: PluginActorCache::new(max_live_file_actors)?,
+            plugin_actor_cache: PluginActorCache::new(max_live_stores)?,
             plugin_v2_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
             plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
             plugin_registry_read_cache: Arc::new(Mutex::new(PluginRegistryReadCache::default())),
@@ -268,7 +268,7 @@ mod tests {
             64 * 1024 * 1024
         );
         assert_eq!(
-            DEFAULT_PLUGIN_V2_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS as u64,
+            DEFAULT_PLUGIN_V2_MEMORY_BYTES * DEFAULT_MAX_LIVE_PLUGIN_STORES as u64,
             1024 * 1024 * 1024
         );
         assert_eq!(

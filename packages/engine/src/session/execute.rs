@@ -1146,41 +1146,6 @@ where
         .await
     }
 
-    /// Executes one atomic import batch whose caller serializes every writer
-    /// that could transition the same plugin-owned files.
-    ///
-    /// The caller may retain actors when the batch fits the configured live
-    /// Store bound, or retire them for a broad one-shot import. Retained actors
-    /// remain bounded cache candidates but are not session acknowledgements
-    /// across batches. Do not use this for concurrent mutation workloads:
-    /// ordinary execution retains acknowledged actor leases through commit to
-    /// compose concurrent semantic transitions.
-    #[doc(hidden)]
-    pub async fn execute_batch_for_single_writer_ingest(
-        &self,
-        statements: &[ExecuteBatchStatement],
-        retain_plugin_actors: bool,
-    ) -> Result<Vec<ExecuteResult>, LixError> {
-        let result = self
-            .execute_batch_with_options_and_metadata_inner(
-                statements,
-                ExecuteOptions::default(),
-                vec![ExecuteStatementMetadata::default(); statements.len()],
-                None,
-                false,
-                retain_plugin_actors,
-            )
-            .await;
-        // A serialized importer submits authoritative successor bytes rather
-        // than edits based on a session acknowledgement. Keep any bounded
-        // private actors as reusable cold-open candidates, but never expose
-        // their observations as acknowledgement authority across batches:
-        // normal cache eviction would otherwise turn a later import into a
-        // stale-observation error instead of a safe cold open.
-        self.file_views.clear();
-        result
-    }
-
     #[doc(hidden)]
     pub async fn execute_batch_with_options_and_metadata(
         &self,
@@ -1194,7 +1159,6 @@ where
             statement_metadata,
             None,
             false,
-            true,
         )
         .await
     }
@@ -1206,7 +1170,6 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
-        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry = start_batch(
             self.telemetry.as_ref(),
@@ -1219,7 +1182,6 @@ where
             statement_metadata,
             idempotency,
             require_idempotency_for_writes,
-            retain_plugin_actor_publications,
         );
         let result = match telemetry.as_ref() {
             Some(telemetry) => telemetry.instrument(operation).await,
@@ -1248,7 +1210,6 @@ where
             statement_metadata,
             idempotency,
             true,
-            true,
         )
         .await
     }
@@ -1260,7 +1221,6 @@ where
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
         require_idempotency_for_writes: bool,
-        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         self.ensure_open()?;
         if statements.is_empty() {
@@ -1310,7 +1270,6 @@ where
                             options,
                             statement_metadata,
                             None,
-                            retain_plugin_actor_publications,
                         )
                         .await;
                 }
@@ -1328,7 +1287,6 @@ where
                             options,
                             statement_metadata,
                             None,
-                            retain_plugin_actor_publications,
                         )
                         .await;
                 };
@@ -1344,7 +1302,6 @@ where
                         options,
                         statement_metadata,
                         Some(idempotency.clone()),
-                        retain_plugin_actor_publications,
                     )
                     .await;
                 match result {
@@ -1383,12 +1340,10 @@ where
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
-        retain_plugin_actor_publications: bool,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
         self.with_write_transaction(move |transaction| {
             Box::pin(async move {
-                transaction.set_retain_plugin_actor_publications(retain_plugin_actor_publications);
                 if let Some(results) = try_execute_transaction_parameter_batch(
                     transaction,
                     &statements,
@@ -3397,46 +3352,6 @@ mod tests {
             sql: sql.to_string(),
             params: Vec::new(),
         }
-    }
-
-    #[tokio::test]
-    async fn single_writer_ingest_never_carries_acknowledgement_authority_across_batches() {
-        let session = open_session().await;
-        let view_key = sql2::SessionFileViewKey::new("branch", "file");
-        session.file_views.remember_plugin_file_view(
-            view_key.clone(),
-            sql2::SessionPluginFileView {
-                path: "/file.txt".to_string(),
-                plugin_key: "plugin".to_string(),
-                plugin_generation: "generation".to_string(),
-                owner_change_id: "owner".to_string(),
-                observation: None,
-            },
-        );
-        assert!(
-            session
-                .file_views
-                .has_plugin_file_at_path("branch", "/file.txt")
-        );
-
-        session
-            .execute_batch_for_single_writer_ingest(
-                &[batch_statement(
-                    "INSERT INTO lix_key_value (key, value) \
-                     VALUES ('single-writer-ingest', lix_json('{}'))",
-                )],
-                true,
-            )
-            .await
-            .expect("serialized ingest should commit");
-
-        assert!(
-            session
-                .file_views
-                .plugin_file_view(&view_key, "plugin", "generation", "owner")
-                .is_none(),
-            "serialized ingestion may cache actors but must clear session acknowledgement authority"
-        );
     }
 
     #[test]

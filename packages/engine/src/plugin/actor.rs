@@ -18,7 +18,7 @@ use super::incremental::FileBytesSha256;
 use crate::wasm::{WasmComponentV2Actor, WasmDocumentHandle};
 use crate::{Blob, LixError};
 
-pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS: usize = 16;
+pub(crate) const DEFAULT_MAX_LIVE_PLUGIN_STORES: usize = 16;
 // One predecessor is enough for the required two-reader serialization while
 // keeping each file actor's retained working set bounded.
 pub(crate) const DEFAULT_MAX_PLUGIN_FILE_HISTORY: usize = 1;
@@ -161,7 +161,7 @@ struct PluginActorExpectedStale {
 
 impl Default for PluginActorCache {
     fn default() -> Self {
-        Self::new(DEFAULT_MAX_LIVE_PLUGIN_FILE_ACTORS)
+        Self::new(DEFAULT_MAX_LIVE_PLUGIN_STORES)
             .expect("the default plugin actor capacity is nonzero")
     }
 }
@@ -702,7 +702,7 @@ fn plugin_store_resource_limit(capacity: NonZeroUsize) -> LixError {
         ),
     )
     .with_hint(
-        "commit or split transactions retaining plugin actors, or raise EngineOptions::with_plugin_v2_resource_limits",
+        "finish transactions holding existing-document plugin leases, or raise EngineOptions::with_plugin_v2_resource_limits",
     )
 }
 

@@ -17,10 +17,6 @@ use zip::write::SimpleFileOptions;
 
 const PROGRESS_EVERY: usize = 10;
 const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
-// The replay opens Lix with the default 16-Store v2 actor bound. Batches
-// that fit can populate the bounded cache; broader imports retire candidates
-// as they go so one transaction never exhausts admission.
-const RETAINED_PLUGIN_ACTOR_BATCH_LIMIT: usize = 16;
 // Four SHA-256 `<oid>\n` requests are 260 bytes, below POSIX `PIPE_BUF`.
 // Keeping each flush below that floor lets the caller enqueue a small request
 // window before draining responses without depending on a platform's larger
@@ -315,12 +311,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
             marker_only += 1;
         }
         let execute_started = Instant::now();
-        execute_statements_as_transaction(
-            &lix,
-            &statements,
-            commit_sha,
-            inserts.saturating_add(updates) <= RETAINED_PLUGIN_ACTOR_BATCH_LIMIT,
-        )?;
+        execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
         phase_totals.execute_ms += execute_ms;
         applied += 1;
@@ -464,7 +455,6 @@ fn execute_statements_as_transaction(
     lix: &RocksLix,
     statements: &[SqlStatement],
     commit_sha: &str,
-    retain_plugin_actors: bool,
 ) -> Result<(), CliError> {
     let batch = statements
         .iter()
@@ -474,11 +464,7 @@ fn execute_statements_as_transaction(
         })
         .collect::<Vec<_>>();
 
-    db::block_on(lix.execute_batch_for_single_writer_ingest(
-        &batch,
-        retain_plugin_actors,
-    ))
-    .map_err(|error| {
+    db::block_on(lix.execute_batch(&batch)).map_err(|error| {
         let sql_preview = batch
             .first()
             .map(|statement| statement.sql.chars().take(160).collect::<String>())
@@ -670,7 +656,7 @@ fn seed_parent_tree(
     let prepared = prepare_commit_changes(state, &changes, &blob_by_oid)?;
     let statements = build_replay_commit_statements(&prepared, DEFAULT_INSERT_BATCH_ROWS);
     if !statements.is_empty() {
-        execute_statements_as_transaction(lix, &statements, parent_commit, false)?;
+        execute_statements_as_transaction(lix, &statements, parent_commit)?;
     }
     if verify_state {
         apply_prepared_to_expected_state(expected_state_by_id, &prepared);

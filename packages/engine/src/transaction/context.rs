@@ -56,11 +56,12 @@ use crate::live_state::{
 use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
     PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
-    PluginActorKey, PluginActorLease, PluginActorStore, PluginArchiveInstallPlan,
-    PluginContentType, PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry,
-    PluginRegistryEntry, PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist,
-    ValidatedConflictTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit,
+    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -335,7 +336,6 @@ pub(crate) struct Transaction<StorageImpl: Storage = Memory> {
     origin_key: Option<SharedStr>,
     idempotency_receipt: Option<(crate::storage_adapter::StorageKey, Vec<u8>)>,
     session_file_views: SessionFileViews,
-    retain_plugin_actor_publications: bool,
     pending_file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     pending_plugin_actor_publications: Vec<PendingPluginActorPublication>,
     plugin_generation_read_guard: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
@@ -586,7 +586,6 @@ where
                 origin_key: None,
                 idempotency_receipt: None,
                 session_file_views,
-                retain_plugin_actor_publications: true,
                 pending_file_view_mutations: BTreeMap::new(),
                 pending_plugin_actor_publications: Vec::new(),
                 plugin_generation_read_guard: None,
@@ -817,12 +816,32 @@ where
         self.trust_filesystem_planner = true;
     }
 
-    /// Bulk import only needs the durable rows produced by a plugin, not a
-    /// warm private Wasm document for every imported file. Retaining those
-    /// documents through one atomic commit can exceed the engine-wide actor
-    /// bound before the transaction is allowed to publish them.
-    pub(crate) fn set_retain_plugin_actor_publications(&mut self, retain: bool) {
-        self.retain_plugin_actor_publications = retain;
+    /// Admits a Store for a file that has no durable plugin actor yet.
+    ///
+    /// Fresh documents are independent until this transaction commits. When
+    /// their pending Stores fill the working set, retire the oldest fresh
+    /// candidate after its durable rows and materialization have been staged,
+    /// then reuse that admission slot. Existing-file leases are never retired
+    /// here: they serialize semantic successors through the commit boundary.
+    async fn admit_fresh_plugin_store(
+        &mut self,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginActorStorePermit, LixError> {
+        loop {
+            match self.plugin_host.actor_cache().admit_store() {
+                Ok(permit) => return Ok(permit),
+                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
+                    if retire_oldest_fresh_actor(current_publications).await
+                        || retire_oldest_fresh_actor(&mut self.pending_plugin_actor_publications)
+                            .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Rolls back the storage transaction.
@@ -3412,7 +3431,9 @@ where
                     create_rows,
                 )
             } else {
-                let store_permit = self.plugin_host.actor_cache().admit_store()?;
+                let store_permit = self
+                    .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
+                    .await?;
                 let mut actor = factory
                     .instantiate_actor()
                     .instrument(tracing::debug_span!(
@@ -3530,11 +3551,6 @@ where
             reconciliation
                 .materialization_versions
                 .insert(file_key.clone(), materialization_version);
-            let publication = if self.retain_plugin_actor_publications {
-                publication
-            } else {
-                publication.into_uncached().await
-            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -3847,11 +3863,6 @@ where
                 .as_mut()
                 .expect("semantic groups promote the reconciled row batch");
             rows.put_prepared_batch_at(&group.row_indices, prepared)?;
-            let publication = if self.retain_plugin_actor_publications {
-                publication
-            } else {
-                publication.into_uncached().await
-            };
             reconciliation.actor_publications.push(publication);
             reconciled_file_keys.insert(file_key);
         }
@@ -6088,6 +6099,18 @@ impl PendingPluginActorPublication {
             }
         }
     }
+}
+
+async fn retire_oldest_fresh_actor(publications: &mut Vec<PendingPluginActorPublication>) -> bool {
+    let Some(index) = publications
+        .iter()
+        .position(|publication| matches!(publication, PendingPluginActorPublication::New { .. }))
+    else {
+        return false;
+    };
+    let publication = publications.remove(index).into_uncached().await;
+    publications.insert(index, publication);
+    true
 }
 
 /// Builds the file write for an accepted semantic renderer transition.
