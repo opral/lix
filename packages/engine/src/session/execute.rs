@@ -427,7 +427,55 @@ pub struct ExecuteBatchStatement {
 
 enum ExecuteBatchExecution {
     ReadOnly(Vec<datafusion::sql::parser::Statement>),
-    Transaction(Vec<datafusion::sql::parser::Statement>),
+    Transaction(TransactionBatchStatements),
+}
+
+enum TransactionBatchStatements {
+    Shared {
+        statement: datafusion::sql::parser::Statement,
+        len: usize,
+    },
+    Distinct(Vec<datafusion::sql::parser::Statement>),
+}
+
+impl TransactionBatchStatements {
+    fn len(&self) -> usize {
+        match self {
+            Self::Shared { len, .. } => *len,
+            Self::Distinct(statements) => statements.len(),
+        }
+    }
+
+    fn first(&self) -> Option<&datafusion::sql::parser::Statement> {
+        match self {
+            Self::Shared { statement, len } => (*len > 0).then_some(statement),
+            Self::Distinct(statements) => statements.first(),
+        }
+    }
+
+    fn contains_write(&self) -> Result<bool, LixError> {
+        match self {
+            Self::Shared { statement, .. } => {
+                Ok(sql2::bind_statement_route(statement)? == sql2::BoundStatementRoute::Write)
+            }
+            Self::Distinct(statements) => {
+                statements
+                    .iter()
+                    .try_fold(false, |contains_write, statement| {
+                        Ok(contains_write
+                            || sql2::bind_statement_route(statement)?
+                                == sql2::BoundStatementRoute::Write)
+                    })
+            }
+        }
+    }
+
+    fn into_vec(self) -> Vec<datafusion::sql::parser::Statement> {
+        match self {
+            Self::Shared { statement, len } => vec![statement; len],
+            Self::Distinct(statements) => statements,
+        }
+    }
 }
 
 enum IdempotencyReceiptResolution {
@@ -1253,14 +1301,7 @@ where
                 self.execute_read_only_batch(&statements, parsed).await
             }
             ExecuteBatchExecution::Transaction(parsed) => {
-                let contains_write =
-                    parsed.iter().try_fold(false, |contains_write, statement| {
-                        Ok::<_, LixError>(
-                            contains_write
-                                || sql2::bind_statement_route(statement)?
-                                    == sql2::BoundStatementRoute::Write,
-                        )
-                    })?;
+                let contains_write = parsed.contains_write()?;
                 if !contains_write {
                     return self
                         .execute_transaction_batch(
@@ -1338,7 +1379,7 @@ where
     async fn execute_transaction_batch(
         &self,
         statements: Vec<ExecuteBatchStatement>,
-        parsed: Vec<DataFusionStatement>,
+        parsed: TransactionBatchStatements,
         options: ExecuteOptions,
         statement_metadata: Vec<ExecuteStatementMetadata>,
         idempotency: Option<ExecuteIdempotency>,
@@ -1365,6 +1406,7 @@ where
                     return Ok(results);
                 }
                 let mut results = Vec::with_capacity(statements.len());
+                let parsed = parsed.into_vec();
                 for (statement_index, ((statement, parsed), metadata)) in statements
                     .iter()
                     .zip(parsed)
@@ -2187,7 +2229,7 @@ where
 async fn try_execute_transaction_parameter_batch<StorageImpl>(
     transaction: &mut crate::transaction::Transaction<StorageImpl>,
     statements: &[ExecuteBatchStatement],
-    parsed: &[DataFusionStatement],
+    parsed: &TransactionBatchStatements,
     options: &ExecuteOptions,
     statement_metadata: &[ExecuteStatementMetadata],
     telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
@@ -2207,7 +2249,11 @@ where
         || statement_metadata
             .iter()
             .any(|metadata| metadata != &ExecuteStatementMetadata::default())
-        || sql2::bind_statement_route(&parsed[0])? != sql2::BoundStatementRoute::Write
+        || sql2::bind_statement_route(
+            parsed
+                .first()
+                .expect("non-empty transaction batch has a parsed statement"),
+        )? != sql2::BoundStatementRoute::Write
     {
         return Ok(None);
     }
@@ -2222,7 +2268,12 @@ where
 
     let previous_origin_key = transaction.replace_origin_key(options.origin_key.clone());
     let execution = async {
-        let plan = transaction.prepare_sql_write_logical_plan(&first_statement.sql, &parsed[0])?;
+        let plan = transaction.prepare_sql_write_logical_plan(
+            &first_statement.sql,
+            parsed
+                .first()
+                .expect("non-empty transaction batch has a parsed statement"),
+        )?;
         sql2::execute_write_logical_plan_parameter_batch(transaction, plan, &parameter_batch).await
     }
     .await;
@@ -3003,6 +3054,32 @@ fn classify_execute_batch(
     // switching execution modes between statements would break atomicity, and
     // any possible durable mutation keeps the whole batch transactional so
     // later reads retain read-after-write visibility.
+    if let Some(first) = statements.first()
+        && statements
+            .iter()
+            .skip(1)
+            .all(|statement| statement.sql == first.sql)
+    {
+        let parsed = planning_cache
+            .parse_statement(&first.sql)
+            .map_err(|error| with_batch_statement_index(error, 0))?;
+        let disposition =
+            execution_disposition(&parsed).map_err(|error| with_batch_statement_index(error, 0))?;
+        return if disposition == ExecutionDisposition::Durable {
+            Ok(ExecuteBatchExecution::Transaction(
+                TransactionBatchStatements::Shared {
+                    statement: parsed,
+                    len: statements.len(),
+                },
+            ))
+        } else {
+            Ok(ExecuteBatchExecution::ReadOnly(vec![
+                parsed;
+                statements.len()
+            ]))
+        };
+    }
+
     let mut parsed = Vec::with_capacity(statements.len());
     let mut is_read_only = true;
     for (statement_index, statement) in statements.iter().enumerate() {
@@ -3019,7 +3096,9 @@ fn classify_execute_batch(
     if is_read_only {
         Ok(ExecuteBatchExecution::ReadOnly(parsed))
     } else {
-        Ok(ExecuteBatchExecution::Transaction(parsed))
+        Ok(ExecuteBatchExecution::Transaction(
+            TransactionBatchStatements::Distinct(parsed),
+        ))
     }
 }
 
@@ -3440,6 +3519,21 @@ mod tests {
             classify_execute_batch(&[batch_statement("SELECT lix_uuid_v7()")], &cache).unwrap(),
             ExecuteBatchExecution::Transaction(_)
         ));
+    }
+
+    #[test]
+    fn execute_batch_reuses_one_parsed_statement_for_homogeneous_writes() {
+        let cache = sql2::SqlPlanningCache::default();
+        let statements = [
+            batch_statement("UPDATE lix_file SET path = '/a' WHERE id = 'a'"),
+            batch_statement("UPDATE lix_file SET path = '/a' WHERE id = 'a'"),
+        ];
+        let ExecuteBatchExecution::Transaction(TransactionBatchStatements::Shared { len, .. }) =
+            classify_execute_batch(&statements, &cache).unwrap()
+        else {
+            panic!("homogeneous durable statements should share one parsed statement");
+        };
+        assert_eq!(len, statements.len());
     }
 
     #[tokio::test]

@@ -94,21 +94,30 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     }
     validate_bound_write_supported(plan, &spec)?;
 
+    let direct_primary_key_param =
+        bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
     let mut entity_pks = Vec::with_capacity(parameter_batch.num_rows());
     let mut unique_entity_pks = std::collections::BTreeSet::new();
     for row_index in 0..parameter_batch.num_rows() {
         let params = super::write::parameter_row(parameter_batch, row_index)
             .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-        let Some(mut row_entity_pks) =
-            bound_entity_pks_from_primary_key_predicate(&spec, &plan.bound.predicate, &params)
-        else {
-            return Ok(None);
+        let entity_pk = if let Some(param_index) = direct_primary_key_param {
+            let Some(Value::Text(value)) = params.get(param_index) else {
+                return Ok(None);
+            };
+            EntityPk::single(value.clone())
+        } else {
+            let Some(mut row_entity_pks) =
+                bound_entity_pks_from_primary_key_predicate(&spec, &plan.bound.predicate, &params)
+            else {
+                return Ok(None);
+            };
+            if row_entity_pks.len() != 1 {
+                return Ok(None);
+            }
+            row_entity_pks.pop().expect("one point-update identity")
         };
-        if row_entity_pks.len() != 1 {
-            return Ok(None);
-        }
-        let entity_pk = row_entity_pks.pop().expect("one point-update identity");
         if !unique_entity_pks.insert(entity_pk.clone()) {
             // Repeated identities observe earlier staged writes and are not
             // independent statements.
@@ -156,6 +165,32 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
             .map(SqlWriteResult::affected)
             .collect(),
     ))
+}
+
+fn bound_single_text_primary_key_param(
+    spec: &EntitySurfaceSpec,
+    predicate: &BoundPredicate,
+) -> Option<usize> {
+    let [path] = spec.primary_key_paths.as_slice() else {
+        return None;
+    };
+    let [primary_key_column] = path.as_slice() else {
+        return None;
+    };
+    spec.visible_column(primary_key_column)
+        .filter(|column| column.column_type == EntityColumnType::String)?;
+    let BoundPredicate::Eq(left, right) = predicate else {
+        return None;
+    };
+    match (left, right) {
+        (BoundExpr::Column(column), BoundExpr::Param(param))
+        | (BoundExpr::Param(param), BoundExpr::Column(column))
+            if column.name == *primary_key_column =>
+        {
+            param.index.checked_sub(1)
+        }
+        _ => None,
+    }
 }
 
 fn with_parameter_batch_statement_index(mut error: LixError, statement_index: usize) -> LixError {
@@ -3437,6 +3472,43 @@ fn entity_action(op: &BoundWriteOp) -> &'static str {
 mod primary_key_route_tests {
     use super::*;
     use crate::sql2::bind::expr::{BoundColumnRef, BoundParamRef};
+
+    #[test]
+    fn compiles_single_text_primary_key_parameter_once() {
+        let spec = crate::sql2::catalog::derive_entity_surface_spec_from_schema(
+            &serde_json::json!({
+                "x-lix-key": "entity",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "required": ["id", "value"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "value": {
+                        "type": ["object", "array", "string", "number", "integer", "boolean", "null"]
+                    }
+                },
+                "additionalProperties": false
+            }),
+        )
+        .expect("entity surface schema should compile");
+        assert_eq!(
+            bound_single_text_primary_key_param(
+                &spec,
+                &equals(column("id"), BoundExpr::Param(BoundParamRef { index: 2 }),),
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            bound_single_text_primary_key_param(
+                &spec,
+                &equals(
+                    column("value"),
+                    BoundExpr::Param(BoundParamRef { index: 2 }),
+                ),
+            ),
+            None
+        );
+    }
 
     #[test]
     fn routes_literal_and_parameter_primary_keys() {
