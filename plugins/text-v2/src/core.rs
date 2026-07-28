@@ -36,6 +36,28 @@ pub(crate) struct Line {
     bytes: Arc<Vec<u8>>,
 }
 
+pub(crate) struct AllUpserts {
+    document: Document,
+    index: usize,
+}
+
+impl Iterator for AllUpserts {
+    type Item = Result<lix::EntityChange, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let line = self.document.lines().get(self.index)?;
+        self.index += 1;
+        Some(line.upsert_change())
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.document.lines().len().saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for AllUpserts {}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LineSnapshot {
@@ -48,7 +70,7 @@ impl Document {
     pub(crate) fn open_file(
         bytes: Vec<u8>,
         mut id_for_ordinal: impl FnMut(u64) -> String,
-    ) -> Result<(Self, Vec<lix::EntityChange>), String> {
+    ) -> Result<(Self, AllUpserts), String> {
         validate_git_text(&bytes)?;
         let chunks = split_lines(&bytes);
         let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
@@ -70,15 +92,26 @@ impl Document {
             bytes: Arc::new(bytes),
             lines,
         }));
-        let changes = document.all_upserts()?;
+        let changes = AllUpserts {
+            document: document.clone(),
+            index: 0,
+        };
         Ok((document, changes))
     }
 
+    #[cfg(test)]
     pub(crate) fn open_entities(
         records: impl IntoIterator<Item = lix::EntityRecord>,
     ) -> Result<Self, String> {
+        Self::open_entities_fallible(records.into_iter().map(Ok))
+    }
+
+    pub(crate) fn open_entities_fallible(
+        records: impl IntoIterator<Item = Result<lix::EntityRecord, String>>,
+    ) -> Result<Self, String> {
         let mut lines = Vec::new();
         for record in records {
+            let record = record?;
             validate_entity_key(&record.schema_key, &record.entity_pk)?;
             let line = Line::from_snapshot(&record.snapshot)?;
             if record.entity_pk[0] != line.id {
@@ -101,20 +134,56 @@ impl Document {
         validate_git_text(&bytes)?;
         let chunks = split_lines(&bytes);
 
-        // Exact byte matches preserve their entity identity even across a
-        // reorder. Remaining old/new positions are paired in order, which
-        // preserves an edited line's ID without inventing a parser-specific
-        // identity rule for arbitrary text.
+        // Preserve the overwhelmingly common unchanged prefix and suffix
+        // without indexing the complete document. Generated bundles can have
+        // hundreds of thousands of lines with a localized edit; putting every
+        // line into the reorder matcher needlessly exhausts the guest heap.
+        let prefix_len = self
+            .lines()
+            .iter()
+            .zip(&chunks)
+            .take_while(|(old, new)| old.bytes.as_slice() == new.as_slice())
+            .count();
+        let suffix_len = self.lines()[prefix_len..]
+            .iter()
+            .rev()
+            .zip(chunks[prefix_len..].iter().rev())
+            .take_while(|(old, new)| old.bytes.as_slice() == new.as_slice())
+            .count();
+
+        let mut old_for_new = vec![None; chunks.len()];
+        let mut old_used = vec![false; self.lines().len()];
+        for index in 0..prefix_len {
+            old_for_new[index] = Some(index);
+            old_used[index] = true;
+        }
+        for offset in 0..suffix_len {
+            let old_index = self.lines().len() - suffix_len + offset;
+            let new_index = chunks.len() - suffix_len + offset;
+            old_for_new[new_index] = Some(old_index);
+            old_used[old_index] = true;
+        }
+
+        // Exact byte matches in the changed middle preserve their entity
+        // identity even across a reorder. Remaining old/new positions are
+        // paired in order, preserving an edited line's ID without inventing a
+        // parser-specific identity rule for arbitrary text.
         let mut exact = BTreeMap::<&[u8], VecDeque<usize>>::new();
-        for (old_index, line) in self.lines().iter().enumerate() {
+        for (old_index, line) in self.lines()[prefix_len..self.lines().len() - suffix_len]
+            .iter()
+            .enumerate()
+            .map(|(index, line)| (prefix_len + index, line))
+        {
             exact
                 .entry(line.bytes.as_slice())
                 .or_default()
                 .push_back(old_index);
         }
-        let mut old_for_new = vec![None; chunks.len()];
-        let mut old_used = vec![false; self.lines().len()];
-        for (new_index, bytes) in chunks.iter().enumerate() {
+        for (new_index, bytes) in chunks[prefix_len..chunks.len() - suffix_len]
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| (prefix_len + index, bytes))
+        {
             let Some(candidates) = exact.get_mut(bytes.as_slice()) else {
                 continue;
             };
@@ -262,13 +331,6 @@ impl Document {
             bytes: Arc::new(bytes),
             lines,
         })))
-    }
-
-    fn all_upserts(&self) -> Result<Vec<lix::EntityChange>, String> {
-        self.lines()
-            .iter()
-            .map(Line::upsert_change)
-            .collect::<Result<Vec<_>, _>>()
     }
 
     fn changes_to(&self, after: &Self) -> Result<Vec<lix::EntityChange>, String> {
