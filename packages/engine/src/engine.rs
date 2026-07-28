@@ -85,12 +85,14 @@ impl EngineOptions {
     /// number of simultaneously live v2 plugin Stores for this engine.
     ///
     /// The Store limit bounds the active working set, not the number of plugin
-    /// documents an atomic transaction may open. Fresh-document imports retire
-    /// completed Stores and reuse their slots while preserving atomic commit.
+    /// documents an atomic transaction may open. Transactions retire completed
+    /// Stores and reuse their slots while preserving atomic commit.
     /// Defaults are 64 MiB and sixteen Stores, bounding guest linear memory to
-    /// 1 GiB before host-side document state. Cached actors, existing-document
-    /// transaction leases, pending publications, cold-open candidates, and
-    /// upgrade preflight Stores consume the same workspace-wide budget.
+    /// 1 GiB before host-side document state. Cached actors, active
+    /// existing-document transaction leases, pending publications, cold-open
+    /// candidates, and upgrade preflight Stores consume the same
+    /// workspace-wide budget. Completed publications may retire their Stores
+    /// under pressure and cold-open again after commit.
     pub fn with_plugin_v2_resource_limits(
         mut self,
         max_memory_bytes: u64,

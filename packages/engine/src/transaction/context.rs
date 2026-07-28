@@ -819,10 +819,9 @@ where
     /// Admits a Store for a file that has no durable plugin actor yet.
     ///
     /// Fresh documents are independent until this transaction commits. When
-    /// their pending Stores fill the working set, retire the oldest fresh
+    /// their pending Stores fill the working set, retire the oldest completed
     /// candidate after its durable rows and materialization have been staged,
-    /// then reuse that admission slot. Existing-file leases are never retired
-    /// here: they serialize semantic successors through the commit boundary.
+    /// then reuse that admission slot.
     async fn admit_fresh_plugin_store(
         &mut self,
         current_publications: &mut Vec<PendingPluginActorPublication>,
@@ -831,9 +830,11 @@ where
             match self.plugin_host.actor_cache().admit_store() {
                 Ok(permit) => return Ok(permit),
                 Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
-                    if retire_oldest_fresh_actor(current_publications).await
-                        || retire_oldest_fresh_actor(&mut self.pending_plugin_actor_publications)
-                            .await
+                    if retire_oldest_completed_actor(current_publications).await
+                        || retire_oldest_completed_actor(
+                            &mut self.pending_plugin_actor_publications,
+                        )
+                        .await
                     {
                         continue;
                     }
@@ -1156,6 +1157,7 @@ where
         plugin: &PluginRegistryEntry,
         descriptor: WasmFileDescriptor,
         factory: Arc<dyn WasmComponentV2Factory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
     ) -> Result<PluginObservation, LixError> {
         let cache = self.plugin_host.actor_cache();
         let _cold_open_guard = cache.cold_open_guard().await;
@@ -1229,7 +1231,23 @@ where
             PluginActorColdOpen::Ready(observation) => return Ok(observation),
             PluginActorColdOpen::Build(cold_install) => cold_install,
         };
-        let store_permit = cache.admit_cold_store(&mut cold_install)?;
+        let store_permit = loop {
+            match cache.admit_cold_store(&mut cold_install) {
+                Ok(permit) => break permit,
+                Err(error) if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT => {
+                    if retire_oldest_completed_actor(current_publications).await
+                        || retire_oldest_completed_actor(
+                            &mut self.pending_plugin_actor_publications,
+                        )
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let rows = overlay_scan_batch(
             &base,
             &staged,
@@ -3154,6 +3172,7 @@ where
                                 selected,
                                 descriptor.clone(),
                                 Arc::clone(&factory),
+                                &mut reconciliation.actor_publications,
                             )
                             .await?
                         }
@@ -3177,6 +3196,7 @@ where
                             selected,
                             descriptor.clone(),
                             Arc::clone(&factory),
+                            &mut reconciliation.actor_publications,
                         )
                         .await?
                     }
@@ -3716,6 +3736,7 @@ where
                                 &group.plugin,
                                 descriptor.clone(),
                                 factory,
+                                &mut reconciliation.actor_publications,
                             )
                             .instrument(tracing::debug_span!(
                                 target: "lix_perf",
@@ -5988,8 +6009,8 @@ enum PendingPluginActorPublication {
         semantic_root: Arc<str>,
         view: PendingPluginActorView,
     },
-    /// The plugin transition has already produced its durable rows, but bulk
-    /// ingestion deliberately does not keep its private Wasm Store alive.
+    /// The plugin transition has already produced its durable rows, but the
+    /// bounded working set does not keep its private Wasm Store alive.
     /// Keeping this marker preserves the normal one-transition-per-file
     /// validation and gives the session a non-authoritative file view after
     /// commit, forcing a cold open before any later edit.
@@ -6101,11 +6122,21 @@ impl PendingPluginActorPublication {
     }
 }
 
-async fn retire_oldest_fresh_actor(publications: &mut Vec<PendingPluginActorPublication>) -> bool {
-    let Some(index) = publications
-        .iter()
-        .position(|publication| matches!(publication, PendingPluginActorPublication::New { .. }))
-    else {
+/// Releases the oldest completed Store retained only for post-commit cache
+/// publication. Existing-file successors keep their durable staged rows but
+/// become uncached. Dropping their leases makes the predecessor slot evictable
+/// only when no concurrent transition references it; an active or waiting
+/// same-file lease therefore still preserves serialization.
+async fn retire_oldest_completed_actor(
+    publications: &mut Vec<PendingPluginActorPublication>,
+) -> bool {
+    let Some(index) = publications.iter().position(|publication| {
+        matches!(
+            publication,
+            PendingPluginActorPublication::Existing { .. }
+                | PendingPluginActorPublication::New { .. }
+        )
+    }) else {
         return false;
     };
     let publication = publications.remove(index).into_uncached().await;

@@ -44,27 +44,28 @@ fixture:
 | Metric | Result |
 | --- | ---: |
 | Documents | 1,184 |
-| Atomic import p50 | 578.739 ms |
-| Atomic import p95 | 608.904 ms |
-| p50 per document | 0.489 ms |
-| Warm whole-process wall time | 690 ms |
-| Warm peak RSS | 149,064 KiB |
+| Atomic import p50 | 594.637 ms |
+| Atomic import p95 | 604.307 ms |
+| p50 per document | 0.502 ms |
+| Warm whole-process wall time | 680 ms |
+| Warm peak RSS | 148,848 KiB |
 | Swaps | 0 |
 
-A profiled warm run completed the measured import in 585.505 ms with these
+A profiled warm run completed the measured import in 577.842 ms with these
 counters:
 
 | Counter | Result |
 | --- | ---: |
-| task-clock | 785.07 ms |
-| cycles | 2,357,089,796 |
-| instructions | 4,584,533,807 |
-| branches | 839,994,658 |
-| branch misses | 14,814,239 |
-| cache misses | 41,726,648 |
+| task-clock | 775.27 ms |
+| cycles | 2,349,944,681 |
+| instructions | 4,583,514,106 |
+| branches | 839,576,968 |
+| branch misses | 14,714,570 |
+| cache misses | 41,646,839 |
 
 The exact `origin/main` baseline (`f860b30ea`) rejects the capacity-plus-one
 fixture before commit with `LIX_ERROR_PLUGIN_RESOURCE_LIMIT`: its 16 live
 Stores are held by the first 16 fresh documents. The candidate keeps that same
-16-Store resource ceiling, retires completed fresh-document Stores as pressure
-requires, and retains the most recent bounded working set for reuse.
+16-Store resource ceiling, retires completed fresh- or existing-document Stores
+as pressure requires, preserves actively contested same-file leases, and
+retains the most recent bounded working set for reuse.
