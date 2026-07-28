@@ -4,8 +4,7 @@ use std::pin::Pin;
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeLoadRequest, ChangelogContext, ChangelogReader, CommitId, CommitLoadEntry,
-    CommitLoadRequest, CommitProjection, CommitRecord,
+    ChangeId, ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitRecord,
 };
 use crate::common::LixTimestamp;
 use crate::entity_pk::EntityPk;
@@ -152,17 +151,10 @@ where
         let batch = reader
             .load_commits(CommitLoadRequest {
                 commit_ids: &[current_commit_id],
-                projection: CommitProjection::Record,
             })
             .await?;
         let record = match batch.entries.into_iter().next().flatten() {
-            Some(CommitLoadEntry::Record(record)) => record,
-            Some(CommitLoadEntry::Full { .. }) => {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "changelog returned a full commit load for tracked-state point replay",
-                ));
-            }
+            Some(record) => record,
             None => {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
@@ -293,7 +285,6 @@ where
     let batch = reader
         .load_commits(CommitLoadRequest {
             commit_ids: &commit_ids,
-            projection: CommitProjection::Full,
         })
         .await?;
     let entry = batch.entries.into_iter().next().flatten().ok_or_else(|| {
@@ -302,46 +293,25 @@ where
             format!("cannot rebuild tracked_state commit_root for unknown commit '{commit_id}'"),
         )
     })?;
-    let (commit, change_refs) = match entry {
-        CommitLoadEntry::Full {
-            record,
-            change_ref_chunks,
-        } => (
-            record,
-            change_ref_chunks
-                .into_iter()
-                .flat_map(|chunk| chunk.entries)
-                .collect::<Vec<_>>(),
-        ),
-        CommitLoadEntry::Record(_) => {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "changelog returned a partial commit load for commit-root rebuild",
-            ));
-        }
-    };
-    let changes = reader
-        .load_changes(ChangeLoadRequest {
-            change_ids: &change_refs,
+    let commit = entry;
+    // The packed delta is the sole membership and payload authority. Preserve
+    // the identity value's original created_at independently from this
+    // mutation's updated_at while rebuilding a root.
+    let deltas = storage::load_commit_delta_members_with_payloads(store, commit.commit_id)
+        .await?
+        .into_iter()
+        .map(|member| CommitRootRebuildDelta {
+            schema_key: member.key.schema_key,
+            file_id: member.key.file_id,
+            entity_pk: member.key.entity_pk,
+            change_id: member.value.change_id,
+            commit_id: member.value.commit_id,
+            snapshot: member.change.snapshot,
+            metadata: member.change.metadata,
+            created_at: member.value.created_at,
+            updated_at: member.value.updated_at,
         })
-        .await?;
-    // Rebuild authored state only. Commit rows are a changelog.commit
-    // projection and are deliberately not part of the tracked tree.
-    let deltas = change_refs
-        .iter()
-        .zip(changes.entries)
-        .map(|(change_id, change)| {
-            let change = change.ok_or_else(|| {
-                LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "commit '{commit_id}' references missing changelog.change '{change_id}'"
-                    ),
-                )
-            })?;
-            rebuild_delta_from_change_ref(commit_id, *change_id, change)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect();
 
     Ok(CommitRootRebuildPlan {
         commit_id: commit.commit_id,
@@ -380,31 +350,4 @@ where
 
 fn first_parent_commit_id(commit: &CommitRecord) -> Option<CommitId> {
     commit.parent_commit_ids.first().copied()
-}
-
-fn rebuild_delta_from_change_ref(
-    commit_id: &str,
-    ref_change_id: ChangeId,
-    change: crate::changelog::ChangeRecord,
-) -> Result<CommitRootRebuildDelta, LixError> {
-    if change.change_id != ref_change_id {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit '{commit_id}' change ref '{ref_change_id}' loaded mismatched changelog.change '{}'",
-                change.change_id
-            ),
-        ));
-    }
-    Ok(CommitRootRebuildDelta {
-        schema_key: change.schema_key,
-        file_id: change.file_id,
-        entity_pk: change.entity_pk,
-        change_id: change.change_id,
-        commit_id: CommitId::parse_lix(commit_id, "commit-root rebuild delta commit_id")?,
-        snapshot: change.snapshot,
-        metadata: change.metadata,
-        created_at: change.created_at,
-        updated_at: change.created_at,
-    })
 }

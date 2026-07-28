@@ -461,6 +461,7 @@ impl StorageWriteSet {
         stats
     }
 
+    #[cfg(test)]
     pub(crate) fn has_mutations_in_space(&self, space: StorageSpace) -> bool {
         self.group_index
             .get(&space.id)

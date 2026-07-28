@@ -3,14 +3,12 @@ use super::types::{
     ChangelogAppend, CommitId, CommitLoadBatch, CommitLoadRequest, CommitScanBatch,
     CommitScanRequest,
 };
-use super::types::{GcPlan, GcRoot};
 use crate::common::LixError;
 use crate::storage_adapter::{StorageSpace, StorageSpaceId};
 use async_trait::async_trait;
 
 pub(crate) const COMMIT_NAMESPACE: &str = "changelog.commit";
 pub(crate) const CHANGE_NAMESPACE: &str = "changelog.change";
-pub(crate) const COMMIT_CHANGE_REF_CHUNK_NAMESPACE: &str = "changelog.commit_change_ref_chunk";
 pub(crate) const COMMIT_CHANGE_ID_NAMESPACE: &str = "changelog.commit_change_id";
 
 // Commit-derived change-id keys are always exactly 16 raw UUID bytes. This
@@ -23,10 +21,8 @@ pub(crate) const COMMIT_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0006_0001), COMMIT_NAMESPACE);
 pub(crate) const CHANGE_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0006_0002), CHANGE_NAMESPACE);
-pub(crate) const COMMIT_CHANGE_REF_CHUNK_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0006_0003),
-    COMMIT_CHANGE_REF_CHUNK_NAMESPACE,
-);
+// The former commit-membership storage space is intentionally retired. Packed
+// tracked-state commit deltas are the sole commit-membership authority.
 /// Immutable reverse lookup from a commit-derived change id to its commit id.
 ///
 /// The changelog write path uses this to enforce the globally unique
@@ -64,16 +60,6 @@ pub(crate) fn commit_change_id_index_format_value() -> Vec<u8> {
     COMMIT_CHANGE_ID_INDEX_FORMAT_VALUE.to_vec()
 }
 
-pub(crate) fn commit_change_ref_chunk_prefix(commit_id: CommitId) -> Vec<u8> {
-    commit_id.as_uuid().as_bytes().to_vec()
-}
-
-pub(crate) fn commit_change_ref_chunk_key(commit_id: CommitId, chunk_no: u32) -> Vec<u8> {
-    let mut key = commit_change_ref_chunk_prefix(commit_id);
-    key.extend_from_slice(&chunk_no.to_be_bytes());
-    key
-}
-
 pub(crate) fn commit_id_from_key(key: &[u8]) -> Result<CommitId, LixError> {
     uuid_from_key(key, "commit").map(CommitId::new)
 }
@@ -93,9 +79,6 @@ fn uuid_from_key(key: &[u8], kind: &str) -> Result<uuid::Uuid, LixError> {
 
 #[async_trait]
 pub(crate) trait ChangelogReader {
-    #[allow(dead_code)] // Exercised directly by the storage-bench feature.
-    async fn plan_gc(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
-
     async fn load_commits(
         &mut self,
         request: CommitLoadRequest<'_>,
@@ -131,9 +114,6 @@ pub(crate) trait ChangelogWriter {
         &mut self,
         change_ids: &[ChangeId],
     ) -> Result<(), LixError>;
-
-    #[allow(dead_code)] // Activated by the checkpoint GC integration.
-    async fn collect_garbage(&mut self, roots: &[GcRoot]) -> Result<GcPlan, LixError>;
 }
 
 #[cfg(test)]
@@ -144,10 +124,6 @@ mod tests {
     fn namespaces_are_stable() {
         assert_eq!(COMMIT_NAMESPACE, "changelog.commit");
         assert_eq!(CHANGE_NAMESPACE, "changelog.change");
-        assert_eq!(
-            COMMIT_CHANGE_REF_CHUNK_NAMESPACE,
-            "changelog.commit_change_ref_chunk"
-        );
         assert_eq!(COMMIT_CHANGE_ID_NAMESPACE, "changelog.commit_change_id");
     }
 
@@ -203,17 +179,5 @@ mod tests {
             text_sorted,
             "binary key order must match hyphenated text order"
         );
-    }
-
-    #[test]
-    fn commit_change_ref_chunk_keys_are_prefixed_by_commit_id() {
-        let commit_id = CommitId::for_test_label("commit-1");
-        let other_commit_id = CommitId::for_test_label("commit-10");
-        let prefix = commit_change_ref_chunk_prefix(commit_id);
-        let key = commit_change_ref_chunk_key(commit_id, 42);
-        assert!(key.starts_with(&prefix));
-        assert!(!commit_change_ref_chunk_key(other_commit_id, 0).starts_with(&prefix));
-        assert_eq!(&key[..16], commit_id.as_uuid().as_bytes());
-        assert_eq!(&key[16..], 42u32.to_be_bytes());
     }
 }

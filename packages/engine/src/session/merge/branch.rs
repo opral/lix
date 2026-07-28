@@ -427,6 +427,7 @@ where
                     {
                         selected_changes.push(
                             pick.identity.clone(),
+                            pick.selected_row.commit_id,
                             pick.change_id,
                             pick.selected_row.deleted,
                             pick.selected_row.created_at,

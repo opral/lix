@@ -1,6 +1,5 @@
 use super::types::{
-    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitChangeRefChunk,
-    CommitChangeRefChunkWire, CommitChangeRefChunkWireRef, CommitId, CommitRecord,
+    ChangeId, ChangeRecord, ChangeRecordRef, ChangeRecordView, CommitRecord,
     TransactionChangeRecordRef,
 };
 use crate::common::LixError;
@@ -119,171 +118,12 @@ pub(crate) fn decode_change_record(
 }
 
 #[cfg(test)]
-pub(crate) fn encode_commit_change_ref_chunk(
-    chunk: &CommitChangeRefChunk,
-) -> Result<Vec<u8>, LixError> {
-    storage_codec::encode(
-        "commit change ref chunk",
-        &CommitChangeRefChunkWireRef {
-            format_version: chunk.format_version,
-            entries: &chunk.entries,
-        },
-    )
-}
-
-pub(crate) fn append_commit_change_ref_chunk(
-    bytes: &mut Vec<u8>,
-    chunk: &CommitChangeRefChunk,
-) -> Result<std::ops::Range<usize>, LixError> {
-    append_commit_change_ref_chunk_wire(bytes, chunk.format_version, &chunk.entries)
-}
-
-pub(crate) fn append_commit_change_ref_chunk_entries(
-    bytes: &mut Vec<u8>,
-    entries: &[ChangeId],
-) -> Result<std::ops::Range<usize>, LixError> {
-    append_commit_change_ref_chunk_wire(
-        bytes,
-        super::context::COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
-        entries,
-    )
-}
-
-fn append_commit_change_ref_chunk_wire(
-    bytes: &mut Vec<u8>,
-    format_version: u32,
-    entries: &[ChangeId],
-) -> Result<std::ops::Range<usize>, LixError> {
-    storage_codec::append(
-        "commit change ref chunk",
-        bytes,
-        &CommitChangeRefChunkWireRef {
-            format_version,
-            entries,
-        },
-    )
-}
-
-pub(crate) fn decode_commit_change_ref_chunk(
-    bytes: &[u8],
-    commit_id: CommitId,
-) -> Result<CommitChangeRefChunk, LixError> {
-    let wire: CommitChangeRefChunkWire = storage_codec::decode("commit change ref chunk", bytes)?;
-    if wire.format_version != super::context::COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            format!(
-                "commit change ref chunk has unsupported format version {}",
-                wire.format_version
-            ),
-        ));
-    }
-    Ok(CommitChangeRefChunk {
-        format_version: wire.format_version,
-        commit_id,
-        entries: wire.entries,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
     use crate::changelog::ChangeId;
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
     use crate::json_store::{JsonRef, JsonSlot};
-
-    fn ref_chunk(entries: Vec<ChangeId>) -> CommitChangeRefChunk {
-        CommitChangeRefChunk {
-            format_version: 1,
-            commit_id: CommitId::for_test_label("ref-chunk-commit"),
-            entries,
-        }
-    }
-
-    #[test]
-    fn ref_chunk_round_trips_change_ids() {
-        let chunk = ref_chunk(vec![
-            ChangeId::for_test_label("change-a"),
-            ChangeId::for_test_label("change-b"),
-            ChangeId::for_test_label("change-c"),
-        ]);
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        let decoded =
-            decode_commit_change_ref_chunk(&encoded, chunk.commit_id).expect("chunk should decode");
-        assert_eq!(decoded, chunk);
-    }
-
-    #[test]
-    fn ref_chunk_round_trips_empty_entries() {
-        let chunk = ref_chunk(Vec::new());
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        let decoded =
-            decode_commit_change_ref_chunk(&encoded, chunk.commit_id).expect("chunk should decode");
-        assert_eq!(decoded, chunk);
-    }
-
-    #[test]
-    fn borrowed_ref_chunk_entries_match_owned_chunk_codec() {
-        let chunk = ref_chunk(vec![
-            ChangeId::for_test_label("borrowed-change-a"),
-            ChangeId::for_test_label("borrowed-change-b"),
-        ]);
-        let expected = encode_commit_change_ref_chunk(&chunk).expect("owned chunk should encode");
-        let mut arena = b"prefix".to_vec();
-
-        let range = append_commit_change_ref_chunk_entries(&mut arena, &chunk.entries)
-            .expect("borrowed chunk entries should append");
-
-        assert_eq!(&arena[range], expected);
-    }
-
-    #[test]
-    fn ref_chunk_wire_format_is_pinned() {
-        // Persisted layout: varint format_version, varint entry count, then
-        // 16 raw uuid bytes per entry (ChangeId encodes via encode_array).
-        let id = ChangeId::parse("019eb805-60d0-71c0-ade3-b0f0efab9d9a").expect("uuid");
-        let chunk = ref_chunk(vec![id]);
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        let expected: Vec<u8> = [
-            &[1u8][..], // format_version
-            &[1u8][..], // entry count
-            &[
-                0x01, 0x9e, 0xb8, 0x05, 0x60, 0xd0, 0x71, 0xc0, 0xad, 0xe3, 0xb0, 0xf0, 0xef, 0xab,
-                0x9d, 0x9a,
-            ][..],
-        ]
-        .concat();
-        assert_eq!(encoded, expected);
-    }
-
-    #[test]
-    fn ref_chunk_decode_rejects_unknown_format_version() {
-        let chunk = CommitChangeRefChunk {
-            format_version: 2,
-            commit_id: CommitId::for_test_label("ref-chunk-commit"),
-            entries: vec![ChangeId::for_test_label("change-a")],
-        };
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        let error = decode_commit_change_ref_chunk(&encoded, chunk.commit_id)
-            .expect_err("unknown format version should fail decode");
-        assert!(
-            error.message.contains("unsupported format version 2"),
-            "{}",
-            error.message
-        );
-    }
-
-    #[test]
-    fn ref_chunk_takes_commit_identity_from_the_decode_argument() {
-        // The stored value omits commit_id; it lives in the storage key.
-        let chunk = ref_chunk(vec![ChangeId::for_test_label("change-a")]);
-        let encoded = encode_commit_change_ref_chunk(&chunk).expect("chunk should encode");
-        let other = CommitId::for_test_label("other-commit");
-        let decoded = decode_commit_change_ref_chunk(&encoded, other).expect("chunk should decode");
-        assert_eq!(decoded.commit_id, other);
-        assert_eq!(decoded.entries, chunk.entries);
-    }
 
     fn full_record() -> ChangeRecord {
         ChangeRecord {

@@ -80,19 +80,9 @@ async fn run(storage: ChangelogBenchStorage, op: &str, duration: Duration) -> Re
                     changelog_bench::prepare_corpus_store(storage.create(), &corpus).await?;
                 black_box(changelog_bench::rebuild_mandatory_indexes(&store).await?);
             }
-            "plan_gc" => {
-                let (store, root_commit_id) =
-                    changelog_bench::prepare_gc_store(storage.create(), 50, 50, 10).await?;
-                black_box(changelog_bench::plan_gc(&store, &root_commit_id).await?);
-            }
-            "collect_gc" => {
-                let (store, root_commit_id) =
-                    changelog_bench::prepare_gc_store(storage.create(), 50, 50, 10).await?;
-                black_box(changelog_bench::collect_garbage(&store, &root_commit_id).await?);
-            }
             _ => {
                 return Err(LixError::unknown(format!(
-                    "unknown changelog profile op '{op}', expected direct, direct_by_id, direct_scattered, direct_by_id_scattered, stage_append, stage_append_raw, stage_corpus, rebuild, plan_gc, or collect_gc"
+                    "unknown changelog profile op '{op}', expected direct, direct_by_id, direct_scattered, direct_by_id_scattered, stage_append, stage_append_raw, stage_corpus, or rebuild"
                 )));
             }
         }

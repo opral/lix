@@ -215,9 +215,17 @@ fn push_selected_change(
         TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
     };
     let deleted = row.deleted;
+    let source_commit_id = row.commit_id;
     let change_id = row.change_id;
     let updated_at = row.updated_at;
-    selected_changes.push(row.identity, change_id, deleted, created_at, updated_at);
+    selected_changes.push(
+        row.identity,
+        source_commit_id,
+        change_id,
+        deleted,
+        created_at,
+        updated_at,
+    );
 }
 
 #[cfg(test)]

@@ -82,13 +82,6 @@ fn cpu_scorecard() -> Result<Vec<(&'static str, Duration)>, LixError> {
                 Ok(())
             })?,
         ),
-        (
-            "build_commit_change_refs / 1c_1000ch",
-            measure_cpu(samples, || {
-                black_box(changelog_bench::build_commit_change_ref_entries(&append));
-                Ok(())
-            })?,
-        ),
     ])
 }
 
@@ -260,40 +253,6 @@ async fn storage_scorecard() -> Result<Vec<StorageScoreRow>, LixError> {
                     .await?;
                     let start = Instant::now();
                     black_box(changelog_bench::rebuild_mandatory_indexes(&store).await?);
-                    Ok(start.elapsed())
-                })
-            },
-        )
-        .await?,
-    );
-
-    rows.push(
-        storage_row(
-            "plan_gc / live_50pct_mixed_append_batches",
-            samples,
-            |storage| {
-                Box::pin(async move {
-                    let (store, root_commit_id) =
-                        changelog_bench::prepare_gc_store(storage.create(), 50, 50, 10).await?;
-                    let start = Instant::now();
-                    black_box(changelog_bench::plan_gc(&store, &root_commit_id).await?);
-                    Ok(start.elapsed())
-                })
-            },
-        )
-        .await?,
-    );
-
-    rows.push(
-        storage_row(
-            "collect_garbage / live_50pct_mixed_append_batches",
-            samples,
-            |storage| {
-                Box::pin(async move {
-                    let (store, root_commit_id) =
-                        changelog_bench::prepare_gc_store(storage.create(), 50, 50, 10).await?;
-                    let start = Instant::now();
-                    black_box(changelog_bench::collect_garbage(&store, &root_commit_id).await?);
                     Ok(start.elapsed())
                 })
             },

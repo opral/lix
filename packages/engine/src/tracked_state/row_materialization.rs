@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 #[cfg(test)]
 use std::mem::size_of;
 use std::ops::Range;
@@ -9,7 +9,7 @@ use bytes::Bytes;
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeRecordProjection, CommitId, MaterializedChangePayload,
-    materialize_change_payloads,
+    materialize_known_change_payloads,
 };
 use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
@@ -615,14 +615,70 @@ impl MaterializedTrackedStateBatchBuilder {
     }
 }
 
+async fn materialize_index_payloads<'a, S>(
+    store: &S,
+    entries: impl Iterator<Item = (TrackedStateKeyRef<'a>, &'a TrackedStateIndexValue)>,
+    projection: ChangeRecordProjection,
+) -> Result<HashMap<ChangeId, MaterializedChangePayload>, LixError>
+where
+    S: StorageAdapterRead,
+{
+    let mut by_commit = BTreeMap::<CommitId, Vec<(TrackedStateKey, ChangeId, LixTimestamp)>>::new();
+    for (key, value) in entries.filter(|(_, value)| !value.deleted) {
+        by_commit.entry(value.commit_id).or_default().push((
+            TrackedStateKey {
+                schema_key: key.schema_key.to_owned(),
+                file_id: key.file_id.map(str::to_owned),
+                entity_pk: key.entity_pk.clone(),
+            },
+            value.change_id,
+            value.updated_at,
+        ));
+    }
+
+    let mut records = Vec::new();
+    for (commit_id, expected) in by_commit {
+        let keys = expected
+            .iter()
+            .map(|(key, _, _)| key.clone())
+            .collect::<Vec<_>>();
+        let loaded =
+            super::storage::load_commit_delta_change_records(store, commit_id, &keys).await?;
+        for ((key, change_id, updated_at), record) in expected.into_iter().zip(loaded) {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked-state row references change '{change_id}' that is missing from owning commit '{commit_id}'"
+                    ),
+                )
+            })?;
+            if record.change_id != change_id
+                || record.schema_key != key.schema_key
+                || record.file_id != key.file_id
+                || record.entity_pk != key.entity_pk
+                || record.snapshot.is_none()
+                || record.created_at != updated_at
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked-state row '{change_id}' does not match its authoritative payload in commit '{commit_id}'"
+                    ),
+                ));
+            }
+            records.push(record);
+        }
+    }
+    materialize_known_change_payloads(store, records.into_iter(), projection).await
+}
+
 /// Materializes tracked-state index entries into one typed batch.
 ///
-/// The durable tracked_state value carries only identity (change id, commit
-/// id, flags, timestamps); payloads live once, in the change record the row
-/// already references. Hydration is a batched changelog point read per
-/// distinct change id, then json_store loads for the rare large payloads.
-/// The GC contract makes this sound: a change record is only deletable when
-/// no tracked-state row references its change id.
+/// Every tracked index value carries its payload-owning commit. Hydration
+/// routes exact identities to those packed deltas and retains the decoded
+/// records through JSON materialization; there is no global changelog
+/// fallback.
 pub(crate) async fn materialize_batch_from_index_entries<S>(
     store: &S,
     entries: Vec<(TrackedStateKey, TrackedStateIndexValue)>,
@@ -647,14 +703,19 @@ where
         return Ok(rows.finish());
     }
 
-    let payloads = materialize_change_payloads(
+    let payloads = materialize_index_payloads(
         store,
-        entries
-            .iter()
-            .filter(|(_, value)| !value.deleted)
-            .map(|(_, value)| value.change_id),
+        entries.iter().map(|(key, value)| {
+            (
+                TrackedStateKeyRef {
+                    schema_key: &key.schema_key,
+                    file_id: key.file_id.as_deref(),
+                    entity_pk: &key.entity_pk,
+                },
+                value,
+            )
+        }),
         *materialization,
-        "tracked-state row",
     )
     .await?;
 
@@ -706,14 +767,10 @@ where
         return Ok(rows.finish());
     }
 
-    let payloads = materialize_change_payloads(
+    let payloads = materialize_index_payloads(
         store,
-        entries
-            .iter()
-            .filter(|(_, value)| !value.deleted)
-            .map(|(_, value)| value.change_id),
+        entries.iter().map(|(key, value)| (*key, value)),
         *materialization,
-        "tracked-state row",
     )
     .await?;
 

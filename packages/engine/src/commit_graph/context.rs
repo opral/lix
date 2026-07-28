@@ -11,7 +11,7 @@ use std::collections::{BTreeSet, HashMap};
 use crate::LixError;
 use crate::changelog::{
     ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogContext, ChangelogReader, CommitId,
-    CommitLoadEntry, CommitLoadRequest, CommitProjection, CommitRecord, CommitScanRequest,
+    CommitLoadRequest, CommitRecord, CommitScanRequest,
 };
 use crate::commit_graph::walker::{best_common_ancestors, walk_reachable_commits};
 use crate::commit_graph::{
@@ -77,25 +77,14 @@ where
         commit_ids: &[CommitId],
     ) -> Result<Vec<Option<CommitGraphCommitRecord>>, LixError> {
         let mut reader = ChangelogContext::new().reader(&self.store);
-        reader
-            .load_commits(CommitLoadRequest {
-                commit_ids,
-                projection: CommitProjection::Record,
-            })
+        let entries = reader
+            .load_commits(CommitLoadRequest { commit_ids })
             .await?
             .entries
             .into_iter()
-            .map(|entry| match entry {
-                None => Ok(None),
-                Some(CommitLoadEntry::Record(record)) => {
-                    Ok(Some(commit_graph_commit_record_from_commit_record(record)))
-                }
-                Some(CommitLoadEntry::Full { .. }) => Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    "changelog record commit projection returned full entry",
-                )),
-            })
-            .collect()
+            .map(|entry| entry.map(commit_graph_commit_record_from_commit_record))
+            .collect();
+        Ok(entries)
     }
 
     /// Loads every direct commit fact from the changelog.
@@ -111,16 +100,9 @@ where
                 .scan_commits(CommitScanRequest {
                     start_after: start_after.as_deref(),
                     limit: Some(1024),
-                    projection: CommitProjection::Record,
                 })
                 .await?;
-            for entry in scan.entries {
-                let CommitLoadEntry::Record(record) = entry else {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        "changelog commit scan returned non-record entry",
-                    ));
-                };
+            for record in scan.entries {
                 commits.push(commit_graph_commit_from_commit_record(record, Vec::new()));
             }
             let Some(next) = scan.next_start_after else {
@@ -323,30 +305,28 @@ where
         let batch = reader
             .load_commits(CommitLoadRequest {
                 commit_ids: std::slice::from_ref(commit_id),
-                projection: CommitProjection::Full,
             })
             .await?;
         let Some(entry) = batch.entries.into_iter().next().flatten() else {
             return Ok(None);
         };
-        match entry {
-            CommitLoadEntry::Full {
-                record,
-                change_ref_chunks,
-            } => {
-                let change_ids = change_ref_chunks
-                    .into_iter()
-                    .flat_map(|chunk| chunk.entries)
-                    .collect::<Vec<_>>();
-                Ok(Some(commit_graph_commit_from_commit_record(
-                    record, change_ids,
-                )))
-            }
-            CommitLoadEntry::Record(_) => Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "changelog full commit projection returned non-full entry",
-            )),
+        let record = entry;
+        let members =
+            crate::tracked_state::load_commit_delta_members_with_payloads(&self.store, *commit_id)
+                .await?;
+        let mut change_ids = Vec::with_capacity(members.len());
+        for member in members {
+            let change_id = member.change.change_id;
+            change_ids.push(change_id);
+            self.canonical_change_cache.insert(
+                change_id,
+                Some(commit_graph_change_from_change_record(member.change)),
+            );
         }
+        change_ids.sort_unstable();
+        Ok(Some(commit_graph_commit_from_commit_record(
+            record, change_ids,
+        )))
     }
 
     async fn load_changelog_commit_record(
@@ -517,8 +497,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::changelog::{
-        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter,
-        CommitChangeRefSet, CommitId, CommitRecord,
+        ChangeId, ChangeRecord, ChangelogAppend, ChangelogContext, ChangelogWriter, CommitId,
+        CommitRecord,
     };
     use crate::commit_graph::{
         CommitGraphChange, CommitGraphChangeHistoryRequest, CommitGraphContext,
@@ -529,6 +509,9 @@ mod tests {
     use crate::storage_adapter::{
         Memory, MemoryRead, Storage, StorageAdapter, StorageAdapterReadScope, StorageReadOptions,
         StorageWriteOptions,
+    };
+    use crate::tracked_state::{
+        TrackedStateCommitDeltaRef, TrackedStateDeltaRef, stage_commit_deltas,
     };
 
     #[derive(Clone)]
@@ -817,8 +800,8 @@ mod tests {
             .expect("first history should resolve");
         let calls_after_first = change_get_many_calls.load(Ordering::Relaxed);
         assert_eq!(
-            calls_after_first, 1,
-            "one history traversal should batch all uncached member changes"
+            calls_after_first, 0,
+            "packed commit members retain their payloads without global change reads"
         );
 
         let second = reader
@@ -1040,7 +1023,6 @@ mod tests {
             .iter()
             .map(|change| (change.change.id, change))
             .collect::<BTreeMap<_, _>>();
-        let mut authored_change_ids = BTreeSet::new();
         let provided_commit_ids = changes
             .iter()
             .filter(|change| change.is_commit())
@@ -1058,6 +1040,7 @@ mod tests {
         let changelog = ChangelogContext::new();
         let mut writer = changelog.writer(&mut read, &mut writes);
         let mut append = ChangelogAppend::default();
+        let mut commit_members = Vec::<(CommitId, Vec<ChangeRecord>)>::new();
         for change in changes.iter().filter(|change| change.is_commit()) {
             let commit_label = change
                 .change
@@ -1080,13 +1063,10 @@ mod tests {
                     append_empty_commit(&mut append, *parent_commit_id);
                 }
             }
-            let mut refs = Vec::new();
+            let mut members = Vec::new();
             for change_id in &commit.change_ids {
                 if let Some(change) = changes_by_id.get(change_id) {
-                    if authored_change_ids.insert(*change_id) {
-                        append.changes.push(change_record_from_test_change(change));
-                    }
-                    refs.push(commit_change_ref_from_test_change(change));
+                    members.push(change_record_from_test_change(change));
                 }
             }
 
@@ -1099,16 +1079,35 @@ mod tests {
                 author_account_ids: commit.author_account_ids.clone(),
                 created_at: commit.canonical_change.created_at,
             });
-            append.commit_change_refs.push(CommitChangeRefSet {
-                commit_id: commit.commit_id,
-                entries: refs,
-            });
+            commit_members.push((commit.commit_id, members));
             staged_commit_ids.insert(commit.commit_id);
         }
         writer
             .stage_append(append)
             .await
             .expect("changelog append should stage");
+        drop(writer);
+        for (commit_id, members) in &commit_members {
+            let deltas = members
+                .iter()
+                .map(|change| TrackedStateCommitDeltaRef {
+                    delta: TrackedStateDeltaRef {
+                        schema_key: &change.schema_key,
+                        file_id: change.file_id.as_deref(),
+                        entity_pk: &change.entity_pk,
+                        change_id: change.change_id,
+                        commit_id: *commit_id,
+                        deleted: change.snapshot.is_none(),
+                        created_at: change.created_at,
+                        updated_at: change.created_at,
+                    },
+                    snapshot: change.snapshot.as_ref_slot(),
+                    metadata: change.metadata.as_ref_slot(),
+                    origin_key: change.origin_key.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            stage_commit_deltas(&mut writes, &deltas).expect("packed commit members should stage");
+        }
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1126,10 +1125,6 @@ mod tests {
             author_account_ids: Vec::new(),
             created_at: ts("2026-01-01T00:00:00Z"),
         });
-        append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id,
-            entries: Vec::new(),
-        });
     }
 
     fn change_record_from_test_change(change: &TestChange) -> ChangeRecord {
@@ -1144,10 +1139,6 @@ mod tests {
             created_at: change.change.created_at,
             origin_key: change.change.origin_key.clone(),
         }
-    }
-
-    fn commit_change_ref_from_test_change(change: &TestChange) -> ChangeId {
-        change.change.id
     }
 
     fn commit_change(

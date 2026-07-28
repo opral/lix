@@ -1215,7 +1215,8 @@ mod tests {
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
     use crate::storage_adapter::{StorageAdapter, StorageWriteSet};
     use crate::tracked_state::{
-        MaterializedTrackedStateRow, TrackedStateDeltaRef, TrackedStateScanRequest,
+        MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,
+        TrackedStateScanRequest, stage_commit_deltas,
     };
     use serde_json::json;
 
@@ -2203,12 +2204,6 @@ mod tests {
                 author_account_ids: Vec::new(),
                 created_at: ts("1970-01-01T00:00:00.000Z"),
             });
-            append
-                .commit_change_refs
-                .push(crate::changelog::CommitChangeRefSet {
-                    commit_id: CommitId::for_test_label(&commit_id_text),
-                    entries: Vec::new(),
-                });
         }
         let mut changelog_read = read;
         let mut writer =
@@ -2289,15 +2284,8 @@ mod tests {
                 .first()
                 .map(|(change, _, _)| change.created_at)
                 .unwrap_or_else(|| ts("1970-01-01T00:00:00.000Z"));
-            let change_refs = rows
-                .iter()
-                .map(|(change, _, _)| change.change_id)
-                .collect::<Vec<_>>();
             let commit_change_id = format!("{commit_id}:commit");
             let mut append = ChangelogAppend::default();
-            append
-                .changes
-                .extend(rows.iter().map(|(change, _, _)| change.clone()));
             append.commits.push(crate::changelog::CommitRecord {
                 format_version: 1,
                 commit_id: CommitId::for_test_label(&commit_id),
@@ -2310,19 +2298,13 @@ mod tests {
                 author_account_ids: Vec::new(),
                 created_at: commit_created_at,
             });
-            append
-                .commit_change_refs
-                .push(crate::changelog::CommitChangeRefSet {
-                    commit_id: CommitId::for_test_label(&commit_id),
-                    entries: change_refs,
-                });
             let mut changelog_read = store;
             let mut writer =
                 crate::changelog::ChangelogContext::new().writer(&mut changelog_read, writes);
             crate::changelog::ChangelogWriter::stage_append(&mut writer, append).await?;
             drop(writer);
             let typed_commit_id = CommitId::for_test_label(&commit_id);
-            let deltas = rows
+            let root_deltas = rows
                 .iter()
                 .map(|(change, created_at, updated_at)| TrackedStateDeltaRef {
                     schema_key: &change.schema_key,
@@ -2335,9 +2317,20 @@ mod tests {
                     updated_at: *updated_at,
                 })
                 .collect::<Vec<_>>();
+            let commit_deltas = rows
+                .iter()
+                .zip(&root_deltas)
+                .map(|((change, _, _), delta)| TrackedStateCommitDeltaRef {
+                    delta: *delta,
+                    snapshot: change.snapshot.as_ref_slot(),
+                    metadata: change.metadata.as_ref_slot(),
+                    origin_key: change.origin_key.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            stage_commit_deltas(writes, &commit_deltas)?;
             TrackedStateContext::new()
                 .writer(&*store, writes)
-                .stage_commit_root(&commit_id, parent_commit_id.as_deref(), deltas)
+                .stage_commit_root(&commit_id, parent_commit_id.as_deref(), root_deltas)
                 .await?;
         }
 

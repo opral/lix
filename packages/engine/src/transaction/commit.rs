@@ -13,9 +13,8 @@ use crate::branch::{
 };
 use crate::changelog::{
     ChangeId, ChangeRecord, ChangeRecordProjection, ChangelogContext, ChangelogReader,
-    ChangelogWriter, CommitChangeRefSet, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest,
-    CommitProjection as ChangelogCommitProjection, CommitRecord, TransactionChangeRecordRef,
-    TransactionChangelogAppend, materialize_change_payloads,
+    ChangelogWriter, CommitId, CommitLoadRequest as ChangelogCommitLoadRequest, CommitRecord,
+    TransactionChangeRecordRef, TransactionChangelogAppend,
 };
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
@@ -28,9 +27,10 @@ use crate::live_state::{
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
-    TrackedStateKey, TrackedStateKeyRef, TrackedStateReadColumns, TrackedStateRootMutationRef,
-    TrackedStateScanRequest, encode_key_ref, stage_commit_deltas,
+    MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
+    TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef,
+    TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
+    load_commit_delta_change_records, stage_commit_deltas,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
 #[cfg(test)]
@@ -209,12 +209,21 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     ensure_explicit_branch_ref_targets_exist(read, &explicit_branch_targets, &staged_commits)
         .await?;
 
+    let selected_change_records = load_selected_change_records(read, &staged_commits).await?;
+    let selected_change_payloads = crate::changelog::materialize_known_change_payloads(
+        read,
+        selected_change_records.values().cloned(),
+        ChangeRecordProjection::full(),
+    )
+    .await?;
+
     stage_tracked_commit_delta_index(
         &mut writes,
         &state_rows,
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
         &staged_commits,
+        &selected_change_records,
     )?;
 
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
@@ -254,6 +263,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &row_index.tracked_row_indices_by_commit,
         &tracked_roots,
         &staged_commits,
+        &selected_change_payloads,
         &insert_selection,
         certified_fresh_plugin_file_id.as_deref(),
         &explicit_branch_targets,
@@ -412,7 +422,7 @@ async fn stage_changelog_commits(
         // published control retains a public ref_change_id, so that immutable
         // ledger fact must remain available to `lix_change` and GC even
         // though it is not a commit member.
-        .filter(|row| !row.untracked || row.schema_key == BRANCH_REF_SCHEMA_KEY)
+        .filter(|row| row.untracked && row.schema_key == BRANCH_REF_SCHEMA_KEY)
         .map(transaction_change_record_from_state_row)
         .chain(
             branch_head_changes
@@ -421,7 +431,6 @@ async fn stage_changelog_commits(
         )
         // Engine-owned untracked state follows the same current-only rule.
         .collect::<Result<Vec<_>, _>>()?;
-    let mut commit_change_refs = Vec::with_capacity(commit_rows.len());
     let mut staged = BTreeMap::<CommitId, StagedChangelogCommit>::new();
     for commit_row in commit_rows {
         let state_row_indices = tracked_row_indices_by_commit
@@ -434,19 +443,14 @@ async fn stage_changelog_commits(
             state_row_indices,
             &commit_row.selected_change_batches,
         )?;
-        let mut refs = Vec::with_capacity(state_row_indices.len());
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
-            let change_id = row.change_id.as_ref().ok_or_else(|| {
+            row.change_id.ok_or_else(|| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     "tracked staged row is missing change_id before changelog append",
                 )
             })?;
-            refs.push(*change_id);
-        }
-        for change_ref in selected_changes(&commit_row.selected_change_batches) {
-            refs.push(change_ref.change_id);
         }
         commits.push(CommitRecord {
             format_version: 1,
@@ -460,11 +464,8 @@ async fn stage_changelog_commits(
             author_account_ids: Vec::new(),
             created_at: commit_row.created_at,
         });
-        let change_count = refs.len();
-        commit_change_refs.push(CommitChangeRefSet {
-            commit_id: commit_row.commit_id,
-            entries: refs,
-        });
+        let change_count =
+            state_row_indices.len() + selected_change_count(&commit_row.selected_change_batches);
         staged.insert(
             commit_row.commit_id,
             StagedChangelogCommit {
@@ -474,11 +475,7 @@ async fn stage_changelog_commits(
         );
     }
 
-    let append = TransactionChangelogAppend {
-        commits,
-        changes,
-        commit_change_refs,
-    };
+    let append = TransactionChangelogAppend { commits, changes };
 
     let mut writer = ChangelogContext::new().writer(read, writes);
     writer
@@ -687,6 +684,23 @@ fn tracked_delta_from_state_row(
     })
 }
 
+fn tracked_commit_delta_from_state_row(
+    row: PreparedStateRowRef<'_>,
+) -> Result<TrackedStateCommitDeltaRef<'_>, LixError> {
+    Ok(TrackedStateCommitDeltaRef {
+        delta: tracked_delta_from_state_row(row)?,
+        snapshot: row.snapshot.map_or(
+            crate::json_store::JsonSlotRef::None,
+            crate::transaction::types::StageJson::slot_ref,
+        ),
+        metadata: row.metadata.map_or(
+            crate::json_store::JsonSlotRef::None,
+            crate::transaction::types::StageJson::slot_ref,
+        ),
+        origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+    })
+}
+
 fn tracked_delta_from_selected_change_ref(
     change_ref: StagedCommitChangeRef<'_>,
     commit_id: CommitId,
@@ -700,6 +714,34 @@ fn tracked_delta_from_selected_change_ref(
         deleted: change_ref.deleted,
         created_at: change_ref.created_at,
         updated_at: change_ref.updated_at,
+    })
+}
+
+fn tracked_commit_delta_from_selected_change_ref<'a>(
+    change_ref: StagedCommitChangeRef<'a>,
+    commit_id: CommitId,
+    record: &'a ChangeRecord,
+) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
+    if record.change_id != change_ref.change_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "selected commit delta payload has the wrong change id",
+        ));
+    }
+    Ok(TrackedStateCommitDeltaRef {
+        delta: TrackedStateDeltaRef {
+            schema_key: change_ref.schema_key(),
+            file_id: change_ref.file_id(),
+            entity_pk: change_ref.entity_pk(),
+            change_id: change_ref.change_id,
+            commit_id,
+            deleted: change_ref.deleted,
+            created_at: change_ref.created_at,
+            updated_at: change_ref.updated_at,
+        },
+        snapshot: record.snapshot.as_ref_slot(),
+        metadata: record.metadata.as_ref_slot(),
+        origin_key: record.origin_key.as_deref(),
     })
 }
 
@@ -765,12 +807,80 @@ fn current_state_delta_from_engine_row(
 /// commit. Sparse immutable roots remain the scan/checkpoint structure; this
 /// index is the missing point-read structure for rootless first-parent
 /// history.
+async fn load_selected_change_records(
+    read: &(impl StorageAdapterRead + ?Sized),
+    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
+    let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
+    for change_ref in staged_commits
+        .values()
+        .flat_map(|staged| selected_changes(&staged.selected_change_batches))
+    {
+        by_source_commit
+            .entry(change_ref.source_commit_id)
+            .or_default()
+            .push(change_ref);
+    }
+
+    let mut records = HashMap::new();
+    for (source_commit_id, change_refs) in by_source_commit {
+        let keys = change_refs
+            .iter()
+            .map(|change_ref| TrackedStateKey {
+                schema_key: change_ref.schema_key().to_owned(),
+                file_id: change_ref.file_id().map(str::to_owned),
+                entity_pk: change_ref.entity_pk().clone(),
+            })
+            .collect::<Vec<_>>();
+        let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
+        for (change_ref, record) in change_refs.into_iter().zip(loaded) {
+            let record = record.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "selected change '{}' has no authoritative payload at source commit '{}'",
+                        change_ref.change_id, source_commit_id
+                    ),
+                )
+            })?;
+            if record.change_id != change_ref.change_id
+                || record.schema_key != change_ref.schema_key()
+                || record.file_id.as_deref() != change_ref.file_id()
+                || record.entity_pk != *change_ref.entity_pk()
+                || record.snapshot.is_none() != change_ref.deleted
+                || record.created_at != change_ref.updated_at
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "selected change '{}' does not match its authoritative source payload",
+                        change_ref.change_id
+                    ),
+                ));
+            }
+            if let Some(existing) = records.insert(record.change_id, record.clone())
+                && existing != record
+            {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "selected change '{}' resolves to conflicting source payloads",
+                        change_ref.change_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(records)
+}
+
 fn stage_tracked_commit_delta_index(
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    selected_change_records: &HashMap<ChangeId, ChangeRecord>,
 ) -> Result<(), LixError> {
     for root in tracked_roots {
         let state_row_indices = tracked_row_indices_by_commit
@@ -790,12 +900,26 @@ fn stage_tracked_commit_delta_index(
             state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
         );
         for &row_index in state_row_indices {
-            deltas.push(tracked_delta_from_state_row(state_rows.row(row_index))?);
+            deltas.push(tracked_commit_delta_from_state_row(
+                state_rows.row(row_index),
+            )?);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
-            deltas.push(tracked_delta_from_selected_change_ref(
+            let record = selected_change_records
+                .get(&change_ref.change_id)
+                .ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!(
+                            "selected change '{}' lost its authoritative payload before delta staging",
+                            change_ref.change_id
+                        ),
+                    )
+                })?;
+            deltas.push(tracked_commit_delta_from_selected_change_ref(
                 change_ref,
                 root.commit_id,
+                record,
             )?);
         }
         stage_commit_deltas(writes, &deltas)?;
@@ -907,6 +1031,7 @@ async fn build_lifecycle_tracked_snapshots(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    selected_payloads: &HashMap<ChangeId, crate::changelog::MaterializedChangePayload>,
     insert_selection: &PreparedInsertSelection,
     required: &BTreeSet<CommitId>,
 ) -> Result<BTreeMap<CommitId, HotTrackedSnapshot>, LixError> {
@@ -935,26 +1060,6 @@ async fn build_lifecycle_tracked_snapshots(
             ));
         }
     }
-    let selected_change_ids = tracked_roots
-        .iter()
-        .filter(|root| required.contains(&root.commit_id))
-        .flat_map(|root| {
-            staged_commits
-                .get(&root.commit_id)
-                .into_iter()
-                .flat_map(|staged| selected_changes(&staged.selected_change_batches))
-        })
-        .map(|change_ref| change_ref.change_id)
-        .filter(|change_id| !prepared_by_change.contains_key(change_id))
-        .collect::<BTreeSet<_>>();
-    let selected_payloads = materialize_change_payloads(
-        read,
-        selected_change_ids.iter().copied(),
-        ChangeRecordProjection::full(),
-        "lifecycle tracked snapshot",
-    )
-    .await?;
-
     let mut snapshots =
         BTreeMap::<CommitId, BTreeMap<TrackedStateKey, MaterializedTrackedStateRow>>::new();
     for root in tracked_roots_parent_first(tracked_roots)? {
@@ -1410,6 +1515,7 @@ async fn stage_tracked_head(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    selected_change_payloads: &HashMap<ChangeId, crate::changelog::MaterializedChangePayload>,
     insert_selection: &PreparedInsertSelection,
     certified_fresh_plugin_file_id: Option<&str>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
@@ -1429,6 +1535,7 @@ async fn stage_tracked_head(
         tracked_row_indices_by_commit,
         tracked_roots,
         staged_commits,
+        selected_change_payloads,
         insert_selection,
         &lifecycle_ids,
     )
@@ -1484,21 +1591,13 @@ async fn stage_tracked_head(
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
-            let payloads = materialize_change_payloads(
-                read,
-                selected_changes(&staged.selected_change_batches)
-                    .map(|change_ref| change_ref.change_id),
-                ChangeRecordProjection::full(),
-                "selected current-state delta",
-            )
-            .await?;
             let selected_rows = selected_changes(&staged.selected_change_batches)
                 .map(|change_ref| {
                     lifecycle_selected_tracked_row(
                         change_ref,
                         root.commit_id,
                         None,
-                        payloads.get(&change_ref.change_id),
+                        selected_change_payloads.get(&change_ref.change_id),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2493,7 +2592,6 @@ async fn ensure_explicit_branch_ref_targets_exist(
         .reader(read)
         .load_commits(ChangelogCommitLoadRequest {
             commit_ids: &target_ids,
-            projection: ChangelogCommitProjection::Record,
         })
         .await?;
     for (commit_id, entry) in target_ids.into_iter().zip(commits.entries) {
@@ -3346,39 +3444,46 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &[commit_id("test-uuid-1")],
-                projection: crate::changelog::CommitProjection::Full,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Full {
-            record,
-            change_ref_chunks,
-        }) = commits.entries.into_iter().next().flatten()
-        else {
+        let Some(record) = commits.entries.into_iter().next().flatten() else {
             panic!("changelog commit should exist");
         };
         assert_eq!(record.change_id, change_id("test-uuid-2"));
+        let membership_read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("membership read should open");
+        let change_ids =
+            crate::tracked_state::load_commit_delta_change_ids(&membership_read, record.commit_id)
+                .await
+                .expect("commit membership should load");
         assert!(
-            change_ref_chunks
-                .iter()
-                .flat_map(|chunk| chunk.entries.iter())
-                .any(|entry| *entry == change_id("change-1"))
+            change_ids.contains(&change_id("change-1")),
+            "tracked change should be a packed commit-delta member"
         );
+        let packed_members = crate::tracked_state::load_commit_delta_members_with_payloads(
+            &membership_read,
+            record.commit_id,
+        )
+        .await
+        .expect("packed commit payloads should load");
+        let change = packed_members
+            .iter()
+            .find(|member| member.change.change_id == change_id("change-1"))
+            .map(|member| &member.change)
+            .expect("tracked change should have an authoritative packed payload");
+        assert_eq!(change.schema_key, "test_schema");
         let changes = changelog_reader
             .load_changes(crate::changelog::ChangeLoadRequest {
                 change_ids: &[change_id("change-1"), record.change_id],
             })
             .await
             .expect("changelog change should load");
-        let mut loaded_changes = changes.entries.into_iter();
-        let Some(change) = loaded_changes.next().flatten() else {
-            panic!("changelog change should exist");
-        };
-        assert_eq!(change.change_id, change_id("change-1"));
-        assert_eq!(change.schema_key, "test_schema");
         assert!(
-            loaded_changes.next().flatten().is_none(),
-            "commit row change is derived from changelog.commit, not stored as changelog.change"
+            changes.entries.iter().all(Option::is_none),
+            "tracked and derived commit changes must not be duplicated in changelog.change"
         );
 
         let mut tracked_reader = TrackedStateContext::new().reader(
@@ -4283,8 +4388,11 @@ mod tests {
             "fence-commit-change",
             "fence-branch-ref-change",
         );
-        fence_refs
-            .add_selected_change_batch(selected_change_batch("fence-normal-change", "entity-1"));
+        fence_refs.add_selected_change_batch(selected_change_batch_from(
+            "fence-normal-change",
+            "entity-1",
+            "fence-normal-commit",
+        ));
         let mut read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -5055,7 +5163,6 @@ mod tests {
                     CommitId::for_test_label("parent-commit"),
                     CommitId::for_test_label("child-commit"),
                 ],
-                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("commits should load");
@@ -5335,26 +5442,28 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &[commit_id("test-uuid-1")],
-                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Record(commit)) =
-            commits.entries.into_iter().next().flatten()
-        else {
+        let Some(commit) = commits.entries.into_iter().next().flatten() else {
             panic!("changelog commit should exist");
         };
         assert_eq!(commit.change_id, change_id("test-uuid-2"));
-        let changes = changelog_reader
-            .load_changes(crate::changelog::ChangeLoadRequest {
-                change_ids: &[change_id("change-tracked"), change_id("change-untracked")],
-            })
+        let packed_read = storage
+            .begin_read(StorageReadOptions::default())
             .await
-            .expect("tracked changelog change should load");
-        assert!(matches!(
-            changes.entries.as_slice(),
-            [Some(tracked), None] if tracked.change_id == change_id("change-tracked")
-        ));
+            .expect("packed payload read should open");
+        let packed_members = crate::tracked_state::load_commit_delta_members_with_payloads(
+            &packed_read,
+            commit.commit_id,
+        )
+        .await
+        .expect("tracked packed change should load");
+        assert!(
+            packed_members
+                .iter()
+                .any(|member| member.change.change_id == change_id("change-tracked"))
+        );
 
         let loaded_head = branch_ctx
             .ref_reader(
@@ -5469,13 +5578,10 @@ mod tests {
         let commits = changelog_reader
             .load_commits(crate::changelog::CommitLoadRequest {
                 commit_ids: &[commit_id("test-uuid-1")],
-                projection: crate::changelog::CommitProjection::Record,
             })
             .await
             .expect("changelog commit should load");
-        let Some(crate::changelog::CommitLoadEntry::Record(commit)) =
-            commits.entries.into_iter().next().flatten()
-        else {
+        let Some(commit) = commits.entries.into_iter().next().flatten() else {
             panic!("changelog commit should exist");
         };
         assert_eq!(commit.change_id, change_id("test-uuid-2"));
@@ -5764,6 +5870,14 @@ mod tests {
     }
 
     fn selected_change_batch(change_id: &str, entity_pk: &str) -> StagedCommitChangeBatch {
+        selected_change_batch_from(change_id, entity_pk, "selected-source")
+    }
+
+    fn selected_change_batch_from(
+        change_id: &str,
+        entity_pk: &str,
+        source_commit_id: &str,
+    ) -> StagedCommitChangeBatch {
         let identity = crate::tracked_state::TrackedStateDiffIdentity::from_key(TrackedStateKey {
             schema_key: "test_schema".to_string(),
             file_id: None,
@@ -5772,6 +5886,7 @@ mod tests {
         let mut batch = StagedCommitChangeBatchBuilder::with_capacity(1);
         batch.push(
             identity,
+            commit_id(source_commit_id),
             self::change_id(change_id),
             false,
             ts("2026-01-01T00:00:00Z"),

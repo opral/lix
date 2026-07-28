@@ -1,14 +1,14 @@
-//! Feature-gated changelog benchmark support for the direct v3 layout.
+//! Feature-gated changelog benchmark support for the direct header/change layout.
 //!
-//! The fixtures build direct commit/change/change-ref append batches.
+//! The fixtures build direct commit-header and standalone-change append batches.
 
 use std::time::{Duration, Instant};
 
 use super::context::ChangelogContext;
 use super::store::{ChangelogReader, ChangelogWriter};
 use super::types::{
-    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitChangeRefSet, CommitId,
-    CommitLoadRequest, CommitProjection, CommitRecord, GcPlan, GcRoot, RebuildIndexStats,
+    ChangeId, ChangeLoadRequest, ChangeRecord, ChangelogAppend, CommitId, CommitLoadRequest,
+    CommitRecord, RebuildIndexStats,
 };
 use crate::LixError;
 use crate::entity_pk::EntityPk;
@@ -145,38 +145,11 @@ pub struct BenchRebuildStats {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct BenchGcStats {
-    pub live_commits: usize,
-    pub live_changes: usize,
-    pub live_payloads: usize,
-    pub live_append_batches: usize,
-    pub sweep_append_batches: usize,
-    pub sweep_index_rows: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BenchSizeStats {
     pub encoded_append_bytes: usize,
     pub direct_commit_record_value_bytes: usize,
     pub direct_change_record_value_bytes: usize,
-    pub change_ref_key_bytes: usize,
     pub inline_payload_bytes: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BenchCommitProjection {
-    Header,
-    Body,
-    Full,
-}
-
-impl BenchCommitProjection {
-    fn into_inner(self) -> CommitProjection {
-        match self {
-            Self::Header => CommitProjection::Record,
-            Self::Body | Self::Full => CommitProjection::Full,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -265,7 +238,6 @@ pub fn append_size_stats(append: &BenchAppend) -> Result<BenchSizeStats, LixErro
         encoded_append_bytes,
         direct_commit_record_value_bytes: append.commit_count() * 96,
         direct_change_record_value_bytes: append.change_count() * 96,
-        change_ref_key_bytes: append.change_count() * 48,
         inline_payload_bytes: 0,
     })
 }
@@ -356,10 +328,6 @@ pub fn build_direct_commit_record_entries(append: &BenchAppend) -> Result<usize,
 
 pub fn build_direct_change_record_entries(append: &BenchAppend) -> Result<usize, LixError> {
     Ok(append.change_count())
-}
-
-pub fn build_commit_change_ref_entries(append: &BenchAppend) -> usize {
-    append.change_count()
 }
 
 pub fn project_first_change_to_logical(append: &BenchAppend) -> Result<usize, LixError> {
@@ -487,16 +455,6 @@ where
     })
 }
 
-pub async fn load_commits_direct_by_id<StorageImpl, S: AsRef<str> + Sync>(
-    store: &BenchStore<StorageImpl>,
-    commit_ids: &[S],
-) -> Result<usize, LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Full).await
-}
-
 pub async fn load_commits_direct<StorageImpl, S: AsRef<str> + Sync>(
     store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
@@ -504,18 +462,7 @@ pub async fn load_commits_direct<StorageImpl, S: AsRef<str> + Sync>(
 where
     StorageImpl: BenchStorage + Sync,
 {
-    load_commits_with_lookup(store, commit_ids, BenchCommitProjection::Header).await
-}
-
-pub async fn load_commits_direct_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
-    store: &BenchStore<StorageImpl>,
-    commit_ids: &[S],
-    projection: BenchCommitProjection,
-) -> Result<usize, LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    load_commits_with_lookup(store, commit_ids, projection).await
+    load_commits_with_lookup(store, commit_ids).await
 }
 
 pub async fn load_changes_direct_by_id<StorageImpl, S: AsRef<str> + Sync>(
@@ -569,68 +516,6 @@ where
     Ok(RebuildIndexStats::default().into())
 }
 
-pub async fn prepare_gc_store<StorageImpl>(
-    storage: StorageImpl,
-    live_percent: usize,
-    dead_percent: usize,
-    changes_per_commit: usize,
-) -> Result<(BenchStore<StorageImpl>, String), LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    let commit_count = (live_percent + dead_percent).max(1);
-    let corpus = BenchCorpus::from_append_batches(
-        (0..commit_count)
-            .map(|index| {
-                direct_append_with_shape(&format!("bench-gc-{index}"), 1, changes_per_commit.max(1))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    );
-    let root_commit_id = corpus
-        .first_commit_id()
-        .unwrap_or_else(|| "bench-gc-0-commit-0".to_string());
-    let store = prepare_corpus_store(storage, &corpus).await?;
-    Ok((store, root_commit_id))
-}
-
-pub async fn plan_gc<StorageImpl>(
-    store: &BenchStore<StorageImpl>,
-    root_commit_id: &str,
-) -> Result<BenchGcStats, LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    let read = store
-        .storage
-        .begin_read(StorageReadOptions::default())
-        .await?;
-    let mut reader = store.context.reader(read);
-    let plan = reader
-        .plan_gc(&[GcRoot::BranchHead(CommitId::for_test_label(root_commit_id))])
-        .await?;
-    Ok(plan.into())
-}
-
-pub async fn collect_garbage<StorageImpl>(
-    store: &BenchStore<StorageImpl>,
-    root_commit_id: &str,
-) -> Result<BenchGcStats, LixError>
-where
-    StorageImpl: BenchStorage + Sync,
-{
-    let mut transaction = store.storage.begin_write_transaction().await?;
-    let mut writes = crate::storage_adapter::StorageWriteSet::new();
-    let plan = {
-        let mut writer = store.context.writer(&mut *transaction, &mut writes);
-        writer
-            .collect_garbage(&[GcRoot::BranchHead(CommitId::for_test_label(root_commit_id))])
-            .await?
-    };
-    writes.apply(&mut *transaction).await?;
-    transaction.commit().await?;
-    Ok(plan.into())
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BenchRebuildMode {
     Noop,
@@ -651,7 +536,6 @@ fn direct_append_with_shape(
         let commit_id = format!("{name}-commit-{commit_index}");
         let commit_change_id = format!("{commit_id}:commit");
         let typed_commit_id = CommitId::for_test_label(&commit_id);
-        let mut refs = Vec::new();
         let remaining = change_count.saturating_sub(next_change);
         let take = remaining.min(changes_per_commit);
         for _ in 0..take {
@@ -674,7 +558,6 @@ fn direct_append_with_shape(
                 ),
                 origin_key: None,
             });
-            refs.push(typed_change_id);
             next_change += 1;
         }
         append.commits.push(CommitRecord {
@@ -688,10 +571,6 @@ fn direct_append_with_shape(
                 "created_at",
                 "2026-05-20T00:00:00Z",
             ),
-        });
-        append.commit_change_refs.push(CommitChangeRefSet {
-            commit_id: typed_commit_id,
-            entries: refs,
         });
     }
     Ok(BenchAppend { append })
@@ -766,7 +645,6 @@ where
 async fn load_commits_with_lookup<StorageImpl, S: AsRef<str> + Sync>(
     store: &BenchStore<StorageImpl>,
     commit_ids: &[S],
-    projection: BenchCommitProjection,
 ) -> Result<usize, LixError>
 where
     StorageImpl: BenchStorage + Sync,
@@ -783,7 +661,6 @@ where
     let batch = reader
         .load_commits(CommitLoadRequest {
             commit_ids: &commit_ids,
-            projection: projection.into_inner(),
         })
         .await?;
     Ok(batch.entries.iter().filter(|entry| entry.is_some()).count())
@@ -832,19 +709,6 @@ impl From<RebuildIndexStats> for BenchRebuildStats {
             put: stats.put,
             deleted: stats.deleted,
             unchanged: stats.unchanged,
-        }
-    }
-}
-
-impl From<GcPlan> for BenchGcStats {
-    fn from(plan: GcPlan) -> Self {
-        Self {
-            live_commits: plan.live.commits.len(),
-            live_changes: plan.live.changes.len(),
-            live_payloads: plan.live.payloads.len(),
-            live_append_batches: 0,
-            sweep_append_batches: 0,
-            sweep_index_rows: plan.sweep.commit_change_ref_chunks.len(),
         }
     }
 }

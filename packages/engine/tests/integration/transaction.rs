@@ -1376,7 +1376,6 @@ fn namespace_space(namespace: &str) -> Option<SpaceId> {
     match namespace {
         "changelog.commit" => Some(SpaceId(0x0006_0001)),
         "changelog.change" => Some(SpaceId(0x0006_0002)),
-        "changelog.commit_change_ref_chunk" => Some(SpaceId(0x0006_0003)),
         _ => None,
     }
 }

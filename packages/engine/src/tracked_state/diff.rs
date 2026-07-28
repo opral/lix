@@ -565,10 +565,6 @@ impl TrackedStateTreeDiffBatch {
         )
     }
 
-    pub(crate) fn change_ids(&self) -> impl Iterator<Item = ChangeId> + '_ {
-        self.side_rows().map(|row| row.change_id())
-    }
-
     fn into_columns(
         self,
     ) -> (
@@ -648,6 +644,10 @@ impl<'a> TrackedStateTreeDiffRowRef<'a> {
 
     pub(crate) fn change_id(self) -> ChangeId {
         self.value.change_id
+    }
+
+    pub(crate) fn commit_id(self) -> CommitId {
+        self.value.commit_id
     }
 
     pub(crate) fn deleted(self) -> bool {
@@ -1676,7 +1676,8 @@ mod tests {
             error
                 .message
                 .contains("does not match changelog change identity")
-                || error.message.contains("changelog commit"),
+                || error.message.contains("changelog commit")
+                || error.message.contains("has no authoritative payload"),
             "unexpected error: {error}"
         );
     }
@@ -1702,7 +1703,7 @@ mod tests {
             .expect_err("missing change must be rejected");
 
         assert!(
-            error.message.contains("missing changelog change"),
+            error.message.contains("resolves to payload"),
             "unexpected error: {error}"
         );
     }
