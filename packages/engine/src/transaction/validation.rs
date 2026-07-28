@@ -2080,6 +2080,12 @@ impl PendingConstraintIndexes {
             .any(|identity| identity.matches_live_row_ref(row))
     }
 
+    fn replaces_committed_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
+        self.identity_targets
+            .iter()
+            .any(|target| target.identity.matches_live_row_ref(row))
+    }
+
     fn has_identity_target(&self, identity: &DomainRowIdentity) -> bool {
         self.identity_targets
             .iter()
@@ -2416,7 +2422,9 @@ async fn validate_committed_normal_delete_restriction(
         .await?;
 
         for row in rows.iter() {
-            if pending_constraints.tombstones_identity(row) {
+            if pending_constraints.tombstones_identity(row)
+                || pending_constraints.replaces_committed_identity(row)
+            {
                 continue;
             }
             let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str())
@@ -2458,7 +2466,9 @@ async fn validate_committed_state_surface_delete_restriction_batches(
         .await?;
 
         for row in rows.iter() {
-            if pending_constraints.tombstones_identity(row) {
+            if pending_constraints.tombstones_identity(row)
+                || pending_constraints.replaces_committed_identity(row)
+            {
                 continue;
             }
             let Some(snapshot_content) = row.snapshot_content().map(|snapshot| snapshot.as_str())
@@ -6490,6 +6500,34 @@ mod tests {
         ))
         .await
         .expect("committed references deleted in the same transaction should not restrict delete");
+    }
+
+    #[tokio::test]
+    async fn validation_allows_delete_when_committed_reference_is_replaced() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut parent_delete = fk_parent_row("parent-1", branch_id);
+        parent_delete.snapshot = None;
+        let child_update = fk_child_row("child-1", "parent-2", branch_id);
+        let live_state = StaticLiveStateReader {
+            rows: vec![
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id)),
+            ],
+        };
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![parent_delete, child_update],
+            ..empty_staged_write_set()
+        };
+
+        validate_prepared_writes(TransactionValidationInput::from_visible_schemas_for_tests(
+            &staged_writes,
+            &visible_schemas,
+            &live_state,
+        ))
+        .await
+        .expect("a replacement row's final foreign keys should supersede its committed references");
     }
 
     #[test]
