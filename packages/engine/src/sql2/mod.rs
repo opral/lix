@@ -56,7 +56,9 @@ pub(crate) use exec::{
     WriteExecutorMode, WriteExecutorPath, create_write_logical_plan, execute_write_logical_plan,
     execute_write_logical_plan_with_mode, execute_write_logical_plan_with_mode_and_trace,
     execute_write_logical_plan_with_mode_and_trace_result,
-    execute_write_logical_plan_with_mode_result, take_entity_update_parameter_batch_executions,
+    execute_write_logical_plan_with_mode_result,
+    take_certified_replacement_parameter_batch_executions,
+    take_entity_update_parameter_batch_executions,
 };
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,

@@ -30,8 +30,8 @@ use crate::live_state::{
     MaterializedLiveStateRow,
 };
 use crate::transaction::types::{
-    LogicalPrimaryKey, PreparedTransactionWrite, StagedCommitChangeRef, TransactionFileData,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    LogicalPrimaryKey, PreparedTransactionWrite, StageJson, StagedCommitChangeRef,
+    TransactionFileData, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome,
 };
 use crate::transaction::types::{PreparedStateRow, StagedCommitChangeRefs};
@@ -234,19 +234,13 @@ impl<'a> PreparedValidationRow<'a> {
 
     pub(crate) fn snapshot_json(self) -> Option<&'a serde_json::Value> {
         match self {
-            Self::State(row) => row
-                .snapshot
-                .as_ref()
-                .map(|snapshot| snapshot.value.as_ref()),
+            Self::State(row) => row.snapshot.as_ref().map(StageJson::value),
         }
     }
 
     pub(crate) fn metadata_json(self) -> Option<&'a serde_json::Value> {
         match self {
-            Self::State(row) => row
-                .metadata
-                .as_ref()
-                .map(|metadata| metadata.value.as_ref()),
+            Self::State(row) => row.metadata.as_ref().map(StageJson::value),
         }
     }
 
@@ -2315,7 +2309,7 @@ mod tests {
             drained.state_rows[0]
                 .snapshot
                 .as_ref()
-                .map(crate::transaction::types::StageJson::materialize)
+                .map(StageJson::materialize)
                 .as_deref(),
             Some("{\"key\":\"alternating-key\",\"value\":\"tracked-final\"}")
         );

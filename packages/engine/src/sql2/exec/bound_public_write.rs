@@ -6,7 +6,9 @@ use serde_json::Value as JsonValue;
 use crate::changelog::CommitId;
 use crate::common::{ExecuteStatementMetadata, RequestBlobSpliceProvenance, validate_row_metadata};
 use crate::entity_pk::EntityPk;
-use crate::live_state::{LiveStateFilter, LiveStateRowFilter, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
+};
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
 use crate::sql2::bind::write::{
@@ -31,11 +33,18 @@ use super::SqlWriteResult;
 std::thread_local! {
     static ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 pub(crate) fn take_entity_update_parameter_batch_executions() -> usize {
     ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
+pub(crate) fn take_certified_replacement_parameter_batch_executions() -> usize {
+    CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
 }
 
 #[cfg(test)]
@@ -96,6 +105,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
 
     let direct_primary_key_param =
         bound_single_text_primary_key_param(&spec, &plan.bound.predicate);
+    let direct_replacement = direct_path_value_replacement(&spec, plan, direct_primary_key_param);
     let mut parameter_rows = Vec::with_capacity(parameter_batch.num_rows());
     let mut entity_pks = Vec::with_capacity(parameter_batch.num_rows());
     let mut unique_entity_pks = std::collections::BTreeSet::new();
@@ -127,9 +137,24 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         entity_pks.push(entity_pk);
     }
 
-    let candidates =
-        scan_entity_candidates_for_pks(ctx, plan, &spec, unique_entity_pks.into_iter().collect())
-            .await?;
+    let candidates = scan_entity_candidates_for_pks(
+        ctx,
+        plan,
+        &spec,
+        unique_entity_pks.into_iter().collect(),
+        direct_replacement.is_some(),
+    )
+    .await?;
+    if direct_replacement.is_some()
+        && candidates
+            .iter()
+            .any(|candidate| candidate.untracked || candidate.file_id.is_some())
+    {
+        // Retention and plugin-owned file rows retain the canonical semantic
+        // preparation path. This certificate is only for ordinary tracked
+        // entity replacements.
+        return Ok(None);
+    }
     let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
     for candidate in candidates {
         candidates_by_pk
@@ -144,10 +169,17 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     {
         let mut affected = 0;
         for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
-            if let Some(write_row) =
-                entity_update_row(ctx, plan, &spec, &candidate, params, None)
-                    .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
-            {
+            let write_row = direct_replacement
+                .as_ref()
+                .map_or_else(
+                    || entity_update_row(ctx, plan, &spec, &candidate, params, None),
+                    |replacement| {
+                        direct_path_value_replacement_row(&spec, &candidate, params, replacement)
+                            .map(Some)
+                    },
+                )
+                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+            if let Some(write_row) = write_row {
                 write_rows.push(write_row);
                 affected += 1;
             }
@@ -156,15 +188,123 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
     #[cfg(test)]
-    ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
-        executions.set(executions.get() + 1);
-    });
+    {
+        ENTITY_UPDATE_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+            executions.set(executions.get() + 1);
+        });
+        if direct_replacement.is_some() {
+            CERTIFIED_REPLACEMENT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+                executions.set(executions.get() + 1);
+            });
+        }
+    }
     Ok(Some(
         affected_by_statement
             .into_iter()
             .map(SqlWriteResult::affected)
             .collect(),
     ))
+}
+
+struct DirectPathValueReplacement {
+    value_param_index: usize,
+}
+
+fn direct_path_value_replacement(
+    spec: &EntitySurfaceSpec,
+    plan: &LogicalWritePlan,
+    primary_key_param_index: Option<usize>,
+) -> Option<DirectPathValueReplacement> {
+    if !spec.certifies_path_value_replacement
+        || primary_key_param_index.is_none()
+        || spec.columns.len() != 2
+        || plan.bound.assignments.len() != 1
+    {
+        return None;
+    }
+    let assignment = &plan.bound.assignments[0];
+    if assignment.column.name != "value"
+        || spec
+            .visible_column("value")
+            .is_none_or(|column| column.column_type != EntityColumnType::Json)
+    {
+        return None;
+    }
+    let BoundExpr::Function { name, args } = &assignment.value else {
+        return None;
+    };
+    let [BoundExpr::Param(param)] = args.as_slice() else {
+        return None;
+    };
+    (name == "lix_json").then(|| DirectPathValueReplacement {
+        value_param_index: param.index.saturating_sub(1),
+    })
+}
+
+fn direct_path_value_replacement_row(
+    spec: &EntitySurfaceSpec,
+    candidate: &crate::live_state::MaterializedLiveStateRow,
+    params: &[Value],
+    replacement: &DirectPathValueReplacement,
+) -> Result<TransactionWriteRow, LixError> {
+    let value = match params.get(replacement.value_param_index) {
+        Some(Value::Null) => JsonValue::Null,
+        Some(Value::Text(raw)) => serde_json::from_str(raw).map_err(|error| {
+            LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!("lix_json argument is not valid JSON: {error}"),
+            )
+        })?,
+        Some(_) => {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                "lix_json expects a text argument",
+            ));
+        }
+        None => {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                format!(
+                    "missing SQL parameter ${}",
+                    replacement.value_param_index + 1
+                ),
+            ));
+        }
+    };
+    let value = serde_json::to_string(&value).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("certified replacement value failed to serialize: {error}"),
+        )
+    })?;
+    let path = serde_json::to_string(candidate.entity_pk.as_single_string()?).map_err(|error| {
+        LixError::new(
+            LixError::CODE_UNKNOWN,
+            format!("certified replacement identity failed to serialize: {error}"),
+        )
+    })?;
+    let normalized = format!(r#"{{"path":{path},"value":{value}}}"#);
+    Ok(TransactionWriteRow {
+        entity_pk: Some(candidate.entity_pk.clone()),
+        schema_key: spec.schema_key.clone(),
+        file_id: candidate.file_id.clone(),
+        snapshot: Some(TransactionJson::from_certified_normalized_row_content(
+            normalized.into(),
+        )),
+        metadata: inherited_metadata(candidate, spec)?,
+        origin: None,
+        created_at: None,
+        updated_at: None,
+        global: candidate.global,
+        change_id: None,
+        commit_id: None,
+        untracked: candidate.untracked,
+        branch_id: if candidate.global {
+            crate::GLOBAL_BRANCH_ID.to_string()
+        } else {
+            candidate.branch_id.to_string()
+        },
+    })
 }
 
 fn bound_single_text_primary_key_param(
@@ -1515,6 +1655,7 @@ async fn scan_entity_candidates_for_pks(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
+    metadata_only: bool,
 ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
     ctx.scan_live_state(&LiveStateScanRequest {
         filter: LiveStateFilter {
@@ -1523,6 +1664,13 @@ async fn scan_entity_candidates_for_pks(
             branch_ids: scan_branch_ids(&plan.bound.branch_scope)?,
             include_tombstones: false,
             ..LiveStateFilter::default()
+        },
+        projection: if metadata_only {
+            LiveStateProjection {
+                columns: vec!["metadata".to_string()],
+            }
+        } else {
+            LiveStateProjection::default()
         },
         ..LiveStateScanRequest::default()
     })

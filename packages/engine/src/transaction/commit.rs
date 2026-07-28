@@ -2258,7 +2258,7 @@ fn explicit_branch_head_targets(
             .as_ref()
             .map(|snapshot| {
                 let commit_id = snapshot
-                    .value
+                    .value()
                     .get("commit_id")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| {
