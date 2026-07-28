@@ -23,6 +23,8 @@ const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
 // pipe capacity or deadlocking behind a large blob response.
 const CAT_FILE_REQUESTS_PER_BATCH: usize = 4;
 const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text_v2";
+const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown_incremental_v2";
+const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw_v2";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
 
 type RocksLix = Lix<RocksDB>;
@@ -221,7 +223,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
 
     let plugin_install_started = Instant::now();
-    install_embedded_git_text_plugin(&lix)?;
+    install_embedded_replay_plugins(&lix)?;
     let plugin_install_ms = duration_to_ms(plugin_install_started.elapsed());
 
     let mut state = ReplayState::default();
@@ -403,7 +405,9 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     println!("[git-replay] commits applied: {applied}");
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
-    println!("[git-replay] Git-text setup excluded from replay timing: {plugin_install_ms:.3}ms");
+    println!(
+        "[git-replay] text/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
+    );
     if let Some(parent) = &baseline_seed_parent {
         println!(
             "[git-replay] parent-tree bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files from {parent})"
@@ -1956,46 +1960,98 @@ fn run_git_bytes(
     )))
 }
 
-fn install_embedded_git_text_plugin(lix: &RocksLix) -> Result<(), CliError> {
-    let archive = build_embedded_git_text_plugin_archive()?;
-    db::block_on(lix.execute(
-        "INSERT INTO lix_file (path, data) VALUES (?, ?)",
-        &[
-            Value::Text(format!("/.lix/plugins/{GIT_TEXT_PLUGIN_KEY}.lixplugin")),
-            Value::Blob(archive.into()),
-        ],
-    ))
-    .map_err(|error| {
-        CliError::msg(format!(
-            "failed to install embedded Git-text plugin: {error}"
+fn install_embedded_replay_plugins(lix: &RocksLix) -> Result<(), CliError> {
+    let plugins = [
+        (
+            GIT_TEXT_PLUGIN_KEY,
+            build_embedded_plugin_archive(
+                include_str!("../../../../../plugins/text-v2/manifest.json"),
+                &[(
+                    "schema/git_text_line_v2.json",
+                    include_bytes!("../../../../../plugins/text-v2/schema/git_text_line_v2.json"),
+                )],
+                Path::new(env!(
+                    "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
+                )),
+            )?,
+        ),
+        (
+            MARKDOWN_PLUGIN_KEY,
+            build_embedded_plugin_archive(
+                include_str!("../../../../../plugins/markdown-v2/manifest.json"),
+                &[(
+                    "schema/markdown_node_v2.json",
+                    include_bytes!(
+                        "../../../../../plugins/markdown-v2/schema/markdown_node_v2.json"
+                    ),
+                )],
+                Path::new(env!(
+                    "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
+                )),
+            )?,
+        ),
+        (
+            EXCALIDRAW_PLUGIN_KEY,
+            build_embedded_plugin_archive(
+                include_str!("../../../../../plugins/excalidraw-v2/manifest.json"),
+                &[
+                    (
+                        "schema/excalidraw_scene.json",
+                        include_bytes!(
+                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_scene.json"
+                        ),
+                    ),
+                    (
+                        "schema/excalidraw_element.json",
+                        include_bytes!(
+                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_element.json"
+                        ),
+                    ),
+                    (
+                        "schema/excalidraw_file.json",
+                        include_bytes!(
+                            "../../../../../plugins/excalidraw-v2/schema/excalidraw_file.json"
+                        ),
+                    ),
+                ],
+                Path::new(env!(
+                    "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V2_plugin_excalidraw_v2"
+                )),
+            )?,
+        ),
+    ];
+    for (key, archive) in plugins {
+        db::block_on(lix.execute(
+            "INSERT INTO lix_file (path, data) VALUES (?, ?)",
+            &[
+                Value::Text(format!("/.lix/plugins/{key}.lixplugin")),
+                Value::Blob(archive.into()),
+            ],
         ))
-    })?;
+        .map_err(|error| {
+            CliError::msg(format!("failed to install embedded {key} plugin: {error}"))
+        })?;
+    }
     Ok(())
 }
 
-fn build_embedded_git_text_plugin_archive() -> Result<Vec<u8>, CliError> {
-    let wasm_path = Path::new(env!(
-        "CARGO_CDYLIB_FILE_PLUGIN_GIT_TEXT_V2_plugin_git_text_v2"
-    ));
+fn build_embedded_plugin_archive(
+    manifest: &str,
+    schemas: &[(&str, &[u8])],
+    wasm_path: &Path,
+) -> Result<Vec<u8>, CliError> {
     let wasm = fs::read(wasm_path).map_err(|source| {
         CliError::msg(format!(
-            "failed to read bindep-built Git-text plugin at {}: {source}",
+            "failed to read bindep-built replay plugin at {}: {source}",
             wasm_path.display()
         ))
     })?;
     let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-    for (path, bytes) in [
-        (
-            "manifest.json",
-            include_str!("../../../../../plugins/text-v2/manifest.json").as_bytes(),
-        ),
-        (
-            "schema/git_text_line_v2.json",
-            include_str!("../../../../../plugins/text-v2/schema/git_text_line_v2.json").as_bytes(),
-        ),
-        ("plugin.wasm", wasm.as_slice()),
-    ] {
+    for (path, bytes) in std::iter::once(("manifest.json", manifest.as_bytes()))
+        .chain(schemas.iter().copied())
+        .chain(std::iter::once(("plugin.wasm", wasm.as_slice())))
+    {
         writer.start_file(path, options).map_err(|error| {
             CliError::msg(format!(
                 "failed to create Git-text plugin archive entry {path}: {error}"
