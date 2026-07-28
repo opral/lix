@@ -677,25 +677,34 @@ struct PluginMergeConflictGroup {
     conflicts: Vec<PluginMergeConflictRow>,
 }
 
-fn conflict_tracked_state_key(conflict: &TrackedStateMergeConflict) -> TrackedStateKey {
-    TrackedStateKey {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PluginMergeConflictKey {
+    schema_key: String,
+    file_id: Option<String>,
+    entity_pk: Vec<String>,
+}
+
+fn plugin_merge_conflict_key(conflict: &TrackedStateMergeConflict) -> PluginMergeConflictKey {
+    PluginMergeConflictKey {
         schema_key: conflict.identity.schema_key.clone(),
         file_id: conflict.identity.file_id.clone(),
-        entity_pk: conflict.identity.entity_pk.clone(),
+        entity_pk: conflict.identity.entity_pk.clone().into_parts(),
     }
 }
 
 fn is_resolvable_plugin_semantic_conflict(
     conflict: &AnalysisMergeConflict,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateKey>,
+    resolvable_plugin_conflicts: &BTreeSet<PluginMergeConflictKey>,
 ) -> bool {
-    let Ok(entity_pk) = EntityPk::from_json_array_value(&conflict.entity_pk) else {
-        // Merge analysis always generates this value from a validated
-        // `EntityPk`; keep a malformed public projection visible rather than
-        // accidentally suppressing a conflict.
+    let Some(entity_pk) = conflict.entity_pk.as_array().and_then(|parts| {
+        parts
+            .iter()
+            .map(|part| part.as_str().map(ToOwned::to_owned))
+            .collect::<Option<Vec<_>>>()
+    }) else {
         return false;
     };
-    resolvable_plugin_conflicts.contains(&TrackedStateKey {
+    resolvable_plugin_conflicts.contains(&PluginMergeConflictKey {
         schema_key: conflict.schema_key.clone(),
         file_id: conflict.file_id.clone(),
         entity_pk,
@@ -710,7 +719,7 @@ async fn resolvable_plugin_conflict_keys<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-) -> Result<BTreeSet<TrackedStateKey>, LixError>
+) -> Result<BTreeSet<PluginMergeConflictKey>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
 {
@@ -783,7 +792,7 @@ where
         )
         .is_ok()
         {
-            eligible.insert(conflict_tracked_state_key(conflict));
+            eligible.insert(plugin_merge_conflict_key(conflict));
         }
     }
     Ok(eligible)
@@ -793,7 +802,7 @@ async fn plugin_merge_conflict_groups<S>(
     reader: &mut TrackedStateStoreReader<S>,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateKey>,
+    resolvable_plugin_conflicts: &BTreeSet<PluginMergeConflictKey>,
 ) -> Result<Vec<PluginMergeConflictGroup>, LixError>
 where
     S: crate::storage_adapter::StorageAdapterRead,
@@ -805,7 +814,7 @@ where
         .conflicts
         .iter()
         .filter(|conflict| {
-            resolvable_plugin_conflicts.contains(&conflict_tracked_state_key(conflict))
+            resolvable_plugin_conflicts.contains(&plugin_merge_conflict_key(conflict))
         })
         .collect::<Vec<_>>();
     if semantic_conflicts.is_empty() {
@@ -1648,7 +1657,7 @@ fn preview_from_analysis(
     source_branch_id: &str,
     analysis: &super::analysis::MergeAnalysis,
     derived_blob_files: &BTreeMap<String, PluginFileOwner>,
-    resolvable_plugin_conflicts: &BTreeSet<TrackedStateKey>,
+    resolvable_plugin_conflicts: &BTreeSet<PluginMergeConflictKey>,
 ) -> MergeBranchPreview {
     MergeBranchPreview {
         outcome: merge_branch_outcome_from_analysis(analysis.outcome),

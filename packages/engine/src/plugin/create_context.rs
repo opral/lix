@@ -1,10 +1,10 @@
-//! Durable generated-ID namespace authority for production v2 plugins.
+//! Durable create-context authority for production v2 plugins.
 //!
-//! Components see only a compact 128-bit namespace. The engine retains the
-//! full operation proof, binds both values to the file authority, and writes
-//! one fixed-shape tracked reservation row when that namespace first emits an
-//! identity. A colliding namespace seed with a different proof is rejected
-//! before any semantic rows are staged.
+//! Components see a compact UUIDv7 create context. The engine retains the full
+//! operation proof, binds the context to the file authority, and writes one
+//! fixed-shape tracked reservation row when that context first creates an
+//! entity. A colliding context with a different proof is rejected before any
+//! semantic rows are staged.
 
 use serde::Deserialize;
 use serde_json::{Value as JsonValue, json};
@@ -17,26 +17,29 @@ use crate::common::MutationIdentity;
 use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
-use crate::wasm::{WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmIdNamespace};
+use crate::wasm::{
+    WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
+    WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
+};
 
 use super::{PluginActorKey, PluginRegistryEntry};
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const RESERVATION_PREFIX: &str = "lix_plugin_id_namespace_v2:";
-const RESERVATION_VERSION: u32 = 2;
+const RESERVATION_PREFIX: &str = "lix_plugin_create_v1:";
+const RESERVATION_VERSION: u32 = 1;
 
 /// A mutation identity after it has been bound to one durable plugin-file
 /// authority. Different operation proofs may deliberately yield the same
-/// namespace when their 128-bit seeds collide; the reservation row detects
+/// context when their 128-bit seeds collide; the reservation row detects
 /// that condition using `bound_operation_proof`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct BoundIdNamespace {
-    namespace: [u8; 16],
+pub(crate) struct BoundCreateContext {
+    prefix: [u8; 12],
     bound_operation_proof: [u8; 32],
     authority_binding: [u8; 32],
 }
 
-impl BoundIdNamespace {
+impl BoundCreateContext {
     pub(crate) fn bind(identity: MutationIdentity, actor_key: &PluginActorKey) -> Self {
         let authority_binding = authority_binding(actor_key);
         let namespace_digest = framed_digest(
@@ -47,32 +50,35 @@ impl BoundIdNamespace {
             b"lix.plugin-v2.bound-operation-proof.v2\0",
             &[&identity.operation_proof, &authority_binding],
         );
+        let mut prefix = [0_u8; 12];
+        prefix[..6].copy_from_slice(&identity.namespace_seed[..6]);
+        prefix[6..].copy_from_slice(&namespace_digest[..6]);
+        prefix[6] = (prefix[6] & 0x0f) | 0x70;
+        prefix[8] = (prefix[8] & 0x3f) | 0x80;
         Self {
-            namespace: namespace_digest[..16]
-                .try_into()
-                .expect("digest has a 16-byte namespace prefix"),
+            prefix,
             bound_operation_proof,
             authority_binding,
         }
     }
 
-    pub(crate) fn ids(self) -> WasmIdNamespace {
-        WasmIdNamespace {
+    pub(crate) fn creates(self) -> WasmCreateContext {
+        WasmCreateContext {
             high: u64::from_be_bytes(
-                self.namespace[..8]
+                self.prefix[..8]
                     .try_into()
-                    .expect("namespace has high bytes"),
+                    .expect("UUID prefix has high bytes"),
             ),
-            low: u64::from_be_bytes(
-                self.namespace[8..]
+            low: u32::from_be_bytes(
+                self.prefix[8..]
                     .try_into()
-                    .expect("namespace has low bytes"),
+                    .expect("UUID prefix has low bytes"),
             ),
         }
     }
 
     pub(crate) fn reservation_key(self) -> String {
-        format!("{RESERVATION_PREFIX}{}", encode_hex(&self.namespace))
+        format!("{RESERVATION_PREFIX}{}", encode_hex(&self.prefix))
     }
 }
 
@@ -118,8 +124,8 @@ fn framed_digest(domain: &[u8], fields: &[&[u8]]) -> [u8; 32] {
 
 /// Result of validating generated identities in one sparse guest transition.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct IdAllocationValidation {
-    /// A current-namespace identity was emitted. The transaction must check or
+pub(crate) struct CreateValidation {
+    /// A keyless create was emitted. The transaction must check or
     /// create the corresponding durable reservation before staging changes.
     pub(crate) requires_reservation: bool,
     /// Non-current compact identities are valid only when the exact durable
@@ -127,50 +133,101 @@ pub(crate) struct IdAllocationValidation {
     pub(crate) existing_authorities: Vec<WasmEntityKey>,
 }
 
-pub(crate) fn validate_host_allocated_changes<B>(
+pub(crate) fn validate_create_changes<B>(
     plugin: &PluginRegistryEntry,
     changes: &WasmEntityChanges<B>,
-    bound: BoundIdNamespace,
-) -> Result<IdAllocationValidation, LixError> {
-    if plugin.host_allocated_schema_keys().is_empty() {
-        return Ok(IdAllocationValidation::default());
-    }
-    let host_allocated = plugin.host_allocated_schema_keys();
-    let mut validation = IdAllocationValidation::default();
+) -> Result<CreateValidation, LixError> {
+    let creatable = plugin.create_schema_keys();
+    let mut validation = CreateValidation::default();
     for change in &changes.changes {
-        let WasmEntityChange::Upsert { entity, .. } = change else {
-            continue;
-        };
-        if host_allocated
-            .binary_search(&entity.key.schema_key)
-            .is_err()
-        {
-            continue;
-        }
-        let [component] = entity.key.entity_pk.as_slice() else {
-            return Err(invalid_id(format!(
-                "plugin '{}' schema '{}' must emit one-component host-allocated entity keys",
-                plugin.key(),
-                entity.key.schema_key
-            )));
-        };
-        if let Some((namespace, _ordinal)) = decode_compact_id(component) {
-            if namespace == bound.namespace {
+        match change {
+            WasmEntityChange::Create {
+                schema_key,
+                local_ref,
+                ..
+            } => {
+                if creatable.binary_search(schema_key).is_err() {
+                    return Err(invalid_id(format!(
+                        "plugin '{}' emitted a keyless create for schema '{}' without a UUIDv7 primary-key default",
+                        plugin.key(),
+                        schema_key
+                    )));
+                }
+                u32::try_from(*local_ref).map_err(|_| {
+                    invalid_id(format!(
+                        "plugin '{}' create local reference {} exceeds the u32 allocation range",
+                        plugin.key(),
+                        local_ref
+                    ))
+                })?;
                 validation.requires_reservation = true;
-            } else {
+            }
+            WasmEntityChange::Upsert { entity, .. }
+                if creatable.binary_search(&entity.key.schema_key).is_ok() =>
+            {
                 validation.existing_authorities.push(entity.key.clone());
             }
-        } else {
-            return Err(invalid_id(format!(
-                "plugin '{}' emitted malformed host-allocated ID for schema '{}'; expected a 32-character compact ID",
-                plugin.key(),
-                entity.key.schema_key
-            )));
+            WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => {}
         }
     }
     validation.existing_authorities.sort();
     validation.existing_authorities.dedup();
     Ok(validation)
+}
+
+pub(crate) fn materialize_keyless_creates(
+    changes: &mut WasmHostEntityChanges,
+    creates: WasmCreateContext,
+) -> Result<(), LixError> {
+    for change in &mut changes.changes {
+        let WasmEntityChange::Create {
+            schema_key,
+            local_ref,
+            snapshot_content,
+        } = change
+        else {
+            continue;
+        };
+        let id = creates.component(*local_ref)?;
+        let WasmHostBytes::CanonicalJson { value, .. } = snapshot_content else {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "validated keyless creates must own parsed canonical snapshots",
+            ));
+        };
+        let mut snapshot = value.as_object().cloned().ok_or_else(|| {
+            invalid_id(format!(
+                "keyless create snapshot for schema '{schema_key}' must be an object"
+            ))
+        })?;
+        if snapshot.contains_key("id") {
+            return Err(invalid_id(format!(
+                "keyless create snapshot for schema '{schema_key}' must omit its defaulted primary key '/id'"
+            )));
+        }
+        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
+        let value = JsonValue::Object(snapshot);
+        let normalized = serde_json::to_string(&value).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to encode completed keyless create snapshot: {error}"),
+            )
+        })?;
+        *change = WasmEntityChange::Upsert {
+            entity: WasmEntity {
+                key: WasmEntityKey {
+                    schema_key: schema_key.clone(),
+                    entity_pk: vec![id],
+                },
+                snapshot_content: WasmHostBytes::CanonicalJson {
+                    value: std::sync::Arc::new(value),
+                    normalized: normalized.into(),
+                },
+            },
+            effect: WasmChangeEffect::Content,
+        };
+    }
+    Ok(())
 }
 
 pub(crate) fn require_existing_id_authorities(
@@ -183,7 +240,7 @@ pub(crate) fn require_existing_id_authorities(
     if keys.len() != rows.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
-            "host-allocated ID authority lookup returned the wrong cardinality",
+            "create authority lookup returned the wrong cardinality",
         ));
     }
     for (key, row) in keys.iter().zip(rows) {
@@ -201,51 +258,16 @@ pub(crate) fn require_existing_id_authorities(
             return Err(LixError::new(
                 LixError::CODE_INVALID_PLUGIN,
                 format!(
-                    "plugin '{}' emitted non-current host-allocated ID for new schema '{}' entity {:?}",
+                    "plugin '{}' emitted a keyed update for creatable schema '{}' entity {:?}, but that entity does not exist",
                     plugin.key(), key.schema_key, key.entity_pk
                 ),
             )
             .with_hint(
-                "Allocate new identities from the id-namespace supplied to this transition.",
+                "Use keyless Create for new entities and keyed Upsert only for existing entities.",
             ));
         }
     }
     Ok(())
-}
-
-/// Strictly decodes the 24-byte `namespace || ordinal` representation. The
-/// decoder accepts only the unpadded base64url alphabet and exactly 32 bytes;
-/// aliases, whitespace, padding, and trailing input are rejected.
-pub(crate) fn decode_compact_id(value: &str) -> Option<([u8; 16], u64)> {
-    let encoded = value.as_bytes();
-    if encoded.len() != 32 {
-        return None;
-    }
-    let mut decoded = [0u8; 24];
-    for (input, output) in encoded.chunks_exact(4).zip(decoded.chunks_exact_mut(3)) {
-        let a = decode_base64url(input[0])?;
-        let b = decode_base64url(input[1])?;
-        let c = decode_base64url(input[2])?;
-        let d = decode_base64url(input[3])?;
-        output[0] = a << 2 | b >> 4;
-        output[1] = b << 4 | c >> 2;
-        output[2] = c << 6 | d;
-    }
-    Some((
-        decoded[..16].try_into().ok()?,
-        u64::from_be_bytes(decoded[16..].try_into().ok()?),
-    ))
-}
-
-fn decode_base64url(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'-' => Some(62),
-        b'_' => Some(63),
-        _ => None,
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,15 +279,15 @@ struct ReservationValue {
 }
 
 /// Returns a row to stage when the reservation is absent, accepts an exact
-/// same-proof replay without another write, and rejects a truncated-namespace
+/// same-proof replay without another write, and rejects a truncated-context
 /// collision before semantic rows enter the transaction buffer.
-pub(crate) fn reserve_namespace_row(
+pub(crate) fn reserve_create_row(
     existing: Option<&MaterializedLiveStateRow>,
-    bound: BoundIdNamespace,
+    bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
 ) -> Result<Option<TransactionWriteRow>, LixError> {
-    validate_namespace_reservation(existing, bound, file_id, branch_id)?;
+    validate_create_reservation(existing, bound, file_id, branch_id)?;
     if existing.is_some() {
         return Ok(None);
     }
@@ -287,16 +309,16 @@ pub(crate) fn reserve_namespace_row(
     )?))
 }
 
-/// Validates an already-reserved namespace before entering a guest transition.
+/// Validates an already-reserved create context before entering a guest transition.
 ///
 /// This preflight is deliberately independent of whether the eventual sparse
-/// change set allocates an ID. A client presenting a reserved namespace with a
+/// change set creates an entity. A client presenting a reserved context with a
 /// different full proof has already violated the mutation-identity contract;
 /// rejecting it here prevents guest-local allocator errors from obscuring the
 /// public constraint violation.
-pub(crate) fn validate_namespace_reservation(
+pub(crate) fn validate_create_reservation(
     existing: Option<&MaterializedLiveStateRow>,
-    bound: BoundIdNamespace,
+    bound: BoundCreateContext,
     file_id: &str,
     branch_id: &str,
 ) -> Result<(), LixError> {
@@ -308,50 +330,50 @@ pub(crate) fn validate_namespace_reservation(
     let snapshot = row
         .snapshot_content
         .as_deref()
-        .ok_or_else(|| invalid_id(format!("namespace reservation '{key}' has no snapshot")))?;
+        .ok_or_else(|| invalid_id(format!("create reservation '{key}' has no snapshot")))?;
     let snapshot: JsonValue = serde_json::from_str(snapshot).map_err(|error| {
         invalid_id(format!(
-            "namespace reservation '{key}' is invalid JSON: {error}"
+            "create reservation '{key}' is invalid JSON: {error}"
         ))
     })?;
     let object = snapshot
         .as_object()
-        .ok_or_else(|| invalid_id(format!("namespace reservation '{key}' must be an object")))?;
+        .ok_or_else(|| invalid_id(format!("create reservation '{key}' must be an object")))?;
     if object.len() != 2 || object.get("key").and_then(JsonValue::as_str) != Some(&key) {
         return Err(invalid_id(format!(
-            "namespace reservation '{key}' has invalid key-value shape"
+            "create reservation '{key}' has invalid key-value shape"
         )));
     }
     let value: ReservationValue = serde_json::from_value(
         object
             .get("value")
             .cloned()
-            .ok_or_else(|| invalid_id(format!("namespace reservation '{key}' has no value")))?,
+            .ok_or_else(|| invalid_id(format!("create reservation '{key}' has no value")))?,
     )
     .map_err(|error| {
         invalid_id(format!(
-            "namespace reservation '{key}' has an invalid value: {error}"
+            "create reservation '{key}' has an invalid value: {error}"
         ))
     })?;
     let operation_proof = decode_hex_32(&value.operation_proof).ok_or_else(|| {
         invalid_id(format!(
-            "namespace reservation '{key}' has an invalid operation proof"
+            "create reservation '{key}' has an invalid operation proof"
         ))
     })?;
     let authority_binding = decode_hex_32(&value.authority_binding).ok_or_else(|| {
         invalid_id(format!(
-            "namespace reservation '{key}' has an invalid authority binding"
+            "create reservation '{key}' has an invalid authority binding"
         ))
     })?;
     if value.version != RESERVATION_VERSION || authority_binding != bound.authority_binding {
         return Err(invalid_id(format!(
-            "namespace reservation '{key}' does not match the current file authority"
+            "create reservation '{key}' does not match the current file authority"
         )));
     }
     if operation_proof != bound.bound_operation_proof {
         return Err(LixError::new(
             LixError::CODE_CONSTRAINT_VIOLATION,
-            "generated-ID namespace collision: the namespace is reserved by a different operation proof",
+            "create-context collision: the context is reserved by a different operation proof",
         ));
     }
     Ok(())
@@ -363,14 +385,14 @@ pub(crate) fn reservation_tombstone_row(
     branch_id: &str,
 ) -> Result<TransactionWriteRow, LixError> {
     if !is_reservation_key(key) {
-        return Err(invalid_id("invalid namespace reservation key"));
+        return Err(invalid_id("invalid create reservation key"));
     }
     reservation_row(key.to_string(), None, file_id, branch_id)
 }
 
 pub(crate) fn is_reservation_key(key: &str) -> bool {
     key.strip_prefix(RESERVATION_PREFIX)
-        .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(is_lower_hex))
+        .is_some_and(|suffix| suffix.len() == 24 && suffix.bytes().all(is_lower_hex))
 }
 
 fn reservation_row(
@@ -381,7 +403,7 @@ fn reservation_row(
 ) -> Result<TransactionWriteRow, LixError> {
     if file_id.is_empty() || branch_id.is_empty() || branch_id == crate::GLOBAL_BRANCH_ID {
         return Err(invalid_id(
-            "namespace reservations require a file-scoped tracked branch",
+            "create reservations require a file-scoped tracked branch",
         ));
     }
     Ok(TransactionWriteRow {
@@ -389,7 +411,7 @@ fn reservation_row(
         schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
         file_id: Some(file_id.to_string()),
         snapshot: snapshot
-            .map(|value| TransactionJson::from_value(value, "plugin ID namespace reservation"))
+            .map(|value| TransactionJson::from_value(value, "plugin create reservation"))
             .transpose()?,
         metadata: None,
         origin: None,
@@ -418,7 +440,7 @@ fn validate_reservation_identity(
         || row.deleted
     {
         return Err(invalid_id(format!(
-            "namespace reservation '{key}' has invalid tracked file scope"
+            "create reservation '{key}' has invalid tracked file scope"
         )));
     }
     Ok(())
@@ -489,7 +511,7 @@ mod tests {
             content_type: None,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
-            host_allocated_schema_keys: vec!["csv_row".to_string()],
+            create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"key":"plugin_csv_v2","runtime":"wasm-component-v2","api_version":"2.1.0","materialization":"blob","match":{"path_glob":"*.csv"},"entry":"plugin.wasm","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
@@ -512,11 +534,21 @@ mod tests {
         }
     }
 
-    fn row_for(bound: BoundIdNamespace) -> MaterializedLiveStateRow {
-        let write =
-            reserve_namespace_row(None, bound, "01920000-0000-7000-8000-0000000000a2", "main")
-                .expect("reserve")
-                .expect("new row");
+    fn create(local_ref: u64) -> WasmEntityChange<WasmHostBytes> {
+        WasmEntityChange::Create {
+            schema_key: "csv_row".to_string(),
+            local_ref,
+            snapshot_content: WasmHostBytes::CanonicalJson {
+                value: std::sync::Arc::new(json!({})),
+                normalized: "{}".into(),
+            },
+        }
+    }
+
+    fn row_for(bound: BoundCreateContext) -> MaterializedLiveStateRow {
+        let write = reserve_create_row(None, bound, "01920000-0000-7000-8000-0000000000a2", "main")
+            .expect("reserve")
+            .expect("new row");
         MaterializedLiveStateRow {
             entity_pk: write.entity_pk.expect("pk"),
             schema_key: write.schema_key,
@@ -537,63 +569,99 @@ mod tests {
     }
 
     #[test]
-    fn compact_id_decoder_is_strict() {
-        let ids = BoundIdNamespace::bind(
+    fn create_context_produces_stable_uuid_v7_values() {
+        let creates = BoundCreateContext::bind(
             MutationIdentity {
-                namespace_seed: [7; 16],
+                namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
+                    .unwrap()
+                    .into_bytes(),
                 operation_proof: [8; 32],
             },
             &actor_key(),
         )
-        .ids();
-        let value = ids.component(42);
-        let (namespace, ordinal) = decode_compact_id(&value).expect("decode");
-        assert_eq!(namespace[..8], ids.high.to_be_bytes());
-        assert_eq!(namespace[8..], ids.low.to_be_bytes());
-        assert_eq!(ordinal, 42);
-        assert!(decode_compact_id(&(value.clone() + "=")).is_none());
-        let mut standard_base64 = value;
-        standard_base64.replace_range(0..1, "+");
-        assert!(decode_compact_id(&standard_base64).is_none());
-        assert!(decode_compact_id("short").is_none());
+        .creates();
+        let value = creates.component(42).expect("uuid");
+        let parsed = uuid::Uuid::parse_str(&value).expect("canonical UUID");
+        assert_eq!(parsed.get_version_num(), 7);
+        assert_eq!(&parsed.as_bytes()[12..], &42_u32.to_be_bytes());
     }
 
     #[test]
     fn validation_distinguishes_current_existing_and_malformed_ids() {
-        let bound = BoundIdNamespace::bind(
-            MutationIdentity {
-                namespace_seed: [7; 16],
-                operation_proof: [8; 32],
-            },
-            &actor_key(),
-        );
-        let old = BoundIdNamespace::bind(
+        let old = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [6; 16],
                 operation_proof: [5; 32],
             },
             &actor_key(),
         );
+        let old_id = old.creates().component(1).unwrap();
         let changes = WasmEntityChanges {
-            changes: vec![
-                upsert(bound.ids().component(0)),
-                upsert(old.ids().component(1)),
-            ],
+            changes: vec![create(0), upsert(old_id)],
         };
-        let validation =
-            validate_host_allocated_changes(&plugin(), &changes, bound).expect("validate");
+        let validation = validate_create_changes(&plugin(), &changes).expect("validate");
         assert!(validation.requires_reservation);
         assert_eq!(validation.existing_authorities.len(), 1);
 
         let malformed = WasmEntityChanges {
-            changes: vec![upsert("not-an-id".to_string())],
+            changes: vec![WasmEntityChange::Create {
+                schema_key: "other".to_string(),
+                local_ref: 0,
+                snapshot_content: WasmHostBytes::Inline(Vec::new()),
+            }],
         };
-        assert!(validate_host_allocated_changes(&plugin(), &malformed, bound).is_err());
+        assert!(validate_create_changes(&plugin(), &malformed).is_err());
+    }
+
+    #[test]
+    fn keyless_create_materializes_the_defaulted_id_once() {
+        let context = BoundCreateContext::bind(
+            MutationIdentity {
+                namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
+                    .unwrap()
+                    .into_bytes(),
+                operation_proof: [8; 32],
+            },
+            &actor_key(),
+        )
+        .creates();
+        let expected_id = context.component(42).unwrap();
+        let mut changes = WasmEntityChanges {
+            changes: vec![WasmEntityChange::Create {
+                schema_key: "csv_row".to_string(),
+                local_ref: 42,
+                snapshot_content: WasmHostBytes::CanonicalJson {
+                    value: std::sync::Arc::new(json!({
+                        "cells": ["Alice", "42"],
+                        "order_key": "4000000000000001"
+                    })),
+                    normalized: r#"{"cells":["Alice","42"],"order_key":"4000000000000001"}"#.into(),
+                },
+            }],
+        };
+
+        materialize_keyless_creates(&mut changes, context).expect("materialize");
+
+        let WasmEntityChange::Upsert { entity, effect } = &changes.changes[0] else {
+            panic!("create must become an upsert before transaction staging");
+        };
+        assert_eq!(entity.key.entity_pk, vec![expected_id.clone()]);
+        assert_eq!(*effect, WasmChangeEffect::Content);
+        let WasmHostBytes::CanonicalJson { value, normalized } = &entity.snapshot_content else {
+            panic!("completed snapshot must stay canonical JSON");
+        };
+        assert_eq!(value["id"], expected_id);
+        assert_eq!(
+            normalized.as_ref(),
+            format!(
+                r#"{{"cells":["Alice","42"],"id":"{expected_id}","order_key":"4000000000000001"}}"#
+            )
+        );
     }
 
     #[test]
     fn reservation_accepts_same_proof_and_rejects_seed_collision() {
-        let first = BoundIdNamespace::bind(
+        let first = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [7; 16],
                 operation_proof: [8; 32],
@@ -602,7 +670,7 @@ mod tests {
         );
         let existing = row_for(first);
         assert!(
-            reserve_namespace_row(
+            reserve_create_row(
                 Some(&existing),
                 first,
                 "01920000-0000-7000-8000-0000000000a2",
@@ -612,15 +680,15 @@ mod tests {
             .is_none()
         );
 
-        let collision = BoundIdNamespace::bind(
+        let collision = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [7; 16],
                 operation_proof: [9; 32],
             },
             &actor_key(),
         );
-        assert_eq!(first.namespace, collision.namespace);
-        let error = reserve_namespace_row(
+        assert_eq!(first.prefix, collision.prefix);
+        let error = reserve_create_row(
             Some(&existing),
             collision,
             "01920000-0000-7000-8000-0000000000a2",
@@ -632,7 +700,7 @@ mod tests {
 
     #[test]
     fn reservation_preflight_reports_seed_collision_as_constraint_violation() {
-        let first = BoundIdNamespace::bind(
+        let first = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [0x31; 16],
                 operation_proof: [0x41; 32],
@@ -640,7 +708,7 @@ mod tests {
             &actor_key(),
         );
         let existing = row_for(first);
-        let collision = BoundIdNamespace::bind(
+        let collision = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [0x31; 16],
                 operation_proof: [0x42; 32],
@@ -648,7 +716,7 @@ mod tests {
             &actor_key(),
         );
 
-        let error = validate_namespace_reservation(
+        let error = validate_create_reservation(
             Some(&existing),
             collision,
             "01920000-0000-7000-8000-0000000000a2",
@@ -663,7 +731,7 @@ mod tests {
     fn large_cold_import_and_sparse_insert_use_one_reservation_each() {
         const ROWS: u64 = 220_000;
         let actor_key = actor_key();
-        let cold = BoundIdNamespace::bind(
+        let cold = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [1; 16],
                 operation_proof: [2; 32],
@@ -671,24 +739,22 @@ mod tests {
             &actor_key,
         );
         let cold_changes = WasmEntityChanges {
-            changes: (0..ROWS)
-                .map(|ordinal| upsert(cold.ids().component(ordinal)))
-                .collect(),
+            changes: (0..ROWS).map(create).collect(),
         };
         let plugin = plugin();
-        let validation = validate_host_allocated_changes(&plugin, &cold_changes, cold)
-            .expect("large cold import IDs");
+        let validation =
+            validate_create_changes(&plugin, &cold_changes).expect("large cold import creates");
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_namespace_row(None, cold, "01920000-0000-7000-8000-0000000000a2", "main")
+            reserve_create_row(None, cold, "01920000-0000-7000-8000-0000000000a2", "main")
                 .expect("cold reservation")
                 .into_iter()
                 .count(),
             1,
         );
 
-        let edit = BoundIdNamespace::bind(
+        let edit = BoundCreateContext::bind(
             MutationIdentity {
                 namespace_seed: [3; 16],
                 operation_proof: [4; 32],
@@ -696,22 +762,22 @@ mod tests {
             &actor_key,
         );
         let edit_changes = WasmEntityChanges {
-            changes: vec![upsert(cold.ids().component(17))],
+            changes: vec![upsert(cold.creates().component(17).unwrap())],
         };
-        let validation = validate_host_allocated_changes(&plugin, &edit_changes, edit)
-            .expect("existing-row edit IDs");
+        let validation =
+            validate_create_changes(&plugin, &edit_changes).expect("existing-row edit IDs");
         assert!(!validation.requires_reservation);
         assert_eq!(validation.existing_authorities.len(), 1);
 
         let insert_changes = WasmEntityChanges {
-            changes: vec![upsert(edit.ids().component(0))],
+            changes: vec![create(0)],
         };
-        let validation = validate_host_allocated_changes(&plugin, &insert_changes, edit)
-            .expect("sparse insert IDs");
+        let validation =
+            validate_create_changes(&plugin, &insert_changes).expect("sparse insert IDs");
         assert!(validation.requires_reservation);
         assert!(validation.existing_authorities.is_empty());
         assert_eq!(
-            reserve_namespace_row(None, edit, "01920000-0000-7000-8000-0000000000a2", "main")
+            reserve_create_row(None, edit, "01920000-0000-7000-8000-0000000000a2", "main")
                 .expect("insert reservation")
                 .into_iter()
                 .count(),

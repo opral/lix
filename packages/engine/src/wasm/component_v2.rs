@@ -374,6 +374,11 @@ pub enum WasmChangeEffect {
 
 #[derive(Debug, Clone)]
 pub enum WasmEntityChange<B> {
+    Create {
+        schema_key: String,
+        local_ref: u64,
+        snapshot_content: B,
+    },
     Upsert {
         entity: WasmEntity<B>,
         effect: WasmChangeEffect,
@@ -382,10 +387,26 @@ pub enum WasmEntityChange<B> {
 }
 
 impl<B> WasmEntityChange<B> {
-    pub fn key(&self) -> &WasmEntityKey {
+    pub fn entity_key(&self) -> Option<&WasmEntityKey> {
         match self {
-            Self::Upsert { entity, .. } => &entity.key,
-            Self::Delete(key) => key,
+            Self::Create { .. } => None,
+            Self::Upsert { entity, .. } => Some(&entity.key),
+            Self::Delete(key) => Some(key),
+        }
+    }
+
+    pub fn schema_key(&self) -> &str {
+        match self {
+            Self::Create { schema_key, .. } => schema_key,
+            Self::Upsert { entity, .. } => &entity.key.schema_key,
+            Self::Delete(key) => &key.schema_key,
+        }
+    }
+
+    pub fn local_ref(&self) -> Option<u64> {
+        match self {
+            Self::Create { local_ref, .. } => Some(*local_ref),
+            Self::Upsert { .. } | Self::Delete(_) => None,
         }
     }
 }
@@ -405,12 +426,35 @@ impl<B> Default for WasmEntityChanges<B> {
 
 impl<B> WasmEntityChanges<B> {
     pub fn validate(&self) -> Result<(), LixError> {
-        let mut seen = BTreeSet::new();
+        let mut seen_entities = BTreeSet::new();
+        let mut seen_creates = BTreeSet::new();
         for change in &self.changes {
-            if !seen.insert(change.key()) {
-                return Err(invalid_param(
-                    "a v2 entity key may occur only once in one transition",
-                ));
+            match change {
+                WasmEntityChange::Create {
+                    schema_key,
+                    local_ref,
+                    ..
+                } => {
+                    if !seen_creates.insert((schema_key, local_ref)) {
+                        return Err(invalid_param(
+                            "a v2 create local reference may occur only once per schema in one transition",
+                        ));
+                    }
+                }
+                WasmEntityChange::Upsert { entity, .. } => {
+                    if !seen_entities.insert(&entity.key) {
+                        return Err(invalid_param(
+                            "a v2 entity key may occur only once in one transition",
+                        ));
+                    }
+                }
+                WasmEntityChange::Delete(key) => {
+                    if !seen_entities.insert(key) {
+                        return Err(invalid_param(
+                            "a v2 entity key may occur only once in one transition",
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -506,42 +550,32 @@ pub struct WasmConflictResolutionPage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WasmIdNamespace {
+pub struct WasmCreateContext {
     pub high: u64,
-    pub low: u64,
+    pub low: u32,
 }
 
-impl WasmIdNamespace {
-    /// Encodes namespace || big-endian ordinal as exactly 32 unpadded
-    /// base64url characters, matching packet-v1's generated-ID rule.
-    pub fn entity_pk(self, ordinal: u64) -> Vec<String> {
-        vec![self.component(ordinal)]
+impl WasmCreateContext {
+    pub fn entity_pk(self, local_ref: u64) -> Result<Vec<String>, LixError> {
+        Ok(vec![self.component(local_ref)?])
     }
 
-    pub fn component(self, ordinal: u64) -> String {
-        const BASE64URL: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-        let mut input = [0u8; 24];
-        input[..8].copy_from_slice(&self.high.to_be_bytes());
-        input[8..16].copy_from_slice(&self.low.to_be_bytes());
-        input[16..].copy_from_slice(&ordinal.to_be_bytes());
-
-        let mut output = String::with_capacity(32);
-        for chunk in input.chunks_exact(3) {
-            let value = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
-            output.push(BASE64URL[((value >> 18) & 0x3f) as usize] as char);
-            output.push(BASE64URL[((value >> 12) & 0x3f) as usize] as char);
-            output.push(BASE64URL[((value >> 6) & 0x3f) as usize] as char);
-            output.push(BASE64URL[(value & 0x3f) as usize] as char);
-        }
-        output
+    pub fn component(self, local_ref: u64) -> Result<String, LixError> {
+        let local_ref = u32::try_from(local_ref).map_err(|_| {
+            invalid_param("v2 create local references must fit in an unsigned 32-bit integer")
+        })?;
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&self.high.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.low.to_be_bytes());
+        bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
+        Ok(uuid::Uuid::from_bytes(bytes).to_string())
     }
 }
 
 pub struct WasmOpenFileInput {
     pub descriptor: WasmFileDescriptor,
     pub file: Arc<dyn WasmByteSource>,
-    pub ids: WasmIdNamespace,
+    pub creates: WasmCreateContext,
 }
 
 impl fmt::Debug for WasmOpenFileInput {
@@ -550,7 +584,7 @@ impl fmt::Debug for WasmOpenFileInput {
             .debug_struct("WasmOpenFileInput")
             .field("descriptor", &self.descriptor)
             .field("file_len", &self.file.len())
-            .field("ids", &self.ids)
+            .field("creates", &self.creates)
             .finish()
     }
 }
@@ -580,7 +614,7 @@ pub struct WasmFileUpdate {
     pub before: Arc<dyn WasmByteSource>,
     pub edits: Vec<WasmInputSplice>,
     pub after: Arc<dyn WasmByteSource>,
-    pub ids: WasmIdNamespace,
+    pub creates: WasmCreateContext,
 }
 
 impl fmt::Debug for WasmFileUpdate {
@@ -592,7 +626,7 @@ impl fmt::Debug for WasmFileUpdate {
             .field("before_len", &self.before.len())
             .field("edits", &self.edits)
             .field("after_len", &self.after.len())
-            .field("ids", &self.ids)
+            .field("creates", &self.creates)
             .finish()
     }
 }
@@ -752,7 +786,8 @@ pub struct WasmEditPage {
 #[derive(Debug)]
 pub struct WasmChangeDrainValidator {
     limits: WasmTransitionLimits,
-    seen: BTreeSet<WasmEntityKey>,
+    seen_entities: BTreeSet<WasmEntityKey>,
+    seen_creates: BTreeSet<(String, u64)>,
     pages: u32,
     attachment_refs: u32,
     reached_eof: bool,
@@ -762,7 +797,8 @@ impl WasmChangeDrainValidator {
     pub fn new(limits: WasmTransitionLimits) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
-            seen: BTreeSet::new(),
+            seen_entities: BTreeSet::new(),
+            seen_creates: BTreeSet::new(),
             pages: 0,
             attachment_refs: 0,
             reached_eof: false,
@@ -791,21 +827,50 @@ impl WasmChangeDrainValidator {
 
         let mut page_refs = 0u32;
         for change in &page.changes.changes {
-            if !self.seen.insert(change.key().clone()) {
-                return Err(invalid_param(
-                    "a v2 entity key may occur only once across a change cursor",
-                ));
-            }
-            if let WasmEntityChange::Upsert { entity, .. } = change
-                && let WasmGuestBytes::Output(range) = &entity.snapshot_content
-            {
-                range
-                    .offset
-                    .checked_add(range.length)
-                    .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
-                page_refs = page_refs
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_param("v2 attachment reference count overflowed"))?;
+            match change {
+                WasmEntityChange::Create {
+                    schema_key,
+                    local_ref,
+                    snapshot_content,
+                } => {
+                    if !self.seen_creates.insert((schema_key.clone(), *local_ref)) {
+                        return Err(invalid_param(
+                            "a v2 create local reference may occur only once per schema across a change cursor",
+                        ));
+                    }
+                    if let WasmGuestBytes::Output(range) = snapshot_content {
+                        range
+                            .offset
+                            .checked_add(range.length)
+                            .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
+                        page_refs = page_refs.checked_add(1).ok_or_else(|| {
+                            invalid_param("v2 attachment reference count overflowed")
+                        })?;
+                    }
+                }
+                WasmEntityChange::Upsert { entity, .. } => {
+                    if !self.seen_entities.insert(entity.key.clone()) {
+                        return Err(invalid_param(
+                            "a v2 entity key may occur only once across a change cursor",
+                        ));
+                    }
+                    if let WasmGuestBytes::Output(range) = &entity.snapshot_content {
+                        range
+                            .offset
+                            .checked_add(range.length)
+                            .ok_or_else(|| invalid_param("v2 change output range overflowed"))?;
+                        page_refs = page_refs.checked_add(1).ok_or_else(|| {
+                            invalid_param("v2 attachment reference count overflowed")
+                        })?;
+                    }
+                }
+                WasmEntityChange::Delete(key) => {
+                    if !self.seen_entities.insert(key.clone()) {
+                        return Err(invalid_param(
+                            "a v2 entity key may occur only once across a change cursor",
+                        ));
+                    }
+                }
             }
         }
         validate_attachment_table_presence(page_refs, page.outputs.is_some())?;
@@ -1229,15 +1294,17 @@ mod tests {
     }
 
     #[test]
-    fn generated_ids_match_fixed_base64url_vectors() {
-        let zero = WasmIdNamespace { high: 0, low: 0 };
-        let max = WasmIdNamespace {
-            high: u64::MAX,
-            low: u64::MAX,
+    fn create_context_produces_canonical_uuid_components() {
+        let creates = WasmCreateContext {
+            high: 0x0192_0000_0000_7000,
+            low: 0x8000_0000,
         };
-        assert_eq!(zero.component(0), "A".repeat(32));
-        assert_eq!(max.component(u64::MAX), "_".repeat(32));
-        assert_eq!(zero.entity_pk(7).len(), 1);
+        assert_eq!(
+            creates.component(42).unwrap(),
+            "01920000-0000-7000-8000-00000000002a"
+        );
+        assert_eq!(creates.entity_pk(7).unwrap().len(), 1);
+        assert!(creates.component(u64::from(u32::MAX) + 1).is_err());
     }
 
     #[test]
@@ -1257,7 +1324,7 @@ mod tests {
                 }),
             }],
             after,
-            ids: WasmIdNamespace { high: 1, low: 2 },
+            creates: WasmCreateContext { high: 1, low: 2 },
         };
         update.validate(WasmTransitionLimits::default()).unwrap();
 

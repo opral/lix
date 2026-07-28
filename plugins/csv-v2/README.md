@@ -45,14 +45,15 @@ printable ASCII, the optional quote is printable non-space ASCII, neither is a
 line ending, and delimiter and quote differ. A quote-less dialect is rejected
 when its cells cannot be rendered into a self-openable file.
 
-Generated row IDs are exactly the v2 mutation-scoped namespace plus a
-big-endian ordinal, encoded as 32 unpadded base64url characters. Supplied
+Generated row IDs are canonical UUIDv7 strings. New rows cross the Wasm
+boundary as a `u32` local reference plus an ID-free snapshot; the host applies
+the schema default and persists the completed UUID-keyed entity. Supplied
 durable IDs are kept byte-for-byte.
 
 For a new production v2 plugin, start with the
 [lix-plugin-api](../../packages/plugin-api/README.md). It owns WIT and packet
 glue; this crate's `bindings.rs` is a format-specific adapter. Its [manifest](manifest.json),
-[host-allocated row schema](schema/csv_v2_row.json), and
+[defaulted row schema](schema/csv_v2_row.json), and
 [tests](src/tests.rs) are the executable production examples.
 
 From the repository root:

@@ -43,10 +43,12 @@ the lower-level protocol material here.
 
 A plugin manifest declares `runtime: "wasm-component-v2"`,
 `api_version: "2.1.0"`, matchers, its component entry, and schemas. Each
-schema declares `x-lix-key` and `x-lix-primary-key`. A schema that lets the
-plugin create entities also declares `x-lix-id-allocation:
-"host-allocated"`; preserve known IDs and use `ids.id(ordinal)` only for new
-ones. Positions, row numbers, and byte offsets are not identities.
+schema declares `x-lix-key` and `x-lix-primary-key`. Creation is available
+when every primary-key property can be completed by a host-evaluated default.
+In v2 that means `/id` is the primary key and declares
+`"x-lix-default": "lix_uuid_v7()"`. Preserve known IDs and emit keyless
+`Create` records only for new entities. Positions, row numbers, and byte
+offsets are not durable identities.
 
 - `open-file`: parse initial bytes, return an immutable `document`, and stream
   complete initial entity upserts.
@@ -104,19 +106,19 @@ interactive resolution are deferred to a later data-model API.
 
 ## Stable IDs
 
-For a schema marked `x-lix-id-allocation: "host-allocated"`, preserve every
-acknowledged ID supplied by durable entities. Allocate an ID only for a truly
-new entity. Encode the supplied namespace's `high` and `low` halves as 16
-big-endian bytes, append one deterministic big-endian `u64` ordinal, and encode
-the 24 bytes as exactly 32 unpadded base64url characters. The same logical
-operation under the same explicit mutation identity must choose the same
-ordinal. Transport replay requires a separate protocol identity and is not
-provided by this API. Never use a row number, array index, or current file
-position as identity.
+Preserve every acknowledged ID supplied by durable entities. Allocate an ID
+only for a truly new entity. `create-context` contains the first 96 bits of a
+canonical UUIDv7; the packet's `u32` `local-ref` supplies its final 32 bits.
+The Rust author API exposes `creates.id(local_ref)` for document-local identity
+and lowers a matching upsert to a keyless `Create` packet. The same logical
+operation under the same explicit mutation identity must choose the same local
+reference. Never use a row number, array index, or current byte offset as a
+durable identity.
 
-The host binds and durably reserves the namespace to the mutation, file
-incarnation, plugin, and generation. A plugin must not mint a different
-namespace or reuse an old namespace for a new entity.
+The host binds and durably reserves the create context to the mutation, file
+incarnation, plugin, and generation. It evaluates the primary-key default,
+inserts `/id`, derives the typed entity key, validates the completed snapshot,
+and persists the create as an ordinary keyed entity.
 
 ## Plugin selection
 
@@ -126,7 +128,7 @@ there is no cross-runtime selection behavior.
 
 Installation accepts the exact `2.1.0` API version. Replacing an owned plugin
 is a compatible generation update: its API version, matcher, content type,
-schema-key set, and ID-allocation contract remain stable.
+schema-key set, and create-default contract remain stable.
 
 ## Build and test
 

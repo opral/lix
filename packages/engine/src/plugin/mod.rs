@@ -7,7 +7,7 @@
 mod actor;
 mod archive;
 mod component;
-mod id_namespace;
+mod create_context;
 mod incremental;
 mod install;
 mod manifest;
@@ -21,10 +21,10 @@ pub(crate) use actor::{
 };
 pub(crate) use archive::{ParsedPluginArchive, parse_plugin_archive_for_install};
 pub(crate) use component::{DEFAULT_PLUGIN_V2_MEMORY_BYTES, PluginRuntimeHost};
-pub(crate) use id_namespace::{
-    BoundIdNamespace, is_reservation_key, local_mutation_identity, require_existing_id_authorities,
-    reservation_tombstone_row, reserve_namespace_row, validate_host_allocated_changes,
-    validate_namespace_reservation,
+pub(crate) use create_context::{
+    BoundCreateContext, is_reservation_key, local_mutation_identity, materialize_keyless_creates,
+    require_existing_id_authorities, reservation_tombstone_row, reserve_create_row,
+    validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
     ArcByteSource, FileBytesSha256, V2SchemaAllowlist, ValidatedConflictTransition,

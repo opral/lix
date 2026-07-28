@@ -100,44 +100,76 @@ fn file_info(descriptor: &exports::lix::plugin::api::FileDescriptor) -> FileInfo
     }
 }
 
-/// The retry-stable mutation namespace supplied by the host.
+/// Retry-stable context for keyless entity creation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct IdNamespace {
+pub struct CreateContext {
     high: u64,
-    low: u64,
+    low: u32,
 }
 
-impl IdNamespace {
-    /// Returns the canonical primary-key component for a newly allocated
-    /// entity ordinal.
+impl CreateContext {
+    /// Returns the canonical UUIDv7 that Lix will assign to `local_ref`.
     ///
-    /// The host supplies a namespace that is stable for one mutation. A
-    /// format must preserve acknowledged IDs and use a deterministic ordinal
-    /// only for genuinely new entities. This helper implements the normative
-    /// `namespace || ordinal` big-endian, unpadded-base64url encoding so a
-    /// normal plugin never has to reproduce that wire rule.
-    pub fn id(self, ordinal: u64) -> String {
-        const BASE64URL: &[u8; 64] =
-            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    /// Create packets do not transport this value. Formats that retain a warm
+    /// parsed document may use it internally so subsequent updates already
+    /// address the accepted entity identity.
+    pub fn id(self, local_ref: u64) -> Result<String> {
+        let local_ref = u32::try_from(local_ref).map_err(|_| {
+            Error::invalid_input("create local references must fit in an unsigned 32-bit integer")
+        })?;
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&self.high.to_be_bytes());
+        bytes[8..12].copy_from_slice(&self.low.to_be_bytes());
+        bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
+        Ok(uuid::Uuid::from_bytes(bytes).to_string())
+    }
 
-        let mut input = [0_u8; 24];
-        input[..8].copy_from_slice(&self.high.to_be_bytes());
-        input[8..16].copy_from_slice(&self.low.to_be_bytes());
-        input[16..].copy_from_slice(&ordinal.to_be_bytes());
-
-        // 24 is divisible by three, so base64url produces exactly 32 bytes
-        // and never needs padding. `BASE64URL` contains ASCII only.
-        let mut output = [0_u8; 32];
-        for (chunk_index, chunk) in input.chunks_exact(3).enumerate() {
-            let output_index = chunk_index * 4;
-            output[output_index] = BASE64URL[usize::from(chunk[0] >> 2)];
-            output[output_index + 1] =
-                BASE64URL[usize::from(((chunk[0] & 0b0000_0011) << 4) | (chunk[1] >> 4))];
-            output[output_index + 2] =
-                BASE64URL[usize::from(((chunk[1] & 0b0000_1111) << 2) | (chunk[2] >> 6))];
-            output[output_index + 3] = BASE64URL[usize::from(chunk[2] & 0b0011_1111)];
+    /// Returns the local reference when `id` belongs to this creation context.
+    pub fn local_ref(self, id: &str) -> Option<u64> {
+        let uuid = uuid::Uuid::parse_str(id).ok()?;
+        let bytes = uuid.as_bytes();
+        if bytes[..8] != self.high.to_be_bytes() || bytes[8..12] != self.low.to_be_bytes() {
+            return None;
         }
-        String::from_utf8(output.to_vec()).expect("the base64url alphabet is valid UTF-8")
+        Some(u64::from(u32::from_be_bytes(bytes[12..].try_into().ok()?)))
+    }
+
+    /// Converts an upsert minted by this context into a keyless create and
+    /// removes the redundant top-level `id` snapshot field.
+    pub fn keyless(self, change: EntityChange) -> Result<EntityChange> {
+        let [id] = change.entity_pk.as_slice() else {
+            return Ok(change);
+        };
+        let Some(local_ref) = self.local_ref(id) else {
+            return Ok(change);
+        };
+        let Some(snapshot) = change.snapshot.as_ref() else {
+            return Ok(change);
+        };
+        if change.effect != ChangeEffect::Content {
+            return Err(Error::invalid_input(
+                "newly created entities cannot be format-only changes",
+            ));
+        }
+        let mut value: serde_json::Value = serde_json::from_slice(snapshot).map_err(|error| {
+            Error::invalid_input(format!("create snapshot is invalid JSON: {error}"))
+        })?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| Error::invalid_input("create snapshot must be a JSON object"))?;
+        let snapshot_id = object
+            .remove("id")
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .ok_or_else(|| Error::invalid_input("create snapshot must contain its generated id"))?;
+        if snapshot_id != *id {
+            return Err(Error::invalid_input(
+                "create snapshot id does not match its generated entity key",
+            ));
+        }
+        let snapshot = serde_json::to_vec(&value).map_err(|error| {
+            Error::internal(format!("failed to encode create snapshot: {error}"))
+        })?;
+        Ok(EntityChange::create(change.schema_key, local_ref, snapshot))
     }
 }
 
@@ -162,6 +194,7 @@ pub enum ChangeEffect {
 pub struct EntityChange {
     pub schema_key: String,
     pub entity_pk: Vec<String>,
+    pub local_ref: Option<u64>,
     pub snapshot: Option<Vec<u8>>,
     pub effect: ChangeEffect,
 }
@@ -175,6 +208,17 @@ impl EntityChange {
         Self {
             schema_key: schema_key.into(),
             entity_pk,
+            local_ref: None,
+            snapshot: Some(snapshot),
+            effect: ChangeEffect::Content,
+        }
+    }
+
+    pub fn create(schema_key: impl Into<String>, local_ref: u64, snapshot: Vec<u8>) -> Self {
+        Self {
+            schema_key: schema_key.into(),
+            entity_pk: Vec::new(),
+            local_ref: Some(local_ref),
             snapshot: Some(snapshot),
             effect: ChangeEffect::Content,
         }
@@ -184,6 +228,7 @@ impl EntityChange {
         Self {
             schema_key: schema_key.into(),
             entity_pk,
+            local_ref: None,
             snapshot: None,
             effect: ChangeEffect::Content,
         }
@@ -611,7 +656,7 @@ pub struct FileInfo {
 pub struct OpenFile<'a> {
     pub file: FileInfo,
     pub source: Source<'a>,
-    pub ids: IdNamespace,
+    pub creates: CreateContext,
 }
 
 /// Input for a cold entity-to-byte transition.
@@ -640,7 +685,7 @@ pub struct FileUpdate<'a> {
     /// large replacement rather than materializing this source by default.
     pub after_source: Source<'a>,
     pub edits: Vec<InputSplice>,
-    pub ids: IdNamespace,
+    pub creates: CreateContext,
 }
 
 impl FileUpdate<'_> {
@@ -868,9 +913,9 @@ impl<P: FormatPlugin> Guest for Component<P> {
         let author_input = OpenFile {
             file: file_info(&input.descriptor),
             source: Source::new(&input.file, budget),
-            ids: IdNamespace {
-                high: input.ids.high,
-                low: input.ids.low,
+            creates: CreateContext {
+                high: input.creates.high,
+                low: input.creates.low,
             },
         };
         P::open_file(author_input)
@@ -942,9 +987,9 @@ impl<P: FormatPlugin> GuestDocument for AuthorDocument<P> {
             before_source: Source::new(&update.before, budget),
             after_source: Source::new(&update.after, budget),
             edits,
-            ids: IdNamespace {
-                high: update.ids.high,
-                low: update.ids.low,
+            creates: CreateContext {
+                high: update.creates.high,
+                low: update.creates.low,
             },
         };
         P::file_changed(&self.0, author_update)
@@ -1491,9 +1536,15 @@ fn next_edit_page(
 }
 
 fn encoded_change_len(change: &EntityChange, attachment_index: Option<u32>) -> Result<usize> {
-    let key_len = encoded_key_len(&change.schema_key, &change.entity_pk)?;
+    let identity_len = if change.local_ref.is_some() {
+        encoded_text_len(&change.schema_key)?
+            .checked_add(8)
+            .ok_or_else(|| Error::LimitExceeded("create identity length overflow".to_owned()))?
+    } else {
+        encoded_key_len(&change.schema_key, &change.entity_pk)?
+    };
     let mut len = 1usize
-        .checked_add(key_len)
+        .checked_add(identity_len)
         .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?;
     if let Some(snapshot) = &change.snapshot {
         let snapshot_len = if attachment_index.is_some() {
@@ -1506,8 +1557,9 @@ fn encoded_change_len(change: &EntityChange, attachment_index: Option<u32>) -> R
                 .and_then(|len| len.checked_add(snapshot.len()))
                 .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?
         };
+        let effect_len = usize::from(change.local_ref.is_none());
         len = len
-            .checked_add(1)
+            .checked_add(effect_len)
             .and_then(|len| len.checked_add(snapshot_len))
             .ok_or_else(|| Error::LimitExceeded("change record length overflow".to_owned()))?;
     }
@@ -1543,13 +1595,29 @@ fn encode_change_into(
     change: &EntityChange,
     attachment_index: Option<u32>,
 ) -> Result<()> {
-    output.push(u8::from(change.snapshot.is_none()));
-    encode_key(output, &change.schema_key, &change.entity_pk)?;
+    if let Some(local_ref) = change.local_ref {
+        if change.snapshot.is_none()
+            || !change.entity_pk.is_empty()
+            || change.effect != ChangeEffect::Content
+        {
+            return Err(Error::invalid_input(
+                "a keyless create requires a snapshot, an empty entity_pk, and content effect",
+            ));
+        }
+        output.push(2);
+        put_text(output, &change.schema_key)?;
+        put_u64(output, local_ref);
+    } else {
+        output.push(u8::from(change.snapshot.is_none()));
+        encode_key(output, &change.schema_key, &change.entity_pk)?;
+    }
     if let Some(snapshot) = &change.snapshot {
-        output.push(match change.effect {
-            ChangeEffect::Content => 0,
-            ChangeEffect::FormatOnly => 1,
-        });
+        if change.local_ref.is_none() {
+            output.push(match change.effect {
+                ChangeEffect::Content => 0,
+                ChangeEffect::FormatOnly => 1,
+            });
+        }
         match attachment_index {
             Some(index) => {
                 output.push(1);
@@ -1658,6 +1726,10 @@ fn put_text(output: &mut Vec<u8>, value: &str) -> Result<()> {
 }
 
 fn put_u32(output: &mut Vec<u8>, value: u32) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -1842,23 +1914,44 @@ fn decode_change_page(
     for record in records {
         let mut decoder = Decoder::new(record);
         let tag = decoder.u8()?;
-        let (schema_key, entity_pk) = decoder.key()?;
-        let (snapshot, effect) = match tag {
+        let (schema_key, entity_pk, local_ref, snapshot, effect) = match tag {
             0 => {
+                let (schema_key, entity_pk) = decoder.key()?;
                 let effect = match decoder.u8()? {
                     0 => ChangeEffect::Content,
                     1 => ChangeEffect::FormatOnly,
                     value => return Err(format!("unknown packet effect tag {value}")),
                 };
-                (Some(decoder.blob(&mut attachment)?), effect)
+                (
+                    schema_key,
+                    entity_pk,
+                    None,
+                    Some(decoder.blob(&mut attachment)?),
+                    effect,
+                )
             }
-            1 => (None, ChangeEffect::Content),
+            1 => {
+                let (schema_key, entity_pk) = decoder.key()?;
+                (schema_key, entity_pk, None, None, ChangeEffect::Content)
+            }
+            2 => {
+                let schema_key = decoder.text()?;
+                let local_ref = decoder.u64()?;
+                (
+                    schema_key,
+                    Vec::new(),
+                    Some(local_ref),
+                    Some(decoder.blob(&mut attachment)?),
+                    ChangeEffect::Content,
+                )
+            }
             value => return Err(format!("unknown packet change tag {value}")),
         };
         decoder.finish()?;
         output.push(EntityChange {
             schema_key,
             entity_pk,
+            local_ref,
             snapshot,
             effect,
         });
@@ -1960,26 +2053,32 @@ mod tests {
     }
 
     #[test]
-    fn generated_ids_are_canonical_unpadded_base64url() {
+    fn create_context_ids_are_canonical_uuid_v7_values() {
         assert_eq!(
-            IdNamespace { high: 0, low: 0 }.id(0),
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            CreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000,
+            }
+            .id(0)
+            .unwrap(),
+            "01920000-0000-7000-8000-000000000000"
         );
         assert_eq!(
-            IdNamespace {
-                high: u64::MAX,
-                low: u64::MAX,
+            CreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000,
             }
-            .id(u64::MAX),
-            "________________________________"
+            .id(42)
+            .unwrap(),
+            "01920000-0000-7000-8000-00000000002a"
         );
-        assert_eq!(
-            IdNamespace {
-                high: 0x0011_2233_4455_6677,
-                low: 0x8899_aabb_ccdd_eeff,
+        assert!(
+            CreateContext {
+                high: 0x0192_0000_0000_7000,
+                low: 0x8000_0000,
             }
-            .id(0x0102_0304_0506_0708),
-            "ABEiM0RVZneImaq7zN3u_wECAwQFBgcI"
+            .id(u64::from(u32::MAX) + 1)
+            .is_err()
         );
     }
 }

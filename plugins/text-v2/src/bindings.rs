@@ -12,9 +12,21 @@ impl lix::FormatPlugin for GitTextPlugin {
 
     fn open_file(input: lix::OpenFile<'_>) -> lix::Result<(Self::Document, lix::Changes)> {
         let bytes = input.source.read_all()?;
-        let (document, changes) = Document::open_file(bytes, |ordinal| input.ids.id(ordinal))
-            .map_err(lix::Error::invalid_input)?;
-        Ok((document, lix::changes(changes.into_iter())))
+        let creates = input.creates;
+        let (document, changes) = Document::open_file(bytes, move |ordinal| {
+            creates
+                .id(ordinal)
+                .expect("materialized text rows fit the create local-ref range")
+        })
+        .map_err(lix::Error::invalid_input)?;
+        Ok((
+            document,
+            lix::try_changes(
+                changes
+                    .into_iter()
+                    .map(move |change| creates.keyless(change)),
+            ),
+        ))
     }
 
     fn open_entities(
@@ -47,10 +59,22 @@ impl lix::FormatPlugin for GitTextPlugin {
                 insert: update.read_insert(edit)?,
             });
         }
+        let creates = update.creates;
         let (document, changes) = document
-            .file_changed(&splices, |ordinal| update.ids.id(ordinal))
+            .file_changed(&splices, move |ordinal| {
+                creates
+                    .id(ordinal)
+                    .expect("materialized text rows fit the create local-ref range")
+            })
             .map_err(lix::Error::invalid_input)?;
-        Ok((document, lix::changes(changes.into_iter())))
+        Ok((
+            document,
+            lix::try_changes(
+                changes
+                    .into_iter()
+                    .map(move |change| creates.keyless(change)),
+            ),
+        ))
     }
 
     fn entities_changed(

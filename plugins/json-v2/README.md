@@ -19,10 +19,9 @@ Object-member identities are the two primary-key components `parent_id` and
 `key`. When an object member contains another object or array, `container_id`
 is deterministically derived from that identity and becomes the `parent_id` of
 its children. An array item already has a stable opaque `id`, so that ID also
-identifies any container held by the item. Only `json_array_item` declares
-`x-lix-id-allocation: "host-allocated"`: newly inserted items use the
-transition's namespace, while acknowledged IDs survive content edits and
-moves.
+identifies any container held by the item. Only `json_array_item` is creatable:
+its `/id` primary key has the `lix_uuid_v7()` default. Newly inserted items are
+sent as keyless creates, while acknowledged IDs survive content edits and moves.
 
 Every node records its `kind`. Scalar values use `scalar_json`, which contains
 the complete raw JSON scalar as text. Numbers therefore preserve their exact

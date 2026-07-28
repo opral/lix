@@ -109,15 +109,16 @@ fn utf16be(source: &str) -> Vec<u8> {
 }
 
 #[test]
-fn namespace_allocated_ids_are_retry_stable_and_exactly_32_characters() {
+fn allocated_uuid_v7_ids_are_retry_stable_and_canonical() {
     let source = b"# Heading\n\nText *emphasis*.\n".to_vec();
-    let namespace = IdNamespace::from_halves(0x0102_0304_0506_0708, 0x1112_1314_1516_1718);
+    let namespace = IdNamespace::from_halves(0x0102_0304_0506_0708, 0x1112_1314);
     let (_, first) = Document::open_file(source.clone(), Some("doc.md"), namespace).unwrap();
     let (_, retry) = Document::open_file(source, Some("doc.md"), namespace).unwrap();
     assert_eq!(first, retry);
     for change in first {
         let id = &change.entity_pk[0];
-        assert_eq!(id.len(), 32);
+        assert_eq!(id.len(), 36);
+        assert!(uuid::Uuid::parse_str(id).is_ok());
     }
 }
 
@@ -486,7 +487,7 @@ fn canonical_literal_prose_fast_path_matches_forced_fallback_bytes_and_entities(
         );
         assert_eq!(parsed.canonical_render.as_deref(), Some(source.as_bytes()));
 
-        let namespace = IdNamespace::from_halves(12, u64::try_from(index).unwrap());
+        let namespace = IdNamespace::from_halves(12, u32::try_from(index).unwrap());
         let (fast_document, fast_changes) =
             Document::open_file(source.as_bytes().to_vec(), Some("prose.md"), namespace)
                 .expect("fast-path document should open");

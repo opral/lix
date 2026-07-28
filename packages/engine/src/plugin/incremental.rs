@@ -901,10 +901,17 @@ impl VecEntityChangeSource {
         changes.validate()?;
         validate_change_order(&changes.changes)?;
         for change in &changes.changes {
-            if let WasmEntityChange::Upsert { entity, .. } = change {
-                validate_host_entity(entity)?;
-            } else if change.key().entity_pk.is_empty() {
-                return Err(invalid_input("v2 entity primary keys must not be empty"));
+            match change {
+                WasmEntityChange::Create { .. } => {
+                    return Err(invalid_input(
+                        "host-to-guest entity changes cannot contain keyless creates",
+                    ));
+                }
+                WasmEntityChange::Upsert { entity, .. } => validate_host_entity(entity)?,
+                WasmEntityChange::Delete(key) if key.entity_pk.is_empty() => {
+                    return Err(invalid_input("v2 entity primary keys must not be empty"));
+                }
+                WasmEntityChange::Delete(_) => {}
             }
         }
         Ok(Self {
@@ -1130,8 +1137,14 @@ fn validate_entity_order(entities: &[WasmHostEntity]) -> Result<(), LixError> {
 }
 
 fn validate_change_order<B>(changes: &[WasmEntityChange<B>]) -> Result<(), LixError> {
+    if changes
+        .iter()
+        .any(|change| matches!(change, WasmEntityChange::Create { .. }))
+    {
+        return Ok(());
+    }
     for pair in changes.windows(2) {
-        if pair[0].key() >= pair[1].key() {
+        if pair[0].entity_key() >= pair[1].entity_key() {
             return Err(invalid_input(
                 "v2 entity changes must be strictly key-sorted and unique",
             ));
@@ -1179,7 +1192,23 @@ fn encoded_entity_record_bytes(entity: &WasmHostEntity) -> Result<u64, LixError>
 fn encoded_entity_change_record_bytes(
     change: &WasmEntityChange<WasmHostBytes>,
 ) -> Result<u64, LixError> {
-    let key_bytes = encoded_entity_key_bytes(change.key())?;
+    if let WasmEntityChange::Create {
+        schema_key,
+        snapshot_content,
+        ..
+    } = change
+    {
+        let snapshot_bytes = encoded_host_bytes_ref_bytes(snapshot_content)?;
+        return encoded_text_bytes(schema_key)?
+            .checked_add(1 + 8)
+            .and_then(|size| size.checked_add(snapshot_bytes))
+            .ok_or_else(|| invalid_input("v2 create record size overflowed"));
+    }
+    let key_bytes = encoded_entity_key_bytes(
+        change
+            .entity_key()
+            .expect("non-create change has an entity key"),
+    )?;
     let mut size = 1_u64
         .checked_add(key_bytes)
         .ok_or_else(|| invalid_input("v2 change record size overflowed"))?;
@@ -1262,6 +1291,9 @@ fn host_bytes_attachment_refs(value: &WasmHostBytes) -> u32 {
 
 fn change_attachment_refs(change: &WasmEntityChange<WasmHostBytes>) -> u32 {
     match change {
+        WasmEntityChange::Create {
+            snapshot_content, ..
+        } => u32::from(matches!(snapshot_content, WasmHostBytes::Source(_))),
         WasmEntityChange::Upsert { entity, .. } => {
             host_bytes_attachment_refs(&entity.snapshot_content)
         }
@@ -1381,6 +1413,26 @@ async fn drain_file_transition_changes_inner(
         async {
             for change in page.changes.changes {
                 let resolved = match change {
+                    WasmEntityChange::Create {
+                        schema_key,
+                        local_ref,
+                        snapshot_content,
+                    } => {
+                        let snapshot = resolve_guest_bytes(
+                            actor,
+                            transition.transition,
+                            outputs,
+                            snapshot_content,
+                            &mut budget,
+                            &mut local_counters,
+                        )
+                        .await?;
+                        WasmEntityChange::Create {
+                            schema_key,
+                            local_ref,
+                            snapshot_content: validated_v2_snapshot(&snapshot)?,
+                        }
+                    }
                     WasmEntityChange::Delete(key) => WasmEntityChange::Delete(key),
                     WasmEntityChange::Upsert { entity, effect } => {
                         let snapshot = resolve_guest_bytes(
@@ -1816,12 +1868,21 @@ fn prevalidate_change_page(
     let mut minimum_attachment_reads = 0u64;
     let mut references = 0u32;
     for change in &page.changes.changes {
-        schemas.validate(&change.key().schema_key)?;
-        if change.key().entity_pk.is_empty() {
+        schemas.validate(change.schema_key())?;
+        if let Some(key) = change.entity_key()
+            && key.entity_pk.is_empty()
+        {
             return Err(invalid_guest("v2 entity primary keys must not be empty"));
         }
-        if let WasmEntityChange::Upsert { entity, .. } = change {
-            match &entity.snapshot_content {
+        let snapshot = match change {
+            WasmEntityChange::Create {
+                snapshot_content, ..
+            } => Some(snapshot_content),
+            WasmEntityChange::Upsert { entity, .. } => Some(&entity.snapshot_content),
+            WasmEntityChange::Delete(_) => None,
+        };
+        if let Some(snapshot) = snapshot {
+            match snapshot {
                 WasmGuestBytes::Inline(bytes) => {
                     inline_bytes = inline_bytes
                         .checked_add(bytes.len() as u64)

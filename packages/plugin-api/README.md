@@ -24,7 +24,7 @@ impl lix::FormatPlugin for MyFormat {
         // Explicit cold-path materialization for a parser that needs all bytes.
         let bytes = input.source.read_all()?;
         let (document, changes) =
-            MyPersistentDocument::parse(bytes, input.file.path.as_deref(), input.ids)?;
+            MyPersistentDocument::parse(bytes, input.file.path.as_deref(), input.creates)?;
         Ok((Arc::new(document), lix::changes(changes)))
     }
 
@@ -43,7 +43,7 @@ impl lix::FormatPlugin for MyFormat {
     {
         // `update.edits` are verified base-relative splices. For a large
         // replacement, `update.read_insert(edit)` reads only that range.
-        let (next, changes) = document.apply_file_splices(&update.edits, update.ids)?;
+        let (next, changes) = document.apply_file_splices(&update.edits, update.creates)?;
         Ok((Arc::new(next), lix::changes(changes)))
     }
 
@@ -90,7 +90,7 @@ the compiled Wasm component; it does not need the host engine crate.
 
 | Method | Author reads | Author returns | Coordinate/base rule |
 |---|---|---|---|
-| `open_file` | `input.file`, `input.source`, `input.ids` | initial complete entity upserts | First import of file bytes. |
+| `open_file` | `input.file`, `input.source`, `input.creates` | initial complete entity creates | First import of file bytes. |
 | `open_entities` | `input.file`, `input.entities`, optionally `input.accepted` | renderer edits | `accepted` is the edit base when present; otherwise the base is empty. |
 | `file_changed` | `update.before`/`after`, verified `update.edits`, optional bounded sources | complete upserts/tombstones | Splices are relative to the prior accepted file. |
 | `entities_changed` | final `update.changes`, `update.before`/`after`, optional `before_source` | sparse `ByteEdit`s | Edits are relative to the accepted materialized file. |
@@ -107,7 +107,7 @@ A small table plugin can keep its format-specific state private and emit a
 complete row snapshot such as:
 
 ```rust
-let row_id = input.ids.id(new_row_ordinal);
+let row_id = input.creates.id(new_row_ordinal)?;
 let snapshot = r#"{
   "id": "…",
   "order": "00000042",
@@ -116,7 +116,11 @@ let snapshot = r#"{
     .replace("…", &row_id)
     .into_bytes();
 
-let change = lix::EntityChange::upsert("tsv_row", vec![row_id], snapshot);
+let change = input.creates.keyless(lix::EntityChange::upsert(
+    "tsv_row",
+    vec![row_id],
+    snapshot,
+))?;
 ```
 
 The `order` fact is deliberate: row position is not an identity, but a row
@@ -146,10 +150,15 @@ JSON, CSV, Markdown, and Excalidraw in this branch are executable examples of
 the same interface. Their parsers, stable identity rules, and semantic models
 remain separate by design.
 
-For a schema with `x-lix-id-allocation: "host-allocated"`, keep durable IDs
-for existing entities and allocate a new one with `input.ids.id(ordinal)`. The
-API package implements the canonical retry-stable encoding; an array position,
-row number, or byte offset is never an identity.
+Creation is inferred from the schema. A creatable schema has `/id` as its
+primary key and gives that property
+`"x-lix-default": "lix_uuid_v7()"`. Keep durable IDs for existing entities.
+For a new entity, choose a transition-local `u32` reference, derive the UUID
+with `input.creates.id(local_ref)`, and pass the complete upsert through
+`input.creates.keyless(...)`. The adapter verifies and removes the derived ID
+from the packet; the host applies the schema default, validates the completed
+snapshot, and returns the same canonical UUIDv7. An array position, row number,
+or byte offset is never a durable identity.
 
 ## Semantic contract
 

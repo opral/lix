@@ -1,16 +1,17 @@
 {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "x-lix-key": "json_array_item",
   "x-lix-primary-key": [
     "/id"
   ],
-  "x-lix-id-allocation": "host-allocated",
-  "description": "One recursively indexed JSON array item. Its opaque host-allocated identity is independent of its numeric JSON Pointer locator and order.",
+  "description": "One recursively indexed JSON array item. Its UUIDv7 identity is independent of its numeric JSON Pointer locator and order.",
   "type": "object",
   "properties": {
     "id": {
       "type": "string",
-      "minLength": 1,
-      "description": "Opaque stable identity allocated from the mutation-scoped transition ID namespace."
+      "format": "uuid",
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable UUIDv7 identity assigned by Lix on create."
     },
     "parent_id": {
       "type": "string",

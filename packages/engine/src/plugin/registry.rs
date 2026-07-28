@@ -32,7 +32,7 @@ pub(crate) const PLUGIN_OWNER_KEY: &str = "lix_plugin_owner_v2";
 pub(crate) const MAX_PLUGIN_REGISTRY_ENTRIES: usize = 128;
 
 const KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
-const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 3;
+const PLUGIN_REGISTRY_FORMAT_VERSION: u32 = 4;
 const PLUGIN_FILE_OWNER_FORMAT_VERSION: u32 = 2;
 const MAX_CACHED_PLUGIN_CATALOGS: usize = 16;
 const DEFAULT_CACHED_PLUGIN_CATALOGS: usize = 8;
@@ -47,7 +47,7 @@ pub(crate) struct PluginRegistryEntryInput {
     pub(crate) content_type: Option<PluginContentType>,
     pub(crate) entry: String,
     pub(crate) schema_keys: Vec<String>,
-    pub(crate) host_allocated_schema_keys: Vec<String>,
+    pub(crate) create_schema_keys: Vec<String>,
     pub(crate) manifest_json: String,
     pub(crate) archive_file_id: String,
     pub(crate) archive_path: String,
@@ -72,7 +72,7 @@ pub(crate) struct PluginRegistryEntry {
     materialization: PluginMaterialization,
     entry: String,
     schema_keys: Vec<String>,
-    host_allocated_schema_keys: Vec<String>,
+    create_schema_keys: Vec<String>,
     manifest_json: String,
     archive_file_id: String,
     archive_path: String,
@@ -103,7 +103,7 @@ impl PluginRegistryEntry {
             materialization: parsed_manifest.manifest.materialization,
             entry: input.entry,
             schema_keys: input.schema_keys,
-            host_allocated_schema_keys: input.host_allocated_schema_keys,
+            create_schema_keys: input.create_schema_keys,
             manifest_json,
             archive_file_id: input.archive_file_id,
             archive_path: input.archive_path,
@@ -111,7 +111,7 @@ impl PluginRegistryEntry {
             wasm_blob_hash: input.wasm_blob_hash,
         };
         entry.schema_keys.sort();
-        entry.host_allocated_schema_keys.sort();
+        entry.create_schema_keys.sort();
         // Install-time validation pays the complete JSON-Schema and glob
         // checks once. Durable reads below use the already-validated compact
         // fields and generation integrity, so warm transactions do not
@@ -136,8 +136,8 @@ impl PluginRegistryEntry {
         &self.schema_keys
     }
 
-    pub(crate) fn host_allocated_schema_keys(&self) -> &[String] {
-        &self.host_allocated_schema_keys
+    pub(crate) fn create_schema_keys(&self) -> &[String] {
+        &self.create_schema_keys
     }
 
     pub(crate) fn archive_blob_hash(&self) -> &str {
@@ -164,12 +164,12 @@ impl PluginRegistryEntry {
             || self.content_type != replacement.content_type
             || self.materialization != replacement.materialization
             || self.schema_keys != replacement.schema_keys
-            || self.host_allocated_schema_keys != replacement.host_allocated_schema_keys;
+            || self.create_schema_keys != replacement.create_schema_keys;
         if incompatible {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 format!(
-                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, materialization, content type, schema keys, and ID-allocation contract",
+                    "owned plugin '{}' may only upgrade between wasm-component-v2 generations with the same API version, matcher, materialization, content type, schema keys, and create-default contract",
                     self.key
                 ),
             )
@@ -841,16 +841,16 @@ fn validate_entry(entry: &PluginRegistryEntry) -> Result<(), LixError> {
         )));
     }
     if entry
-        .host_allocated_schema_keys
+        .create_schema_keys
         .windows(2)
         .any(|keys| keys[0] >= keys[1])
         || entry
-            .host_allocated_schema_keys
+            .create_schema_keys
             .iter()
             .any(|key| entry.schema_keys.binary_search(key).is_err())
     {
         return Err(invalid_registry(format!(
-            "plugin '{}' host_allocated_schema_keys must be unique, sorted, and owned by the plugin",
+            "plugin '{}' create_schema_keys must be unique, sorted, and owned by the plugin",
             entry.key
         )));
     }
@@ -1161,7 +1161,7 @@ mod tests {
             content_type,
             entry: "plugin.wasm".to_string(),
             schema_keys: vec![format!("{key}_schema")],
-            host_allocated_schema_keys: Vec::new(),
+            create_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(key, path_glob, content_type),
             archive_file_id: plugin_storage_archive_file_id(key),
             archive_path: plugin_storage_archive_path(key),
@@ -1182,7 +1182,7 @@ mod tests {
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
-            host_allocated_schema_keys: vec!["csv_row".to_string()],
+            create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: format!(
                 r#"{{"api_version":"2.1.0","entry":"plugin.wasm","key":"{key}","match":{{"content_type":"text","path_glob":"{path_glob}"}},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}}"#
             ),
@@ -1236,7 +1236,7 @@ mod tests {
         value.schema_keys = vec!["csv_table".to_string()];
         incompatible.push(value);
         let mut value = replacement;
-        value.host_allocated_schema_keys.clear();
+        value.create_schema_keys.clear();
         incompatible.push(value);
 
         for replacement in incompatible {
@@ -1403,7 +1403,7 @@ mod tests {
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["plugin_a_schema".to_string()],
-            host_allocated_schema_keys: Vec::new(),
+            create_schema_keys: Vec::new(),
             manifest_json: manifest_with_content_type(
                 "plugin_a",
                 "*.json",

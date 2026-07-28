@@ -24,7 +24,7 @@ pub(crate) struct ParsedPluginArchive {
     pub normalized_manifest_json: String,
     pub schemas: Vec<JsonValue>,
     pub schema_keys: Vec<String>,
-    pub host_allocated_schema_keys: Vec<String>,
+    pub create_schema_keys: Vec<String>,
     pub wasm_bytes: Vec<u8>,
     pub wasm_hash: BlobHash,
 }
@@ -61,7 +61,7 @@ struct LoadedPluginArchive {
     normalized_manifest_json: String,
     schemas: Vec<JsonValue>,
     schema_keys: Vec<String>,
-    host_allocated_schema_keys: Vec<String>,
+    create_schema_keys: Vec<String>,
     wasm: Option<Vec<u8>>,
 }
 
@@ -123,7 +123,7 @@ pub(crate) fn parse_plugin_archive_for_install(
         normalized_manifest_json: loaded.normalized_manifest_json,
         schemas: loaded.schemas,
         schema_keys: loaded.schema_keys,
-        host_allocated_schema_keys: loaded.host_allocated_schema_keys,
+        create_schema_keys: loaded.create_schema_keys,
         wasm_bytes,
         wasm_hash,
     })
@@ -219,7 +219,7 @@ fn load_plugin_archive(
 
     let mut schemas = Vec::with_capacity(validated_manifest.manifest.schemas.len());
     let mut schema_keys = Vec::with_capacity(validated_manifest.manifest.schemas.len());
-    let mut host_allocated_schema_keys = Vec::new();
+    let mut create_schema_keys = Vec::new();
     let mut seen_schema_keys = BTreeSet::<String>::new();
     for schema_path in &validated_manifest.manifest.schemas {
         let schema_entry_path = parse_plugin_archive_path_with_limit(
@@ -242,12 +242,8 @@ fn load_plugin_archive(
                 "Plugin archive declares duplicate schema '{schema_key}'"
             )));
         }
-        if schema_json
-            .get("x-lix-id-allocation")
-            .and_then(JsonValue::as_str)
-            == Some("host-allocated")
-        {
-            host_allocated_schema_keys.push(schema_key.clone());
+        if schema_has_uuid_v7_primary_key_default(&schema_json) {
+            create_schema_keys.push(schema_key.clone());
         }
         schema_keys.push(schema_key);
         schemas.push(schema_json);
@@ -258,9 +254,34 @@ fn load_plugin_archive(
         normalized_manifest_json: validated_manifest.normalized_json,
         schemas,
         schema_keys,
-        host_allocated_schema_keys,
+        create_schema_keys,
         wasm,
     })
+}
+
+fn schema_has_uuid_v7_primary_key_default(schema: &JsonValue) -> bool {
+    let Some(primary_key) = schema
+        .get("x-lix-primary-key")
+        .and_then(JsonValue::as_array)
+    else {
+        return false;
+    };
+    if primary_key.len() != 1 || primary_key[0].as_str() != Some("/id") {
+        return false;
+    }
+    schema
+        .get("properties")
+        .and_then(JsonValue::as_object)
+        .and_then(|properties| properties.get("id"))
+        .and_then(JsonValue::as_object)
+        .is_some_and(|id| {
+            id.get("type").and_then(JsonValue::as_str) == Some("string")
+                && id.get("format").and_then(JsonValue::as_str) == Some("uuid")
+                && id
+                    .get("x-lix-default")
+                    .and_then(JsonValue::as_str)
+                    .is_some_and(|expression| expression.trim() == "lix_uuid_v7()")
+        })
 }
 
 /// Production v2 snapshots currently use a durable JSON representation that

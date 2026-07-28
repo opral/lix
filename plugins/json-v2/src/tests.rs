@@ -1018,12 +1018,8 @@ fn retry_namespace_reuses_id_and_distinct_namespace_does_not() {
     assert_eq!(distinct.bytes(), first.bytes());
     assert_eq!(retry_id, first_id);
     assert_ne!(distinct_id, first_id);
-    assert_eq!(first_id.len(), 32);
-    assert!(
-        first_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    );
+    assert_eq!(first_id.len(), 36);
+    assert!(uuid::Uuid::parse_str(&first_id).is_ok());
 }
 
 fn flat_object_fixture(target_bytes: usize) -> (Vec<u8>, usize) {

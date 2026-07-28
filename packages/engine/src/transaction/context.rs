@@ -51,7 +51,7 @@ use crate::live_state::{
     overlay_scan_rows,
 };
 use crate::plugin::{
-    ArcByteSource, BoundIdNamespace, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
     PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
     PluginActorKey, PluginActorLease, PluginActorStore, PluginArchiveInstallPlan,
     PluginContentType, PluginDetectedChange, PluginFileOwner, PluginMaterialization,
@@ -62,11 +62,11 @@ use crate::plugin::{
     drain_entity_transition_edits, drain_file_transition_changes,
     host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
     inferred_media_type_for_path, is_plugin_storage_path, is_reservation_key,
-    local_mutation_identity, plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
-    plugin_key_from_archive_delete_origin, plugin_state_live_state_projection,
-    require_existing_id_authorities, reservation_tombstone_row, reserve_namespace_row,
-    transport_splice_preserves_git_text, transport_splice_preserves_utf8,
-    validate_host_allocated_changes, validate_namespace_reservation,
+    local_mutation_identity, materialize_keyless_creates, plugin_archive_file_id_matches,
+    plugin_install_plan_from_archive_path, plugin_key_from_archive_delete_origin,
+    plugin_state_live_state_projection, require_existing_id_authorities, reservation_tombstone_row,
+    reserve_create_row, transport_splice_preserves_git_text, transport_splice_preserves_utf8,
+    validate_create_changes, validate_create_reservation,
 };
 use crate::session::{
     EXECUTE_IDEMPOTENCY_RECEIPT_SPACE, ExecuteIdempotency, ExecuteIdempotencyReceipt, SessionMode,
@@ -107,9 +107,9 @@ use crate::transaction::validation::{
 };
 use crate::wasm::{
     WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictUpdate,
-    WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityUpdate, WasmFileDescriptor,
-    WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput,
-    WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
+    WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate,
+    WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges,
+    WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -1390,6 +1390,7 @@ where
     /// complete file graph.
     async fn suppress_v2_format_only_noops(
         &mut self,
+        plugin: &PluginRegistryEntry,
         changes: WasmHostEntityChanges,
         file_key: &PluginFileWriteKey,
     ) -> Result<WasmHostEntityChanges, LixError> {
@@ -1401,7 +1402,9 @@ where
                     entity,
                     effect: WasmChangeEffect::FormatOnly,
                 } => Some(entity.key.clone()),
-                WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => None,
+                WasmEntityChange::Create { .. }
+                | WasmEntityChange::Upsert { .. }
+                | WasmEntityChange::Delete(_) => None,
             })
             .collect::<Vec<_>>();
         if format_only_keys.is_empty() {
@@ -1414,12 +1417,7 @@ where
                 Ok(LiveStateExactRowRequest {
                     schema_key: key.schema_key.clone(),
                     branch_id: file_key.branch_id.clone(),
-                    entity_pk: EntityPk::from_parts(key.entity_pk.clone()).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!("v2 plugin emitted invalid entity_pk: {error}"),
-                        )
-                    })?,
+                    entity_pk: plugin_entity_pk(plugin, key)?,
                     file_id: Some(file_key.file_id.clone()),
                 })
             })
@@ -1439,20 +1437,19 @@ where
         suppress_v2_format_only_noops_against_rows(changes, &accepted)
     }
 
-    /// Validates host-allocated entity identities and returns the one durable
-    /// namespace reservation row (if this transition is the first use of the
-    /// namespace). Exact authority reads are proportional to sparse changed
-    /// keys; a cold import whose IDs all use the supplied namespace performs
-    /// only the single reservation lookup, independent of row count.
-    async fn v2_id_namespace_rows(
+    /// Materializes keyless creates and returns the one durable mutation
+    /// reservation row when this transition creates at least one entity.
+    /// Existing keyed updates are checked with exact sparse authority reads.
+    async fn v2_create_rows(
         &mut self,
         plugin: &PluginRegistryEntry,
-        changes: &WasmHostEntityChanges,
-        bound: BoundIdNamespace,
+        changes: &mut WasmHostEntityChanges,
+        bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
         existing_reservation: Option<&MaterializedLiveStateRow>,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
-        let validation = validate_host_allocated_changes(plugin, changes, bound)?;
+        let validation = validate_create_changes(plugin, changes)?;
+        materialize_keyless_creates(changes, bound.creates())?;
         if !validation.requires_reservation && validation.existing_authorities.is_empty() {
             return Ok(Vec::new());
         }
@@ -1461,13 +1458,22 @@ where
             .existing_authorities
             .iter()
             .map(|key| {
+                let [id] = key.entity_pk.as_slice() else {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "creatable schema '{}' requires one UUID primary-key component",
+                            key.schema_key
+                        ),
+                    ));
+                };
                 Ok(LiveStateExactRowRequest {
                     schema_key: key.schema_key.clone(),
                     branch_id: file_key.branch_id.clone(),
-                    entity_pk: EntityPk::from_parts(key.entity_pk.clone()).map_err(|error| {
+                    entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
                         LixError::new(
                             LixError::CODE_INVALID_PLUGIN,
-                            format!("v2 plugin emitted invalid host-allocated entity_pk: {error}"),
+                            format!("v2 plugin emitted invalid entity_pk: {error}"),
                         )
                     })?,
                     file_id: Some(file_key.file_id.clone()),
@@ -1496,7 +1502,7 @@ where
 
         let mut rows = Vec::new();
         if validation.requires_reservation {
-            if let Some(row) = reserve_namespace_row(
+            if let Some(row) = reserve_create_row(
                 existing_reservation,
                 bound,
                 &file_key.file_id,
@@ -1508,9 +1514,9 @@ where
         Ok(rows)
     }
 
-    async fn preflight_v2_id_namespace(
+    async fn preflight_v2_create(
         &mut self,
-        bound: BoundIdNamespace,
+        bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         let reservation_key = bound.reservation_key();
@@ -1528,7 +1534,7 @@ where
             })
             .await?;
         let existing = loaded.pop().flatten();
-        validate_namespace_reservation(
+        validate_create_reservation(
             existing.as_ref(),
             bound,
             &file_key.file_id,
@@ -1949,7 +1955,7 @@ where
                 content_type: parsed.manifest.file_match.content_type,
                 entry: parsed.manifest.entry.clone(),
                 schema_keys: parsed.schema_keys.clone(),
-                host_allocated_schema_keys: parsed.host_allocated_schema_keys.clone(),
+                create_schema_keys: parsed.create_schema_keys.clone(),
                 manifest_json: parsed.normalized_manifest_json.clone(),
                 archive_file_id,
                 archive_path: path.to_string(),
@@ -3003,10 +3009,10 @@ where
             let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                 local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
             });
-            let bound_ids = BoundIdNamespace::bind(mutation_identity, &actor_key);
-            let ids = bound_ids.ids();
-            let existing_id_namespace_reservation =
-                match self.preflight_v2_id_namespace(bound_ids, &file_key).await {
+            let create_context = BoundCreateContext::bind(mutation_identity, &actor_key);
+            let creates = create_context.creates();
+            let existing_create_reservation =
+                match self.preflight_v2_create(create_context, &file_key).await {
                     Ok(existing) => existing,
                     Err(error) => {
                         discard_plugin_actor_publications(std::mem::take(
@@ -3020,7 +3026,7 @@ where
             let submitted_bytes = write.payload().shared_bytes();
             let mut verified_same_length_blob_splice = None;
 
-            let (changes, publication, materialized_bytes) = if same_plugin_owner {
+            let (mut changes, publication, materialized_bytes) = if same_plugin_owner {
                 let acknowledged_view = self.acknowledged_session_plugin_view(
                     &view.session_key,
                     selected,
@@ -3130,7 +3136,7 @@ where
                             before: Arc::new(observed_source),
                             edits: built_splices.edits,
                             after: Arc::new(submitted_source),
-                            ids,
+                            creates,
                         },
                     )
                     .instrument(tracing::debug_span!(
@@ -3164,7 +3170,7 @@ where
                 let detection_document = detected_transition.document;
                 let mut counters = detected_transition.counters;
                 let changes = match self
-                    .suppress_v2_format_only_noops(detected_transition.changes, &file_key)
+                    .suppress_v2_format_only_noops(selected, detected_transition.changes, &file_key)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
                         "lix.perf.plugin_suppress_noops"
@@ -3307,7 +3313,7 @@ where
                         WasmOpenFileInput {
                             descriptor,
                             file: Arc::new(source),
-                            ids,
+                            creates,
                         },
                     )
                     .instrument(tracing::debug_span!(
@@ -3350,20 +3356,20 @@ where
                     submitted_bytes.clone(),
                 )
             };
-            let namespace_rows = self
-                .v2_id_namespace_rows(
+            let create_rows = self
+                .v2_create_rows(
                     selected,
-                    &changes,
-                    bound_ids,
+                    &mut changes,
+                    create_context,
                     &file_key,
-                    existing_id_namespace_reservation.as_ref(),
+                    existing_create_reservation.as_ref(),
                 )
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
-                    "lix.perf.plugin_id_namespace_rows"
+                    "lix.perf.plugin_create_rows"
                 ))
                 .await;
-            let namespace_rows = match namespace_rows {
+            let create_rows = match create_rows {
                 Ok(rows) => rows,
                 Err(error) => {
                     publication.discard().await;
@@ -3379,7 +3385,7 @@ where
                 "lix.perf.plugin_change_rows"
             )
             .in_scope(|| {
-                plugin_detected_changes_from_v2(&changes).and_then(|detected| {
+                plugin_detected_changes_from_v2(selected, &changes).and_then(|detected| {
                     plugin_change_rows(
                         selected,
                         detected,
@@ -3400,7 +3406,7 @@ where
                     return Err(error);
                 }
             };
-            reconciliation.rows.extend(namespace_rows);
+            reconciliation.rows.extend(create_rows);
             reconciliation.rows.extend(change_rows);
             match selected.materialization() {
                 PluginMaterialization::Blob => {
@@ -4886,13 +4892,13 @@ fn v2_actor_key_is_descriptor_successor(
 }
 
 #[cfg(test)]
-fn v2_id_namespace(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmIdNamespace {
-    BoundIdNamespace::bind(local_mutation_identity(seed), actor_key).ids()
+fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmCreateContext {
+    BoundCreateContext::bind(local_mutation_identity(seed), actor_key).creates()
 }
 
 fn suppress_v2_format_only_noops_against_rows(
     changes: WasmHostEntityChanges,
-    accepted: &BTreeMap<crate::wasm::WasmEntityKey, Option<MaterializedLiveStateRow>>,
+    accepted: &BTreeMap<WasmEntityKey, Option<MaterializedLiveStateRow>>,
 ) -> Result<WasmHostEntityChanges, LixError> {
     let mut effective = Vec::with_capacity(changes.changes.len());
     for change in changes.changes {
@@ -4926,7 +4932,9 @@ fn suppress_v2_format_only_noops_against_rows(
                 })?;
                 candidate == &base
             }
-            WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => false,
+            WasmEntityChange::Create { .. }
+            | WasmEntityChange::Upsert { .. }
+            | WasmEntityChange::Delete(_) => false,
         };
         if !is_noop {
             effective.push(change);
@@ -4936,11 +4944,18 @@ fn suppress_v2_format_only_noops_against_rows(
 }
 
 fn plugin_detected_changes_from_v2(
+    plugin: &PluginRegistryEntry,
     changes: &WasmHostEntityChanges,
 ) -> Result<Vec<PluginDetectedChange>, LixError> {
     let mut detected = Vec::with_capacity(changes.entity_change_count());
     for change in &changes.changes {
         let (key, snapshot_content, effect) = match change {
+            WasmEntityChange::Create { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "keyless create was not materialized before transaction staging",
+                ));
+            }
             WasmEntityChange::Delete(key) => (key, None, WasmChangeEffect::Content),
             WasmEntityChange::Upsert { entity, effect } => {
                 let snapshot = match &entity.snapshot_content {
@@ -4958,12 +4973,7 @@ fn plugin_detected_changes_from_v2(
             }
         };
         detected.push(PluginDetectedChange {
-            entity_pk: EntityPk::from_parts(key.entity_pk.clone()).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_INVALID_PLUGIN,
-                    format!("v2 plugin emitted invalid entity_pk: {error}"),
-                )
-            })?,
+            entity_pk: plugin_entity_pk(plugin, key)?,
             schema_key: key.schema_key.clone(),
             snapshot_content,
             metadata: (effect == WasmChangeEffect::FormatOnly)
@@ -4971,6 +4981,36 @@ fn plugin_detected_changes_from_v2(
         });
     }
     Ok(detected)
+}
+
+fn plugin_entity_pk(
+    plugin: &PluginRegistryEntry,
+    key: &WasmEntityKey,
+) -> Result<EntityPk, LixError> {
+    let result = if plugin
+        .create_schema_keys()
+        .binary_search(&key.schema_key)
+        .is_ok()
+    {
+        let [id] = key.entity_pk.as_slice() else {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "creatable schema '{}' requires one UUID primary-key component",
+                    key.schema_key
+                ),
+            ));
+        };
+        EntityPk::uuid_from_canonical(id)
+    } else {
+        EntityPk::from_parts(key.entity_pk.clone())
+    };
+    result.map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("v2 plugin emitted invalid entity_pk: {error}"),
+        )
+    })
 }
 
 fn v2_host_entities_from_live_rows(
@@ -4982,7 +5022,7 @@ fn v2_host_entities_from_live_rows(
         .filter_map(|row| {
             row.snapshot_content.map(|snapshot_content| {
                 host_entity_with_lazy_snapshot(
-                    crate::wasm::WasmEntityKey {
+                    WasmEntityKey {
                         schema_key: row.schema_key,
                         entity_pk: row.entity_pk.into_parts(),
                     },
@@ -5017,7 +5057,7 @@ fn v2_host_changes_from_prepared_rows(
                     "v2 semantic rendering requires tracked, branch-local, file-scoped rows",
                 ));
             }
-            let key = crate::wasm::WasmEntityKey {
+            let key = WasmEntityKey {
                 schema_key: row.schema_key,
                 entity_pk: row.entity_pk.into_parts(),
             };
@@ -5045,9 +5085,9 @@ fn v2_host_changes_from_prepared_rows(
             }
         })
         .collect::<Result<Vec<_>, LixError>>()?;
-    changes.sort_by(|left, right| left.key().cmp(right.key()));
+    changes.sort_by(|left, right| left.entity_key().cmp(&right.entity_key()));
     for pair in changes.windows(2) {
-        if pair[0].key() == pair[1].key() {
+        if pair[0].entity_key() == pair[1].entity_key() {
             return Err(LixError::new(
                 LixError::CODE_CONSTRAINT_VIOLATION,
                 "one v2 semantic write batch cannot contain the same entity key more than once",
@@ -6953,7 +6993,7 @@ mod tests {
 
     #[test]
     fn format_only_equal_snapshots_are_semantic_noops() {
-        let key = |id: &str| crate::wasm::WasmEntityKey {
+        let key = |id: &str| WasmEntityKey {
             schema_key: "plugin_note".to_string(),
             entity_pk: vec![id.to_string()],
         };
@@ -7026,9 +7066,9 @@ mod tests {
         let effective = suppress_v2_format_only_noops_against_rows(changes, &accepted)
             .expect("number-free normalized snapshots should compare");
         assert_eq!(effective.changes.len(), 3);
-        assert_eq!(effective.changes[0].key(), &key("changed"));
-        assert_eq!(effective.changes[1].key(), &key("content"));
-        assert_eq!(effective.changes[2].key(), &key("deleted"));
+        assert_eq!(effective.changes[0].entity_key(), Some(&key("changed")));
+        assert_eq!(effective.changes[1].entity_key(), Some(&key("content")));
+        assert_eq!(effective.changes[2].entity_key(), Some(&key("deleted")));
     }
 
     #[test]
@@ -7327,7 +7367,7 @@ mod tests {
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
-            host_allocated_schema_keys: vec!["csv_row".to_string()],
+            create_schema_keys: vec!["csv_row".to_string()],
             manifest_json: r#"{"api_version":"2.1.0","entry":"plugin.wasm","key":"plugin_csv_v2","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component-v2","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv_v2"),
             archive_path: "/.lix/plugins/plugin_csv_v2.lixplugin".to_string(),
@@ -8190,7 +8230,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_id_namespaces_are_retry_stable_and_file_incarnation_scoped() {
+    fn v2_create_contexts_are_retry_stable_and_file_incarnation_scoped() {
         let seed = [7; 16];
         let key = PluginActorKey {
             branch_id: "main".to_string(),
@@ -8200,20 +8240,20 @@ mod tests {
             plugin_key: "plugin_csv_v2".to_string(),
             plugin_generation: "generation-a".to_string(),
         };
-        assert_eq!(v2_id_namespace(seed, &key), v2_id_namespace(seed, &key));
+        assert_eq!(v2_create_context(seed, &key), v2_create_context(seed, &key));
 
         let mut other_file = key.clone();
         other_file.file_id = "01920000-0000-7000-8000-0000000000b2".to_string();
         assert_ne!(
-            v2_id_namespace(seed, &key),
-            v2_id_namespace(seed, &other_file)
+            v2_create_context(seed, &key),
+            v2_create_context(seed, &other_file)
         );
 
         let mut other_incarnation = key.clone();
         other_incarnation.owner_change_id = "incarnation-b".to_string();
         assert_ne!(
-            v2_id_namespace(seed, &key),
-            v2_id_namespace(seed, &other_incarnation)
+            v2_create_context(seed, &key),
+            v2_create_context(seed, &other_incarnation)
         );
     }
 
