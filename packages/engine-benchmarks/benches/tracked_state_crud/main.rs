@@ -391,6 +391,10 @@ fn profile_hot_sql_session_operations(
     profile: StorageProfile,
 ) {
     operation.assert_supports_hot_repeats();
+    assert!(
+        !matches!(operation, TransactionBenchOp::DeleteOneByPk),
+        "delete_one hot repeats are only available for the transaction layer"
+    );
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
     let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
@@ -459,6 +463,10 @@ fn profile_hot_raw_sqlite_operations(
     output: RawSqliteProfileOutput,
 ) {
     operation.assert_supports_hot_repeats();
+    assert!(
+        !matches!(operation, TransactionBenchOp::DeleteOneByPk),
+        "delete_one hot repeats are only available for the transaction layer"
+    );
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
     let mut fixture = raw_sqlite::seeded_fixture_with_read_many_pk_count(rows, read_many_pk_count);
