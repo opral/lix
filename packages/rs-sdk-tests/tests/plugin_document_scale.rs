@@ -60,6 +60,51 @@ async fn atomic_plugin_import_scaling_is_format_independent() {
     .await;
 }
 
+#[tokio::test]
+async fn sequential_batches_survive_observation_cache_eviction() {
+    const DOCUMENTS: usize = 17;
+
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("document-scale workspace should open");
+    install_plugin(
+        &lix,
+        "plugin_git_text_v2",
+        &build_git_text_v2_plugin_archive(),
+    )
+    .await;
+
+    lix.execute_batch(&[file_insert_statement(
+        "txt",
+        (0..DOCUMENTS).map(|index| format!("before {index}\n").into_bytes()),
+    )])
+    .await
+    .expect("the first batch should exceed the Store working set");
+
+    let updates = (0..DOCUMENTS)
+        .map(|index| ExecuteBatchStatement {
+            sql: "UPDATE lix_file SET data = $1 WHERE path = $2".to_string(),
+            params: vec![
+                Value::Blob(format!("after {index}\n").into_bytes().into()),
+                Value::Text(format!("/scale-document-{index:04}.txt")),
+            ],
+        })
+        .collect::<Vec<_>>();
+    lix.execute_batch(&updates)
+        .await
+        .expect("retained observations must survive cache eviction between batches");
+
+    for index in 0..DOCUMENTS {
+        assert_eq!(
+            read_file(&lix, &format!("/scale-document-{index:04}.txt")).await,
+            format!("after {index}\n").into_bytes()
+        );
+    }
+    lix.close()
+        .await
+        .expect("document-scale workspace should close");
+}
+
 async fn assert_format_scales(
     plugin_key: &str,
     archive: Vec<u8>,

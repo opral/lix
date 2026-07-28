@@ -33,7 +33,9 @@ The fixture installs the production Markdown component before timing, then
 executes one public `execute_batch` statement containing 1,184 fresh Markdown
 documents. It verifies the committed file count, semantic rows, and exact bytes
 from the first and last files. CSV, Git-text, and Excalidraw run the same
-capacity-plus-one conformance check.
+capacity-plus-one conformance check. A sequential Git-text fixture imports 17
+files, then updates them in deterministic path order to prove retained session
+observations survive cache eviction between atomic batches.
 
 ## Results
 

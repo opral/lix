@@ -1424,6 +1424,55 @@ where
             .await
     }
 
+    /// Leases an acknowledged actor, cold-opening only when cache eviction is
+    /// the sole reason the observation no longer resolves.
+    ///
+    /// The durable semantic root must still exactly match the root delivered
+    /// with the observation. A concurrent committed transition therefore
+    /// remains stale and cannot be mistaken for benign working-set eviction.
+    async fn lease_or_reopen_observed_v2_actor(
+        &mut self,
+        observation: &PluginObservation,
+        actor_key: &PluginActorKey,
+        plugin: &PluginRegistryEntry,
+        descriptor: WasmFileDescriptor,
+        factory: Arc<dyn WasmComponentV2Factory>,
+        current_publications: &mut Vec<PendingPluginActorPublication>,
+    ) -> Result<PluginActorLease, LixError> {
+        let cache = self.plugin_host.actor_cache();
+        match cache.lease_for_transition(observation).await {
+            Ok(lease) => return Ok(lease),
+            Err(error) if error.code == LixError::CODE_PLUGIN_OBSERVATION_STALE => {
+                let file_key = PluginFileWriteKey {
+                    branch_id: actor_key.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: actor_key.file_id.clone(),
+                };
+                let Some(visible_materialization) =
+                    self.visible_v2_materialization(&file_key).await?
+                else {
+                    return Err(error);
+                };
+                if visible_materialization.semantic_root != observation.semantic_root() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+
+        let reopened = self
+            .cold_open_v2_semantic_actor(
+                actor_key,
+                plugin,
+                descriptor,
+                factory,
+                current_publications,
+            )
+            .await?;
+        cache.lease_for_transition(&reopened).await
+    }
+
     async fn load_visible_exact_live_state_batch(
         &mut self,
         request: &LiveStateExactBatchRequest,
@@ -3210,13 +3259,20 @@ where
                 }
                 let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
                 let after_descriptor = descriptor.clone();
-                let cache = self.plugin_host.actor_cache();
-                // Acquire serialization first, then read the root again.
-                // A second local session may have committed while this
-                // request waited for the actor; reading before the lease
-                // would mistake that valid serialization for an external
-                // stale-cache race.
-                let mut lease = cache.lease_for_transition(&observation).await?;
+                // Acquire serialization first, reopening a benignly evicted
+                // observation only while its exact durable root is unchanged.
+                // Then read the root again: a second local session may have
+                // committed while this request waited for the actor.
+                let mut lease = self
+                    .lease_or_reopen_observed_v2_actor(
+                        &observation,
+                        &actor_key,
+                        selected,
+                        descriptor.clone(),
+                        Arc::clone(&factory),
+                        &mut reconciliation.actor_publications,
+                    )
+                    .await?;
                 let visible_materialization = self
                     .visible_v2_materialization(&file_key)
                     .await?
