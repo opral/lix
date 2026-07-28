@@ -65,6 +65,34 @@ fn profile_row_count(max_rows: usize) -> usize {
     row_count
 }
 
+fn profile_bound_update_row_count(max_rows: usize) -> usize {
+    let Some(value) = std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_BOUND_UPDATE_ROW_COUNT")
+    else {
+        return max_rows;
+    };
+    let value = value.to_string_lossy();
+    let row_count = value.parse::<usize>().unwrap_or_else(|_| {
+        panic!(
+            "LIX_TRACKED_STATE_CRUD_PROFILE_BOUND_UPDATE_ROW_COUNT must be an integer between 1 and {max_rows}, got '{value}'"
+        )
+    });
+    assert!(
+        (1..=max_rows).contains(&row_count),
+        "LIX_TRACKED_STATE_CRUD_PROFILE_BOUND_UPDATE_ROW_COUNT must be between 1 and {max_rows}, got {row_count}"
+    );
+    row_count
+}
+
+fn profile_bound_update_spread() -> bool {
+    match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_BOUND_UPDATE_DISTRIBUTION").as_deref() {
+        Ok("spread") => true,
+        Ok("prefix") | Err(_) => false,
+        Ok(other) => panic!(
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_BOUND_UPDATE_DISTRIBUTION '{other}'; expected prefix or spread"
+        ),
+    }
+}
+
 /// Reproducible, setup-excluded latency samples for one production transaction
 /// operation. Criterion's CodSpeed-compatible harness intentionally delegates
 /// timing to the runner, while this opt-in mode is useful for local profiling
@@ -390,6 +418,8 @@ fn profile_hot_sql_session_bound_updates(
 ) {
     let repeats_u32 =
         u32::try_from(repeats).expect("LIX_TRACKED_STATE_CRUD_PROFILE_HOT_REPEATS must fit in u32");
+    let bound_update_row_count = profile_bound_update_row_count(rows.len());
+    let spread = profile_bound_update_spread();
     let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
         profile,
         rows,
@@ -398,7 +428,13 @@ fn profile_hot_sql_session_bound_updates(
     let start = Instant::now();
     let mut row_count = 0;
     for _ in 0..repeats {
-        row_count += runtime.block_on(fixture.update_all_bound());
+        row_count += if spread {
+            runtime.block_on(fixture.update_spread_bound_rows(bound_update_row_count))
+        } else if bound_update_row_count == rows.len() {
+            runtime.block_on(fixture.update_all_bound())
+        } else {
+            runtime.block_on(fixture.update_bound_rows(bound_update_row_count))
+        };
     }
     let elapsed = start.elapsed();
     println!(
@@ -669,6 +705,8 @@ fn profile_sql_session_bound_updates(
     sample_count: usize,
     profile: StorageProfile,
 ) {
+    let bound_update_row_count = profile_bound_update_row_count(rows.len());
+    let spread = profile_bound_update_spread();
     let mut samples = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
         let fixture = runtime.block_on(sql_session::seeded_fixture_with_read_many_pk_count(
@@ -677,7 +715,13 @@ fn profile_sql_session_bound_updates(
             read_many_pk_count,
         ));
         let start = Instant::now();
-        let result = runtime.block_on(fixture.update_all_bound());
+        let result = if spread {
+            runtime.block_on(fixture.update_spread_bound_rows(bound_update_row_count))
+        } else if bound_update_row_count == rows.len() {
+            runtime.block_on(fixture.update_all_bound())
+        } else {
+            runtime.block_on(fixture.update_bound_rows(bound_update_row_count))
+        };
         samples.push(start.elapsed());
         black_box(result);
     }

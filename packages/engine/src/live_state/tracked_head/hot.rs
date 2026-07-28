@@ -24,6 +24,8 @@ pub(crate) const HOT_FILE_SPACE: StorageSpace =
 /// Reserved for the row-level first-before working-diff index.
 pub(crate) const HOT_DIFF_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
+const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
+const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Direct reader for one published hot generation.
@@ -2025,6 +2027,11 @@ async fn hot_scan_entries(
             || !hot_schema_has_file_members(store, branch_id, generation, &filter.schema_keys)
                 .await?;
         if may_use_null_point_batch {
+            if limit.is_none()
+                && let Some(entries) = hot_scan_dense_identity_range(store, &identities).await?
+            {
+                return Ok(entries);
+            }
             let values = hot_load_identity_bytes(store, &identities).await?;
             return Ok(identities
                 .into_iter()
@@ -2091,6 +2098,80 @@ async fn hot_scan_entries(
         }
     }
     Ok(rows)
+}
+
+async fn hot_scan_dense_identity_range(
+    store: &(impl StorageAdapterRead + ?Sized),
+    identities: &[HeadIdentity],
+) -> Result<Option<Vec<(HeadRowIdentity, Bytes)>>, LixError> {
+    if identities.len() < HOT_DENSE_SCAN_MIN_IDENTITIES
+        || identities
+            .windows(2)
+            .any(|pair| pair[0].schema_key != pair[1].schema_key)
+    {
+        return Ok(None);
+    }
+
+    let requested_keys = identities
+        .iter()
+        .map(encode_hot_row_key)
+        .collect::<Vec<_>>();
+    let Some(first_key) = requested_keys.first() else {
+        return Ok(Some(Vec::new()));
+    };
+    let Some(last_key) = requested_keys.last() else {
+        return Ok(Some(Vec::new()));
+    };
+    let plan = ScanPlan::range(
+        HOT_ROW_SPACE,
+        crate::storage_adapter::StorageKeyRange {
+            lower: std::ops::Bound::Included(StorageKey(Bytes::copy_from_slice(first_key))),
+            upper: std::ops::Bound::Included(StorageKey(Bytes::copy_from_slice(last_key))),
+        },
+    );
+    let scan_budget = identities.len().saturating_mul(HOT_DENSE_SCAN_MAX_OVERREAD);
+    let mut scanned = 0;
+    let mut requested_index = 0;
+    let mut resume_after = None;
+    let mut rows = Vec::with_capacity(identities.len());
+    loop {
+        let remaining_budget = scan_budget.saturating_sub(scanned);
+        if remaining_budget == 0 {
+            return Ok(None);
+        }
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    limit_rows: remaining_budget.min(StorageScanOptions::default().limit_rows),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        scanned += page.value.entries.len();
+        for entry in page.value.entries {
+            while requested_index < requested_keys.len()
+                && requested_keys[requested_index].as_slice() < entry.key.0.as_ref()
+            {
+                requested_index += 1;
+            }
+            if requested_index < requested_keys.len()
+                && requested_keys[requested_index].as_slice() == entry.key.0.as_ref()
+            {
+                rows.push((
+                    identities[requested_index].clone().into_row_identity(),
+                    full_value_bytes(entry.value)?,
+                ));
+                requested_index += 1;
+            }
+        }
+        if requested_index == requested_keys.len() || !page.value.has_more || resume_after.is_none()
+        {
+            return Ok(Some(rows));
+        }
+    }
 }
 
 fn hot_file_scan_prefixes(
@@ -2652,6 +2733,98 @@ mod tests {
             entity_pk: EntityPk::single(entity),
             file_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn dense_identity_range_scan_returns_requested_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("dense-range-generation");
+        let all_identities = (0..HOT_DENSE_SCAN_MIN_IDENTITIES * 2)
+            .map(|index| diff_identity("branch", generation, &format!("{index:04}")))
+            .collect::<Vec<_>>();
+        let requested = all_identities
+            .iter()
+            .step_by(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut writes = StorageWriteSet::new();
+        for identity in &all_identities {
+            writes.put(
+                HOT_ROW_SPACE,
+                StorageKey(Bytes::from(encode_hot_row_key(identity))),
+                StorageValue {
+                    bytes: Bytes::from_static(b"row"),
+                },
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit dense-range fixture");
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open dense-range read"),
+        );
+
+        let rows = hot_scan_dense_identity_range(&read, &requested)
+            .await
+            .expect("scan dense identity range")
+            .expect("dense range should stay on the scan path");
+
+        assert_eq!(
+            rows.into_iter()
+                .map(|(identity, _)| identity.entity_pk)
+                .collect::<Vec<_>>(),
+            requested
+                .into_iter()
+                .map(|identity| identity.entity_pk)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn sparse_identity_range_scan_returns_to_point_reads() {
+        let storage = StorageAdapter::new(Memory::new());
+        let generation = CommitId::for_test_label("sparse-range-generation");
+        let all_identities = (0..HOT_DENSE_SCAN_MIN_IDENTITIES * 4)
+            .map(|index| diff_identity("branch", generation, &format!("{index:04}")))
+            .collect::<Vec<_>>();
+        let requested = all_identities
+            .iter()
+            .step_by(4)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut writes = StorageWriteSet::new();
+        for identity in &all_identities {
+            writes.put(
+                HOT_ROW_SPACE,
+                StorageKey(Bytes::from(encode_hot_row_key(identity))),
+                StorageValue {
+                    bytes: Bytes::from_static(b"row"),
+                },
+            );
+        }
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit sparse-range fixture");
+        let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+            storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("open sparse-range read"),
+        );
+
+        let rows = hot_scan_dense_identity_range(&read, &requested)
+            .await
+            .expect("probe sparse identity range");
+
+        assert!(
+            rows.is_none(),
+            "sparse ranges must return to the exact point-read path"
+        );
     }
 
     #[tokio::test]
