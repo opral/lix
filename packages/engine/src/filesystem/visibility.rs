@@ -4,8 +4,6 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::LixError;
-#[cfg(test)]
-use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
 };
@@ -53,13 +51,6 @@ impl VisibleFilesystem {
             })
             .await?;
         Self::from_live_batch(&rows)
-    }
-
-    /// Builds filesystem lookup indexes from rows that are already known to be
-    /// transaction-visible.
-    #[cfg(test)]
-    pub(crate) fn from_live_rows(rows: Vec<MaterializedLiveStateRow>) -> Result<Self, LixError> {
-        Self::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
     }
 
     pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
@@ -182,13 +173,21 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemDescriptorKey, FilesystemRowContext};
-    use crate::live_state::MaterializedLiveStateRow;
-    use crate::live_state::{LiveStateReader, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::live_state::{
+        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
+        MaterializedLiveStateRow,
+    };
 
     use super::{
         BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         FILE_DESCRIPTOR_SCHEMA_KEY, VisibleFilesystem,
     };
+
+    fn visible_filesystem_from_rows(
+        rows: Vec<MaterializedLiveStateRow>,
+    ) -> Result<VisibleFilesystem, LixError> {
+        VisibleFilesystem::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
 
     #[tokio::test]
     async fn load_uses_expected_scan_filter() {
@@ -335,7 +334,7 @@ mod tests {
 
     #[test]
     fn from_live_rows_ignores_tombstones_unrelated_schemas_and_indexes_root_files() {
-        let filesystem = VisibleFilesystem::from_live_rows(vec![
+        let filesystem = visible_filesystem_from_rows(vec![
             live_row(
                 "dir-tombstone",
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -388,7 +387,7 @@ mod tests {
 
     #[test]
     fn from_live_rows_rejects_invalid_filesystem_json() {
-        let error = VisibleFilesystem::from_live_rows(vec![live_row(
+        let error = visible_filesystem_from_rows(vec![live_row(
             "dir-invalid",
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             None,
