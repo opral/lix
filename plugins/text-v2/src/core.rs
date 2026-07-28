@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -26,7 +27,7 @@ pub(crate) struct Document(Arc<DocumentInner>);
 #[derive(Debug, PartialEq, Eq)]
 struct DocumentInner {
     bytes: Arc<Vec<u8>>,
-    lines: Vec<Line>,
+    lines: Vec<Arc<Line>>,
 }
 
 /// A durable line entity. `bytes` includes its trailing LF when present.
@@ -111,11 +112,11 @@ impl Document {
         let order_keys = OrderKey::evenly_between(None, None, chunks.len())?;
         let mut lines = Vec::with_capacity(chunks.len());
         for (ordinal, (bytes, order_key)) in chunks.into_iter().zip(order_keys).enumerate() {
-            lines.push(Line {
+            lines.push(Arc::new(Line {
                 id: id_for_ordinal(usize_to_u64(ordinal, "line ID ordinal")?),
                 order_key,
                 bytes,
-            });
+            }));
         }
         // A cold open constructs lines in strict order from one already
         // validated byte stream. Host ordinal IDs and evenly-spaced order
@@ -200,29 +201,32 @@ impl Document {
         // identity even across a reorder. Remaining old/new positions are
         // paired in order, preserving an edited line's ID without inventing a
         // parser-specific identity rule for arbitrary text.
-        let mut exact = BTreeMap::<&[u8], VecDeque<usize>>::new();
+        let mut exact =
+            Vec::with_capacity(self.lines().len().saturating_sub(prefix_len + suffix_len));
         for (old_index, line) in self.lines()[prefix_len..self.lines().len() - suffix_len]
             .iter()
             .enumerate()
             .map(|(index, line)| (prefix_len + index, line))
         {
-            exact
-                .entry(line.bytes.as_slice())
-                .or_default()
-                .push_back(old_index);
+            exact.push((line_hash(line.bytes.as_slice()), old_index));
         }
+        exact.sort_unstable();
         for (new_index, bytes) in chunks[prefix_len..chunks.len() - suffix_len]
             .iter()
             .enumerate()
             .map(|(index, bytes)| (prefix_len + index, bytes))
         {
-            let Some(candidates) = exact.get_mut(bytes.as_slice()) else {
-                continue;
-            };
-            // A candidate entry remains in the map after its queue is
-            // exhausted. Further equal successor lines are new lines, not an
-            // invariant violation.
-            let Some(old_index) = candidates.pop_front() else {
+            let hash = line_hash(bytes.as_slice());
+            let start = exact.partition_point(|(candidate, _)| *candidate < hash);
+            let end = exact.partition_point(|(candidate, _)| *candidate <= hash);
+            let Some(old_index) = exact[start..end]
+                .iter()
+                .map(|(_, old_index)| *old_index)
+                .find(|old_index| {
+                    !old_used[*old_index]
+                        && self.lines()[*old_index].bytes.as_slice() == bytes.as_slice()
+                })
+            else {
                 continue;
             };
             old_for_new[new_index] = Some(old_index);
@@ -248,8 +252,10 @@ impl Document {
         let mut known_ids = self
             .lines()
             .iter()
-            .map(|line| line.id.clone())
-            .collect::<BTreeSet<_>>();
+            .map(|line| line.id.as_str())
+            .collect::<Vec<_>>();
+        known_ids.sort_unstable();
+        let mut new_ids = BTreeSet::new();
         let mut next_ordinal = 0u64;
         let mut lines = Vec::with_capacity(chunks.len());
         for ((bytes, old_index), order_key) in chunks.into_iter().zip(old_for_new).zip(order_keys) {
@@ -260,7 +266,8 @@ impl Document {
                     next_ordinal = next_ordinal
                         .checked_add(1)
                         .ok_or_else(|| "line ID ordinal overflow".to_owned())?;
-                    if !known_ids.insert(id.clone()) {
+                    if known_ids.binary_search(&id.as_str()).is_ok() || !new_ids.insert(id.clone())
+                    {
                         return Err(format!(
                             "new line ID '{id}' collides with an existing line identity"
                         ));
@@ -268,11 +275,18 @@ impl Document {
                     id
                 }
             };
-            lines.push(Line {
-                id,
-                order_key,
-                bytes,
-            });
+            if let Some(old_index) = old_index
+                && self.lines()[old_index].order_key == order_key
+                && self.lines()[old_index].bytes == bytes
+            {
+                lines.push(Arc::clone(&self.lines()[old_index]));
+            } else {
+                lines.push(Arc::new(Line {
+                    id,
+                    order_key,
+                    bytes,
+                }));
+            }
         }
 
         // The splice result and each constructed line were validated above.
@@ -292,8 +306,7 @@ impl Document {
         let mut lines = self
             .lines()
             .iter()
-            .cloned()
-            .map(|line| (line.id.clone(), line))
+            .map(|line| (line.id.clone(), line.as_ref().clone()))
             .collect::<BTreeMap<_, _>>();
 
         for change in changes {
@@ -327,7 +340,7 @@ impl Document {
         self.0.bytes.as_slice()
     }
 
-    pub(crate) fn lines(&self) -> &[Line] {
+    pub(crate) fn lines(&self) -> &[Arc<Line>] {
         &self.0.lines
     }
 
@@ -354,41 +367,75 @@ impl Document {
                 .cmp(&right.order_key)
                 .then_with(|| left.id.cmp(&right.id))
         });
-        let bytes = render_lines(&lines)?;
+        let bytes = Arc::new(render_lines(&lines)?);
         validate_git_text(&bytes)?;
+        let mut offset = 0usize;
+        for line in &mut lines {
+            let end = offset
+                .checked_add(line.bytes.len())
+                .ok_or_else(|| "line byte range overflow".to_owned())?;
+            line.bytes = LineBytes::new(Arc::clone(&bytes), offset..end);
+            offset = end;
+        }
         Ok(Self(Arc::new(DocumentInner {
-            bytes: Arc::new(bytes),
-            lines,
+            bytes,
+            lines: lines.into_iter().map(Arc::new).collect(),
         })))
     }
 
     fn changes_to(&self, after: &Self) -> Result<Vec<lix::EntityChange>, String> {
-        let before = self
+        let mut before = self
             .lines()
             .iter()
             .map(|line| (line.id.as_str(), line))
-            .collect::<BTreeMap<_, _>>();
-        let after_by_id = after
+            .collect::<Vec<_>>();
+        let mut after_by_id = after
             .lines()
             .iter()
             .map(|line| (line.id.as_str(), line))
-            .collect::<BTreeMap<_, _>>();
+            .collect::<Vec<_>>();
+        before.sort_unstable_by_key(|(id, _)| *id);
+        after_by_id.sort_unstable_by_key(|(id, _)| *id);
 
         let mut changes = Vec::new();
-        for line in self.lines() {
-            if !after_by_id.contains_key(line.id.as_str()) {
-                changes.push(lix::EntityChange::delete(
-                    LINE_SCHEMA_KEY,
-                    vec![line.id.clone()],
-                ));
-            }
-        }
-        for line in after.lines() {
-            let changed = before
-                .get(line.id.as_str())
-                .is_none_or(|before_line| before_line != &line);
-            if changed {
-                changes.push(line.upsert_change()?);
+        let mut before_index = 0usize;
+        let mut after_index = 0usize;
+        while before_index < before.len() || after_index < after_by_id.len() {
+            match (before.get(before_index), after_by_id.get(after_index)) {
+                (Some((before_id, before_line)), Some((after_id, after_line))) => {
+                    match before_id.cmp(after_id) {
+                        std::cmp::Ordering::Less => {
+                            changes.push(lix::EntityChange::delete(
+                                LINE_SCHEMA_KEY,
+                                vec![(*before_id).to_owned()],
+                            ));
+                            before_index += 1;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            changes.push(after_line.upsert_change()?);
+                            after_index += 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            if before_line != after_line {
+                                changes.push(after_line.upsert_change()?);
+                            }
+                            before_index += 1;
+                            after_index += 1;
+                        }
+                    }
+                }
+                (Some((before_id, _)), None) => {
+                    changes.push(lix::EntityChange::delete(
+                        LINE_SCHEMA_KEY,
+                        vec![(*before_id).to_owned()],
+                    ));
+                    before_index += 1;
+                }
+                (None, Some((_, after_line))) => {
+                    changes.push(after_line.upsert_change()?);
+                    after_index += 1;
+                }
+                (None, None) => break,
             }
         }
         Ok(changes)
@@ -537,6 +584,12 @@ impl Line {
             self.snapshot_bytes()?,
         ))
     }
+}
+
+fn line_hash(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn split_lines(bytes: Arc<Vec<u8>>) -> Vec<LineBytes> {
