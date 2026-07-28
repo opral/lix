@@ -110,6 +110,24 @@ impl EntityPk {
             .collect()
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        let tuple_storage = if self.components.spilled() {
+            self.components.capacity() * size_of::<EntityPkComponent>()
+        } else {
+            0
+        };
+        tuple_storage
+            + self
+                .components
+                .iter()
+                .map(|component| match component {
+                    EntityPkComponent::Uuid(_) | EntityPkComponent::Integer(_) => 0,
+                    EntityPkComponent::String(value) => value.len(),
+                    EntityPkComponent::Bytes(value) => value.len(),
+                })
+                .sum::<usize>()
+    }
+
     pub(crate) fn from_components(
         components: SmallVec<[EntityPkComponent; 1]>,
     ) -> Result<Self, EntityPkError> {

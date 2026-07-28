@@ -977,7 +977,7 @@ async fn stage_incremental_file_delete_cascades(
         let Some(file_id) = file_delete_cascade_id(cascade)? else {
             continue;
         };
-        cascades.insert(file_id.to_string(), cascade);
+        cascades.insert(file_id, cascade);
     }
     if cascades.is_empty() {
         return Ok(());
@@ -1275,7 +1275,7 @@ fn apply_complete_file_delete_cascade(
     };
     let identities = rows
         .keys()
-        .filter(|identity| identity.file_id.as_deref() == Some(file_id))
+        .filter(|identity| identity.file_id.as_deref() == Some(file_id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
     for identity in identities {
@@ -1309,15 +1309,13 @@ fn apply_complete_file_delete_cascade(
     Ok(())
 }
 
-fn file_delete_cascade_id<'a>(
-    delta: &'a CurrentStateDeltaRef<'_>,
-) -> Result<Option<&'a str>, LixError> {
+fn file_delete_cascade_id(delta: &CurrentStateDeltaRef<'_>) -> Result<Option<String>, LixError> {
     if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || delta.file_id.is_some() || !delta.deleted {
         return Ok(None);
     }
     delta
         .entity_pk
-        .as_single_string()
+        .as_single_string_owned()
         .map(Some)
         .map_err(|error| {
             head_value_error(&format!(

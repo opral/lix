@@ -171,12 +171,7 @@ impl FilesystemPathEntry {
             + self.updated_at.capacity()
             + self.blob_ref.as_ref().map_or(0, |row| {
                 row.schema_key.capacity()
-                    + row
-                        .entity_pk
-                        .parts
-                        .iter()
-                        .map(String::capacity)
-                        .sum::<usize>()
+                    + row.entity_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
                     + row.snapshot_content.as_ref().map_or(0, String::capacity)
                     + row.metadata.as_ref().map_or(0, String::capacity)

@@ -1291,7 +1291,7 @@ fn apply_lifecycle_tracked_snapshot_row(
         && next.file_id.is_none()
         && next.snapshot_content.is_none()
     {
-        let file_id = next.entity_pk.as_single_string().map_err(|error| {
+        let file_id = next.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("file descriptor tombstone has invalid identity: {error}"),
@@ -1299,7 +1299,9 @@ fn apply_lifecycle_tracked_snapshot_row(
         })?;
         let cascade_keys = rows
             .iter()
-            .filter(|(key, value)| key.file_id.as_deref() == Some(file_id) && !value.deleted)
+            .filter(|(key, value)| {
+                key.file_id.as_deref() == Some(file_id.as_str()) && !value.deleted
+            })
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in cascade_keys {
@@ -2531,13 +2533,13 @@ async fn stage_tracked_roots(
                 })
                 .map(|row| {
                     let delta = tracked_delta_from_state_row(row)?;
-                    let file_id = row.entity_pk.as_single_string().map_err(|error| {
+                    let file_id = row.entity_pk.as_single_string_owned().map_err(|error| {
                         LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
                             format!("file descriptor tombstone has invalid identity: {error}"),
                         )
                     })?;
-                    Ok((file_id.to_string(), delta))
+                    Ok((file_id, delta))
                 })
                 .collect::<Result<BTreeMap<_, _>, LixError>>()?;
             let first_row = &state_rows[state_row_indices[0]];

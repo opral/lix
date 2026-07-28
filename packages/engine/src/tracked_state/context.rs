@@ -1869,13 +1869,13 @@ where
                 {
                     continue;
                 }
-                let file_id = delta.entity_pk.as_single_string().map_err(|error| {
+                let file_id = delta.entity_pk.as_single_string_owned().map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("file descriptor tombstone has invalid identity: {error}"),
                     )
                 })?;
-                cascades.insert(file_id.to_string(), delta);
+                cascades.insert(file_id, delta);
             }
             if !cascades.is_empty() {
                 let rows = self
@@ -2352,13 +2352,13 @@ fn tracked_state_winner_identity_for_diff_row(
         && change.snapshot.is_none()
         && row.deleted
     {
-        let file_id = change.entity_pk.as_single_string().map_err(|error| {
+        let file_id = change.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::unknown(format!(
                 "tracked-state cascade change '{}' has invalid file descriptor identity: {error}",
                 row.change_id
             ))
         })?;
-        if row.file_id.as_deref() == Some(file_id) {
+        if row.file_id.as_deref() == Some(file_id.as_str()) {
             return Ok(TrackedStateRowWinner {
                 identity: TrackedStateIdentity {
                     schema_key: change.schema_key.clone(),

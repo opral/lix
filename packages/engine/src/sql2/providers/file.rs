@@ -7631,12 +7631,11 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&find_files_projection))
             .expect("findFiles projection should be valid");
-        let _request =
-            super::lix_file_scan_request(
-                Some("01920000-0000-7000-8000-0000000000b1"),
-                Some(&projected_schema),
-                None,
-            );
+        let _request = super::lix_file_scan_request(
+            Some("01920000-0000-7000-8000-0000000000b1"),
+            Some(&projected_schema),
+            None,
+        );
         let rows =
             super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
@@ -7903,12 +7902,11 @@ mod tests {
         ];
         let projected_schema = super::projected_schema(&base_schema, Some(&projection))
             .expect("projection should be valid");
-        let _request =
-            super::lix_file_scan_request(
-                Some("01920000-0000-7000-8000-0000000000b1"),
-                Some(&projected_schema),
-                None,
-            );
+        let _request = super::lix_file_scan_request(
+            Some("01920000-0000-7000-8000-0000000000b1"),
+            Some(&projected_schema),
+            None,
+        );
         let rows =
             super::scan_indexed_file_rows(&matches, true).expect("matching blob rows should load");
         let prepared = super::prepare_indexed_lix_file_rows(&matches, rows)
