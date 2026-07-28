@@ -61,6 +61,29 @@ pub(crate) fn normalize_transaction_write_row(
         ));
     };
 
+    if row
+        .snapshot
+        .as_ref()
+        .is_some_and(TransactionJson::row_content_certified)
+    {
+        if row.entity_pk.is_none() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "certified replacement row is missing its proven entity identity",
+            ));
+        }
+        let snapshot = row.snapshot.take();
+        return Ok(NormalizedTransactionWriteRow {
+            row,
+            snapshot,
+            schema_plan_id,
+            facts: PreparedRowFacts {
+                row_content_validated: true,
+                requires_transaction_validation: false,
+            },
+        });
+    }
+
     let normalized_snapshot = if let Some(snapshot) = row.snapshot.take() {
         let (mut snapshot, normalized) = snapshot_object_from_transaction_json(snapshot, &row)?;
         let defaults_changed = apply_defaults(&mut snapshot, schema_plan, &row, functions)?;
@@ -203,7 +226,7 @@ fn snapshot_object_from_transaction_json(
     snapshot: TransactionJson,
     row: &TransactionWriteRow,
 ) -> Result<(JsonMap<String, JsonValue>, Arc<str>), LixError> {
-    let (snapshot, normalized) = snapshot.into_parts();
+    let (snapshot, normalized) = snapshot.into_materialized_parts();
     let snapshot = match Arc::try_unwrap(snapshot) {
         Ok(snapshot) => snapshot,
         Err(snapshot) => snapshot.as_ref().clone(),

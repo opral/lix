@@ -1,4 +1,9 @@
-use std::{collections::BTreeSet, fmt, ops::Deref, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    ops::Deref,
+    sync::{Arc, OnceLock},
+};
 
 use crate::LixError;
 use crate::binary_cas::{BlobHash, BlobPayload, BlobSameLengthSplice};
@@ -13,7 +18,7 @@ use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TransactionJson {
-    value: Arc<JsonValue>,
+    value: Option<Arc<JsonValue>>,
     normalized: Arc<str>,
 }
 
@@ -27,10 +32,7 @@ impl TransactionJson {
                 )
             })?
             .into();
-        Ok(Self {
-            value: Arc::new(value),
-            normalized,
-        })
+        Ok(Self::from_parts(Arc::new(value), normalized))
     }
 
     pub(crate) fn from_value_unchecked(value: JsonValue) -> Self {
@@ -44,19 +46,53 @@ impl TransactionJson {
     }
 
     pub(crate) fn from_parts(value: Arc<JsonValue>, normalized: Arc<str>) -> Self {
-        Self { value, normalized }
+        Self {
+            value: Some(value),
+            normalized,
+        }
+    }
+
+    /// Constructs canonical row content whose schema semantics and identity
+    /// were proven by a typed lowerer.
+    ///
+    /// The decoded JSON stays lazy because ordinary staging and durable
+    /// placement only consume canonical bytes. Callers may issue this
+    /// certificate only for complete replacement rows whose unchanged
+    /// identity and row-local schema constraints were already established.
+    pub(crate) fn from_certified_normalized_row_content(normalized: Arc<str>) -> Self {
+        Self {
+            value: None,
+            normalized,
+        }
+    }
+
+    pub(crate) fn row_content_certified(&self) -> bool {
+        self.value.is_none()
     }
 
     pub(crate) fn value(&self) -> &JsonValue {
-        self.value.as_ref()
+        self.value
+            .as_ref()
+            .expect("certified row content must be prepared before decoded JSON is requested")
+            .as_ref()
     }
 
     pub(crate) fn normalized(&self) -> &str {
         self.normalized.as_ref()
     }
 
-    pub(crate) fn into_parts(self) -> (Arc<JsonValue>, Arc<str>) {
-        (self.value, self.normalized)
+    pub(crate) fn into_parts(self) -> (OnceLock<Arc<JsonValue>>, Arc<str>) {
+        (
+            self.value.map_or_else(OnceLock::new, OnceLock::from),
+            self.normalized,
+        )
+    }
+
+    pub(crate) fn into_materialized_parts(self) -> (Arc<JsonValue>, Arc<str>) {
+        let value = self
+            .value
+            .expect("certified row content must bypass semantic normalization");
+        (value, self.normalized)
     }
 }
 
@@ -91,7 +127,7 @@ impl Serialize for TransactionJson {
     where
         S: Serializer,
     {
-        self.value.serialize(serializer)
+        self.value().serialize(serializer)
     }
 }
 
@@ -387,12 +423,23 @@ pub(crate) struct TransactionWriteOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StageJson {
-    pub(crate) value: Arc<serde_json::Value>,
+    value: OnceLock<Arc<serde_json::Value>>,
     pub(crate) normalized: Arc<str>,
     pub(crate) json_ref: JsonRef,
 }
 
 impl StageJson {
+    pub(crate) fn value(&self) -> &serde_json::Value {
+        self.value
+            .get_or_init(|| {
+                Arc::new(
+                    serde_json::from_str(&self.normalized)
+                        .expect("prepared normalized JSON must remain valid JSON"),
+                )
+            })
+            .as_ref()
+    }
+
     pub(crate) fn materialize(&self) -> String {
         self.normalized.as_ref().to_string()
     }
@@ -610,6 +657,21 @@ impl StagedCommitChangeRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn certified_normalized_content_can_materialize_from_the_prepared_boundary() {
+        let transaction_json = TransactionJson::from_certified_normalized_row_content(
+            r#"{"path":"/a","value":{"nested":true}}"#.into(),
+        );
+        assert!(transaction_json.row_content_certified());
+
+        let staged = stage_json_from_value(transaction_json, "certified test row")
+            .expect("certified JSON should prepare");
+        assert_eq!(
+            staged.value(),
+            &serde_json::json!({"path": "/a", "value": {"nested": true}})
+        );
+    }
 
     #[test]
     fn verified_same_length_splice_requires_the_visible_blob_base() {

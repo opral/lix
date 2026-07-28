@@ -3689,6 +3689,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_certifies_complete_path_value_replacements() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "x-lix-key": "certified_replacement_probe",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": {
+                    "type": [
+                        "object", "array", "string", "number", "integer", "boolean", "null"
+                    ]
+                }
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        session
+            .execute(
+                "INSERT INTO certified_replacement_probe (path, value) VALUES \
+                 ('/a', lix_json('\"old-a\"')), ('/b', lix_json('\"old-b\"'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_replacement_parameter_batch_executions();
+        let sql = "UPDATE certified_replacement_probe SET value = lix_json($1) WHERE path = $2";
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("null".to_string()),
+                        Value::Text("/a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text(r#"{"nested":[1,true,"x"]}"#.to_string()),
+                        Value::Text("/b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sql2::take_certified_replacement_parameter_batch_executions(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let rows = session
+            .execute(
+                "SELECT path, value FROM certified_replacement_probe ORDER BY path",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].value("value").unwrap(), &Value::Null);
+        assert_eq!(
+            rows.rows()[1].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!({"nested": [1, true, "x"]})
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_keeps_repeated_entity_identity_sequential() {
         let session = open_session().await;
         let schema = serde_json::json!({

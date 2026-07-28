@@ -5032,7 +5032,7 @@ fn v2_host_changes_from_prepared_rows(
                     let format_only = row
                         .metadata
                         .as_ref()
-                        .and_then(|metadata| metadata.value.get("impact"))
+                        .and_then(|metadata| metadata.value().get("impact"))
                         .and_then(JsonValue::as_str)
                         .is_some_and(|impact| impact == "format");
                     let effect = if format_only {

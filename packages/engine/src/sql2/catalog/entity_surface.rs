@@ -50,6 +50,9 @@ pub(crate) struct EntitySurfaceSpec {
     /// only when every row is independent. JSON Schema validation is row-local;
     /// uniqueness and foreign-key declarations are the inter-row exceptions.
     pub(crate) has_inter_row_constraints: bool,
+    /// This exact schema shape proves that replacing `value` while preserving
+    /// the already-valid string `path` produces complete valid row content.
+    pub(crate) certifies_path_value_replacement: bool,
 }
 
 impl EntitySurfaceSpec {
@@ -133,6 +136,7 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
         .collect::<Result<Vec<_>, LixError>>()?;
     columns.sort_by(|left, right| left.name.cmp(&right.name));
 
+    let certifies_path_value_replacement = certifies_path_value_replacement(schema);
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         primary_key_paths,
@@ -146,7 +150,117 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
                     .is_some_and(|values| !values.is_empty())
             },
         ),
+        certifies_path_value_replacement,
     })
+}
+
+fn certifies_path_value_replacement(schema: &JsonValue) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    let allowed_schema_keys = [
+        "$id",
+        "$schema",
+        "$comment",
+        "title",
+        "description",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "x-lix-key",
+        "x-lix-primary-key",
+    ];
+    if object
+        .keys()
+        .any(|key| !allowed_schema_keys.contains(&key.as_str()))
+        || object.get("type").and_then(JsonValue::as_str) != Some("object")
+        || object.get("additionalProperties") != Some(&JsonValue::Bool(false))
+    {
+        return false;
+    }
+    let Some(properties) = object.get("properties").and_then(JsonValue::as_object) else {
+        return false;
+    };
+    if properties.len() != 2
+        || !properties.contains_key("path")
+        || !properties
+            .get("path")
+            .is_some_and(schema_accepts_string_identity)
+        || !properties
+            .get("value")
+            .is_some_and(schema_accepts_every_json_value)
+    {
+        return false;
+    }
+    let required = object
+        .get("required")
+        .and_then(JsonValue::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(JsonValue::as_str)
+        .collect::<BTreeSet<_>>();
+    required == BTreeSet::from(["path", "value"])
+        && object
+            .get("x-lix-primary-key")
+            .and_then(JsonValue::as_array)
+            .is_some_and(|paths| paths.as_slice() == [JsonValue::String("/path".to_string())])
+}
+
+fn schema_accepts_string_identity(schema: &JsonValue) -> bool {
+    schema
+        .as_object()
+        .and_then(|schema| schema.get("type"))
+        .and_then(JsonValue::as_str)
+        == Some("string")
+}
+
+fn schema_accepts_every_json_value(schema: &JsonValue) -> bool {
+    if schema == &JsonValue::Bool(true) {
+        return true;
+    }
+    let Some(schema) = schema.as_object() else {
+        return false;
+    };
+    let annotations = ["$comment", "title", "description", "default", "examples"];
+    if schema.is_empty() || schema.keys().all(|key| annotations.contains(&key.as_str())) {
+        return true;
+    }
+    let validation_keys = schema
+        .keys()
+        .filter(|key| !annotations.contains(&key.as_str()))
+        .collect::<Vec<_>>();
+    if validation_keys.len() == 1 && validation_keys[0].as_str() == "type" {
+        let Some(types) = schema.get("type").and_then(JsonValue::as_array) else {
+            return false;
+        };
+        let accepted = types
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .collect::<BTreeSet<_>>();
+        return accepted
+            == BTreeSet::from([
+                "array", "boolean", "integer", "null", "number", "object", "string",
+            ]);
+    }
+    if validation_keys.len() != 1 || validation_keys[0].as_str() != "anyOf" {
+        return false;
+    }
+    let Some(branches) = schema.get("anyOf").and_then(JsonValue::as_array) else {
+        return false;
+    };
+    let accepted = branches
+        .iter()
+        .filter_map(|branch| {
+            let branch = branch.as_object()?;
+            branch
+                .keys()
+                .all(|key| key == "type" || annotations.contains(&key.as_str()))
+                .then(|| branch.get("type")?.as_str())
+                .flatten()
+        })
+        .collect::<BTreeSet<_>>();
+    accepted == BTreeSet::from(["array", "boolean", "null", "number", "object", "string"])
 }
 
 pub(crate) fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
@@ -396,6 +510,63 @@ mod tests {
     use super::{
         EntitySurfaceShape, derive_entity_surface_spec_from_schema, entity_surface_schema,
     };
+
+    fn path_value_schema(value_schema: serde_json::Value) -> serde_json::Value {
+        json!({
+            "x-lix-key": "arbitrary_name",
+            "x-lix-primary-key": ["/path"],
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "value": value_schema
+            },
+            "required": ["path", "value"],
+            "additionalProperties": false
+        })
+    }
+
+    #[test]
+    fn certifies_complete_path_value_rows_when_value_accepts_all_json() {
+        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
+            "anyOf": [
+                { "type": "object" },
+                { "type": "array" },
+                { "type": "string" },
+                { "type": "number" },
+                { "type": "boolean" },
+                { "type": "null" }
+            ]
+        })))
+        .expect("schema should derive");
+
+        assert!(spec.certifies_path_value_replacement);
+    }
+
+    #[test]
+    fn does_not_certify_path_value_rows_with_value_constraints() {
+        let spec = derive_entity_surface_spec_from_schema(&path_value_schema(json!({
+            "type": "object"
+        })))
+        .expect("schema should derive");
+        assert!(!spec.certifies_path_value_replacement);
+
+        let mut schema = path_value_schema(json!({
+            "anyOf": [
+                { "type": "object" },
+                { "type": "array" },
+                { "type": "string" },
+                { "type": "number" },
+                { "type": "boolean" },
+                { "type": "null" }
+            ]
+        }));
+        schema
+            .as_object_mut()
+            .expect("object schema")
+            .insert("minProperties".to_string(), json!(3));
+        let spec = derive_entity_surface_spec_from_schema(&schema).expect("schema should derive");
+        assert!(!spec.certifies_path_value_replacement);
+    }
 
     #[test]
     fn history_identity_roots_are_non_null_even_for_nested_keys() {
