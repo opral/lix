@@ -1,9 +1,11 @@
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
+#[cfg(test)]
+use crate::live_state::MaterializedLiveStateRow;
 use crate::live_state::{
     LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateReader, LiveStateRowIdentityRef,
     LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
-    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRowRef,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -114,21 +116,6 @@ pub(crate) fn expanded_branch_ids(branch_ids: &[String]) -> Vec<String> {
     expanded
 }
 
-/// Explicit terminal bridge for legacy scalar/test consumers.
-#[allow(dead_code)]
-pub(crate) fn resolve_visible_rows(
-    base_rows: Vec<MaterializedLiveStateRow>,
-    staged_rows: Vec<MaterializedLiveStateRow>,
-    request: &VisibilityRequest,
-) -> Vec<MaterializedLiveStateRow> {
-    resolve_visible_batch(
-        MaterializedLiveStateBatch::from_rows(base_rows),
-        MaterializedLiveStateBatch::from_rows(staged_rows),
-        request,
-    )
-    .into_rows()
-}
-
 pub(crate) fn resolve_visible_batch(
     base_rows: MaterializedLiveStateBatch,
     staged_rows: MaterializedLiveStateBatch,
@@ -142,19 +129,6 @@ pub(crate) fn resolve_visible_batch(
         request.include_tombstones,
         request.limit,
     )
-}
-
-/// Explicit terminal bridge for legacy scalar/test consumers.
-#[allow(dead_code)]
-pub(crate) async fn overlay_scan_rows<S>(
-    base: &dyn LiveStateReader,
-    staged: &S,
-    request: &LiveStateScanRequest,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
-where
-    S: StagedLiveStateRows + ?Sized,
-{
-    Ok(overlay_scan_batch(base, staged, request).await?.into_rows())
 }
 
 pub(crate) async fn overlay_scan_batch<S>(
@@ -214,21 +188,6 @@ where
 
 /// Overlays staged exact identities without converting correlated row keys to
 /// independent scan filters.
-/// Explicit terminal bridge for legacy scalar/test consumers.
-#[allow(dead_code)]
-pub(crate) async fn overlay_load_exact_rows<S>(
-    base: &dyn LiveStateReader,
-    staged: &S,
-    request: &LiveStateExactBatchRequest,
-) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError>
-where
-    S: StagedLiveStateRows + ?Sized,
-{
-    Ok(overlay_load_exact_batch(base, staged, request)
-        .await?
-        .into_rows())
-}
-
 pub(crate) async fn overlay_load_exact_batch<S>(
     base: &dyn LiveStateReader,
     staged: &S,
@@ -1219,7 +1178,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_visible_rows_maps_branch_scope_and_applies_limit() {
+    fn resolve_visible_batch_maps_branch_scope_and_applies_limit() {
         let request = VisibilityRequest {
             branch_scope: VisibilityBranchScope::BranchIds {
                 branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
@@ -1227,8 +1186,8 @@ mod tests {
             include_tombstones: false,
             limit: Some(1),
         };
-        let rows = resolve_visible_rows(
-            vec![
+        let rows = resolve_visible_batch(
+            MaterializedLiveStateBatch::from_rows(vec![
                 row_at(
                     "01920000-0000-7000-8000-0000000000a1",
                     "a",
@@ -1243,10 +1202,11 @@ mod tests {
                     false,
                     Some("change-b"),
                 ),
-            ],
-            Vec::new(),
+            ]),
+            MaterializedLiveStateBatch::default(),
             &request,
-        );
+        )
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
     }
@@ -1264,7 +1224,7 @@ mod tests {
         };
         let staged = EmptyStagedRows;
 
-        let rows = overlay_scan_rows(
+        let rows = overlay_scan_batch(
             &base,
             &staged,
             &LiveStateScanRequest {
@@ -1276,7 +1236,8 @@ mod tests {
             },
         )
         .await
-        .expect("overlay scan should succeed");
+        .expect("overlay scan should succeed")
+        .into_rows();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].branch_id.as_ref(), "staged-branch");
@@ -1407,9 +1368,10 @@ mod tests {
             ..Default::default()
         };
 
-        let rows = overlay_load_exact_rows(&base, &staged, &request)
+        let rows = overlay_load_exact_batch(&base, &staged, &request)
             .await
-            .expect("exact overlay should resolve");
+            .expect("exact overlay should resolve")
+            .into_rows();
         let value = |index: usize| {
             rows[index]
                 .as_ref()
@@ -1423,7 +1385,7 @@ mod tests {
         assert_eq!(rows[5], None, "base branch tombstone beats staged global");
         assert_eq!(rows[6], None, "staged global tombstone hides base global");
 
-        let tombstone = overlay_load_exact_rows(
+        let tombstone = overlay_load_exact_batch(
             &base,
             &staged,
             &LiveStateExactBatchRequest {
@@ -1434,6 +1396,7 @@ mod tests {
         )
         .await
         .expect("exact tombstone overlay should resolve")
+        .into_rows()
         .pop()
         .flatten()
         .expect("requested tombstone should be returned");

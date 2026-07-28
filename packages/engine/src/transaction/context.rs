@@ -44,8 +44,6 @@ use crate::gc::{
     CheckpointGcState, CheckpointPublication, CheckpointRecoveryRef, load_checkpoint_gc_state,
     load_recovery_ref,
 };
-#[cfg(test)]
-use crate::live_state::overlay_load_exact_rows;
 use crate::live_state::{
     LiveStateContext, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
     LiveStateProjection, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
@@ -4727,7 +4725,9 @@ where
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        overlay_load_exact_rows(&self.base, &self.staged, request).await
+        Ok(overlay_load_exact_batch(&self.base, &self.staged, request)
+            .await?
+            .into_rows())
     }
 
     async fn load_exact_batch(
