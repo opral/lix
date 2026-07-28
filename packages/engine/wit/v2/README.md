@@ -45,10 +45,10 @@ A plugin manifest declares `runtime: "wasm-component-v2"`,
 `api_version: "2.1.0"`, matchers, its component entry, and schemas. Each
 schema declares `x-lix-key` and `x-lix-primary-key`. Creation is available
 when every primary-key property can be completed by a host-evaluated default.
-In v2 that means `/id` is the primary key and declares
-`"x-lix-default": "lix_uuid_v7()"`. Preserve known IDs and emit keyless
-`Create` records only for new entities. Positions, row numbers, and byte
-offsets are not durable identities.
+In v2 that means `/id` is the primary key and its string property declares both
+`"format": "uuid"` and `"x-lix-default": "lix_uuid_v7()"`. Preserve known
+IDs and emit keyless `Create` records only for new entities. Positions, row
+numbers, and byte offsets are not durable identities.
 
 - `open-file`: parse initial bytes, return an immutable `document`, and stream
   complete initial entity upserts.

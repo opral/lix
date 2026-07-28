@@ -151,7 +151,7 @@ the same interface. Their parsers, stable identity rules, and semantic models
 remain separate by design.
 
 Creation is inferred from the schema. A creatable schema has `/id` as its
-primary key and gives that property
+primary key and gives that string property both `"format": "uuid"` and
 `"x-lix-default": "lix_uuid_v7()"`. Keep durable IDs for existing entities.
 For a new entity, choose a transition-local `u32` reference, derive the UUID
 with `input.creates.id(local_ref)`, and pass the complete upsert through

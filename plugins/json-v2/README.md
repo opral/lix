@@ -20,8 +20,9 @@ Object-member identities are the two primary-key components `parent_id` and
 is deterministically derived from that identity and becomes the `parent_id` of
 its children. An array item already has a stable opaque `id`, so that ID also
 identifies any container held by the item. Only `json_array_item` is creatable:
-its `/id` primary key has the `lix_uuid_v7()` default. Newly inserted items are
-sent as keyless creates, while acknowledged IDs survive content edits and moves.
+its `/id` primary-key string has `format: uuid` and the `lix_uuid_v7()`
+default. Newly inserted items are sent as keyless creates, while acknowledged
+IDs survive content edits and moves.
 
 Every node records its `kind`. Scalar values use `scalar_json`, which contains
 the complete raw JSON scalar as text. Numbers therefore preserve their exact
