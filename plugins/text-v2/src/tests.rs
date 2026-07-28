@@ -6,8 +6,15 @@ use serde_json::{Value, json};
 use crate::core::{Document, InputSplice, LINE_SCHEMA_KEY, Line};
 
 fn open(bytes: &[u8]) -> (Document, Vec<lix::EntityChange>) {
-    Document::open_file(bytes.to_vec(), |ordinal| format!("line-{ordinal}"))
-        .expect("Git text document should open")
+    let (document, changes) =
+        Document::open_file(bytes.to_vec(), |ordinal| format!("line-{ordinal}"))
+            .expect("Git text document should open");
+    (
+        document,
+        changes
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Git text changes should serialize"),
+    )
 }
 
 fn ids(document: &Document) -> Vec<String> {
@@ -244,6 +251,9 @@ fn git_nul_window_rejects_early_nul_and_allows_nul_after_eight_kib() {
     let (document, changes) =
         Document::open_file(source.clone(), |ordinal| format!("line-{ordinal}"))
             .expect("a NUL after Git's scan window remains text");
+    let changes = changes
+        .collect::<Result<Vec<_>, _>>()
+        .expect("late-NUL changes should serialize");
     assert_eq!(document.bytes(), source);
     let reopened = Document::open_entities(records(&changes)).expect("late-NUL row should reopen");
     assert_eq!(reopened.bytes(), source);

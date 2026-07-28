@@ -21,11 +21,11 @@ impl lix::FormatPlugin for GitTextPlugin {
         .map_err(lix::Error::invalid_input)?;
         Ok((
             document,
-            lix::try_changes(
-                changes
-                    .into_iter()
-                    .map(move |change| creates.keyless(change)),
-            ),
+            lix::try_changes(changes.into_iter().map(move |change| {
+                change
+                    .map_err(lix::Error::invalid_input)
+                    .and_then(|change| creates.keyless(change))
+            })),
         ))
     }
 
@@ -38,11 +38,13 @@ impl lix::FormatPlugin for GitTextPlugin {
         // that the renderer agrees. A missing checkpoint instead means the
         // host needs one insertion relative to an empty file.
         let has_accepted = input.accepted.is_some();
-        let mut records = Vec::new();
-        while let Some(record) = input.entities.next()? {
-            records.push(record);
-        }
-        let document = Document::open_entities(records).map_err(lix::Error::invalid_input)?;
+        let records = std::iter::from_fn(|| match input.entities.next() {
+            Ok(Some(record)) => Some(Ok(record)),
+            Ok(None) => None,
+            Err(error) => Some(Err(format!("{error:?}"))),
+        });
+        let document =
+            Document::open_entities_fallible(records).map_err(lix::Error::invalid_input)?;
         let edits = restore_edits(has_accepted, document.bytes());
         Ok((document, lix::edits(edits.into_iter())))
     }
