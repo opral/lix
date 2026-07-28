@@ -67,7 +67,7 @@ fn parse_markdown_source_with_literal_fast_path(
     }
     let mut canonical = source.to_string();
     for _ in 0..8 {
-        let rendered = render_tree(&parsed.root)?;
+        let rendered = fully_escape_orphan_table_delimiters(render_tree(&parsed.root)?);
         if rendered == canonical.as_bytes() {
             parsed.canonical_literal_paragraph_layout =
                 source_is_canonical_literal_paragraph_layout;
@@ -85,6 +85,41 @@ fn parse_markdown_source_with_literal_fast_path(
         "Markdown parser/serializer did not reach a stable representation after 8 passes"
             .to_string(),
     ))
+}
+
+fn fully_escape_orphan_table_delimiters(rendered: Vec<u8>) -> Vec<u8> {
+    let mut output = Vec::with_capacity(rendered.len());
+    for line in rendered.split_inclusive(|byte| *byte == b'\n') {
+        let content = line
+            .strip_suffix(b"\n")
+            .unwrap_or(line)
+            .strip_suffix(b"\r")
+            .unwrap_or_else(|| line.strip_suffix(b"\n").unwrap_or(line));
+        let trimmed = content
+            .iter()
+            .copied()
+            .skip_while(|byte| byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        let candidate = trimmed.starts_with(b"|")
+            && trimmed.ends_with(b"|")
+            && trimmed.contains(&b'\\')
+            && trimmed
+                .iter()
+                .all(|byte| matches!(byte, b'|' | b'-' | b':' | b'\\' | b' ' | b'\t'));
+        if !candidate {
+            output.extend_from_slice(line);
+            continue;
+        }
+        let mut previous = None;
+        for byte in line {
+            if *byte == b'-' && previous != Some(b'\\') {
+                output.push(b'\\');
+            }
+            output.push(*byte);
+            previous = Some(*byte);
+        }
+    }
+    output
 }
 
 fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginError> {

@@ -200,6 +200,20 @@ fn cold_entity_open_roundtrips_marker_free_complete_gfm_document() {
 }
 
 #[test]
+fn duplicate_adjacent_table_headers_reach_a_stable_representation() {
+    let source = "\
+| Command | Description |
+|---------|-------------|
+| Command | Description |
+|---------|-------------|
+| `clawdis login` | Link WhatsApp Web via QR |
+";
+    let parsed =
+        parse_markdown_source(source).expect("adjacent table-like headers should stabilize");
+    assert!(parsed.canonical_render.is_some());
+}
+
+#[test]
 fn cold_entity_open_reuses_host_verified_materialized_bytes() {
     let source = b"Alpha\n\nBeta\n".to_vec();
     let (_, changes) = Document::open_file(
