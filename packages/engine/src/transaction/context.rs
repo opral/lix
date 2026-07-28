@@ -3009,7 +3009,7 @@ where
             let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
                 local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
             });
-            let create_context = BoundCreateContext::bind(mutation_identity, &actor_key);
+            let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
             let creates = create_context.creates();
             let existing_create_reservation =
                 match self.preflight_v2_create(create_context, &file_key).await {
@@ -4908,7 +4908,9 @@ fn v2_actor_key_is_descriptor_successor(
 
 #[cfg(test)]
 fn v2_create_context(seed: [u8; 16], actor_key: &PluginActorKey) -> crate::wasm::WasmCreateContext {
-    BoundCreateContext::bind(local_mutation_identity(seed), actor_key).creates()
+    BoundCreateContext::bind(local_mutation_identity(seed), actor_key)
+        .expect("local mutation seeds are generated as UUIDv7")
+        .creates()
 }
 
 fn suppress_v2_format_only_noops_against_rows(
@@ -8246,7 +8248,9 @@ mod tests {
 
     #[test]
     fn v2_create_contexts_are_retry_stable_and_file_incarnation_scoped() {
-        let seed = [7; 16];
+        let seed = uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
+            .expect("fixture UUIDv7")
+            .into_bytes();
         let key = PluginActorKey {
             branch_id: "main".to_string(),
             file_id: "01920000-0000-7000-8000-0000000000a2".to_string(),

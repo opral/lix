@@ -40,7 +40,19 @@ pub(crate) struct BoundCreateContext {
 }
 
 impl BoundCreateContext {
-    pub(crate) fn bind(identity: MutationIdentity, actor_key: &PluginActorKey) -> Self {
+    pub(crate) fn bind(
+        identity: MutationIdentity,
+        actor_key: &PluginActorKey,
+    ) -> Result<Self, LixError> {
+        let namespace_uuid = uuid::Uuid::from_bytes(identity.namespace_seed);
+        if namespace_uuid.get_version_num() != 7
+            || namespace_uuid.get_variant() != uuid::Variant::RFC4122
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PARAM,
+                "mutation identity namespace_seed must be RFC 9562 UUIDv7 bytes",
+            ));
+        }
         let authority_binding = authority_binding(actor_key);
         let namespace_digest = framed_digest(
             b"lix.plugin-v2.bound-namespace.v2\0",
@@ -55,11 +67,11 @@ impl BoundCreateContext {
         prefix[6..].copy_from_slice(&namespace_digest[..6]);
         prefix[6] = (prefix[6] & 0x0f) | 0x70;
         prefix[8] = (prefix[8] & 0x3f) | 0x80;
-        Self {
+        Ok(Self {
             prefix,
             bound_operation_proof,
             authority_binding,
-        }
+        })
     }
 
     pub(crate) fn creates(self) -> WasmCreateContext {
@@ -83,7 +95,7 @@ impl BoundCreateContext {
 }
 
 /// Creates a complete proof for local calls that do not arrive through the
-/// remote mutation protocol. The caller must supply a fresh 128-bit seed.
+/// remote mutation protocol. The caller must supply a freshly minted UUIDv7.
 pub(crate) fn local_mutation_identity(namespace_seed: [u8; 16]) -> MutationIdentity {
     MutationIdentity {
         namespace_seed,
@@ -502,6 +514,17 @@ mod tests {
         }
     }
 
+    fn mutation_identity(seed_suffix: u8, proof: u8) -> MutationIdentity {
+        let mut namespace_seed = uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000000")
+            .expect("fixture UUID")
+            .into_bytes();
+        namespace_seed[15] = seed_suffix;
+        MutationIdentity {
+            namespace_seed,
+            operation_proof: [proof; 32],
+        }
+    }
+
     fn plugin() -> PluginRegistryEntry {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: "plugin_csv_v2".to_string(),
@@ -570,16 +593,9 @@ mod tests {
 
     #[test]
     fn create_context_produces_stable_uuid_v7_values() {
-        let creates = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
-                    .unwrap()
-                    .into_bytes(),
-                operation_proof: [8; 32],
-            },
-            &actor_key(),
-        )
-        .creates();
+        let creates = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
+            .expect("valid UUIDv7 seed")
+            .creates();
         let value = creates.component(42).expect("uuid");
         let parsed = uuid::Uuid::parse_str(&value).expect("canonical UUID");
         assert_eq!(parsed.get_version_num(), 7);
@@ -587,14 +603,23 @@ mod tests {
     }
 
     #[test]
-    fn validation_distinguishes_current_existing_and_malformed_ids() {
-        let old = BoundCreateContext::bind(
+    fn create_context_rejects_a_namespace_seed_without_uuid_v7_time_semantics() {
+        let error = BoundCreateContext::bind(
             MutationIdentity {
-                namespace_seed: [6; 16],
-                operation_proof: [5; 32],
+                namespace_seed: [0x31; 16],
+                operation_proof: [0x41; 32],
             },
             &actor_key(),
-        );
+        )
+        .expect_err("arbitrary retry bytes must not become a UUID timestamp");
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert!(error.message.contains("UUIDv7"));
+    }
+
+    #[test]
+    fn validation_distinguishes_current_existing_and_malformed_ids() {
+        let old = BoundCreateContext::bind(mutation_identity(6, 5), &actor_key())
+            .expect("valid UUIDv7 seed");
         let old_id = old.creates().component(1).unwrap();
         let changes = WasmEntityChanges {
             changes: vec![create(0), upsert(old_id)],
@@ -615,16 +640,9 @@ mod tests {
 
     #[test]
     fn keyless_create_materializes_the_defaulted_id_once() {
-        let context = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000007")
-                    .unwrap()
-                    .into_bytes(),
-                operation_proof: [8; 32],
-            },
-            &actor_key(),
-        )
-        .creates();
+        let context = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
+            .expect("valid UUIDv7 seed")
+            .creates();
         let expected_id = context.component(42).unwrap();
         let mut changes = WasmEntityChanges {
             changes: vec![WasmEntityChange::Create {
@@ -661,13 +679,8 @@ mod tests {
 
     #[test]
     fn reservation_accepts_same_proof_and_rejects_seed_collision() {
-        let first = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [7; 16],
-                operation_proof: [8; 32],
-            },
-            &actor_key(),
-        );
+        let first = BoundCreateContext::bind(mutation_identity(7, 8), &actor_key())
+            .expect("valid UUIDv7 seed");
         let existing = row_for(first);
         assert!(
             reserve_create_row(
@@ -680,13 +693,8 @@ mod tests {
             .is_none()
         );
 
-        let collision = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [7; 16],
-                operation_proof: [9; 32],
-            },
-            &actor_key(),
-        );
+        let collision = BoundCreateContext::bind(mutation_identity(7, 9), &actor_key())
+            .expect("valid UUIDv7 seed");
         assert_eq!(first.prefix, collision.prefix);
         let error = reserve_create_row(
             Some(&existing),
@@ -700,21 +708,11 @@ mod tests {
 
     #[test]
     fn reservation_preflight_reports_seed_collision_as_constraint_violation() {
-        let first = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [0x31; 16],
-                operation_proof: [0x41; 32],
-            },
-            &actor_key(),
-        );
+        let first = BoundCreateContext::bind(mutation_identity(0x31, 0x41), &actor_key())
+            .expect("valid UUIDv7 seed");
         let existing = row_for(first);
-        let collision = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [0x31; 16],
-                operation_proof: [0x42; 32],
-            },
-            &actor_key(),
-        );
+        let collision = BoundCreateContext::bind(mutation_identity(0x31, 0x42), &actor_key())
+            .expect("valid UUIDv7 seed");
 
         let error = validate_create_reservation(
             Some(&existing),
@@ -731,13 +729,8 @@ mod tests {
     fn large_cold_import_and_sparse_insert_use_one_reservation_each() {
         const ROWS: u64 = 220_000;
         let actor_key = actor_key();
-        let cold = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [1; 16],
-                operation_proof: [2; 32],
-            },
-            &actor_key,
-        );
+        let cold = BoundCreateContext::bind(mutation_identity(1, 2), &actor_key)
+            .expect("valid UUIDv7 seed");
         let cold_changes = WasmEntityChanges {
             changes: (0..ROWS).map(create).collect(),
         };
@@ -754,13 +747,8 @@ mod tests {
             1,
         );
 
-        let edit = BoundCreateContext::bind(
-            MutationIdentity {
-                namespace_seed: [3; 16],
-                operation_proof: [4; 32],
-            },
-            &actor_key,
-        );
+        let edit = BoundCreateContext::bind(mutation_identity(3, 4), &actor_key)
+            .expect("valid UUIDv7 seed");
         let edit_changes = WasmEntityChanges {
             changes: vec![upsert(cold.creates().component(17).unwrap())],
         };

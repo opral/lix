@@ -2956,7 +2956,9 @@ async fn v2_create_reservations_survive_restart_and_tombstone_with_file() {
         .unwrap();
     assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 1);
     let inserted_identity = MutationIdentity {
-        namespace_seed: [0x31; 16],
+        namespace_seed: uuid::Uuid::parse_str("01920000-0000-7000-8000-000000000031")
+            .expect("fixture UUIDv7")
+            .into_bytes(),
         operation_proof: [0x41; 32],
     };
     write_file_with_mutation_identity(
