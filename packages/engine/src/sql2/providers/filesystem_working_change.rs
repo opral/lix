@@ -343,7 +343,10 @@ where
     let file_entity_pks = if load_all_files {
         Vec::new()
     } else {
-        selected_file_ids.iter().map(EntityPk::single).collect()
+        selected_file_ids
+            .iter()
+            .map(|file_id| filesystem_descriptor_entity_pk(file_id, "file"))
+            .collect::<Result<Vec<_>, _>>()?
     };
     let files = if !load_all_files && selected_file_ids.is_empty() {
         Vec::new()
@@ -425,7 +428,9 @@ where
             tracked,
             commit_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            ids.into_iter().map(EntityPk::single).collect(),
+            ids.iter()
+                .map(|directory_id| filesystem_descriptor_entity_pk(directory_id, "directory"))
+                .collect::<Result<Vec<_>, _>>()?,
         )
         .await?;
         pending.extend(
@@ -437,6 +442,15 @@ where
         directories.extend(loaded);
     }
     Ok(directories)
+}
+
+fn filesystem_descriptor_entity_pk(id: &str, kind: &str) -> Result<EntityPk, LixError> {
+    EntityPk::uuid_from_canonical(id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("validated {kind} ID is not a canonical UUID: {error}"),
+        )
+    })
 }
 
 async fn scan_descriptors<S, T>(
