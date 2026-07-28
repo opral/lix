@@ -1056,7 +1056,7 @@ async fn stage_incremental_file_delete_cascades(
             metadata: JsonSlotRef::None,
             working_diff_baseline: baseline,
         })?;
-        stage_hot_mutation_value(writes, &encoded, Some(value));
+        stage_hot_mutation_value(writes, &encoded, Some(value.into()));
     }
     Ok(())
 }
@@ -1369,6 +1369,25 @@ fn hot_identity(
 struct EncodedHotMutationIdentity {
     row_key: Bytes,
     file_key: Option<Bytes>,
+}
+
+fn encode_hot_mutation_identity(
+    branch_id: &str,
+    generation: CommitId,
+    schema_key: &str,
+    entity_pk: &EntityPk,
+    file_id: Option<&str>,
+) -> EncodedHotMutationIdentity {
+    EncodedHotMutationIdentity {
+        row_key: Bytes::from(encode_hot_row_key_parts(
+            branch_id, generation, schema_key, entity_pk, file_id,
+        )),
+        file_key: file_id.map(|_| {
+            Bytes::from(encode_hot_file_key_parts(
+                branch_id, generation, schema_key, entity_pk, file_id,
+            ))
+        }),
+    }
 }
 
 fn encode_hot_mutation_identities(
