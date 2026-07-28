@@ -3026,7 +3026,7 @@ where
             let submitted_bytes = write.payload().shared_bytes();
             let mut verified_same_length_blob_splice = None;
 
-            let (mut changes, publication, materialized_bytes) = if same_plugin_owner {
+            let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {
                 let acknowledged_view = self.acknowledged_session_plugin_view(
                     &view.session_key,
                     selected,
@@ -3169,7 +3169,7 @@ where
 
                 let detection_document = detected_transition.document;
                 let mut counters = detected_transition.counters;
-                let changes = match self
+                let mut changes = match self
                     .suppress_v2_format_only_noops(selected, detected_transition.changes, &file_key)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
@@ -3178,6 +3178,30 @@ where
                     .await
                 {
                     Ok(changes) => changes,
+                    Err(error) => {
+                        if let Err(cleanup_error) =
+                            lease.actor_mut().drop_document(detection_document).await
+                        {
+                            return Err(lease.handle_guest_call_error(cleanup_error));
+                        }
+                        return Err(lease.handle_guest_call_error(error));
+                    }
+                };
+                let create_rows = match self
+                    .v2_create_rows(
+                        selected,
+                        &mut changes,
+                        create_context,
+                        &file_key,
+                        existing_create_reservation.as_ref(),
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_create_rows"
+                    ))
+                    .await
+                {
+                    Ok(rows) => rows,
                     Err(error) => {
                         if let Err(cleanup_error) =
                             lease.actor_mut().drop_document(detection_document).await
@@ -3293,6 +3317,7 @@ where
                         view,
                     },
                     materialized_bytes,
+                    create_rows,
                 )
             } else {
                 let store_permit = self.plugin_host.actor_cache().admit_store()?;
@@ -3332,7 +3357,20 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
-                let changes = validated.changes;
+                let mut changes = validated.changes;
+                let create_rows = self
+                    .v2_create_rows(
+                        selected,
+                        &mut changes,
+                        create_context,
+                        &file_key,
+                        existing_create_reservation.as_ref(),
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_create_rows"
+                    ))
+                    .await?;
                 let mut counters = validated.counters;
                 counters.host_content_classification_bytes = content_classification_bytes
                     .get(&file_key)
@@ -3354,31 +3392,8 @@ where
                         view,
                     },
                     submitted_bytes.clone(),
+                    create_rows,
                 )
-            };
-            let create_rows = self
-                .v2_create_rows(
-                    selected,
-                    &mut changes,
-                    create_context,
-                    &file_key,
-                    existing_create_reservation.as_ref(),
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.plugin_create_rows"
-                ))
-                .await;
-            let create_rows = match create_rows {
-                Ok(rows) => rows,
-                Err(error) => {
-                    publication.discard().await;
-                    discard_plugin_actor_publications(std::mem::take(
-                        &mut reconciliation.actor_publications,
-                    ))
-                    .await;
-                    return Err(error);
-                }
             };
             let change_rows = tracing::debug_span!(
                 target: "lix_perf",

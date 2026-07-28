@@ -429,6 +429,61 @@ async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
 }
 
 #[tokio::test]
+async fn v2_csv_stale_observation_composes_a_keyless_create_with_a_concurrent_edit() {
+    let archive = build_csv_v2_plugin_archive();
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v2",
+        &archive,
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/concurrent-create.csv";
+    let initial = b"first,one\n".to_vec();
+    write_file(&lix, path, initial.clone()).await.unwrap();
+    let file_id = lix
+        .execute(
+            "SELECT id FROM lix_file WHERE path = $1",
+            &[Value::Text(path.to_string())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    let edit_session = lix.open_workspace_session().await.unwrap();
+    let create_session = lix.open_workspace_session().await.unwrap();
+    assert_eq!(
+        read_file(&edit_session, path).await.unwrap(),
+        Some(initial.clone())
+    );
+    assert_eq!(
+        read_file(&create_session, path).await.unwrap(),
+        Some(initial)
+    );
+
+    write_file(&edit_session, path, b"first,ONE\n".to_vec())
+        .await
+        .unwrap();
+    write_file(&create_session, path, b"first,one\nsecond,two\n".to_vec())
+        .await
+        .expect("a keyless create from a stale observation should render onto current bytes");
+
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"first,ONE\nsecond,two\n".to_vec())
+    );
+    assert_eq!(plugin_create_reservation_count(&lix, &file_id).await, 2);
+
+    edit_session.close().await.unwrap();
+    create_session.close().await.unwrap();
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
     let archive = build_csv_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
