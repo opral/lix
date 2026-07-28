@@ -78,6 +78,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     read: &mut impl StorageAdapterRead,
     prepared_writes: PreparedWriteSet,
 ) -> Result<(StorageWriteSet, Vec<StoragePrecondition>), LixError> {
+    let certified_fresh_plugin_file_id =
+        crate::transaction::validation::fresh_plugin_file_import_certificate(&prepared_writes)
+            .is_some()
+            .then(|| prepared_writes.file_data_writes[0].file_id.clone());
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
     for publication in &prepared_writes.checkpoint_publications {
@@ -237,6 +241,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_identities,
+        certified_fresh_plugin_file_id.as_deref(),
         &branch_control_observations,
         &checkpoint_epochs,
     )
@@ -1357,6 +1362,7 @@ async fn stage_tracked_head(
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
     insert_identities: &BTreeMap<PreparedStateRowIdentity, PreparedInsertIdentity>,
+    certified_fresh_plugin_file_id: Option<&str>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CommitId>,
 ) -> Result<StagedHotHeads, LixError> {
@@ -1376,6 +1382,10 @@ async fn stage_tracked_head(
         insert_identities,
         &lifecycle_ids,
     )
+    .instrument(tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.materialization.tracked_head.lifecycle"
+    ))
     .await?;
     let explicit_branches = explicit_branch_head_targets(state_rows)?
         .into_keys()
@@ -1409,10 +1419,17 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let mut tracked_deltas = state_row_indices
-            .iter()
-            .map(|&row_index| current_state_delta_from_state_row(&state_rows[row_index]))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut tracked_deltas = {
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.tracked_head.deltas"
+            )
+            .entered();
+            state_row_indices
+                .iter()
+                .map(|&row_index| current_state_delta_from_state_row(&state_rows[row_index]))
+                .collect::<Result<Vec<_>, _>>()?
+        };
         let selected_materialization = if !staged.selected_change_refs.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
@@ -1501,23 +1518,30 @@ async fn stage_tracked_head(
                 .filter(|row| row.branch_id == root.branch_id)
                 .map(current_state_delta_from_engine_row),
         );
-        let absence_guards = if insert_identities.is_empty() {
-            BTreeSet::new()
-        } else {
-            state_rows
-                .iter()
-                .filter(|row| {
-                    row.branch_id == root.branch_id
-                        && row.schema_key != BRANCH_REF_SCHEMA_KEY
-                        && row.snapshot.is_some()
-                        && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
-                })
-                .map(|row| TrackedStateKey {
-                    schema_key: row.schema_key.clone(),
-                    file_id: row.file_id.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                })
-                .collect()
+        let absence_guards = {
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.tracked_head.absence_guards"
+            )
+            .entered();
+            if insert_identities.is_empty() {
+                BTreeSet::new()
+            } else {
+                state_rows
+                    .iter()
+                    .filter(|row| {
+                        row.branch_id == root.branch_id
+                            && row.schema_key != BRANCH_REF_SCHEMA_KEY
+                            && row.snapshot.is_some()
+                            && insert_identities.contains_key(&PreparedStateRowIdentity::from(*row))
+                    })
+                    .map(|row| TrackedStateKey {
+                        schema_key: row.schema_key.clone(),
+                        file_id: row.file_id.clone(),
+                        entity_pk: row.entity_pk.clone(),
+                    })
+                    .collect()
+            }
         };
         let parent_generation = match (root.parent_commit_id, parent_control) {
             (Some(parent_commit_id), Some(control))
@@ -1613,20 +1637,51 @@ async fn stage_tracked_head(
             .unwrap_or_default();
         let mut deltas = tracked_deltas;
         deltas.extend(untracked_deltas);
-        let generation = tracked_head
-            .writer(read, writes)
-            .stage_current_state_with_working_diff(
-                &root.branch_id,
-                Some(parent_generation),
-                root.commit_id,
-                &deltas,
-                &absence_guards,
-                None,
-                None,
-                working_diff_capture_checkpoint_commit_id,
-                &mut coverage,
-            )
-            .await?;
+        // Every absence guard above is derived from one of these exact
+        // transaction deltas. The fresh-file certificate likewise proves its
+        // complete file-scoped namespace absent. The branch-control CAS
+        // protects both proofs through publication.
+        let has_validated_insert_deltas = staged.selected_change_refs.is_empty()
+            && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
+        let mut writer = tracked_head.writer(read, writes);
+        let generation = if has_validated_insert_deltas {
+            writer
+                .stage_validated_insert_current_state_with_working_diff(
+                    &root.branch_id,
+                    Some(parent_generation),
+                    root.commit_id,
+                    &deltas,
+                    &absence_guards,
+                    None,
+                    None,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                    certified_fresh_plugin_file_id,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_current_state"
+                ))
+                .await?
+        } else {
+            writer
+                .stage_current_state_with_working_diff(
+                    &root.branch_id,
+                    Some(parent_generation),
+                    root.commit_id,
+                    &deltas,
+                    &absence_guards,
+                    None,
+                    None,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_current_state"
+                ))
+                .await?
+        };
         if let Some(epoch) = working_diff_epoch {
             let next_epoch = TrackedWorkingDiffEpoch {
                 checkpoint_commit_id: epoch.checkpoint_commit_id,

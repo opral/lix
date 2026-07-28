@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use bytes::Bytes;
+use tracing::Instrument as _;
 
 use super::*;
 
@@ -522,17 +523,104 @@ where
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
     ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            parent_generation,
+            new_head,
+            deltas,
+            absence_guards,
+            parent_rows,
+            preserved_untracked_rows,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+            false,
+            None,
+        )
+        .await
+    }
+
+    /// Stages deltas whose absence was already validated against the coherent
+    /// transaction snapshot. The caller must publish the corresponding branch
+    /// control with a compare-and-swap precondition from that same snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_validated_insert_current_state_with_working_diff(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+        validated_absent_file_id: Option<&str>,
+    ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            parent_generation,
+            new_head,
+            deltas,
+            absence_guards,
+            parent_rows,
+            preserved_untracked_rows,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+            true,
+            validated_absent_file_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_current_state_with_working_diff_inner(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        parent_rows: Option<Vec<MaterializedTrackedStateRow>>,
+        preserved_untracked_rows: Option<Vec<MaterializedLiveStateRow>>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+        absence_guards_validated: bool,
+        validated_absent_file_id: Option<&str>,
+    ) -> Result<CommitId, LixError> {
         let generation = parent_generation.unwrap_or(new_head);
-        let mut sorted = deltas.iter().collect::<Vec<_>>();
-        for delta in &sorted {
-            delta.validate()?;
-        }
-        sorted.sort_unstable_by(|left, right| compare_hot_deltas(left, right));
-        for pair in sorted.windows(2) {
-            if compare_hot_deltas(pair[0], pair[1]).is_eq() {
-                return Err(current_state_duplicate_delta_error(pair[1]));
+        let sorted = {
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.hot.sort"
+            )
+            .entered();
+            let mut sorted = deltas.iter().collect::<Vec<_>>();
+            for delta in &sorted {
+                delta.validate()?;
             }
-        }
+            let mut already_strictly_sorted = true;
+            for pair in sorted.windows(2) {
+                match compare_hot_deltas(pair[0], pair[1]) {
+                    Ordering::Less => {}
+                    Ordering::Equal => {
+                        return Err(current_state_duplicate_delta_error(pair[1]));
+                    }
+                    Ordering::Greater => {
+                        already_strictly_sorted = false;
+                        break;
+                    }
+                }
+            }
+            if !already_strictly_sorted {
+                sorted.sort_unstable_by(|left, right| compare_hot_deltas(left, right));
+                for pair in sorted.windows(2) {
+                    if compare_hot_deltas(pair[0], pair[1]).is_eq() {
+                        return Err(current_state_duplicate_delta_error(pair[1]));
+                    }
+                }
+            }
+            sorted
+        };
 
         if parent_generation.is_none() {
             stage_hot_bootstrap(
@@ -549,23 +637,54 @@ where
             return Ok(generation);
         }
 
-        let identities = sorted
-            .iter()
-            .map(|delta| {
-                encode_hot_mutation_identity(
-                    branch_id,
-                    generation,
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                )
-            })
-            .collect::<Vec<_>>();
+        let identities = {
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.hot.identities"
+            )
+            .entered();
+            encode_hot_mutation_identities(branch_id, generation, &sorted)
+        };
         // Mutation validation must use primary rows rather than the file-id
         // projection. The projection is an equally-valued read accelerator,
         // not an ownership record.
-        let previous_values =
-            hot_load_primary_mutation_identity_bytes(self.store, &identities).await?;
+        let guarded_deltas = if absence_guards_validated {
+            sorted
+                .iter()
+                .map(|delta| {
+                    validated_absent_file_id.is_some_and(|file_id| delta.file_id == Some(file_id))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            vec![false; sorted.len()]
+        };
+        let identities_requiring_reads = identities
+            .iter()
+            .zip(&guarded_deltas)
+            .filter(|(_, guarded)| !**guarded)
+            .map(|(identity, _)| identity)
+            .collect::<Vec<_>>();
+        let loaded_previous_values =
+            hot_load_primary_mutation_identity_refs(self.store, &identities_requiring_reads)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.hot.previous"
+                ))
+                .await?;
+        let mut loaded_previous_values = loaded_previous_values.into_iter();
+        let previous_values = guarded_deltas
+            .iter()
+            .map(|guarded| {
+                if *guarded {
+                    None
+                } else {
+                    loaded_previous_values
+                        .next()
+                        .expect("every unguarded hot delta has one loaded previous value")
+                }
+            })
+            .collect::<Vec<_>>();
+        debug_assert_eq!(loaded_previous_values.len(), 0);
         let mut created_ats = Vec::with_capacity(sorted.len());
         let mut retired_untracked_json_refs = BTreeSet::new();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
@@ -585,7 +704,7 @@ where
             }
             created_ats.push(existing.created_at);
         }
-        let unmatched_guards = if absence_guards.is_empty() {
+        let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
         } else {
             let delta_keys = sorted
@@ -611,50 +730,69 @@ where
         // point-read batch against it here.
         let mut next_coverage = *coverage;
         let mut diff_keys = Vec::new();
-        let mut next_values = Vec::with_capacity(sorted.len());
-        for (delta, (created_at, previous)) in
-            sorted.iter().zip(created_ats.iter().zip(&previous_values))
+        let mut next_value_ranges = Vec::with_capacity(sorted.len());
+        let mut next_value_bytes = Vec::new();
         {
-            // Ordinary commits have no active checkpoint, so their baseline
-            // is always disabled. Do not decode the row a second time merely
-            // to rediscover that fact; the first decode above already handled
-            // retention validation and `created_at` preservation.
-            let (working_diff_baseline, newly_dirty) =
-                if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
-                    let previous = previous.as_deref().map(decode_head_value).transpose()?;
-                    next_hot_working_diff_baseline(
-                        working_diff_capture_checkpoint_commit_id,
-                        delta,
-                        previous,
-                    )?
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.hot.values"
+            )
+            .entered();
+            for (delta, (created_at, previous)) in
+                sorted.iter().zip(created_ats.iter().zip(&previous_values))
+            {
+                // Ordinary commits have no active checkpoint, so their baseline
+                // is always disabled. Do not decode the row a second time merely
+                // to rediscover that fact; the first decode above already handled
+                // retention validation and `created_at` preservation.
+                let (working_diff_baseline, newly_dirty) =
+                    if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
+                        let previous = previous.as_deref().map(decode_head_value).transpose()?;
+                        next_hot_working_diff_baseline(
+                            working_diff_capture_checkpoint_commit_id,
+                            delta,
+                            previous,
+                        )?
+                    } else {
+                        (WorkingDiffBaseline::Disabled, false)
+                    };
+                if newly_dirty {
+                    let checkpoint_commit_id = working_diff_capture_checkpoint_commit_id
+                        .expect("a newly dirty hot row requires an active checkpoint");
+                    let key = encode_hot_diff_key_parts(
+                        branch_id,
+                        checkpoint_commit_id,
+                        generation,
+                        delta.schema_key,
+                        delta.entity_pk,
+                        delta.file_id,
+                    );
+                    next_coverage.add_encoded_group_key(&key).ok_or_else(|| {
+                        head_value_error("hot working-diff index count exceeds u64")
+                    })?;
+                    diff_keys.push(key);
+                }
+                next_value_ranges.push(if delta.physically_deletes() {
+                    None
                 } else {
-                    (WorkingDiffBaseline::Disabled, false)
-                };
-            if newly_dirty {
-                let checkpoint_commit_id = working_diff_capture_checkpoint_commit_id
-                    .expect("a newly dirty hot row requires an active checkpoint");
-                let key = encode_hot_diff_key_parts(
-                    branch_id,
-                    checkpoint_commit_id,
-                    generation,
-                    delta.schema_key,
-                    delta.entity_pk,
-                    delta.file_id,
-                );
-                next_coverage
-                    .add_encoded_group_key(&key)
-                    .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
-                diff_keys.push(key);
+                    Some(append_head_value(
+                        &mut next_value_bytes,
+                        &delta.value_ref(*created_at, working_diff_baseline),
+                    )?)
+                });
             }
-            next_values.push(
-                (!delta.physically_deletes())
-                    .then(|| {
-                        encode_head_value(&delta.value_ref(*created_at, working_diff_baseline))
-                    })
-                    .transpose()?,
-            );
         }
+        let next_value_bytes = Bytes::from(next_value_bytes);
+        let next_values = next_value_ranges
+            .into_iter()
+            .map(|range| range.map(|range| next_value_bytes.slice(range)))
+            .collect::<Vec<_>>();
 
+        let _stage_span = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.materialization.hot.stage"
+        )
+        .entered();
         self.writes.reserve_space(
             HOT_ROW_SPACE,
             next_values.iter().filter(|value| value.is_some()).count(),
@@ -913,7 +1051,7 @@ async fn stage_incremental_file_delete_cascades(
             metadata: JsonSlotRef::None,
             working_diff_baseline: baseline,
         })?;
-        stage_hot_mutation_value(writes, &encoded, Some(value));
+        stage_hot_mutation_value(writes, &encoded, Some(value.into()));
     }
     Ok(())
 }
@@ -1247,9 +1385,45 @@ fn encode_hot_mutation_identity(
     }
 }
 
-async fn hot_load_primary_mutation_identity_bytes(
+fn encode_hot_mutation_identities(
+    branch_id: &str,
+    generation: CommitId,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+) -> Vec<EncodedHotMutationIdentity> {
+    let scope = hot_scope_prefix(branch_id, generation);
+    let mut encoded = Vec::new();
+    let mut ranges = Vec::with_capacity(deltas.len());
+    for delta in deltas {
+        let row_start = encoded.len();
+        encoded.extend_from_slice(&scope);
+        write_key_string(&mut encoded, delta.schema_key, KEY_PART_FINAL);
+        write_entity_pk(&mut encoded, delta.entity_pk);
+        write_file_id(&mut encoded, delta.file_id);
+        let row_range = row_start..encoded.len();
+
+        let file_range = delta.file_id.map(|file_id| {
+            let file_start = encoded.len();
+            encoded.extend_from_slice(&scope);
+            write_key_string(&mut encoded, delta.schema_key, KEY_PART_FINAL);
+            write_file_id(&mut encoded, Some(file_id));
+            write_entity_pk(&mut encoded, delta.entity_pk);
+            file_start..encoded.len()
+        });
+        ranges.push((row_range, file_range));
+    }
+    let encoded = Bytes::from(encoded);
+    ranges
+        .into_iter()
+        .map(|(row_range, file_range)| EncodedHotMutationIdentity {
+            row_key: encoded.slice(row_range),
+            file_key: file_range.map(|range| encoded.slice(range)),
+        })
+        .collect()
+}
+
+async fn hot_load_primary_mutation_identity_refs(
     store: &(impl StorageAdapterRead + ?Sized),
-    identities: &[EncodedHotMutationIdentity],
+    identities: &[&EncodedHotMutationIdentity],
 ) -> Result<Vec<Option<Bytes>>, LixError> {
     if identities.is_empty() {
         return Ok(Vec::new());
@@ -1270,7 +1444,7 @@ async fn hot_load_primary_mutation_identity_bytes(
 fn stage_hot_mutation_value(
     writes: &mut StorageWriteSet,
     identity: &EncodedHotMutationIdentity,
-    value: Option<Vec<u8>>,
+    value: Option<Bytes>,
 ) {
     let Some(value) = value else {
         writes.delete(HOT_ROW_SPACE, StorageKey(identity.row_key.clone()));
@@ -1280,7 +1454,6 @@ fn stage_hot_mutation_value(
         return;
     };
     if let Some(file_key) = &identity.file_key {
-        let value = Bytes::from(value);
         writes.put(
             HOT_ROW_SPACE,
             StorageKey(identity.row_key.clone()),
@@ -1297,9 +1470,7 @@ fn stage_hot_mutation_value(
         writes.put(
             HOT_ROW_SPACE,
             StorageKey(identity.row_key.clone()),
-            StorageValue {
-                bytes: Bytes::from(value),
-            },
+            StorageValue { bytes: value },
         );
     }
 }

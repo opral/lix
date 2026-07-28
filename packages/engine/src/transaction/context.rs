@@ -4905,28 +4905,21 @@ fn suppress_v2_format_only_noops_against_rows(
                     continue;
                 };
                 let candidate = match &entity.snapshot_content {
-                    WasmHostBytes::Inline(bytes) => bytes,
-                    WasmHostBytes::Source(_) => {
+                    WasmHostBytes::CanonicalJson { value, .. } => value.as_ref(),
+                    WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "validated v2 guest changes must own canonical inline snapshots",
+                            "validated v2 guest changes must own parsed canonical snapshots",
                         ));
                     }
                 };
-                let candidate =
-                    serde_json::from_slice::<JsonValue>(candidate).map_err(|error| {
-                        LixError::new(
-                            LixError::CODE_INVALID_PLUGIN,
-                            format!("validated v2 snapshot is invalid JSON: {error}"),
-                        )
-                    })?;
                 let base = serde_json::from_str::<JsonValue>(base_snapshot).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
                         format!("accepted v2 snapshot is invalid JSON: {error}"),
                     )
                 })?;
-                candidate == base
+                candidate == &base
             }
             WasmEntityChange::Upsert { .. } | WasmEntityChange::Delete(_) => false,
         };
@@ -4945,21 +4938,17 @@ fn plugin_detected_changes_from_v2(
         let (key, snapshot_content, effect) = match change {
             WasmEntityChange::Delete(key) => (key, None, WasmChangeEffect::Content),
             WasmEntityChange::Upsert { entity, effect } => {
-                let bytes = match &entity.snapshot_content {
-                    WasmHostBytes::Inline(bytes) => bytes,
-                    WasmHostBytes::Source(_) => {
+                let snapshot = match &entity.snapshot_content {
+                    WasmHostBytes::CanonicalJson { value, normalized } => {
+                        TransactionJson::from_parts(value.clone(), normalized.clone())
+                    }
+                    WasmHostBytes::Inline(_) | WasmHostBytes::Source(_) => {
                         return Err(LixError::new(
                             LixError::CODE_INTERNAL_ERROR,
-                            "validated v2 guest changes must own canonical inline snapshots",
+                            "validated v2 guest changes must own parsed canonical snapshots",
                         ));
                     }
                 };
-                let snapshot = String::from_utf8(bytes.clone()).map_err(|_| {
-                    LixError::new(
-                        LixError::CODE_INVALID_PLUGIN,
-                        "validated v2 snapshot is not UTF-8",
-                    )
-                })?;
                 (&entity.key, Some(snapshot), *effect)
             }
         };
@@ -6621,10 +6610,7 @@ fn plugin_change_rows(
                 entity_pk: Some(change.entity_pk),
                 schema_key: change.schema_key,
                 file_id: Some(file_id.to_string()),
-                snapshot: change
-                    .snapshot_content
-                    .map(|raw| plugin_transaction_json(&raw, json_context))
-                    .transpose()?,
+                snapshot: change.snapshot_content,
                 metadata: change
                     .metadata
                     .map(|raw| plugin_transaction_json(&raw, json_context))
@@ -6955,12 +6941,21 @@ mod tests {
             untracked: false,
             branch_id: "branch-a".into(),
         };
-        let upsert = |id: &str, snapshot: &[u8], effect| WasmEntityChange::Upsert {
-            entity: WasmEntity {
-                key: key(id),
-                snapshot_content: WasmHostBytes::Inline(snapshot.to_vec()),
-            },
-            effect,
+        let upsert = |id: &str, snapshot: &[u8], effect| {
+            let value = serde_json::from_slice::<JsonValue>(snapshot)
+                .expect("test snapshot must contain valid JSON");
+            let normalized =
+                String::from_utf8(snapshot.to_vec()).expect("test snapshot must be UTF-8");
+            WasmEntityChange::Upsert {
+                entity: WasmEntity {
+                    key: key(id),
+                    snapshot_content: WasmHostBytes::CanonicalJson {
+                        value: Arc::new(value),
+                        normalized: normalized.into(),
+                    },
+                },
+                effect,
+            }
         };
         let changes = WasmHostEntityChanges {
             changes: vec![

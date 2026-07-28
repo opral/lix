@@ -1239,17 +1239,29 @@ struct HeadValueEncode<'a> {
 }
 
 fn encode_head_value(value: &HeadValueRef<'_>) -> Result<Vec<u8>, LixError> {
-    encode_head_value_parts(HeadValueEncode {
-        change_id: value.change_id,
-        commit_id: value.commit_id,
-        untracked: value.untracked,
-        deleted: value.deleted,
-        created_at: value.created_at,
-        updated_at: value.updated_at,
-        snapshot: value.snapshot.into(),
-        metadata: value.metadata.into(),
-        working_diff_baseline: value.working_diff_baseline,
-    })
+    let mut bytes = Vec::new();
+    append_head_value(&mut bytes, value)?;
+    Ok(bytes)
+}
+
+fn append_head_value(
+    bytes: &mut Vec<u8>,
+    value: &HeadValueRef<'_>,
+) -> Result<std::ops::Range<usize>, LixError> {
+    append_head_value_parts(
+        bytes,
+        HeadValueEncode {
+            change_id: value.change_id,
+            commit_id: value.commit_id,
+            untracked: value.untracked,
+            deleted: value.deleted,
+            created_at: value.created_at,
+            updated_at: value.updated_at,
+            snapshot: value.snapshot.into(),
+            metadata: value.metadata.into(),
+            working_diff_baseline: value.working_diff_baseline,
+        },
+    )
 }
 
 fn reencode_head_value_with_baseline(
@@ -1270,6 +1282,15 @@ fn reencode_head_value_with_baseline(
 }
 
 fn encode_head_value_parts(value: HeadValueEncode<'_>) -> Result<Vec<u8>, LixError> {
+    let mut bytes = Vec::new();
+    append_head_value_parts(&mut bytes, value)?;
+    Ok(bytes)
+}
+
+fn append_head_value_parts(
+    bytes: &mut Vec<u8>,
+    value: HeadValueEncode<'_>,
+) -> Result<std::ops::Range<usize>, LixError> {
     let snapshot_kind = encoded_slot_kind(value.snapshot);
     let metadata_kind = encoded_slot_kind(value.metadata);
     if value.deleted && (snapshot_kind != HEAD_SLOT_NONE || metadata_kind != HEAD_SLOT_NONE) {
@@ -1319,7 +1340,8 @@ fn encode_head_value_parts(value: HeadValueEncode<'_>) -> Result<Vec<u8>, LixErr
             })
         })
         .ok_or_else(|| head_value_error("encoded row length overflow"))?;
-    let mut bytes = Vec::with_capacity(capacity);
+    let start = bytes.len();
+    bytes.reserve(capacity);
     bytes.push(HEAD_VALUE_VERSION);
     let mut flags = if value.deleted { HEAD_VALUE_DELETED } else { 0 };
     if value.untracked {
@@ -1344,13 +1366,13 @@ fn encode_head_value_parts(value: HeadValueEncode<'_>) -> Result<Vec<u8>, LixErr
             .map_err(|_| head_value_error("metadata payload exceeds v5 u32 limit"))?
             .to_be_bytes(),
     );
-    append_slot_payload(&mut bytes, value.snapshot);
-    append_slot_payload(&mut bytes, value.metadata);
+    append_slot_payload(bytes, value.snapshot);
+    append_slot_payload(bytes, value.metadata);
     if let WorkingDiffBaseline::BeforePresent(version) = value.working_diff_baseline {
-        encode_working_diff_version(&mut bytes, version);
+        encode_working_diff_version(bytes, version);
     }
-    debug_assert_eq!(bytes.len(), capacity);
-    Ok(bytes)
+    debug_assert_eq!(bytes.len() - start, capacity);
+    Ok(start..bytes.len())
 }
 
 fn encode_working_diff_baseline_tag(baseline: WorkingDiffBaseline) -> u8 {

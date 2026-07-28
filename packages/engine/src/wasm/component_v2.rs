@@ -10,6 +10,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value as JsonValue;
 
 use crate::{LixError, wasm::WasmLimits};
 
@@ -303,6 +304,10 @@ impl WasmSourceSlice {
 pub enum WasmHostBytes {
     Inline(Vec<u8>),
     Source(WasmSourceSlice),
+    CanonicalJson {
+        value: Arc<JsonValue>,
+        normalized: Arc<str>,
+    },
 }
 
 impl WasmHostBytes {
@@ -310,6 +315,7 @@ impl WasmHostBytes {
         match self {
             Self::Inline(bytes) => bytes.len() as u64,
             Self::Source(slice) => slice.range.length,
+            Self::CanonicalJson { normalized, .. } => normalized.len() as u64,
         }
     }
 

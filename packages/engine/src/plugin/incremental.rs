@@ -718,6 +718,36 @@ pub(crate) fn canonicalize_v2_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError
     Ok(canonical.into_bytes())
 }
 
+fn validated_v2_snapshot(bytes: &[u8]) -> Result<WasmHostBytes, LixError> {
+    let value = parse_number_free_snapshot(bytes)?;
+    if !matches!(value, NumberFreeJson::Object(_)) {
+        return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+    }
+    let mut normalized = String::new();
+    encode_number_free_json(&value, &mut normalized);
+    Ok(WasmHostBytes::CanonicalJson {
+        value: Arc::new(number_free_json_value(value)),
+        normalized: normalized.into(),
+    })
+}
+
+fn number_free_json_value(value: NumberFreeJson) -> serde_json::Value {
+    match value {
+        NumberFreeJson::Null => serde_json::Value::Null,
+        NumberFreeJson::Bool(value) => serde_json::Value::Bool(value),
+        NumberFreeJson::String(value) => serde_json::Value::String(value),
+        NumberFreeJson::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(number_free_json_value).collect())
+        }
+        NumberFreeJson::Object(values) => serde_json::Value::Object(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, number_free_json_value(value)))
+                .collect(),
+        ),
+    }
+}
+
 fn parse_number_free_snapshot(bytes: &[u8]) -> Result<NumberFreeJson, LixError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = NumberFreeJson::deserialize(&mut deserializer).map_err(|error| {
@@ -1214,6 +1244,11 @@ fn encoded_host_bytes_ref_bytes(value: &WasmHostBytes) -> Result<u64, LixError> 
                 .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
             Ok(1 + 4 + u64::from(length))
         }
+        WasmHostBytes::CanonicalJson { normalized, .. } => {
+            let length = u32::try_from(normalized.len())
+                .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
+            Ok(1 + 4 + u64::from(length))
+        }
         WasmHostBytes::Source(slice) => {
             slice.validate()?;
             Ok(1 + 4 + 8 + 8)
@@ -1357,11 +1392,11 @@ async fn drain_file_transition_changes_inner(
                             &mut local_counters,
                         )
                         .await?;
-                        let snapshot = canonicalize_v2_snapshot(&snapshot)?;
+                        let snapshot = validated_v2_snapshot(&snapshot)?;
                         WasmEntityChange::Upsert {
                             entity: WasmEntity {
                                 key: entity.key,
-                                snapshot_content: WasmHostBytes::Inline(snapshot),
+                                snapshot_content: snapshot,
                             },
                             effect,
                         }
@@ -2483,6 +2518,18 @@ mod tests {
             canonical,
             r#"{"a":[true,null,"é"],"slash":"/","z":"\u000A"}"#.as_bytes()
         );
+        let WasmHostBytes::CanonicalJson { value, normalized } =
+            validated_v2_snapshot(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
+                .unwrap()
+        else {
+            panic!("validated snapshots must retain parsed canonical JSON")
+        };
+        assert_eq!(
+            normalized.as_ref(),
+            r#"{"a":[true,null,"é"],"slash":"/","z":"\u000A"}"#
+        );
+        assert_eq!(value["z"], "\n");
+        assert_eq!(value["a"][0], true);
 
         assert!(canonicalize_v2_snapshot(br#"{"nested":{"n":1}}"#).is_err());
         let duplicate = canonicalize_v2_snapshot(br#"{"a":"x","\u0061":"y"}"#)
@@ -2892,10 +2939,17 @@ mod tests {
         let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[0] else {
             panic!("expected upsert")
         };
-        let WasmHostBytes::Inline(snapshot) = &entity.snapshot_content else {
-            panic!("resolved snapshots must be inline owned bytes")
+        let WasmHostBytes::CanonicalJson {
+            value, normalized, ..
+        } = &entity.snapshot_content
+        else {
+            panic!("resolved snapshots must retain parsed canonical JSON")
         };
-        assert_eq!(snapshot, br#"{"cells":[],"id":"row","order_key":"a"}"#);
+        assert_eq!(
+            normalized.as_ref(),
+            r#"{"cells":[],"id":"row","order_key":"a"}"#
+        );
+        assert_eq!(value["id"], "row");
         assert!(drained.counters.attachment_reads > 1);
         assert_eq!(drained.counters.source_read_calls, 2);
         assert!(actor.finished);
