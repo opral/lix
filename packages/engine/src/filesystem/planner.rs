@@ -22,9 +22,11 @@ use super::keys::{
 };
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
+#[cfg(test)]
+use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{
     LogicalPrimaryKey, RawWriteBatch, TransactionFileData, TransactionJson,
-    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
+    TransactionWriteOperation, TransactionWriteOrigin,
 };
 
 /// Planned filesystem write output after SQL surface columns have been lowered
@@ -370,6 +372,61 @@ pub(crate) struct DerivedFileRefRowInput {
     pub(crate) sha256: String,
     pub(crate) size_bytes: usize,
     pub(crate) context: FilesystemRowContext,
+}
+
+impl DerivedFileRefRowInput {
+    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
+        let size_bytes = u64::try_from(self.size_bytes).map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "derived file size exceeds supported range for file '{}' branch '{}'",
+                    self.file_id, self.context.branch_id
+                ),
+            )
+        })?;
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "derived file materialization for '{}' must carry a lowercase SHA-256",
+                    self.file_id
+                ),
+            ));
+        }
+        if !self.path.starts_with('/') {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "derived file materialization for '{}' must carry an absolute renderer path",
+                    self.file_id
+                ),
+            ));
+        }
+        let snapshot = json!({
+            "id": self.file_id,
+            "path": self.path,
+            "sha256": self.sha256,
+            "size_bytes": size_bytes,
+        });
+        let file_id = self.file_id;
+        append_state_row(
+            rows,
+            file_id.clone(),
+            DERIVED_FILE_REF_SCHEMA_KEY,
+            Some(snapshot),
+            FilesystemRowContext {
+                file_id: Some(file_id),
+                ..self.context
+            },
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -931,114 +988,50 @@ fn filesystem_namespace_conflict_error(
 
 #[cfg(test)]
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> TransactionWriteRow {
-    directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
-        id: Some(input.id),
-        parent_id: input.parent_id,
-        name: input.name,
-        context: input.context,
-    })
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows);
+    rows.into_rows()
+        .pop()
+        .expect("directory-descriptor append produces one row")
 }
 
 #[cfg(test)]
 pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionWriteRow {
-    file_descriptor_write_row(FileDescriptorWriteIntent {
-        id: Some(input.id),
-        directory_id: input.directory_id,
-        name: input.name,
-        context: input.context,
-    })
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows);
+    rows.into_rows()
+        .pop()
+        .expect("file-descriptor append produces one row")
 }
 
 #[cfg(test)]
 pub(crate) fn directory_descriptor_write_row(
     input: DirectoryDescriptorWriteIntent,
 ) -> TransactionWriteRow {
-    let mut snapshot = JsonMap::new();
-    if let Some(id) = input.id.as_ref() {
-        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
-    }
-    snapshot.insert(
-        "parent_id".to_string(),
-        input
-            .parent_id
-            .clone()
-            .map(JsonValue::String)
-            .unwrap_or(JsonValue::Null),
-    );
-    snapshot.insert("name".to_string(), JsonValue::String(input.name));
-
-    partial_state_row(
-        input.id,
-        DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-        Some(JsonValue::Object(snapshot)),
-        input.context,
-    )
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows);
+    rows.into_rows()
+        .pop()
+        .expect("directory-descriptor write append produces one row")
 }
 
 #[cfg(test)]
 pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> TransactionWriteRow {
-    let mut snapshot = JsonMap::new();
-    if let Some(id) = input.id.as_ref() {
-        snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
-    }
-    snapshot.insert(
-        "directory_id".to_string(),
-        input
-            .directory_id
-            .clone()
-            .map(JsonValue::String)
-            .unwrap_or(JsonValue::Null),
-    );
-    snapshot.insert("name".to_string(), JsonValue::String(input.name));
-
-    partial_state_row(
-        input.id,
-        FILE_DESCRIPTOR_SCHEMA_KEY,
-        Some(JsonValue::Object(snapshot)),
-        input.context,
-    )
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows);
+    rows.into_rows()
+        .pop()
+        .expect("file-descriptor write append produces one row")
 }
 
+#[cfg(test)]
 pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<TransactionWriteRow, LixError> {
-    let size_bytes = u64::try_from(input.size_bytes).map_err(|_| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "binary blob size exceeds supported range for file '{}' branch '{}'",
-                input.file_id, input.context.branch_id
-            ),
-        )
-    })?;
-    let snapshot = json!({
-        "id": input.file_id,
-        "blob_hash": input.blob_hash.to_hex(),
-        "size_bytes": size_bytes,
-    });
-
-    Ok(state_row(
-        input.file_id.clone(),
-        BLOB_REF_SCHEMA_KEY,
-        Some(snapshot),
-        FilesystemRowContext {
-            file_id: Some(input.file_id),
-            ..input.context
-        },
-    ))
-}
-
-pub(crate) fn blob_ref_tombstone_row(
-    file_id: String,
-    context: FilesystemRowContext,
-) -> TransactionWriteRow {
-    tombstone_row(
-        file_id.clone(),
-        BLOB_REF_SCHEMA_KEY,
-        FilesystemRowContext {
-            file_id: Some(file_id),
-            metadata: None,
-            ..context
-        },
-    )
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows)?;
+    Ok(rows
+        .into_rows()
+        .pop()
+        .expect("blob-ref append produces one row"))
 }
 
 pub(crate) fn append_blob_ref_tombstone_row(
@@ -1058,72 +1051,16 @@ pub(crate) fn append_blob_ref_tombstone_row(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn derived_file_ref_row(
     input: DerivedFileRefRowInput,
 ) -> Result<TransactionWriteRow, LixError> {
-    let size_bytes = u64::try_from(input.size_bytes).map_err(|_| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "derived file size exceeds supported range for file '{}' branch '{}'",
-                input.file_id, input.context.branch_id
-            ),
-        )
-    })?;
-    if input.sha256.len() != 64
-        || !input
-            .sha256
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "derived file materialization for '{}' must carry a lowercase SHA-256",
-                input.file_id
-            ),
-        ));
-    }
-    if !input.path.starts_with('/') {
-        return Err(LixError::new(
-            LixError::CODE_INVALID_PLUGIN,
-            format!(
-                "derived file materialization for '{}' must carry an absolute renderer path",
-                input.file_id
-            ),
-        ));
-    }
-    let snapshot = json!({
-        "id": input.file_id,
-        "path": input.path,
-        "sha256": input.sha256,
-        "size_bytes": size_bytes,
-    });
-
-    Ok(state_row(
-        input.file_id.clone(),
-        DERIVED_FILE_REF_SCHEMA_KEY,
-        Some(snapshot),
-        FilesystemRowContext {
-            file_id: Some(input.file_id),
-            ..input.context
-        },
-    ))
-}
-
-pub(crate) fn derived_file_ref_tombstone_row(
-    file_id: String,
-    context: FilesystemRowContext,
-) -> TransactionWriteRow {
-    tombstone_row(
-        file_id.clone(),
-        DERIVED_FILE_REF_SCHEMA_KEY,
-        FilesystemRowContext {
-            file_id: Some(file_id),
-            metadata: None,
-            ..context
-        },
-    )
+    let mut rows = RawWriteBatch::with_capacity(1);
+    input.append_to(&mut rows)?;
+    Ok(rows
+        .into_rows()
+        .pop()
+        .expect("derived-file-ref append produces one row"))
 }
 
 pub(crate) fn append_derived_file_ref_tombstone_row(
@@ -1743,15 +1680,6 @@ impl DirectoryPathRecord for DirectoryDescriptorSeed {
     }
 }
 
-fn state_row(
-    entity_pk: String,
-    schema_key: &str,
-    snapshot: Option<JsonValue>,
-    context: FilesystemRowContext,
-) -> TransactionWriteRow {
-    partial_state_row(Some(entity_pk), schema_key, snapshot, context)
-}
-
 fn append_state_row(
     rows: &mut RawWriteBatch,
     entity_pk: String,
@@ -1760,42 +1688,6 @@ fn append_state_row(
     context: FilesystemRowContext,
 ) {
     append_partial_state_row(rows, Some(entity_pk), schema_key, snapshot, context);
-}
-
-fn partial_state_row(
-    entity_pk: Option<String>,
-    schema_key: &str,
-    snapshot: Option<JsonValue>,
-    context: FilesystemRowContext,
-) -> TransactionWriteRow {
-    let derived_entity_pk = entity_pk.map(|value| {
-        if snapshot.is_none() {
-            EntityPk::uuid_from_canonical(&value)
-                .expect("filesystem tombstones target validated UUID identities")
-        } else {
-            // These builders are schema-aware: filesystem descriptor and
-            // materialization IDs are declared UUID primary keys. Preserve an
-            // invalid caller value only until normalization can return the
-            // public schema-validation error instead of panicking.
-            EntityPk::uuid_from_canonical(&value).unwrap_or_else(|_| EntityPk::single(value))
-        }
-    });
-    let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
-    TransactionWriteRow {
-        entity_pk: derived_entity_pk,
-        schema_key: schema_key.into(),
-        file_id: context.file_id.map(Into::into),
-        snapshot,
-        metadata: context.metadata,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global: context.global,
-        change_id: None,
-        commit_id: None,
-        untracked: context.untracked,
-        branch_id: context.branch_id.into(),
-    }
 }
 
 fn append_partial_state_row(
@@ -1832,14 +1724,6 @@ fn append_partial_state_row(
         context.untracked,
         context.branch_id.into(),
     );
-}
-
-fn tombstone_row(
-    entity_pk: String,
-    schema_key: &str,
-    context: FilesystemRowContext,
-) -> TransactionWriteRow {
-    state_row(entity_pk, schema_key, None, context)
 }
 
 fn append_tombstone_row(
