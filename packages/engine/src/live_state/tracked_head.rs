@@ -10,8 +10,8 @@ mod hot;
 
 pub(crate) use hot::{HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot};
 
-use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -23,14 +23,17 @@ use crate::NullableKeyFilter;
 use crate::branch::stage_branch_head_control;
 use crate::branch::{BranchHeadControl, BranchHeadControlContext};
 use crate::changelog::{ChangeId, ChangeRecordProjection, CommitId};
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
 #[cfg(test)]
 use crate::json_store::JsonSlot;
 use crate::json_store::{
     JsonLoadRequestRef, JsonReadScopeRef, JsonRef, JsonSlotRef, JsonStoreContext, JsonStoreWriter,
 };
-use crate::live_state::MaterializedLiveStateRow;
+use crate::live_state::{
+    MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder, MaterializedLiveStateExactBatch,
+    MaterializedLiveStateRow,
+};
 use crate::storage_adapter::{
     PointReadPlan, ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions,
     StorageKey, StoragePrefix, StorageProjectedValue, StorageScanOptions, StorageSpace,
@@ -40,7 +43,7 @@ use crate::storage_codec;
 use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity,
     TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStateFilter,
-    TrackedStateKey, TrackedStateScanRequest,
+    TrackedStateKey, TrackedStateKeyRef, TrackedStateScanRequest,
 };
 
 pub(crate) const TRACKED_WORKING_DIFF_MARKER_NAMESPACE: &str = "live_state.hot_diff_marker.v16";
@@ -461,6 +464,38 @@ fn reject_guarded_live_member(
     Ok(())
 }
 
+/// Checks a sorted zero-copy INSERT guard selection.
+///
+/// Normal transaction publication carries INSERT intent as prepared-row
+/// ordinals. Lowering those ordinals to borrowed key views avoids allocating
+/// one owned key and one tree node per mutation merely to test the matching
+/// current-state delta.
+fn reject_borrowed_guarded_live_member(
+    absence_guards: &[TrackedStateKeyRef<'_>],
+    delta: &CurrentStateDeltaRef<'_>,
+    existing: HeadValueView<'_>,
+) -> Result<(), LixError> {
+    if absence_guards.is_empty() || existing.deleted {
+        return Ok(());
+    }
+    let guarded = absence_guards
+        .binary_search_by(|guard| {
+            guard
+                .schema_key
+                .cmp(delta.schema_key)
+                .then_with(|| guard.entity_pk.cmp(delta.entity_pk))
+                .then_with(|| guard.file_id.cmp(&delta.file_id))
+        })
+        .is_ok();
+    if guarded {
+        return Err(tracked_head_duplicate_insert_error_ref(
+            delta.schema_key,
+            delta.entity_pk,
+        ));
+    }
+    Ok(())
+}
+
 /// Retention is an identity property, not a mutable value column. An UPDATE
 /// is planned against the current row and therefore preserves it; an INSERT
 /// finding an existing identity is rejected by `absence_guards` above. This
@@ -477,6 +512,15 @@ fn reject_retention_change(
     // removes its member entirely, after which a new tracked insert is a new
     // identity and cannot affect historical diff state.
     if existing.untracked != delta.untracked {
+        if existing.untracked {
+            return Err(LixError::new(
+                LixError::CODE_UNIQUE,
+                format!(
+                    "cannot insert tracked row in schema '{}' entity_pk {:?}: a canonical untracked row already exists; delete it first",
+                    delta.schema_key, delta.entity_pk,
+                ),
+            ));
+        }
         return Err(LixError::new(
             LixError::CODE_UNIQUE,
             format!(
@@ -495,15 +539,18 @@ fn reject_retention_change(
 }
 
 fn tracked_head_duplicate_insert_error(key: &TrackedStateKey) -> LixError {
-    let entity_pk = key
-        .entity_pk
+    tracked_head_duplicate_insert_error_ref(&key.schema_key, &key.entity_pk)
+}
+
+fn tracked_head_duplicate_insert_error_ref(schema_key: &str, entity_pk: &EntityPk) -> LixError {
+    let entity_pk = entity_pk
         .as_json_array_text()
         .unwrap_or_else(|_| "<invalid entity_pk>".to_string());
     LixError::new(
         LixError::CODE_UNIQUE,
         format!(
             "primary-key constraint violation on schema '{}': INSERT would duplicate entity_pk '{entity_pk}'",
-            key.schema_key
+            schema_key
         ),
     )
 }
@@ -541,7 +588,7 @@ async fn materialize_entity_snapshot_refs(
         *snapshots
             .get_mut(row_index)
             .ok_or_else(|| head_value_error("lost an out-of-band entity JSON row index"))? =
-            Some(Bytes::from(bytes));
+            Some(bytes);
     }
     Ok(snapshots)
 }
@@ -933,14 +980,14 @@ fn read_entity_pk_part(
         ENTITY_PK_STRING => {
             let (value, terminator) = read_key_string(bytes, offset, "entity primary key")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::String(value.into_boxed_str()),
+                crate::entity_pk::EntityPkComponent::String(value.into()),
                 terminator,
             ))
         }
         ENTITY_PK_BYTES => {
             let (value, terminator) = read_key_bytes(bytes, offset, "entity primary key bytes")?;
             Ok((
-                crate::entity_pk::EntityPkComponent::Bytes(value.into_boxed_slice()),
+                crate::entity_pk::EntityPkComponent::Bytes(value.into()),
                 terminator,
             ))
         }
@@ -1298,11 +1345,9 @@ impl WorkingDiffVersion {
             || (self.snapshot == other.snapshot && self.metadata == other.metadata)
     }
 
-    fn into_diff_row(self, identity: &HeadRowIdentity) -> TrackedStateDiffRow {
+    fn into_diff_row(self, identity: TrackedStateDiffIdentity) -> TrackedStateDiffRow {
         TrackedStateDiffRow {
-            entity_pk: identity.entity_pk.clone(),
-            schema_key: identity.schema_key.clone(),
-            file_id: identity.file_id.clone(),
+            identity,
             deleted: self.deleted,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -1721,26 +1766,113 @@ struct DeferredJson {
     json_ref: JsonRef,
 }
 
-/// Builds serving rows directly from a V5 hot-row value. The only allocations
-/// here are the final `String` fields and identities which the public row type
-/// requires; there is no `HeadValue`/`MaterializedTrackedStateRow` staging
-/// layer to drop after each scan.
-async fn materialize_live_entries(
+trait LiveMaterializationIdentity {
+    #[allow(clippy::too_many_arguments)]
+    fn push_materialized(
+        self,
+        rows: &mut MaterializedLiveStateBatchBuilder,
+        snapshot_content: Option<SharedStr>,
+        metadata: Option<SharedStr>,
+        deleted: bool,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: &str,
+    );
+}
+
+impl LiveMaterializationIdentity for HeadRowIdentity {
+    fn push_materialized(
+        self,
+        rows: &mut MaterializedLiveStateBatchBuilder,
+        snapshot_content: Option<SharedStr>,
+        metadata: Option<SharedStr>,
+        deleted: bool,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: &str,
+    ) {
+        rows.push_materialized(
+            self.entity_pk,
+            self.schema_key,
+            self.file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
+            branch_id,
+        );
+    }
+}
+
+impl LiveMaterializationIdentity for TrackedStateKeyRef<'_> {
+    fn push_materialized(
+        self,
+        rows: &mut MaterializedLiveStateBatchBuilder,
+        snapshot_content: Option<SharedStr>,
+        metadata: Option<SharedStr>,
+        deleted: bool,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: &str,
+    ) {
+        rows.push_materialized_ref(
+            self.entity_pk,
+            self.schema_key,
+            self.file_id,
+            snapshot_content,
+            metadata,
+            deleted,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            commit_id,
+            untracked,
+            branch_id,
+        );
+    }
+}
+
+/// Builds serving rows directly from a V5 hot-row value. Inline JSON remains a
+/// range over the immutable head-value buffer, while out-of-band JSON retains
+/// the `JsonStore` buffer. There is no per-row payload `String` or intermediate
+/// `HeadValue`/`MaterializedTrackedStateRow` staging layer.
+async fn materialize_live_entries<I>(
     store: &(impl StorageAdapterRead + ?Sized),
-    entries: Vec<(HeadRowIdentity, Bytes)>,
+    entries: Vec<(I, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-    let branch_id = Arc::<str>::from(branch_id);
-    let global = branch_id.as_ref() == crate::GLOBAL_BRANCH_ID;
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    I: LiveMaterializationIdentity,
+{
+    let global = branch_id == crate::GLOBAL_BRANCH_ID;
     let mut json_refs = Vec::new();
     let mut deferred = Vec::new();
-    let mut rows = Vec::with_capacity(entries.len());
+    let mut rows = MaterializedLiveStateBatchBuilder::with_capacity(entries.len());
     for (identity, bytes) in entries {
         let value = decode_head_value(&bytes)?;
         let row_index = rows.len();
         let snapshot_content = materialize_live_slot(
             !value.deleted && projection.snapshot_content,
+            &bytes,
             value.snapshot,
             &mut json_refs,
             &mut deferred,
@@ -1749,30 +1881,29 @@ async fn materialize_live_entries(
         );
         let metadata = materialize_live_slot(
             !value.deleted && projection.metadata,
+            &bytes,
             value.metadata,
             &mut json_refs,
             &mut deferred,
             row_index,
             DeferredJsonField::Metadata,
         );
-        rows.push(MaterializedLiveStateRow {
-            entity_pk: identity.entity_pk,
-            schema_key: identity.schema_key,
-            file_id: identity.file_id,
+        identity.push_materialized(
+            &mut rows,
             snapshot_content,
             metadata,
-            deleted: value.deleted,
-            created_at: value.created_at,
-            updated_at: value.updated_at,
+            value.deleted,
+            value.created_at,
+            value.updated_at,
             global,
-            change_id: value.change_id,
-            commit_id: value.commit_id,
-            untracked: value.untracked,
-            branch_id: Arc::clone(&branch_id),
-        });
+            value.change_id,
+            value.commit_id,
+            value.untracked,
+            branch_id,
+        );
     }
     if json_refs.is_empty() {
-        return Ok(rows);
+        return Ok(rows.finish());
     }
     let mut json_values = JsonStoreContext::new()
         .load_bytes_many(
@@ -1795,34 +1926,37 @@ async fn materialize_live_entries(
                     deferred.json_ref.to_hex()
                 ))
             })?;
-        let json = String::from_utf8(bytes).map_err(|error| {
+        let json = SharedStr::from_utf8(bytes).map_err(|error| {
             head_value_error(&format!("out-of-band JSON payload is not UTF-8: {error}"))
         })?;
-        let row = rows
-            .get_mut(deferred.row_index)
-            .ok_or_else(|| head_value_error("lost an out-of-band JSON row index"))?;
         match deferred.field {
-            DeferredJsonField::Snapshot => row.snapshot_content = Some(json),
-            DeferredJsonField::Metadata => row.metadata = Some(json),
+            DeferredJsonField::Snapshot => {
+                rows.set_snapshot_content(deferred.row_index, json);
+            }
+            DeferredJsonField::Metadata => rows.set_metadata(deferred.row_index, json),
         }
     }
-    Ok(rows)
+    Ok(rows.finish())
 }
 
 fn materialize_live_slot(
     include: bool,
+    owner: &Bytes,
     slot: HeadSlotView<'_>,
     json_refs: &mut Vec<JsonRef>,
     deferred: &mut Vec<DeferredJson>,
     row_index: usize,
     field: DeferredJsonField,
-) -> Option<String> {
+) -> Option<SharedStr> {
     if !include {
         return None;
     }
     match slot {
         HeadSlotView::None => None,
-        HeadSlotView::Inline(json) => Some(json.to_string()),
+        HeadSlotView::Inline(json) => Some(
+            SharedStr::from_utf8_slice(owner.clone(), json)
+                .expect("decoded inline JSON points into its head-value buffer"),
+        ),
         HeadSlotView::Ref(json_ref) => {
             json_refs.push(json_ref);
             deferred.push(DeferredJson {
@@ -2017,6 +2151,51 @@ mod tests {
             HeadSlotView::Inline("{\"snapshot\":true}")
         );
         assert_eq!(decoded.metadata, HeadSlotView::Ref(snapshot_ref));
+    }
+
+    #[test]
+    fn materialized_inline_fields_share_the_head_value_buffer() {
+        let value = HeadValueRef {
+            change_id: Some(ChangeId::for_test_label("shared-fields-change")),
+            commit_id: Some(CommitId::for_test_label("shared-fields-commit")),
+            untracked: false,
+            deleted: false,
+            created_at: ts("2026-01-01T00:00:00Z"),
+            updated_at: ts("2026-01-02T00:00:00Z"),
+            snapshot: JsonSlotRef::Inline("{\"snapshot\":true}"),
+            metadata: JsonSlotRef::Inline("{\"source\":\"test\"}"),
+            working_diff_baseline: WorkingDiffBaseline::Disabled,
+        };
+        let bytes = Bytes::from(encode_head_value(&value).expect("encode v5 row"));
+        let decoded = decode_head_value(&bytes).expect("decode v5 row");
+        let mut json_refs = Vec::new();
+        let mut deferred = Vec::new();
+        let snapshot = materialize_live_slot(
+            true,
+            &bytes,
+            decoded.snapshot,
+            &mut json_refs,
+            &mut deferred,
+            0,
+            DeferredJsonField::Snapshot,
+        )
+        .expect("snapshot view");
+        let metadata = materialize_live_slot(
+            true,
+            &bytes,
+            decoded.metadata,
+            &mut json_refs,
+            &mut deferred,
+            0,
+            DeferredJsonField::Metadata,
+        )
+        .expect("metadata view");
+
+        assert!(snapshot.shares_buffer_with(&metadata));
+        assert_eq!(snapshot.retained_buffer_len(), bytes.len());
+        assert_eq!(metadata.retained_buffer_len(), bytes.len());
+        assert!(json_refs.is_empty());
+        assert!(deferred.is_empty());
     }
 
     #[test]
@@ -2445,8 +2624,8 @@ mod tests {
         assert_eq!(diff.diff.entries.len(), 1);
         let entry = &diff.diff.entries[0];
         assert_eq!(entry.kind, TrackedStateDiffKind::Modified);
-        assert_eq!(entry.identity.entity_pk, entity_pk);
-        assert_eq!(entry.identity.file_id.as_deref(), Some(file_id));
+        assert_eq!(entry.identity.entity_pk(), &entity_pk);
+        assert_eq!(entry.identity.file_id(), Some(file_id));
         assert_eq!(
             entry
                 .before
@@ -2642,7 +2821,7 @@ mod tests {
                     entity_pk: entity_pk.clone(),
                     schema_key: "schema".to_string(),
                     file_id: None,
-                    snapshot_content: Some("{\"value\":\"two\"}".to_string()),
+                    snapshot_content: Some("{\"value\":\"two\"}".into()),
                     metadata: None,
                     deleted: false,
                     created_at: "2026-01-01T00:00:00Z".to_string(),
@@ -4266,7 +4445,7 @@ mod tests {
             entity_pk: entity_pk.clone(),
             schema_key: "schema".to_string(),
             file_id: None,
-            snapshot_content: Some("{\"value\":1}".to_string()),
+            snapshot_content: Some("{\"value\":1}".into()),
             metadata: None,
             deleted: false,
             created_at: "2026-01-01T00:00:00.000Z".to_string(),

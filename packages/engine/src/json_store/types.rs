@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use musli::{Allocator, Decode, Decoder, Encode, Encoder};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -143,15 +144,15 @@ pub(crate) struct JsonLoadRequestRef<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JsonLoadBatch {
-    values: Vec<Option<Vec<u8>>>,
+    values: Vec<Option<Bytes>>,
 }
 
 impl JsonLoadBatch {
-    pub(crate) fn new(values: Vec<Option<Vec<u8>>>) -> Self {
+    pub(crate) fn new(values: Vec<Option<Bytes>>) -> Self {
         Self { values }
     }
 
-    pub(crate) fn into_values(self) -> Vec<Option<Vec<u8>>> {
+    pub(crate) fn into_values(self) -> Vec<Option<Bytes>> {
         self.values
     }
 }

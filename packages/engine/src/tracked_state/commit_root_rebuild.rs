@@ -122,50 +122,11 @@ where
     Ok(plans)
 }
 
-/// Loads the first-parent interval required for a read-only historical
-/// replay. Unlike root repair, this deliberately trusts the presence of a
-/// durable checkpoint and never recursively validates/rebuilds it; that keeps
-/// the returned future `Send` for DataFusion's asynchronous providers.
-pub(crate) async fn load_first_parent_replay_plans<S>(
-    store: &S,
-    commit_id: &str,
-) -> Result<Vec<CommitRootRebuildPlan>, LixError>
-where
-    S: StorageAdapterRead + ?Sized,
-{
-    let mut plans = Vec::new();
-    let mut current_commit_id = commit_id.to_string();
-    let mut seen_commit_ids = HashSet::new();
-    loop {
-        if !seen_commit_ids.insert(current_commit_id.clone()) {
-            return Err(LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                format!(
-                    "cannot replay tracked_state commit '{commit_id}': first-parent cycle includes commit '{current_commit_id}'"
-                ),
-            ));
-        }
-        if storage::load_root(store, &current_commit_id)
-            .await?
-            .is_some()
-        {
-            return Ok(plans);
-        }
-        let plan = load_commit_root_rebuild_plan(store, &current_commit_id).await?;
-        let parent_commit_id = plan.parent_commit_id;
-        plans.push(plan);
-        let Some(parent_commit_id) = parent_commit_id else {
-            return Ok(plans);
-        };
-        current_commit_id = parent_commit_id.to_string();
-    }
-}
-
 /// Locates a rootless first-parent interval for an identity-routed read.
 ///
-/// Unlike [`load_first_parent_replay_plans`], this reads commit records only:
-/// the caller consults the commit-delta index for the requested identities, so
-/// it must not hydrate every change ref just to discover unrelated keys.
+/// This reads commit records only: the caller consults the commit-delta index
+/// for the requested identities, so it must not hydrate every change ref just
+/// to discover unrelated keys.
 pub(crate) async fn load_first_parent_point_replay_interval<S>(
     store: &S,
     commit_id: &str,

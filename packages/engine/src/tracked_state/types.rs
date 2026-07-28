@@ -1,7 +1,8 @@
 use crate::NullableKeyFilter;
 use crate::changelog::{ChangeId, CommitId};
-use crate::common::LixTimestamp;
+use crate::common::{LixTimestamp, SharedStr};
 use crate::entity_pk::EntityPk;
+use bytes::Bytes;
 
 pub(crate) const TRACKED_STATE_HASH_BYTES: usize = 32;
 
@@ -126,8 +127,8 @@ pub(crate) struct MaterializedTrackedStateRow {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) snapshot_content: Option<SharedStr>,
+    pub(crate) metadata: Option<SharedStr>,
     pub(crate) deleted: bool,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
@@ -168,16 +169,60 @@ pub(crate) struct TrackedStateScanRequest {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TrackedStateMutation {
-    pub(crate) encoded_key: Vec<u8>,
-    pub(crate) encoded_value: Vec<u8>,
+    pub(crate) encoded_key: Bytes,
+    pub(crate) encoded_value: Bytes,
 }
 
 impl TrackedStateMutation {
+    #[cfg(test)]
     pub(crate) fn put_encoded(encoded_key: Vec<u8>, encoded_value: Vec<u8>) -> Self {
+        Self {
+            encoded_key: Bytes::from(encoded_key),
+            encoded_value: Bytes::from(encoded_value),
+        }
+    }
+
+    pub(crate) fn from_shared(encoded_key: Bytes, encoded_value: Bytes) -> Self {
         Self {
             encoded_key,
             encoded_value,
         }
+    }
+}
+
+/// An encoded tracked-root mutation batch.
+///
+/// Every key is a slice of one immutable key arena and every value is a slice
+/// of one immutable value arena. The row vector therefore carries descriptors
+/// only; moving it through diff, merge, root planning, and tree materialization
+/// never clones row-owned payload buffers.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TrackedStateMutationBatch {
+    mutations: Vec<TrackedStateMutation>,
+}
+
+impl TrackedStateMutationBatch {
+    pub(crate) fn from_shared(mutations: Vec<TrackedStateMutation>) -> Self {
+        Self { mutations }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.mutations.len()
+    }
+
+    pub(crate) fn first_encoded_key(&self) -> Option<&[u8]> {
+        self.mutations
+            .first()
+            .map(|mutation| mutation.encoded_key.as_ref())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn as_slice(&self) -> &[TrackedStateMutation] {
+        &self.mutations
+    }
+
+    pub(crate) fn into_mutations(self) -> Vec<TrackedStateMutation> {
+        self.mutations
     }
 }
 
@@ -204,24 +249,44 @@ impl Default for TrackedStateTreeScanRequest {
 
 impl TrackedStateTreeScanRequest {
     pub(crate) fn matches(&self, key: &TrackedStateKey, value: &TrackedStateIndexValue) -> bool {
+        self.matches_ref(
+            TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            },
+            value,
+        )
+    }
+
+    pub(crate) fn matches_ref(
+        &self,
+        key: TrackedStateKeyRef<'_>,
+        value: &TrackedStateIndexValue,
+    ) -> bool {
         if !self.include_tombstones && value.deleted {
             return false;
         }
-        self.matches_key(key)
+        self.matches_key_ref(key)
     }
 
-    pub(crate) fn matches_key(&self, key: &TrackedStateKey) -> bool {
-        if !self.schema_keys.is_empty() && !self.schema_keys.contains(&key.schema_key) {
+    pub(crate) fn matches_key_ref(&self, key: TrackedStateKeyRef<'_>) -> bool {
+        if !self.schema_keys.is_empty()
+            && !self
+                .schema_keys
+                .iter()
+                .any(|schema_key| schema_key == key.schema_key)
+        {
             return false;
         }
-        if !self.entity_pks.is_empty() && !self.entity_pks.contains(&key.entity_pk) {
+        if !self.entity_pks.is_empty() && !self.entity_pks.contains(key.entity_pk) {
             return false;
         }
         if !self.file_ids.is_empty()
             && !self.file_ids.iter().any(|filter| match filter {
                 NullableKeyFilter::Any => true,
                 NullableKeyFilter::Null => key.file_id.is_none(),
-                NullableKeyFilter::Value(value) => key.file_id.as_ref() == Some(value),
+                NullableKeyFilter::Value(value) => key.file_id == Some(value.as_str()),
             })
         {
             return false;
@@ -239,8 +304,16 @@ pub(crate) struct TrackedStateApplyResult {
     pub(crate) chunk_bytes: usize,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeDiffEntry {
-    pub(crate) before: Option<(TrackedStateKey, TrackedStateIndexValue)>,
-    pub(crate) after: Option<(TrackedStateKey, TrackedStateIndexValue)>,
+    /// Identity column shared by both sides of a modified row.
+    ///
+    /// Tree ordering already proves that a modified entry has the same
+    /// encoded key on both sides. Keeping one decoded key avoids decoding and
+    /// allocating the schema/file/entity identity twice before diff and merge
+    /// immediately re-share it.
+    pub(crate) key: TrackedStateKey,
+    pub(crate) before: Option<TrackedStateIndexValue>,
+    pub(crate) after: Option<TrackedStateIndexValue>,
 }

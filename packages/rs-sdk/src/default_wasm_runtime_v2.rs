@@ -3,6 +3,8 @@ use std::mem::size_of;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Instant;
 
+use bytes::Bytes;
+use lix_engine::SharedStr;
 use lix_engine::wasm::v2::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmChangeCursorHandle, WasmChangeEffect, WasmChangePage, WasmComponentV2Actor,
@@ -149,6 +151,12 @@ struct EncodedPacketPage {
     attachments: Vec<WasmSourceSlice>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PacketLayout {
+    payload_len: usize,
+    attachment_count: usize,
+}
+
 struct WasmtimeV2Factory {
     shared: Arc<WasmtimeSharedRuntime>,
     component: Component,
@@ -237,22 +245,24 @@ fn encode_entity_packet(
     if page.entities.is_empty() {
         return Err(v2_invalid_plugin("v2 entity source returned an empty page"));
     }
-    let mut records = Vec::with_capacity(page.entities.len());
-    let mut attachments = Vec::new();
+    validate_packet_max_bytes(max_bytes, limits)?;
+    let record_count = page.entities.len();
+    let layout = entity_packet_layout(&page, limits)?;
+    let mut payload = packet_payload(layout.payload_len, max_bytes, limits)?;
+    let mut attachments = Vec::with_capacity(layout.attachment_count);
     for entity in page.entities {
         if previous_key.as_ref().is_some_and(|key| key >= &entity.key) {
             return Err(v2_invalid_plugin(
                 "v2 entity source keys are not globally strictly increasing",
             ));
         }
-        let mut record = Vec::new();
-        encode_entity_key(&entity.key, &mut record)?;
-        encode_host_blob(entity.snapshot_content, &mut record, &mut attachments)?;
-        validate_record_len(record.len(), limits)?;
+        let record = begin_packet_record(&mut payload);
+        encode_entity_key(&entity.key, &mut payload)?;
+        encode_host_blob(entity.snapshot_content, &mut payload, &mut attachments)?;
+        finish_packet_record(&mut payload, record, max_bytes, limits)?;
         *previous_key = Some(entity.key);
-        records.push(record);
     }
-    frame_records(records, attachments, max_bytes, limits)
+    finish_packet(record_count, payload, attachments)
 }
 
 fn encode_change_packet(
@@ -265,10 +275,21 @@ fn encode_change_packet(
         return Err(v2_invalid_plugin("v2 change source returned an empty page"));
     }
     page.validate()?;
-    let mut records = Vec::with_capacity(page.changes.len());
-    let mut attachments = Vec::new();
+    validate_packet_max_bytes(max_bytes, limits)?;
+    let record_count = page.changes.len();
+    let layout = change_packet_layout(&page, limits)?;
+    let mut payload = packet_payload(layout.payload_len, max_bytes, limits)?;
+    let mut attachments = Vec::with_capacity(layout.attachment_count);
     for change in page.changes {
-        let mut record = Vec::new();
+        let key = change.entity_key().ok_or_else(|| {
+            v2_invalid_plugin("host-to-guest change streams cannot contain keyless creates")
+        })?;
+        if !seen_keys.insert(key.clone()) {
+            return Err(v2_invalid_plugin(
+                "v2 change source repeated an entity key across its transition",
+            ));
+        }
+        let record = begin_packet_record(&mut payload);
         match change {
             WasmEntityChange::Create { .. } => {
                 return Err(v2_invalid_plugin(
@@ -276,33 +297,22 @@ fn encode_change_packet(
                 ));
             }
             WasmEntityChange::Upsert { entity, effect } => {
-                if !seen_keys.insert(entity.key.clone()) {
-                    return Err(v2_invalid_plugin(
-                        "v2 change source repeated an entity key across its transition",
-                    ));
-                }
-                record.push(0);
-                encode_entity_key(&entity.key, &mut record)?;
-                record.push(match effect {
+                payload.push(0);
+                encode_entity_key(&entity.key, &mut payload)?;
+                payload.push(match effect {
                     WasmChangeEffect::Content => 0,
                     WasmChangeEffect::FormatOnly => 1,
                 });
-                encode_host_blob(entity.snapshot_content, &mut record, &mut attachments)?;
+                encode_host_blob(entity.snapshot_content, &mut payload, &mut attachments)?;
             }
             WasmEntityChange::Delete(key) => {
-                if !seen_keys.insert(key.clone()) {
-                    return Err(v2_invalid_plugin(
-                        "v2 change source repeated an entity key across its transition",
-                    ));
-                }
-                record.push(1);
-                encode_entity_key(&key, &mut record)?;
+                payload.push(1);
+                encode_entity_key(&key, &mut payload)?;
             }
         }
-        validate_record_len(record.len(), limits)?;
-        records.push(record);
+        finish_packet_record(&mut payload, record, max_bytes, limits)?;
     }
-    frame_records(records, attachments, max_bytes, limits)
+    finish_packet(record_count, payload, attachments)
 }
 
 fn encode_conflict_packet(
@@ -316,8 +326,11 @@ fn encode_conflict_packet(
             "v2 conflict source returned an empty page",
         ));
     }
-    let mut records = Vec::with_capacity(page.conflicts.len());
-    let mut attachments = Vec::new();
+    validate_packet_max_bytes(max_bytes, limits)?;
+    let record_count = page.conflicts.len();
+    let layout = conflict_packet_layout(&page, limits)?;
+    let mut payload = packet_payload(layout.payload_len, max_bytes, limits)?;
+    let mut attachments = Vec::with_capacity(layout.attachment_count);
     for conflict in page.conflicts {
         if previous_key
             .as_ref()
@@ -327,17 +340,16 @@ fn encode_conflict_packet(
                 "v2 conflict source keys are not globally strictly increasing",
             ));
         }
-        let mut record = Vec::new();
-        encode_entity_key(&conflict.key, &mut record)?;
-        push_u32(&mut record, conflict.ordinal);
-        encode_conflict_state(conflict.base, &mut record, &mut attachments)?;
-        encode_conflict_state(conflict.a, &mut record, &mut attachments)?;
-        encode_conflict_state(conflict.b, &mut record, &mut attachments)?;
-        validate_record_len(record.len(), limits)?;
+        let record = begin_packet_record(&mut payload);
+        encode_entity_key(&conflict.key, &mut payload)?;
+        push_u32(&mut payload, conflict.ordinal);
+        encode_conflict_state(conflict.base, &mut payload, &mut attachments)?;
+        encode_conflict_state(conflict.a, &mut payload, &mut attachments)?;
+        encode_conflict_state(conflict.b, &mut payload, &mut attachments)?;
+        finish_packet_record(&mut payload, record, max_bytes, limits)?;
         *previous_key = Some(conflict.key);
-        records.push(record);
     }
-    frame_records(records, attachments, max_bytes, limits)
+    finish_packet(record_count, payload, attachments)
 }
 
 fn encode_conflict_state(
@@ -355,30 +367,195 @@ fn encode_conflict_state(
     Ok(())
 }
 
-fn frame_records(
-    records: Vec<Vec<u8>>,
-    attachments: Vec<WasmSourceSlice>,
+fn entity_packet_layout(
+    page: &WasmEntityPage,
+    limits: WasmTransitionLimits,
+) -> Result<PacketLayout, LixError> {
+    let mut layout = PacketLayout::default();
+    for entity in &page.entities {
+        let key_len = encoded_entity_key_len(&entity.key)?;
+        let blob = encoded_host_blob_layout(&entity.snapshot_content)?;
+        let record_len = checked_packet_len_add(key_len, blob.payload_len)?;
+        add_packet_record_layout(&mut layout, record_len, blob.attachment_count, limits)?;
+    }
+    Ok(layout)
+}
+
+fn change_packet_layout(
+    page: &WasmEntityChanges<WasmHostBytes>,
+    limits: WasmTransitionLimits,
+) -> Result<PacketLayout, LixError> {
+    let mut layout = PacketLayout::default();
+    for change in &page.changes {
+        let key = change.entity_key().ok_or_else(|| {
+            v2_invalid_plugin("host-to-guest change streams cannot contain keyless creates")
+        })?;
+        let key_len = encoded_entity_key_len(key)?;
+        let (record_len, attachment_count) = match change {
+            WasmEntityChange::Create { .. } => {
+                return Err(v2_invalid_plugin(
+                    "host-to-guest change streams cannot contain keyless creates",
+                ));
+            }
+            WasmEntityChange::Upsert { entity, .. } => {
+                let blob = encoded_host_blob_layout(&entity.snapshot_content)?;
+                (
+                    checked_packet_len_add(
+                        checked_packet_len_add(checked_packet_len_add(1, key_len)?, 1)?,
+                        blob.payload_len,
+                    )?,
+                    blob.attachment_count,
+                )
+            }
+            WasmEntityChange::Delete(_) => (checked_packet_len_add(1, key_len)?, 0),
+        };
+        add_packet_record_layout(&mut layout, record_len, attachment_count, limits)?;
+    }
+    Ok(layout)
+}
+
+fn conflict_packet_layout(
+    page: &WasmEntityConflictPage,
+    limits: WasmTransitionLimits,
+) -> Result<PacketLayout, LixError> {
+    let mut layout = PacketLayout::default();
+    for conflict in &page.conflicts {
+        let mut record_len =
+            checked_packet_len_add(encoded_entity_key_len(&conflict.key)?, size_of::<u32>())?;
+        let mut attachment_count = 0_usize;
+        for state in [&conflict.base, &conflict.a, &conflict.b] {
+            record_len = checked_packet_len_add(record_len, 1)?;
+            if let Some(value) = state {
+                let blob = encoded_host_blob_layout(value)?;
+                record_len = checked_packet_len_add(record_len, blob.payload_len)?;
+                attachment_count = checked_packet_len_add(attachment_count, blob.attachment_count)?;
+            }
+        }
+        add_packet_record_layout(&mut layout, record_len, attachment_count, limits)?;
+    }
+    Ok(layout)
+}
+
+fn add_packet_record_layout(
+    layout: &mut PacketLayout,
+    record_len: usize,
+    attachment_count: usize,
+    limits: WasmTransitionLimits,
+) -> Result<(), LixError> {
+    validate_record_len(record_len, limits)?;
+    layout.payload_len = checked_packet_len_add(
+        layout.payload_len,
+        checked_packet_len_add(size_of::<u32>(), record_len)?,
+    )?;
+    layout.attachment_count = checked_packet_len_add(layout.attachment_count, attachment_count)?;
+    Ok(())
+}
+
+fn encoded_entity_key_len(key: &WasmEntityKey) -> Result<usize, LixError> {
+    checked_u32(key.entity_pk.len(), "entity primary-key component count")?;
+    let mut len = checked_packet_len_add(encoded_text_len(&key.schema_key)?, size_of::<u32>())?;
+    for component in &key.entity_pk {
+        len = checked_packet_len_add(len, encoded_text_len(component)?)?;
+    }
+    Ok(len)
+}
+
+fn encoded_text_len(value: &str) -> Result<usize, LixError> {
+    checked_u32(value.len(), "packet text length")?;
+    checked_packet_len_add(size_of::<u32>(), value.len())
+}
+
+fn encoded_host_blob_layout(bytes: &WasmHostBytes) -> Result<PacketLayout, LixError> {
+    match bytes {
+        WasmHostBytes::Inline(bytes) => {
+            checked_u32(bytes.len(), "inline snapshot length")?;
+            Ok(PacketLayout {
+                payload_len: checked_packet_len_add(
+                    checked_packet_len_add(1, size_of::<u32>())?,
+                    bytes.len(),
+                )?,
+                attachment_count: 0,
+            })
+        }
+        WasmHostBytes::CanonicalJson(json) => {
+            let len = json.normalized().len();
+            checked_u32(len, "inline snapshot length")?;
+            Ok(PacketLayout {
+                payload_len: checked_packet_len_add(
+                    checked_packet_len_add(1, size_of::<u32>())?,
+                    len,
+                )?,
+                attachment_count: 0,
+            })
+        }
+        WasmHostBytes::Source(_) => Ok(PacketLayout {
+            payload_len: 1 + size_of::<u32>() + size_of::<u64>() + size_of::<u64>(),
+            attachment_count: 1,
+        }),
+    }
+}
+
+fn checked_packet_len_add(left: usize, right: usize) -> Result<usize, LixError> {
+    left.checked_add(right)
+        .ok_or_else(|| v2_limit("v2 packet encoded length overflowed"))
+}
+
+fn packet_payload(
+    encoded_len: usize,
     max_bytes: u32,
     limits: WasmTransitionLimits,
-) -> Result<EncodedPacketPage, LixError> {
+) -> Result<Vec<u8>, LixError> {
+    validate_packet_max_bytes(max_bytes, limits)?;
+    if encoded_len > max_bytes as usize || encoded_len > limits.max_page_bytes as usize {
+        return Err(v2_limit("v2 packet source page exceeds max-bytes"));
+    }
+    Ok(Vec::with_capacity(encoded_len))
+}
+
+fn validate_packet_max_bytes(max_bytes: u32, limits: WasmTransitionLimits) -> Result<(), LixError> {
     if max_bytes == 0 || max_bytes > limits.max_page_bytes {
         return Err(v2_limit(
             "v2 packet max-bytes is outside its transition limit",
         ));
     }
-    let mut payload = Vec::new();
-    for record in &records {
-        push_u32(
-            &mut payload,
-            checked_u32(record.len(), "packet record length")?,
-        );
-        payload.extend_from_slice(record);
-    }
+    Ok(())
+}
+
+fn begin_packet_record(payload: &mut Vec<u8>) -> usize {
+    let frame_offset = payload.len();
+    payload.extend_from_slice(&0_u32.to_le_bytes());
+    frame_offset
+}
+
+fn finish_packet_record(
+    payload: &mut [u8],
+    frame_offset: usize,
+    max_bytes: u32,
+    limits: WasmTransitionLimits,
+) -> Result<(), LixError> {
+    let record_offset = frame_offset
+        .checked_add(size_of::<u32>())
+        .ok_or_else(|| v2_limit("v2 packet record offset overflowed"))?;
+    let record_len = payload
+        .len()
+        .checked_sub(record_offset)
+        .ok_or_else(|| v2_limit("v2 packet record frame is invalid"))?;
+    validate_record_len(record_len, limits)?;
     if payload.len() > max_bytes as usize || payload.len() > limits.max_page_bytes as usize {
         return Err(v2_limit("v2 packet source page exceeds max-bytes"));
     }
+    payload[frame_offset..record_offset]
+        .copy_from_slice(&checked_u32(record_len, "packet record length")?.to_le_bytes());
+    Ok(())
+}
+
+fn finish_packet(
+    record_count: usize,
+    payload: Vec<u8>,
+    attachments: Vec<WasmSourceSlice>,
+) -> Result<EncodedPacketPage, LixError> {
     Ok(EncodedPacketPage {
-        record_count: checked_u32(records.len(), "packet record count")?,
+        record_count: checked_u32(record_count, "packet record count")?,
         payload,
         attachments,
     })
@@ -421,13 +598,13 @@ fn encode_host_blob(
             push_u32(output, checked_u32(bytes.len(), "inline snapshot length")?);
             output.extend_from_slice(&bytes);
         }
-        WasmHostBytes::CanonicalJson { normalized, .. } => {
+        WasmHostBytes::CanonicalJson(json) => {
             output.push(0);
             push_u32(
                 output,
-                checked_u32(normalized.len(), "inline snapshot length")?,
+                checked_u32(json.normalized().len(), "inline snapshot length")?,
             );
-            output.extend_from_slice(normalized.as_bytes());
+            output.extend_from_slice(json.normalized().as_bytes());
         }
         WasmHostBytes::Source(slice) => {
             slice.validate()?;
@@ -455,9 +632,14 @@ struct DecodedResolutionPacket {
     output_ranges: Vec<WasmOutputRange>,
 }
 
+fn payload_bounded_row_capacity<T>(record_count: usize, payload_len: usize) -> usize {
+    let row_size = size_of::<T>();
+    record_count.min(payload_len.checked_div(row_size).unwrap_or(record_count))
+}
+
 fn decode_change_packet(
     record_count: u32,
-    payload: &[u8],
+    payload: Vec<u8>,
     max_bytes: u32,
     limits: WasmTransitionLimits,
 ) -> Result<DecodedChangePacket, LixError> {
@@ -483,18 +665,24 @@ fn decode_change_packet(
             "v2 guest record count exceeds its bounded payload framing",
         ));
     }
-    let mut framed = PacketReader::new(payload);
-    // Do not reserve from a guest-controlled count. Framing bounds the number
-    // of successful pushes, and malformed pages fail before a large allocation.
-    let mut changes = Vec::new();
+    let payload = Bytes::from(payload);
+    let mut framed = PacketReader::new(&payload);
+    // A packet count is guest-controlled even after its framing bound has been
+    // checked. Cap the eager row-column allocation at the already-owned payload
+    // size, while reserving the exact count for normal records whose wire form
+    // is at least as large as one decoded host row.
+    let change_capacity = payload_bounded_row_capacity::<WasmEntityChange<WasmGuestBytes>>(
+        record_count,
+        payload.len(),
+    );
+    let mut changes = Vec::with_capacity(change_capacity);
     let mut output_ranges = Vec::new();
     for _ in 0..record_count {
         let record_len = framed.read_u32()? as usize;
         if record_len > limits.max_record_bytes as usize {
             return Err(v2_record_too_large(record_len as u64));
         }
-        let record_bytes = framed.read_exact(record_len)?;
-        let mut record = PacketReader::new(record_bytes);
+        let mut record = framed.read_reader(record_len)?;
         let change_tag = record.read_u8()?;
         let change = match change_tag {
             0 => {
@@ -519,7 +707,7 @@ fn decode_change_packet(
                 let local_ref = record.read_u64()?;
                 let snapshot_content = decode_guest_blob(&mut record, &mut output_ranges)?;
                 WasmEntityChange::Create {
-                    schema_key,
+                    schema_key: schema_key.to_string(),
                     local_ref,
                     snapshot_content,
                 }
@@ -538,7 +726,7 @@ fn decode_change_packet(
 
 fn decode_resolution_packet(
     record_count: u32,
-    payload: &[u8],
+    payload: Vec<u8>,
     max_bytes: u32,
     limits: WasmTransitionLimits,
 ) -> Result<DecodedResolutionPacket, LixError> {
@@ -564,7 +752,8 @@ fn decode_resolution_packet(
             "v2 guest resolution record count exceeds its bounded payload framing",
         ));
     }
-    let mut framed = PacketReader::new(payload);
+    let payload = Bytes::from(payload);
+    let mut framed = PacketReader::new(&payload);
     let mut ordinals = Vec::new();
     let mut resolutions = Vec::new();
     let mut output_ranges = Vec::new();
@@ -573,8 +762,7 @@ fn decode_resolution_packet(
         if record_len > limits.max_record_bytes as usize {
             return Err(v2_record_too_large(record_len as u64));
         }
-        let record_bytes = framed.read_exact(record_len)?;
-        let mut record = PacketReader::new(record_bytes);
+        let mut record = framed.read_reader(record_len)?;
         let tag = record.read_u8()?;
         let ordinal = record.read_u32()?;
         let resolution = match tag {
@@ -623,14 +811,11 @@ fn decode_entity_key(reader: &mut PacketReader<'_>) -> Result<WasmEntityKey, Lix
             "v2 entity primary-key component count exceeds packet bounds",
         ));
     }
-    let mut entity_pk = Vec::with_capacity(pk_count as usize);
+    let mut key = WasmEntityKey::from_shared_parts(schema_key, std::iter::empty());
     for _ in 0..pk_count {
-        entity_pk.push(reader.read_text()?);
+        key.entity_pk.push(reader.read_text()?);
     }
-    Ok(WasmEntityKey {
-        schema_key,
-        entity_pk,
-    })
+    Ok(key)
 }
 
 fn decode_guest_blob(
@@ -640,8 +825,7 @@ fn decode_guest_blob(
     match reader.read_u8()? {
         0 => {
             let length = reader.read_u32()? as usize;
-            let bytes = reader.read_exact(length)?.to_vec();
-            validate_number_free_snapshot(&bytes)?;
+            let bytes = reader.read_bytes(length)?;
             Ok(WasmGuestBytes::Inline(bytes))
         }
         1 => {
@@ -662,17 +846,22 @@ fn decode_guest_blob(
 }
 
 struct PacketReader<'a> {
-    bytes: &'a [u8],
+    bytes: &'a Bytes,
     offset: usize,
+    end: usize,
 }
 
 impl<'a> PacketReader<'a> {
-    const fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+    fn new(bytes: &'a Bytes) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            end: bytes.len(),
+        }
     }
 
     fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.offset)
+        self.end.saturating_sub(self.offset)
     }
 
     fn read_exact(&mut self, length: usize) -> Result<&'a [u8], LixError> {
@@ -680,12 +869,31 @@ impl<'a> PacketReader<'a> {
             .offset
             .checked_add(length)
             .ok_or_else(|| v2_invalid_plugin("v2 packet range overflowed"))?;
+        if end > self.end {
+            return Err(v2_invalid_plugin("truncated v2 packet"));
+        }
         let value = self
             .bytes
             .get(self.offset..end)
             .ok_or_else(|| v2_invalid_plugin("truncated v2 packet"))?;
         self.offset = end;
         Ok(value)
+    }
+
+    fn read_bytes(&mut self, length: usize) -> Result<Bytes, LixError> {
+        let start = self.offset;
+        self.read_exact(length)?;
+        Ok(self.bytes.slice(start..self.offset))
+    }
+
+    fn read_reader(&mut self, length: usize) -> Result<Self, LixError> {
+        let start = self.offset;
+        self.read_exact(length)?;
+        Ok(Self {
+            bytes: self.bytes,
+            offset: start,
+            end: self.offset,
+        })
     }
 
     fn read_u8(&mut self) -> Result<u8, LixError> {
@@ -708,15 +916,17 @@ impl<'a> PacketReader<'a> {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    fn read_text(&mut self) -> Result<String, LixError> {
+    fn read_text(&mut self) -> Result<SharedStr, LixError> {
         let length = self.read_u32()? as usize;
         let bytes = self.read_exact(length)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| v2_invalid_plugin("v2 packet text is not valid UTF-8"))
+        let value = std::str::from_utf8(bytes)
+            .map_err(|_| v2_invalid_plugin("v2 packet text is not valid UTF-8"))?;
+        SharedStr::from_utf8_slice(self.bytes.clone(), value)
+            .ok_or_else(|| v2_invalid_plugin("v2 packet text is outside its page allocation"))
     }
 
     fn finish(&self) -> Result<(), LixError> {
-        if self.offset != self.bytes.len() {
+        if self.offset != self.end {
             return Err(v2_invalid_plugin("v2 packet contains trailing bytes"));
         }
         Ok(())
@@ -1880,23 +2090,21 @@ mod tests {
                 )
                 .into_bytes();
                 entities.push(WasmEntity {
-                    key: WasmEntityKey {
-                        schema_key: "csv_v2_row".to_owned(),
-                        entity_pk: vec![id],
-                    },
-                    snapshot_content: WasmHostBytes::Inline(snapshot),
+                    key: WasmEntityKey::from_owned_parts("csv_v2_row", vec![id]),
+                    snapshot_content: WasmHostBytes::Inline(snapshot.into()),
                 });
                 self.next_row += 1;
             }
             if self.next_row == LARGE_CSV_ROWS && !self.emitted_table {
                 entities.push(WasmEntity {
-                    key: WasmEntityKey {
-                        schema_key: "csv_v2_table".to_owned(),
-                        entity_pk: vec!["root".to_owned()],
-                    },
+                    key: WasmEntityKey::from_owned_parts(
+                        "csv_v2_table",
+                        vec!["root".to_owned()],
+                    ),
                     snapshot_content: WasmHostBytes::Inline(
                         br#"{"id":"root","dialect":{"delimiter":",","quote":"\"","terminator":"\n"}}"#
-                            .to_vec(),
+                            .to_vec()
+                            .into(),
                     ),
                 });
                 self.emitted_table = true;
@@ -1998,12 +2206,11 @@ mod tests {
                             .expect("row snapshot object")
                             .insert("id".to_string(), serde_json::Value::String(id.clone()));
                         row = Some(WasmEntity {
-                            key: WasmEntityKey {
-                                schema_key,
-                                entity_pk: vec![id],
-                            },
+                            key: WasmEntityKey::from_owned_parts(schema_key, vec![id]),
                             snapshot_content: WasmHostBytes::Inline(
-                                serde_json::to_vec(&snapshot).expect("completed row snapshot"),
+                                serde_json::to_vec(&snapshot)
+                                    .expect("completed row snapshot")
+                                    .into(),
                             ),
                         });
                     }
@@ -2232,11 +2439,8 @@ mod tests {
         let unsupported = WasmEntityChanges {
             changes: vec![WasmEntityChange::Upsert {
                 entity: WasmEntity {
-                    key: WasmEntityKey {
-                        schema_key: "unsupported".to_owned(),
-                        entity_pk: vec!["one".to_owned()],
-                    },
-                    snapshot_content: WasmHostBytes::Inline(br#"{"id":"one"}"#.to_vec()),
+                    key: WasmEntityKey::from_owned_parts("unsupported", vec!["one".to_owned()]),
+                    snapshot_content: WasmHostBytes::Inline(br#"{"id":"one"}"#.to_vec().into()),
                 },
                 effect: WasmChangeEffect::Content,
             }],
@@ -2275,10 +2479,12 @@ mod tests {
         let limits = WasmTransitionLimits::default();
         let snapshot = match row.snapshot_content {
             WasmHostBytes::Inline(bytes) => bytes,
-            WasmHostBytes::CanonicalJson { normalized, .. } => normalized.as_bytes().to_vec(),
+            WasmHostBytes::CanonicalJson(json) => {
+                Bytes::copy_from_slice(json.normalized().as_bytes())
+            }
             WasmHostBytes::Source(_) => panic!("small row snapshot must be inline"),
         };
-        let snapshot = String::from_utf8(snapshot)
+        let snapshot = String::from_utf8(snapshot.to_vec())
             .expect("CSV row snapshot is UTF-8")
             .replace("[\"a\",\"b\"]", "[\"x\",\"b\"]")
             .into_bytes();
@@ -2298,7 +2504,7 @@ mod tests {
                         changes: vec![WasmEntityChange::Upsert {
                             entity: WasmEntity {
                                 key: row.key,
-                                snapshot_content: WasmHostBytes::Inline(snapshot),
+                                snapshot_content: WasmHostBytes::Inline(snapshot.into()),
                             },
                             effect: WasmChangeEffect::Content,
                         }],
@@ -2402,10 +2608,12 @@ mod tests {
 
         let snapshot = match row.snapshot_content {
             WasmHostBytes::Inline(bytes) => bytes,
-            WasmHostBytes::CanonicalJson { normalized, .. } => normalized.as_bytes().to_vec(),
+            WasmHostBytes::CanonicalJson(json) => {
+                Bytes::copy_from_slice(json.normalized().as_bytes())
+            }
             WasmHostBytes::Source(_) => panic!("small row snapshot must be inline"),
         };
-        let snapshot = String::from_utf8(snapshot)
+        let snapshot = String::from_utf8(snapshot.to_vec())
             .expect("CSV row snapshot is UTF-8")
             .replace("[\"a\",\"b\"]", "[\"x\",\"b\"]")
             .into_bytes();
@@ -2425,7 +2633,7 @@ mod tests {
                         changes: vec![WasmEntityChange::Upsert {
                             entity: WasmEntity {
                                 key: row.key,
-                                snapshot_content: WasmHostBytes::Inline(snapshot),
+                                snapshot_content: WasmHostBytes::Inline(snapshot.into()),
                             },
                             effect: WasmChangeEffect::Content,
                         }],
@@ -2484,15 +2692,306 @@ mod tests {
     }
 
     #[test]
+    fn guest_change_decoder_defers_snapshot_semantics_to_engine_validation() {
+        let limits = WasmTransitionLimits::default();
+        let snapshot = br#"{"value":1}"#;
+        let mut record = Vec::new();
+        record.push(0); // upsert
+        encode_entity_key(
+            &WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]),
+            &mut record,
+        )
+        .unwrap();
+        record.push(0); // content effect
+        record.push(0); // inline snapshot
+        push_u32(&mut record, snapshot.len() as u32);
+        record.extend_from_slice(snapshot);
+
+        let mut packet = Vec::new();
+        push_u32(&mut packet, record.len() as u32);
+        packet.extend_from_slice(&record);
+        let decoded = decode_change_packet(1, packet, limits.max_page_bytes, limits).unwrap();
+        let WasmEntityChange::Upsert { entity, .. } = &decoded.changes.changes[0] else {
+            panic!("decoded record must remain an upsert")
+        };
+        let WasmGuestBytes::Inline(decoded_snapshot) = &entity.snapshot_content else {
+            panic!("decoded record must retain its inline snapshot")
+        };
+        assert_eq!(decoded_snapshot.as_ref(), snapshot);
+    }
+
+    #[test]
+    fn guest_change_decoder_slices_one_owned_page_payload() {
+        let limits = WasmTransitionLimits::default();
+        let mut packet = Vec::new();
+        for (id, snapshot) in [
+            ("first", br#"{"id":"first"}"#.as_slice()),
+            ("second", br#"{"id":"second"}"#.as_slice()),
+        ] {
+            let frame = begin_packet_record(&mut packet);
+            packet.push(0); // upsert
+            encode_entity_key(
+                &WasmEntityKey::from_owned_parts("csv_row", vec![id.to_owned()]),
+                &mut packet,
+            )
+            .unwrap();
+            packet.push(0); // content effect
+            packet.push(0); // inline snapshot
+            push_u32(&mut packet, snapshot.len() as u32);
+            packet.extend_from_slice(snapshot);
+            finish_packet_record(&mut packet, frame, limits.max_page_bytes, limits).unwrap();
+        }
+
+        let decoded =
+            decode_change_packet(2, packet, limits.max_page_bytes, limits).expect("valid page");
+        let first_key = decoded.changes.changes[0]
+            .entity_key()
+            .expect("upsert entity key");
+        let second_key = decoded.changes.changes[1]
+            .entity_key()
+            .expect("upsert entity key");
+        assert_eq!(first_key.schema_key, "csv_row");
+        assert_eq!(first_key.entity_pk[0], "first");
+        assert_eq!(second_key.entity_pk[0], "second");
+        assert!(
+            first_key
+                .schema_key
+                .shares_buffer_with(&first_key.entity_pk[0])
+                && first_key
+                    .schema_key
+                    .shares_buffer_with(&second_key.schema_key)
+                && first_key
+                    .schema_key
+                    .shares_buffer_with(&second_key.entity_pk[0]),
+            "all decoded key text must retain the packet page's one shared allocation"
+        );
+        let snapshots = decoded
+            .changes
+            .changes
+            .iter()
+            .map(|change| {
+                let WasmEntityChange::Upsert { entity, .. } = change else {
+                    panic!("test page contains only upserts")
+                };
+                let WasmGuestBytes::Inline(snapshot) = &entity.snapshot_content else {
+                    panic!("test page contains only inline snapshots")
+                };
+                snapshot
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots[0].as_ref(), br#"{"id":"first"}"#);
+        assert_eq!(snapshots[1].as_ref(), br#"{"id":"second"}"#);
+        assert!(
+            snapshots.iter().all(|snapshot| !snapshot.is_unique()),
+            "all inline snapshots must retain the page's one shared allocation"
+        );
+    }
+
+    #[test]
+    fn guest_change_decoder_reserves_exact_normal_row_capacity() {
+        let limits = WasmTransitionLimits::default();
+        let row_count = 4_usize;
+        let snapshot = format!(
+            r#"{{"payload":"{}"}}"#,
+            "x".repeat(size_of::<WasmEntityChange<WasmGuestBytes>>() + 32)
+        );
+        let mut packet = Vec::new();
+        for row in 0..row_count {
+            let frame = begin_packet_record(&mut packet);
+            packet.push(0); // upsert
+            encode_entity_key(
+                &WasmEntityKey::from_owned_parts("csv_row", vec![format!("row-{row}")]),
+                &mut packet,
+            )
+            .unwrap();
+            packet.push(0); // content effect
+            packet.push(0); // inline snapshot
+            push_u32(&mut packet, snapshot.len() as u32);
+            packet.extend_from_slice(snapshot.as_bytes());
+            finish_packet_record(&mut packet, frame, limits.max_page_bytes, limits).unwrap();
+        }
+        assert_eq!(
+            payload_bounded_row_capacity::<WasmEntityChange<WasmGuestBytes>>(
+                row_count,
+                packet.len(),
+            ),
+            row_count
+        );
+
+        let decoded = decode_change_packet(row_count as u32, packet, limits.max_page_bytes, limits)
+            .expect("normal change packet");
+        assert_eq!(decoded.changes.changes.len(), row_count);
+        assert_eq!(decoded.changes.changes.capacity(), row_count);
+        for (row, change) in decoded.changes.changes.iter().enumerate() {
+            let WasmEntityChange::Upsert { entity, effect } = change else {
+                panic!("normal test packet contains only upserts")
+            };
+            assert_eq!(entity.key.schema_key, "csv_row");
+            assert_eq!(entity.key.entity_pk[0], format!("row-{row}"));
+            assert_eq!(*effect, WasmChangeEffect::Content);
+            let WasmGuestBytes::Inline(decoded_snapshot) = &entity.snapshot_content else {
+                panic!("normal test packet contains only inline snapshots")
+            };
+            assert_eq!(decoded_snapshot.as_ref(), snapshot.as_bytes());
+        }
+    }
+
+    #[test]
+    fn guest_change_decoder_hostile_count_preallocation_stays_payload_bounded() {
+        let limits = WasmTransitionLimits::default();
+        let payload_len = limits.max_page_bytes as usize;
+        let framing_bound = payload_len / size_of::<u32>();
+        let row_size = size_of::<WasmEntityChange<WasmGuestBytes>>();
+        let capacity = payload_bounded_row_capacity::<WasmEntityChange<WasmGuestBytes>>(
+            framing_bound,
+            payload_len,
+        );
+
+        assert!(capacity < framing_bound);
+        assert!(capacity * row_size <= payload_len);
+        assert!((capacity + 1) * row_size > payload_len);
+        assert!(
+            decode_change_packet(
+                framing_bound as u32,
+                vec![0; payload_len],
+                limits.max_page_bytes,
+                limits,
+            )
+            .is_err(),
+            "malformed maximally dense framing must still be rejected"
+        );
+        assert!(
+            decode_change_packet(
+                framing_bound as u32 + 1,
+                vec![0; payload_len],
+                limits.max_page_bytes,
+                limits,
+            )
+            .is_err(),
+            "a count beyond the payload framing bound must be rejected"
+        );
+    }
+
+    #[test]
+    fn packet_encoder_uses_one_exact_preallocated_page_buffer() {
+        let limits = WasmTransitionLimits::default();
+        let encoded_len = 2 * size_of::<u32>() + b"first".len() + b"second".len();
+        let mut payload =
+            packet_payload(encoded_len, 4_096, limits).expect("bounded packet payload");
+        assert_eq!(payload.capacity(), encoded_len);
+        assert!(payload.capacity() < 4_096);
+        let allocation = payload.as_ptr();
+
+        for value in [b"first".as_slice(), b"second".as_slice()] {
+            let record = begin_packet_record(&mut payload);
+            payload.extend_from_slice(value);
+            finish_packet_record(&mut payload, record, 4_096, limits)
+                .expect("record should fit the planned page");
+            assert_eq!(
+                payload.as_ptr(),
+                allocation,
+                "records must be written directly into the page allocation"
+            );
+        }
+
+        let packet = finish_packet(2, payload, Vec::new()).expect("finish packet");
+        assert_eq!(packet.record_count, 2);
+        assert_eq!(
+            &packet.payload, b"\x05\0\0\0first\x06\0\0\0second",
+            "record lengths are backpatched in place"
+        );
+    }
+
+    #[test]
+    fn small_packet_pages_reserve_their_exact_encoded_size() {
+        let limits = WasmTransitionLimits::default();
+        let max_bytes = limits.max_page_bytes;
+        let key = WasmEntityKey::from_owned_parts("s", vec!["id".to_owned()]);
+        let snapshot = Bytes::from_static(br#"{"id":"row"}"#);
+        let mut previous_entity_key = None;
+
+        let entity = encode_entity_packet(
+            WasmEntityPage {
+                entities: vec![WasmEntity {
+                    key: key.clone(),
+                    snapshot_content: WasmHostBytes::Inline(snapshot.clone()),
+                }],
+            },
+            max_bytes,
+            limits,
+            &mut previous_entity_key,
+        )
+        .expect("small entity page");
+        let encoded_key_len = size_of::<u32>() + 1 + size_of::<u32>() + size_of::<u32>() + 2;
+        let encoded_inline_blob_len = 1 + size_of::<u32>() + snapshot.len();
+        assert_eq!(
+            entity.payload.len(),
+            size_of::<u32>() + encoded_key_len + encoded_inline_blob_len
+        );
+        assert_eq!(entity.payload.capacity(), entity.payload.len());
+        assert!(entity.payload.capacity() < max_bytes as usize);
+
+        let mut seen_change_keys = BTreeSet::new();
+        let change = encode_change_packet(
+            WasmEntityChanges {
+                changes: vec![WasmEntityChange::Delete(key.clone())],
+            },
+            max_bytes,
+            limits,
+            &mut seen_change_keys,
+        )
+        .expect("small change page");
+        assert_eq!(change.payload.len(), size_of::<u32>() + 1 + encoded_key_len);
+        assert_eq!(change.payload.capacity(), change.payload.len());
+        assert!(change.payload.capacity() < max_bytes as usize);
+
+        let source = Arc::new(TestByteSource(Arc::new(br#"{"id":"row"}"#.to_vec())));
+        let mut previous_conflict_key = None;
+        let conflict = encode_conflict_packet(
+            WasmEntityConflictPage {
+                conflicts: vec![lix_engine::wasm::v2::WasmEntityConflict {
+                    ordinal: 0,
+                    key,
+                    base: None,
+                    a: Some(WasmHostBytes::Source(WasmSourceSlice {
+                        source,
+                        range: lix_engine::wasm::v2::WasmSourceRange {
+                            offset: 0,
+                            length: snapshot.len() as u64,
+                        },
+                    })),
+                    b: None,
+                }],
+            },
+            max_bytes,
+            limits,
+            &mut previous_conflict_key,
+        )
+        .expect("small conflict page");
+        let encoded_source_blob_len = 1 + size_of::<u32>() + size_of::<u64>() + size_of::<u64>();
+        assert_eq!(
+            conflict.payload.len(),
+            size_of::<u32>()
+                + encoded_key_len
+                + size_of::<u32>()
+                + 1
+                + 1
+                + encoded_source_blob_len
+                + 1
+        );
+        assert_eq!(conflict.payload.capacity(), conflict.payload.len());
+        assert!(conflict.payload.capacity() < max_bytes as usize);
+        assert_eq!(conflict.attachments.len(), 1);
+        assert_eq!(conflict.attachments.capacity(), 1);
+    }
+
+    #[test]
     fn packet_v1_change_decoder_rejects_trailing_and_overflowed_attachment_data() {
         let limits = WasmTransitionLimits::default();
         let mut record = Vec::new();
         record.push(1); // delete
         encode_entity_key(
-            &WasmEntityKey {
-                schema_key: "csv_row".to_owned(),
-                entity_pk: vec!["row".to_owned()],
-            },
+            &WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]),
             &mut record,
         )
         .unwrap();
@@ -2502,30 +3001,33 @@ mod tests {
             u32::try_from(record.len()).expect("test change record length fits u32"),
         );
         packet.extend_from_slice(&record);
-        let decoded = decode_change_packet(1, &packet, limits.max_page_bytes, limits).unwrap();
+        let decoded =
+            decode_change_packet(1, packet.clone(), limits.max_page_bytes, limits).unwrap();
         assert_eq!(decoded.changes.entity_change_count(), 1);
         assert!(
-            decode_change_packet(1, &packet, u32::try_from(packet.len() - 1).unwrap(), limits,)
-                .err()
-                .expect("guest payload must honor this exact next(max-bytes) request")
-                .message
-                .contains("requested max-bytes")
+            decode_change_packet(
+                1,
+                packet.clone(),
+                u32::try_from(packet.len() - 1).unwrap(),
+                limits,
+            )
+            .err()
+            .expect("guest payload must honor this exact next(max-bytes) request")
+            .message
+            .contains("requested max-bytes")
         );
         assert!(
-            decode_change_packet(u32::MAX, &packet, limits.max_page_bytes, limits).is_err(),
+            decode_change_packet(u32::MAX, packet.clone(), limits.max_page_bytes, limits,).is_err(),
             "guest-controlled record count must be bounded before allocation"
         );
 
         packet.push(0);
-        assert!(decode_change_packet(1, &packet, limits.max_page_bytes, limits).is_err());
+        assert!(decode_change_packet(1, packet, limits.max_page_bytes, limits).is_err());
 
         let mut attachment_record = Vec::new();
         attachment_record.push(0); // upsert
         encode_entity_key(
-            &WasmEntityKey {
-                schema_key: "csv_row".to_owned(),
-                entity_pk: vec!["row".to_owned()],
-            },
+            &WasmEntityKey::from_owned_parts("csv_row", vec!["row".to_owned()]),
             &mut attachment_record,
         )
         .unwrap();
@@ -2540,9 +3042,7 @@ mod tests {
             u32::try_from(attachment_record.len()).expect("test attachment record length fits u32"),
         );
         attachment_packet.extend_from_slice(&attachment_record);
-        assert!(
-            decode_change_packet(1, &attachment_packet, limits.max_page_bytes, limits).is_err()
-        );
+        assert!(decode_change_packet(1, attachment_packet, limits.max_page_bytes, limits).is_err());
     }
 
     #[test]
@@ -2558,7 +3058,7 @@ mod tests {
         );
         packet.extend_from_slice(&record);
 
-        let decoded = decode_resolution_packet(1, &packet, limits.max_page_bytes, limits)
+        let decoded = decode_resolution_packet(1, packet, limits.max_page_bytes, limits)
             .expect("an explicit delete is a valid resolution packet");
         assert_eq!(decoded.ordinals, [7]);
         assert!(matches!(
@@ -2911,7 +3411,7 @@ mod tests {
         assert_eq!(edit_page.edits.len(), 1);
         let edit = &edit_page.edits[0];
         let insert = match &edit.insert {
-            WasmGuestBytes::Inline(bytes) => bytes.clone(),
+            WasmGuestBytes::Inline(bytes) => bytes.to_vec(),
             WasmGuestBytes::Output(range) => {
                 let outputs = edit_page
                     .outputs
@@ -3364,11 +3864,12 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .limits;
+        let payload_len = page.payload.len();
         let decoded = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.plugin_drain_decode_packet"
         )
-        .in_scope(|| decode_change_packet(page.record_count, &page.payload, max_bytes, limits))?;
+        .in_scope(|| decode_change_packet(page.record_count, page.payload, max_bytes, limits))?;
         let reference_count = checked_u32(decoded.output_ranges.len(), "output reference count")?;
         if (reference_count == 0) == page.attachments.is_some() {
             self.retire_now();
@@ -3382,7 +3883,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.charge_attachment_refs(reference_count)?;
-            state.charge_page(page.payload.len() as u64)?;
+            state.charge_page(payload_len as u64)?;
             state.counters.packet_pages = state.counters.packet_pages.saturating_add(1);
             state.counters.packet_records = state
                 .counters
@@ -3471,8 +3972,8 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .limits;
-        let decoded =
-            decode_resolution_packet(page.record_count, &page.payload, max_bytes, limits)?;
+        let payload_len = page.payload.len();
+        let decoded = decode_resolution_packet(page.record_count, page.payload, max_bytes, limits)?;
         let reference_count = checked_u32(decoded.output_ranges.len(), "output reference count")?;
         if (reference_count == 0) == page.attachments.is_some() {
             self.retire_now();
@@ -3486,7 +3987,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.charge_attachment_refs(reference_count)?;
-            state.charge_page(page.payload.len() as u64)?;
+            state.charge_page(payload_len as u64)?;
             state.counters.packet_pages = state.counters.packet_pages.saturating_add(1);
             state.counters.packet_records = state
                 .counters
@@ -3612,7 +4113,7 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
                                 self.retire_now();
                                 v2_limit("v2 guest edit record byte count overflowed")
                             })?;
-                    WasmGuestBytes::Inline(bytes)
+                    WasmGuestBytes::Inline(bytes.into())
                 }
                 bindings::exports::lix::plugin::api::OutputBytes::Output(range) => {
                     let range = WasmOutputRange {

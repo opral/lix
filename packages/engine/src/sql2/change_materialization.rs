@@ -1,4 +1,5 @@
 use crate::changelog::ChangeRecord;
+use crate::common::SharedStr;
 use crate::entity_pk::EntityPk;
 use crate::json_store::{JsonLoadRequestRef, JsonReadScopeRef, JsonStoreReader};
 use crate::storage_adapter::StorageAdapterRead;
@@ -16,8 +17,8 @@ pub(crate) struct MaterializedChange {
     pub(crate) entity_pk: EntityPk,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
+    pub(crate) snapshot_content: Option<SharedStr>,
+    pub(crate) metadata: Option<SharedStr>,
     pub(crate) created_at: String,
     pub(crate) origin_key: Option<String>,
 }
@@ -90,7 +91,9 @@ where
     };
     let metadata = if payload_projection.metadata {
         match load_changelog_json_slot(json_reader, &change.metadata, "metadata").await? {
-            Some(value) => Some(parse_row_metadata(&value, "changelog change metadata_ref")?),
+            Some(value) => {
+                Some(parse_row_metadata(&value, "changelog change metadata_ref")?.into())
+            }
             None => None,
         }
     } else {
@@ -112,13 +115,15 @@ async fn load_changelog_json_slot<S>(
     json_reader: &mut JsonStoreReader<S>,
     slot: &crate::json_store::JsonSlot,
     field: &str,
-) -> Result<Option<String>, LixError>
+) -> Result<Option<SharedStr>, LixError>
 where
     S: StorageAdapterRead,
 {
     let json_ref = match slot {
         crate::json_store::JsonSlot::None => return Ok(None),
-        crate::json_store::JsonSlot::Inline(json) => return Ok(Some(json.to_string())),
+        crate::json_store::JsonSlot::Inline(json) => {
+            return Ok(Some(json.to_string().into()));
+        }
         crate::json_store::JsonSlot::Ref(json_ref) => json_ref,
     };
     let batch = json_reader
@@ -136,7 +141,7 @@ where
             ),
         ));
     };
-    String::from_utf8(bytes).map(Some).map_err(|error| {
+    SharedStr::from_utf8(bytes).map(Some).map_err(|error| {
         LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("changelog change {field} is not UTF-8 JSON: {error}"),

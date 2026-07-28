@@ -14,9 +14,8 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::commit_graph::CommitGraphReader;
-use crate::tracked_state::{
-    MaterializedTrackedStateRow, TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest,
-};
+use crate::common::SharedStr;
+use crate::tracked_state::{TrackedStateContext, TrackedStateFilter, TrackedStateScanRequest};
 
 use crate::sql2::SqlHistoryQuerySource;
 use crate::sql2::WriteAccess;
@@ -31,14 +30,16 @@ use crate::sql2::history_route::{
     serialize_history_source_changes, validate_history_anchor_filter,
 };
 use crate::sql2::providers::filesystem_history_path::{
-    HistoryDirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
-    resolve_history_directory_path,
+    DirectoryPathRecord, HistoryDirectoryTree, load_history_commit_parents,
+    resolve_observed_directory_path,
 };
 use crate::sql2::result_metadata::json_field;
 use crate::storage_adapter::StorageAdapterRead;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
-use super::history_util::entity_pk_json_array;
+use super::history_util::{
+    ObservedTrackedStateOrdinal, ObservedTrackedStateRows, entity_pk_json_array,
+};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
 
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -157,7 +158,7 @@ struct DirectoryHistoryRecord {
     entry: HistoryEntry,
 }
 
-impl HistoryDirectoryPathRecord for DirectoryHistoryRecord {
+impl DirectoryPathRecord for DirectoryHistoryRecord {
     fn id(&self) -> &str {
         &self.id
     }
@@ -169,21 +170,51 @@ impl HistoryDirectoryPathRecord for DirectoryHistoryRecord {
     fn name(&self) -> Option<&str> {
         self.name.as_deref()
     }
+}
 
-    fn entry(&self) -> &HistoryEntry {
-        &self.entry
+#[derive(Debug)]
+struct DirectoryHistoryObservedState {
+    rows: ObservedTrackedStateRows,
+    descriptors: Vec<DirectoryHistoryObservedRecord>,
+}
+
+#[derive(Debug)]
+struct DirectoryHistoryObservedRecord {
+    id: String,
+    parent_id: Option<String>,
+    name: Option<String>,
+    row: ObservedTrackedStateOrdinal,
+}
+
+impl DirectoryPathRecord for DirectoryHistoryObservedRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct DirectoryHistoryOutputRow {
-    entity_pk: String,
+    observed_state: Arc<DirectoryHistoryObservedState>,
+    descriptor_ordinal: u32,
     id: String,
     path: Option<String>,
-    parent_id: Option<String>,
-    name: Option<String>,
-    is_deleted: bool,
     event: DirectoryHistoryEvent,
+}
+
+impl DirectoryHistoryOutputRow {
+    fn descriptor(&self) -> &DirectoryHistoryObservedRecord {
+        let descriptor = &self.observed_state.descriptors[self.descriptor_ordinal as usize];
+        let _ = self.observed_state.rows.row(descriptor.row);
+        descriptor
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -253,7 +284,7 @@ where
     let mut output = Vec::new();
 
     for event in events {
-        let Some(descriptors) = observed_states.get(&event.observed_commit_id) else {
+        let Some(observed_state) = observed_states.get(&event.observed_commit_id) else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -262,18 +293,18 @@ where
                 ),
             ));
         };
-        let Some(visible_descriptor) = descriptors
+        let Some((descriptor_ordinal, visible_descriptor)) = observed_state
+            .descriptors
             .iter()
-            .find(|descriptor| descriptor.id == event.directory_id)
+            .enumerate()
+            .find(|(_, descriptor)| descriptor.id == event.directory_id)
         else {
             continue;
         };
         let path = if visible_descriptor.name.is_some() {
-            resolve_history_directory_path(
+            resolve_observed_directory_path(
                 &visible_descriptor.id,
-                &event.observed_commit_id,
-                0,
-                descriptors,
+                &observed_state.descriptors,
                 &mut BTreeMap::new(),
                 &mut BTreeSet::new(),
             )
@@ -288,28 +319,32 @@ where
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| visible_descriptor.id.clone());
         output.push(DirectoryHistoryOutputRow {
-            entity_pk: visible_descriptor.id.clone(),
+            observed_state: Arc::clone(observed_state),
+            descriptor_ordinal: u32::try_from(descriptor_ordinal).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "lix_directory_history observed descriptor ordinal exceeds u32",
+                )
+            })?,
             id,
             path,
-            parent_id: visible_descriptor.parent_id.clone(),
-            name: visible_descriptor.name.clone(),
-            is_deleted: visible_descriptor.name.is_none(),
             event,
         });
     }
     output.retain(|row| {
-        let entity_pk = entity_pk_json_array(&row.entity_pk).ok();
+        let entity_pk = entity_pk_json_array(&row.descriptor().id).ok();
         route.matches_surface_row(
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            entity_pk.as_deref().unwrap_or(&row.entity_pk),
+            entity_pk.as_deref().unwrap_or(&row.descriptor().id),
             None,
             row.event.depth,
         )
     });
 
     output.sort_by(|left, right| {
-        left.entity_pk
-            .cmp(&right.entity_pk)
+        left.descriptor()
+            .id
+            .cmp(&right.descriptor().id)
             .then(left.event.as_of_commit_id.cmp(&right.event.as_of_commit_id))
             .then(left.event.depth.cmp(&right.event.depth))
             .then(
@@ -350,7 +385,7 @@ where
 async fn load_directory_history_observed_states<S>(
     query_source: SqlHistoryQuerySource<S>,
     observed_commit_ids: BTreeSet<String>,
-) -> Result<BTreeMap<String, Vec<DirectoryHistoryRecord>>, LixError>
+) -> Result<BTreeMap<String, Arc<DirectoryHistoryObservedState>>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
@@ -360,8 +395,8 @@ where
     let mut reader = TrackedStateContext::new().reader(query_source.store);
     let mut states = BTreeMap::new();
     for observed_commit_id in observed_commit_ids {
-        let rows = reader
-            .scan_rows_at_commit(
+        let batch = reader
+            .scan_batch_at_commit(
                 &observed_commit_id,
                 &TrackedStateScanRequest {
                     filter: TrackedStateFilter {
@@ -373,38 +408,50 @@ where
                 },
             )
             .await?;
-        let entries = rows
-            .into_iter()
-            .map(|row| directory_history_entry_from_observed_state(row, &observed_commit_id))
-            .collect::<Vec<_>>();
+        let rows = ObservedTrackedStateRows::from_batch(
+            SharedStr::from(observed_commit_id.as_str()),
+            batch,
+        )?;
+        let descriptors = parse_directory_history_observed_records(&rows)?;
         states.insert(
             observed_commit_id,
-            parse_directory_history_records(&entries)?,
+            Arc::new(DirectoryHistoryObservedState { rows, descriptors }),
         );
     }
     Ok(states)
 }
 
-fn directory_history_entry_from_observed_state(
-    row: MaterializedTrackedStateRow,
-    observed_commit_id: &str,
-) -> HistoryEntry {
-    HistoryEntry {
-        change: MaterializedChange {
-            id: row.change_id.to_string(),
-            entity_pk: row.entity_pk,
-            schema_key: row.schema_key,
-            file_id: row.file_id,
-            snapshot_content: row.snapshot_content,
-            metadata: row.metadata,
-            created_at: row.updated_at.clone(),
-            origin_key: None,
-        },
-        observed_commit_id: observed_commit_id.to_string(),
-        commit_created_at: Some(row.updated_at),
-        as_of_commit_id: observed_commit_id.to_string(),
-        depth: 0,
-    }
+fn parse_directory_history_observed_records(
+    rows: &ObservedTrackedStateRows,
+) -> Result<Vec<DirectoryHistoryObservedRecord>, LixError> {
+    rows.iter()
+        .filter(|observed| observed.row().schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY)
+        .map(|observed| {
+            let _ = observed.observed_commit_id();
+            let row = observed.row();
+            let Some(snapshot_content) = row.snapshot_content() else {
+                return Ok(DirectoryHistoryObservedRecord {
+                    id: row.entity_pk().as_single_string_owned()?,
+                    parent_id: None,
+                    name: None,
+                    row: observed.ordinal(),
+                });
+            };
+            let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
+                .map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("invalid lix_directory_descriptor history snapshot JSON: {error}"),
+                    )
+                })?;
+            Ok(DirectoryHistoryObservedRecord {
+                id: snapshot.id,
+                parent_id: snapshot.parent_id,
+                name: Some(snapshot.name),
+                row: observed.ordinal(),
+            })
+        })
+        .collect()
 }
 
 fn parse_directory_history_records(
@@ -441,7 +488,7 @@ fn parse_directory_history_records(
 
 fn grouped_directory_history_events(
     descriptors: &[DirectoryHistoryRecord],
-    observed_states: &BTreeMap<String, Vec<DirectoryHistoryRecord>>,
+    observed_states: &BTreeMap<String, Arc<DirectoryHistoryObservedState>>,
     parent_commit_ids_by_commit: &BTreeMap<String, Vec<String>>,
 ) -> Vec<DirectoryHistoryEvent> {
     let mut grouped = BTreeMap::<(String, String, String), DirectoryHistoryEvent>::new();
@@ -450,7 +497,7 @@ fn grouped_directory_history_events(
         .map(|(commit_id, state)| {
             (
                 commit_id.as_str(),
-                HistoryDirectoryTree::from_records(state),
+                HistoryDirectoryTree::from_records(&state.descriptors),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -532,11 +579,14 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
     columns: &[
         ("id", Col::Utf8(|row| Some(row.id.as_str()))),
         ("path", Col::Utf8(|row| row.path.as_deref())),
-        ("parent_id", Col::Utf8(|row| row.parent_id.as_deref())),
-        ("name", Col::Utf8(|row| row.name.as_deref())),
+        (
+            "parent_id",
+            Col::Utf8(|row| row.descriptor().parent_id.as_deref()),
+        ),
+        ("name", Col::Utf8(|row| row.descriptor().name.as_deref())),
         (
             HISTORY_COL_ENTITY_PK,
-            Col::Utf8Fallible(|row| entity_pk_json_array(&row.entity_pk).map(Some)),
+            Col::Utf8Fallible(|row| entity_pk_json_array(&row.descriptor().id).map(Some)),
         ),
         (
             HISTORY_COL_SOURCE_CHANGES,
@@ -563,7 +613,7 @@ static LIX_DIRECTORY_HISTORY_COLS: ColumnTable<DirectoryHistoryOutputRow> = Colu
         ),
         (
             HISTORY_COL_IS_DELETED,
-            Col::Bool(|row| Some(row.is_deleted)),
+            Col::Bool(|row| Some(row.descriptor().name.is_none())),
         ),
     ],
 };

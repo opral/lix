@@ -228,8 +228,6 @@ pub enum BenchmarkGate {
     BulkWrite,
     /// Sparse and direct operations may regress by no more than five percent.
     ElapsedRegression,
-    /// Record a stable reference without imposing a performance ratio.
-    Reference,
 }
 
 impl BenchmarkGate {
@@ -241,7 +239,12 @@ impl BenchmarkGate {
                     "elapsed_ms": 0.70,
                     "allocation_count": 0.40,
                     "allocated_bytes": 0.50,
-                    "peak_live_bytes_delta": 0.70
+                    "peak_live_bytes_delta": 0.70,
+                    // The end-to-end counter includes unavoidable backend
+                    // buffers, so use a no-regression gate here. The
+                    // transaction and lowering unit tests separately assert
+                    // that engine-owned key/value arenas stay O(1) per batch.
+                    "large_allocation_count": 1.00
                 }
             }),
             Self::ElapsedRegression => serde_json::json!({
@@ -249,10 +252,6 @@ impl BenchmarkGate {
                 "max_candidate_over_baseline": {
                     "elapsed_ms": 1.05
                 }
-            }),
-            Self::Reference => serde_json::json!({
-                "comparison": "reference_only",
-                "max_candidate_over_baseline": {}
             }),
         }
     }
@@ -377,4 +376,22 @@ fn median<T: Copy>(sorted: &[T]) -> T {
 fn percentile_95<T: Copy>(sorted: &[T]) -> T {
     let index = ((sorted.len() * 95).div_ceil(100)).saturating_sub(1);
     sorted[index]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BenchmarkGate;
+
+    #[test]
+    fn bulk_write_gate_covers_every_requested_resource_metric() {
+        let gate = BenchmarkGate::BulkWrite.json();
+        let thresholds = gate["max_candidate_over_baseline"]
+            .as_object()
+            .expect("bulk-write thresholds must be an object");
+        assert_eq!(thresholds["elapsed_ms"].as_f64(), Some(0.70));
+        assert_eq!(thresholds["allocation_count"].as_f64(), Some(0.40));
+        assert_eq!(thresholds["allocated_bytes"].as_f64(), Some(0.50));
+        assert_eq!(thresholds["peak_live_bytes_delta"].as_f64(), Some(0.70));
+        assert_eq!(thresholds["large_allocation_count"].as_f64(), Some(1.00));
+    }
 }

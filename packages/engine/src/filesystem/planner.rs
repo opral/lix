@@ -13,6 +13,7 @@ use crate::common::{LixPath, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    MaterializedLiveStateRowRef,
 };
 
 use super::keys::{
@@ -22,8 +23,8 @@ use super::keys::{
 use super::visibility::VisibleFilesystem;
 use super::{DirectoryPathRecord, derive_directory_paths};
 use crate::transaction::types::{
-    LogicalPrimaryKey, TransactionFileData, TransactionJson, TransactionWriteOperation,
-    TransactionWriteOrigin, TransactionWriteRow,
+    LogicalPrimaryKey, RawWriteBatch, TransactionFileData, TransactionJson,
+    TransactionWriteOperation, TransactionWriteOrigin, TransactionWriteRow,
 };
 
 /// Planned filesystem write output after SQL surface columns have been lowered
@@ -32,24 +33,24 @@ use crate::transaction::types::{
 /// Providers should emit this shape; transaction/commit code should not need
 /// to know whether a row came from `lix_file`, `lix_directory`, or a future
 /// filesystem write surface.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct FilesystemWritePlan {
-    pub(crate) rows: Vec<TransactionWriteRow>,
+    pub(crate) rows: RawWriteBatch,
     pub(crate) file_data: Vec<TransactionFileData>,
     pub(crate) count: u64,
 }
 
 /// Planned filesystem delete output after SQL predicates have selected rows
 /// and the surface delete has been lowered into tombstone state rows.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct FilesystemDeletePlan {
-    pub(crate) rows: Vec<TransactionWriteRow>,
+    pub(crate) rows: RawWriteBatch,
     pub(crate) count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct DirectoryPathCreatePlan {
-    pub(crate) rows: Vec<TransactionWriteRow>,
+    pub(crate) rows: RawWriteBatch,
     pub(crate) directory_id: String,
 }
 
@@ -105,6 +106,19 @@ impl FilesystemDescriptorKey {
             global: row.global,
             untracked: row.untracked,
             file_id: row.file_id.clone(),
+            descriptor_id: descriptor_id.into(),
+        }
+    }
+
+    pub(crate) fn from_live_row_ref(
+        row: MaterializedLiveStateRowRef<'_>,
+        descriptor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id: row.branch_id().to_owned(),
+            global: row.global(),
+            untracked: row.untracked(),
+            file_id: row.file_id().map(str::to_owned),
             descriptor_id: descriptor_id.into(),
         }
     }
@@ -192,6 +206,13 @@ impl FilesystemBlobRefKey {
     ) -> Self {
         Self(FilesystemDescriptorKey::from_live_row(row, blob_ref_id))
     }
+
+    pub(crate) fn from_live_row_ref(
+        row: MaterializedLiveStateRowRef<'_>,
+        blob_ref_id: impl Into<String>,
+    ) -> Self {
+        Self(FilesystemDescriptorKey::from_live_row_ref(row, blob_ref_id))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,12 +223,36 @@ pub(crate) struct DirectoryDescriptorRowInput {
     pub(crate) context: FilesystemRowContext,
 }
 
+impl DirectoryDescriptorRowInput {
+    fn append_to(self, rows: &mut RawWriteBatch) {
+        DirectoryDescriptorWriteIntent {
+            id: Some(self.id),
+            parent_id: self.parent_id,
+            name: self.name,
+            context: self.context,
+        }
+        .append_to(rows);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileDescriptorRowInput {
     pub(crate) id: String,
     pub(crate) directory_id: Option<String>,
     pub(crate) name: String,
     pub(crate) context: FilesystemRowContext,
+}
+
+impl FileDescriptorRowInput {
+    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) {
+        FileDescriptorWriteIntent {
+            id: Some(self.id),
+            directory_id: self.directory_id,
+            name: self.name,
+            context: self.context,
+        }
+        .append_to(rows);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +263,30 @@ pub(crate) struct DirectoryDescriptorWriteIntent {
     pub(crate) context: FilesystemRowContext,
 }
 
+impl DirectoryDescriptorWriteIntent {
+    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) {
+        let mut snapshot = JsonMap::new();
+        if let Some(id) = self.id.as_ref() {
+            snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
+        }
+        snapshot.insert(
+            "parent_id".to_string(),
+            self.parent_id
+                .clone()
+                .map(JsonValue::String)
+                .unwrap_or(JsonValue::Null),
+        );
+        snapshot.insert("name".to_string(), JsonValue::String(self.name));
+        append_partial_state_row(
+            rows,
+            self.id,
+            DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+            Some(JsonValue::Object(snapshot)),
+            self.context,
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileDescriptorWriteIntent {
     pub(crate) id: Option<String>,
@@ -226,12 +295,67 @@ pub(crate) struct FileDescriptorWriteIntent {
     pub(crate) context: FilesystemRowContext,
 }
 
+impl FileDescriptorWriteIntent {
+    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) {
+        let mut snapshot = JsonMap::new();
+        if let Some(id) = self.id.as_ref() {
+            snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
+        }
+        snapshot.insert(
+            "directory_id".to_string(),
+            self.directory_id
+                .clone()
+                .map(JsonValue::String)
+                .unwrap_or(JsonValue::Null),
+        );
+        snapshot.insert("name".to_string(), JsonValue::String(self.name));
+        append_partial_state_row(
+            rows,
+            self.id,
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            Some(JsonValue::Object(snapshot)),
+            self.context,
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlobRefRowInput {
     pub(crate) file_id: String,
     pub(crate) blob_hash: BlobHash,
     pub(crate) size_bytes: usize,
     pub(crate) context: FilesystemRowContext,
+}
+
+impl BlobRefRowInput {
+    pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
+        let size_bytes = u64::try_from(self.size_bytes).map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "binary blob size exceeds supported range for file '{}' branch '{}'",
+                    self.file_id, self.context.branch_id
+                ),
+            )
+        })?;
+        let snapshot = json!({
+            "id": self.file_id,
+            "blob_hash": self.blob_hash.to_hex(),
+            "size_bytes": size_bytes,
+        });
+        let file_id = self.file_id;
+        append_state_row(
+            rows,
+            file_id.clone(),
+            BLOB_REF_SCHEMA_KEY,
+            Some(snapshot),
+            FilesystemRowContext {
+                file_id: Some(file_id),
+                ..self.context
+            },
+        );
+        Ok(())
+    }
 }
 
 /// Durable proof for a plugin-owned file whose bytes are reconstructed from
@@ -428,14 +552,16 @@ impl DirectoryPathResolver {
         generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<TransactionWriteRow>, LixError> {
         let parsed = LixPath::try_from_directory_path(directory_path)?;
-        self.plan_directory_segments_with_fallback(
-            None,
-            parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>(),
-            None,
-            context,
-            generate_directory_id,
-            None,
-        )
+        Ok(self
+            .plan_directory_segments_with_fallback(
+                None,
+                parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>(),
+                None,
+                context,
+                generate_directory_id,
+                None,
+            )?
+            .into_rows())
     }
 
     fn plan_directory_segments_with_fallback(
@@ -446,15 +572,15 @@ impl DirectoryPathResolver {
         context: FilesystemRowContext,
         generate_directory_id: &mut dyn FnMut() -> String,
         duplicate_directory_path: Option<&str>,
-    ) -> Result<Vec<TransactionWriteRow>, LixError> {
+    ) -> Result<RawWriteBatch, LixError> {
         if segments.is_empty() {
             if let Some(directory_path) = duplicate_directory_path {
                 return Err(duplicate_directory_path_error(directory_path));
             }
-            return Ok(Vec::new());
+            return Ok(RawWriteBatch::new());
         }
 
-        let mut rows = Vec::new();
+        let mut rows = RawWriteBatch::with_capacity(segments.len());
         let mut parent_id = None::<String>;
         let leaf_index = segments.len() - 1;
         for (index, name) in segments.into_iter().enumerate() {
@@ -542,7 +668,7 @@ impl DirectoryPathResolver {
             };
             self.reserve_directory(parent_id.clone(), name.clone(), id.clone())?;
 
-            rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
+            DirectoryDescriptorRowInput {
                 id: id.clone(),
                 parent_id: parent_id.clone(),
                 name,
@@ -552,7 +678,8 @@ impl DirectoryPathResolver {
                     file_id: None,
                     ..context.clone()
                 },
-            }));
+            }
+            .append_to(&mut rows);
             parent_id = Some(id);
         }
 
@@ -582,7 +709,7 @@ impl DirectoryPathResolver {
         &mut self,
         directory_id: &str,
         context: &FilesystemRowContext,
-        rows: &mut Vec<TransactionWriteRow>,
+        rows: &mut RawWriteBatch,
     ) -> Result<(), LixError> {
         let seed = self.directories_by_id.get(directory_id).cloned().ok_or_else(|| {
             LixError::new(
@@ -600,13 +727,14 @@ impl DirectoryPathResolver {
         &mut self,
         seed: DirectoryDescriptorSeed,
         context: &FilesystemRowContext,
-        rows: &mut Vec<TransactionWriteRow>,
+        rows: &mut RawWriteBatch,
     ) {
         if !self.promoted_directory_ids.insert(seed.id.clone()) {
             return;
         }
         let directory_id = seed.id;
-        let mut row = directory_descriptor_row(DirectoryDescriptorRowInput {
+        let row_index = rows.len();
+        DirectoryDescriptorRowInput {
             id: directory_id.clone(),
             parent_id: seed.parent_id,
             name: seed.name,
@@ -615,16 +743,16 @@ impl DirectoryPathResolver {
                 untracked: false,
                 ..context.clone()
             },
-        });
-        row.origin = Some(TransactionWriteOrigin {
-            surface: "filesystem path parent".to_string(),
-            operation: TransactionWriteOperation::Update,
-            primary_key: Some(LogicalPrimaryKey {
-                columns: vec!["id".to_string()],
-                values: vec![directory_id],
+        }
+        .append_to(rows);
+        rows.set_origin(
+            row_index,
+            Some(TransactionWriteOrigin {
+                surface: crate::transaction::types::shared_origin_surface("filesystem path parent"),
+                operation: TransactionWriteOperation::Update,
+                primary_key: Some(Arc::new(LogicalPrimaryKey::single_id(directory_id))),
             }),
-        });
-        rows.push(row);
+        );
     }
 
     fn validate_directory_parent_graph(&self) -> Result<(), LixError> {
@@ -801,6 +929,7 @@ fn filesystem_namespace_conflict_error(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> TransactionWriteRow {
     directory_descriptor_write_row(DirectoryDescriptorWriteIntent {
         id: Some(input.id),
@@ -810,6 +939,7 @@ pub(crate) fn directory_descriptor_row(input: DirectoryDescriptorRowInput) -> Tr
     })
 }
 
+#[cfg(test)]
 pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionWriteRow {
     file_descriptor_write_row(FileDescriptorWriteIntent {
         id: Some(input.id),
@@ -819,6 +949,7 @@ pub(crate) fn file_descriptor_row(input: FileDescriptorRowInput) -> TransactionW
     })
 }
 
+#[cfg(test)]
 pub(crate) fn directory_descriptor_write_row(
     input: DirectoryDescriptorWriteIntent,
 ) -> TransactionWriteRow {
@@ -844,6 +975,7 @@ pub(crate) fn directory_descriptor_write_row(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn file_descriptor_write_row(input: FileDescriptorWriteIntent) -> TransactionWriteRow {
     let mut snapshot = JsonMap::new();
     if let Some(id) = input.id.as_ref() {
@@ -907,6 +1039,23 @@ pub(crate) fn blob_ref_tombstone_row(
             ..context
         },
     )
+}
+
+pub(crate) fn append_blob_ref_tombstone_row(
+    rows: &mut RawWriteBatch,
+    file_id: String,
+    context: FilesystemRowContext,
+) {
+    append_tombstone_row(
+        rows,
+        file_id.clone(),
+        BLOB_REF_SCHEMA_KEY,
+        FilesystemRowContext {
+            file_id: Some(file_id),
+            metadata: None,
+            ..context
+        },
+    );
 }
 
 pub(crate) fn derived_file_ref_row(
@@ -977,6 +1126,23 @@ pub(crate) fn derived_file_ref_tombstone_row(
     )
 }
 
+pub(crate) fn append_derived_file_ref_tombstone_row(
+    rows: &mut RawWriteBatch,
+    file_id: String,
+    context: FilesystemRowContext,
+) {
+    append_tombstone_row(
+        rows,
+        file_id.clone(),
+        DERIVED_FILE_REF_SCHEMA_KEY,
+        FilesystemRowContext {
+            file_id: Some(file_id),
+            metadata: None,
+            ..context
+        },
+    );
+}
+
 pub(crate) fn plan_parsed_file_path_write_with_resolvers(
     resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
     parsed: LixPath,
@@ -1007,7 +1173,7 @@ fn plan_parsed_file_path_write_with_fallback(
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
-    let mut rows = Vec::new();
+    let mut rows = RawWriteBatch::with_capacity(parsed.segments().count().saturating_add(1));
     let file_id = id.unwrap_or_else(&mut *generate_directory_id);
     let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
     let filename = segments
@@ -1020,7 +1186,7 @@ fn plan_parsed_file_path_write_with_fallback(
     let directory_id = if directory_segments.is_empty() {
         None
     } else {
-        rows.extend(resolver.plan_directory_segments_with_fallback(
+        rows.append(resolver.plan_directory_segments_with_fallback(
             fallback,
             directory_segments.to_vec(),
             None,
@@ -1034,12 +1200,13 @@ fn plan_parsed_file_path_write_with_fallback(
     };
 
     resolver.reserve_file(directory_id.clone(), filename.clone(), file_id.clone())?;
-    rows.push(file_descriptor_row(FileDescriptorRowInput {
+    FileDescriptorRowInput {
         id: file_id.clone(),
         directory_id,
         name: filename.clone(),
         context: context.clone(),
-    }));
+    }
+    .append_to(&mut rows);
 
     let mut file_data = Vec::new();
     if let Some(data) = data {
@@ -1053,7 +1220,7 @@ fn plan_parsed_file_path_write_with_fallback(
             data,
         );
         if !file_payload.is_empty() {
-            rows.push(blob_ref_row(BlobRefRowInput {
+            BlobRefRowInput {
                 file_id,
                 blob_hash: file_payload
                     .blob_hash()
@@ -1064,7 +1231,8 @@ fn plan_parsed_file_path_write_with_fallback(
                     metadata: None,
                     ..context
                 },
-            })?);
+            }
+            .append_to(&mut rows)?;
         }
         file_data.push(file_payload);
     }
@@ -1089,12 +1257,14 @@ pub(crate) fn plan_file_descriptor_write(
         input.name.clone(),
         file_id.clone(),
     )?;
-    let mut rows = vec![file_descriptor_row(FileDescriptorRowInput {
+    let mut rows = RawWriteBatch::with_capacity(2);
+    FileDescriptorRowInput {
         id: file_id.clone(),
         directory_id: input.directory_id,
         name: input.name,
         context: input.context.clone(),
-    })];
+    }
+    .append_to(&mut rows);
 
     let mut file_data = Vec::new();
     if let Some(data) = input.data {
@@ -1108,7 +1278,7 @@ pub(crate) fn plan_file_descriptor_write(
             data,
         );
         if !file_payload.is_empty() {
-            rows.push(blob_ref_row(BlobRefRowInput {
+            BlobRefRowInput {
                 file_id,
                 blob_hash: file_payload
                     .blob_hash()
@@ -1119,7 +1289,8 @@ pub(crate) fn plan_file_descriptor_write(
                     metadata: None,
                     ..input.context.clone()
                 },
-            })?);
+            }
+            .append_to(&mut rows)?;
         }
         file_data.push(file_payload);
     }
@@ -1158,7 +1329,7 @@ fn plan_parsed_file_path_update_with_fallback(
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
-    let mut rows = Vec::new();
+    let mut rows = RawWriteBatch::with_capacity(parsed.segments().count());
     let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
     let filename = segments
         .last()
@@ -1169,7 +1340,7 @@ fn plan_parsed_file_path_update_with_fallback(
     let directory_id = if directory_segments.is_empty() {
         None
     } else {
-        rows.extend(resolver.plan_directory_segments_with_fallback(
+        rows.append(resolver.plan_directory_segments_with_fallback(
             fallback,
             directory_segments.to_vec(),
             None,
@@ -1187,12 +1358,13 @@ fn plan_parsed_file_path_update_with_fallback(
         filename.clone(),
         existing_file_id.clone(),
     )?;
-    rows.push(file_descriptor_row(FileDescriptorRowInput {
+    FileDescriptorRowInput {
         id: existing_file_id,
         directory_id,
         name: filename,
         context,
-    }));
+    }
+    .append_to(&mut rows);
 
     // Data/blob-ref state is intentionally left untouched for path-only
     // updates. A provider should plan blob rows only when `data` is assigned.
@@ -1240,7 +1412,7 @@ pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
     directory_id: String,
     context: FilesystemRowContext,
     generate_directory_id: &mut dyn FnMut() -> String,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
+) -> Result<RawWriteBatch, LixError> {
     let segments = parsed.segments().map(ToOwned::to_owned).collect::<Vec<_>>();
     if segments.is_empty() {
         return Err(duplicate_directory_path_error("/"));
@@ -1268,7 +1440,7 @@ pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
             .map(ToOwned::to_owned)
     };
     resolver.update_directory(parent_id.clone(), leaf_name.clone(), directory_id.clone())?;
-    rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
+    DirectoryDescriptorRowInput {
         id: directory_id,
         parent_id,
         name: leaf_name,
@@ -1276,7 +1448,8 @@ pub(crate) fn plan_parsed_directory_path_update_with_resolvers(
             file_id: None,
             ..context
         },
-    }));
+    }
+    .append_to(&mut rows);
     Ok(rows)
 }
 
@@ -1319,37 +1492,35 @@ fn directory_path_from_segments(segments: &[String]) -> String {
 }
 
 pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
-    let mut rows = vec![tombstone_row(
+    let mut rows = RawWriteBatch::with_capacity(
+        1 + usize::from(input.has_blob_ref) + usize::from(input.has_derived_file_ref),
+    );
+    append_tombstone_row(
+        &mut rows,
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
         input.context.clone(),
-    )];
+    );
 
     if input.has_blob_ref {
-        rows.push(blob_ref_tombstone_row(
-            input.file_id.clone(),
-            input.context.clone(),
-        ));
+        append_blob_ref_tombstone_row(&mut rows, input.file_id.clone(), input.context.clone());
     }
     if input.has_derived_file_ref {
-        rows.push(derived_file_ref_tombstone_row(
-            input.file_id.clone(),
-            input.context,
-        ));
+        append_derived_file_ref_tombstone_row(&mut rows, input.file_id.clone(), input.context);
     }
 
     FilesystemDeletePlan { rows, count: 1 }
 }
 
 pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDeletePlan {
-    FilesystemDeletePlan {
-        rows: vec![tombstone_row(
-            input.directory_id,
-            DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-            input.context,
-        )],
-        count: 1,
-    }
+    let mut rows = RawWriteBatch::with_capacity(1);
+    append_tombstone_row(
+        &mut rows,
+        input.directory_id,
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
+        input.context,
+    );
+    FilesystemDeletePlan { rows, count: 1 }
 }
 
 pub(crate) fn plan_recursive_directory_delete(
@@ -1357,7 +1528,7 @@ pub(crate) fn plan_recursive_directory_delete(
     visible_filesystem: &VisibleFilesystem,
     context: FilesystemRowContext,
 ) -> FilesystemDeletePlan {
-    let mut rows = Vec::new();
+    let mut rows = RawWriteBatch::new();
     let mut count = 0;
 
     collect_recursive_directory_delete(
@@ -1371,27 +1542,35 @@ pub(crate) fn plan_recursive_directory_delete(
     FilesystemDeletePlan { rows, count }
 }
 
+#[cfg(test)]
 pub(crate) fn directory_path_resolvers_from_state_rows(
     rows: Vec<MaterializedLiveStateRow>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let rows = crate::live_state::MaterializedLiveStateBatch::from_rows(rows);
+    directory_path_resolvers_from_state_batch(&rows)
+}
+
+pub(crate) fn directory_path_resolvers_from_state_batch(
+    rows: &crate::live_state::MaterializedLiveStateBatch,
+) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let mut directory_rows = BTreeMap::<String, BTreeMap<String, DirectoryDescriptorSeed>>::new();
     let mut file_rows = BTreeMap::<String, Vec<(Option<String>, String, String)>>::new();
-    for row in rows {
-        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+    for row in rows.iter() {
+        let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
             continue;
         };
-        let storage_branch_id = if row.global {
+        let storage_branch_id = if row.global() {
             GLOBAL_BRANCH_ID
         } else {
-            row.branch_id.as_ref()
+            row.branch_id()
         };
         let resolver_key = filesystem_storage_scope_key(
             storage_branch_id,
-            row.global,
-            row.untracked,
-            row.file_id.as_deref(),
+            row.global(),
+            row.untracked(),
+            row.file_id(),
         );
-        match row.schema_key.as_str() {
+        match row.schema_key() {
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
                 let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                     .map_err(|error| {
@@ -1449,7 +1628,7 @@ pub(crate) async fn directory_path_resolvers_from_live_state(
     branch_binding: Option<&str>,
 ) -> Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let rows = live_state
-        .scan_rows(&LiveStateScanRequest {
+        .scan_batch(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![
                     DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -1463,7 +1642,7 @@ pub(crate) async fn directory_path_resolvers_from_live_state(
             ..Default::default()
         })
         .await?;
-    let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
+    let mut resolvers = directory_path_resolvers_from_state_batch(&rows)?;
     if let Some(branch_id) = branch_binding {
         let key = filesystem_storage_scope_key(branch_id, false, false, None);
         resolvers.entry(key).or_default();
@@ -1573,6 +1752,16 @@ fn state_row(
     partial_state_row(Some(entity_pk), schema_key, snapshot, context)
 }
 
+fn append_state_row(
+    rows: &mut RawWriteBatch,
+    entity_pk: String,
+    schema_key: &str,
+    snapshot: Option<JsonValue>,
+    context: FilesystemRowContext,
+) {
+    append_partial_state_row(rows, Some(entity_pk), schema_key, snapshot, context);
+}
+
 fn partial_state_row(
     entity_pk: Option<String>,
     schema_key: &str,
@@ -1594,8 +1783,8 @@ fn partial_state_row(
     let snapshot = snapshot.map(TransactionJson::from_value_unchecked);
     TransactionWriteRow {
         entity_pk: derived_entity_pk,
-        schema_key: schema_key.to_string(),
-        file_id: context.file_id,
+        schema_key: schema_key.into(),
+        file_id: context.file_id.map(Into::into),
         snapshot,
         metadata: context.metadata,
         origin: None,
@@ -1605,8 +1794,44 @@ fn partial_state_row(
         change_id: None,
         commit_id: None,
         untracked: context.untracked,
-        branch_id: context.branch_id,
+        branch_id: context.branch_id.into(),
     }
+}
+
+fn append_partial_state_row(
+    rows: &mut RawWriteBatch,
+    entity_pk: Option<String>,
+    schema_key: &str,
+    snapshot: Option<JsonValue>,
+    context: FilesystemRowContext,
+) {
+    let derived_entity_pk = entity_pk.map(|value| {
+        if snapshot.is_none() {
+            EntityPk::uuid_from_canonical(&value)
+                .expect("filesystem tombstones target validated UUID identities")
+        } else {
+            // These builders are schema-aware: filesystem descriptor and
+            // materialization IDs are declared UUID primary keys. Preserve an
+            // invalid caller value only until normalization can return the
+            // public schema-validation error instead of panicking.
+            EntityPk::uuid_from_canonical(&value).unwrap_or_else(|_| EntityPk::single(value))
+        }
+    });
+    rows.push_parts(
+        derived_entity_pk,
+        schema_key.into(),
+        context.file_id.map(Into::into),
+        snapshot.map(TransactionJson::from_value_unchecked),
+        context.metadata,
+        None,
+        None,
+        None,
+        context.global,
+        None,
+        None,
+        context.untracked,
+        context.branch_id.into(),
+    );
 }
 
 fn tombstone_row(
@@ -1617,11 +1842,20 @@ fn tombstone_row(
     state_row(entity_pk, schema_key, None, context)
 }
 
+fn append_tombstone_row(
+    rows: &mut RawWriteBatch,
+    entity_pk: String,
+    schema_key: &str,
+    context: FilesystemRowContext,
+) {
+    append_state_row(rows, entity_pk, schema_key, None, context);
+}
+
 fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
     context: &FilesystemRowContext,
-    rows: &mut Vec<TransactionWriteRow>,
+    rows: &mut RawWriteBatch,
     count: &mut u64,
 ) {
     if let Some(child_ids) = visible_filesystem
@@ -1651,7 +1885,7 @@ fn collect_recursive_directory_delete(
                 has_derived_file_ref: visible_filesystem.has_derived_file_ref(context, file_id),
                 context: context.clone(),
             });
-            rows.extend(plan.rows);
+            rows.append(plan.rows);
             *count += plan.count;
         }
     }
@@ -1660,7 +1894,7 @@ fn collect_recursive_directory_delete(
         directory_id: directory_id.to_string(),
         context: context.clone(),
     });
-    rows.extend(plan.rows);
+    rows.append(plan.rows);
     *count += plan.count;
 }
 
@@ -1675,7 +1909,7 @@ mod tests {
     use crate::changelog::{ChangeId, CommitId};
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemBlobRefKey, FilesystemDescriptorKey};
-    use crate::transaction::types::TransactionJson;
+    use crate::transaction::types::{RawWriteBatch, TransactionJson};
 
     use super::{
         BlobRefRowInput, DerivedFileRefRowInput, DirectoryDeleteInput, DirectoryDescriptorRowInput,
@@ -1696,6 +1930,45 @@ mod tests {
 
     fn uuid_pk(value: &str) -> EntityPk {
         EntityPk::uuid_from_canonical(value).expect("fixture ID should be a canonical UUID")
+    }
+
+    #[test]
+    fn ten_thousand_directory_intents_append_into_aligned_batch_columns() {
+        const ROW_COUNT: usize = 10_000;
+        let mut rows = RawWriteBatch::with_capacity(ROW_COUNT);
+        let owner_pointers = rows.aligned_owner_allocation_ptrs();
+        let owner_capacities = rows.aligned_owner_capacities();
+        let context = FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1");
+
+        for index in 0..ROW_COUNT {
+            DirectoryDescriptorWriteIntent {
+                id: Some(format!("01920000-0000-7000-8000-{index:012x}")),
+                parent_id: None,
+                name: format!("directory-{index:05}"),
+                context: context.clone(),
+            }
+            .append_to(&mut rows);
+        }
+
+        assert_eq!(rows.len(), ROW_COUNT);
+        assert_eq!(rows.aligned_owner_allocation_ptrs(), owner_pointers);
+        assert_eq!(rows.aligned_owner_capacities(), owner_capacities);
+        assert_eq!(
+            rows.shared_string_count(),
+            2,
+            "schema and branch identifiers must each be stored once"
+        );
+        assert_eq!(rows.shared_origin_count(), 0);
+        assert_eq!(
+            rows.row(0).entity_pk,
+            Some(&uuid_pk("01920000-0000-7000-8000-000000000000")),
+            "the first directory identity must remain a typed UUID"
+        );
+        assert_eq!(
+            rows.row(ROW_COUNT - 1).entity_pk,
+            Some(&uuid_pk("01920000-0000-7000-8000-00000000270f")),
+            "the last directory identity must remain a typed UUID"
+        );
     }
 
     fn parsed_file_path(path: &str) -> LixPath {
@@ -1730,7 +2003,7 @@ mod tests {
                 context,
                 generate_directory_id,
             )
-            .map(|plan| plan.rows)
+            .map(|plan| plan.rows.into_rows())
         })
     }
 
@@ -2033,8 +2306,8 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert!(plan.file_data.is_empty());
         assert_eq!(plan.rows.len(), 1);
-        assert_eq!(plan.rows[0].schema_key, "lix_file_descriptor");
-        let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
+        assert_eq!(plan.rows.row(0).schema_key, "lix_file_descriptor");
+        let snapshot: JsonValue = plan.rows.row(0).snapshot.unwrap().value().clone();
         assert_eq!(snapshot["id"], "file-generated-readme");
         assert_eq!(snapshot["directory_id"], JsonValue::Null);
         assert_eq!(snapshot["name"], "readme.md");
@@ -2081,6 +2354,18 @@ mod tests {
             plan.rows
                 .iter()
                 .any(|row| row.schema_key == "lix_binary_blob_ref")
+        );
+        assert!(std::ptr::eq(
+            plan.rows.row(0).branch_id,
+            plan.rows.row(plan.rows.len() - 1).branch_id,
+        ));
+        assert!(std::ptr::eq(
+            plan.rows.row(0).schema_key,
+            plan.rows.row(1).schema_key,
+        ));
+        assert!(
+            plan.rows.shared_string_count() < plan.rows.len().saturating_mul(2),
+            "multi-row filesystem plans dictionary-encode repeated schema and branch metadata"
         );
 
         let file_row = plan
@@ -2313,7 +2598,7 @@ mod tests {
                 .all(|row| row.schema_key != "lix_binary_blob_ref")
         );
 
-        let snapshot: JsonValue = plan.rows[0].snapshot.as_ref().unwrap().value().clone();
+        let snapshot: JsonValue = plan.rows.row(0).snapshot.unwrap().value().clone();
         assert_eq!(snapshot["id"], "01920000-0000-7000-8000-0000000000d2");
         assert_eq!(
             snapshot["directory_id"],
@@ -2438,7 +2723,7 @@ mod tests {
         assert_eq!(directory.global, true);
         assert_eq!(directory.untracked, true);
         assert_eq!(directory.file_id, None);
-        assert_eq!(directory.metadata.as_ref(), Some(&metadata));
+        assert_eq!(directory.metadata, Some(&metadata));
 
         let descriptor = plan
             .rows
@@ -2447,8 +2732,11 @@ mod tests {
             .expect("file descriptor should be planned");
         assert_eq!(descriptor.global, true);
         assert_eq!(descriptor.untracked, true);
-        assert_eq!(descriptor.file_id.as_deref(), Some("context-file"));
-        assert_eq!(descriptor.metadata.as_ref(), Some(&metadata));
+        assert_eq!(
+            descriptor.file_id.map(crate::common::SharedStr::as_str),
+            Some("context-file")
+        );
+        assert_eq!(descriptor.metadata, Some(&metadata));
 
         let blob = plan
             .rows
@@ -2458,7 +2746,7 @@ mod tests {
         assert_eq!(blob.global, true);
         assert_eq!(blob.untracked, true);
         assert_eq!(
-            blob.file_id.as_deref(),
+            blob.file_id.map(crate::common::SharedStr::as_str),
             Some("01920000-0000-7000-8000-0000000000d2")
         );
         assert_eq!(blob.metadata, None);
@@ -2706,7 +2994,7 @@ mod tests {
             .find(|row| row.schema_key == "lix_file_descriptor")
             .expect("file descriptor tombstone should be planned");
         assert_eq!(
-            descriptor.entity_pk.as_ref(),
+            descriptor.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(descriptor.file_id, None);
@@ -2718,11 +3006,11 @@ mod tests {
             .find(|row| row.schema_key == "lix_binary_blob_ref")
             .expect("blob ref tombstone should be planned");
         assert_eq!(
-            blob_ref.entity_pk.as_ref(),
+            blob_ref.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
         assert_eq!(
-            blob_ref.file_id.as_deref(),
+            blob_ref.file_id.map(crate::common::SharedStr::as_str),
             Some("01920000-0000-7000-8000-0000000000d2")
         );
         assert_eq!(blob_ref.snapshot, None);
@@ -2739,8 +3027,8 @@ mod tests {
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
-        assert_eq!(plan.rows[0].schema_key, "lix_file_descriptor");
-        assert_eq!(plan.rows[0].snapshot, None);
+        assert_eq!(plan.rows.row(0).schema_key, "lix_file_descriptor");
+        assert_eq!(plan.rows.row(0).snapshot, None);
     }
 
     #[test]
@@ -2753,12 +3041,12 @@ mod tests {
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
         assert_eq!(
-            plan.rows[0].entity_pk.as_ref(),
+            plan.rows.row(0).entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d3"))
         );
-        assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
-        assert_eq!(plan.rows[0].file_id, None);
-        assert_eq!(plan.rows[0].snapshot, None);
+        assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
+        assert_eq!(plan.rows.row(0).file_id, None);
+        assert_eq!(plan.rows.row(0).snapshot, None);
     }
 
     #[test]
@@ -2771,12 +3059,12 @@ mod tests {
 
         assert_eq!(plan.count, 1);
         assert_eq!(plan.rows.len(), 1);
-        assert_eq!(plan.rows[0].schema_key, "lix_directory_descriptor");
+        assert_eq!(plan.rows.row(0).schema_key, "lix_directory_descriptor");
         assert_eq!(
-            plan.rows[0].entity_pk.as_ref(),
+            plan.rows.row(0).entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000e3"))
         );
-        assert_eq!(plan.rows[0].snapshot, None);
+        assert_eq!(plan.rows.row(0).snapshot, None);
     }
 
     #[test]
@@ -2884,7 +3172,7 @@ mod tests {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id,
-            snapshot_content: Some(snapshot_content.to_string()),
+            snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),

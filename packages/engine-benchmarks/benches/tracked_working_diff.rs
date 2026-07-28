@@ -1,3 +1,5 @@
+#![allow(clippy::large_futures)]
+
 //! Two-phase populated tracked-working-diff benchmark for storage adapters.
 //!
 //! The fixture deliberately remains *between* checkpoints. The old checkpoint

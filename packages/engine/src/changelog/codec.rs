@@ -6,10 +6,19 @@ use super::types::{
 use crate::common::LixError;
 use crate::storage_codec;
 
+#[cfg(test)]
 pub(crate) fn encode_commit_record(record: &CommitRecord) -> Result<Vec<u8>, LixError> {
     storage_codec::encode("commit record", record)
 }
 
+pub(crate) fn append_commit_record(
+    bytes: &mut Vec<u8>,
+    record: &CommitRecord,
+) -> Result<std::ops::Range<usize>, LixError> {
+    storage_codec::append("commit record", bytes, record)
+}
+
+#[cfg(test)]
 pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, LixError> {
     encode_change_record_ref(&ChangeRecordRef {
         format_version: record.format_version,
@@ -23,6 +32,26 @@ pub(crate) fn encode_change_record(record: &ChangeRecord) -> Result<Vec<u8>, Lix
     })
 }
 
+pub(crate) fn append_change_record(
+    bytes: &mut Vec<u8>,
+    record: &ChangeRecord,
+) -> Result<std::ops::Range<usize>, LixError> {
+    append_change_record_ref(
+        bytes,
+        &ChangeRecordRef {
+            format_version: record.format_version,
+            schema_key: &record.schema_key,
+            entity_pk: &record.entity_pk,
+            file_id: record.file_id.as_deref(),
+            snapshot: record.snapshot.as_ref_slot(),
+            metadata: record.metadata.as_ref_slot(),
+            created_at: record.created_at,
+            origin_key: record.origin_key.as_deref(),
+        },
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn encode_transaction_change_record(
     record: &TransactionChangeRecordRef<'_>,
 ) -> Result<Vec<u8>, LixError> {
@@ -38,9 +67,37 @@ pub(crate) fn encode_transaction_change_record(
     })
 }
 
+pub(crate) fn append_transaction_change_record(
+    bytes: &mut Vec<u8>,
+    record: &TransactionChangeRecordRef<'_>,
+) -> Result<std::ops::Range<usize>, LixError> {
+    append_change_record_ref(
+        bytes,
+        &ChangeRecordRef {
+            format_version: record.format_version,
+            schema_key: record.schema_key,
+            entity_pk: record.entity_pk,
+            file_id: record.file_id,
+            snapshot: record.snapshot,
+            metadata: record.metadata,
+            created_at: record.created_at,
+            origin_key: record.origin_key,
+        },
+    )
+}
+
+#[cfg(test)]
 fn encode_change_record_ref(record: &ChangeRecordRef<'_>) -> Result<Vec<u8>, LixError> {
     // change_id is the storage key; the value intentionally omits it.
     storage_codec::encode("change record", record)
+}
+
+fn append_change_record_ref(
+    bytes: &mut Vec<u8>,
+    record: &ChangeRecordRef<'_>,
+) -> Result<std::ops::Range<usize>, LixError> {
+    // change_id is the storage key; the value intentionally omits it.
+    storage_codec::append("change record", bytes, record)
 }
 
 pub(crate) fn decode_change_record(
@@ -61,6 +118,7 @@ pub(crate) fn decode_change_record(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn encode_commit_change_ref_chunk(
     chunk: &CommitChangeRefChunk,
 ) -> Result<Vec<u8>, LixError> {
@@ -69,6 +127,39 @@ pub(crate) fn encode_commit_change_ref_chunk(
         &CommitChangeRefChunkWireRef {
             format_version: chunk.format_version,
             entries: &chunk.entries,
+        },
+    )
+}
+
+pub(crate) fn append_commit_change_ref_chunk(
+    bytes: &mut Vec<u8>,
+    chunk: &CommitChangeRefChunk,
+) -> Result<std::ops::Range<usize>, LixError> {
+    append_commit_change_ref_chunk_wire(bytes, chunk.format_version, &chunk.entries)
+}
+
+pub(crate) fn append_commit_change_ref_chunk_entries(
+    bytes: &mut Vec<u8>,
+    entries: &[ChangeId],
+) -> Result<std::ops::Range<usize>, LixError> {
+    append_commit_change_ref_chunk_wire(
+        bytes,
+        super::context::COMMIT_CHANGE_REF_CHUNK_FORMAT_VERSION,
+        entries,
+    )
+}
+
+fn append_commit_change_ref_chunk_wire(
+    bytes: &mut Vec<u8>,
+    format_version: u32,
+    entries: &[ChangeId],
+) -> Result<std::ops::Range<usize>, LixError> {
+    storage_codec::append(
+        "commit change ref chunk",
+        bytes,
+        &CommitChangeRefChunkWireRef {
+            format_version,
+            entries,
         },
     )
 }
@@ -130,6 +221,21 @@ mod tests {
         let decoded =
             decode_commit_change_ref_chunk(&encoded, chunk.commit_id).expect("chunk should decode");
         assert_eq!(decoded, chunk);
+    }
+
+    #[test]
+    fn borrowed_ref_chunk_entries_match_owned_chunk_codec() {
+        let chunk = ref_chunk(vec![
+            ChangeId::for_test_label("borrowed-change-a"),
+            ChangeId::for_test_label("borrowed-change-b"),
+        ]);
+        let expected = encode_commit_change_ref_chunk(&chunk).expect("owned chunk should encode");
+        let mut arena = b"prefix".to_vec();
+
+        let range = append_commit_change_ref_chunk_entries(&mut arena, &chunk.entries)
+            .expect("borrowed chunk entries should append");
+
+        assert_eq!(&arena[range], expected);
     }
 
     #[test]

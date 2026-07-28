@@ -97,6 +97,50 @@ fn single_key_get_many_preserves_snapshot_and_projection_semantics() {
 }
 
 #[test]
+fn multi_key_delete_uses_exact_contiguous_key_ranges() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let path = temp_dir.path().join("storage.rocksdb");
+    let storage = RocksDB::open(&path).expect("open storage");
+    let space = SpaceId(0x0005_0003);
+    let keys = [
+        Key(Bytes::from_static(b"delete-first")),
+        Key(Bytes::from_static(b"delete-second")),
+        Key(Bytes::from_static(b"retain-third")),
+    ];
+    let mut write = block_on(storage.begin_write(WriteOptions::default())).expect("begin put");
+    block_on(
+        write.put_many(
+            space,
+            PutBatch {
+                entries: keys
+                    .iter()
+                    .cloned()
+                    .map(|key| PutEntry {
+                        key,
+                        value: StoredValue {
+                            bytes: Bytes::from_static(b"value"),
+                        },
+                    })
+                    .collect(),
+            },
+        ),
+    )
+    .expect("put rows");
+    block_on(write.commit()).expect("commit puts");
+
+    let mut write = block_on(storage.begin_write(WriteOptions::default())).expect("begin delete");
+    block_on(write.delete_many(space, &keys[..2])).expect("delete two exact keys");
+    block_on(write.commit()).expect("commit deletes");
+
+    assert_eq!(read_one(&storage, space, keys[0].clone()), None);
+    assert_eq!(read_one(&storage, space, keys[1].clone()), None);
+    assert_eq!(
+        read_one(&storage, space, keys[2].clone()),
+        Some(Bytes::from_static(b"value"))
+    );
+}
+
+#[test]
 fn same_process_writes_are_serialized_across_reopened_handles() {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let path = temp_dir.path().join("storage.rocksdb");

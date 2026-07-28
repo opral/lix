@@ -1,7 +1,4 @@
-#[macro_use]
-#[path = "integration/support/mod.rs"]
-mod support;
-
+use crate::support;
 use lix_engine::{CreateBranchOptions, Value};
 use serde_json::json;
 use tokio::time::{Duration, Instant};

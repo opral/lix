@@ -2250,10 +2250,10 @@ where
     pub(crate) async fn scan_live_state_for_test(
         &mut self,
         request: &crate::live_state::LiveStateScanRequest,
-    ) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+    ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
         let _operation_guard = self.begin_session_operation()?;
         let transaction = self.transaction_mut()?;
-        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state(
+        <crate::transaction::Transaction<StorageImpl> as sql2::SqlWriteExecutionContext>::scan_live_state_batch(
             transaction,
             request,
         )
@@ -3355,7 +3355,7 @@ mod tests {
     use crate::telemetry::{
         CallbackTelemetrySink, CompletedTelemetrySpan, TelemetrySpanKind, TelemetryValue,
     };
-    use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+    use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
     use crate::{Engine, EngineOptions, Memory};
 
     async fn open_session() -> SessionContext<Memory> {
@@ -4601,6 +4601,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tracked_insert_fast_lane_rejects_duplicate_committed_identity_without_overwrite() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('duplicate-fast-lane', 'original')",
+                &[],
+            )
+            .await
+            .expect("the original tracked row should commit");
+
+        let error = session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) \
+                 VALUES ('duplicate-fast-lane', 'replacement')",
+                &[],
+            )
+            .await
+            .expect_err("a committed tracked INSERT identity must remain absent-only");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+
+        let result = session
+            .execute(
+                "SELECT value FROM lix_key_value \
+                 WHERE key = 'duplicate-fast-lane'",
+                &[],
+            )
+            .await
+            .expect("the original row should remain readable after rejection");
+        assert_eq!(result.rows().len(), 1);
+        assert_eq!(
+            result.rows()[0]
+                .get::<serde_json::Value>("value")
+                .expect("value should remain JSON"),
+            serde_json::json!("original"),
+            "the rejected INSERT must not overwrite committed state"
+        );
+    }
+
+    #[tokio::test]
     async fn coherent_read_batch_returns_metadata_and_ordered_results() {
         let session = open_session().await;
         session
@@ -4856,7 +4896,7 @@ mod tests {
         fn row(value: &str, created_at: Option<&str>) -> TransactionWriteRow {
             TransactionWriteRow {
                 entity_pk: Some(EntityPk::single(KEY)),
-                schema_key: "lix_key_value".to_string(),
+                schema_key: "lix_key_value".into(),
                 file_id: None,
                 snapshot: Some(TransactionJson::from_value_for_test(serde_json::json!({
                     "key": KEY,
@@ -4870,7 +4910,7 @@ mod tests {
                 change_id: None,
                 commit_id: None,
                 untracked: false,
-                branch_id: crate::GLOBAL_BRANCH_ID.to_string(),
+                branch_id: crate::GLOBAL_BRANCH_ID.into(),
             }
         }
 
@@ -4882,7 +4922,10 @@ mod tests {
             .expect("seed transaction should begin");
         seed.transaction_mut()
             .expect("seed transaction should be open")
-            .stage_rows(vec![row("seed", Some(FIRST_CREATED_AT))])
+            .stage_rows(RawWriteBatch::from_test_rows(vec![row(
+                "seed",
+                Some(FIRST_CREATED_AT),
+            )]))
             .await
             .expect("programmatic seed should stage");
         seed.commit()
@@ -4896,7 +4939,10 @@ mod tests {
         transaction
             .transaction_mut()
             .expect("transaction should be open")
-            .stage_rows(vec![row("programmatic replacement", None)])
+            .stage_rows(RawWriteBatch::from_test_rows(vec![row(
+                "programmatic replacement",
+                None,
+            )]))
             .await
             .expect("programmatic replacement should stage");
         transaction

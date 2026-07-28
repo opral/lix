@@ -101,17 +101,26 @@ where
                     notices: Vec::new(),
                 }));
             }
-            let mut rows = ctx.live_state().scan_rows(&request).await?;
+            let rows = ctx.live_state().scan_batch(&request).await?;
 
             // The accepted ORDER BY is the complete one-column primary key.
             // Retain multiple file-backed identities for one logical primary
             // key; `file_id` is a first-class row identity and must not be
             // collapsed by this route.
-            rows.sort_by(|left, right| left.entity_pk.cmp(&right.entity_pk));
-            let result_rows = rows
-                .iter()
+            let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
+            ordinals.sort_unstable_by(|left, right| {
+                rows.row(*left)
+                    .entity_pk()
+                    .cmp(rows.row(*right).entity_pk())
+            });
+            let result_rows = ordinals
+                .into_iter()
                 .map(|row| {
-                    materialize_row(spec, &shape.projection, row.snapshot_content.as_deref())
+                    materialize_row(
+                        spec,
+                        &shape.projection,
+                        rows.row(row).snapshot_content().map(|value| value.as_str()),
+                    )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 

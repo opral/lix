@@ -6,7 +6,7 @@ use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::branch::{BranchLifecycle, BranchOperation, BranchReferenceRole};
 use crate::storage_adapter::Storage;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{RawWriteBatch, TransactionJson, TransactionWriteRow};
 
 use super::context::{SessionContext, SessionMode, WORKSPACE_BRANCH_KEY};
 
@@ -59,9 +59,9 @@ where
                             branch_id: branch_id.clone(),
                         }),
                         SessionMode::Workspace => {
-                            transaction
-                                .stage_rows(vec![workspace_branch_stage_row(&branch_id)?])
-                                .await?;
+                            let mut rows = RawWriteBatch::with_capacity(1);
+                            rows.push(workspace_branch_stage_row(&branch_id)?);
+                            transaction.stage_rows(rows).await?;
                             Ok(SessionMode::Workspace)
                         }
                     }
@@ -100,7 +100,7 @@ where
 fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, LixError> {
     Ok(TransactionWriteRow {
         entity_pk: Some(crate::entity_pk::EntityPk::single(WORKSPACE_BRANCH_KEY)),
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
+        schema_key: KEY_VALUE_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
             "key": WORKSPACE_BRANCH_KEY,
@@ -114,6 +114,6 @@ fn workspace_branch_stage_row(branch_id: &str) -> Result<TransactionWriteRow, Li
         change_id: None,
         commit_id: None,
         untracked: true,
-        branch_id: GLOBAL_BRANCH_ID.to_string(),
+        branch_id: GLOBAL_BRANCH_ID.into(),
     })
 }

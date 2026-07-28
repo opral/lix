@@ -18,8 +18,8 @@ use crate::entity_pk::EntityPk;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::transaction::types::{TransactionJson, TransactionWriteRow};
 use crate::wasm::{
-    WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange, WasmEntityChanges,
-    WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
+    WasmCanonicalJson, WasmChangeEffect, WasmCreateContext, WasmEntity, WasmEntityChange,
+    WasmEntityChanges, WasmEntityKey, WasmHostBytes, WasmHostEntityChanges,
 };
 
 use super::{PluginActorKey, PluginRegistryEntry};
@@ -175,7 +175,11 @@ pub(crate) fn validate_create_changes<B>(
                 validation.requires_reservation = true;
             }
             WasmEntityChange::Upsert { entity, .. }
-                if creatable.binary_search(&entity.key.schema_key).is_ok() =>
+                if creatable
+                    .binary_search_by(|candidate| {
+                        candidate.as_str().cmp(entity.key.schema_key.as_str())
+                    })
+                    .is_ok() =>
             {
                 validation.existing_authorities.push(entity.key.clone());
             }
@@ -201,13 +205,13 @@ pub(crate) fn materialize_keyless_creates(
             continue;
         };
         let id = creates.component(*local_ref)?;
-        let WasmHostBytes::CanonicalJson { value, .. } = snapshot_content else {
+        let WasmHostBytes::CanonicalJson(canonical) = snapshot_content else {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "validated keyless creates must own parsed canonical snapshots",
             ));
         };
-        let mut snapshot = value.as_object().cloned().ok_or_else(|| {
+        let mut snapshot = canonical.value().as_object().cloned().ok_or_else(|| {
             invalid_id(format!(
                 "keyless create snapshot for schema '{schema_key}' must be an object"
             ))
@@ -219,22 +223,31 @@ pub(crate) fn materialize_keyless_creates(
         }
         snapshot.insert("id".to_string(), JsonValue::String(id.clone()));
         let value = JsonValue::Object(snapshot);
-        let normalized = serde_json::to_string(&value).map_err(|error| {
+        let normalized = serde_json::to_vec(&value).map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("failed to encode completed keyless create snapshot: {error}"),
             )
         })?;
+        let normalized_len = u32::try_from(normalized.len()).map_err(|_| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "completed keyless create snapshot exceeds u32",
+            )
+        })?;
+        let canonical = WasmCanonicalJson::from_batch_parts(
+            vec![value],
+            normalized,
+            vec![(0, normalized_len)],
+            0,
+            1,
+        )?
+        .pop()
+        .expect("one completed keyless create snapshot was built");
         *change = WasmEntityChange::Upsert {
             entity: WasmEntity {
-                key: WasmEntityKey {
-                    schema_key: schema_key.clone(),
-                    entity_pk: vec![id],
-                },
-                snapshot_content: WasmHostBytes::CanonicalJson {
-                    value: std::sync::Arc::new(value),
-                    normalized: normalized.into(),
-                },
+                key: WasmEntityKey::from_owned_parts(schema_key.clone(), vec![id]),
+                snapshot_content: WasmHostBytes::CanonicalJson(canonical),
             },
             effect: WasmChangeEffect::Content,
         };
@@ -260,7 +273,9 @@ pub(crate) fn require_existing_id_authorities(
             !row.deleted
                 && row.snapshot_content.is_some()
                 && row.schema_key == key.schema_key
-                && row.entity_pk.clone().into_parts() == key.entity_pk
+                && key.entity_pk.len() == 1
+                && EntityPk::uuid_from_canonical(&key.entity_pk[0])
+                    .is_ok_and(|entity_pk| row.entity_pk == entity_pk)
                 && row.file_id.as_deref() == Some(file_id)
                 && row.branch_id.as_ref() == branch_id
                 && !row.global
@@ -420,8 +435,8 @@ fn reservation_row(
     }
     Ok(TransactionWriteRow {
         entity_pk: Some(EntityPk::single(key)),
-        schema_key: KEY_VALUE_SCHEMA_KEY.to_string(),
-        file_id: Some(file_id.to_string()),
+        schema_key: KEY_VALUE_SCHEMA_KEY.into(),
+        file_id: Some(file_id.into()),
         snapshot: snapshot
             .map(|value| TransactionJson::from_value(value, "plugin create reservation"))
             .transpose()?,
@@ -433,7 +448,7 @@ fn reservation_row(
         change_id: None,
         commit_id: None,
         untracked: false,
-        branch_id: branch_id.to_string(),
+        branch_id: branch_id.into(),
     })
 }
 
@@ -547,24 +562,34 @@ mod tests {
     fn upsert(id: String) -> WasmEntityChange<WasmHostBytes> {
         WasmEntityChange::Upsert {
             entity: WasmEntity {
-                key: WasmEntityKey {
-                    schema_key: "csv_row".to_string(),
-                    entity_pk: vec![id],
-                },
-                snapshot_content: WasmHostBytes::Inline(b"{}".to_vec()),
+                key: WasmEntityKey::from_owned_parts("csv_row", vec![id]),
+                snapshot_content: WasmHostBytes::Inline(b"{}".to_vec().into()),
             },
             effect: WasmChangeEffect::Content,
         }
+    }
+
+    fn canonical(value: JsonValue) -> WasmHostBytes {
+        let normalized = serde_json::to_vec(&value).expect("canonical test JSON");
+        let normalized_len = u32::try_from(normalized.len()).expect("test JSON fits u32");
+        let canonical = WasmCanonicalJson::from_batch_parts(
+            vec![value],
+            normalized,
+            vec![(0, normalized_len)],
+            0,
+            1,
+        )
+        .expect("canonical test batch")
+        .pop()
+        .expect("one canonical test row");
+        WasmHostBytes::CanonicalJson(canonical)
     }
 
     fn create(local_ref: u64) -> WasmEntityChange<WasmHostBytes> {
         WasmEntityChange::Create {
             schema_key: "csv_row".to_string(),
             local_ref,
-            snapshot_content: WasmHostBytes::CanonicalJson {
-                value: std::sync::Arc::new(json!({})),
-                normalized: "{}".into(),
-            },
+            snapshot_content: canonical(json!({})),
         }
     }
 
@@ -574,11 +599,9 @@ mod tests {
             .expect("new row");
         MaterializedLiveStateRow {
             entity_pk: write.entity_pk.expect("pk"),
-            schema_key: write.schema_key,
-            file_id: write.file_id,
-            snapshot_content: write
-                .snapshot
-                .map(|snapshot| snapshot.normalized().to_string()),
+            schema_key: write.schema_key.into(),
+            file_id: write.file_id.map(Into::into),
+            snapshot_content: write.snapshot.map(|snapshot| snapshot.normalized().into()),
             metadata: None,
             deleted: false,
             created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
@@ -632,10 +655,44 @@ mod tests {
             changes: vec![WasmEntityChange::Create {
                 schema_key: "other".to_string(),
                 local_ref: 0,
-                snapshot_content: WasmHostBytes::Inline(Vec::new()),
+                snapshot_content: WasmHostBytes::Inline(Vec::new().into()),
             }],
         };
         assert!(validate_create_changes(&plugin(), &malformed).is_err());
+    }
+
+    #[test]
+    fn existing_authority_accepts_a_typed_uuid_primary_key() {
+        let id = BoundCreateContext::bind(mutation_identity(6, 5), &actor_key())
+            .expect("valid UUIDv7 seed")
+            .creates()
+            .component(1)
+            .expect("generated UUID");
+        let key = WasmEntityKey::from_owned_parts("csv_row", vec![id.clone()]);
+        let row = MaterializedLiveStateRow {
+            entity_pk: EntityPk::uuid_from_canonical(&id).expect("typed UUID primary key"),
+            schema_key: "csv_row".into(),
+            file_id: Some("01920000-0000-7000-8000-0000000000a2".into()),
+            snapshot_content: Some("{}".into()),
+            metadata: None,
+            deleted: false,
+            created_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            updated_at: LixTimestamp::from_unix_millis_utc_lossy(1),
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            branch_id: "main".into(),
+        };
+
+        require_existing_id_authorities(
+            &plugin(),
+            &[key],
+            &[Some(row)],
+            "01920000-0000-7000-8000-0000000000a2",
+            "main",
+        )
+        .expect("typed UUID authority must compare without string-only accessors");
     }
 
     #[test]
@@ -648,13 +705,10 @@ mod tests {
             changes: vec![WasmEntityChange::Create {
                 schema_key: "csv_row".to_string(),
                 local_ref: 42,
-                snapshot_content: WasmHostBytes::CanonicalJson {
-                    value: std::sync::Arc::new(json!({
-                        "cells": ["Alice", "42"],
-                        "order_key": "4000000000000001"
-                    })),
-                    normalized: r#"{"cells":["Alice","42"],"order_key":"4000000000000001"}"#.into(),
-                },
+                snapshot_content: canonical(json!({
+                    "cells": ["Alice", "42"],
+                    "order_key": "4000000000000001"
+                })),
             }],
         };
 
@@ -663,14 +717,14 @@ mod tests {
         let WasmEntityChange::Upsert { entity, effect } = &changes.changes[0] else {
             panic!("create must become an upsert before transaction staging");
         };
-        assert_eq!(entity.key.entity_pk, vec![expected_id.clone()]);
+        assert_eq!(entity.key.entity_pk.as_slice(), &[expected_id.clone()]);
         assert_eq!(*effect, WasmChangeEffect::Content);
-        let WasmHostBytes::CanonicalJson { value, normalized } = &entity.snapshot_content else {
+        let WasmHostBytes::CanonicalJson(canonical) = &entity.snapshot_content else {
             panic!("completed snapshot must stay canonical JSON");
         };
-        assert_eq!(value["id"], expected_id);
+        assert_eq!(canonical.value()["id"], expected_id);
         assert_eq!(
-            normalized.as_ref(),
+            canonical.normalized(),
             format!(
                 r#"{{"cells":["Alice","42"],"id":"{expected_id}","order_key":"4000000000000001"}}"#
             )

@@ -1,4 +1,6 @@
-use std::ops::Deref;
+use std::borrow::Borrow;
+use std::fmt;
+use std::ops::{Deref, Range};
 
 /// Immutable, cheaply cloned binary SQL value.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -60,6 +62,265 @@ impl Deref for Blob {
 
     fn deref(&self) -> &Self::Target {
         &self.0
+    }
+}
+
+/// Immutable UTF-8 backed by a cheaply cloned byte buffer.
+///
+/// A `SharedStr` retains its source buffer plus a validated byte range. This
+/// lets decoders hand out many string views over one arena without allocating
+/// one `String` per row. Every public constructor validates UTF-8 before the
+/// value can be observed as `str`.
+#[derive(Clone)]
+pub struct SharedStr {
+    bytes: bytes::Bytes,
+    range: Range<usize>,
+}
+
+impl SharedStr {
+    /// Retains a static UTF-8 string without allocating.
+    ///
+    /// Repeated construction from the same static string produces views over
+    /// the same immutable backing buffer, which is useful for batch-wide
+    /// engine metadata such as write-surface identifiers.
+    pub fn from_static(value: &'static str) -> Self {
+        let bytes = bytes::Bytes::from_static(value.as_bytes());
+        let len = bytes.len();
+        Self {
+            bytes,
+            range: 0..len,
+        }
+    }
+
+    /// Retains `bytes` without copying after validating the complete buffer.
+    pub fn from_utf8(bytes: bytes::Bytes) -> Result<Self, std::str::Utf8Error> {
+        std::str::from_utf8(&bytes)?;
+        let len = bytes.len();
+        Ok(Self {
+            bytes,
+            range: 0..len,
+        })
+    }
+
+    /// Retains one UTF-8 range of an otherwise arbitrary shared buffer.
+    #[cfg(test)]
+    pub(crate) fn from_utf8_range(bytes: bytes::Bytes, range: Range<usize>) -> Option<Self> {
+        let slice = bytes.get(range.clone())?;
+        std::str::from_utf8(slice).ok()?;
+        Some(Self { bytes, range })
+    }
+
+    /// Retains `value` as a zero-copy view when it points inside `bytes`.
+    ///
+    /// `value` is already valid UTF-8 by type. Pointer containment is checked
+    /// before constructing the range, so callers cannot forge an invalid view.
+    pub fn from_utf8_slice(bytes: bytes::Bytes, value: &str) -> Option<Self> {
+        if value.is_empty() {
+            return Some(Self::default());
+        }
+        let bytes_start = bytes.as_ptr() as usize;
+        let bytes_end = bytes_start.checked_add(bytes.len())?;
+        let value_start = value.as_ptr() as usize;
+        let value_end = value_start.checked_add(value.len())?;
+        if value_start < bytes_start || value_end > bytes_end {
+            return None;
+        }
+        Some(Self {
+            range: (value_start - bytes_start)..(value_end - bytes_start),
+            bytes,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        // SAFETY: all constructors validate exactly `range`; slicing a
+        // `SharedStr` below also checks UTF-8 character boundaries via `str`.
+        unsafe { std::str::from_utf8_unchecked(&self.bytes[self.range.clone()]) }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[self.range.clone()]
+    }
+
+    /// Creates another zero-copy view over this value.
+    pub fn slice(&self, range: Range<usize>) -> Option<Self> {
+        self.as_str().get(range.clone())?;
+        let start = self.range.start.checked_add(range.start)?;
+        let end = self.range.start.checked_add(range.end)?;
+        Some(Self {
+            bytes: self.bytes.clone(),
+            range: start..end,
+        })
+    }
+
+    /// Returns the selected bytes without copying.
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.bytes.slice(self.range)
+    }
+
+    /// Whether two views retain the same complete source buffer.
+    ///
+    /// Intended for structural assertions and batch diagnostics; it makes no
+    /// claim that the selected ranges overlap.
+    pub fn shares_buffer_with(&self, other: &Self) -> bool {
+        self.bytes.as_ptr() == other.bytes.as_ptr() && self.bytes.len() == other.bytes.len()
+    }
+
+    pub(crate) fn retained_buffer_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub(crate) fn retained_buffer_identity(&self) -> (*const u8, usize) {
+        (self.bytes.as_ptr(), self.bytes.len())
+    }
+}
+
+impl Default for SharedStr {
+    fn default() -> Self {
+        Self {
+            bytes: bytes::Bytes::new(),
+            range: 0..0,
+        }
+    }
+}
+
+impl From<String> for SharedStr {
+    fn from(value: String) -> Self {
+        let bytes = bytes::Bytes::from(value.into_bytes());
+        let len = bytes.len();
+        Self {
+            bytes,
+            range: 0..len,
+        }
+    }
+}
+
+impl From<&str> for SharedStr {
+    fn from(value: &str) -> Self {
+        Self::from(value.to_owned())
+    }
+}
+
+impl From<Box<str>> for SharedStr {
+    fn from(value: Box<str>) -> Self {
+        Self::from(value.into_string())
+    }
+}
+
+impl From<SharedStr> for bytes::Bytes {
+    fn from(value: SharedStr) -> Self {
+        value.into_bytes()
+    }
+}
+
+impl From<SharedStr> for String {
+    fn from(value: SharedStr) -> Self {
+        value.as_str().to_owned()
+    }
+}
+
+impl Deref for SharedStr {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl AsRef<str> for SharedStr {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl AsRef<[u8]> for SharedStr {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl Borrow<str> for SharedStr {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Debug for SharedStr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_str().fmt(formatter)
+    }
+}
+
+impl fmt::Display for SharedStr {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl PartialEq for SharedStr {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SharedStr {}
+
+impl PartialOrd for SharedStr {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SharedStr {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str().cmp(other.as_str())
+    }
+}
+
+impl std::hash::Hash for SharedStr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+impl PartialEq<str> for SharedStr {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for SharedStr {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<String> for SharedStr {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<SharedStr> for String {
+    fn eq(&self, other: &SharedStr) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl serde::Serialize for SharedStr {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SharedStr {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        <String as serde::Deserialize>::deserialize(deserializer).map(Self::from)
     }
 }
 
@@ -134,7 +395,8 @@ pub struct LixNotice {
 
 #[cfg(test)]
 mod tests {
-    use super::Value;
+    use super::{SharedStr, Value};
+    use bytes::Bytes;
 
     #[test]
     fn cloning_blob_values_shares_the_payload() {
@@ -147,5 +409,35 @@ mod tests {
             unreachable!("cloned a blob value");
         };
         assert_eq!(original.as_ptr(), cloned.as_ptr());
+    }
+
+    #[test]
+    fn shared_str_views_retain_one_utf8_buffer() {
+        let arena = Bytes::from_static(b"alpha|beta");
+        let alpha = SharedStr::from_utf8_range(arena.clone(), 0..5).expect("valid alpha");
+        let beta = SharedStr::from_utf8_range(arena, 6..10).expect("valid beta");
+
+        assert_eq!(alpha, "alpha");
+        assert_eq!(beta, "beta");
+        assert!(alpha.shares_buffer_with(&beta));
+        assert_eq!(
+            alpha.clone().into_bytes().as_ptr(),
+            alpha.as_bytes().as_ptr()
+        );
+    }
+
+    #[test]
+    fn shared_str_static_views_reuse_the_static_buffer() {
+        let first = SharedStr::from_static("plugin_reconciliation");
+        let second = SharedStr::from_static("plugin_reconciliation");
+
+        assert_eq!(first, "plugin_reconciliation");
+        assert!(first.shares_buffer_with(&second));
+        assert_eq!(first.as_bytes().as_ptr(), second.as_bytes().as_ptr());
+    }
+
+    #[test]
+    fn shared_str_rejects_invalid_utf8() {
+        assert!(SharedStr::from_utf8(Bytes::from_static(b"\xff")).is_err());
     }
 }

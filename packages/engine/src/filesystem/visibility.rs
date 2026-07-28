@@ -4,8 +4,11 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::LixError;
+#[cfg(test)]
 use crate::live_state::MaterializedLiveStateRow;
-use crate::live_state::{LiveStateFilter, LiveStateReader, LiveStateScanRequest};
+use crate::live_state::{
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+};
 
 use super::keys::{
     BLOB_REF_SCHEMA_KEY, DERIVED_FILE_REF_SCHEMA_KEY, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -35,7 +38,7 @@ impl VisibleFilesystem {
         branch_id: &str,
     ) -> Result<Self, LixError> {
         let rows = live_state
-            .scan_rows(&LiveStateScanRequest {
+            .scan_batch(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![
                         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -49,19 +52,24 @@ impl VisibleFilesystem {
                 ..LiveStateScanRequest::default()
             })
             .await?;
-        Self::from_live_rows(rows)
+        Self::from_live_batch(&rows)
     }
 
     /// Builds filesystem lookup indexes from rows that are already known to be
     /// transaction-visible.
+    #[cfg(test)]
     pub(crate) fn from_live_rows(rows: Vec<MaterializedLiveStateRow>) -> Result<Self, LixError> {
+        Self::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
+    pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
         let mut visible = Self::default();
 
-        for row in rows {
-            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        for row in rows.iter() {
+            let Some(snapshot_content) = row.snapshot_content().map(|value| value.as_str()) else {
                 continue;
             };
-            match row.schema_key.as_str() {
+            match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: DirectoryDescriptorSnapshot =
                         serde_json::from_str(snapshot_content).map_err(|error| {
@@ -70,7 +78,7 @@ impl VisibleFilesystem {
                                 format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
                             )
                         })?;
-                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
                     visible
                         .directory_children_by_parent_id
                         .entry(snapshot.parent_id.map(|id| key.in_same_scope(&id)))
@@ -85,7 +93,7 @@ impl VisibleFilesystem {
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
                     visible
                         .files_by_directory_id
                         .entry(snapshot.directory_id.map(|id| key.in_same_scope(&id)))
@@ -102,7 +110,7 @@ impl VisibleFilesystem {
                         })?;
                     visible
                         .blob_refs_by_key
-                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
+                        .insert(FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id));
                 }
                 DERIVED_FILE_REF_SCHEMA_KEY => {
                     let snapshot: DerivedFileRefSnapshot = serde_json::from_str(snapshot_content)
@@ -114,7 +122,7 @@ impl VisibleFilesystem {
                     })?;
                     visible
                         .derived_file_refs_by_key
-                        .insert(FilesystemBlobRefKey::from_live_row(&row, snapshot.id));
+                        .insert(FilesystemBlobRefKey::from_live_row_ref(row, snapshot.id));
                 }
                 _ => {}
             }
@@ -538,7 +546,7 @@ mod tests {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: schema_key.to_string(),
             file_id,
-            snapshot_content: snapshot_content.map(ToOwned::to_owned),
+            snapshot_content: snapshot_content.map(Into::into),
             metadata: None,
             deleted: false,
             branch_id: branch_id.into(),

@@ -2344,9 +2344,9 @@ mod tests {
                     .expect("captured staged row should carry entity_pk")
                     .as_json_array_text()
                     .expect("captured staged row should project entity_pk"),
-                schema_key: row.schema_key,
-                branch_id: row.branch_id,
-                file_id: row.file_id,
+                schema_key: row.schema_key.into(),
+                branch_id: row.branch_id.into(),
+                file_id: row.file_id.map(Into::into),
                 global: row.global,
                 untracked: row.untracked,
                 tombstone: row.snapshot.is_none(),
@@ -2469,11 +2469,18 @@ mod tests {
             self.blob_reader.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state(
+        async fn scan_live_state_batch(
             &mut self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            self.live_state.scan_rows(request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            self.live_state.scan_batch(request).await
+        }
+
+        async fn load_exact_live_state_batch(
+            &mut self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            self.live_state.load_exact_batch(request).await
         }
 
         async fn load_branch_head(
@@ -2497,8 +2504,8 @@ mod tests {
                 TransactionWrite::RowsWithFileData { count, .. } => *count,
             };
             let rows = match write {
-                TransactionWrite::Rows { rows, .. } => rows,
-                TransactionWrite::RowsWithFileData { rows, .. } => rows,
+                TransactionWrite::Rows { rows, .. } => rows.into_rows(),
+                TransactionWrite::RowsWithFileData { rows, .. } => rows.into_rows(),
             };
             self.staged_writes
                 .lock()
@@ -2534,11 +2541,18 @@ mod tests {
             self.inner.load_bytes_many(hashes).await
         }
 
-        async fn scan_live_state(
+        async fn scan_live_state_batch(
             &mut self,
             request: &LiveStateScanRequest,
-        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-            self.inner.scan_live_state(request).await
+        ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
+            self.inner.scan_live_state_batch(request).await
+        }
+
+        async fn load_exact_live_state_batch(
+            &mut self,
+            request: &crate::live_state::LiveStateExactBatchRequest,
+        ) -> Result<crate::live_state::MaterializedLiveStateExactBatch, LixError> {
+            self.inner.load_exact_live_state_batch(request).await
         }
 
         async fn load_branch_head(
@@ -2973,8 +2987,8 @@ mod tests {
             entity_pk: crate::entity_pk::EntityPk::single(entity_pk),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
-            metadata: Some(json!({ "source": entity_pk }).to_string()),
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
+            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
@@ -2993,7 +3007,11 @@ mod tests {
         untracked: bool,
     ) -> MaterializedLiveStateRow {
         let mut row = live_entity_row(entity_pk, branch_id, value);
-        row.snapshot_content = Some(json!({ "id": entity_pk, "value": value }).to_string());
+        row.snapshot_content = Some(
+            json!({ "id": entity_pk, "value": value })
+                .to_string()
+                .into(),
+        );
         row.untracked = untracked;
         row
     }
@@ -3015,9 +3033,10 @@ mod tests {
                     "parent_id": parent_id,
                     "name": name
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
@@ -3046,9 +3065,10 @@ mod tests {
                     "directory_id": directory_id,
                     "name": name
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!("change-{entity_pk}"))),
@@ -3076,9 +3096,10 @@ mod tests {
                     "blob_hash": crate::binary_cas::BlobHash::from_content(bytes).to_hex(),
                     "size_bytes": bytes.len()
                 })
-                .to_string(),
+                .to_string()
+                .into(),
             ),
-            metadata: Some(json!({ "source": entity_pk }).to_string()),
+            metadata: Some(json!({ "source": entity_pk }).to_string().into()),
             deleted: false,
             branch_id: branch_id.into(),
             change_id: Some(ChangeId::for_test_label(&format!(
@@ -4830,7 +4851,7 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000d3"),
             "existing.md",
         );
-        existing.metadata = Some(r#"{"source":"old"}"#.to_string());
+        existing.metadata = Some(r#"{"source":"old"}"#.into());
         let rows = vec![
             live_directory_row(
                 "01920000-0000-7000-8000-0000000000d3",
@@ -5618,7 +5639,7 @@ mod tests {
             "01920000-0000-7000-8000-0000000000a1",
             b"old",
         );
-        malformed.snapshot_content = Some("not-json".to_string());
+        malformed.snapshot_content = Some("not-json".into());
         let (mut fast_ctx, _, _) = counting_write_context(vec![malformed.clone()]);
         let (mut datafusion_ctx, _, _) = counting_write_context(vec![malformed]);
         let sql =

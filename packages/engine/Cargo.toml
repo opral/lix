@@ -30,10 +30,6 @@ path = "tests/integration/main.rs"
 name = "execute_result_allocations"
 path = "tests/execute_result_allocations.rs"
 
-[[test]]
-name = "checkpoint_gc"
-path = "tests/checkpoint_gc.rs"
-
 [dependencies]
 ahash = "0.8"
 async-trait = "0.1"

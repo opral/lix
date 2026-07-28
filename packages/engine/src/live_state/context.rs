@@ -12,9 +12,10 @@ use crate::filesystem::{
 };
 use crate::live_state::tracked_head::TrackedHeadContext;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowIdentity,
-    LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateRow, VisibilityBranchScope,
-    VisibilityRequest, expanded_branch_ids, resolve_visible_rows,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowFilter, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    VisibilityBranchScope, VisibilityRequest, expanded_branch_ids, resolve_visible_batch,
 };
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::{
@@ -152,31 +153,43 @@ where
         ))
     }
 
+    #[cfg(test)]
     pub(crate) async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_rows_with_schema_presence(request, false).await
+        self.scan_batch(request)
+            .await
+            .map(MaterializedLiveStateBatch::into_rows)
     }
 
-    async fn scan_rows_with_schema_presence(
+    pub(crate) async fn scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        self.scan_batch_with_schema_presence(request, false).await
+    }
+
+    async fn scan_batch_with_schema_presence(
         &self,
         request: &LiveStateScanRequest,
         skip_proven_empty_schema: bool,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, request, reads_tracked).await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(Vec::new());
+            return Ok(MaterializedLiveStateBatch::default());
         }
-        if let Some(rows) = self.scan_direct_entity_pk_rows(request, &scope).await? {
+        if let Some(rows) = self.scan_direct_entity_pk_batch(request, &scope).await? {
             return Ok(rows);
         }
         let commit_derived_rows = if request.filter.untracked != Some(true) {
-            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?
+            MaterializedLiveStateBatch::from_rows(
+                scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
+            )
         } else {
-            Vec::new()
+            MaterializedLiveStateBatch::default()
         };
         let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
             self.scan_hot_branch_rows(request, &scope).await?
@@ -188,7 +201,7 @@ where
             if !branch_ref_rows.is_empty() {
                 hot_branch_rows.push(HotBranchRows {
                     branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    rows: branch_ref_rows,
+                    rows: MaterializedLiveStateBatch::from_rows(branch_ref_rows),
                     ordered_unique: false,
                 });
             }
@@ -197,30 +210,34 @@ where
         // resolver, so apply the retention predicate before taking that fast
         // path. Otherwise `untracked = Some(..)` accidentally returned both
         // member kinds from an already-unified group.
-        for branch_rows in &mut hot_branch_rows {
-            branch_rows
-                .rows
-                .retain(|row| current_row_matches_retention(row, request.filter.untracked));
+        if request.filter.untracked.is_some() {
+            for branch_rows in &mut hot_branch_rows {
+                branch_rows.rows = filter_current_row_retention(
+                    std::mem::take(&mut branch_rows.rows),
+                    request.filter.untracked,
+                );
+            }
         }
         if commit_derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
-            return Ok(finalize_ordered_unique_rows(
+            return Ok(finalize_ordered_unique_batch(
                 std::mem::take(&mut hot_branch_rows[index].rows),
                 request.filter.include_tombstones,
                 request.limit,
             ));
         }
-        let mut rows = commit_derived_rows;
-        rows.extend(
-            hot_branch_rows
-                .into_iter()
-                .flat_map(|branch_rows| branch_rows.rows),
+        let rows = concat_live_state_batches(
+            std::iter::once(commit_derived_rows).chain(
+                hot_branch_rows
+                    .into_iter()
+                    .map(|branch_rows| branch_rows.rows),
+            ),
         );
-        Ok(resolve_visible_rows(
+        Ok(resolve_visible_batch(
             rows,
-            Vec::new(),
+            MaterializedLiveStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids.clone(),
@@ -234,11 +251,23 @@ where
     /// Serves finite entity-PK scans from the hot current-state index. Every
     /// row already has its retention tag, so an unrelated untracked row
     /// cannot route selected tracked identities through a separate scan.
+    #[cfg(test)]
     async fn scan_direct_entity_pk_rows(
         &self,
         request: &LiveStateScanRequest,
         scope: &LiveStateScanScope,
     ) -> Result<Option<Vec<MaterializedLiveStateRow>>, LixError> {
+        Ok(self
+            .scan_direct_entity_pk_batch(request, scope)
+            .await?
+            .map(MaterializedLiveStateBatch::into_rows))
+    }
+
+    async fn scan_direct_entity_pk_batch(
+        &self,
+        request: &LiveStateScanRequest,
+        scope: &LiveStateScanScope,
+    ) -> Result<Option<MaterializedLiveStateBatch>, LixError> {
         if !matches!(request.filter.rows, LiveStateRowFilter::All)
             || request.filter.branch_ids.is_empty()
             || request.filter.schema_keys.is_empty()
@@ -272,16 +301,16 @@ where
         let rows_by_branch = self
             .tracked_head
             .reader(&self.store)
-            .scan_live_rows_for_controls(&controls, &tracked_request)
+            .scan_live_batches_for_controls(&controls, &tracked_request)
             .await?;
-        let rows = rows_by_branch
-            .into_iter()
-            .flat_map(|(_, rows)| rows)
-            .filter(|row| current_row_matches_retention(row, request.filter.untracked))
-            .collect();
-        Ok(Some(resolve_visible_rows(
+        let rows = concat_live_state_batches(
+            rows_by_branch
+                .into_iter()
+                .map(|(_, rows)| filter_current_row_retention(rows, request.filter.untracked)),
+        );
+        Ok(Some(resolve_visible_batch(
             rows,
-            Vec::new(),
+            MaterializedLiveStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids.clone(),
@@ -297,7 +326,7 @@ where
         request: &LiveStateRowRequest,
     ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
         let rows = self
-            .scan_rows(&LiveStateScanRequest {
+            .scan_batch(&LiveStateScanRequest {
                 filter: crate::live_state::LiveStateFilter {
                     schema_keys: vec![request.schema_key.clone()],
                     entity_pks: vec![request.entity_pk.clone()],
@@ -310,7 +339,7 @@ where
                 ..Default::default()
             })
             .await?;
-        Ok(rows.into_iter().next())
+        Ok(rows.get(0).map(MaterializedLiveStateRowRef::to_owned))
     }
 
     /// Loads exact visible identities without lowering correlated row keys to
@@ -319,8 +348,17 @@ where
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
+        self.load_exact_batch(request)
+            .await
+            .map(MaterializedLiveStateExactBatch::into_rows)
+    }
+
+    pub(crate) async fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
         if request.rows.is_empty() {
-            return Ok(Vec::new());
+            return Ok(MaterializedLiveStateExactBatch::default());
         }
         // Commit-derived rows are synthesized rather than stored under the
         // requested identity. Preserve their exact scan semantics without
@@ -331,16 +369,23 @@ where
                 COMMIT_SCHEMA_KEY | COMMIT_EDGE_SCHEMA_KEY | BRANCH_REF_SCHEMA_KEY
             )
         }) {
-            let mut rows = Vec::with_capacity(request.rows.len());
+            let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+            let mut slots = Vec::with_capacity(request.rows.len());
             for row in &request.rows {
-                rows.push(
-                    self.scan_rows(&request.row_scan_request(row))
-                        .await?
-                        .into_iter()
-                        .next(),
-                );
+                let rows = self.scan_batch(&request.row_scan_request(row)).await?;
+                let found = rows.get(0);
+                slots.push(if let Some(found) = found {
+                    Some(u32::try_from(builder.push_ref(found, None)).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "exact derived live-state result exceeds u32 rows",
+                        )
+                    })?)
+                } else {
+                    None
+                });
             }
-            return Ok(rows);
+            return MaterializedLiveStateExactBatch::new(builder.finish(), slots);
         }
 
         let branch_ids = request
@@ -370,167 +415,203 @@ where
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
 
-        let mut storage_identities = std::collections::BTreeSet::new();
+        let mut storage_identities = Vec::with_capacity(request.rows.len().saturating_mul(2));
         for row in &request.rows {
             if !visible_branch_ids.contains(&row.branch_id) {
                 continue;
             }
-            storage_identities.insert(LiveStateRowIdentity {
-                branch_id: row.branch_id.clone(),
-                schema_key: row.schema_key.clone(),
-                entity_pk: row.entity_pk.clone(),
-                file_id: row.file_id.clone(),
+            storage_identities.push(crate::live_state::LiveStateRowIdentityRef {
+                branch_id: row.branch_id.as_str(),
+                schema_key: row.schema_key.as_str(),
+                entity_pk: &row.entity_pk,
+                file_id: row.file_id.as_deref(),
             });
             if row.branch_id != GLOBAL_BRANCH_ID {
-                storage_identities.insert(LiveStateRowIdentity {
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    schema_key: row.schema_key.clone(),
-                    entity_pk: row.entity_pk.clone(),
-                    file_id: row.file_id.clone(),
+                storage_identities.push(crate::live_state::LiveStateRowIdentityRef {
+                    branch_id: GLOBAL_BRANCH_ID,
+                    schema_key: row.schema_key.as_str(),
+                    entity_pk: &row.entity_pk,
+                    file_id: row.file_id.as_deref(),
                 });
             }
         }
-        let storage_identities = storage_identities.into_iter().collect::<Vec<_>>();
-        let mut candidates =
-            std::collections::BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
+        storage_identities.sort_unstable();
+        storage_identities.dedup();
 
-        let mut identities_by_branch = std::collections::BTreeMap::<String, Vec<_>>::new();
-        for identity in &storage_identities {
-            if scope.branch_heads.contains_key(&identity.branch_id) {
-                identities_by_branch
-                    .entry(identity.branch_id.clone())
-                    .or_default()
-                    .push(identity.clone());
+        let mut branch_ranges = Vec::new();
+        let mut offset = 0;
+        while offset < storage_identities.len() {
+            let branch_id = storage_identities[offset].branch_id;
+            let mut end = offset + 1;
+            while end < storage_identities.len() && storage_identities[end].branch_id == branch_id {
+                end += 1;
             }
+            if scope.branch_heads.contains_key(branch_id) {
+                branch_ranges.push(offset..end);
+            }
+            offset = end;
         }
         let projection =
             crate::changelog::ChangeRecordProjection::from_columns(&request.projection.columns);
-        let current_batches = stream::iter(identities_by_branch)
-            .map(|(branch_id, identities)| {
-                let control = scope.branch_heads[&branch_id];
+        let current_batches = stream::iter(branch_ranges)
+            .map(|range| {
+                let identities = &storage_identities[range.clone()];
+                let branch_id = identities[0].branch_id;
+                let control = scope.branch_heads[branch_id];
                 let projection = projection.clone();
                 async move {
                     let keys = identities
                         .iter()
-                        .map(|identity| crate::tracked_state::TrackedStateKey {
-                            schema_key: identity.schema_key.clone(),
-                            entity_pk: identity.entity_pk.clone(),
-                            file_id: identity.file_id.clone(),
+                        .map(|identity| crate::tracked_state::TrackedStateKeyRef {
+                            schema_key: identity.schema_key,
+                            entity_pk: identity.entity_pk,
+                            file_id: identity.file_id,
                         })
                         .collect::<Vec<_>>();
                     let rows = self
                         .tracked_head
                         .reader(&self.store)
-                        .load_projected_live_rows(&branch_id, control, &keys, &projection)
+                        .load_projected_live_batch_refs(branch_id, control, &keys, &projection)
                         .await?;
-                    Ok::<_, LixError>((identities, rows))
+                    Ok::<_, LixError>((range, rows))
                 }
             })
             .buffered(BRANCH_READ_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
-        for (identities, rows) in current_batches {
-            for (identity, row) in identities.into_iter().zip(rows) {
-                if let Some(row) = row {
-                    candidates.insert(identity, row);
+
+        let mut candidate_slots = Vec::with_capacity(storage_identities.len());
+        for (batch_index, (range, rows)) in current_batches.iter().enumerate() {
+            for (slot, identity_index) in range.clone().enumerate() {
+                if rows.row(slot).is_some() {
+                    candidate_slots.push((storage_identities[identity_index], batch_index, slot));
                 }
             }
         }
+        // `storage_identities` and branch ranges are sorted, and `buffered`
+        // preserves input order, so candidate slots are already identity
+        // ordered. Keep the assertion close to the binary-search contract.
+        debug_assert!(candidate_slots.windows(2).all(|pair| pair[0].0 < pair[1].0));
 
-        Ok(request
-            .rows
-            .iter()
-            .map(|requested| {
-                if !visible_branch_ids.contains(&requested.branch_id) {
-                    return None;
-                }
-                let branch_identity = LiveStateRowIdentity {
-                    branch_id: requested.branch_id.clone(),
-                    schema_key: requested.schema_key.clone(),
-                    entity_pk: requested.entity_pk.clone(),
-                    file_id: requested.file_id.clone(),
-                };
-                let global_identity = LiveStateRowIdentity {
-                    branch_id: GLOBAL_BRANCH_ID.to_string(),
-                    schema_key: requested.schema_key.clone(),
-                    entity_pk: requested.entity_pk.clone(),
-                    file_id: requested.file_id.clone(),
-                };
-                // Filter each source before branch/global precedence. A local
-                // row of the other retention must not mask a matching global
-                // row from an explicit retention-scoped internal read.
-                let mut row = candidates
-                    .get(&branch_identity)
-                    .filter(|row| current_row_matches_retention(row, request.untracked))
-                    .or_else(|| {
-                        candidates
-                            .get(&global_identity)
-                            .filter(|row| current_row_matches_retention(row, request.untracked))
-                    })?
-                    .clone();
-                if row.branch_id.as_ref() == GLOBAL_BRANCH_ID
-                    && requested.branch_id != GLOBAL_BRANCH_ID
-                {
-                    row.branch_id = requested.branch_id.clone().into();
-                    row.global = true;
-                }
-                if row.deleted && !request.include_tombstones {
-                    None
-                } else {
-                    Some(row)
-                }
-            })
-            .collect())
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+        let mut slots = Vec::with_capacity(request.rows.len());
+        for requested in &request.rows {
+            if !visible_branch_ids.contains(&requested.branch_id) {
+                slots.push(None);
+                continue;
+            }
+            let branch_identity = crate::live_state::LiveStateRowIdentityRef {
+                branch_id: requested.branch_id.as_str(),
+                schema_key: requested.schema_key.as_str(),
+                entity_pk: &requested.entity_pk,
+                file_id: requested.file_id.as_deref(),
+            };
+            let global_identity = crate::live_state::LiveStateRowIdentityRef {
+                branch_id: GLOBAL_BRANCH_ID,
+                ..branch_identity
+            };
+            let lookup = |identity| {
+                candidate_slots
+                    .binary_search_by_key(&identity, |candidate| candidate.0)
+                    .ok()
+                    .and_then(|index| {
+                        let (_, batch_index, slot) = candidate_slots[index];
+                        current_batches[batch_index].1.row(slot)
+                    })
+            };
+            // Filter each source before branch/global precedence. A local
+            // row of the other retention must not mask a matching global
+            // row from an explicit retention-scoped internal read.
+            let row = lookup(branch_identity)
+                .filter(|row| current_row_matches_retention(*row, request.untracked))
+                .or_else(|| {
+                    lookup(global_identity)
+                        .filter(|row| current_row_matches_retention(*row, request.untracked))
+                });
+            let Some(row) = row else {
+                slots.push(None);
+                continue;
+            };
+            if row.deleted() && !request.include_tombstones {
+                slots.push(None);
+                continue;
+            }
+            let branch_override = (row.branch_id() == GLOBAL_BRANCH_ID
+                && requested.branch_id != GLOBAL_BRANCH_ID)
+                .then_some(requested.branch_id.as_str());
+            slots.push(Some(
+                u32::try_from(builder.push_ref(row, branch_override)).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "exact live-state result exceeds u32 rows",
+                    )
+                })?,
+            ));
+        }
+        MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
 
+    #[cfg(test)]
     pub(crate) async fn scan_tracked_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
-        self.scan_tracked_rows_with_schema_presence(request, false)
+        self.scan_tracked_batch(request)
+            .await
+            .map(MaterializedLiveStateBatch::into_rows)
+    }
+
+    pub(crate) async fn scan_tracked_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        self.scan_tracked_batch_with_schema_presence(request, false)
             .await
     }
 
-    async fn scan_tracked_rows_with_schema_presence(
+    async fn scan_tracked_batch_with_schema_presence(
         &self,
         request: &LiveStateScanRequest,
         skip_proven_empty_schema: bool,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
         let store = &self.store;
         let reads_tracked = !is_commit_derived_only_request(request);
         let scope = scan_scope(store, request, reads_tracked).await?;
         if skip_proven_empty_schema && !scope_may_have_schema_rows(request, &scope) {
-            return Ok(Vec::new());
+            return Ok(MaterializedLiveStateBatch::default());
         }
-        let commit_derived_rows =
-            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?;
+        let commit_derived_rows = MaterializedLiveStateBatch::from_rows(
+            scan_commit_derived_rows(store, &self.commit_graph, request, &scope).await?,
+        );
         let mut hot_branch_rows = if !is_commit_derived_only_request(request) {
             self.scan_hot_branch_rows(request, &scope).await?
         } else {
             Vec::new()
         };
         for branch_rows in &mut hot_branch_rows {
-            branch_rows.rows.retain(|row| !row.untracked);
+            branch_rows.rows =
+                filter_current_row_retention(std::mem::take(&mut branch_rows.rows), Some(false));
         }
         if commit_derived_rows.is_empty()
             && let Some(index) =
                 ordered_unique_branch_row_index(&hot_branch_rows, &scope.projection_branch_ids)
         {
-            return Ok(finalize_ordered_unique_rows(
+            return Ok(finalize_ordered_unique_batch(
                 std::mem::take(&mut hot_branch_rows[index].rows),
                 request.filter.include_tombstones,
                 request.limit,
             ));
         }
-        let mut rows = commit_derived_rows;
-        rows.extend(
-            hot_branch_rows
-                .into_iter()
-                .flat_map(|branch_rows| branch_rows.rows),
+        let rows = concat_live_state_batches(
+            std::iter::once(commit_derived_rows).chain(
+                hot_branch_rows
+                    .into_iter()
+                    .map(|branch_rows| branch_rows.rows),
+            ),
         );
-        Ok(resolve_visible_rows(
+        Ok(resolve_visible_batch(
             rows,
-            Vec::new(),
+            MaterializedLiveStateBatch::default(),
             &VisibilityRequest {
                 branch_scope: VisibilityBranchScope::BranchIds {
                     branch_ids: scope.projection_branch_ids,
@@ -565,7 +646,7 @@ where
                     let rows = self
                         .tracked_head
                         .reader(store)
-                        .scan_live_rows(&branch_id, control, &tracked_request)
+                        .scan_live_batch(&branch_id, control, &tracked_request)
                         .await?;
                     Ok::<_, LixError>(HotBranchRows {
                         branch_id: branch_id.clone(),
@@ -586,19 +667,27 @@ impl<S> LiveStateReader for LiveStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
-    async fn scan_constraint_rows(
+    async fn scan_constraint_batch(
         &self,
         request: &LiveStateScanRequest,
         tracked_only: bool,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
         if tracked_only {
-            self.scan_tracked_rows_with_schema_presence(request, true)
+            self.scan_tracked_batch_with_schema_presence(request, true)
                 .await
         } else {
-            self.scan_rows_with_schema_presence(request, true).await
+            self.scan_batch_with_schema_presence(request, true).await
         }
     }
 
+    async fn scan_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        Self::scan_batch(self, request).await
+    }
+
+    #[cfg(test)]
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,
@@ -613,18 +702,26 @@ where
         Self::load_row(self, request).await
     }
 
-    async fn load_exact_rows(
+    async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
-    ) -> Result<Vec<Option<MaterializedLiveStateRow>>, LixError> {
-        Self::load_exact_rows(self, request).await
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        Self::load_exact_batch(self, request).await
     }
 
+    #[cfg(test)]
     async fn scan_tracked_rows(
         &self,
         request: &LiveStateScanRequest,
     ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
         Self::scan_tracked_rows(self, request).await
+    }
+
+    async fn scan_tracked_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        Self::scan_tracked_batch(self, request).await
     }
 }
 
@@ -785,7 +882,7 @@ fn direct_branch_ref_row(
         })?,
         schema_key: BRANCH_REF_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(snapshot_content),
+        snapshot_content: Some(snapshot_content.into()),
         metadata: None,
         deleted: false,
         // These read-only columns are part of every public entity surface.
@@ -859,7 +956,7 @@ fn commit_row(
         )?,
         schema_key: COMMIT_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(snapshot_content),
+        snapshot_content: Some(snapshot_content.into()),
         metadata: None,
         deleted: false,
         created_at: commit.change.created_at,
@@ -895,7 +992,7 @@ fn commit_edge_row(
         .expect("commit edge primary key has two components"),
         schema_key: COMMIT_EDGE_SCHEMA_KEY.to_string(),
         file_id: None,
-        snapshot_content: Some(snapshot_content),
+        snapshot_content: Some(snapshot_content.into()),
         metadata: None,
         deleted: false,
         created_at: crate::common::LixTimestamp::from_unix_millis_utc_lossy(0),
@@ -938,7 +1035,7 @@ struct LiveStateScanScope {
 /// and has one row per identity.
 struct HotBranchRows {
     branch_id: String,
-    rows: Vec<MaterializedLiveStateRow>,
+    rows: MaterializedLiveStateBatch,
     ordered_unique: bool,
 }
 
@@ -970,25 +1067,63 @@ fn ordered_unique_branch_row_index(
 /// Finalizes a table scan whose rows are already ordered and unique for the
 /// sole requested branch. This intentionally does no identity sort or
 /// deduplication; the tracked-head key codec proves both properties.
-fn finalize_ordered_unique_rows(
-    mut rows: Vec<MaterializedLiveStateRow>,
+fn finalize_ordered_unique_batch(
+    rows: MaterializedLiveStateBatch,
     include_tombstones: bool,
     limit: Option<usize>,
-) -> Vec<MaterializedLiveStateRow> {
-    if !include_tombstones {
-        rows.retain(|row| !row.deleted);
+) -> MaterializedLiveStateBatch {
+    if limit.is_none_or(|limit| limit >= rows.len())
+        && (include_tombstones || !rows.iter().any(|row| row.deleted()))
+    {
+        return rows;
     }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    rows
+    rows.filter(|row| include_tombstones || !row.deleted(), limit)
 }
 
 fn current_row_matches_retention(
-    row: &MaterializedLiveStateRow,
+    row: MaterializedLiveStateRowRef<'_>,
     requested_untracked: Option<bool>,
 ) -> bool {
-    requested_untracked.is_none_or(|untracked| row.untracked == untracked)
+    requested_untracked.is_none_or(|untracked| row.untracked() == untracked)
+}
+
+fn filter_current_row_retention(
+    rows: MaterializedLiveStateBatch,
+    requested_untracked: Option<bool>,
+) -> MaterializedLiveStateBatch {
+    if requested_untracked.is_none()
+        || rows
+            .iter()
+            .all(|row| current_row_matches_retention(row, requested_untracked))
+    {
+        return rows;
+    }
+    rows.filter(
+        |row| current_row_matches_retention(row, requested_untracked),
+        None,
+    )
+}
+
+fn concat_live_state_batches(
+    batches: impl IntoIterator<Item = MaterializedLiveStateBatch>,
+) -> MaterializedLiveStateBatch {
+    let mut incoming = batches.into_iter().filter(|batch| !batch.is_empty());
+    let Some(first) = incoming.next() else {
+        return MaterializedLiveStateBatch::default();
+    };
+    let Some(second) = incoming.next() else {
+        return first;
+    };
+    let mut batches = vec![first, second];
+    batches.extend(incoming);
+    let capacity = batches.iter().map(MaterializedLiveStateBatch::len).sum();
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(capacity);
+    for batch in &batches {
+        for row in batch.iter() {
+            builder.push_ref(row, None);
+        }
+    }
+    builder.finish()
 }
 
 /// Proves a single-schema hot-state scan empty from the atomic branch
@@ -1347,9 +1482,9 @@ mod tests {
         let requested_branch_ids = vec!["branch".to_string()];
         let branch = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: vec![tracked_row_at_with_commit(
+            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
-            )],
+            )]),
             ordered_unique: true,
         };
         assert_eq!(
@@ -1359,19 +1494,19 @@ mod tests {
 
         let branch = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: vec![tracked_row_at_with_commit(
+            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
-            )],
+            )]),
             ordered_unique: true,
         };
         let global = HotBranchRows {
             branch_id: GLOBAL_BRANCH_ID.to_string(),
-            rows: vec![tracked_row_at_with_commit(
+            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 GLOBAL_BRANCH_ID,
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
                 None,
                 "ffffffff-ffff-7fff-bfff-ffffffffffff",
-            )],
+            )]),
             ordered_unique: true,
         };
         assert_eq!(
@@ -1382,9 +1517,9 @@ mod tests {
 
         let unordered_candidate = HotBranchRows {
             branch_id: "branch".to_string(),
-            rows: vec![tracked_row_at_with_commit(
+            rows: MaterializedLiveStateBatch::from_rows(vec![tracked_row_at_with_commit(
                 "branch", "branch", None, "branch",
-            )],
+            )]),
             ordered_unique: false,
         };
         assert_eq!(
@@ -1392,6 +1527,30 @@ mod tests {
             None,
             "an unordered candidate does not make the table ordering promise"
         );
+    }
+
+    #[test]
+    fn ordered_and_single_batch_fast_paths_preserve_the_existing_columns() {
+        let batch = MaterializedLiveStateBatch::from_rows(vec![
+            tracked_row_at_with_commit("branch", "first", None, "first"),
+            tracked_row_at_with_commit("branch", "second", None, "second"),
+        ]);
+        let entity_column = batch.entity_column_ptr();
+        let batch = filter_current_row_retention(batch, Some(false));
+        assert_eq!(batch.entity_column_ptr(), entity_column);
+
+        let entity_column = batch.entity_column_ptr();
+        let batch = finalize_ordered_unique_batch(batch, false, None);
+        assert_eq!(batch.entity_column_ptr(), entity_column);
+
+        let entity_column = batch.entity_column_ptr();
+        let batch = concat_live_state_batches([
+            MaterializedLiveStateBatch::default(),
+            batch,
+            MaterializedLiveStateBatch::default(),
+        ]);
+        assert_eq!(batch.entity_column_ptr(), entity_column);
+        assert_eq!(batch.len(), 2);
     }
 
     #[tokio::test]
@@ -3036,7 +3195,7 @@ mod tests {
             tracked_row_with_commit("global-fallback", Some("change-fallback"), "commit-global");
         global_fallback.entity_pk = identity("fallback");
         global_fallback.file_id = Some("fallback".to_string());
-        global_fallback.metadata = Some("{\"source\":\"global\"}".to_string());
+        global_fallback.metadata = Some("{\"source\":\"global\"}".into());
         let mut global_overridden =
             tracked_row_with_commit("global-old", Some("change-global-old"), "commit-global");
         global_overridden.entity_pk = identity("overridden");
@@ -3449,7 +3608,7 @@ mod tests {
             entity_pk: identity("selected-tab"),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
             metadata: None,
             deleted: false,
             created_at: ts("2026-01-01T00:00:00Z"),
@@ -3534,7 +3693,8 @@ mod tests {
         );
         row.metadata = Some(
             serde_json::to_string(&json!({ "test_parents": parent_id_texts }))
-                .expect("test metadata should serialize"),
+                .expect("test metadata should serialize")
+                .into(),
         );
         row
     }
@@ -3550,7 +3710,9 @@ mod tests {
             schema_key: COMMIT_SCHEMA_KEY.to_string(),
             file_id: None,
             snapshot_content: Some(
-                serde_json::to_string(&snapshot).expect("commit snapshot should serialize"),
+                serde_json::to_string(&snapshot)
+                    .expect("commit snapshot should serialize")
+                    .into(),
             ),
             metadata: None,
             deleted: false,

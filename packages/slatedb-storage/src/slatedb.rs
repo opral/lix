@@ -1473,8 +1473,27 @@ impl StorageWrite for SlateDBWrite {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let physical_key_bytes = entries.entries.iter().try_fold(0_usize, |total, entry| {
+                let key_len = SPACE_PREFIX_LEN
+                    .checked_add(entry.key.0.len())
+                    .ok_or(StorageError::InvalidKey)?;
+                if key_len > MAX_SLATEDB_KEY_LEN {
+                    return Err(StorageError::InvalidKey);
+                }
+                total.checked_add(key_len).ok_or(StorageError::InvalidKey)
+            })?;
+            let space_prefix = space.0.to_be_bytes();
+            let mut physical_keys = Vec::with_capacity(physical_key_bytes);
+            for entry in &entries.entries {
+                physical_keys.extend_from_slice(&space_prefix);
+                physical_keys.extend_from_slice(&entry.key.0);
+            }
+            let physical_keys = Bytes::from(physical_keys);
+            let mut key_start = 0;
             for entry in entries.entries {
-                let key = physical_key(space, &entry.key)?;
+                let key_end = key_start + SPACE_PREFIX_LEN + entry.key.0.len();
+                let key = Key(physical_keys.slice(key_start..key_end));
+                key_start = key_end;
                 let value = stored_value_bytes(entry.value);
                 self.stats.put_entries += 1;
                 self.stats.written_bytes += value.len() as u64;
@@ -1491,8 +1510,28 @@ impl StorageWrite for SlateDBWrite {
         keys: &[Key],
     ) -> impl Future<Output = Result<(), StorageError>> + Send {
         async move {
+            let physical_key_bytes = keys.iter().try_fold(0_usize, |total, key| {
+                let key_len = SPACE_PREFIX_LEN
+                    .checked_add(key.0.len())
+                    .ok_or(StorageError::InvalidKey)?;
+                if key_len > MAX_SLATEDB_KEY_LEN {
+                    return Err(StorageError::InvalidKey);
+                }
+                total.checked_add(key_len).ok_or(StorageError::InvalidKey)
+            })?;
+            let space_prefix = space.0.to_be_bytes();
+            let mut physical_keys = Vec::with_capacity(physical_key_bytes);
             for key in keys {
-                self.overlay.insert(physical_key(space, key)?, None);
+                physical_keys.extend_from_slice(&space_prefix);
+                physical_keys.extend_from_slice(&key.0);
+            }
+            let physical_keys = Bytes::from(physical_keys);
+            let mut key_start = 0;
+            for key in keys {
+                let key_end = key_start + SPACE_PREFIX_LEN + key.0.len();
+                self.overlay
+                    .insert(Key(physical_keys.slice(key_start..key_end)), None);
+                key_start = key_end;
             }
             self.stats.deleted_entries += keys.len() as u64;
             self.stats.storage_calls += 1;

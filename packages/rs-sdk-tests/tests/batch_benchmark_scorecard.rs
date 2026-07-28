@@ -10,6 +10,11 @@
 //!   batch_benchmark_scorecard_compares_base_and_candidate \
 //!   -- --ignored --exact --nocapture
 //! ```
+//!
+//! Each capture must concatenate the summary records from the JSON import
+//! (which also measures bulk UPDATE and DELETE), CSV import, ordinary sparse
+//! update, public read, unrelated merge/diff-preview, and same-entity merge
+//! ignored release tests. Missing lanes are an acceptance failure.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,6 +22,22 @@ use std::path::Path;
 
 const MACHINE_RECORD_PREFIX: &str = "LIX_BATCH_BENCHMARK_JSON=";
 const COMPARISON_RECORD_PREFIX: &str = "LIX_BATCH_BENCHMARK_COMPARISON_JSON=";
+
+const REQUIRED_SUMMARIES: &[&str] = &[
+    "v2_json_ten_mib_rocksdb_import_parity_benchmark/plugin",
+    "v2_json_ten_mib_rocksdb_import_parity_benchmark/direct_no_file",
+    "v2_json_ten_mib_rocksdb_import_parity_benchmark/direct_file_scoped",
+    "v2_csv_ten_mib_rocksdb_import_parity_benchmark/plugin",
+    "v2_csv_ten_mib_rocksdb_import_parity_benchmark/direct_file_scoped",
+    "v2_json_ten_mib_ordinary_sql_byte_edit_benchmark/sparse_plugin_update",
+    "v2_json_ten_mib_bulk_sql_mutation_benchmark/bulk_update",
+    "v2_json_ten_mib_bulk_sql_mutation_benchmark/bulk_delete",
+    "v2_json_ten_mib_rocksdb_read_benchmark/warm_read",
+    "v2_json_ten_mib_rocksdb_read_benchmark/cold_open_read",
+    "v2_json_ten_mib_unrelated_entity_merge_benchmark/tracked_diff_preview",
+    "v2_json_ten_mib_unrelated_entity_merge_benchmark/unrelated_entity",
+    "v2_json_ten_mib_same_entity_canonical_b_merge_benchmark/same_entity_conflict",
+];
 
 #[test]
 #[ignore = "requires frozen baseline and candidate JSONL benchmark outputs"]
@@ -28,18 +49,16 @@ fn batch_benchmark_scorecard_compares_base_and_candidate() {
     let baseline = read_summaries(Path::new(&baseline_path));
     let candidate = read_summaries(Path::new(&candidate_path));
 
-    for required in [
-        "v2_json_ten_mib_rocksdb_import_parity_benchmark/plugin",
-        "v2_csv_ten_mib_rocksdb_import_parity_benchmark/plugin",
-    ] {
+    for required in REQUIRED_SUMMARIES {
         assert!(
-            baseline.contains_key(required),
+            baseline.contains_key(*required),
             "baseline output is missing required summary {required}"
         );
         assert!(
-            candidate.contains_key(required),
+            candidate.contains_key(*required),
             "candidate output is missing required summary {required}"
         );
+        assert_expected_candidate_gate(required, &candidate[*required]);
     }
 
     let mut comparisons = Vec::new();
@@ -68,11 +87,13 @@ fn batch_benchmark_scorecard_compares_base_and_candidate() {
             "allocator configuration changed for {key}"
         );
         assert_eq!(
-            baseline_summary.get("gate"),
-            candidate_summary.get("gate"),
-            "acceptance gate changed between baseline and candidate for {key}"
+            baseline_summary.get("samples"),
+            candidate_summary.get("samples"),
+            "sample count changed between baseline and candidate for {key}"
         );
-
+        // The frozen engine commit may carry an older emitter. The candidate
+        // gate is pinned against REQUIRED_SUMMARIES above, rather than
+        // trusting threshold metadata supplied by either measurement file.
         for (metric, maximum_ratio) in thresholds {
             let maximum_ratio = maximum_ratio
                 .as_f64()
@@ -122,6 +143,42 @@ fn batch_benchmark_scorecard_compares_base_and_candidate() {
         failures.is_empty(),
         "batch benchmark acceptance failures:\n{}",
         failures.join("\n")
+    );
+}
+
+fn assert_expected_candidate_gate(key: &str, summary: &serde_json::Value) {
+    assert_eq!(
+        summary
+            .pointer("/gate/comparison")
+            .and_then(serde_json::Value::as_str),
+        Some("candidate_p50_over_baseline_p50"),
+        "required summary {key} must use a baseline-ratio gate"
+    );
+    let actual = summary
+        .pointer("/gate/max_candidate_over_baseline")
+        .and_then(serde_json::Value::as_object)
+        .unwrap_or_else(|| panic!("required summary {key} is missing a ratio gate"));
+    let expected = if matches!(
+        key,
+        "v2_json_ten_mib_rocksdb_import_parity_benchmark/plugin"
+            | "v2_csv_ten_mib_rocksdb_import_parity_benchmark/plugin"
+    ) {
+        serde_json::json!({
+            "elapsed_ms": 0.70,
+            "allocation_count": 0.40,
+            "allocated_bytes": 0.50,
+            "peak_live_bytes_delta": 0.70,
+            "large_allocation_count": 1.00
+        })
+    } else {
+        serde_json::json!({"elapsed_ms": 1.05})
+    };
+    assert_eq!(
+        actual,
+        expected
+            .as_object()
+            .expect("scorecard gate fixture must be an object"),
+        "candidate changed the acceptance gate for required summary {key}"
     );
 }
 
@@ -186,4 +243,33 @@ fn p50(summary: &serde_json::Value, key: &str, metric: &str) -> f64 {
         .pointer(&format!("/metrics/{metric}/p50"))
         .and_then(serde_json::Value::as_f64)
         .unwrap_or_else(|| panic!("summary {key} is missing numeric p50 metric {metric}"))
+}
+
+#[test]
+fn required_scorecard_lanes_are_unique_and_cover_the_full_batch_pipeline() {
+    let unique = REQUIRED_SUMMARIES
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), REQUIRED_SUMMARIES.len());
+    for required_fragment in [
+        "/plugin",
+        "/direct_no_file",
+        "/direct_file_scoped",
+        "/sparse_plugin_update",
+        "/bulk_update",
+        "/bulk_delete",
+        "/warm_read",
+        "/cold_open_read",
+        "/tracked_diff_preview",
+        "/unrelated_entity",
+        "/same_entity_conflict",
+    ] {
+        assert!(
+            REQUIRED_SUMMARIES
+                .iter()
+                .any(|lane| lane.ends_with(required_fragment)),
+            "scorecard contract omitted {required_fragment}"
+        );
+    }
 }

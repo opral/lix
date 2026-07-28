@@ -4,27 +4,31 @@
 //! neutral `wasm::v2` traits. It deliberately does not decide transaction,
 //! conflict-resolution, observation, or actor-publication policy.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use serde::Deserialize;
 use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest as _, Sha256};
 use tracing::Instrument as _;
 
-use crate::common::RequestBlobSpliceProvenance;
+use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
+use crate::common::{RequestBlobSpliceProvenance, SharedStr};
+use crate::entity_pk::EntityPk;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmChangeDrainValidator, WasmChangePage, WasmComponentV2Actor, WasmConflictResolution,
-    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
-    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
-    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
-    WasmEntityConflictSource, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
-    WasmFileTransition, WasmGuestBytes, WasmHostBytes, WasmHostConflictResolution, WasmHostEntity,
-    WasmHostEntityChanges, WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmSourceRange,
-    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmChangeDrainValidator, WasmChangePage,
+    WasmComponentV2Actor, WasmConflictResolution, WasmConflictResolutionDrainValidator,
+    WasmConflictResolutionPage, WasmConflictTransition, WasmDocumentHandle, WasmEditDrainValidator,
+    WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges,
+    WasmEntityConflict, WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityPage,
+    WasmEntitySource, WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
+    WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
+    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
+    WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
 };
 use crate::{Blob, LixError};
 
@@ -147,7 +151,7 @@ impl WasmByteSource for ArcByteSource {
 /// of the complete Snapshot JSON for the guest to read on demand.
 pub(crate) fn host_entity_with_lazy_snapshot(
     key: crate::wasm::WasmEntityKey,
-    snapshot: Vec<u8>,
+    snapshot: Bytes,
     limits: WasmTransitionLimits,
 ) -> Result<WasmHostEntity, LixError> {
     let limits = limits.validate()?;
@@ -168,7 +172,7 @@ pub(crate) fn host_entity_with_lazy_snapshot(
 /// Change-record counterpart of [`host_entity_with_lazy_snapshot`].
 pub(crate) fn host_entity_change_with_lazy_snapshot(
     key: crate::wasm::WasmEntityKey,
-    snapshot: Vec<u8>,
+    snapshot: Bytes,
     effect: crate::wasm::WasmChangeEffect,
     limits: WasmTransitionLimits,
 ) -> Result<WasmEntityChange<WasmHostBytes>, LixError> {
@@ -189,7 +193,7 @@ pub(crate) fn host_entity_change_with_lazy_snapshot(
     };
     let snapshot = std::mem::replace(
         &mut entity.snapshot_content,
-        WasmHostBytes::Inline(Vec::new()),
+        WasmHostBytes::Inline(Bytes::new()),
     );
     entity.snapshot_content = lazy_source_from_inline(snapshot);
     validate_host_entity(entity)?;
@@ -582,6 +586,7 @@ fn common_suffix_len(left: &[u8], right: &[u8], max: usize) -> (usize, u64) {
 #[derive(Debug, Clone)]
 pub(crate) struct V2SchemaAllowlist {
     schema_keys: BTreeSet<String>,
+    catalog: Option<Arc<CatalogSnapshot>>,
 }
 
 impl V2SchemaAllowlist {
@@ -590,11 +595,23 @@ impl V2SchemaAllowlist {
         if schema_keys.is_empty() {
             return Err(invalid_input("v2 schema allowlist must not be empty"));
         }
-        Ok(Self { schema_keys })
+        Ok(Self {
+            schema_keys,
+            catalog: None,
+        })
     }
 
     pub(crate) fn from_slice(schema_keys: &[String]) -> Result<Self, LixError> {
         Self::new(schema_keys.iter().cloned())
+    }
+
+    pub(crate) fn from_catalog(
+        schema_keys: &[String],
+        catalog: Arc<CatalogSnapshot>,
+    ) -> Result<Self, LixError> {
+        let mut allowlist = Self::from_slice(schema_keys)?;
+        allowlist.catalog = Some(catalog);
+        Ok(allowlist)
     }
 
     fn validate(&self, schema_key: &str) -> Result<(), LixError> {
@@ -605,56 +622,58 @@ impl V2SchemaAllowlist {
         }
         Ok(())
     }
+
+    fn schema_plan(&self, schema_key: &str) -> Option<&SchemaPlan> {
+        self.catalog
+            .as_deref()?
+            .plan_for_key(schema_key)
+            .map(|(_, plan)| plan)
+    }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum NumberFreeJson {
-    Null,
-    Bool(bool),
-    String(String),
-    Array(Vec<Self>),
-    Object(BTreeMap<String, Self>),
-}
+struct NumberFreeJsonValue(serde_json::Value);
 
-impl<'de> Deserialize<'de> for NumberFreeJson {
+impl<'de> Deserialize<'de> for NumberFreeJsonValue {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_any(NumberFreeJsonVisitor)
+        deserializer
+            .deserialize_any(NumberFreeJsonValueVisitor)
+            .map(Self)
     }
 }
 
-struct NumberFreeJsonVisitor;
+struct NumberFreeJsonValueVisitor;
 
-impl<'de> Visitor<'de> for NumberFreeJsonVisitor {
-    type Value = NumberFreeJson;
+impl<'de> Visitor<'de> for NumberFreeJsonValueVisitor {
+    type Value = serde_json::Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("number-free JSON")
     }
 
     fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(NumberFreeJson::Null)
+        Ok(serde_json::Value::Null)
     }
 
     fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(NumberFreeJson::Null)
+        Ok(serde_json::Value::Null)
     }
 
     fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(NumberFreeJson::Bool(value))
+        Ok(serde_json::Value::Bool(value))
     }
 
     fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
     where
         E: serde::de::Error,
     {
-        Ok(NumberFreeJson::String(value.to_owned()))
+        Ok(serde_json::Value::String(value.to_owned()))
     }
 
     fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
-        Ok(NumberFreeJson::String(value))
+        Ok(serde_json::Value::String(value))
     }
 
     fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E>
@@ -683,26 +702,27 @@ impl<'de> Visitor<'de> for NumberFreeJsonVisitor {
         A: SeqAccess<'de>,
     {
         let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
-        while let Some(value) = sequence.next_element()? {
+        while let Some(NumberFreeJsonValue(value)) = sequence.next_element()? {
             values.push(value);
         }
-        Ok(NumberFreeJson::Array(values))
+        Ok(serde_json::Value::Array(values))
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
     where
         A: MapAccess<'de>,
     {
-        let mut values = BTreeMap::new();
+        let mut values = serde_json::Map::new();
         while let Some(key) = map.next_key::<String>()? {
             if values.contains_key(&key) {
                 return Err(A::Error::custom(format!(
                     "duplicate decoded JSON object key '{key}'"
                 )));
             }
-            values.insert(key, map.next_value()?);
+            let NumberFreeJsonValue(value) = map.next_value()?;
+            values.insert(key, value);
         }
-        Ok(NumberFreeJson::Object(values))
+        Ok(serde_json::Value::Object(values))
     }
 }
 
@@ -710,51 +730,334 @@ impl<'de> Visitor<'de> for NumberFreeJsonVisitor {
 /// snapshot. Snapshot roots must be objects.
 pub(crate) fn canonicalize_v2_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError> {
     let value = parse_number_free_snapshot(bytes)?;
-    if !matches!(value, NumberFreeJson::Object(_)) {
+    if !value.is_object() {
         return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
     }
-    let mut canonical = String::new();
-    encode_number_free_json(&value, &mut canonical);
-    Ok(canonical.into_bytes())
+    let mut canonical = Vec::new();
+    encode_number_free_json(&value, &mut canonical)?;
+    Ok(canonical)
 }
 
-fn validated_v2_snapshot(bytes: &[u8]) -> Result<WasmHostBytes, LixError> {
-    let value = parse_number_free_snapshot(bytes)?;
-    if !matches!(value, NumberFreeJson::Object(_)) {
-        return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
-    }
-    let mut normalized = String::new();
-    encode_number_free_json(&value, &mut normalized);
-    Ok(WasmHostBytes::CanonicalJson {
-        value: Arc::new(number_free_json_value(value)),
-        normalized: normalized.into(),
-    })
+#[derive(Debug)]
+struct CanonicalJsonBatchBuilder {
+    row_kinds: Vec<CanonicalJsonBatchRowKind>,
+    decoded_values: Vec<serde_json::Value>,
+    certified_normalized: Vec<SharedStr>,
+    certified_entity_pks: Vec<EntityPk>,
+    schema_fingerprints: Vec<Arc<SchemaPlanFingerprint>>,
+    schema_fingerprint_indices: Vec<u32>,
+    normalized_ends: Vec<u32>,
+    parse_count: usize,
+    serialize_count: usize,
+    normalized_len: u32,
+    row_capacity: usize,
 }
 
-fn number_free_json_value(value: NumberFreeJson) -> serde_json::Value {
-    match value {
-        NumberFreeJson::Null => serde_json::Value::Null,
-        NumberFreeJson::Bool(value) => serde_json::Value::Bool(value),
-        NumberFreeJson::String(value) => serde_json::Value::String(value),
-        NumberFreeJson::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(number_free_json_value).collect())
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum CanonicalJsonBatchRowKind {
+    Decoded,
+    Certified,
+}
+
+impl CanonicalJsonBatchBuilder {
+    fn with_row_capacity(row_count: usize) -> Self {
+        Self {
+            row_kinds: Vec::with_capacity(row_count),
+            decoded_values: Vec::new(),
+            certified_normalized: Vec::new(),
+            certified_entity_pks: Vec::new(),
+            schema_fingerprints: Vec::new(),
+            schema_fingerprint_indices: Vec::new(),
+            normalized_ends: Vec::with_capacity(row_count),
+            parse_count: 0,
+            serialize_count: 0,
+            normalized_len: 0,
+            row_capacity: row_count,
         }
-        NumberFreeJson::Object(values) => serde_json::Value::Object(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, number_free_json_value(value)))
-                .collect(),
-        ),
+    }
+
+    fn reserve_decoded_column(&mut self) {
+        if self.decoded_values.capacity() == 0 {
+            self.decoded_values.reserve_exact(self.row_capacity);
+        }
+    }
+
+    fn reserve_certified_columns(&mut self) {
+        if self.certified_normalized.capacity() == 0 {
+            self.certified_normalized.reserve_exact(self.row_capacity);
+            self.certified_entity_pks.reserve_exact(self.row_capacity);
+            self.schema_fingerprint_indices
+                .reserve_exact(self.row_capacity);
+        }
+    }
+
+    fn schema_fingerprint_index(
+        &mut self,
+        fingerprint: Arc<SchemaPlanFingerprint>,
+    ) -> Result<u32, LixError> {
+        if let Some(index) = self
+            .schema_fingerprints
+            .iter()
+            .position(|existing| Arc::ptr_eq(existing, &fingerprint))
+        {
+            return u32::try_from(index)
+                .map_err(|_| invalid_guest("v2 canonical JSON page has too many schemas"));
+        }
+        let index = u32::try_from(self.schema_fingerprints.len())
+            .map_err(|_| invalid_guest("v2 canonical JSON page has too many schemas"))?;
+        self.schema_fingerprints.push(fingerprint);
+        Ok(index)
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<usize, LixError> {
+        self.parse_count = self.parse_count.saturating_add(1);
+        let value = parse_number_free_snapshot(bytes)?;
+        if !value.is_object() {
+            return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+        }
+
+        let encoded_len = canonical_json_encoded_len(&value)?;
+        let start = self.normalized_len;
+        let end = start
+            .checked_add(encoded_len)
+            .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+        self.normalized_len = end;
+        let row = self.row_kinds.len();
+        self.reserve_decoded_column();
+        self.decoded_values.push(value);
+        self.row_kinds.push(CanonicalJsonBatchRowKind::Decoded);
+        self.normalized_ends.push(end);
+        Ok(row)
+    }
+
+    fn push_plugin(
+        &mut self,
+        bytes: Bytes,
+        key: &crate::wasm::WasmEntityKey,
+        schemas: &V2SchemaAllowlist,
+    ) -> Result<usize, LixError> {
+        self.parse_count = self.parse_count.saturating_add(1);
+        let certificate = if let Some(plan) = schemas.schema_plan(&key.schema_key) {
+            plan.certify_or_normalize_v2_plugin_row(&bytes, key)?
+                .map(|row| (row, plan.shared_fingerprint()))
+        } else {
+            None
+        };
+        if let Some((certified, schema_fingerprint)) = certificate {
+            let normalized = match certified.normalized {
+                Some(normalized) => {
+                    self.serialize_count = self.serialize_count.saturating_add(1);
+                    Bytes::from(normalized)
+                }
+                None => bytes,
+            };
+            let encoded_len = u32::try_from(normalized.len())
+                .map_err(|_| invalid_guest("v2 canonical JSON row exceeds u32"))?;
+            let start = self.normalized_len;
+            let end = start
+                .checked_add(encoded_len)
+                .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+            self.normalized_len = end;
+            let row = self.row_kinds.len();
+            self.reserve_certified_columns();
+            let schema_fingerprint_index = self.schema_fingerprint_index(schema_fingerprint)?;
+            self.certified_normalized.push(
+                SharedStr::from_utf8(normalized)
+                    .map_err(|_| invalid_guest("certified canonical JSON row is not UTF-8"))?,
+            );
+            self.certified_entity_pks.push(certified.entity_pk);
+            self.schema_fingerprint_indices
+                .push(schema_fingerprint_index);
+            self.row_kinds.push(CanonicalJsonBatchRowKind::Certified);
+            self.normalized_ends.push(end);
+            return Ok(row);
+        }
+
+        // Plans that cannot use the streaming certificate parser take one DOM
+        // pass and serialize once at batch finalization.
+        let value = parse_number_free_snapshot(&bytes)?;
+        if !value.is_object() {
+            return Err(invalid_guest("v2 entity snapshots must be JSON objects"));
+        }
+        let encoded_len = canonical_json_encoded_len(&value)?;
+        let start = self.normalized_len;
+        let end = start
+            .checked_add(encoded_len)
+            .ok_or_else(|| invalid_guest("v2 canonical JSON page exceeds u32"))?;
+        self.normalized_len = end;
+        let row = self.row_kinds.len();
+        self.reserve_decoded_column();
+        self.decoded_values.push(value);
+        self.row_kinds.push(CanonicalJsonBatchRowKind::Decoded);
+        self.normalized_ends.push(end);
+        Ok(row)
+    }
+
+    fn finish(self) -> Result<Vec<WasmCanonicalJson>, LixError> {
+        if self.decoded_values.is_empty()
+            && self.certified_normalized.len() == self.row_kinds.len()
+            && self.serialize_count == 0
+        {
+            debug_assert!(
+                self.row_kinds
+                    .iter()
+                    .all(|kind| *kind == CanonicalJsonBatchRowKind::Certified)
+            );
+            debug_assert_eq!(
+                self.certified_normalized
+                    .iter()
+                    .map(|row| row.len())
+                    .sum::<usize>(),
+                self.normalized_len as usize
+            );
+            return WasmCanonicalJson::from_certified_batch_parts(
+                self.certified_normalized,
+                self.certified_entity_pks,
+                self.schema_fingerprints,
+                self.schema_fingerprint_indices,
+                self.parse_count,
+            );
+        }
+
+        let mut normalized = Vec::with_capacity(self.normalized_len as usize);
+        let mut values = Vec::with_capacity(self.row_kinds.len());
+        let mut certificates = Vec::with_capacity(self.row_kinds.len());
+        let mut offsets = Vec::with_capacity(self.row_kinds.len());
+        let mut decoded_values = self.decoded_values.into_iter();
+        let mut certified_normalized = self.certified_normalized.into_iter();
+        let mut certified_entity_pks = self.certified_entity_pks.into_iter();
+        let mut schema_fingerprint_indices = self.schema_fingerprint_indices.into_iter();
+        let mut serialize_count = self.serialize_count;
+        let mut start = 0_u32;
+        for (kind, end) in self.row_kinds.into_iter().zip(self.normalized_ends) {
+            debug_assert_eq!(normalized.len(), start as usize);
+            match kind {
+                CanonicalJsonBatchRowKind::Decoded => {
+                    let value = decoded_values
+                        .next()
+                        .expect("decoded canonical JSON row has a value");
+                    encode_number_free_json(&value, &mut normalized)?;
+                    values.push(Some(value));
+                    certificates.push(None);
+                    serialize_count += 1;
+                }
+                CanonicalJsonBatchRowKind::Certified => {
+                    let canonical = certified_normalized
+                        .next()
+                        .expect("certified canonical JSON row has bytes");
+                    let entity_pk = certified_entity_pks
+                        .next()
+                        .expect("certified canonical JSON row has an entity identity");
+                    let schema_fingerprint_index = schema_fingerprint_indices
+                        .next()
+                        .expect("certified canonical JSON row has a schema index");
+                    let schema_fingerprint = self
+                        .schema_fingerprints
+                        .get(schema_fingerprint_index as usize)
+                        .expect("certified canonical JSON row schema index was interned")
+                        .clone();
+                    normalized.extend_from_slice(canonical.as_bytes());
+                    values.push(None);
+                    certificates.push(Some(WasmCanonicalJsonCertificate::new(
+                        entity_pk,
+                        schema_fingerprint,
+                    )));
+                }
+            }
+            debug_assert_eq!(normalized.len(), end as usize);
+            offsets.push((start, end));
+            start = end;
+        }
+        #[cfg(debug_assertions)]
+        {
+            assert!(decoded_values.next().is_none());
+            assert!(certified_normalized.next().is_none());
+            assert!(certified_entity_pks.next().is_none());
+            assert!(schema_fingerprint_indices.next().is_none());
+        }
+        debug_assert_eq!(normalized.len(), normalized.capacity());
+        WasmCanonicalJson::from_mixed_batch_parts(
+            values,
+            certificates,
+            normalized,
+            offsets,
+            self.parse_count,
+            serialize_count,
+        )
     }
 }
 
-fn parse_number_free_snapshot(bytes: &[u8]) -> Result<NumberFreeJson, LixError> {
+fn canonical_json_encoded_len(value: &serde_json::Value) -> Result<u32, LixError> {
+    fn add(total: &mut u64, value: u64) -> Result<(), LixError> {
+        *total = total
+            .checked_add(value)
+            .ok_or_else(|| invalid_guest("v2 canonical JSON size overflowed"))?;
+        Ok(())
+    }
+
+    fn visit(value: &serde_json::Value, total: &mut u64) -> Result<(), LixError> {
+        match value {
+            serde_json::Value::Null => add(total, 4),
+            serde_json::Value::Bool(true) => add(total, 4),
+            serde_json::Value::Bool(false) => add(total, 5),
+            serde_json::Value::Number(_) => Err(invalid_guest(
+                "JSON numbers are not enabled for production v2",
+            )),
+            serde_json::Value::String(value) => encoded_json_string_len(value, total),
+            serde_json::Value::Array(values) => {
+                add(total, 2)?;
+                if values.len() > 1 {
+                    add(total, (values.len() - 1) as u64)?;
+                }
+                for value in values {
+                    visit(value, total)?;
+                }
+                Ok(())
+            }
+            serde_json::Value::Object(values) => {
+                add(total, 2)?;
+                if values.len() > 1 {
+                    add(total, (values.len() - 1) as u64)?;
+                }
+                for (key, value) in values {
+                    encoded_json_string_len(key, total)?;
+                    add(total, 1)?;
+                    visit(value, total)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn encoded_json_string_len(value: &str, total: &mut u64) -> Result<(), LixError> {
+        add(total, 2)?;
+        for scalar in value.chars() {
+            add(
+                total,
+                match scalar {
+                    '"' | '\\' | '\u{08}' | '\t' | '\n' | '\u{0c}' | '\r' => 2,
+                    scalar if scalar <= '\u{1f}' => 6,
+                    scalar => scalar.len_utf8() as u64,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    let mut total = 0;
+    visit(value, &mut total)?;
+    u32::try_from(total).map_err(|_| invalid_guest("v2 canonical JSON row exceeds u32"))
+}
+
+fn parse_number_free_snapshot(bytes: &[u8]) -> Result<serde_json::Value, LixError> {
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
-    let value = NumberFreeJson::deserialize(&mut deserializer).map_err(|error| {
-        invalid_guest(format!(
-            "v2 snapshot must be duplicate-free number-free UTF-8 JSON: {error}"
-        ))
-    })?;
+    let NumberFreeJsonValue(value) =
+        NumberFreeJsonValue::deserialize(&mut deserializer).map_err(|error| {
+            invalid_guest(format!(
+                "v2 snapshot must be duplicate-free number-free UTF-8 JSON: {error}"
+            ))
+        })?;
     deserializer.end().map_err(|error| {
         invalid_guest(format!(
             "v2 snapshot contains trailing or invalid JSON input: {error}"
@@ -763,54 +1066,71 @@ fn parse_number_free_snapshot(bytes: &[u8]) -> Result<NumberFreeJson, LixError> 
     Ok(value)
 }
 
-fn encode_number_free_json(value: &NumberFreeJson, output: &mut String) {
+fn encode_number_free_json(
+    value: &serde_json::Value,
+    output: &mut Vec<u8>,
+) -> Result<(), LixError> {
     match value {
-        NumberFreeJson::Null => output.push_str("null"),
-        NumberFreeJson::Bool(true) => output.push_str("true"),
-        NumberFreeJson::Bool(false) => output.push_str("false"),
-        NumberFreeJson::String(value) => encode_json_string(value, output),
-        NumberFreeJson::Array(values) => {
-            output.push('[');
+        serde_json::Value::Null => output.extend_from_slice(b"null"),
+        serde_json::Value::Bool(true) => output.extend_from_slice(b"true"),
+        serde_json::Value::Bool(false) => output.extend_from_slice(b"false"),
+        serde_json::Value::String(value) => encode_json_string(value, output),
+        serde_json::Value::Array(values) => {
+            output.push(b'[');
             for (index, value) in values.iter().enumerate() {
                 if index != 0 {
-                    output.push(',');
+                    output.push(b',');
                 }
-                encode_number_free_json(value, output);
+                encode_number_free_json(value, output)?;
             }
-            output.push(']');
+            output.push(b']');
         }
-        NumberFreeJson::Object(values) => {
-            output.push('{');
+        serde_json::Value::Object(values) => {
+            output.push(b'{');
             for (index, (key, value)) in values.iter().enumerate() {
                 if index != 0 {
-                    output.push(',');
+                    output.push(b',');
                 }
                 encode_json_string(key, output);
-                output.push(':');
-                encode_number_free_json(value, output);
+                output.push(b':');
+                encode_number_free_json(value, output)?;
             }
-            output.push('}');
+            output.push(b'}');
+        }
+        serde_json::Value::Number(_) => {
+            return Err(invalid_guest(
+                "JSON numbers are not enabled for production v2",
+            ));
         }
     }
+    Ok(())
 }
 
-fn encode_json_string(value: &str, output: &mut String) {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    output.push('"');
+fn encode_json_string(value: &str, output: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    output.push(b'"');
     for scalar in value.chars() {
         match scalar {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
+            '"' => output.extend_from_slice(br#"\""#),
+            '\\' => output.extend_from_slice(br#"\\"#),
+            '\u{08}' => output.extend_from_slice(br#"\b"#),
+            '\t' => output.extend_from_slice(br#"\t"#),
+            '\n' => output.extend_from_slice(br#"\n"#),
+            '\u{0c}' => output.extend_from_slice(br#"\f"#),
+            '\r' => output.extend_from_slice(br#"\r"#),
             scalar if scalar <= '\u{1f}' => {
                 let scalar = scalar as usize;
-                output.push_str("\\u00");
-                output.push(HEX[(scalar >> 4) & 0x0f] as char);
-                output.push(HEX[scalar & 0x0f] as char);
+                output.extend_from_slice(b"\\u00");
+                output.push(HEX[(scalar >> 4) & 0x0f]);
+                output.push(HEX[scalar & 0x0f]);
             }
-            scalar => output.push(scalar),
+            scalar => {
+                let mut encoded = [0_u8; 4];
+                output.extend_from_slice(scalar.encode_utf8(&mut encoded).as_bytes());
+            }
         }
     }
-    output.push('"');
+    output.push(b'"');
 }
 
 /// Vec-backed complete-entity packet source for cold rendering. Construction
@@ -1273,8 +1593,8 @@ fn encoded_host_bytes_ref_bytes(value: &WasmHostBytes) -> Result<u64, LixError> 
                 .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
             Ok(1 + 4 + u64::from(length))
         }
-        WasmHostBytes::CanonicalJson { normalized, .. } => {
-            let length = u32::try_from(normalized.len())
+        WasmHostBytes::CanonicalJson(json) => {
+            let length = u32::try_from(json.normalized().len())
                 .map_err(|_| invalid_input("v2 inline snapshot exceeds u32 framing"))?;
             Ok(1 + 4 + u64::from(length))
         }
@@ -1321,7 +1641,7 @@ pub(crate) struct ValidatedConflictTransition {
 pub(crate) struct ResolvedOutputSplice {
     pub(crate) offset: u64,
     pub(crate) delete_len: u64,
-    pub(crate) insert: Vec<u8>,
+    pub(crate) insert: Bytes,
 }
 
 /// One fixed-width renderer splice which the host has applied against the
@@ -1352,8 +1672,10 @@ pub(crate) struct ValidatedEntityTransition {
 }
 
 /// Drains and validates every change before returning any proposed semantic
-/// state to transaction code. Validation of a page's keys, attachment count,
-/// and aggregate budget happens before the first attachment method is invoked.
+/// state to transaction code. Validation of a page's key shape, attachment
+/// count, and aggregate budget happens before the first attachment method is
+/// invoked. Cursor-wide key uniqueness is checked once over borrowed references
+/// after the final stable change vector has been assembled.
 pub(crate) async fn drain_file_transition_changes(
     actor: &mut dyn WasmComponentV2Actor,
     transition: WasmFileTransition,
@@ -1409,8 +1731,19 @@ async fn drain_file_transition_changes_inner(
             .packet_records
             .saturating_add(page.changes.changes.len() as u64);
 
+        let page_row_count = page.changes.changes.len();
+        let page_snapshot_count = page
+            .changes
+            .changes
+            .iter()
+            .filter(|change| !matches!(change, WasmEntityChange::Delete(_)))
+            .count();
+        let page_start = changes.len();
+        changes.reserve(page_row_count);
+        let mut snapshots = CanonicalJsonBatchBuilder::with_row_capacity(page_snapshot_count);
         let outputs = page.outputs;
         async {
+            let mut page_snapshot_ordinal = 0usize;
             for change in page.changes.changes {
                 let resolved = match change {
                     WasmEntityChange::Create {
@@ -1427,10 +1760,15 @@ async fn drain_file_transition_changes_inner(
                             &mut local_counters,
                         )
                         .await?;
+                        let snapshot_row = snapshots.push(&snapshot)?;
+                        debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
+                        page_snapshot_ordinal += 1;
                         WasmEntityChange::Create {
                             schema_key,
                             local_ref,
-                            snapshot_content: validated_v2_snapshot(&snapshot)?,
+                            // Patched with the page-owned canonical row after
+                            // every snapshot validates.
+                            snapshot_content: WasmHostBytes::Inline(Bytes::new()),
                         }
                     }
                     WasmEntityChange::Delete(key) => WasmEntityChange::Delete(key),
@@ -1444,11 +1782,17 @@ async fn drain_file_transition_changes_inner(
                             &mut local_counters,
                         )
                         .await?;
-                        let snapshot = validated_v2_snapshot(&snapshot)?;
+                        let snapshot_row = snapshots.push_plugin(snapshot, &entity.key, schemas)?;
+                        debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
+                        page_snapshot_ordinal += 1;
                         WasmEntityChange::Upsert {
                             entity: WasmEntity {
                                 key: entity.key,
-                                snapshot_content: snapshot,
+                                // The canonical page does not exist until every
+                                // snapshot has validated. Patch this sentinel in
+                                // place after `finish`, retaining source order
+                                // without a second page-sized row vector.
+                                snapshot_content: WasmHostBytes::Inline(Bytes::new()),
                             },
                             effect,
                         }
@@ -1456,6 +1800,7 @@ async fn drain_file_transition_changes_inner(
                 };
                 changes.push(resolved);
             }
+            debug_assert_eq!(page_snapshot_ordinal, page_snapshot_count);
             Ok::<(), LixError>(())
         }
         .instrument(tracing::debug_span!(
@@ -1463,8 +1808,35 @@ async fn drain_file_transition_changes_inner(
             "lix.perf.plugin_drain_resolve_page"
         ))
         .await?;
+
+        let mut canonical = snapshots.finish()?.into_iter();
+        debug_assert_eq!(changes.len() - page_start, page_row_count);
+        for change in &mut changes[page_start..] {
+            let snapshot_content = match change {
+                WasmEntityChange::Create {
+                    snapshot_content, ..
+                } => Some(snapshot_content),
+                WasmEntityChange::Upsert { entity, .. } => Some(&mut entity.snapshot_content),
+                WasmEntityChange::Delete(_) => None,
+            };
+            if let Some(snapshot_content) = snapshot_content {
+                debug_assert!(matches!(
+                    snapshot_content,
+                    WasmHostBytes::Inline(bytes) if bytes.is_empty()
+                ));
+                let snapshot = canonical
+                    .next()
+                    .expect("one canonical snapshot exists for every appended write");
+                *snapshot_content = WasmHostBytes::CanonicalJson(snapshot);
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert!(canonical.next().is_none());
     }
 
+    validate_change_cursor_key_uniqueness(&changes).map_err(|error| {
+        invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
+    })?;
     let runtime_counters = actor
         .finish_transition(transition.transition)
         .instrument(tracing::debug_span!(
@@ -1540,7 +1912,16 @@ async fn drain_conflict_transition_resolutions_inner(
             .packet_records
             .saturating_add(page.resolutions.len() as u64);
 
+        let page_row_count = page.resolutions.len();
+        let page_snapshot_count = page
+            .resolutions
+            .iter()
+            .filter(|resolution| matches!(resolution, WasmConflictResolution::Replace { .. }))
+            .count();
+        let page_start = resolutions.len();
+        let mut snapshots = CanonicalJsonBatchBuilder::with_row_capacity(page_snapshot_count);
         let outputs = page.outputs;
+        let mut page_snapshot_ordinal = 0usize;
         for (ordinal, resolution) in page.ordinals.into_iter().zip(page.resolutions) {
             let expected_ordinal = u32::try_from(resolutions.len()).map_err(|_| {
                 invalid_guest("v2 conflict resolver has more than u32::MAX results")
@@ -1570,9 +1951,14 @@ async fn drain_conflict_transition_resolutions_inner(
                         &mut local_counters,
                     )
                     .await?;
-                    let snapshot = canonicalize_v2_snapshot(&snapshot)?;
+                    let snapshot_row = snapshots.push(&snapshot)?;
+                    debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
+                    page_snapshot_ordinal += 1;
                     WasmConflictResolution::Replace {
-                        snapshot_content: WasmHostBytes::Inline(snapshot),
+                        // See the file-transition drain above: finish the
+                        // canonical page once, then replace this sentinel
+                        // inside the stable result vector.
+                        snapshot_content: WasmHostBytes::Inline(Bytes::new()),
                         effect,
                     }
                 }
@@ -1584,6 +1970,26 @@ async fn drain_conflict_transition_resolutions_inner(
                 ));
             }
         }
+        debug_assert_eq!(page_snapshot_ordinal, page_snapshot_count);
+        let mut canonical = snapshots.finish()?.into_iter();
+        debug_assert_eq!(resolutions.len() - page_start, page_row_count);
+        for resolution in &mut resolutions[page_start..] {
+            if let WasmConflictResolution::Replace {
+                snapshot_content, ..
+            } = resolution
+            {
+                debug_assert!(matches!(
+                    snapshot_content,
+                    WasmHostBytes::Inline(bytes) if bytes.is_empty()
+                ));
+                let snapshot = canonical
+                    .next()
+                    .expect("one canonical snapshot exists for every appended replacement");
+                *snapshot_content = WasmHostBytes::CanonicalJson(snapshot);
+            }
+        }
+        #[cfg(debug_assertions)]
+        assert!(canonical.next().is_none());
     }
     if resolutions.len() != expected_count {
         return Err(invalid_guest(format!(
@@ -2010,7 +2416,7 @@ async fn resolve_guest_bytes(
     bytes: WasmGuestBytes,
     budget: &mut OutputDrainBudget,
     counters: &mut WasmTransitionCounters,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<Bytes, LixError> {
     match bytes {
         WasmGuestBytes::Inline(bytes) => {
             budget.charge_inline(bytes.len() as u64)?;
@@ -2035,7 +2441,7 @@ async fn read_output_range(
     range: WasmOutputRange,
     budget: &mut OutputDrainBudget,
     counters: &mut WasmTransitionCounters,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<Bytes, LixError> {
     let end = range
         .offset
         .checked_add(range.length)
@@ -2076,7 +2482,7 @@ async fn read_output_range(
             .ok_or_else(|| invalid_guest("v2 output read offset overflowed"))?;
         bytes.extend_from_slice(&chunk);
     }
-    Ok(bytes)
+    Ok(bytes.into())
 }
 
 #[derive(Debug)]
@@ -2314,18 +2720,21 @@ mod tests {
         WasmOpenFileInput, WasmOutputSplice,
     };
 
+    const UUID_A: &str = "019a0000-0000-7000-8000-000000000001";
+    const UUID_B: &str = "019a0000-0000-7000-8000-000000000002";
+    const UUID_C: &str = "019a0000-0000-7000-8000-000000000003";
+
     fn key(id: &str) -> crate::wasm::WasmEntityKey {
-        crate::wasm::WasmEntityKey {
-            schema_key: "csv_row".to_owned(),
-            entity_pk: vec![id.to_owned()],
-        }
+        crate::wasm::WasmEntityKey::from_owned_parts("csv_row", vec![id.to_owned()])
     }
 
     fn host_entity(id: &str) -> WasmHostEntity {
         WasmEntity {
             key: key(id),
             snapshot_content: WasmHostBytes::Inline(
-                format!(r#"{{"cells":[],"id":"{id}","order_key":"a"}}"#).into_bytes(),
+                format!(r#"{{"cells":[],"id":"{id}","order_key":"a"}}"#)
+                    .into_bytes()
+                    .into(),
             ),
         }
     }
@@ -2577,26 +2986,418 @@ mod tests {
                 .unwrap();
         assert_eq!(
             canonical,
-            r#"{"a":[true,null,"é"],"slash":"/","z":"\u000A"}"#.as_bytes()
+            r#"{"a":[true,null,"é"],"slash":"/","z":"\n"}"#.as_bytes()
         );
-        let WasmHostBytes::CanonicalJson { value, normalized } =
-            validated_v2_snapshot(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
-                .unwrap()
-        else {
-            panic!("validated snapshots must retain parsed canonical JSON")
-        };
+        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
+        batch
+            .push(r#"{"z":"\n","a":[true,null,"é"],"slash":"/"}"#.as_bytes())
+            .unwrap();
+        let json = batch.finish().unwrap().pop().unwrap();
         assert_eq!(
-            normalized.as_ref(),
-            r#"{"a":[true,null,"é"],"slash":"/","z":"\u000A"}"#
+            json.normalized(),
+            r#"{"a":[true,null,"é"],"slash":"/","z":"\n"}"#
         );
-        assert_eq!(value["z"], "\n");
-        assert_eq!(value["a"][0], true);
+        assert_eq!(json.value()["z"], "\n");
+        assert_eq!(json.value()["a"][0], true);
 
         assert!(canonicalize_v2_snapshot(br#"{"nested":{"n":1}}"#).is_err());
         let duplicate = canonicalize_v2_snapshot(br#"{"a":"x","\u0061":"y"}"#)
             .expect_err("escaped and literal decoded keys are duplicates");
         assert!(duplicate.message.contains("duplicate"), "{duplicate:?}");
         assert!(canonicalize_v2_snapshot(br#"["not","an","object"]"#).is_err());
+    }
+
+    #[test]
+    fn canonical_json_uses_exact_serde_control_escape_spelling() {
+        let canonical = canonicalize_v2_snapshot(
+            br#"{"controls":"\b\t\n\f\r\u0001\u001f","quote":"\"","slash":"\\","solidus":"/"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical,
+            br#"{"controls":"\b\t\n\f\r\u0001\u001f","quote":"\"","slash":"\\","solidus":"/"}"#
+        );
+    }
+
+    #[test]
+    fn canonical_json_rows_share_one_arena_and_validate_once() {
+        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
+        batch.push(br#"{"id":"a","value":"first"}"#).unwrap();
+        batch.push(br#"{"id":"b","value":"second"}"#).unwrap();
+        let rows = batch.finish().unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].shares_batch_with(&rows[1]));
+        assert_eq!(rows[0].row_index(), 0);
+        assert_eq!(rows[1].row_index(), 1);
+        assert_eq!(rows[0].batch_row_count(), 2);
+        assert_eq!(
+            rows[0].batch_arena_len(),
+            rows[0].normalized().len() + rows[1].normalized().len()
+        );
+        assert_eq!(rows[0].validation_counts(), (2, 2));
+        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
+        assert_eq!(rows[0].value()["id"], "a");
+        assert_eq!(rows[1].value()["id"], "b");
+    }
+
+    #[test]
+    fn certified_builder_uses_sub_64k_parallel_columns_for_a_cursor_page() {
+        const PAGE_ROWS: usize = 1_024;
+        const LARGE_ALLOCATION_BYTES: usize = 64 * 1_024;
+
+        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(PAGE_ROWS);
+        batch.reserve_decoded_column();
+        batch.reserve_certified_columns();
+
+        assert_eq!(size_of::<CanonicalJsonBatchRowKind>(), 1);
+        assert!(
+            batch.row_kinds.capacity() * size_of::<CanonicalJsonBatchRowKind>()
+                < LARGE_ALLOCATION_BYTES
+        );
+        assert!(
+            batch.decoded_values.capacity() * size_of::<serde_json::Value>()
+                < LARGE_ALLOCATION_BYTES
+        );
+        assert!(
+            batch.certified_normalized.capacity() * size_of::<SharedStr>() < LARGE_ALLOCATION_BYTES
+        );
+        assert!(
+            batch.certified_entity_pks.capacity() * size_of::<EntityPk>() < LARGE_ALLOCATION_BYTES
+        );
+        assert!(
+            batch.schema_fingerprint_indices.capacity() * size_of::<u32>() < LARGE_ALLOCATION_BYTES
+        );
+        assert!(batch.normalized_ends.capacity() * size_of::<u32>() < LARGE_ALLOCATION_BYTES);
+    }
+
+    #[test]
+    fn certified_plugin_rows_retain_source_buffers_without_an_arena() {
+        let schema = serde_json::from_str(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ))
+        .expect("CSV row schema");
+        let catalog =
+            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
+                crate::domain::Domain::schema_catalog("main", false),
+                crate::schema::SchemaKey::new("csv_v2_row"),
+                schema,
+            )])
+            .expect("CSV row catalog");
+        let schemas =
+            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+                .expect("CSV allowlist");
+
+        let first = Bytes::from(
+            br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+                .as_slice()
+                .to_vec(),
+        );
+        let second = Bytes::from(
+            br#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
+                .as_slice()
+                .to_vec(),
+        );
+        let first_ptr = first.as_ptr();
+        let second_ptr = second.as_ptr();
+        let normalized_len = first.len() + second.len();
+        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
+        batch
+            .push_plugin(
+                first,
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_A.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("first canonical row");
+        batch
+            .push_plugin(
+                second,
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_B.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("second canonical row");
+        let rows = batch.finish().expect("certified canonical batch");
+
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].shares_batch_with(&rows[1]));
+        assert_eq!(rows[0].row_index(), 0);
+        assert_eq!(rows[1].row_index(), 1);
+        assert_eq!(rows[0].batch_row_count(), 2);
+        assert_eq!(rows[0].batch_arena_len(), normalized_len);
+        assert_eq!(rows[0].batch_arena_allocation_count(), 0);
+        assert_eq!(rows[0].validation_counts(), (2, 0));
+        assert_eq!(rows[0].batch_decoded_value_count(), 0);
+        assert_eq!(rows[0].batch_certified_schema_count(), 1);
+        assert!(rows.iter().all(|row| row.certificate().is_some()));
+        assert_eq!(
+            rows[0]
+                .certificate()
+                .expect("first certificate")
+                .entity_pk(),
+            &EntityPk::uuid_from_canonical(UUID_A).expect("canonical UUID")
+        );
+        assert_eq!(
+            rows[1]
+                .certificate()
+                .expect("second certificate")
+                .entity_pk(),
+            &EntityPk::uuid_from_canonical(UUID_B).expect("canonical UUID")
+        );
+        assert_eq!(
+            rows[0].normalized(),
+            r#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+        );
+        assert_eq!(
+            rows[1].normalized(),
+            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
+        );
+        assert_eq!(rows[0].normalized_shared().as_bytes().as_ptr(), first_ptr);
+        assert_eq!(rows[1].normalized_shared().as_bytes().as_ptr(), second_ptr);
+    }
+
+    #[test]
+    fn canonical_plugin_rows_skip_dom_and_share_the_normalized_arena() {
+        let schema = serde_json::from_str(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ))
+        .expect("CSV row schema");
+        let catalog =
+            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
+                crate::domain::Domain::schema_catalog("main", false),
+                crate::schema::SchemaKey::new("csv_v2_row"),
+                schema,
+            )])
+            .expect("CSV row catalog");
+        let schemas =
+            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+                .expect("CSV allowlist");
+        let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(2);
+        batch
+            .push_plugin(
+                Bytes::from_static(
+                    br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                ),
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_A.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("canonical row");
+        batch
+            .push_plugin(
+                Bytes::from_static(
+                    br#"{"id":"019a0000-0000-7000-8000-000000000002","order_key":"03","cells":["b"]}"#,
+                ),
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_B.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("compatibility row");
+        let rows = batch.finish().expect("mixed canonical batch");
+
+        assert!(rows[0].certificate().is_some());
+        assert!(rows[1].certificate().is_some());
+        assert_eq!(rows[0].batch_decoded_value_count(), 0);
+        assert_eq!(rows[0].validation_counts(), (2, 1));
+        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
+        assert!(rows[0].shares_batch_with(&rows[1]));
+        assert_eq!(
+            rows[0].normalized(),
+            r#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+        );
+        assert_eq!(
+            rows[1].normalized(),
+            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
+        );
+    }
+
+    #[test]
+    fn plugin_row_parser_counts_one_pass_for_canonical_compatibility_and_invalid_rows() {
+        let schema = serde_json::from_str(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ))
+        .expect("CSV row schema");
+        let catalog =
+            CatalogSnapshot::from_schema_facts(&[crate::catalog::SchemaCatalogFact::new(
+                crate::domain::Domain::schema_catalog("main", false),
+                crate::schema::SchemaKey::new("csv_v2_row"),
+                schema,
+            )])
+            .expect("CSV row catalog");
+        let schemas =
+            V2SchemaAllowlist::from_catalog(&["csv_v2_row".to_owned()], Arc::new(catalog))
+                .expect("CSV allowlist");
+
+        let mut canonical = CanonicalJsonBatchBuilder::with_row_capacity(1);
+        canonical
+            .push_plugin(
+                Bytes::from_static(
+                    br#"{"cells":["a"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
+                ),
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_A.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("canonical row");
+        let canonical = canonical.finish().expect("canonical batch");
+        assert_eq!(canonical[0].validation_counts(), (1, 0));
+        assert_eq!(canonical[0].batch_arena_allocation_count(), 0);
+
+        let mut compatibility = CanonicalJsonBatchBuilder::with_row_capacity(1);
+        compatibility
+            .push_plugin(
+                Bytes::from_static(
+                    br#" { "id":"019a0000-0000-7000-8000-000000000002", "order_key":"03", "cells":["b"] } "#,
+                ),
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_B.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect("compatibility row");
+        let compatibility = compatibility.finish().expect("compatibility batch");
+        assert_eq!(compatibility[0].validation_counts(), (1, 1));
+        assert_eq!(compatibility[0].batch_decoded_value_count(), 0);
+        assert!(compatibility[0].certificate().is_some());
+        assert_eq!(
+            compatibility[0].normalized(),
+            r#"{"cells":["b"],"id":"019a0000-0000-7000-8000-000000000002","order_key":"03"}"#
+        );
+
+        let mut invalid = CanonicalJsonBatchBuilder::with_row_capacity(1);
+        let error = invalid
+            .push_plugin(
+                Bytes::from_static(
+                    br#"{"cells":[1],"id":"019a0000-0000-7000-8000-000000000003","order_key":"05"}"#,
+                ),
+                &crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_C.to_owned()],
+                ),
+                &schemas,
+            )
+            .expect_err("number-bearing plugin row must fail");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert_eq!(invalid.parse_count, 1);
+        assert_eq!(invalid.serialize_count, 0);
+        assert!(invalid.row_kinds.is_empty());
+    }
+
+    #[test]
+    fn streaming_plugin_parser_matches_dom_canonicalization_for_compatibility_corpus() {
+        let row_schema = serde_json::from_str(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_row.json"
+        ))
+        .expect("CSV row schema");
+        let table_schema = serde_json::from_str(include_str!(
+            "../../../../plugins/csv-v2/schema/csv_v2_table.json"
+        ))
+        .expect("CSV table schema");
+        let catalog = CatalogSnapshot::from_schema_facts(&[
+            crate::catalog::SchemaCatalogFact::new(
+                crate::domain::Domain::schema_catalog("main", false),
+                crate::schema::SchemaKey::new("csv_v2_row"),
+                row_schema,
+            ),
+            crate::catalog::SchemaCatalogFact::new(
+                crate::domain::Domain::schema_catalog("main", false),
+                crate::schema::SchemaKey::new("csv_v2_table"),
+                table_schema,
+            ),
+        ])
+        .expect("CSV catalog");
+        let schemas = V2SchemaAllowlist::from_catalog(
+            &["csv_v2_row".to_owned(), "csv_v2_table".to_owned()],
+            Arc::new(catalog),
+        )
+        .expect("CSV allowlist");
+
+        let valid = [
+            (
+                br#" { "id":"019a0000-0000-7000-8000-000000000001", "order_key":"01", "cells":[ "a", "b" ] } "#.as_slice(),
+                crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_A.to_owned()],
+                ),
+            ),
+            (
+                br#"{"cells":["\uD83D\uDE00","line\u000Abreak"],"\u0069d":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#
+                    .as_slice(),
+                crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_row",
+                    vec![UUID_A.to_owned()],
+                ),
+            ),
+            (
+                br#" { "id":"root", "dialect": { "terminator":"\u000A", "quote":"\u0022", "\u0064elimiter":"," } } "#
+                    .as_slice(),
+                crate::wasm::WasmEntityKey::from_owned_parts(
+                    "csv_v2_table",
+                    vec!["root".to_owned()],
+                ),
+            ),
+        ];
+        for (input, key) in valid {
+            let expected = canonicalize_v2_snapshot(input).expect("DOM compatibility oracle");
+            let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
+            batch
+                .push_plugin(Bytes::copy_from_slice(input), &key, &schemas)
+                .expect("streaming compatibility row");
+            let rows = batch.finish().expect("streaming compatibility batch");
+
+            assert_eq!(rows[0].normalized().as_bytes(), expected);
+            assert_eq!(rows[0].validation_counts(), (1, 1));
+            assert_eq!(rows[0].batch_decoded_value_count(), 0);
+            assert_eq!(
+                rows[0]
+                    .certificate()
+                    .expect("streaming row certificate")
+                    .entity_pk()
+                    .clone(),
+                if key.schema_key == "csv_v2_row" {
+                    EntityPk::uuid_from_canonical(&key.entity_pk[0]).expect("canonical UUID")
+                } else {
+                    EntityPk::single(key.entity_pk[0].as_str())
+                }
+            );
+        }
+
+        for input in [
+            br#"{"id":"019a0000-0000-7000-8000-000000000001","order_key":"01","\u0069d":"019a0000-0000-7000-8000-000000000001","cells":["a"]}"#.as_slice(),
+            br#"{"cells":["\x"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
+            br#"{"cells":["\uD83D"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
+            br#"{"cells":["\uDE00"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#.as_slice(),
+        ] {
+            let dom_error =
+                canonicalize_v2_snapshot(input).expect_err("DOM oracle must reject hostile input");
+            let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
+            let streaming_error = batch
+                .push_plugin(
+                    Bytes::copy_from_slice(input),
+                    &crate::wasm::WasmEntityKey::from_owned_parts(
+                        "csv_v2_row",
+                        vec![UUID_A.to_owned()],
+                    ),
+                    &schemas,
+                )
+                .expect_err("streaming parser must reject hostile input");
+            assert_eq!(streaming_error.code, dom_error.code, "{input:?}");
+            assert_eq!(batch.parse_count, 1);
+            assert_eq!(batch.serialize_count, 0);
+            assert!(batch.row_kinds.is_empty());
+        }
     }
 
     #[test]
@@ -2613,12 +3414,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(first_page.entities.len(), 1);
-        assert_eq!(first_page.entities[0].key.entity_pk, ["a".to_owned()]);
+        assert_eq!(first_page.entities[0].key.entity_pk[0], "a");
         let second_page = source
             .next_page(WasmTransitionLimits::default().max_page_bytes)
             .unwrap()
             .unwrap();
-        assert_eq!(second_page.entities[0].key.entity_pk, ["b".to_owned()]);
+        assert_eq!(second_page.entities[0].key.entity_pk[0], "b");
         assert!(source.next_page(1).unwrap().is_none());
         assert!(source.next_page(1).unwrap().is_none());
 
@@ -2910,6 +3711,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conflict_replacements_share_one_canonical_batch() {
+        let transition = WasmConflictTransition {
+            transition: WasmTransitionHandle(56),
+            resolutions: crate::wasm::WasmResolutionCursorHandle(57),
+        };
+        let page = WasmConflictResolutionPage {
+            format_version: PACKET_FORMAT_V1,
+            ordinals: vec![0, 1],
+            resolutions: vec![
+                WasmConflictResolution::Replace {
+                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"a"}"#.to_vec().into()),
+                    effect: WasmChangeEffect::Content,
+                },
+                WasmConflictResolution::Replace {
+                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"b"}"#.to_vec().into()),
+                    effect: WasmChangeEffect::FormatOnly,
+                },
+            ],
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            resolution_pages: [page].into(),
+            ..FakeActor::default()
+        };
+
+        let drained = drain_conflict_transition_resolutions(
+            &mut actor,
+            transition,
+            2,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect("valid replacements should drain");
+        let WasmConflictResolution::Replace {
+            snapshot_content: WasmHostBytes::CanonicalJson(first),
+            ..
+        } = &drained.resolutions[0]
+        else {
+            panic!("first resolution must retain canonical JSON")
+        };
+        let WasmConflictResolution::Replace {
+            snapshot_content: WasmHostBytes::CanonicalJson(second),
+            ..
+        } = &drained.resolutions[1]
+        else {
+            panic!("second resolution must retain canonical JSON")
+        };
+        assert!(first.shares_batch_with(second));
+        assert_eq!(first.validation_counts(), (2, 2));
+        assert_eq!(first.batch_arena_allocation_count(), 1);
+        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
+        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
+    }
+
+    #[tokio::test]
+    async fn conflict_drain_patches_replacements_without_reordering_other_results() {
+        let transition = WasmConflictTransition {
+            transition: WasmTransitionHandle(58),
+            resolutions: crate::wasm::WasmResolutionCursorHandle(59),
+        };
+        let page = WasmConflictResolutionPage {
+            format_version: PACKET_FORMAT_V1,
+            ordinals: vec![0, 1, 2, 3],
+            resolutions: vec![
+                WasmConflictResolution::Replace {
+                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"a"}"#.to_vec().into()),
+                    effect: WasmChangeEffect::Content,
+                },
+                WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B),
+                WasmConflictResolution::Delete,
+                WasmConflictResolution::Replace {
+                    snapshot_content: WasmGuestBytes::Inline(br#"{"id":"b"}"#.to_vec().into()),
+                    effect: WasmChangeEffect::FormatOnly,
+                },
+            ],
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            resolution_pages: [page].into(),
+            ..FakeActor::default()
+        };
+
+        let drained = drain_conflict_transition_resolutions(
+            &mut actor,
+            transition,
+            4,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect("interleaved replacements should retain their input ordinals");
+
+        let WasmConflictResolution::Replace {
+            snapshot_content: WasmHostBytes::CanonicalJson(first),
+            effect: WasmChangeEffect::Content,
+        } = &drained.resolutions[0]
+        else {
+            panic!("ordinal zero must remain the first replacement")
+        };
+        assert!(matches!(
+            drained.resolutions[1],
+            WasmConflictResolution::Take(crate::wasm::WasmConflictTake::B)
+        ));
+        assert!(matches!(
+            drained.resolutions[2],
+            WasmConflictResolution::Delete
+        ));
+        let WasmConflictResolution::Replace {
+            snapshot_content: WasmHostBytes::CanonicalJson(second),
+            effect: WasmChangeEffect::FormatOnly,
+        } = &drained.resolutions[3]
+        else {
+            panic!("ordinal three must remain the second replacement")
+        };
+        assert!(first.shares_batch_with(second));
+        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
+        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
+    }
+
+    #[tokio::test]
     async fn conflict_drain_rejects_oversized_replacement_before_output_read() {
         let transition = WasmConflictTransition {
             transition: WasmTransitionHandle(61),
@@ -2954,20 +3874,30 @@ mod tests {
     async fn change_drain_validates_before_reading_and_canonicalizes_attachments() {
         let outputs = WasmByteOutputsHandle(7);
         let snapshot = br#"{"order_key":"a","id":"row","cells":[]}"#.to_vec();
+        let second_snapshot = br#"{"order_key":"b","id":"row2","cells":[]}"#.to_vec();
         let page = WasmChangePage {
             format_version: PACKET_FORMAT_V1,
             changes: WasmEntityChanges {
-                changes: vec![WasmEntityChange::Upsert {
-                    entity: WasmEntity {
-                        key: key("row"),
-                        snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
-                            index: 0,
-                            offset: 0,
-                            length: snapshot.len() as u64,
-                        }),
+                changes: vec![
+                    WasmEntityChange::Upsert {
+                        entity: WasmEntity {
+                            key: key("row"),
+                            snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
+                                index: 0,
+                                offset: 0,
+                                length: snapshot.len() as u64,
+                            }),
+                        },
+                        effect: WasmChangeEffect::Content,
                     },
-                    effect: WasmChangeEffect::Content,
-                }],
+                    WasmEntityChange::Upsert {
+                        entity: WasmEntity {
+                            key: key("row2"),
+                            snapshot_content: WasmGuestBytes::Inline(second_snapshot.into()),
+                        },
+                        effect: WasmChangeEffect::Content,
+                    },
+                ],
             },
             outputs: Some(outputs),
         };
@@ -3000,20 +3930,179 @@ mod tests {
         let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[0] else {
             panic!("expected upsert")
         };
-        let WasmHostBytes::CanonicalJson {
-            value, normalized, ..
-        } = &entity.snapshot_content
-        else {
+        let WasmHostBytes::CanonicalJson(json) = &entity.snapshot_content else {
             panic!("resolved snapshots must retain parsed canonical JSON")
         };
         assert_eq!(
-            normalized.as_ref(),
+            json.normalized(),
             r#"{"cells":[],"id":"row","order_key":"a"}"#
         );
-        assert_eq!(value["id"], "row");
+        assert_eq!(json.value()["id"], "row");
+        let WasmEntityChange::Upsert { entity, .. } = &drained.changes.changes[1] else {
+            panic!("expected second upsert")
+        };
+        let WasmHostBytes::CanonicalJson(second_json) = &entity.snapshot_content else {
+            panic!("resolved snapshots must retain parsed canonical JSON")
+        };
+        assert!(json.shares_batch_with(second_json));
+        assert_eq!(json.validation_counts(), (2, 2));
+        assert_eq!(json.batch_arena_allocation_count(), 1);
         assert!(drained.counters.attachment_reads > 1);
         assert_eq!(drained.counters.source_read_calls, 2);
         assert!(actor.finished);
+    }
+
+    #[tokio::test]
+    async fn change_drain_bounds_canonical_arenas_to_cursor_pages() {
+        let page = |id: &str| WasmChangePage {
+            format_version: PACKET_FORMAT_V1,
+            changes: WasmEntityChanges {
+                changes: vec![WasmEntityChange::Upsert {
+                    entity: WasmEntity {
+                        key: key(id),
+                        snapshot_content: WasmGuestBytes::Inline(
+                            format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
+                        ),
+                    },
+                    effect: WasmChangeEffect::Content,
+                }],
+            },
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            change_pages: [page("a"), page("b")].into(),
+            ..FakeActor::default()
+        };
+        let transition = WasmFileTransition {
+            transition: WasmTransitionHandle(11),
+            document: WasmDocumentHandle(12),
+            changes: WasmChangeCursorHandle(13),
+        };
+        let schemas = V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
+
+        let drained = drain_file_transition_changes(
+            &mut actor,
+            transition,
+            &schemas,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .unwrap();
+        let rows = drained
+            .changes
+            .changes
+            .iter()
+            .map(|change| match change {
+                WasmEntityChange::Upsert {
+                    entity:
+                        WasmEntity {
+                            snapshot_content: WasmHostBytes::CanonicalJson(json),
+                            ..
+                        },
+                    ..
+                } => json,
+                _ => panic!("test pages contain only canonical upserts"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].shares_batch_with(rows[1]));
+        assert_eq!(rows[0].batch_row_count(), 1);
+        assert_eq!(rows[1].batch_row_count(), 1);
+        assert_eq!(rows[0].validation_counts(), (1, 1));
+        assert_eq!(rows[1].validation_counts(), (1, 1));
+        assert_eq!(rows[0].batch_arena_allocation_count(), 1);
+        assert_eq!(rows[1].batch_arena_allocation_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn change_drain_patches_only_appended_page_ranges_in_source_order() {
+        let upsert = |id: &str| WasmEntityChange::Upsert {
+            entity: WasmEntity {
+                key: key(id),
+                snapshot_content: WasmGuestBytes::Inline(
+                    format!(r#"{{"id":"{id}"}}"#).into_bytes().into(),
+                ),
+            },
+            effect: WasmChangeEffect::Content,
+        };
+        let page = |changes| WasmChangePage {
+            format_version: PACKET_FORMAT_V1,
+            changes: WasmEntityChanges { changes },
+            outputs: None,
+        };
+        let mut actor = FakeActor {
+            change_pages: [
+                page(vec![
+                    upsert("a"),
+                    WasmEntityChange::Delete(key("gone-a")),
+                    upsert("b"),
+                ]),
+                page(vec![WasmEntityChange::Delete(key("gone-b")), upsert("c")]),
+            ]
+            .into(),
+            ..FakeActor::default()
+        };
+        let transition = WasmFileTransition {
+            transition: WasmTransitionHandle(14),
+            document: WasmDocumentHandle(15),
+            changes: WasmChangeCursorHandle(16),
+        };
+        let schemas = V2SchemaAllowlist::new(["csv_row".to_owned()]).unwrap();
+
+        let drained = drain_file_transition_changes(
+            &mut actor,
+            transition,
+            &schemas,
+            WasmTransitionLimits::default(),
+        )
+        .await
+        .expect("interleaved rows should retain exact source order");
+        let changes = &drained.changes.changes;
+        assert_eq!(changes.len(), 5);
+        assert_eq!(
+            changes[0].entity_key().expect("entity key").entity_pk[0],
+            "a"
+        );
+        assert_eq!(
+            changes[1].entity_key().expect("entity key").entity_pk[0],
+            "gone-a"
+        );
+        assert_eq!(
+            changes[2].entity_key().expect("entity key").entity_pk[0],
+            "b"
+        );
+        assert_eq!(
+            changes[3].entity_key().expect("entity key").entity_pk[0],
+            "gone-b"
+        );
+        assert_eq!(
+            changes[4].entity_key().expect("entity key").entity_pk[0],
+            "c"
+        );
+        assert!(matches!(changes[1], WasmEntityChange::Delete(_)));
+        assert!(matches!(changes[3], WasmEntityChange::Delete(_)));
+
+        fn canonical(change: &WasmEntityChange<WasmHostBytes>) -> &WasmCanonicalJson {
+            match change {
+                WasmEntityChange::Upsert {
+                    entity:
+                        WasmEntity {
+                            snapshot_content: WasmHostBytes::CanonicalJson(json),
+                            ..
+                        },
+                    ..
+                } => json,
+                _ => panic!("expected canonical upsert"),
+            }
+        }
+        let first = canonical(&changes[0]);
+        let second = canonical(&changes[2]);
+        let third = canonical(&changes[4]);
+        assert_eq!(first.normalized(), r#"{"id":"a"}"#);
+        assert_eq!(second.normalized(), r#"{"id":"b"}"#);
+        assert_eq!(third.normalized(), r#"{"id":"c"}"#);
+        assert!(first.shares_batch_with(second));
+        assert!(!second.shares_batch_with(third));
     }
 
     #[tokio::test]
@@ -3044,7 +4133,11 @@ mod tests {
         .await
         .expect_err("the engine drain must remain the transition-wide uniqueness authority");
 
-        assert!(error.message.contains("only once"), "{error:?}");
+        assert_eq!(error.code, LixError::CODE_INVALID_PLUGIN);
+        assert_eq!(
+            error.message,
+            "invalid v2 change cursor page: a v2 entity key may occur only once across a change cursor"
+        );
         assert_eq!(actor.discarded_transitions, vec![transition.transition]);
         assert!(!actor.finished);
     }
@@ -3057,10 +4150,10 @@ mod tests {
             changes: WasmEntityChanges {
                 changes: vec![WasmEntityChange::Upsert {
                     entity: WasmEntity {
-                        key: crate::wasm::WasmEntityKey {
-                            schema_key: "not_allowed".to_owned(),
-                            entity_pk: vec!["row".to_owned()],
-                        },
+                        key: crate::wasm::WasmEntityKey::from_owned_parts(
+                            "not_allowed",
+                            vec!["row".to_owned()],
+                        ),
                         snapshot_content: WasmGuestBytes::Output(WasmOutputRange {
                             index: 0,
                             offset: 0,
@@ -3126,10 +4219,12 @@ mod tests {
             change_pages: [WasmChangePage {
                 format_version: PACKET_FORMAT_V1,
                 changes: WasmEntityChanges {
-                    changes: vec![WasmEntityChange::Delete(crate::wasm::WasmEntityKey {
-                        schema_key: "not_allowed".to_owned(),
-                        entity_pk: vec!["row".to_owned()],
-                    })],
+                    changes: vec![WasmEntityChange::Delete(
+                        crate::wasm::WasmEntityKey::from_owned_parts(
+                            "not_allowed",
+                            vec!["row".to_owned()],
+                        ),
+                    )],
                 },
                 outputs: None,
             }]
@@ -3166,7 +4261,7 @@ mod tests {
                     edits: vec![WasmOutputSplice {
                         offset: 1,
                         delete_len: 2,
-                        insert: WasmGuestBytes::Inline(b"XY".to_vec()),
+                        insert: WasmGuestBytes::Inline(b"XY".to_vec().into()),
                     }],
                     outputs: None,
                 },
@@ -3214,7 +4309,7 @@ mod tests {
                 edits: vec![WasmOutputSplice {
                     offset: 2,
                     delete_len: 2,
-                    insert: WasmGuestBytes::Inline(b"XY".to_vec()),
+                    insert: WasmGuestBytes::Inline(b"XY".to_vec().into()),
                 }],
                 outputs: None,
             }]
@@ -3252,7 +4347,7 @@ mod tests {
         let fixed_width = ResolvedOutputSplice {
             offset: 2,
             delete_len: 2,
-            insert: b"XY".to_vec(),
+            insert: Bytes::from_static(b"XY"),
         };
         assert_eq!(
             same_length_output_splice_after_host_validation(
@@ -3269,7 +4364,7 @@ mod tests {
         let length_changing = ResolvedOutputSplice {
             offset: 2,
             delete_len: 1,
-            insert: b"XY".to_vec(),
+            insert: Bytes::from_static(b"XY"),
         };
         assert_eq!(
             same_length_output_splice_after_host_validation(
@@ -3287,12 +4382,12 @@ mod tests {
                     ResolvedOutputSplice {
                         offset: 1,
                         delete_len: 1,
-                        insert: b"X".to_vec(),
+                        insert: Bytes::from_static(b"X"),
                     },
                     ResolvedOutputSplice {
                         offset: 4,
                         delete_len: 1,
-                        insert: b"Y".to_vec(),
+                        insert: Bytes::from_static(b"Y"),
                     },
                 ],
             ),
@@ -3305,7 +4400,7 @@ mod tests {
                 &[ResolvedOutputSplice {
                     offset: 6,
                     delete_len: 1,
-                    insert: b"X".to_vec(),
+                    insert: Bytes::from_static(b"X"),
                 }],
             ),
             None,
@@ -3319,7 +4414,7 @@ mod tests {
                 edits: vec![WasmOutputSplice {
                     offset: 1,
                     delete_len: 4,
-                    insert: WasmGuestBytes::Inline(b"bXYe".to_vec()),
+                    insert: WasmGuestBytes::Inline(b"bXYe".to_vec().into()),
                 }],
                 outputs: None,
             }]

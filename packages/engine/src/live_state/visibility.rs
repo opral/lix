@@ -1,11 +1,9 @@
-use std::cmp::Ordering;
-use std::collections::BTreeMap;
-
 use crate::GLOBAL_BRANCH_ID;
 use crate::LixError;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateReader, LiveStateRowIdentity,
-    LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateReader, LiveStateRowIdentityRef,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,15 +19,47 @@ pub(crate) enum VisibilityBranchScope {
 }
 
 pub(crate) trait StagedLiveStateRows {
+    /// Returns staged candidates in one shared columnar owner.
+    ///
+    /// Production overlays must implement this batch lane directly. The
+    /// row-oriented fallback exists only for compact test fakes.
+    #[cfg(not(test))]
+    fn staged_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError>;
+
+    #[cfg(test)]
+    fn staged_batch(
+        &self,
+        request: &LiveStateScanRequest,
+    ) -> Result<MaterializedLiveStateBatch, LixError> {
+        self.staged_rows(request)
+            .map(MaterializedLiveStateBatch::from_rows)
+    }
+
+    /// Test-only terminal bridge for row-oriented fakes and assertions.
+    #[cfg(test)]
     fn staged_rows(
         &self,
         request: &LiveStateScanRequest,
-    ) -> Result<Vec<MaterializedLiveStateRow>, LixError>;
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        self.staged_batch(request)
+            .map(MaterializedLiveStateBatch::into_rows)
+    }
 
     /// Loads exact staged storage identities in request order.
     ///
     /// This does not apply global fallback: overlay composition needs the
     /// branch and global candidates separately to preserve their precedence.
+    #[cfg(not(test))]
+    fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+
+    /// Test-only bridge for small row-oriented staged-state fakes.
+    #[cfg(test)]
     fn load_exact_rows(
         &self,
         request: &LiveStateExactBatchRequest,
@@ -44,6 +74,15 @@ pub(crate) trait StagedLiveStateRows {
                     .next())
             })
             .collect()
+    }
+
+    #[cfg(test)]
+    fn load_exact_batch(
+        &self,
+        request: &LiveStateExactBatchRequest,
+    ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+        self.load_exact_rows(request)
+            .map(MaterializedLiveStateExactBatch::from_rows)
     }
 }
 
@@ -75,21 +114,38 @@ pub(crate) fn expanded_branch_ids(branch_ids: &[String]) -> Vec<String> {
     expanded
 }
 
+/// Explicit terminal bridge for legacy scalar/test consumers.
+#[allow(dead_code)]
 pub(crate) fn resolve_visible_rows(
     base_rows: Vec<MaterializedLiveStateRow>,
     staged_rows: Vec<MaterializedLiveStateRow>,
     request: &VisibilityRequest,
 ) -> Vec<MaterializedLiveStateRow> {
+    resolve_visible_batch(
+        MaterializedLiveStateBatch::from_rows(base_rows),
+        MaterializedLiveStateBatch::from_rows(staged_rows),
+        request,
+    )
+    .into_rows()
+}
+
+pub(crate) fn resolve_visible_batch(
+    base_rows: MaterializedLiveStateBatch,
+    staged_rows: MaterializedLiveStateBatch,
+    request: &VisibilityRequest,
+) -> MaterializedLiveStateBatch {
     let requested_branch_ids = requested_branch_ids(&request.branch_scope);
-    resolve_live_state_rows(
-        base_rows,
-        staged_rows,
+    resolve_live_state_batch(
+        &base_rows,
+        &staged_rows,
         &requested_branch_ids,
         request.include_tombstones,
         request.limit,
     )
 }
 
+/// Explicit terminal bridge for legacy scalar/test consumers.
+#[allow(dead_code)]
 pub(crate) async fn overlay_scan_rows<S>(
     base: &dyn LiveStateReader,
     staged: &S,
@@ -98,13 +154,24 @@ pub(crate) async fn overlay_scan_rows<S>(
 where
     S: StagedLiveStateRows + ?Sized,
 {
+    Ok(overlay_scan_batch(base, staged, request).await?.into_rows())
+}
+
+pub(crate) async fn overlay_scan_batch<S>(
+    base: &dyn LiveStateReader,
+    staged: &S,
+    request: &LiveStateScanRequest,
+) -> Result<MaterializedLiveStateBatch, LixError>
+where
+    S: StagedLiveStateRows + ?Sized,
+{
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
     candidate_request.filter.include_tombstones = true;
     candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
-    let staged_rows = staged.staged_rows(&candidate_request)?;
-    let rows = base.scan_rows(&candidate_request).await?;
-    Ok(resolve_visible_rows(
+    let staged_rows = staged.staged_batch(&candidate_request)?;
+    let rows = base.scan_batch(&candidate_request).await?;
+    Ok(resolve_visible_batch(
         rows,
         staged_rows,
         &VisibilityRequest {
@@ -117,16 +184,11 @@ where
     ))
 }
 
-/// Overlays staged tracked rows on the immutable tracked head.
-///
-/// This is deliberately separate from [`overlay_scan_rows`]: tracked schema
-/// planning and validation must ignore unrelated untracked transaction rows
-/// and remain based on an independently valid commit.
-pub(crate) async fn overlay_scan_tracked_rows<S>(
+pub(crate) async fn overlay_scan_tracked_batch<S>(
     base: &dyn LiveStateReader,
     staged: &S,
     request: &LiveStateScanRequest,
-) -> Result<Vec<MaterializedLiveStateRow>, LixError>
+) -> Result<MaterializedLiveStateBatch, LixError>
 where
     S: StagedLiveStateRows + ?Sized,
 {
@@ -135,9 +197,9 @@ where
     candidate_request.filter.include_tombstones = true;
     candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
     candidate_request.filter.untracked = Some(false);
-    let staged_rows = staged.staged_rows(&candidate_request)?;
-    let rows = base.scan_tracked_rows(&candidate_request).await?;
-    Ok(resolve_visible_rows(
+    let staged_rows = staged.staged_batch(&candidate_request)?;
+    let rows = base.scan_tracked_batch(&candidate_request).await?;
+    Ok(resolve_visible_batch(
         rows,
         staged_rows,
         &VisibilityRequest {
@@ -152,6 +214,8 @@ where
 
 /// Overlays staged exact identities without converting correlated row keys to
 /// independent scan filters.
+/// Explicit terminal bridge for legacy scalar/test consumers.
+#[allow(dead_code)]
 pub(crate) async fn overlay_load_exact_rows<S>(
     base: &dyn LiveStateReader,
     staged: &S,
@@ -160,13 +224,26 @@ pub(crate) async fn overlay_load_exact_rows<S>(
 where
     S: StagedLiveStateRows + ?Sized,
 {
+    Ok(overlay_load_exact_batch(base, staged, request)
+        .await?
+        .into_rows())
+}
+
+pub(crate) async fn overlay_load_exact_batch<S>(
+    base: &dyn LiveStateReader,
+    staged: &S,
+    request: &LiveStateExactBatchRequest,
+) -> Result<MaterializedLiveStateExactBatch, LixError>
+where
+    S: StagedLiveStateRows + ?Sized,
+{
     if request.rows.is_empty() {
-        return Ok(Vec::new());
+        return Ok(MaterializedLiveStateExactBatch::default());
     }
 
     let mut base_request = request.clone();
     base_request.include_tombstones = true;
-    let base_rows = base.load_exact_rows(&base_request).await?;
+    let base_rows = base.load_exact_batch(&base_request).await?;
     if base_rows.len() != request.rows.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -203,7 +280,7 @@ where
         untracked: request.untracked,
         include_tombstones: true,
     };
-    let staged_rows = staged.load_exact_rows(&staged_request)?;
+    let staged_rows = staged.load_exact_batch(&staged_request)?;
     if staged_rows.len() != staged_request.rows.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -215,52 +292,68 @@ where
         ));
     }
 
-    Ok(request
-        .rows
-        .iter()
-        .zip(base_rows)
-        .zip(staged_indices)
-        .map(|((requested, base), (global_index, branch_index))| {
-            let mut winner = base.map(|row| {
-                let tier = if row.global {
-                    OverlayTier::BaseGlobal
-                } else {
-                    OverlayTier::BaseBranch
-                };
-                (tier, row)
-            });
-            if let Some(mut row) = staged_rows[global_index].clone() {
-                if requested.branch_id != GLOBAL_BRANCH_ID {
-                    row.branch_id = requested.branch_id.clone().into();
-                }
-                row.global = true;
-                insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedGlobal, row);
-            }
-            if let Some(index) = branch_index
-                && let Some(row) = staged_rows[index].clone()
-            {
-                insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedBranch, row);
-            }
-            let row = winner.map(|(_, row)| row)?;
-            if row.deleted && !request.include_tombstones {
-                None
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(request.rows.len());
+    let mut slots = Vec::with_capacity(request.rows.len());
+    for (slot, (requested, (global_index, branch_index))) in
+        request.rows.iter().zip(staged_indices).enumerate()
+    {
+        let mut winner = base_rows.row(slot).map(|row| {
+            let tier = if row.global() {
+                OverlayTier::BaseGlobal
             } else {
-                Some(row)
-            }
-        })
-        .collect())
+                OverlayTier::BaseBranch
+            };
+            (tier, row, None)
+        });
+        if let Some(row) = staged_rows.row(global_index) {
+            let branch_override =
+                (requested.branch_id != GLOBAL_BRANCH_ID).then_some(requested.branch_id.as_str());
+            insert_exact_overlay_candidate(
+                &mut winner,
+                OverlayTier::StagedGlobal,
+                row,
+                branch_override,
+            );
+        }
+        if let Some(index) = branch_index
+            && let Some(row) = staged_rows.row(index)
+        {
+            insert_exact_overlay_candidate(&mut winner, OverlayTier::StagedBranch, row, None);
+        }
+        let Some((_, row, branch_override)) = winner else {
+            slots.push(None);
+            continue;
+        };
+        if row.deleted() && !request.include_tombstones {
+            slots.push(None);
+        } else {
+            let ordinal = u32::try_from(builder.push_ref(row, branch_override)).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "exact live-state overlay exceeds u32 rows",
+                )
+            })?;
+            slots.push(Some(ordinal));
+        }
+    }
+    MaterializedLiveStateExactBatch::new(builder.finish(), slots)
 }
 
-fn insert_exact_overlay_candidate(
-    winner: &mut Option<(OverlayTier, MaterializedLiveStateRow)>,
+fn insert_exact_overlay_candidate<'a>(
+    winner: &mut Option<(
+        OverlayTier,
+        MaterializedLiveStateRowRef<'a>,
+        Option<&'a str>,
+    )>,
     tier: OverlayTier,
-    row: MaterializedLiveStateRow,
+    row: MaterializedLiveStateRowRef<'a>,
+    branch_override: Option<&'a str>,
 ) {
     if winner
         .as_ref()
-        .is_none_or(|(existing_tier, _)| *existing_tier <= tier)
+        .is_none_or(|(existing_tier, _, _)| *existing_tier <= tier)
     {
-        *winner = Some((tier, row));
+        *winner = Some((tier, row, branch_override));
     }
 }
 
@@ -272,18 +365,23 @@ fn insert_exact_overlay_candidate(
 /// visibility is resolved. This projection is a read concern; constraint
 /// validation remains exact storage-scope local unless a validator explicitly
 /// opts into overlay semantics.
+#[cfg(test)]
 fn resolve_scan_rows(
     rows: Vec<MaterializedLiveStateRow>,
     requested_branch_ids: &[String],
     include_tombstones: bool,
 ) -> Vec<MaterializedLiveStateRow> {
-    let mut rows = project_global_rows_into_requested_branches(rows, requested_branch_ids);
-    if !include_tombstones {
-        rows.retain(|row| !row.deleted);
-    }
-    rows
+    resolve_live_state_batch(
+        &MaterializedLiveStateBatch::from_rows(rows),
+        &MaterializedLiveStateBatch::default(),
+        requested_branch_ids,
+        include_tombstones,
+        None,
+    )
+    .into_rows()
 }
 
+#[cfg(test)]
 fn resolve_live_state_rows(
     base_rows: Vec<MaterializedLiveStateRow>,
     staged_rows: Vec<MaterializedLiveStateRow>,
@@ -291,11 +389,25 @@ fn resolve_live_state_rows(
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<MaterializedLiveStateRow> {
-    if can_resolve_uncontested_single_branch_rows(&base_rows, &staged_rows, requested_branch_ids) {
-        return resolve_uncontested_single_branch_rows(base_rows, include_tombstones, limit);
-    }
+    resolve_live_state_batch(
+        &MaterializedLiveStateBatch::from_rows(base_rows),
+        &MaterializedLiveStateBatch::from_rows(staged_rows),
+        requested_branch_ids,
+        include_tombstones,
+        limit,
+    )
+    .into_rows()
+}
 
-    resolve_live_state_rows_via_overlay(
+#[cfg(test)]
+fn resolve_live_state_rows_via_overlay(
+    base_rows: Vec<MaterializedLiveStateRow>,
+    staged_rows: Vec<MaterializedLiveStateRow>,
+    requested_branch_ids: &[String],
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> Vec<MaterializedLiveStateRow> {
+    resolve_live_state_rows(
         base_rows,
         staged_rows,
         requested_branch_ids,
@@ -304,48 +416,158 @@ fn resolve_live_state_rows(
     )
 }
 
-fn resolve_live_state_rows_via_overlay(
-    base_rows: Vec<MaterializedLiveStateRow>,
-    staged_rows: Vec<MaterializedLiveStateRow>,
-    requested_branch_ids: &[String],
-    include_tombstones: bool,
-    limit: Option<usize>,
-) -> Vec<MaterializedLiveStateRow> {
-    let base_rows = resolve_scan_rows(base_rows, requested_branch_ids, true);
-    let staged_rows = resolve_scan_rows(staged_rows, requested_branch_ids, true);
-    let mut rows_by_identity =
-        BTreeMap::<LiveStateRowIdentity, (OverlayTier, MaterializedLiveStateRow)>::new();
-
-    for row in base_rows {
-        let tier = if row.global {
-            OverlayTier::BaseGlobal
-        } else {
-            OverlayTier::BaseBranch
-        };
-        insert_overlay_row(&mut rows_by_identity, tier, row);
-    }
-    for row in staged_rows {
-        let tier = if row.global {
-            OverlayTier::StagedGlobal
-        } else {
-            OverlayTier::StagedBranch
-        };
-        insert_overlay_row(&mut rows_by_identity, tier, row);
-    }
-
-    let mut rows = rows_by_identity
-        .into_values()
-        .map(|(_, row)| row)
-        .collect::<Vec<_>>();
-    if !include_tombstones {
-        rows.retain(|row| !row.deleted);
-    }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    rows
+#[derive(Clone, Copy)]
+struct OverlayCandidate<'a> {
+    row: MaterializedLiveStateRowRef<'a>,
+    branch_id: &'a str,
+    tier: OverlayTier,
+    sequence: usize,
 }
 
+impl<'a> OverlayCandidate<'a> {
+    fn identity(self) -> LiveStateRowIdentityRef<'a> {
+        LiveStateRowIdentityRef {
+            branch_id: self.branch_id,
+            schema_key: self.row.schema_key(),
+            entity_pk: self.row.entity_pk(),
+            file_id: self.row.file_id(),
+        }
+    }
+}
+
+/// Resolves visibility by sorting borrowed row ordinals.
+///
+/// The temporary vector carries one row view, effective branch view, and tier
+/// per candidate. No identity field is cloned into a map. The winning rows are
+/// then lowered directly into one dictionary-backed result batch.
+fn resolve_live_state_batch<'a>(
+    base_rows: &'a MaterializedLiveStateBatch,
+    staged_rows: &'a MaterializedLiveStateBatch,
+    requested_branch_ids: &'a [String],
+    include_tombstones: bool,
+    limit: Option<usize>,
+) -> MaterializedLiveStateBatch {
+    let capacity = projected_candidate_count(base_rows, requested_branch_ids)
+        .checked_add(projected_candidate_count(staged_rows, requested_branch_ids))
+        .expect("live-state candidate count overflow");
+    let mut candidates = Vec::with_capacity(capacity);
+    append_projected_candidates(
+        &mut candidates,
+        base_rows,
+        requested_branch_ids,
+        OverlayTier::BaseGlobal,
+        OverlayTier::BaseBranch,
+    );
+    append_projected_candidates(
+        &mut candidates,
+        staged_rows,
+        requested_branch_ids,
+        OverlayTier::StagedGlobal,
+        OverlayTier::StagedBranch,
+    );
+    debug_assert_eq!(candidates.len(), capacity);
+
+    candidates.sort_unstable_by(|left, right| {
+        left.identity()
+            .cmp(&right.identity())
+            .then_with(|| left.sequence.cmp(&right.sequence))
+    });
+
+    let output_capacity = limit.map_or(capacity, |limit| limit.min(capacity));
+    let mut output = MaterializedLiveStateBatchBuilder::with_capacity(output_capacity);
+    let mut offset = 0;
+    while offset < candidates.len() && output.len() < output_capacity {
+        let mut end = offset + 1;
+        let mut winner = candidates[offset];
+        while end < candidates.len() && candidates[offset].identity() == candidates[end].identity()
+        {
+            let candidate = candidates[end];
+            if winner.tier <= candidate.tier {
+                winner = candidate;
+            }
+            end += 1;
+        }
+        if include_tombstones || !winner.row.deleted() {
+            let branch_override =
+                (winner.branch_id != winner.row.branch_id()).then_some(winner.branch_id);
+            output.push_ref(winner.row, branch_override);
+        }
+        offset = end;
+    }
+    output.finish()
+}
+
+fn projected_candidate_count(
+    rows: &MaterializedLiveStateBatch,
+    requested_branch_ids: &[String],
+) -> usize {
+    if requested_branch_ids.is_empty() {
+        return rows.len();
+    }
+    requested_branch_ids
+        .iter()
+        .map(|requested_branch_id| {
+            rows.iter()
+                .filter(|row| {
+                    row.branch_id() == GLOBAL_BRANCH_ID
+                        || row.branch_id() == requested_branch_id.as_str()
+                })
+                .count()
+        })
+        .sum()
+}
+
+fn append_projected_candidates<'a>(
+    candidates: &mut Vec<OverlayCandidate<'a>>,
+    rows: &'a MaterializedLiveStateBatch,
+    requested_branch_ids: &'a [String],
+    global_tier: OverlayTier,
+    branch_tier: OverlayTier,
+) {
+    if requested_branch_ids.is_empty() {
+        for row in rows.iter() {
+            let sequence = candidates.len();
+            candidates.push(OverlayCandidate {
+                row,
+                branch_id: row.branch_id(),
+                tier: if row.global() {
+                    global_tier
+                } else {
+                    branch_tier
+                },
+                sequence,
+            });
+        }
+        return;
+    }
+    for requested_branch_id in requested_branch_ids {
+        for row in rows.iter() {
+            if row.branch_id() == GLOBAL_BRANCH_ID {
+                let sequence = candidates.len();
+                candidates.push(OverlayCandidate {
+                    row,
+                    branch_id: requested_branch_id,
+                    tier: global_tier,
+                    sequence,
+                });
+            } else if row.branch_id() == requested_branch_id {
+                let sequence = candidates.len();
+                candidates.push(OverlayCandidate {
+                    row,
+                    branch_id: row.branch_id(),
+                    tier: if row.global() {
+                        global_tier
+                    } else {
+                        branch_tier
+                    },
+                    sequence,
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 fn can_resolve_uncontested_single_branch_rows(
     base_rows: &[MaterializedLiveStateRow],
     staged_rows: &[MaterializedLiveStateRow],
@@ -368,94 +590,25 @@ fn can_resolve_uncontested_single_branch_rows(
 /// general path's identity order and "last input row wins" behavior without
 /// cloning row payloads. Reversing before the stable sort makes the last input
 /// candidate the first equal-key candidate retained by `dedup_by`.
+#[cfg(test)]
 fn resolve_uncontested_single_branch_rows(
-    mut rows: Vec<MaterializedLiveStateRow>,
+    rows: Vec<MaterializedLiveStateRow>,
     include_tombstones: bool,
     limit: Option<usize>,
 ) -> Vec<MaterializedLiveStateRow> {
-    rows.reverse();
-    rows.sort_by(compare_row_identity);
-    rows.dedup_by(|later, earlier| same_row_identity(later, earlier));
-    if !include_tombstones {
-        rows.retain(|row| !row.deleted);
-    }
-    if let Some(limit) = limit {
-        rows.truncate(limit);
-    }
-    rows
-}
-
-fn compare_row_identity(
-    left: &MaterializedLiveStateRow,
-    right: &MaterializedLiveStateRow,
-) -> Ordering {
-    left.branch_id
-        .cmp(&right.branch_id)
-        .then_with(|| left.schema_key.cmp(&right.schema_key))
-        .then_with(|| left.entity_pk.cmp(&right.entity_pk))
-        .then_with(|| left.file_id.cmp(&right.file_id))
-}
-
-fn same_row_identity(left: &MaterializedLiveStateRow, right: &MaterializedLiveStateRow) -> bool {
-    compare_row_identity(left, right) == Ordering::Equal
+    resolve_live_state_batch(
+        &MaterializedLiveStateBatch::from_rows(rows),
+        &MaterializedLiveStateBatch::default(),
+        &[],
+        include_tombstones,
+        limit,
+    )
+    .into_rows()
 }
 
 fn requested_branch_ids(branch_scope: &VisibilityBranchScope) -> Vec<String> {
     match branch_scope {
         VisibilityBranchScope::BranchIds { branch_ids } => branch_ids.clone(),
-    }
-}
-
-fn project_global_rows_into_requested_branches(
-    rows: Vec<MaterializedLiveStateRow>,
-    requested_branch_ids: &[String],
-) -> Vec<MaterializedLiveStateRow> {
-    if requested_branch_ids.is_empty() {
-        return dedupe_rows(rows);
-    }
-
-    let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
-    for requested_branch_id in requested_branch_ids {
-        for row in &rows {
-            if row.branch_id.as_ref() == GLOBAL_BRANCH_ID {
-                let mut projected = row.clone();
-                projected.branch_id = requested_branch_id.clone().into();
-                rows_by_identity.insert(LiveStateRowIdentity::from_row(&projected), projected);
-            }
-        }
-        let mut branch_rows_by_identity =
-            BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
-        for row in rows
-            .iter()
-            .filter(|row| row.branch_id.as_ref() == requested_branch_id)
-        {
-            branch_rows_by_identity.insert(LiveStateRowIdentity::from_row(row), row.clone());
-        }
-        rows_by_identity.extend(branch_rows_by_identity);
-    }
-
-    rows_by_identity.into_values().collect()
-}
-
-fn dedupe_rows(rows: Vec<MaterializedLiveStateRow>) -> Vec<MaterializedLiveStateRow> {
-    let mut rows_by_identity = BTreeMap::<LiveStateRowIdentity, MaterializedLiveStateRow>::new();
-    for row in rows {
-        rows_by_identity.insert(LiveStateRowIdentity::from_row(&row), row);
-    }
-    rows_by_identity.into_values().collect()
-}
-
-fn insert_overlay_row(
-    rows_by_identity: &mut BTreeMap<LiveStateRowIdentity, (OverlayTier, MaterializedLiveStateRow)>,
-    tier: OverlayTier,
-    row: MaterializedLiveStateRow,
-) {
-    let identity = LiveStateRowIdentity::from_row(&row);
-    match rows_by_identity.get(&identity) {
-        Some((existing_tier, _)) if *existing_tier > tier => {}
-        _ => {
-            rows_by_identity.insert(identity, (tier, row));
-        }
     }
 }
 
@@ -485,6 +638,50 @@ mod tests {
         assert_eq!(
             expanded_branch_ids(&["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()]),
             vec!["ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()]
+        );
+    }
+
+    #[test]
+    fn ten_thousand_row_visibility_keeps_identity_metadata_dictionary_encoded() {
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let rows = (0..10_000)
+            .map(|index| MaterializedLiveStateRow {
+                entity_pk: EntityPk::uuid_from_canonical(&format!(
+                    "01920000-0000-7000-8000-{index:012x}"
+                ))
+                .expect("canonical test UUID"),
+                schema_key: "shared_schema".to_owned(),
+                file_id: Some("shared_file".to_owned()),
+                snapshot_content: Some(crate::common::SharedStr::from_static("{}")),
+                metadata: None,
+                deleted: false,
+                created_at: test_timestamp(),
+                updated_at: test_timestamp(),
+                global: false,
+                change_id: None,
+                commit_id: None,
+                untracked: true,
+                branch_id: branch_id.into(),
+            })
+            .collect();
+        let batch = resolve_visible_batch(
+            MaterializedLiveStateBatch::from_rows(rows),
+            MaterializedLiveStateBatch::default(),
+            &VisibilityRequest {
+                branch_scope: VisibilityBranchScope::BranchIds {
+                    branch_ids: vec![branch_id.to_owned()],
+                },
+                include_tombstones: false,
+                limit: None,
+            },
+        );
+
+        assert_eq!(batch.len(), 10_000);
+        assert_eq!(batch.dictionary_entry_count(), 3);
+        assert_eq!(batch.row(0).schema_key(), batch.row(9_999).schema_key());
+        assert_eq!(
+            batch.row(0).schema_key().as_ptr(),
+            batch.row(9_999).schema_key().as_ptr()
         );
     }
 
@@ -1255,7 +1452,7 @@ mod tests {
             entity_pk: EntityPk::single(entity_pk),
             schema_key: "schema".to_string(),
             file_id: None,
-            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}").into()),
             metadata: None,
             deleted: false,
             created_at: test_timestamp(),

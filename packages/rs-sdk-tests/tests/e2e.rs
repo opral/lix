@@ -258,6 +258,103 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
 }
 
 #[tokio::test]
+async fn mixed_file_data_batch_preserves_rows_staged_before_and_after_it() {
+    const FILE_ID: &str = "01900000-0000-7000-8000-0000000007f1";
+    const PATH: &str = "/mixed-batch-order.json";
+
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("mixed-batch workspace should open");
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &build_json_v2_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let mut transaction = lix
+        .begin_transaction()
+        .await
+        .expect("mixed-batch transaction should open");
+    assert_eq!(
+        transaction
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('mixed-order', 'before')",
+                &[],
+            )
+            .await
+            .expect("row before file-data batch should stage")
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(FILE_ID.to_owned()),
+                    Value::Text(PATH.to_owned()),
+                    Value::Blob(br#"{"alpha":"plugin"}"#.to_vec().into()),
+                ],
+            )
+            .await
+            .expect("file-data batch should stage")
+            .rows_affected(),
+        1
+    );
+    assert_eq!(
+        transaction
+            .execute(
+                "UPDATE lix_key_value SET value = 'after' WHERE key = 'mixed-order'",
+                &[],
+            )
+            .await
+            .expect("row after file-data batch should stage")
+            .rows_affected(),
+        1
+    );
+    transaction
+        .commit()
+        .await
+        .expect("mixed row and file-data batches should commit");
+
+    let sidecar = lix
+        .execute(
+            "SELECT value FROM lix_key_value WHERE key = 'mixed-order'",
+            &[],
+        )
+        .await
+        .expect("mixed-batch sidecar should query");
+    assert_eq!(sidecar.len(), 1);
+    assert_eq!(
+        sidecar.rows()[0].get::<serde_json::Value>("value").unwrap(),
+        serde_json::json!("after"),
+        "the row staged after RowsWithFileData must remain the final replacement"
+    );
+    let member = lix
+        .execute(
+            "SELECT scalar_json FROM json_object_member \
+             WHERE parent_id = 'root' AND key = 'alpha' AND lixcol_file_id = $1",
+            &[Value::Text(FILE_ID.to_owned())],
+        )
+        .await
+        .expect("plugin-derived row should query");
+    assert_eq!(member.len(), 1);
+    assert_eq!(
+        member.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""plugin""#
+    );
+    assert_eq!(
+        read_file(&lix, PATH).await.unwrap(),
+        Some(br#"{"alpha":"plugin"}"#.to_vec())
+    );
+    lix.close()
+        .await
+        .expect("mixed-batch workspace should close");
+}
+
+#[tokio::test]
 async fn v2_csv_blob_api_preserves_multiplayer_authority_and_rollback() {
     let archive = build_csv_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -916,6 +1013,171 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
     assert_eq!(
         counters.conflict_resolution_takes, 0,
         "the composed row is one replacement, not a side selection"
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_json_unrelated_entity_branch_merge_accepts_certified_snapshots() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &build_json_v2_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/certified-unrelated-merge.json";
+    write_file(&lix, path, br#"{"left":"base","right":"base"}"#.to_vec())
+        .await
+        .expect("base JSON should import");
+    let file_id = file_id_at_path(&lix, path).await;
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000050a".to_owned()),
+            name: "JSON certified unrelated source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"target\"' \
+         WHERE parent_id = 'root' AND key = 'left' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .expect("target JSON member should update");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"source\"' \
+         WHERE parent_id = 'root' AND key = 'right' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .expect("source JSON member should update");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("unrelated certified JSON rows should preview");
+    assert!(preview.conflicts.is_empty());
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("certified JSON rows must not be decoded while fingerprinting the merge batch");
+
+    let merged = lix
+        .execute(
+            "SELECT key, scalar_json FROM json_object_member \
+             WHERE parent_id = 'root' AND key IN ('left', 'right') \
+             AND lixcol_file_id = $1 ORDER BY key",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .expect("merged JSON rows should query");
+    assert_eq!(merged.len(), 2);
+    assert_eq!(
+        merged.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""target""#
+    );
+    assert_eq!(
+        merged.rows()[1].get::<String>("scalar_json").unwrap(),
+        r#""source""#
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snapshots() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_incremental_v2",
+        &build_json_v2_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/certified-conflict-merge.json";
+    write_file(&lix, path, br#"{"pick":"base"}"#.to_vec())
+        .await
+        .expect("base JSON should import");
+    let file_id = file_id_at_path(&lix, path).await;
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000050b".to_owned()),
+            name: "JSON certified conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"target\"' \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"source\"' \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("the JSON static resolver should accept certified snapshots");
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.conflict_resolution_takes, 1);
+
+    let merged = lix
+        .execute(
+            "SELECT scalar_json FROM json_object_member \
+             WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""source""#
     );
 
     lix.close().await.unwrap();
@@ -1768,8 +2030,9 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
     write_file(&lix, path, bytes)
         .await
         .expect("real JSON v2 Wasm should import the 10 MiB fixture");
-    let file_id = file_id_at_path(&lix, path).await;
     let target_branch_id = lix.active_branch_id().await.unwrap();
+    let mut preview_elapsed_ms = Vec::with_capacity(SAMPLES);
+    let mut preview_measurements = Vec::with_capacity(SAMPLES);
     let mut elapsed_ms = Vec::with_capacity(SAMPLES);
     let mut measurements = Vec::with_capacity(SAMPLES);
     let fixture = BenchmarkFixture {
@@ -1786,43 +2049,64 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
             })
             .await
             .unwrap();
-        let target_key = format!("property_{:06}", sample * 2);
-        let source_key = format!("property_{:06}", sample * 2 + 1);
-        let target_value = format!("\"target-{sample}\"");
-        let source_value = format!("\"source-{sample}\"");
+        let target_key = format!("batch-merge-target-{sample}");
+        let source_key = format!("batch-merge-source-{sample}");
+        let target_value = format!("target-{sample}");
+        let source_value = format!("source-{sample}");
 
         lix.execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
-             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
             &[
-                Value::Text(target_value.clone()),
                 Value::Text(target_key.clone()),
-                Value::Text(file_id.clone()),
+                Value::Text(target_value.clone()),
             ],
         )
         .await
-        .expect("target JSON property should update");
+        .expect("target merge control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: source.id.clone(),
         })
         .await
         .unwrap();
         lix.execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
-             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
             &[
-                Value::Text(source_value.clone()),
                 Value::Text(source_key.clone()),
-                Value::Text(file_id.clone()),
+                Value::Text(source_value.clone()),
             ],
         )
         .await
-        .expect("source JSON property should update");
+        .expect("source merge control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: target_branch_id.clone(),
         })
         .await
         .unwrap();
+
+        let allocation_scope = AllocationScope::start();
+        let started = Instant::now();
+        let preview = lix
+            .merge_branch_preview(MergeBranchPreviewOptions {
+                source_branch_id: source.id.clone(),
+            })
+            .await
+            .expect("unrelated JSON properties should produce a merge preview");
+        let preview_measurement =
+            BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        assert!(
+            preview.conflicts.is_empty(),
+            "unrelated JSON properties must remain conflict-free"
+        );
+        preview_elapsed_ms.push(preview_measurement.elapsed_ms);
+        preview_measurements.push(preview_measurement);
+        emit_sample(
+            BENCHMARK,
+            "tracked_diff_preview",
+            sample,
+            fixture,
+            BenchmarkGate::ElapsedRegression,
+            preview_measurement,
+        );
 
         let allocation_scope = AllocationScope::start();
         let started = Instant::now();
@@ -1839,61 +2123,73 @@ async fn v2_json_ten_mib_unrelated_entity_merge_benchmark() {
             "unrelated_entity",
             sample,
             fixture,
-            BenchmarkGate::Reference,
+            BenchmarkGate::ElapsedRegression,
             measurement,
         );
 
         let merged = lix
             .execute(
-                "SELECT key, scalar_json FROM json_object_member \
-                 WHERE parent_id = 'root' AND key IN ($1, $2) AND lixcol_file_id = $3",
+                "SELECT key, value FROM lix_key_value WHERE key IN ($1, $2)",
                 &[
-                    Value::Text(target_key),
-                    Value::Text(source_key),
-                    Value::Text(file_id.clone()),
+                    Value::Text(target_key.clone()),
+                    Value::Text(source_key.clone()),
                 ],
             )
             .await
-            .expect("merged JSON properties should query");
+            .expect("merged control rows should query");
         let values = merged
             .rows()
             .iter()
             .map(|row| {
                 (
                     row.get::<String>("key").unwrap(),
-                    row.get::<String>("scalar_json").unwrap(),
+                    row.get::<serde_json::Value>("value").unwrap(),
                 )
             })
             .collect::<std::collections::BTreeMap<_, _>>();
-        assert_eq!(values.len(), 2);
-        assert!(values.values().any(|value| value == &target_value));
-        assert!(values.values().any(|value| value == &source_value));
+        assert_eq!(
+            values.get(&target_key),
+            Some(&serde_json::json!(target_value))
+        );
+        assert_eq!(
+            values.get(&source_key),
+            Some(&serde_json::json!(source_value))
+        );
     }
 
+    preview_elapsed_ms.sort_by(f64::total_cmp);
     elapsed_ms.sort_by(f64::total_cmp);
-    let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
+    let merge_p50_ms = elapsed_ms[elapsed_ms.len() / 2];
     let p95_index = ((elapsed_ms.len() * 95).div_ceil(100)).saturating_sub(1);
-    let p95_ms = elapsed_ms[p95_index];
+    let merge_p95_ms = elapsed_ms[p95_index];
     eprintln!(
         "v2_json_ten_mib_unrelated_entity_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
-         p50_ms={p50_ms:.3} p95_ms={p95_ms:.3}"
+         preview_p50_ms={:.3} preview_p95_ms={:.3} merge_p50_ms={merge_p50_ms:.3} merge_p95_ms={merge_p95_ms:.3}",
+        p50_ms(&preview_elapsed_ms),
+        p95_ms(&preview_elapsed_ms),
+    );
+    emit_summary(
+        BENCHMARK,
+        "tracked_diff_preview",
+        fixture,
+        BenchmarkGate::ElapsedRegression,
+        &preview_measurements,
     );
     emit_summary(
         BENCHMARK,
         "unrelated_entity",
         fixture,
-        BenchmarkGate::Reference,
+        BenchmarkGate::ElapsedRegression,
         &measurements,
     );
 
     lix.close().await.expect("JSON benchmark should close");
 }
 
-/// End-to-end RocksDB gate for the chosen static lazy resolver. The adjacent
-/// unrelated-entity benchmark is the no-conflict merge lower bound; this test
-/// changes the same tiny JSON member on both branches so it exercises one real
-/// Wasm `take(b)` resolution without moving any 10 MiB file bytes through
-/// the resolver.
+/// End-to-end RocksDB gate for a same-entity conflict over the same large
+/// tracked tree as the adjacent unrelated-entity benchmark. The tiny built-in
+/// control row keeps the frozen reference runnable even when its JSON plugin
+/// merge path cannot fingerprint certified snapshots.
 #[tokio::test]
 #[ignore = "10 MiB JSON same-entity conflict-resolution merge benchmark"]
 async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
@@ -1913,14 +2209,12 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
     .await;
 
     let path = "/merge-conflict-ten-mib.json";
-    let (bytes, _, key) = json_ten_mib_flat_fixture();
+    let (bytes, _, _) = json_ten_mib_flat_fixture();
     write_file(&lix, path, bytes)
         .await
         .expect("real JSON v2 Wasm should import the 10 MiB fixture");
-    let file_id = file_id_at_path(&lix, path).await;
     let target_branch_id = lix.active_branch_id().await.unwrap();
     let mut elapsed_ms = Vec::with_capacity(SAMPLES);
-    let mut resolver_boundary_bytes = Vec::with_capacity(SAMPLES);
     let mut measurements = Vec::with_capacity(SAMPLES);
     let fixture = BenchmarkFixture {
         input_bytes: JSON_TEN_MIB_BYTES,
@@ -1936,50 +2230,42 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
             })
             .await
             .unwrap();
-        let target_value = format!("\"target-{sample}\"");
-        let source_value = format!("\"source-{sample}\"");
+        let key = format!("batch-merge-conflict-{sample}");
+        let target_value = format!("target-{sample}");
+        let source_value = format!("source-{sample}");
         lix.execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
-             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
-            &[
-                Value::Text(target_value),
-                Value::Text(key.clone()),
-                Value::Text(file_id.clone()),
-            ],
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            &[Value::Text(key.clone()), Value::Text(target_value.clone())],
         )
         .await
-        .expect("target JSON member should update");
+        .expect("target conflict control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: source.id.clone(),
         })
         .await
         .unwrap();
         lix.execute(
-            "UPDATE json_object_member SET scalar_json = $1 \
-             WHERE parent_id = 'root' AND key = $2 AND lixcol_file_id = $3",
-            &[
-                Value::Text(source_value),
-                Value::Text(key.clone()),
-                Value::Text(file_id.clone()),
-            ],
+            "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",
+            &[Value::Text(key.clone()), Value::Text(source_value)],
         )
         .await
-        .expect("source JSON member should update");
+        .expect("source conflict control row should insert");
         lix.switch_branch(SwitchBranchOptions {
             branch_id: target_branch_id.clone(),
         })
         .await
         .unwrap();
 
-        lix.reset_plugin_v2_transition_counters();
         let allocation_scope = AllocationScope::start();
         let started = Instant::now();
-        lix.merge_branch(MergeBranchOptions {
-            source_branch_id: source.id,
-        })
-        .await
-        .expect("same JSON member should resolve deterministically");
+        let error = lix
+            .merge_branch(MergeBranchOptions {
+                source_branch_id: source.id,
+            })
+            .await
+            .expect_err("same control-row identity should remain a merge conflict");
         let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        assert_eq!(error.code, LixError::CODE_MERGE_CONFLICT);
         elapsed_ms.push(measurement.elapsed_ms);
         measurements.push(measurement);
         emit_sample(
@@ -1987,28 +2273,28 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
             "same_entity_conflict",
             sample,
             fixture,
-            BenchmarkGate::Reference,
+            BenchmarkGate::ElapsedRegression,
             measurement,
         );
-
-        let counters = lix.plugin_v2_transition_counters();
-        assert_eq!(counters.conflict_resolution_calls, 1, "sample {sample}");
-        assert_eq!(counters.conflict_resolution_records, 1, "sample {sample}");
-        assert_eq!(counters.conflict_resolution_takes, 1, "sample {sample}");
-        assert_eq!(counters.source_bytes_read, 0, "sample {sample}");
-        assert_eq!(counters.attachment_bytes_read, 0, "sample {sample}");
+        let target = lix
+            .execute(
+                "SELECT value FROM lix_key_value WHERE key = $1",
+                &[Value::Text(key)],
+            )
+            .await
+            .expect("target control row should remain queryable after conflict");
+        assert_eq!(target.len(), 1);
         assert_eq!(
-            counters.full_state_semantic_rows_materialized, 0,
-            "sample {sample}"
+            target.rows()[0].get::<serde_json::Value>("value").unwrap(),
+            serde_json::json!(target_value)
         );
-        resolver_boundary_bytes.push(counters.component_boundary_bytes);
     }
 
     let raw_ms = elapsed_ms.clone();
     elapsed_ms.sort_by(f64::total_cmp);
     eprintln!(
         "v2_json_ten_mib_same_entity_canonical_b_merge bytes={JSON_TEN_MIB_BYTES} samples={SAMPLES} \
-         raw_ms={raw_ms:?} p50_ms={:.3} p95_ms={:.3} resolver_boundary_bytes={resolver_boundary_bytes:?}",
+         raw_ms={raw_ms:?} p50_ms={:.3} p95_ms={:.3}",
         p50_ms(&elapsed_ms),
         p95_ms(&elapsed_ms),
     );
@@ -2016,7 +2302,7 @@ async fn v2_json_ten_mib_same_entity_canonical_b_merge_benchmark() {
         BENCHMARK,
         "same_entity_conflict",
         fixture,
-        BenchmarkGate::Reference,
+        BenchmarkGate::ElapsedRegression,
         &measurements,
     );
 
@@ -2043,6 +2329,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     const FILE_ID: &str = "01900000-0000-7000-8000-000000000701";
     const FILE_PATH: &str = "/native-json-semantic-control.json";
     const BENCHMARK: &str = "v2_json_ten_mib_rocksdb_import_parity_benchmark";
+    const MUTATION_BENCHMARK: &str = "v2_json_ten_mib_bulk_sql_mutation_benchmark";
 
     let archive = build_json_v2_plugin_archive();
     let (source, _, _) = json_ten_mib_flat_fixture();
@@ -2055,6 +2342,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     let file_scoped_root_statement = native_json_control_root_insert(Some(FILE_ID));
     let file_scoped_member_statements =
         native_json_control_member_insert_chunks(&members, Some(FILE_ID), SQL_CHUNK_ROWS);
+    let bulk_update_params = [Value::Text(r#""batch-updated""#.to_owned())];
 
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
@@ -2137,6 +2425,12 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     let mut direct_file_scoped_ms = Vec::with_capacity(SAMPLES);
     let mut direct_no_file_measurements = Vec::with_capacity(SAMPLES);
     let mut direct_file_scoped_measurements = Vec::with_capacity(SAMPLES);
+    let mut bulk_update_measurements = Vec::with_capacity(SAMPLES);
+    let mut bulk_delete_measurements = Vec::with_capacity(SAMPLES);
+    let bulk_mutation_fixture = BenchmarkFixture {
+        input_bytes: JSON_TEN_MIB_BYTES,
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT,
+    };
     for (label, file_scoped, root_statement, member_statements, samples, measurements) in [
         (
             "direct_no_file",
@@ -2233,6 +2527,78 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
                 member_count, JSON_TEN_MIB_PROPERTY_COUNT as i64,
                 "{label} sample {sample} must retain every member"
             );
+            if !file_scoped {
+                let allocation_scope = AllocationScope::start();
+                let started = Instant::now();
+                let updated = lix
+                    .execute(
+                        "UPDATE json_object_member SET scalar_json = $1",
+                        &bulk_update_params,
+                    )
+                    .await
+                    .expect("bulk-update direct JSON members");
+                let measurement =
+                    BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+                assert_eq!(
+                    updated.rows_affected(),
+                    JSON_TEN_MIB_PROPERTY_COUNT as u64,
+                    "bulk update sample {sample}"
+                );
+                bulk_update_measurements.push(measurement);
+                emit_sample(
+                    MUTATION_BENCHMARK,
+                    "bulk_update",
+                    sample,
+                    bulk_mutation_fixture,
+                    BenchmarkGate::ElapsedRegression,
+                    measurement,
+                );
+                let updated_count = lix
+                    .execute(
+                        "SELECT COUNT(*) AS count FROM json_object_member WHERE scalar_json = $1",
+                        &bulk_update_params,
+                    )
+                    .await
+                    .expect("verify bulk-updated direct JSON members")
+                    .rows()[0]
+                    .get::<i64>("count")
+                    .expect("updated member count must be an integer");
+                assert_eq!(
+                    updated_count, JSON_TEN_MIB_PROPERTY_COUNT as i64,
+                    "bulk update sample {sample} must retain every updated snapshot"
+                );
+
+                let allocation_scope = AllocationScope::start();
+                let started = Instant::now();
+                let deleted = lix
+                    .execute("DELETE FROM json_object_member", &[])
+                    .await
+                    .expect("bulk-delete direct JSON members");
+                let measurement =
+                    BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+                assert_eq!(
+                    deleted.rows_affected(),
+                    JSON_TEN_MIB_PROPERTY_COUNT as u64,
+                    "bulk delete sample {sample}"
+                );
+                bulk_delete_measurements.push(measurement);
+                emit_sample(
+                    MUTATION_BENCHMARK,
+                    "bulk_delete",
+                    sample,
+                    bulk_mutation_fixture,
+                    BenchmarkGate::ElapsedRegression,
+                    measurement,
+                );
+                let remaining_count = lix
+                    .execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+                    .await
+                    .expect("verify bulk-deleted direct JSON members")
+                    .rows()[0]
+                    .get::<i64>("count")
+                    .expect("remaining member count must be an integer");
+                assert_eq!(remaining_count, 0, "bulk delete sample {sample}");
+            }
             if file_scoped {
                 assert_eq!(
                     read_file(&lix, FILE_PATH)
@@ -2245,6 +2611,20 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
             lix.close().await.expect("close direct import benchmark");
         }
     }
+    emit_summary(
+        MUTATION_BENCHMARK,
+        "bulk_update",
+        bulk_mutation_fixture,
+        BenchmarkGate::ElapsedRegression,
+        &bulk_update_measurements,
+    );
+    emit_summary(
+        MUTATION_BENCHMARK,
+        "bulk_delete",
+        bulk_mutation_fixture,
+        BenchmarkGate::ElapsedRegression,
+        &bulk_delete_measurements,
+    );
 
     for samples in [
         &mut plugin_ms,
@@ -2568,7 +2948,7 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
             "warm_read",
             sample,
             fixture,
-            BenchmarkGate::Reference,
+            BenchmarkGate::ElapsedRegression,
             measurement,
         );
         assert_eq!(read.len(), JSON_TEN_MIB_BYTES);
@@ -2616,7 +2996,7 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
             "cold_open_read",
             sample,
             fixture,
-            BenchmarkGate::Reference,
+            BenchmarkGate::ElapsedRegression,
             measurement,
         );
     }
@@ -2647,14 +3027,14 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
         BENCHMARK,
         "warm_read",
         fixture,
-        BenchmarkGate::Reference,
+        BenchmarkGate::ElapsedRegression,
         &warm_measurements,
     );
     emit_summary(
         BENCHMARK,
         "cold_open_read",
         fixture,
-        BenchmarkGate::Reference,
+        BenchmarkGate::ElapsedRegression,
         &cold_measurements,
     );
 }

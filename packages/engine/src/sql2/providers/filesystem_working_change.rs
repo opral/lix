@@ -258,17 +258,17 @@ where
     let mut file_ids = BTreeSet::new();
     let mut directory_ids = BTreeSet::new();
     for entry in &diff.entries {
-        if let Some(file_id) = &entry.identity.file_id {
-            file_ids.insert(file_id.clone());
+        if let Some(file_id) = entry.identity.file_id() {
+            file_ids.insert(file_id.to_owned());
         }
-        match entry.identity.schema_key.as_str() {
+        match entry.identity.schema_key() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(&entry.identity.entity_pk) {
+                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
                     file_ids.insert(id);
                 }
             }
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
-                if let Some(id) = single_entity_pk_value(&entry.identity.entity_pk) {
+                if let Some(id) = single_entity_pk_value(entry.identity.entity_pk()) {
                     directory_ids.insert(id);
                 }
             }
@@ -449,8 +449,8 @@ where
     S: StorageAdapterRead,
     T: for<'de> Deserialize<'de>,
 {
-    tracked
-        .scan_rows_at_commit(
+    let batch = tracked
+        .scan_batch_at_commit(
             commit_id,
             &TrackedStateScanRequest {
                 filter: TrackedStateFilter {
@@ -465,11 +465,12 @@ where
                 ..TrackedStateScanRequest::default()
             },
         )
-        .await?
-        .into_iter()
-        .filter_map(|row| row.snapshot_content)
+        .await?;
+    batch
+        .iter()
+        .filter_map(|row| row.snapshot_content())
         .map(|snapshot| {
-            serde_json::from_str(&snapshot).map_err(|error| {
+            serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!("invalid {schema_key} snapshot JSON: {error}"),

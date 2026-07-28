@@ -4,7 +4,10 @@
 mod tests {
     use crate::common::serialize_row_metadata;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::{LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateRow};
+    use crate::live_state::{
+        LiveStateFilter, LiveStateScanRequest, MaterializedLiveStateBatch,
+        MaterializedLiveStateRowRef,
+    };
     use crate::session::CreateBranchOptions;
     use crate::sql2::test_support::generators::{
         ACTIVE_BRANCH_PROBE_ID, DifferentialExpectation, DifferentialParam, DifferentialProbe,
@@ -525,7 +528,7 @@ mod tests {
         entity_pks: &[&str],
         branch_ids: &[&str],
         active_branch_id: &str,
-    ) -> Vec<MaterializedLiveStateRow> {
+    ) -> MaterializedLiveStateBatch {
         transaction
         .scan_live_state_for_test(&LiveStateScanRequest {
             filter: LiveStateFilter {
@@ -551,15 +554,24 @@ mod tests {
     }
 
     fn registered_schema_by_branch_rows(
-        mut rows: Vec<MaterializedLiveStateRow>,
+        rows: MaterializedLiveStateBatch,
         active_branch_id: &str,
     ) -> Vec<Vec<Value>> {
-        rows.sort_by_key(|row| (row.entity_pk.clone(), row.branch_id.clone()));
-        rows.iter()
-            .map(|row| {
+        let mut ordinals = (0..rows.len()).collect::<Vec<_>>();
+        ordinals.sort_by(|left, right| {
+            let left = rows.row(*left);
+            let right = rows.row(*right);
+            left.entity_pk()
+                .cmp(right.entity_pk())
+                .then_with(|| left.branch_id().cmp(right.branch_id()))
+        });
+        ordinals
+            .into_iter()
+            .map(|ordinal| {
+                let row = rows.row(ordinal);
                 let value = row
-                    .snapshot_content
-                    .as_deref()
+                    .snapshot_content()
+                    .map(|snapshot| snapshot.as_str())
                     .and_then(|snapshot| serde_json::from_str::<serde_json::Value>(snapshot).ok())
                     .and_then(|snapshot| snapshot.get("value").cloned())
                     .map(|value| {
@@ -570,14 +582,14 @@ mod tests {
                     &[
                         entity_pk_value(row),
                         value,
-                        Value::Text(row.branch_id.to_string()),
-                        row.metadata
-                            .as_deref()
+                        Value::Text(row.branch_id().to_string()),
+                        row.metadata()
+                            .map(|metadata| metadata.as_str())
                             .map(serialize_row_metadata)
                             .map(Value::Text)
                             .unwrap_or(Value::Null),
-                        Value::Boolean(row.global),
-                        Value::Boolean(row.untracked),
+                        Value::Boolean(row.global()),
+                        Value::Boolean(row.untracked()),
                     ],
                     active_branch_id,
                     &[2],
@@ -586,9 +598,9 @@ mod tests {
             .collect()
     }
 
-    fn entity_pk_value(row: &MaterializedLiveStateRow) -> Value {
+    fn entity_pk_value(row: MaterializedLiveStateRowRef<'_>) -> Value {
         Value::Text(
-            row.entity_pk
+            row.entity_pk()
                 .as_json_array_text()
                 .expect("materialized entity pk should encode"),
         )

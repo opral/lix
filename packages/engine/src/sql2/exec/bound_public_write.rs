@@ -4,10 +4,13 @@ use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
 
 use crate::changelog::CommitId;
-use crate::common::{ExecuteStatementMetadata, RequestBlobSpliceProvenance, validate_row_metadata};
+use crate::common::{
+    ExecuteStatementMetadata, RequestBlobSpliceProvenance, SharedStr, validate_row_metadata,
+};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateRowFilter, LiveStateScanRequest,
+    MaterializedLiveStateBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
 };
 use crate::sql2::SqlWriteExecutionContext;
 use crate::sql2::bind::expr::{BoundCastType, BoundExpr, BoundLiteral};
@@ -23,7 +26,7 @@ use crate::sql2::plan::predicate::{BoundPredicate, FilterSet};
 use crate::sql2::read_only::reject_read_only_entity_surface;
 use crate::sql2::value_contract::{json_bigint_value, json_double_value};
 use crate::transaction::types::{
-    TransactionJson, TransactionWrite, TransactionWriteMode, TransactionWriteRow,
+    RawWriteBatch, RawWriteRowRef, TransactionJson, TransactionWrite, TransactionWriteMode,
 };
 use crate::{LixError, NullableKeyFilter, Value, parse_row_metadata_value};
 
@@ -148,7 +151,7 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
     if direct_replacement.is_some()
         && candidates
             .iter()
-            .any(|candidate| candidate.untracked || candidate.file_id.is_some())
+            .any(|candidate| candidate.untracked() || candidate.file_id().is_some())
     {
         // Retention and plugin-owned file rows retain the canonical semantic
         // preparation path. This certificate is only for ordinary tracked
@@ -156,31 +159,40 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
         return Ok(None);
     }
     let mut candidates_by_pk = std::collections::BTreeMap::<EntityPk, Vec<_>>::new();
-    for candidate in candidates {
+    for candidate in candidates.iter() {
         candidates_by_pk
-            .entry(candidate.entity_pk.clone())
+            .entry(candidate.entity_pk().clone())
             .or_default()
             .push(candidate);
     }
 
     let mut affected_by_statement = Vec::with_capacity(parameter_rows.len());
-    let mut write_rows = Vec::with_capacity(parameter_rows.len());
+    let mut write_rows = RawWriteBatch::with_capacity(parameter_rows.len());
     for (row_index, (entity_pk, params)) in entity_pks.into_iter().zip(&parameter_rows).enumerate()
     {
         let mut affected = 0;
         for candidate in candidates_by_pk.remove(&entity_pk).unwrap_or_default() {
-            let write_row = direct_replacement
-                .as_ref()
-                .map_or_else(
-                    || entity_update_row(ctx, plan, &spec, &candidate, params, None),
-                    |replacement| {
-                        direct_path_value_replacement_row(&spec, &candidate, params, replacement)
-                            .map(Some)
-                    },
+            let appended = match direct_replacement.as_ref() {
+                Some(replacement) => append_direct_path_value_replacement_row(
+                    &mut write_rows,
+                    &spec,
+                    candidate,
+                    params,
+                    replacement,
                 )
-                .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-            if let Some(write_row) = write_row {
-                write_rows.push(write_row);
+                .map(|()| true),
+                None => append_entity_update_row(
+                    &mut write_rows,
+                    ctx,
+                    plan,
+                    &spec,
+                    candidate,
+                    params,
+                    None,
+                ),
+            }
+            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+            if appended {
                 affected += 1;
             }
         }
@@ -208,6 +220,110 @@ pub(crate) async fn try_execute_entity_update_parameter_batch(
 
 struct DirectPathValueReplacement {
     value_param_index: usize,
+}
+
+#[derive(Clone, Copy)]
+enum EntityLiveRowRef<'a> {
+    Owned(&'a MaterializedLiveStateRow),
+    Batch(MaterializedLiveStateRowRef<'a>),
+}
+
+impl<'a> EntityLiveRowRef<'a> {
+    fn entity_pk(self) -> &'a EntityPk {
+        match self {
+            Self::Owned(row) => &row.entity_pk,
+            Self::Batch(row) => row.entity_pk(),
+        }
+    }
+
+    fn schema_key(self) -> &'a str {
+        match self {
+            Self::Owned(row) => &row.schema_key,
+            Self::Batch(row) => row.schema_key(),
+        }
+    }
+
+    fn file_id(self) -> Option<&'a str> {
+        match self {
+            Self::Owned(row) => row.file_id.as_deref(),
+            Self::Batch(row) => row.file_id(),
+        }
+    }
+
+    fn snapshot_content(self) -> Option<&'a str> {
+        match self {
+            Self::Owned(row) => row.snapshot_content.as_deref(),
+            Self::Batch(row) => row.snapshot_content().map(SharedStr::as_str),
+        }
+    }
+
+    fn metadata(self) -> Option<&'a str> {
+        match self {
+            Self::Owned(row) => row.metadata.as_deref(),
+            Self::Batch(row) => row.metadata().map(SharedStr::as_str),
+        }
+    }
+
+    fn created_at(self) -> crate::common::LixTimestamp {
+        match self {
+            Self::Owned(row) => row.created_at,
+            Self::Batch(row) => row.created_at(),
+        }
+    }
+
+    fn updated_at(self) -> crate::common::LixTimestamp {
+        match self {
+            Self::Owned(row) => row.updated_at,
+            Self::Batch(row) => row.updated_at(),
+        }
+    }
+
+    fn global(self) -> bool {
+        match self {
+            Self::Owned(row) => row.global,
+            Self::Batch(row) => row.global(),
+        }
+    }
+
+    fn change_id(self) -> Option<crate::changelog::ChangeId> {
+        match self {
+            Self::Owned(row) => row.change_id,
+            Self::Batch(row) => row.change_id(),
+        }
+    }
+
+    fn commit_id(self) -> Option<CommitId> {
+        match self {
+            Self::Owned(row) => row.commit_id,
+            Self::Batch(row) => row.commit_id(),
+        }
+    }
+
+    fn untracked(self) -> bool {
+        match self {
+            Self::Owned(row) => row.untracked,
+            Self::Batch(row) => row.untracked(),
+        }
+    }
+
+    fn branch_id(self) -> &'a str {
+        match self {
+            Self::Owned(row) => row.branch_id.as_ref(),
+            Self::Batch(row) => row.branch_id(),
+        }
+    }
+}
+
+impl<'a> From<&'a MaterializedLiveStateRow> for EntityLiveRowRef<'a> {
+    fn from(row: &'a MaterializedLiveStateRow) -> Self {
+        Self::Owned(row)
+    }
+}
+
+impl<'a> From<MaterializedLiveStateRowRef<'a>> for EntityLiveRowRef<'a> {
+    fn from(row: MaterializedLiveStateRowRef<'a>) -> Self {
+        Self::Batch(row)
+    }
 }
 
 fn direct_path_value_replacement(
@@ -241,12 +357,14 @@ fn direct_path_value_replacement(
     })
 }
 
-fn direct_path_value_replacement_row(
+fn append_direct_path_value_replacement_row<'a>(
+    rows: &mut RawWriteBatch,
     spec: &EntitySurfaceSpec,
-    candidate: &crate::live_state::MaterializedLiveStateRow,
+    candidate: impl Into<EntityLiveRowRef<'a>>,
     params: &[Value],
     replacement: &DirectPathValueReplacement,
-) -> Result<TransactionWriteRow, LixError> {
+) -> Result<(), LixError> {
+    let candidate = candidate.into();
     let value = match params.get(replacement.value_param_index) {
         Some(Value::Null) => JsonValue::Null,
         Some(Value::Text(raw)) => serde_json::from_str(raw).map_err(|error| {
@@ -277,34 +395,37 @@ fn direct_path_value_replacement_row(
             format!("certified replacement value failed to serialize: {error}"),
         )
     })?;
-    let path = serde_json::to_string(candidate.entity_pk.as_single_string()?).map_err(|error| {
-        LixError::new(
-            LixError::CODE_UNKNOWN,
-            format!("certified replacement identity failed to serialize: {error}"),
-        )
-    })?;
+    let path =
+        serde_json::to_string(candidate.entity_pk().as_single_string()?).map_err(|error| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("certified replacement identity failed to serialize: {error}"),
+            )
+        })?;
     let normalized = format!(r#"{{"path":{path},"value":{value}}}"#);
-    Ok(TransactionWriteRow {
-        entity_pk: Some(candidate.entity_pk.clone()),
-        schema_key: spec.schema_key.clone(),
-        file_id: candidate.file_id.clone(),
-        snapshot: Some(TransactionJson::from_certified_normalized_row_content(
+    let metadata = inherited_metadata(candidate, spec)?;
+    rows.push_parts(
+        Some(candidate.entity_pk().clone()),
+        spec.schema_key.as_str().into(),
+        candidate.file_id().map(Into::into),
+        Some(TransactionJson::from_certified_normalized_row_content(
             normalized.into(),
         )),
-        metadata: inherited_metadata(candidate, spec)?,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global: candidate.global,
-        change_id: None,
-        commit_id: None,
-        untracked: candidate.untracked,
-        branch_id: if candidate.global {
-            crate::GLOBAL_BRANCH_ID.to_string()
+        metadata,
+        None,
+        None,
+        None,
+        candidate.global(),
+        None,
+        None,
+        candidate.untracked(),
+        if candidate.global() {
+            crate::GLOBAL_BRANCH_ID.into()
         } else {
-            candidate.branch_id.to_string()
+            candidate.branch_id().into()
         },
-    })
+    );
+    Ok(())
 }
 
 fn bound_single_text_primary_key_param(
@@ -551,7 +672,7 @@ async fn execute_entity_write(
     match plan.bound.op {
         BoundWriteOp::Insert => {
             if no_op {
-                entity_insert_rows(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
+                entity_insert_batch(ctx, plan, &spec, params, active_branch_commit_id.as_ref())?;
                 return Ok(SqlWriteResult::affected(0));
             }
             if plan.bound.conflict.is_some() {
@@ -1046,7 +1167,7 @@ async fn entity_insert(
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
-    let write_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
+    let write_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
     stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await
 }
 
@@ -1065,53 +1186,55 @@ async fn entity_upsert(
     })?;
     validate_insert_conflict_target(plan, spec, conflict)?;
 
-    let insert_rows = entity_insert_rows(ctx, plan, spec, params, active_branch_commit_id)?;
-    let candidates = scan_entity_conflict_candidates(ctx, spec, insert_rows.as_slice()).await?;
-    let mut write_rows = Vec::with_capacity(insert_rows.len());
+    let mut insert_rows = entity_insert_batch(ctx, plan, spec, params, active_branch_commit_id)?;
+    let candidates = scan_entity_conflict_candidates(ctx, spec, &insert_rows).await?;
+    let mut write_rows = RawWriteBatch::with_capacity(insert_rows.len());
 
-    for insert_row in insert_rows {
-        let inserted_entity_pk = insert_row_entity_pk(&insert_row, spec)?;
+    for index in 0..insert_rows.len() {
+        let insert_row = insert_rows.row(index);
+        let inserted_entity_pk = insert_row_entity_pk(insert_row, spec)?;
         let matching_candidate =
-            find_conflict_candidate(&insert_row, &inserted_entity_pk, candidates.as_slice());
+            find_conflict_candidate(insert_row, &inserted_entity_pk, &candidates);
         match (matching_candidate, &conflict.action) {
             // DO NOTHING on a conflicting row: leave the existing row untouched.
             (Some(_), BoundConflictAction::DoNothing) => {}
             (Some(candidate), BoundConflictAction::DoUpdate { assignments }) => {
-                write_rows.push(entity_conflict_update_row(
+                append_entity_conflict_update_row(
+                    &mut write_rows,
                     ctx,
                     spec,
                     candidate,
-                    &insert_row,
+                    insert_row,
                     assignments.as_slice(),
                     params,
                     active_branch_commit_id,
-                )?);
+                )?;
             }
-            (None, _) => write_rows.push(insert_row),
+            (None, _) => write_rows.append_taken_row(&mut insert_rows, index),
         }
     }
 
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
 }
 
-fn entity_insert_rows(
+fn entity_insert_batch(
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
+) -> Result<RawWriteBatch, LixError> {
     let BoundWriteInput::Values(values) = &plan.bound.input else {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "bound entity INSERT supports VALUES only",
         ));
     };
-
     let layout = InsertRowLayout::from_values(spec, values)?;
-    let mut write_rows = Vec::with_capacity(values.rows.len());
+    let mut write_rows = RawWriteBatch::with_capacity(values.rows.len());
     for row in &values.rows {
-        write_rows.push(entity_insert_row(
+        append_entity_insert_row(
+            &mut write_rows,
             ctx,
             plan,
             spec,
@@ -1119,7 +1242,7 @@ fn entity_insert_rows(
             row,
             params,
             active_branch_commit_id,
-        )?);
+        )?;
     }
     Ok(write_rows)
 }
@@ -1132,27 +1255,33 @@ async fn entity_update(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<u64, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
-    let mut write_rows = Vec::new();
-    for candidate in candidates {
-        if let Some(write_row) =
-            entity_update_row(ctx, plan, spec, &candidate, params, active_branch_commit_id)?
-        {
-            write_rows.push(write_row);
-        }
+    let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
+    for candidate in candidates.iter() {
+        append_entity_update_row(
+            &mut write_rows,
+            ctx,
+            plan,
+            spec,
+            candidate,
+            params,
+            active_branch_commit_id,
+        )?;
     }
     stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await
 }
 
-fn entity_update_row(
+fn append_entity_update_row<'a>(
+    rows: &mut RawWriteBatch,
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
-    candidate: &crate::live_state::MaterializedLiveStateRow,
+    candidate: impl Into<EntityLiveRowRef<'a>>,
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<Option<TransactionWriteRow>, LixError> {
+) -> Result<bool, LixError> {
+    let candidate = candidate.into();
     let Some(snapshot) = candidate_snapshot(candidate)? else {
-        return Ok(None);
+        return Ok(false);
     };
     let original_context = EntityEvalContext::live(&snapshot, candidate, spec);
     if !predicate_matches(
@@ -1163,7 +1292,7 @@ fn entity_update_row(
         params,
         active_branch_commit_id,
     )? {
-        return Ok(None);
+        return Ok(false);
     }
     reject_projected_global_write(plan, candidate, "UPDATE")?;
     let mut updated = snapshot.clone();
@@ -1203,7 +1332,8 @@ fn entity_update_row(
     for (column_name, value) in visible_assignments {
         updated[&column_name] = value;
     }
-    entity_replace_row_from_live(
+    append_entity_replace_row_from_live(
+        rows,
         ctx,
         spec,
         candidate,
@@ -1211,8 +1341,8 @@ fn entity_update_row(
         plan.bound.assignments.as_slice(),
         params,
         active_branch_commit_id,
-    )
-    .map(Some)
+    )?;
+    Ok(true)
 }
 
 async fn entity_delete(
@@ -1223,13 +1353,13 @@ async fn entity_delete(
     active_branch_commit_id: Option<&CommitId>,
 ) -> Result<SqlWriteResult, LixError> {
     let candidates = scan_entity_candidates(ctx, plan, spec, params).await?;
-    let mut write_rows = Vec::new();
+    let mut write_rows = RawWriteBatch::with_capacity(candidates.len());
     let mut returning_rows = plan.bound.returning.as_ref().map(|_| Vec::new());
-    for candidate in candidates {
-        let Some(snapshot) = candidate_snapshot(&candidate)? else {
+    for candidate in candidates.iter() {
+        let Some(snapshot) = candidate_snapshot(candidate)? else {
             continue;
         };
-        let context = EntityEvalContext::live(&snapshot, &candidate, spec);
+        let context = EntityEvalContext::live(&snapshot, candidate, spec);
         if predicate_matches(
             &plan.bound.predicate,
             &context,
@@ -1238,7 +1368,7 @@ async fn entity_delete(
             params,
             active_branch_commit_id,
         )? {
-            reject_projected_global_write(plan, &candidate, "DELETE")?;
+            reject_projected_global_write(plan, candidate, "DELETE")?;
             if let (Some(returning), Some(rows)) =
                 (plan.bound.returning.as_ref(), returning_rows.as_mut())
             {
@@ -1251,15 +1381,16 @@ async fn entity_delete(
                     active_branch_commit_id,
                 )?);
             }
-            write_rows.push(entity_replace_row_from_live(
+            append_entity_replace_row_from_live(
+                &mut write_rows,
                 ctx,
                 spec,
-                &candidate,
+                candidate,
                 None,
                 plan.bound.assignments.as_slice(),
                 params,
                 active_branch_commit_id,
-            )?);
+            )?;
         }
     }
     let rows_affected = stage_rows(ctx, TransactionWriteMode::Replace, write_rows).await?;
@@ -1405,15 +1536,17 @@ fn visible_entity_column<'a>(
     spec.visible_column(&column.name)
 }
 
-fn entity_conflict_update_row(
+fn append_entity_conflict_update_row<'a>(
+    rows: &mut RawWriteBatch,
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
-    candidate: &crate::live_state::MaterializedLiveStateRow,
-    insert_row: &TransactionWriteRow,
+    candidate: impl Into<EntityLiveRowRef<'a>>,
+    insert_row: RawWriteRowRef<'_>,
     assignments: &[BoundAssignment],
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<TransactionWriteRow, LixError> {
+) -> Result<(), LixError> {
+    let candidate = candidate.into();
     let snapshot = candidate_snapshot(candidate)?.ok_or_else(|| {
         LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -1422,7 +1555,6 @@ fn entity_conflict_update_row(
     })?;
     let insert_snapshot = insert_row
         .snapshot
-        .as_ref()
         .map(TransactionJson::value)
         .unwrap_or(&JsonValue::Null);
     let context =
@@ -1450,7 +1582,7 @@ fn entity_conflict_update_row(
                 )?,
             ));
         } else if assignment.column.name == "lixcol_metadata" {
-            // handled by entity_replace_row_from_live from the assignment list
+            // handled by append_entity_replace_row_from_live from the assignment list
         } else {
             return Err(LixError::new(
                 LixError::CODE_UNSUPPORTED_SQL,
@@ -1465,7 +1597,8 @@ fn entity_conflict_update_row(
         updated[&column_name] = value;
     }
 
-    entity_replace_row_from_live(
+    append_entity_replace_row_from_live(
+        rows,
         ctx,
         spec,
         candidate,
@@ -1479,9 +1612,9 @@ fn entity_conflict_update_row(
 async fn stage_rows(
     ctx: &mut dyn SqlWriteExecutionContext,
     mode: TransactionWriteMode,
-    rows: Vec<TransactionWriteRow>,
+    rows: RawWriteBatch,
 ) -> Result<u64, LixError> {
-    if rows.is_empty() {
+    if rows.len() == 0 {
         return Ok(0);
     }
     let outcome = ctx
@@ -1540,13 +1673,13 @@ fn validate_insert_conflict_target(
 }
 
 fn insert_row_entity_pk(
-    row: &TransactionWriteRow,
+    row: RawWriteRowRef<'_>,
     spec: &EntitySurfaceSpec,
 ) -> Result<EntityPk, LixError> {
-    if let Some(entity_pk) = &row.entity_pk {
+    if let Some(entity_pk) = row.entity_pk {
         return Ok(entity_pk.clone());
     }
-    let snapshot = row.snapshot.as_ref().ok_or_else(|| {
+    let snapshot = row.snapshot.ok_or_else(|| {
         LixError::new(
             LixError::CODE_SCHEMA_VALIDATION,
             format!(
@@ -1567,53 +1700,58 @@ fn insert_row_entity_pk(
 }
 
 fn find_conflict_candidate<'a>(
-    insert_row: &TransactionWriteRow,
+    insert_row: RawWriteRowRef<'_>,
     inserted_entity_pk: &EntityPk,
-    candidates: &'a [crate::live_state::MaterializedLiveStateRow],
-) -> Option<&'a crate::live_state::MaterializedLiveStateRow> {
+    candidates: &'a MaterializedLiveStateBatch,
+) -> Option<MaterializedLiveStateRowRef<'a>> {
     candidates.iter().find(|candidate| {
-        candidate_matches_insert_identity(candidate, insert_row, inserted_entity_pk)
+        candidate_matches_insert_identity(*candidate, insert_row, inserted_entity_pk)
     })
 }
 
-fn candidate_matches_insert_identity(
-    candidate: &crate::live_state::MaterializedLiveStateRow,
-    insert_row: &TransactionWriteRow,
+fn candidate_matches_insert_identity<'a>(
+    candidate: impl Into<EntityLiveRowRef<'a>>,
+    insert_row: RawWriteRowRef<'_>,
     inserted_entity_pk: &EntityPk,
 ) -> bool {
-    candidate.entity_pk == *inserted_entity_pk
-        && candidate.file_id == insert_row.file_id
-        && candidate.branch_id.as_ref() == insert_row.branch_id
-        && candidate.global == insert_row.global
+    let candidate = candidate.into();
+    candidate.entity_pk() == inserted_entity_pk
+        && candidate.file_id() == insert_row.file_id.map(SharedStr::as_str)
+        && candidate.branch_id() == insert_row.branch_id.as_str()
+        && candidate.global() == insert_row.global
 }
 
 async fn scan_entity_conflict_candidates(
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
-    insert_rows: &[TransactionWriteRow],
-) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+    insert_rows: &RawWriteBatch,
+) -> Result<MaterializedLiveStateBatch, LixError> {
     let mut branch_ids = std::collections::BTreeSet::new();
     let mut entity_pks = std::collections::BTreeSet::new();
     let mut file_ids = std::collections::BTreeSet::new();
-    for row in insert_rows {
+    for row in insert_rows.iter() {
         branch_ids.insert(row.branch_id.clone());
         entity_pks.insert(insert_row_entity_pk(row, spec)?);
-        file_ids.insert(row.file_id.clone());
+        file_ids.insert(row.file_id.cloned());
     }
     let file_ids = file_ids
         .into_iter()
-        .map(|file_id| file_id.map_or(NullableKeyFilter::Null, NullableKeyFilter::Value))
+        .map(|file_id| {
+            file_id.map_or(NullableKeyFilter::Null, |file_id| {
+                NullableKeyFilter::Value(file_id.into())
+            })
+        })
         .collect::<Vec<_>>();
 
     // Retention is an attribute of the one canonical live identity, not part
     // of SQL conflict identity. A tracked INSERT therefore conflicts with an
     // existing untracked row (and vice versa); `DO UPDATE` then preserves the
-    // existing row's retention through `entity_replace_row_from_live`.
-    ctx.scan_live_state(&LiveStateScanRequest {
+    // existing row's retention through `append_entity_replace_row_from_live`.
+    ctx.scan_live_state_batch(&LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks: entity_pks.into_iter().collect(),
-            branch_ids: branch_ids.into_iter().collect(),
+            branch_ids: branch_ids.into_iter().map(Into::into).collect(),
             file_ids,
             include_tombstones: false,
             ..LiveStateFilter::default()
@@ -1628,7 +1766,7 @@ async fn scan_entity_candidates(
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
     params: &[Value],
-) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
+) -> Result<MaterializedLiveStateBatch, LixError> {
     let branch_ids = scan_branch_ids(&plan.bound.branch_scope)?;
     let mut request = LiveStateScanRequest {
         filter: LiveStateFilter {
@@ -1647,7 +1785,7 @@ async fn scan_entity_candidates(
         }
         request.filter.entity_pks = entity_pks;
     }
-    ctx.scan_live_state(&request).await
+    ctx.scan_live_state_batch(&request).await
 }
 
 async fn scan_entity_candidates_for_pks(
@@ -1656,8 +1794,8 @@ async fn scan_entity_candidates_for_pks(
     spec: &EntitySurfaceSpec,
     entity_pks: Vec<EntityPk>,
     metadata_only: bool,
-) -> Result<Vec<crate::live_state::MaterializedLiveStateRow>, LixError> {
-    ctx.scan_live_state(&LiveStateScanRequest {
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    ctx.scan_live_state_batch(&LiveStateScanRequest {
         filter: LiveStateFilter {
             schema_keys: vec![spec.schema_key.clone()],
             entity_pks,
@@ -1962,7 +2100,8 @@ impl InsertRowLayout {
     }
 }
 
-fn entity_insert_row(
+fn append_entity_insert_row(
+    rows: &mut RawWriteBatch,
     ctx: &mut dyn SqlWriteExecutionContext,
     plan: &LogicalWritePlan,
     spec: &EntitySurfaceSpec,
@@ -1970,7 +2109,7 @@ fn entity_insert_row(
     row: &[BoundExpr],
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<TransactionWriteRow, LixError> {
+) -> Result<(), LixError> {
     if row.len() != layout.columns.len() {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
@@ -2095,36 +2234,38 @@ fn entity_insert_row(
     }
     let global = global.unwrap_or(false);
     let branch_id = entity_row_branch_id(plan, explicit_branch_id, global)?;
-    Ok(TransactionWriteRow {
+    rows.push_parts(
         entity_pk,
-        schema_key: layout.schema_key.clone(),
-        file_id,
-        snapshot: Some(TransactionJson::from_value(
+        layout.schema_key.as_str().into(),
+        file_id.map(Into::into),
+        Some(TransactionJson::from_value(
             snapshot,
             &layout.snapshot_context,
         )?),
         metadata,
-        origin: None,
-        created_at: None,
-        updated_at: None,
+        None,
+        None,
+        None,
         global,
-        change_id: None,
-        commit_id: None,
-        untracked: untracked.unwrap_or(false),
-        branch_id,
-    })
+        None,
+        None,
+        untracked.unwrap_or(false),
+        branch_id.into(),
+    );
+    Ok(())
 }
 
-fn reject_projected_global_write(
+fn reject_projected_global_write<'a>(
     plan: &LogicalWritePlan,
-    row: &crate::live_state::MaterializedLiveStateRow,
+    row: impl Into<EntityLiveRowRef<'a>>,
     action: &str,
 ) -> Result<(), LixError> {
+    let row = row.into();
     let target_is_by_branch = matches!(
         &plan.bound.target,
         BoundWriteTarget::Entity(EntityWriteSurface::ByBranch { .. })
     );
-    if target_is_by_branch && row.global && row.branch_id.as_ref() != crate::GLOBAL_BRANCH_ID {
+    if target_is_by_branch && row.global() && row.branch_id() != crate::GLOBAL_BRANCH_ID {
         return Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             format!(
@@ -2135,15 +2276,17 @@ fn reject_projected_global_write(
     Ok(())
 }
 
-fn entity_replace_row_from_live(
+fn append_entity_replace_row_from_live<'a>(
+    rows: &mut RawWriteBatch,
     ctx: &mut dyn SqlWriteExecutionContext,
     spec: &EntitySurfaceSpec,
-    row: &crate::live_state::MaterializedLiveStateRow,
+    row: impl Into<EntityLiveRowRef<'a>>,
     snapshot: Option<JsonValue>,
     assignments: &[BoundAssignment],
     params: &[Value],
     active_branch_commit_id: Option<&CommitId>,
-) -> Result<TransactionWriteRow, LixError> {
+) -> Result<(), LixError> {
+    let row = row.into();
     let metadata = if let Some(expr) = assignment_value(assignments, "lixcol_metadata") {
         let snapshot_for_eval = candidate_snapshot(row)?.unwrap_or(JsonValue::Null);
         let context = EntityEvalContext::live(&snapshot_for_eval, row, spec);
@@ -2153,40 +2296,42 @@ fn entity_replace_row_from_live(
         inherited_metadata(row, spec)?
     };
 
-    Ok(TransactionWriteRow {
-        entity_pk: Some(row.entity_pk.clone()),
-        schema_key: spec.schema_key.clone(),
-        file_id: row.file_id.clone(),
-        snapshot: snapshot
-            .map(|snapshot| {
-                TransactionJson::from_value(
-                    snapshot,
-                    &format!("{} update snapshot_content", spec.schema_key),
-                )
-            })
-            .transpose()?,
+    let snapshot = snapshot
+        .map(|snapshot| {
+            TransactionJson::from_value(
+                snapshot,
+                &format!("{} update snapshot_content", spec.schema_key),
+            )
+        })
+        .transpose()?;
+    rows.push_parts(
+        Some(row.entity_pk().clone()),
+        spec.schema_key.as_str().into(),
+        row.file_id().map(Into::into),
+        snapshot,
         metadata,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global: row.global,
-        change_id: None,
-        commit_id: None,
-        untracked: row.untracked,
-        branch_id: if row.global {
-            crate::GLOBAL_BRANCH_ID.to_string()
+        None,
+        None,
+        None,
+        row.global(),
+        None,
+        None,
+        row.untracked(),
+        if row.global() {
+            crate::GLOBAL_BRANCH_ID.into()
         } else {
-            row.branch_id.to_string()
+            row.branch_id().into()
         },
-    })
+    );
+    Ok(())
 }
 
-fn inherited_metadata(
-    row: &crate::live_state::MaterializedLiveStateRow,
+fn inherited_metadata<'a>(
+    row: impl Into<EntityLiveRowRef<'a>>,
     spec: &EntitySurfaceSpec,
 ) -> Result<Option<TransactionJson>, LixError> {
-    row.metadata
-        .as_ref()
+    row.into()
+        .metadata()
         .map(|metadata| {
             let metadata = parse_row_metadata_value(metadata, &spec.schema_key)?;
             TransactionJson::from_value(metadata, &format!("{} metadata", spec.schema_key))
@@ -2196,9 +2341,9 @@ fn inherited_metadata(
 
 struct EntityEvalContext<'a> {
     snapshot: &'a JsonValue,
-    row: Option<&'a crate::live_state::MaterializedLiveStateRow>,
+    row: Option<EntityLiveRowRef<'a>>,
     excluded_snapshot: Option<&'a JsonValue>,
-    excluded_row: Option<&'a TransactionWriteRow>,
+    excluded_row: Option<RawWriteRowRef<'a>>,
     visible_columns: &'a [EntitySurfaceColumn],
 }
 
@@ -2215,12 +2360,12 @@ impl<'a> EntityEvalContext<'a> {
 
     fn live(
         snapshot: &'a JsonValue,
-        row: &'a crate::live_state::MaterializedLiveStateRow,
+        row: impl Into<EntityLiveRowRef<'a>>,
         spec: &'a EntitySurfaceSpec,
     ) -> Self {
         Self {
             snapshot,
-            row: Some(row),
+            row: Some(row.into()),
             excluded_snapshot: None,
             excluded_row: None,
             visible_columns: &spec.columns,
@@ -2229,14 +2374,14 @@ impl<'a> EntityEvalContext<'a> {
 
     fn conflict(
         snapshot: &'a JsonValue,
-        row: &'a crate::live_state::MaterializedLiveStateRow,
+        row: impl Into<EntityLiveRowRef<'a>>,
         excluded_snapshot: &'a JsonValue,
-        excluded_row: &'a TransactionWriteRow,
+        excluded_row: RawWriteRowRef<'a>,
         spec: &'a EntitySurfaceSpec,
     ) -> Self {
         Self {
             snapshot,
-            row: Some(row),
+            row: Some(row.into()),
             excluded_snapshot: Some(excluded_snapshot),
             excluded_row: Some(excluded_row),
             visible_columns: &spec.columns,
@@ -2982,11 +3127,11 @@ fn validate_expr_supported(expr: &BoundExpr) -> Result<(), LixError> {
     }
 }
 
-fn candidate_snapshot(
-    row: &crate::live_state::MaterializedLiveStateRow,
+fn candidate_snapshot<'a>(
+    row: impl Into<EntityLiveRowRef<'a>>,
 ) -> Result<Option<JsonValue>, LixError> {
-    row.snapshot_content
-        .as_deref()
+    row.into()
+        .snapshot_content()
         .map(|snapshot| {
             serde_json::from_str(snapshot).map_err(|error| {
                 LixError::new(
@@ -3323,21 +3468,19 @@ fn column_eval_value(
     };
     match column_name {
         "lixcol_entity_pk" => row
-            .entity_pk
+            .entity_pk()
             .as_json_array_value()
             .map(EntityEvalValue::Json),
         "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.schema_key.clone(),
+            row.schema_key().to_string(),
         ))),
         "lixcol_file_id" => Ok(row
-            .file_id
-            .as_ref()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .file_id()
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_metadata" => row
-            .metadata
-            .as_ref()
-            .map(|metadata| parse_row_metadata_value(metadata, &row.schema_key))
+            .metadata()
+            .map(|metadata| parse_row_metadata_value(metadata, row.schema_key()))
             .transpose()
             .map(|metadata| {
                 metadata
@@ -3345,25 +3488,23 @@ fn column_eval_value(
                     .unwrap_or(EntityEvalValue::SqlNull)
             }),
         "lixcol_change_id" => Ok(row
-            .change_id
-            .as_ref()
+            .change_id()
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_created_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.created_at.to_string(),
+            row.created_at().to_string(),
         ))),
         "lixcol_updated_at" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.updated_at.to_string(),
+            row.updated_at().to_string(),
         ))),
         "lixcol_commit_id" => Ok(row
-            .commit_id
-            .as_ref()
+            .commit_id()
             .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
-        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
-        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
+        "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global()))),
+        "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked()))),
         "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.branch_id.to_string(),
+            row.branch_id().to_string(),
         ))),
         _ => Ok(EntityEvalValue::SqlNull),
     }
@@ -3394,28 +3535,25 @@ fn excluded_column_eval_value(
     match column_name {
         "lixcol_entity_pk" => row
             .entity_pk
-            .as_ref()
             .map(|entity_pk| entity_pk.as_json_array_value().map(EntityEvalValue::Json))
             .transpose()
             .map(|value| value.unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_schema_key" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.schema_key.clone(),
+            row.schema_key.to_string(),
         ))),
         "lixcol_file_id" => Ok(row
             .file_id
-            .as_ref()
-            .map(|value| EntityEvalValue::Json(JsonValue::String(value.clone())))
+            .map(|value| EntityEvalValue::Json(JsonValue::String(value.to_string())))
             .unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_metadata" => row
             .metadata
-            .as_ref()
             .map(|metadata| Ok(EntityEvalValue::Json(metadata.value().clone())))
             .transpose()
             .map(|metadata| metadata.unwrap_or(EntityEvalValue::SqlNull)),
         "lixcol_global" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.global))),
         "lixcol_untracked" => Ok(EntityEvalValue::Json(JsonValue::Bool(row.untracked))),
         "lixcol_branch_id" => Ok(EntityEvalValue::Json(JsonValue::String(
-            row.branch_id.clone(),
+            row.branch_id.to_string(),
         ))),
         _ => Ok(EntityEvalValue::SqlNull),
     }

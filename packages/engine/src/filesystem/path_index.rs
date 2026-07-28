@@ -16,7 +16,8 @@ use crate::changelog::{ChangeId, CommitId};
 use crate::common::{LixTimestamp, compose_directory_path, compose_file_path};
 use crate::entity_pk::EntityPk;
 use crate::live_state::{
-    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateRow,
+    LiveStateFilter, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateRow,
 };
 use crate::storage_adapter::{
     PointReadPlan, StorageAdapterRead, StorageCoreProjection, StorageGetOptions, StorageKey,
@@ -114,8 +115,8 @@ impl FilesystemPathEntry {
             }
             .to_string(),
             file_id: self.key.file_id().map(str::to_string),
-            snapshot_content: Some(snapshot_content.to_string()),
-            metadata: self.metadata.clone(),
+            snapshot_content: Some(snapshot_content.to_string().into()),
+            metadata: self.metadata.clone().map(Into::into),
             deleted: false,
             created_at: LixTimestamp::expect_parse(
                 "filesystem path entry created_at",
@@ -173,8 +174,14 @@ impl FilesystemPathEntry {
                 row.schema_key.capacity()
                     + row.entity_pk.estimated_heap_bytes()
                     + row.file_id.as_ref().map_or(0, String::capacity)
-                    + row.snapshot_content.as_ref().map_or(0, String::capacity)
-                    + row.metadata.as_ref().map_or(0, String::capacity)
+                    + row
+                        .snapshot_content
+                        .as_ref()
+                        .map_or(0, crate::common::SharedStr::retained_buffer_len)
+                    + row
+                        .metadata
+                        .as_ref()
+                        .map_or(0, crate::common::SharedStr::retained_buffer_len)
                     + row.branch_id.len()
             })
             + self.cached_blob_data.as_ref().map_or(0, |data| data.len())
@@ -293,16 +300,22 @@ impl Default for FilesystemPathIndex {
 }
 
 impl FilesystemPathIndex {
+    #[cfg(test)]
     pub(crate) fn from_live_rows(rows: Vec<MaterializedLiveStateRow>) -> Result<Self, LixError> {
+        Self::from_live_batch(&MaterializedLiveStateBatch::from_rows(rows))
+    }
+
+    pub(crate) fn from_live_batch(rows: &MaterializedLiveStateBatch) -> Result<Self, LixError> {
         let mut directory_rows = BTreeMap::<FilesystemDescriptorKey, DirectoryRecord>::new();
         let mut file_rows = Vec::<(FilesystemDescriptorKey, FileRecord)>::new();
         let mut blob_rows = BTreeMap::<FilesystemBlobRefKey, MaterializedLiveStateRow>::new();
 
-        for row in &rows {
-            if row.schema_key != BLOB_REF_SCHEMA_KEY || row.deleted {
+        for row in rows.iter() {
+            if row.schema_key() != BLOB_REF_SCHEMA_KEY || row.deleted() {
                 continue;
             }
-            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str())
+            else {
                 continue;
             };
             let snapshot: serde_json::Value =
@@ -318,16 +331,17 @@ impl FilesystemPathIndex {
                     LixError::unknown("lix_binary_blob_ref snapshot is missing string id")
                 })?;
             blob_rows.insert(
-                FilesystemBlobRefKey::from_live_row(row, id.to_string()),
-                row.clone(),
+                FilesystemBlobRefKey::from_live_row_ref(row, id.to_string()),
+                row.to_owned(),
             );
         }
 
-        for row in rows {
-            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        for row in rows.iter() {
+            let Some(snapshot_content) = row.snapshot_content().map(|content| content.as_str())
+            else {
                 continue;
             };
-            match row.schema_key.as_str() {
+            match row.schema_key() {
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
                     let snapshot: DirectorySnapshot = serde_json::from_str(snapshot_content)
                         .map_err(|error| {
@@ -335,7 +349,7 @@ impl FilesystemPathIndex {
                                 "invalid lix_directory_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
                     directory_rows.insert(
                         key.clone(),
                         DirectoryRecord {
@@ -343,11 +357,11 @@ impl FilesystemPathIndex {
                             id: snapshot.id,
                             parent_id: snapshot.parent_id,
                             name: snapshot.name,
-                            metadata: row.metadata,
-                            created_at: row.created_at.to_string(),
-                            updated_at: row.updated_at.to_string(),
-                            change_id: row.change_id,
-                            commit_id: row.commit_id,
+                            metadata: row.metadata().map(ToString::to_string),
+                            created_at: row.created_at().to_string(),
+                            updated_at: row.updated_at().to_string(),
+                            change_id: row.change_id(),
+                            commit_id: row.commit_id(),
                         },
                     );
                 }
@@ -358,18 +372,18 @@ impl FilesystemPathIndex {
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    let key = FilesystemDescriptorKey::from_live_row(&row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
                     file_rows.push((
                         key,
                         FileRecord {
                             id: snapshot.id,
                             directory_id: snapshot.directory_id,
                             name: snapshot.name,
-                            metadata: row.metadata,
-                            created_at: row.created_at.to_string(),
-                            updated_at: row.updated_at.to_string(),
-                            change_id: row.change_id,
-                            commit_id: row.commit_id,
+                            metadata: row.metadata().map(ToString::to_string),
+                            created_at: row.created_at().to_string(),
+                            updated_at: row.updated_at().to_string(),
+                            change_id: row.change_id(),
+                            commit_id: row.commit_id(),
                         },
                     ));
                 }
@@ -819,7 +833,7 @@ impl FilesystemPathIndex {
             name,
             key,
             parent_identity: None,
-            metadata: row.metadata.clone(),
+            metadata: row.metadata.as_ref().map(ToString::to_string),
             created_at: row.created_at.to_string(),
             updated_at: row.updated_at.to_string(),
             change_id: row.change_id,
@@ -1116,13 +1130,13 @@ pub(crate) async fn build_path_index(
     live_state: &dyn LiveStateReader,
     request: &FilesystemPathIndexRequest,
 ) -> Result<Arc<FilesystemPathIndex>, LixError> {
-    let rows = live_state.scan_rows(&request.live_state_request()).await?;
+    let rows = live_state.scan_batch(&request.live_state_request()).await?;
     #[cfg(test)]
     {
         FULL_REBUILD_BUILDS.fetch_add(1, Ordering::SeqCst);
         FULL_REBUILD_DESCRIPTOR_ROWS.fetch_add(rows.len(), Ordering::SeqCst);
     }
-    Ok(Arc::new(FilesystemPathIndex::from_live_rows(rows)?))
+    Ok(Arc::new(FilesystemPathIndex::from_live_batch(&rows)?))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1411,6 +1425,38 @@ mod tests {
     use super::*;
     use crate::changelog::{ChangeId, CommitId};
     use crate::entity_pk::EntityPk;
+    use crate::live_state::MaterializedLiveStateBatchBuilder;
+
+    #[derive(Clone)]
+    struct BatchOnlyLiveStateReader {
+        rows: MaterializedLiveStateBatch,
+        scan_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl LiveStateReader for BatchOnlyLiveStateReader {
+        async fn scan_batch(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            self.scan_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.rows.clone())
+        }
+
+        async fn scan_rows(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+            panic!("production path-index construction must not lower its batch to owned rows")
+        }
+
+        async fn load_row(
+            &self,
+            _request: &crate::live_state::LiveStateRowRequest,
+        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
+            unreachable!("path-index construction only scans live state")
+        }
+    }
 
     #[test]
     fn eager_blob_hydration_has_an_aggregate_cache_budget() {
@@ -1423,6 +1469,68 @@ mod tests {
             None
         );
         assert_eq!(reserve_eager_blob_cache_bytes(usize::MAX, 1), None);
+    }
+
+    #[tokio::test]
+    async fn batch_only_path_index_build_preserves_paths_scopes_and_blob_refs() {
+        const BRANCH_ID: &str = "01920000-0000-7000-8000-0000000000a1";
+        const DIRECTORY_ID: &str = "01920000-0000-7000-8000-0000000000d3";
+        const FILE_ID: &str = "01920000-0000-7000-8000-0000000000f4";
+        let mut file = file_row(FILE_ID, Some(DIRECTORY_ID), "a.md", BRANCH_ID, false);
+        file.metadata = Some(crate::common::SharedStr::from_static(
+            r#"{"source":"batch"}"#,
+        ));
+        let rows = vec![
+            blob_row(FILE_ID, "hash-from-batch", BRANCH_ID),
+            file,
+            directory_row(DIRECTORY_ID, None, "docs", BRANCH_ID, false),
+        ];
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(rows.len());
+        for row in rows {
+            builder.push_owned(row);
+        }
+        let batch = builder.finish();
+
+        let direct = FilesystemPathIndex::from_live_batch(&batch)
+            .expect("direct batch path index should build");
+        let scan_calls = Arc::new(AtomicUsize::new(0));
+        let reader = BatchOnlyLiveStateReader {
+            rows: batch,
+            scan_calls: Arc::clone(&scan_calls),
+        };
+        let built = build_path_index(
+            &reader,
+            &FilesystemPathIndexRequest::new(vec![BRANCH_ID.to_owned()]),
+        )
+        .await
+        .expect("production batch path index should build");
+
+        assert_eq!(scan_calls.load(Ordering::SeqCst), 1);
+        for index in [&direct, built.as_ref()] {
+            assert_eq!(
+                index
+                    .entries()
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["/docs/", "/docs/a.md"]
+            );
+            let file = index
+                .exact_entries("/docs/a.md")
+                .pop()
+                .expect("batch file should be indexed");
+            assert_eq!(file.kind, FilesystemPathKind::File);
+            assert_eq!(file.key.branch_id(), BRANCH_ID);
+            assert!(!file.key.global());
+            assert_eq!(file.metadata(), Some(r#"{"source":"batch"}"#));
+            assert_eq!(
+                file.blob_ref_live_row()
+                    .and_then(|row| row.snapshot_content.as_deref()),
+                Some(
+                    r#"{"blob_hash":"hash-from-batch","id":"01920000-0000-7000-8000-0000000000f4","size_bytes":7}"#
+                )
+            );
+        }
     }
 
     #[test]
@@ -1991,7 +2099,7 @@ mod tests {
             entity_pk: EntityPk::single(id),
             schema_key: schema_key.to_string(),
             file_id: None,
-            snapshot_content: Some(snapshot_content),
+            snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
             created_at: LixTimestamp::expect_parse(

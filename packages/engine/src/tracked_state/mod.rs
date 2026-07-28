@@ -14,13 +14,17 @@ pub(crate) use codec::encode_key_ref;
 pub(crate) use context::{TrackedStateContext, TrackedStateStoreReader};
 pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
-    TrackedStateDiffRequest, TrackedStateDiffRow,
+    TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
 };
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,
 };
-pub(crate) use row_materialization::materialize_rows_from_index_entries;
+pub(crate) use row_materialization::{
+    MaterializedTrackedStateBatch, MaterializedTrackedStateExactBatch,
+    MaterializedTrackedStateRowRef, materialize_batch_from_index_entries,
+    materialize_batch_from_index_entry_refs,
+};
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
     TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,

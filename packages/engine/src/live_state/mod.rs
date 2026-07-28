@@ -22,11 +22,14 @@ pub(crate) use tracked_head::{
 #[allow(unused_imports)]
 pub(crate) use types::{
     Bound, LiveStateExactBatchRequest, LiveStateExactRowRequest, LiveStateFilter,
-    LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentity, LiveStateRowRequest,
-    LiveStateScanRequest, MaterializedLiveStateRow, ScanConstraint, ScanField, ScanOperator,
+    LiveStateProjection, LiveStateRowFilter, LiveStateRowIdentityRef, LiveStateRowRequest,
+    LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateBatchBuilder,
+    MaterializedLiveStateExactBatch, MaterializedLiveStateRow, MaterializedLiveStateRowRef,
+    ScanConstraint, ScanField, ScanOperator,
 };
 #[allow(unused_imports)]
 pub(crate) use visibility::{
     StagedLiveStateRows, VisibilityBranchScope, VisibilityRequest, expanded_branch_ids,
-    overlay_load_exact_rows, overlay_scan_rows, overlay_scan_tracked_rows, resolve_visible_rows,
+    overlay_load_exact_batch, overlay_load_exact_rows, overlay_scan_batch, overlay_scan_rows,
+    overlay_scan_tracked_batch, resolve_visible_batch, resolve_visible_rows,
 };

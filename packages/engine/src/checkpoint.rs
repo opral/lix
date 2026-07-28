@@ -36,7 +36,7 @@ pub(crate) struct CheckpointHistoryEntry {
 pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRow {
     TransactionWriteRow {
         entity_pk: None,
-        schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.to_string(),
+        schema_key: CHECKPOINT_MARKER_SCHEMA_KEY.into(),
         file_id: None,
         snapshot: Some(TransactionJson::from_value_unchecked(json!({
             "branch_id": branch_id,
@@ -49,7 +49,7 @@ pub(crate) fn checkpoint_marker_stage_row(branch_id: &str) -> TransactionWriteRo
         change_id: None,
         commit_id: None,
         untracked: false,
-        branch_id: branch_id.to_string(),
+        branch_id: branch_id.into(),
     }
 }
 

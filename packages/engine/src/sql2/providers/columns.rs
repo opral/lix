@@ -14,8 +14,6 @@ use datafusion::arrow::error::ArrowError;
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
 use crate::LixError;
-use crate::live_state::MaterializedLiveStateRow;
-use crate::serialize_row_metadata;
 
 /// How one output column is produced from a row of `R`.
 ///
@@ -97,21 +95,15 @@ impl<R> ColumnTable<R> {
 pub(super) fn build_array<R>(col: &Col<R>, rows: &[R]) -> Result<ArrayRef, ColumnTableError> {
     Ok(match col {
         Col::Utf8(get) => string_array(rows.iter().map(get)),
-        Col::Utf8Owned(get) => {
-            Arc::new(StringArray::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef
-        }
+        Col::Utf8Owned(get) => Arc::new(StringArray::from_iter(rows.iter().map(get))) as ArrayRef,
         Col::Utf8Fallible(get) => Arc::new(StringArray::from(
             rows.iter()
                 .map(get)
                 .collect::<Result<Vec<_>, LixError>>()
                 .map_err(ColumnTableError::Row)?,
         )) as ArrayRef,
-        Col::Bool(get) => {
-            Arc::new(BooleanArray::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef
-        }
-        Col::I64(get) => {
-            Arc::new(Int64Array::from(rows.iter().map(get).collect::<Vec<_>>())) as ArrayRef
-        }
+        Col::Bool(get) => Arc::new(BooleanArray::from_iter(rows.iter().map(get))) as ArrayRef,
+        Col::I64(get) => Arc::new(Int64Array::from_iter(rows.iter().map(get))) as ArrayRef,
         Col::Binary(get) => Arc::new(LargeBinaryArray::from(
             rows.iter()
                 .map(get)
@@ -126,45 +118,5 @@ pub(super) fn build_array<R>(col: &Col<R>, rows: &[R]) -> Result<ArrayRef, Colum
 /// Nullable Utf8 array from borrowed values; shared by the spec files.
 #[expect(trivial_casts)]
 pub(super) fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
-    Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
+    Arc::new(StringArray::from_iter(values)) as ArrayRef
 }
-
-/// Column table over materialized live-state rows. Entity specs reuse these
-/// accessors for their `lixcol_*` system columns after stripping the prefix.
-pub(super) static LIVE_STATE_COLS: ColumnTable<MaterializedLiveStateRow> = ColumnTable {
-    columns: &[
-        (
-            "entity_pk",
-            Col::Utf8Fallible(|row| row.entity_pk.as_json_array_text().map(Some)),
-        ),
-        ("schema_key", Col::Utf8(|row| Some(&row.schema_key))),
-        ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
-        (
-            "snapshot_content",
-            Col::Utf8(|row| row.snapshot_content.as_deref()),
-        ),
-        (
-            "metadata",
-            Col::Utf8Owned(|row| row.metadata.as_deref().map(serialize_row_metadata)),
-        ),
-        (
-            "created_at",
-            Col::Utf8Owned(|row| Some(row.created_at.to_string())),
-        ),
-        (
-            "updated_at",
-            Col::Utf8Owned(|row| Some(row.updated_at.to_string())),
-        ),
-        ("global", Col::Bool(|row| Some(row.global))),
-        (
-            "change_id",
-            Col::Utf8Owned(|row| row.change_id.map(|id| id.to_string())),
-        ),
-        (
-            "commit_id",
-            Col::Utf8Owned(|row| row.commit_id.map(|id| id.to_string())),
-        ),
-        ("untracked", Col::Bool(|row| Some(row.untracked))),
-        ("branch_id", Col::Utf8(|row| Some(row.branch_id.as_ref()))),
-    ],
-};

@@ -196,7 +196,8 @@ pub(crate) async fn stage_tracked_root_from_materialized(
     parent_commit_id: Option<&str>,
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), crate::LixError> {
-    let commit_id_text = test_commit_id(commit_id).to_string();
+    let commit_id = test_commit_id(commit_id);
+    let commit_id_text = commit_id.to_string();
     let parent_commit_id_text = parent_commit_id.map(|parent| test_commit_id(parent).to_string());
     let changes = rows
         .iter()
@@ -242,6 +243,16 @@ pub(crate) async fn stage_tracked_root_from_materialized(
             }
         })
         .collect::<Vec<_>>();
+    // Production stages the packed replay index for every tracked commit,
+    // including commits that also receive a durable root. Keep rooted test
+    // fixtures faithful to that invariant so deleting a root exercises the
+    // same rootless recovery lane as a real repository.
+    let packed_deltas = deltas
+        .iter()
+        .copied()
+        .filter(|delta| delta.commit_id == commit_id)
+        .collect::<Vec<_>>();
+    crate::tracked_state::stage_commit_deltas(writes, &packed_deltas)?;
     tracked_state
         .writer(read, writes)
         .stage_commit_root(&commit_id_text, parent_commit_id_text.as_deref(), deltas)
@@ -257,7 +268,8 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
     parent_commit_id: Option<&str>,
     rows: &[MaterializedTrackedStateRow],
 ) -> Result<(), crate::LixError> {
-    let commit_id_text = test_commit_id(commit_id).to_string();
+    let commit_id = test_commit_id(commit_id);
+    let commit_id_text = commit_id.to_string();
     let parent_id_texts = parent_commit_id
         .map(|parent| vec![test_commit_id(parent).to_string()])
         .unwrap_or_default();
@@ -360,6 +372,12 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
             }
         })
         .collect::<Vec<_>>();
+    let packed_deltas = deltas
+        .iter()
+        .copied()
+        .filter(|delta| delta.commit_id == commit_id)
+        .collect::<Vec<_>>();
+    crate::tracked_state::stage_commit_deltas(writes, &packed_deltas)?;
     tracked_state
         .writer(read, writes)
         .stage_commit_root(

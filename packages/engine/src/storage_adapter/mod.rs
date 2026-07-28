@@ -22,10 +22,10 @@ mod write_set;
 mod conformance;
 
 pub use crate::storage::{
-    CoreProjection as StorageCoreProjection, GetManyRequest as StorageGetManyRequest,
-    GetManyResult as StorageGetManyResult, GetOptions as StorageGetOptions, Key as StorageKey,
-    KeyRange as StorageKeyRange, Memory, MemoryRead, MemoryWrite,
-    Precondition as StoragePrecondition, Prefix as StoragePrefix,
+    BufferRange, CoreProjection as StorageCoreProjection, EncodedMutationBatch, EncodedPut,
+    GetManyRequest as StorageGetManyRequest, GetManyResult as StorageGetManyResult,
+    GetOptions as StorageGetOptions, Key as StorageKey, KeyRange as StorageKeyRange, Memory,
+    MemoryRead, MemoryWrite, Precondition as StoragePrecondition, Prefix as StoragePrefix,
     ProjectedValue as StorageProjectedValue, ReadDurability as StorageReadDurability,
     ReadEntry as StorageReadEntry, ReadOptions as StorageReadOptions,
     ScanChunk as StorageScanChunk, ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId,
@@ -42,4 +42,6 @@ pub use spaces::StorageSpace;
 pub use stats::{
     StorageReadResult, StorageReadStats, StorageReadStatsCollector, StorageWriteSetStats,
 };
+#[cfg(any(test, feature = "storage-benches"))]
+pub use write_set::StorageWriteSetArenaStats;
 pub use write_set::{StorageWriteSet, StorageWriteSetError};

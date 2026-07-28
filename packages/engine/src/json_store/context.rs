@@ -4,8 +4,9 @@ use crate::json_store::types::{
     JsonLoadBatch, JsonLoadRequestRef, JsonRef, JsonWritePlacementRef, NormalizedJsonRef,
 };
 use crate::storage_adapter::{
-    ScanPlan, StorageAdapterRead, StorageCoreProjection, StorageKey, StoragePrefix,
-    StorageScanOptions, StorageSpace, StorageSpaceId, StorageValue, StorageWriteSet,
+    BufferRange, EncodedMutationBatch, EncodedPut, ScanPlan, StorageAdapterRead,
+    StorageCoreProjection, StorageKey, StoragePrefix, StorageScanOptions, StorageSpace,
+    StorageSpaceId, StorageWriteSet,
 };
 use bytes::Bytes;
 use std::collections::HashSet;
@@ -25,6 +26,7 @@ pub(crate) const UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE: StorageSpace = StorageS
 );
 
 const UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE: &[u8] = b"\x01";
+const JSON_REF_BYTES: usize = 32;
 
 /// One candidate record discovered from the pinned repository-GC view.
 ///
@@ -145,6 +147,12 @@ where
 
 pub(crate) struct JsonStoreWriter;
 
+#[derive(Clone, Copy)]
+struct UniqueJsonPayloadRef<'a> {
+    json_ref: JsonRef,
+    normalized: &'a str,
+}
+
 impl JsonStoreWriter {
     fn new() -> Self {
         Self
@@ -158,36 +166,66 @@ impl JsonStoreWriter {
         payloads: impl IntoIterator<Item = NormalizedJsonRef<'a>>,
     ) -> Result<Vec<JsonRef>, LixError> {
         let JsonWritePlacementRef::OutOfBand = placement;
-        let mut unique_encoded = Vec::new();
-        let mut order = Vec::new();
-        let mut seen = HashSet::new();
+        let payloads = payloads.into_iter();
+        let (lower_bound, upper_bound) = payloads.size_hint();
+        let row_capacity = upper_bound.unwrap_or(lower_bound);
+        let mut unique_payloads = Vec::with_capacity(row_capacity);
+        let mut value_plan = store::StoredJsonBatchPlan::default();
+        let mut order = Vec::with_capacity(row_capacity);
+        let mut seen = HashSet::with_capacity(row_capacity);
         for payload in payloads {
-            let encoded = match payload.trusted_json_ref() {
-                Some(json_ref) => store::encode_json_str_with_ref(payload.normalized(), json_ref)?,
-                None => store::encode_json_str(payload.normalized())?,
-            };
-            let hash: [u8; 32] = encoded
-                .json_ref
+            let normalized = payload.normalized();
+            let json_ref = payload
+                .trusted_json_ref()
+                .unwrap_or_else(|| JsonRef::for_content(normalized.as_bytes()));
+            let hash: [u8; 32] = json_ref
                 .as_hash_bytes()
                 .try_into()
                 .expect("json ref hash is fixed size");
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_json_store_stage_bytes(hash);
-            order.push(encoded.json_ref);
+            order.push(json_ref);
             if seen.insert(hash) {
-                unique_encoded.push(encoded);
+                value_plan.push_json(normalized)?;
+                unique_payloads.push(UniqueJsonPayloadRef {
+                    json_ref,
+                    normalized,
+                });
             }
         }
 
-        for encoded in &unique_encoded {
-            writes.put(
-                store::JSON_SPACE,
-                StorageKey(Bytes::copy_from_slice(encoded.json_ref.as_hash_bytes())),
-                StorageValue {
-                    bytes: Bytes::from(store::encode_direct_json_payload(encoded)),
-                },
-            );
+        if unique_payloads.is_empty() {
+            return Ok(order);
         }
+
+        const JSON_REF_BYTES: usize = 32;
+        let key_bytes_len = unique_payloads
+            .len()
+            .checked_mul(JSON_REF_BYTES)
+            .ok_or_else(|| LixError::unknown("JSON-store key batch exceeds addressable memory"))?;
+        let mut key_bytes = Vec::with_capacity(key_bytes_len);
+        let mut value_encoder = value_plan.encoder()?;
+        let mut puts = Vec::with_capacity(unique_payloads.len());
+        for payload in unique_payloads {
+            let key_offset = key_bytes.len();
+            key_bytes.extend_from_slice(payload.json_ref.as_hash_bytes());
+            let value_range =
+                value_encoder.append_json_with_ref(payload.normalized, payload.json_ref)?;
+            puts.push(EncodedPut {
+                key: BufferRange::new(key_offset, JSON_REF_BYTES),
+                value: BufferRange::new(value_range.start, value_range.len()),
+            });
+        }
+        debug_assert_eq!(key_bytes.len(), key_bytes_len);
+        let value_bytes = value_encoder.finish();
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::from(value_bytes),
+            puts,
+            Vec::new(),
+        )
+        .expect("JSON-store batch descriptors are built from arena offsets");
+        writes.stage_encoded_batch(store::JSON_SPACE, batch);
 
         Ok(order)
     }
@@ -196,51 +234,228 @@ impl JsonStoreWriter {
     /// current-state owner in this atomic write. Repeated content hashes are
     /// idempotent: they remain one durable GC hint until a sweep proves them
     /// dead.
-    pub(crate) fn stage_untracked_reclaim_candidates(
-        writes: &mut StorageWriteSet,
-        refs: impl IntoIterator<Item = JsonRef>,
-    ) {
-        // The caller can retire thousands of rows in one current-state
-        // mutation. Batch the idempotent puts so the write set indexes the
-        // candidate lane once rather than linearly rescanning it per hash.
-        // The write-set helper also coalesces a candidate emitted by an
+    pub(crate) fn stage_untracked_reclaim_candidates<I>(writes: &mut StorageWriteSet, refs: I)
+    where
+        I: IntoIterator<Item = JsonRef>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let refs = refs.into_iter();
+        let row_capacity = refs.len();
+        let mut key_bytes =
+            Vec::with_capacity(row_capacity.checked_mul(JSON_REF_BYTES).unwrap_or_default());
+        let mut puts = Vec::with_capacity(row_capacity);
+        for json_ref in refs {
+            let offset = key_bytes.len();
+            key_bytes.extend_from_slice(json_ref.as_hash_bytes());
+            puts.push(EncodedPut {
+                key: BufferRange::new(offset, JSON_REF_BYTES),
+                value: BufferRange::new(0, UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE.len()),
+            });
+        }
+        if puts.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::from_static(UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE),
+            puts,
+            Vec::new(),
+        )
+        .expect("JSON reclaim candidate descriptors are built from arena offsets");
+        // The write-set helper coalesces an identical hint emitted by an
         // earlier current-state staging call in the same atomic commit.
-        writes.put_content_addressed_batch(
-            UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE,
-            refs.into_iter().map(|json_ref| {
-                (
-                    StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes())),
-                    StorageValue {
-                        bytes: Bytes::from_static(UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE),
-                    },
-                )
-            }),
-        );
+        writes.stage_content_addressed_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
     /// Removes only candidate hints whose payload was proved dead (or whose
     /// key was malformed) from the same pinned GC view.
-    pub(crate) fn stage_delete_untracked_reclaim_candidates(
+    pub(crate) fn stage_delete_untracked_reclaim_candidates<I>(
         writes: &mut StorageWriteSet,
-        keys: impl IntoIterator<Item = StorageKey>,
-    ) {
+        keys: I,
+    ) where
+        I: IntoIterator<Item = StorageKey>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let keys = keys.into_iter();
+        let row_capacity = keys.len();
+        let mut key_bytes =
+            Vec::with_capacity(row_capacity.checked_mul(JSON_REF_BYTES).unwrap_or_default());
+        let mut deletes = Vec::with_capacity(row_capacity);
         for key in keys {
-            writes.delete(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, key);
+            let offset = key_bytes.len();
+            key_bytes.extend_from_slice(&key.0);
+            deletes.push(BufferRange::new(offset, key.0.len()));
         }
+        if deletes.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::new(),
+            Vec::new(),
+            deletes,
+        )
+        .expect("JSON reclaim candidate delete descriptors are built from arena offsets");
+        writes.stage_encoded_batch(UNTRACKED_JSON_RECLAIM_CANDIDATE_SPACE, batch);
     }
 
     #[allow(dead_code)] // Activated by the checkpoint GC integration.
     #[expect(clippy::unused_self)]
-    pub(crate) fn stage_delete_refs(
-        &self,
-        writes: &mut StorageWriteSet,
-        refs: impl IntoIterator<Item = JsonRef>,
-    ) {
+    pub(crate) fn stage_delete_refs<I>(&self, writes: &mut StorageWriteSet, refs: I)
+    where
+        I: IntoIterator<Item = JsonRef>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let refs = refs.into_iter();
+        let row_capacity = refs.len();
+        let mut key_bytes =
+            Vec::with_capacity(row_capacity.checked_mul(JSON_REF_BYTES).unwrap_or_default());
+        let mut deletes = Vec::with_capacity(row_capacity);
         for json_ref in refs {
-            writes.delete(
-                store::JSON_SPACE,
-                StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes())),
-            );
+            let offset = key_bytes.len();
+            key_bytes.extend_from_slice(json_ref.as_hash_bytes());
+            deletes.push(BufferRange::new(offset, JSON_REF_BYTES));
         }
+        if deletes.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::new(),
+            Vec::new(),
+            deletes,
+        )
+        .expect("JSON-store delete descriptors are built from arena offsets");
+        writes.stage_encoded_batch(store::JSON_SPACE, batch);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json_store::types::JsonReadScopeRef;
+    use crate::storage_adapter::{Memory, StorageAdapter, StorageReadOptions, StorageWriteOptions};
+
+    #[tokio::test]
+    async fn stage_batch_deduplicates_into_one_key_and_value_arena() {
+        let first = format!(r#"{{"kind":"first","data":"{}"}}"#, "a".repeat(1_024));
+        let second = format!(r#"{{"kind":"second","data":"{}"}}"#, "b".repeat(1_024));
+        let storage = StorageAdapter::new(Memory::new());
+        let mut writes = storage.new_write_set();
+        let refs = JsonStoreContext::new()
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::OutOfBand,
+                [
+                    NormalizedJsonRef::new(&first),
+                    NormalizedJsonRef::new(&first),
+                    NormalizedJsonRef::new(&second),
+                ],
+            )
+            .expect("JSON batch should stage");
+
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0], refs[1], "duplicate content keeps request order");
+        assert_ne!(refs[0], refs[2]);
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.spaces, 1);
+        assert_eq!(arenas.put_descriptors, 2);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, 2 * 32);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        assert_eq!(arenas.key_inline_bytes, 0);
+        assert_eq!(arenas.value_inline_bytes, 0);
+
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("shared JSON batch should commit");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let loaded = JsonStoreContext::new()
+            .load_bytes_many(
+                &read,
+                JsonLoadRequestRef {
+                    refs: &refs,
+                    scope: JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await
+            .expect("shared JSON batch should decode")
+            .into_values();
+        assert_eq!(
+            loaded,
+            vec![
+                Some(Bytes::copy_from_slice(first.as_bytes())),
+                Some(Bytes::copy_from_slice(first.as_bytes())),
+                Some(Bytes::copy_from_slice(second.as_bytes())),
+            ]
+        );
+        assert_eq!(
+            loaded[0].as_ref().expect("first payload").as_ptr(),
+            loaded[1].as_ref().expect("duplicate payload").as_ptr(),
+            "duplicate request rows must share one loaded payload buffer"
+        );
+    }
+
+    #[test]
+    fn reclaim_and_delete_batches_use_one_key_arena_for_ten_thousand_rows() {
+        const ROW_COUNT: usize = 10_000;
+
+        let refs = (0_u32..ROW_COUNT as u32)
+            .map(|index| JsonRef::for_content(&index.to_be_bytes()))
+            .collect::<Vec<_>>();
+
+        let mut candidate_puts = StorageWriteSet::new();
+        JsonStoreWriter::stage_untracked_reclaim_candidates(
+            &mut candidate_puts,
+            refs.iter().copied(),
+        );
+        // A later domain stage of the same content-addressed hints must discard
+        // descriptors without retaining another pair of arenas.
+        JsonStoreWriter::stage_untracked_reclaim_candidates(
+            &mut candidate_puts,
+            refs.iter().copied(),
+        );
+        let arenas = candidate_puts.arena_stats();
+        assert_eq!(arenas.put_descriptors, ROW_COUNT);
+        assert_eq!(arenas.delete_descriptors, 0);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, ROW_COUNT * JSON_REF_BYTES);
+        assert_eq!(arenas.value_shared_buffers, 1);
+        assert_eq!(
+            arenas.value_shared_bytes,
+            UNTRACKED_JSON_RECLAIM_CANDIDATE_VALUE.len()
+        );
+
+        let candidate_keys = refs
+            .iter()
+            .map(|json_ref| StorageKey(Bytes::copy_from_slice(json_ref.as_hash_bytes())))
+            .collect::<Vec<_>>();
+        let mut candidate_deletes = StorageWriteSet::new();
+        JsonStoreWriter::stage_delete_untracked_reclaim_candidates(
+            &mut candidate_deletes,
+            candidate_keys,
+        );
+        let arenas = candidate_deletes.arena_stats();
+        assert_eq!(arenas.put_descriptors, 0);
+        assert_eq!(arenas.delete_descriptors, ROW_COUNT);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, ROW_COUNT * JSON_REF_BYTES);
+        assert_eq!(arenas.value_shared_buffers, 0);
+
+        let mut payload_deletes = StorageWriteSet::new();
+        JsonStoreContext::new()
+            .writer()
+            .stage_delete_refs(&mut payload_deletes, refs.iter().copied());
+        let arenas = payload_deletes.arena_stats();
+        assert_eq!(arenas.put_descriptors, 0);
+        assert_eq!(arenas.delete_descriptors, ROW_COUNT);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, ROW_COUNT * JSON_REF_BYTES);
+        assert_eq!(arenas.value_shared_buffers, 0);
     }
 }

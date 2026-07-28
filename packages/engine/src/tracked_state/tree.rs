@@ -15,32 +15,37 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use bytes::Bytes;
 use lru::LruCache;
 
 use crate::storage_adapter::{StorageAdapterRead, StorageWriteSet};
 use crate::tracked_state::codec::{
     ChildSummary, ChildSummaryRef, DecodedLeafNodeRef, DecodedNode, DecodedNodeRef,
-    EncodedLeafEntry, EncodedLeafEntryRef, PendingChunkWrite, boundary_trigger,
-    child_summary_from_node, decode_key, decode_key_with_trusted_prefix, decode_node,
-    decode_node_ref, decode_value, decode_visible_value, encode_internal_node,
-    encode_internal_node_refs, encode_key, encode_key_ref, encode_leaf_node, encode_leaf_node_refs,
-    encode_schema_file_prefix, encode_schema_key_prefix, encode_value_ref,
+    EncodedLeafEntry, EncodedLeafEntryRef, PendingChunk, PendingChunkBatch,
+    TrackedStateKeyBatchBuilder, boundary_trigger, decode_key, decode_key_shared,
+    decode_key_with_trusted_prefix, decode_node, decode_node_ref, decode_value,
+    decode_visible_value, encode_internal_node, encode_internal_node_refs, encode_key,
+    encode_key_ref_into, encode_leaf_node, encode_leaf_node_refs, encode_schema_file_prefix,
+    encode_schema_key_prefix, encode_value_ref, encode_value_ref_into, hash_bytes,
 };
+use crate::tracked_state::diff::{TrackedStateTreeDiffBatch, TrackedStateTreeDiffBatchBuilder};
 use crate::tracked_state::storage;
+#[cfg(test)]
+use crate::tracked_state::types::TrackedStateTreeDiffEntry;
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateApplyResult, TrackedStateDeltaRef,
     TrackedStateIndexValue, TrackedStateIndexValueRef, TrackedStateKey, TrackedStateKeyRef,
-    TrackedStateMutation, TrackedStateRootId, TrackedStateRootMutationRef,
-    TrackedStateTreeDiffEntry, TrackedStateTreeScanRequest,
+    TrackedStateMutation, TrackedStateMutationBatch, TrackedStateRootId,
+    TrackedStateRootMutationRef, TrackedStateTreeScanRequest,
 };
 use crate::{LixError, NullableKeyFilter};
 
 // Nodes are immutable and addressed by their BLAKE3 content hash, so verified
 // bytes are safe to share across tree clones. Nodes larger than the configured
 // maximum chunk size bypass the cache, bounding production payload bytes at
-// about 64 MiB (excluding cache metadata and live Arcs held by callers).
+// about 64 MiB (excluding cache metadata and live `Bytes` views held by callers).
 const TRACKED_STATE_NODE_CACHE_CAPACITY: usize = 4096;
-type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Arc<[u8]>>;
+type TrackedStateNodeCache = LruCache<[u8; TRACKED_STATE_HASH_BYTES], Bytes>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateTreeOptions {
@@ -124,7 +129,7 @@ impl TrackedStateTree {
                     let child = internal
                         .children()
                         .iter()
-                        .find(|child| child.last_key.as_slice() >= encoded_key.as_slice())
+                        .find(|child| child.last_key.as_ref() >= encoded_key.as_slice())
                         .or_else(|| internal.children().last())
                         .ok_or_else(|| {
                             LixError::new(
@@ -148,11 +153,31 @@ impl TrackedStateTree {
             return Ok(Vec::new());
         }
 
-        let mut encoded_keys = keys
-            .iter()
-            .enumerate()
-            .map(|(index, key)| (index, encode_key(key)))
-            .collect::<Vec<_>>();
+        let mut key_batch = TrackedStateKeyBatchBuilder::with_row_capacity(keys.len());
+        for key in keys {
+            key_batch.push(TrackedStateKeyRef {
+                schema_key: &key.schema_key,
+                file_id: key.file_id.as_deref(),
+                entity_pk: &key.entity_pk,
+            });
+        }
+        let encoded_keys = key_batch.finish();
+        self.get_many_encoded(store, root_id, &encoded_keys).await
+    }
+
+    /// Resolves an arena-backed encoded identity batch without materializing
+    /// row-owned schema or file strings.
+    pub(crate) async fn get_many_encoded(
+        &self,
+        store: &(impl StorageAdapterRead + ?Sized),
+        root_id: &TrackedStateRootId,
+        keys: &[Bytes],
+    ) -> Result<Vec<Option<TrackedStateIndexValue>>, LixError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut encoded_keys = keys.iter().cloned().enumerate().collect::<Vec<_>>();
         encoded_keys.sort_by(|left, right| left.1.cmp(&right.1));
 
         let mut values = vec![None; keys.len()];
@@ -216,12 +241,12 @@ impl TrackedStateTree {
         left_root: Option<&TrackedStateRootId>,
         right_root: Option<&TrackedStateRootId>,
         request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<TrackedStateTreeDiffEntry>, LixError> {
+    ) -> Result<TrackedStateTreeDiffBatch, LixError> {
         match (left_root, right_root) {
-            (None, None) => Ok(Vec::new()),
-            (Some(left), Some(right)) if left == right => Ok(Vec::new()),
+            (None, None) => Ok(TrackedStateTreeDiffBatch::default()),
+            (Some(left), Some(right)) if left == right => Ok(TrackedStateTreeDiffBatch::default()),
             (Some(left), Some(right)) => {
-                let mut out = Vec::new();
+                let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
                 self.diff_nodes(
                     store,
                     *left.as_bytes(),
@@ -230,26 +255,36 @@ impl TrackedStateTree {
                     &mut out,
                 )
                 .await?;
-                Ok(out)
+                out.finish()
             }
-            (Some(left), None) => Ok(self
-                .collect_filtered_entries(store, left, request)
-                .await?
-                .into_iter()
-                .map(|(key, value)| TrackedStateTreeDiffEntry {
-                    before: Some((key, value)),
-                    after: None,
-                })
-                .collect()),
-            (None, Some(right)) => Ok(self
-                .collect_filtered_entries(store, right, request)
-                .await?
-                .into_iter()
-                .map(|(key, value)| TrackedStateTreeDiffEntry {
-                    before: None,
-                    after: Some((key, value)),
-                })
-                .collect()),
+            (Some(left), None) => {
+                let ranges = scan_ranges(request);
+                let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+                self.collect_root_diff_shared(
+                    store,
+                    *left.as_bytes(),
+                    request,
+                    &ranges,
+                    true,
+                    &mut out,
+                )
+                .await?;
+                out.finish()
+            }
+            (None, Some(right)) => {
+                let ranges = scan_ranges(request);
+                let mut out = TrackedStateTreeDiffBatchBuilder::with_row_capacity(0);
+                self.collect_root_diff_shared(
+                    store,
+                    *right.as_bytes(),
+                    request,
+                    &ranges,
+                    false,
+                    &mut out,
+                )
+                .await?;
+                out.finish()
+            }
         }
     }
 
@@ -259,7 +294,7 @@ impl TrackedStateTree {
         store: &(impl StorageAdapterRead + ?Sized),
         writes: &mut StorageWriteSet,
         base_root: Option<&TrackedStateRootId>,
-        mutations: Vec<TrackedStateMutation>,
+        mutations: TrackedStateMutationBatch,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
         let mut overlay = storage::TrackedStateChunkOverlay::new();
@@ -280,9 +315,10 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         base_root: Option<&TrackedStateRootId>,
-        mut mutations: Vec<TrackedStateMutation>,
+        mutations: TrackedStateMutationBatch,
         commit_id: Option<&str>,
     ) -> Result<TrackedStateApplyResult, LixError> {
+        let mut mutations = mutations.into_mutations();
         // The normal bulk tracked-write path already arrives in primary-key
         // order.  With no parent root there is nothing to merge it with, so
         // preserve that order directly instead of routing every row through a
@@ -363,6 +399,7 @@ impl TrackedStateTree {
         writes: &mut StorageWriteSet,
         overlay: &mut storage::TrackedStateChunkOverlay,
         root_id: &TrackedStateRootId,
+        mutation_count: usize,
         file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'a>>,
         mutations: I,
         commit_id: Option<&str>,
@@ -371,9 +408,9 @@ impl TrackedStateTree {
         I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
     {
         let mut parent_entries = OrderedLeafCursor::new(*root_id.as_bytes());
-        let mut mutations = mutations.into_iter();
-        let mut next_mutation = next_root_mutation(&mut mutations)?;
-        let mut assembler = OrderedTreeAssembler::new(&self.options);
+        let mut mutations = collect_pending_root_mutations(mutation_count, mutations)?;
+        let mut next_mutation = mutations.pop_front();
+        let mut assembler = OrderedTreeAssembler::new(&self.options, mutation_count);
         let mut cascaded_rows = 0usize;
 
         let mut next_parent_entry = parent_entries.next(self, store, overlay).await?;
@@ -386,11 +423,11 @@ impl TrackedStateTree {
                 next_parent_entry = parent_entries.next(self, store, overlay).await?;
                 continue;
             };
-            match mutation.encoded_key.cmp(&parent_entry.key) {
+            match mutation.encoded_key.as_ref().cmp(parent_entry.key.as_ref()) {
                 std::cmp::Ordering::Less => {
                     let created_at = mutation.delta.created_at;
-                    assembler.push(mutation.into_entry(created_at))?;
-                    next_mutation = next_root_mutation(&mut mutations)?;
+                    assembler.push_mutation(mutation, created_at)?;
+                    next_mutation = mutations.pop_front();
                     next_parent_entry = Some(parent_entry);
                 }
                 std::cmp::Ordering::Equal => {
@@ -398,8 +435,8 @@ impl TrackedStateTree {
                     if mutation.require_absence && !parent_value.deleted() {
                         return Err(duplicate_root_insert_error(&mutation.delta));
                     }
-                    assembler.push(mutation.into_entry(parent_value.created_at()))?;
-                    next_mutation = next_root_mutation(&mut mutations)?;
+                    assembler.push_mutation(mutation, parent_value.created_at())?;
+                    next_mutation = mutations.pop_front();
                     next_parent_entry = parent_entries.next(self, store, overlay).await?;
                 }
                 std::cmp::Ordering::Greater => {
@@ -415,8 +452,8 @@ impl TrackedStateTree {
 
         while let Some(mutation) = next_mutation {
             let created_at = mutation.delta.created_at;
-            assembler.push(mutation.into_entry(created_at))?;
-            next_mutation = next_root_mutation(&mut mutations)?;
+            assembler.push_mutation(mutation, created_at)?;
+            next_mutation = mutations.pop_front();
         }
 
         let built = assembler.finish(self)?;
@@ -491,7 +528,7 @@ impl TrackedStateTree {
         };
         let target_leaf_index = leaves
             .iter()
-            .position(|leaf| leaf.last_key.as_slice() >= encoded_key.as_slice())
+            .position(|leaf| leaf.last_key.as_ref() >= encoded_key.as_ref())
             .unwrap_or_else(|| leaves.len().saturating_sub(1));
         let Some(target_leaf) = leaves.get(target_leaf_index).cloned() else {
             return Ok(MutationApply::Fallback(TrackedStateMutation {
@@ -503,32 +540,31 @@ impl TrackedStateTree {
         let mut entries = self
             .load_leaf_entries_with_overlay(store, overlay, &target_leaf.child_hash)
             .await?;
-        let mutation_entry_index = match entries
-            .binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key.as_slice()))
-        {
-            Ok(index) => {
-                if entries[index].value.as_slice() == encoded_value.as_slice() {
-                    return Ok(MutationApply::Fallback(TrackedStateMutation {
-                        encoded_key,
-                        encoded_value,
-                    }));
+        let mutation_entry_index =
+            match entries.binary_search_by(|entry| entry.key.as_ref().cmp(encoded_key.as_ref())) {
+                Ok(index) => {
+                    if entries[index].value.as_ref() == encoded_value.as_ref() {
+                        return Ok(MutationApply::Fallback(TrackedStateMutation {
+                            encoded_key,
+                            encoded_value,
+                        }));
+                    }
+                    entries[index].value = encoded_value;
+                    index
                 }
-                entries[index].value = encoded_value;
-                index
-            }
-            Err(index) => {
-                entries.insert(
-                    index,
-                    EncodedLeafEntry {
-                        key: encoded_key,
-                        value: encoded_value,
-                    },
-                );
-                index
-            }
-        };
+                Err(index) => {
+                    entries.insert(
+                        index,
+                        EncodedLeafEntry {
+                            key: encoded_key,
+                            value: encoded_value,
+                        },
+                    );
+                    index
+                }
+            };
 
-        let mut chunks = BTreeMap::new();
+        let mut chunks = PendingChunkBatchBuilder::default();
         let mut suffix_entries = entries;
         let mut next_leaf_index = target_leaf_index + 1;
         let mut replacement_leaves;
@@ -537,7 +573,7 @@ impl TrackedStateTree {
         // Rechunk from the edited leaf until a generated leaf matches an
         // existing post-mutation leaf, then reuse the rest of the old suffix.
         loop {
-            let mut candidate_chunks = BTreeMap::new();
+            let mut candidate_chunks = PendingChunkBatchBuilder::default();
             let candidate_summaries = self.build_leaf_level_from_refs(
                 suffix_entries.iter().map(EncodedLeafEntry::as_ref),
                 &mut candidate_chunks,
@@ -546,12 +582,10 @@ impl TrackedStateTree {
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_summaries,
                 &leaves[target_leaf_index..],
-                suffix_entries[mutation_entry_index].key.as_slice(),
+                suffix_entries[mutation_entry_index].key.as_ref(),
             ) {
                 for summary in &candidate_summaries[..generated_resync_index] {
-                    if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
-                        chunks.entry(chunk.hash).or_insert(chunk);
-                    }
+                    chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
                 }
                 replacement_leaves = candidate_summaries
                     .into_iter()
@@ -585,7 +619,7 @@ impl TrackedStateTree {
             old_leaf_count,
             std::mem::take(&mut replacement_leaves),
             chunks,
-            suffix_entries[mutation_entry_index].key.as_slice(),
+            suffix_entries[mutation_entry_index].key.as_ref(),
         )?;
         overlay.stage_chunks(writes, &built.chunks);
 
@@ -604,7 +638,7 @@ impl TrackedStateTree {
         left_hash: [u8; TRACKED_STATE_HASH_BYTES],
         right_hash: [u8; TRACKED_STATE_HASH_BYTES],
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
         if left_hash == right_hash {
             return Ok(());
@@ -740,25 +774,25 @@ impl TrackedStateTree {
         left: &[EncodedLeafEntry],
         right: &[EncodedLeafEntry],
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
         let mut left_index = 0usize;
         let mut right_index = 0usize;
         while left_index < left.len() && right_index < right.len() {
             match left[left_index].key.cmp(&right[right_index].key) {
                 std::cmp::Ordering::Less => {
-                    self.push_removed_diff(left[left_index].as_ref(), request, out)?;
+                    self.push_removed_diff(left[left_index].clone(), request, out)?;
                     left_index += 1;
                 }
                 std::cmp::Ordering::Greater => {
-                    self.push_added_diff(right[right_index].as_ref(), request, out)?;
+                    self.push_added_diff(right[right_index].clone(), request, out)?;
                     right_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
                     if left[left_index].value != right[right_index].value {
                         self.push_modified_diff(
-                            left[left_index].as_ref(),
-                            right[right_index].as_ref(),
+                            left[left_index].clone(),
+                            right[right_index].clone(),
                             request,
                             out,
                         )?;
@@ -769,10 +803,10 @@ impl TrackedStateTree {
             }
         }
         for entry in &left[left_index..] {
-            self.push_removed_diff(entry.as_ref(), request, out)?;
+            self.push_removed_diff((*entry).clone(), request, out)?;
         }
         for entry in &right[right_index..] {
-            self.push_added_diff(entry.as_ref(), request, out)?;
+            self.push_added_diff((*entry).clone(), request, out)?;
         }
         Ok(())
     }
@@ -782,14 +816,14 @@ impl TrackedStateTree {
         left: &DecodedLeafNodeRef,
         right: &DecodedLeafNodeRef,
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
         let mut left_index = 0usize;
         let mut right_index = 0usize;
         while left_index < left.len() && right_index < right.len() {
-            let left_entry = decoded_leaf_entry(left, left_index)?;
-            let right_entry = decoded_leaf_entry(right, right_index)?;
-            match left_entry.key.cmp(right_entry.key) {
+            let left_entry = decoded_leaf_entry_owned(left, left_index)?;
+            let right_entry = decoded_leaf_entry_owned(right, right_index)?;
+            match left_entry.key.cmp(&right_entry.key) {
                 std::cmp::Ordering::Less => {
                     self.push_removed_diff(left_entry, request, out)?;
                     left_index += 1;
@@ -808,11 +842,11 @@ impl TrackedStateTree {
             }
         }
         while left_index < left.len() {
-            self.push_removed_diff(decoded_leaf_entry(left, left_index)?, request, out)?;
+            self.push_removed_diff(decoded_leaf_entry_owned(left, left_index)?, request, out)?;
             left_index += 1;
         }
         while right_index < right.len() {
-            self.push_added_diff(decoded_leaf_entry(right, right_index)?, request, out)?;
+            self.push_added_diff(decoded_leaf_entry_owned(right, right_index)?, request, out)?;
             right_index += 1;
         }
         Ok(())
@@ -821,16 +855,14 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_removed_diff(
         &self,
-        entry: EncodedLeafEntryRef<'_>,
+        entry: EncodedLeafEntry,
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        let (key, value) = decode_entry(entry)?;
-        if request.matches(&key, &value) {
-            out.push(TrackedStateTreeDiffEntry {
-                before: Some((key, value)),
-                after: None,
-            });
+        let key = decode_key_shared(entry.key)?;
+        let value = decode_value(&entry.value)?;
+        if request.matches_ref(key.as_ref(), &value) {
+            out.push_shared(key, Some(value), None);
         }
         Ok(())
     }
@@ -838,16 +870,14 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_added_diff(
         &self,
-        entry: EncodedLeafEntryRef<'_>,
+        entry: EncodedLeafEntry,
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        let (key, value) = decode_entry(entry)?;
-        if request.matches(&key, &value) {
-            out.push(TrackedStateTreeDiffEntry {
-                before: None,
-                after: Some((key, value)),
-            });
+        let key = decode_key_shared(entry.key)?;
+        let value = decode_value(&entry.value)?;
+        if request.matches_ref(key.as_ref(), &value) {
+            out.push_shared(key, None, Some(value));
         }
         Ok(())
     }
@@ -855,18 +885,19 @@ impl TrackedStateTree {
     #[expect(clippy::unused_self)]
     fn push_modified_diff(
         &self,
-        left: EncodedLeafEntryRef<'_>,
-        right: EncodedLeafEntryRef<'_>,
+        left: EncodedLeafEntry,
+        right: EncodedLeafEntry,
         request: &TrackedStateTreeScanRequest,
-        out: &mut Vec<TrackedStateTreeDiffEntry>,
+        out: &mut TrackedStateTreeDiffBatchBuilder,
     ) -> Result<(), LixError> {
-        let (left_key, left_value) = decode_entry(left)?;
-        let (right_key, right_value) = decode_entry(right)?;
-        if request.matches(&left_key, &left_value) || request.matches(&right_key, &right_value) {
-            out.push(TrackedStateTreeDiffEntry {
-                before: Some((left_key, left_value)),
-                after: Some((right_key, right_value)),
-            });
+        debug_assert_eq!(left.key, right.key);
+        let key = decode_key_shared(left.key)?;
+        let left_value = decode_value(&left.value)?;
+        let right_value = decode_value(&right.value)?;
+        if request.matches_ref(key.as_ref(), &left_value)
+            || request.matches_ref(key.as_ref(), &right_value)
+        {
+            out.push_shared(key, Some(left_value), Some(right_value));
         }
         Ok(())
     }
@@ -914,7 +945,7 @@ impl TrackedStateTree {
         );
         let append_only = leaves
             .last()
-            .is_some_and(|leaf| first_mutation_key.as_slice() > leaf.last_key.as_slice());
+            .is_some_and(|leaf| first_mutation_key.as_ref() > leaf.last_key.as_ref());
         if mutations_are_sorted && !append_only && mutations.len() * 2 > base_row_count {
             return Ok(MutationApply::Applied(
                 self.rebuild_from_sorted_mutations(
@@ -924,33 +955,39 @@ impl TrackedStateTree {
             ));
         }
 
-        let mutation_map = mutation_map.take().unwrap_or_else(|| {
-            mutations
+        let mut mutations = if let Some(mutation_map) = mutation_map.take() {
+            if !append_only && mutation_map.len() * 2 > base_row_count {
+                return Ok(MutationApply::Fallback(
+                    mutation_map
+                        .into_iter()
+                        .map(|(encoded_key, encoded_value)| TrackedStateMutation {
+                            encoded_key,
+                            encoded_value,
+                        })
+                        .collect(),
+                ));
+            }
+            mutation_map
                 .into_iter()
-                .map(|mutation| (mutation.encoded_key, mutation.encoded_value))
-                .collect()
-        });
-        if !append_only && mutation_map.len() * 2 > base_row_count {
-            return Ok(MutationApply::Fallback(
-                mutation_map
-                    .into_iter()
-                    .map(|(encoded_key, encoded_value)| TrackedStateMutation {
-                        encoded_key,
-                        encoded_value,
-                    })
-                    .collect(),
-            ));
-        }
-
-        let mut mutations = mutation_map.into_iter().collect::<VecDeque<_>>();
+                .map(|(encoded_key, encoded_value)| TrackedStateMutation {
+                    encoded_key,
+                    encoded_value,
+                })
+                .collect::<VecDeque<_>>()
+        } else {
+            // Strictly ordered batches are already deduplicated by definition.
+            // Preserve their descriptor buffer rather than routing every shared
+            // key/value slice through a temporary BTreeMap.
+            VecDeque::from(mutations)
+        };
         let mut output_leaves = Vec::new();
-        let mut chunks = BTreeMap::new();
+        let mut chunks = PendingChunkBatchBuilder::default();
         let mut leaf_index = 0usize;
 
         while leaf_index < leaves.len() {
-            let current_leaf_has_mutation = mutations
-                .front()
-                .is_some_and(|(key, _)| key.as_slice() <= leaves[leaf_index].last_key.as_slice());
+            let current_leaf_has_mutation = mutations.front().is_some_and(|mutation| {
+                mutation.encoded_key.as_ref() <= leaves[leaf_index].last_key.as_ref()
+            });
             if !current_leaf_has_mutation {
                 output_leaves.push(leaves[leaf_index].clone());
                 leaf_index += 1;
@@ -961,7 +998,7 @@ impl TrackedStateTree {
             let mut window_entries = BTreeMap::new();
             let mut window_mutation_ceiling = mutations
                 .front()
-                .map(|(key, _)| key.clone())
+                .map(|mutation| mutation.encoded_key.clone())
                 .expect("window with mutation should have front mutation");
 
             loop {
@@ -974,41 +1011,40 @@ impl TrackedStateTree {
                         window_entries.insert(entry.key, entry.value);
                     }
 
-                    while mutations
-                        .front()
-                        .is_some_and(|(key, _)| key.as_slice() <= leaf.last_key.as_slice())
-                    {
-                        let (key, value) = mutations
+                    while mutations.front().is_some_and(|mutation| {
+                        mutation.encoded_key.as_ref() <= leaf.last_key.as_ref()
+                    }) {
+                        let mutation = mutations
                             .pop_front()
                             .expect("front mutation should be present");
-                        window_mutation_ceiling.clone_from(&key);
-                        window_entries.insert(key, value);
+                        window_mutation_ceiling.clone_from(&mutation.encoded_key);
+                        window_entries.insert(mutation.encoded_key, mutation.encoded_value);
                     }
                     leaf_index += 1;
                 }
 
-                while let Some((key, _)) = mutations.front() {
+                while let Some(mutation) = mutations.front() {
                     if leaf_index < leaves.len()
-                        && key.as_slice() >= leaves[leaf_index].first_key.as_slice()
+                        && mutation.encoded_key.as_ref() >= leaves[leaf_index].first_key.as_ref()
                     {
                         break;
                     }
-                    let (key, value) = mutations
+                    let mutation = mutations
                         .pop_front()
                         .expect("front mutation should be present");
-                    window_mutation_ceiling.clone_from(&key);
-                    window_entries.insert(key, value);
+                    window_mutation_ceiling.clone_from(&mutation.encoded_key);
+                    window_entries.insert(mutation.encoded_key, mutation.encoded_value);
                 }
 
                 if leaf_index < leaves.len()
-                    && mutations.front().is_some_and(|(key, _)| {
-                        key.as_slice() <= leaves[leaf_index].last_key.as_slice()
+                    && mutations.front().is_some_and(|mutation| {
+                        mutation.encoded_key.as_ref() <= leaves[leaf_index].last_key.as_ref()
                     })
                 {
                     continue;
                 }
 
-                let mut candidate_chunks = BTreeMap::new();
+                let mut candidate_chunks = PendingChunkBatchBuilder::default();
                 let candidate_leaves = self.build_leaf_level_from_refs(
                     window_entries
                         .iter()
@@ -1022,9 +1058,7 @@ impl TrackedStateTree {
                     &window_mutation_ceiling,
                 ) {
                     for summary in &candidate_leaves[..generated_resync_index] {
-                        if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
-                            chunks.entry(chunk.hash).or_insert(chunk);
-                        }
+                        chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
                     }
                     output_leaves.extend(candidate_leaves.into_iter().take(generated_resync_index));
                     leaf_index = window_start + existing_resync_index;
@@ -1042,7 +1076,10 @@ impl TrackedStateTree {
         if !mutations.is_empty() {
             let entries = mutations
                 .into_iter()
-                .map(|(key, value)| EncodedLeafEntry { key, value })
+                .map(|mutation| EncodedLeafEntry {
+                    key: mutation.encoded_key,
+                    value: mutation.encoded_value,
+                })
                 .collect();
             output_leaves.extend(self.build_leaf_level(entries, &mut chunks));
         }
@@ -1147,7 +1184,7 @@ impl TrackedStateTree {
                     let children = internal.into_children();
                     let child_index = children
                         .iter()
-                        .position(|child| child.last_key.as_slice() >= encoded_key.as_slice())
+                        .position(|child| child.last_key.as_ref() >= encoded_key.as_ref())
                         .or_else(|| (!children.is_empty()).then_some(children.len() - 1))
                         .ok_or_else(|| {
                             LixError::new(
@@ -1164,32 +1201,31 @@ impl TrackedStateTree {
             }
         };
 
-        let mutation_entry_index = match entries
-            .binary_search_by(|entry| entry.key.as_slice().cmp(encoded_key.as_slice()))
-        {
-            Ok(index) => {
-                if entries[index].value.as_slice() == encoded_value.as_slice() {
-                    return Ok(MutationApply::Fallback(TrackedStateMutation {
-                        encoded_key,
-                        encoded_value,
-                    }));
+        let mutation_entry_index =
+            match entries.binary_search_by(|entry| entry.key.as_ref().cmp(encoded_key.as_ref())) {
+                Ok(index) => {
+                    if entries[index].value.as_ref() == encoded_value.as_ref() {
+                        return Ok(MutationApply::Fallback(TrackedStateMutation {
+                            encoded_key,
+                            encoded_value,
+                        }));
+                    }
+                    entries[index].value = encoded_value;
+                    index
                 }
-                entries[index].value = encoded_value;
-                index
-            }
-            Err(index) => {
-                entries.insert(
-                    index,
-                    EncodedLeafEntry {
-                        key: encoded_key,
-                        value: encoded_value,
-                    },
-                );
-                index
-            }
-        };
+                Err(index) => {
+                    entries.insert(
+                        index,
+                        EncodedLeafEntry {
+                            key: encoded_key,
+                            value: encoded_value,
+                        },
+                    );
+                    index
+                }
+            };
 
-        let mut chunks = BTreeMap::new();
+        let mut chunks = PendingChunkBatchBuilder::default();
         let mut replacement_children;
         let mut old_child_count;
 
@@ -1208,7 +1244,7 @@ impl TrackedStateTree {
         let mut leaf_entries = entries;
         let mut next_leaf_index = leaf_parent.child_index + 1;
         loop {
-            let mut candidate_chunks = BTreeMap::new();
+            let mut candidate_chunks = PendingChunkBatchBuilder::default();
             let candidate_leaves = self.build_leaf_level_from_refs(
                 leaf_entries.iter().map(EncodedLeafEntry::as_ref),
                 &mut candidate_chunks,
@@ -1216,12 +1252,10 @@ impl TrackedStateTree {
             if let Some((generated_resync_index, existing_resync_index)) = first_resync_index(
                 &candidate_leaves,
                 &leaf_parent.children[leaf_parent.child_index..],
-                leaf_entries[mutation_entry_index].key.as_slice(),
+                leaf_entries[mutation_entry_index].key.as_ref(),
             ) {
                 for summary in &candidate_leaves[..generated_resync_index] {
-                    if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
-                        chunks.entry(chunk.hash).or_insert(chunk);
-                    }
+                    chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
                 }
                 replacement_children = candidate_leaves
                     .into_iter()
@@ -1285,8 +1319,8 @@ impl TrackedStateTree {
                         "tracked-state seek-path mutation produced no root",
                     )
                 })?;
-                let chunks = chunks.into_values().collect::<Vec<_>>();
-                let chunk_bytes = chunks.iter().map(|chunk| chunk.data.len()).sum();
+                let chunk_bytes = chunks.data.len();
+                let chunks = chunks.finish();
                 let built = BuiltTree {
                     root_id: TrackedStateRootId::new(root.child_hash),
                     chunks,
@@ -1328,7 +1362,13 @@ impl TrackedStateTree {
         entries: Vec<EncodedLeafEntry>,
     ) -> Result<BuiltTree, LixError> {
         let row_count = entries.len();
-        let mut chunks = BTreeMap::<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>::new();
+        let encoded_bytes = entries.iter().fold(64usize, |bytes, entry| {
+            bytes
+                .saturating_add(entry.key.len())
+                .saturating_add(entry.value.len())
+                .saturating_add(8)
+        });
+        let mut chunks = PendingChunkBatchBuilder::with_data_capacity(encoded_bytes);
         let mut summaries = self.build_leaf_level(entries, &mut chunks);
         let mut tree_height = 1usize;
         while summaries.len() > 1 {
@@ -1341,8 +1381,8 @@ impl TrackedStateTree {
                 "tracked-state tree tree build produced no root",
             )
         })?;
-        let chunks = chunks.into_values().collect::<Vec<_>>();
-        let chunk_bytes = chunks.iter().map(|chunk| chunk.data.len()).sum();
+        let chunk_bytes = chunks.data.len();
+        let chunks = chunks.finish();
         Ok(BuiltTree {
             root_id: TrackedStateRootId::new(root.child_hash),
             chunks,
@@ -1356,7 +1396,7 @@ impl TrackedStateTree {
     fn build_tree_from_leaf_summaries(
         &self,
         mut leaf_summaries: Vec<ChildSummary>,
-        mut chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        mut chunks: PendingChunkBatchBuilder,
     ) -> Result<BuiltTree, LixError> {
         if leaf_summaries.len() > 1 {
             // The one empty leaf is the canonical empty-tree root, not a
@@ -1388,8 +1428,8 @@ impl TrackedStateTree {
                 "tracked-state tree build from leaves produced no root",
             )
         })?;
-        let chunks = chunks.into_values().collect::<Vec<_>>();
-        let chunk_bytes = chunks.iter().map(|chunk| chunk.data.len()).sum();
+        let chunk_bytes = chunks.data.len();
+        let chunks = chunks.finish();
         Ok(BuiltTree {
             root_id: TrackedStateRootId::new(root.child_hash),
             chunks,
@@ -1406,7 +1446,7 @@ impl TrackedStateTree {
         leaf_start: usize,
         old_leaf_count: usize,
         replacement_leaves: Vec<ChildSummary>,
-        mut chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        mut chunks: PendingChunkBatchBuilder,
         mutation_key: &[u8],
     ) -> Result<BuiltTree, LixError> {
         if levels.len() <= 1 {
@@ -1462,8 +1502,8 @@ impl TrackedStateTree {
                 "tracked-state patched tree produced no root",
             )
         })?;
-        let chunks = chunks.into_values().collect::<Vec<_>>();
-        let chunk_bytes = chunks.iter().map(|chunk| chunk.data.len()).sum();
+        let chunk_bytes = chunks.data.len();
+        let chunks = chunks.finish();
         Ok(BuiltTree {
             root_id: TrackedStateRootId::new(root.child_hash),
             chunks,
@@ -1481,7 +1521,7 @@ impl TrackedStateTree {
         old_child_count: usize,
         replacement_children: Vec<ChildSummary>,
         parent_level: usize,
-        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        chunks: &mut PendingChunkBatchBuilder,
         mutation_key: &[u8],
     ) -> Result<ParentLevelPatch, LixError> {
         if old_parents.is_empty() {
@@ -1521,7 +1561,7 @@ impl TrackedStateTree {
         let mut next_parent_index = parent_end + 1;
 
         loop {
-            let mut candidate_chunks = BTreeMap::new();
+            let mut candidate_chunks = PendingChunkBatchBuilder::default();
             let candidate_parents = self.build_internal_level_from_refs(
                 window_children.iter().copied(),
                 parent_level,
@@ -1534,9 +1574,7 @@ impl TrackedStateTree {
                 mutation_key,
             ) {
                 for summary in &candidate_parents[..generated_resync_index] {
-                    if let Some(chunk) = candidate_chunks.remove(&summary.child_hash) {
-                        chunks.entry(chunk.hash).or_insert(chunk);
-                    }
+                    chunks.copy_chunk_from(&candidate_chunks, &summary.child_hash);
                 }
                 return Ok(ParentLevelPatch {
                     parent_start,
@@ -1566,7 +1604,7 @@ impl TrackedStateTree {
     fn build_leaf_level(
         &self,
         entries: Vec<EncodedLeafEntry>,
-        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        chunks: &mut PendingChunkBatchBuilder,
     ) -> Vec<ChildSummary> {
         let groups = chunk_leaf_entries(entries, &self.options);
         groups
@@ -1584,10 +1622,7 @@ impl TrackedStateTree {
                     .map(|entry| entry.key.clone())
                     .unwrap_or_default();
                 let node = encode_leaf_node(&group.entries);
-                let (chunk, summary) =
-                    child_summary_from_node(node, first_key, last_key, subtree_count);
-                chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                chunks.insert_node(node, first_key, last_key, subtree_count)
             })
             .collect()
     }
@@ -1595,7 +1630,7 @@ impl TrackedStateTree {
     fn build_leaf_level_from_refs<'a>(
         &self,
         entries: impl IntoIterator<Item = EncodedLeafEntryRef<'a>>,
-        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        chunks: &mut PendingChunkBatchBuilder,
     ) -> Vec<ChildSummary> {
         let groups = chunk_leaf_entry_refs(entries, &self.options);
         groups
@@ -1613,10 +1648,7 @@ impl TrackedStateTree {
                     .map(|entry| entry.key.to_vec())
                     .unwrap_or_default();
                 let node = encode_leaf_node_refs(&group.entries);
-                let (chunk, summary) =
-                    child_summary_from_node(node, first_key, last_key, subtree_count);
-                chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                chunks.insert_node(node, first_key.into(), last_key.into(), subtree_count)
             })
             .collect()
     }
@@ -1625,7 +1657,7 @@ impl TrackedStateTree {
         &self,
         children: Vec<ChildSummary>,
         level: usize,
-        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        chunks: &mut PendingChunkBatchBuilder,
     ) -> Vec<ChildSummary> {
         let groups = chunk_internal_entries(children, &self.options, level);
         groups
@@ -1643,10 +1675,7 @@ impl TrackedStateTree {
                     .map(|child| child.last_key.clone())
                     .unwrap_or_default();
                 let node = encode_internal_node(&group.children);
-                let (chunk, summary) =
-                    child_summary_from_node(node, first_key, last_key, subtree_count);
-                chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                chunks.insert_node(node, first_key, last_key, subtree_count)
             })
             .collect()
     }
@@ -1655,7 +1684,7 @@ impl TrackedStateTree {
         &self,
         children: impl IntoIterator<Item = ChildSummaryRef<'a>>,
         level: usize,
-        chunks: &mut BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+        chunks: &mut PendingChunkBatchBuilder,
     ) -> Vec<ChildSummary> {
         let groups = chunk_internal_entry_refs(children, &self.options, level);
         groups
@@ -1673,10 +1702,7 @@ impl TrackedStateTree {
                     .map(|child| child.last_key.to_vec())
                     .unwrap_or_default();
                 let node = encode_internal_node_refs(&group.children);
-                let (chunk, summary) =
-                    child_summary_from_node(node, first_key, last_key, subtree_count);
-                chunks.entry(chunk.hash).or_insert(chunk);
-                summary
+                chunks.insert_node(node, first_key.into(), last_key.into(), subtree_count)
             })
             .collect()
     }
@@ -1715,13 +1741,64 @@ impl TrackedStateTree {
         Ok(out)
     }
 
-    async fn collect_filtered_entries(
-        &self,
-        store: &(impl StorageAdapterRead + ?Sized),
-        root_id: &TrackedStateRootId,
-        request: &TrackedStateTreeScanRequest,
-    ) -> Result<Vec<(TrackedStateKey, TrackedStateIndexValue)>, LixError> {
-        self.scan(store, root_id, request).await
+    fn collect_root_diff_shared<'a, S>(
+        &'a self,
+        store: &'a S,
+        hash: [u8; TRACKED_STATE_HASH_BYTES],
+        request: &'a TrackedStateTreeScanRequest,
+        ranges: &'a [EncodedScanRange],
+        before_side: bool,
+        out: &'a mut TrackedStateTreeDiffBatchBuilder,
+    ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
+    where
+        S: StorageAdapterRead + ?Sized + 'a,
+    {
+        Box::pin(async move {
+            let node = self.load_node(store, &hash).await?;
+            out.reserve_exact_once(tree_diff_capacity_hint(&node, request).min(u32::MAX as usize));
+            match node {
+                DecodedNode::Leaf(leaf) => {
+                    for index in 0..leaf.len() {
+                        if scan_limit_reached(request, out.len()) {
+                            break;
+                        }
+                        let entry = leaf.entry_owned(index).ok_or_else(|| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                "tracked-state leaf entry disappeared during one-sided diff",
+                            )
+                        })?;
+                        if !encoded_key_in_scan_ranges(&entry.key, ranges) {
+                            continue;
+                        }
+                        if before_side {
+                            self.push_removed_diff(entry, request, out)?;
+                        } else {
+                            self.push_added_diff(entry, request, out)?;
+                        }
+                    }
+                }
+                DecodedNode::Internal(internal) => {
+                    for child in internal.children() {
+                        if scan_limit_reached(request, out.len()) {
+                            break;
+                        }
+                        if child_summary_overlaps_scan_ranges(child, ranges) {
+                            self.collect_root_diff_shared(
+                                store,
+                                child.child_hash,
+                                request,
+                                ranges,
+                                before_side,
+                                out,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn scan_node<'a, S>(
@@ -1803,7 +1880,7 @@ impl TrackedStateTree {
         &'a self,
         store: &'a S,
         hash: [u8; TRACKED_STATE_HASH_BYTES],
-        encoded_keys: &'a [(usize, Vec<u8>)],
+        encoded_keys: &'a [(usize, Bytes)],
         values: &'a mut [Option<TrackedStateIndexValue>],
     ) -> Pin<Box<dyn Future<Output = Result<(), LixError>> + Send + 'a>>
     where
@@ -1842,7 +1919,7 @@ impl TrackedStateTree {
                         } else {
                             let mut end = start;
                             while end < encoded_keys.len()
-                                && encoded_keys[end].1.as_slice() <= child.last_key.as_slice()
+                                && encoded_keys[end].1.as_ref() <= child.last_key.as_ref()
                             {
                                 end += 1;
                             }
@@ -1969,7 +2046,7 @@ impl TrackedStateTree {
         &self,
         store: &(impl StorageAdapterRead + ?Sized),
         hash: &[u8; TRACKED_STATE_HASH_BYTES],
-    ) -> Result<Arc<[u8]>, LixError> {
+    ) -> Result<Bytes, LixError> {
         let cached = {
             let mut cache = self
                 .node_cache
@@ -1986,12 +2063,11 @@ impl TrackedStateTree {
         })?;
         // Verify once on a durable-store miss before making the bytes reusable.
         storage::verify_chunk_hash(hash, &bytes)?;
-        let bytes: Arc<[u8]> = bytes.into();
         if bytes.len() <= self.options.max_chunk_bytes {
             self.node_cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .put(*hash, Arc::clone(&bytes));
+                .put(*hash, bytes.clone());
         }
         Ok(bytes)
     }
@@ -2015,16 +2091,100 @@ impl TrackedStateTree {
 #[derive(Debug)]
 struct BuiltTree {
     root_id: TrackedStateRootId,
-    chunks: Vec<PendingChunkWrite>,
+    chunks: PendingChunkBatch,
     row_count: usize,
     tree_height: usize,
     chunk_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PendingChunkSpan {
+    start: usize,
+    len: usize,
+}
+
+#[derive(Debug, Default)]
+struct PendingChunkBatchBuilder {
+    data: Vec<u8>,
+    chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkSpan>,
+}
+
+impl PendingChunkBatchBuilder {
+    fn with_data_capacity(data_bytes: usize) -> Self {
+        Self {
+            data: Vec::with_capacity(data_bytes),
+            chunks: BTreeMap::new(),
+        }
+    }
+
+    fn insert_node(
+        &mut self,
+        node: Vec<u8>,
+        first_key: Bytes,
+        last_key: Bytes,
+        subtree_count: u64,
+    ) -> ChildSummary {
+        let hash = hash_bytes(&node);
+        if !self.chunks.contains_key(&hash) {
+            let start = self.data.len();
+            let len = node.len();
+            self.data.extend_from_slice(&node);
+            self.chunks.insert(hash, PendingChunkSpan { start, len });
+        }
+        ChildSummary {
+            first_key,
+            last_key,
+            child_hash: hash,
+            subtree_count,
+        }
+    }
+
+    fn copy_chunk_from(&mut self, source: &Self, hash: &[u8; TRACKED_STATE_HASH_BYTES]) {
+        if self.chunks.contains_key(hash) {
+            return;
+        }
+        let span = source
+            .chunks
+            .get(hash)
+            .copied()
+            .expect("generated child summary must reference a pending chunk");
+        let start = self.data.len();
+        self.data
+            .extend_from_slice(&source.data[span.start..span.start + span.len]);
+        self.chunks.insert(
+            *hash,
+            PendingChunkSpan {
+                start,
+                len: span.len,
+            },
+        );
+    }
+
+    fn extend(&mut self, source: Self) {
+        for hash in source.chunks.keys() {
+            self.copy_chunk_from(&source, hash);
+        }
+    }
+
+    fn finish(self) -> PendingChunkBatch {
+        PendingChunkBatch::from_parts(
+            Bytes::from(self.data),
+            self.chunks
+                .into_iter()
+                .map(|(hash, span)| PendingChunk {
+                    hash,
+                    data_start: span.start,
+                    data_len: span.len,
+                })
+                .collect(),
+        )
+    }
+}
+
 struct PendingRootMutation<'a> {
     delta: TrackedStateDeltaRef<'a>,
     require_absence: bool,
-    encoded_key: Vec<u8>,
+    encoded_key: Bytes,
 }
 
 /// In-order cursor over leaf entries that reads staged chunks before the
@@ -2061,12 +2221,9 @@ impl OrderedLeafCursor {
     ) -> Result<Option<EncodedLeafEntry>, LixError> {
         loop {
             if let Some(leaf) = self.leaf.as_ref() {
-                if let Some(entry) = leaf.entry(self.leaf_entry_index)? {
+                if let Some(entry) = leaf.entry_owned(self.leaf_entry_index) {
                     self.leaf_entry_index += 1;
-                    return Ok(Some(EncodedLeafEntry {
-                        key: entry.key.to_vec(),
-                        value: entry.value.to_vec(),
-                    }));
+                    return Ok(Some(entry));
                 }
                 self.leaf = None;
                 self.leaf_entry_index = 0;
@@ -2102,22 +2259,6 @@ impl OrderedLeafCursor {
     }
 }
 
-impl PendingRootMutation<'_> {
-    fn into_entry(self, created_at: crate::common::LixTimestamp) -> EncodedLeafEntry {
-        let value = TrackedStateIndexValueRef {
-            change_id: self.delta.change_id,
-            commit_id: self.delta.commit_id,
-            deleted: self.delta.deleted,
-            created_at,
-            updated_at: self.delta.updated_at,
-        };
-        EncodedLeafEntry {
-            key: self.encoded_key,
-            value: encode_value_ref(value),
-        }
-    }
-}
-
 fn cascade_parent_entry(
     mut entry: EncodedLeafEntry,
     file_delete_cascades: &BTreeMap<String, TrackedStateDeltaRef<'_>>,
@@ -2142,27 +2283,44 @@ fn cascade_parent_entry(
         deleted: true,
         created_at: parent_value.created_at(),
         updated_at: cascade.updated_at,
-    });
+    })
+    .into();
     Ok((entry, true))
 }
 
-fn next_root_mutation<'a, I>(mutations: &mut I) -> Result<Option<PendingRootMutation<'a>>, LixError>
+fn collect_pending_root_mutations<'a, I>(
+    mutation_count: usize,
+    mutations: I,
+) -> Result<VecDeque<PendingRootMutation<'a>>, LixError>
 where
-    I: Iterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
+    I: IntoIterator<Item = Result<TrackedStateRootMutationRef<'a>, LixError>>,
 {
-    let Some(mutation) = mutations.next().transpose()? else {
-        return Ok(None);
-    };
-    let delta = mutation.delta;
-    Ok(Some(PendingRootMutation {
-        encoded_key: encode_key_ref(TrackedStateKeyRef {
-            schema_key: delta.schema_key,
-            file_id: delta.file_id,
-            entity_pk: delta.entity_pk,
-        }),
-        delta,
-        require_absence: mutation.require_absence,
-    }))
+    let mut key_arena = Vec::with_capacity(mutation_count.saturating_mul(96));
+    let mut pending = Vec::with_capacity(mutation_count);
+    for mutation in mutations {
+        let mutation = mutation?;
+        let delta = mutation.delta;
+        let encoded_key = encode_key_ref_into(
+            &mut key_arena,
+            TrackedStateKeyRef {
+                schema_key: delta.schema_key,
+                file_id: delta.file_id,
+                entity_pk: delta.entity_pk,
+            },
+        );
+        pending.push((delta, mutation.require_absence, encoded_key));
+    }
+    let key_arena = Bytes::from(key_arena);
+    Ok(pending
+        .into_iter()
+        .map(
+            |(delta, require_absence, encoded_key)| PendingRootMutation {
+                delta,
+                require_absence,
+                encoded_key: key_arena.slice(encoded_key),
+            },
+        )
+        .collect())
 }
 
 fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
@@ -2181,48 +2339,128 @@ fn duplicate_root_insert_error(delta: &TrackedStateDeltaRef<'_>) -> LixError {
 
 struct OrderedTreeAssembler<'a> {
     options: &'a TrackedStateTreeOptions,
-    current_leaf: LeafChunkAccumulator,
+    current_leaf: OrderedLeafAccumulator,
     leaf_summaries: Vec<ChildSummary>,
-    chunks: BTreeMap<[u8; TRACKED_STATE_HASH_BYTES], PendingChunkWrite>,
+    chunks: PendingChunkBatchBuilder,
+}
+
+#[derive(Debug)]
+enum OrderedLeafValue {
+    Shared(Bytes),
+    Arena(Range<usize>),
+}
+
+#[derive(Debug)]
+struct OrderedLeafEntry {
+    key: Bytes,
+    value: OrderedLeafValue,
+}
+
+#[derive(Debug, Default)]
+struct OrderedLeafAccumulator {
+    entries: Vec<OrderedLeafEntry>,
+    value_arena: Vec<u8>,
+    key_bytes: usize,
+}
+
+impl OrderedLeafAccumulator {
+    fn into_entries(self) -> Vec<EncodedLeafEntry> {
+        let value_arena = Bytes::from(self.value_arena);
+        self.entries
+            .into_iter()
+            .map(|entry| EncodedLeafEntry {
+                key: entry.key,
+                value: match entry.value {
+                    OrderedLeafValue::Shared(value) => value,
+                    OrderedLeafValue::Arena(range) => value_arena.slice(range),
+                },
+            })
+            .collect()
+    }
 }
 
 impl<'a> OrderedTreeAssembler<'a> {
-    fn new(options: &'a TrackedStateTreeOptions) -> Self {
+    fn new(options: &'a TrackedStateTreeOptions, mutation_count: usize) -> Self {
         Self {
             options,
-            current_leaf: LeafChunkAccumulator::default(),
+            current_leaf: OrderedLeafAccumulator::default(),
             leaf_summaries: Vec::new(),
-            chunks: BTreeMap::new(),
+            chunks: PendingChunkBatchBuilder::with_data_capacity(
+                mutation_count.saturating_mul(128),
+            ),
         }
     }
 
     fn push(&mut self, entry: EncodedLeafEntry) -> Result<(), LixError> {
+        let item_size = self.prepare_key(&entry.key)?;
+        self.finish_push(
+            OrderedLeafEntry {
+                key: entry.key,
+                value: OrderedLeafValue::Shared(entry.value),
+            },
+            item_size,
+        );
+        Ok(())
+    }
+
+    fn push_mutation(
+        &mut self,
+        mutation: PendingRootMutation<'_>,
+        created_at: crate::common::LixTimestamp,
+    ) -> Result<(), LixError> {
+        let item_size = self.prepare_key(&mutation.encoded_key)?;
+        let value_start = self.current_leaf.value_arena.len();
+        encode_value_ref_into(
+            &mut self.current_leaf.value_arena,
+            TrackedStateIndexValueRef {
+                change_id: mutation.delta.change_id,
+                commit_id: mutation.delta.commit_id,
+                deleted: mutation.delta.deleted,
+                created_at,
+                updated_at: mutation.delta.updated_at,
+            },
+        );
+        let value_end = self.current_leaf.value_arena.len();
+        self.finish_push(
+            OrderedLeafEntry {
+                key: mutation.encoded_key,
+                value: OrderedLeafValue::Arena(value_start..value_end),
+            },
+            item_size,
+        );
+        Ok(())
+    }
+
+    fn prepare_key(&mut self, key: &Bytes) -> Result<usize, LixError> {
         let previous_key = self
             .current_leaf
             .entries
             .last()
-            .map(|previous| previous.key.as_slice())
+            .map(|previous| previous.key.as_ref())
             .or_else(|| {
                 self.leaf_summaries
                     .last()
-                    .map(|previous| previous.last_key.as_slice())
+                    .map(|previous| previous.last_key.as_ref())
             });
-        if previous_key.is_some_and(|previous| previous >= entry.key.as_slice()) {
+        if previous_key.is_some_and(|previous| previous >= key.as_ref()) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked-state ordered bulk mutation keys must be strictly ascending",
             ));
         }
 
-        let item_size = estimate_leaf_boundary_entry_size(entry.key.len());
+        let item_size = estimate_leaf_boundary_entry_size(key.len());
         let projected_size = estimate_leaf_boundary_chunk_size(
             self.current_leaf.entries.len() + 1,
-            self.current_leaf.key_bytes + entry.key.len(),
+            self.current_leaf.key_bytes + key.len(),
         );
         if !self.current_leaf.entries.is_empty() && projected_size > self.options.max_chunk_bytes {
             self.flush_leaf();
         }
+        Ok(item_size)
+    }
 
+    fn finish_push(&mut self, entry: OrderedLeafEntry, item_size: usize) {
         self.current_leaf.key_bytes += entry.key.len();
         self.current_leaf.entries.push(entry);
         let current_size = estimate_leaf_boundary_chunk_size(
@@ -2243,7 +2481,6 @@ impl<'a> OrderedTreeAssembler<'a> {
         {
             self.flush_leaf();
         }
-        Ok(())
     }
 
     fn finish(mut self, tree: &TrackedStateTree) -> Result<BuiltTree, LixError> {
@@ -2266,9 +2503,11 @@ impl<'a> OrderedTreeAssembler<'a> {
             .last()
             .map(|entry| entry.key.clone())
             .unwrap_or_default();
-        let node = encode_leaf_node(&leaf.entries);
-        let (chunk, summary) = child_summary_from_node(node, first_key, last_key, subtree_count);
-        self.chunks.entry(chunk.hash).or_insert(chunk);
+        let entries = leaf.into_entries();
+        let node = encode_leaf_node(&entries);
+        let summary = self
+            .chunks
+            .insert_node(node, first_key, last_key, subtree_count);
         self.leaf_summaries.push(summary);
     }
 }
@@ -2571,7 +2810,7 @@ fn first_resync_index(
     for (generated_index, generated) in generated.iter().enumerate() {
         // A matching old chunk before the mutation key is only unchanged
         // prefix; resync is only valid after the mutation has been emitted.
-        if generated.first_key.as_slice() <= mutation_key {
+        if generated.first_key.as_ref() <= mutation_key {
             continue;
         }
         if let Some(existing_index) = existing.iter().position(|existing| generated == existing) {
@@ -2622,11 +2861,11 @@ fn replace_front_with_children(
     Ok(())
 }
 
-fn decoded_leaf_entry(
+fn decoded_leaf_entry_owned(
     leaf: &DecodedLeafNodeRef,
     index: usize,
-) -> Result<EncodedLeafEntryRef<'_>, LixError> {
-    leaf.entry(index)?.ok_or_else(|| {
+) -> Result<EncodedLeafEntry, LixError> {
+    leaf.entry_owned(index).ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "tracked-state leaf entry disappeared during diff",
@@ -2634,10 +2873,31 @@ fn decoded_leaf_entry(
     })
 }
 
-fn decode_entry(
-    entry: EncodedLeafEntryRef<'_>,
-) -> Result<(TrackedStateKey, TrackedStateIndexValue), LixError> {
-    Ok((decode_key(entry.key)?, decode_value(entry.value)?))
+fn decoded_node_row_count(node: &DecodedNode) -> usize {
+    match node {
+        DecodedNode::Leaf(leaf) => leaf.len(),
+        DecodedNode::Internal(internal) => internal
+            .children()
+            .iter()
+            .try_fold(0_u64, |total, child| total.checked_add(child.subtree_count))
+            .and_then(|total| usize::try_from(total).ok())
+            .unwrap_or(0),
+    }
+}
+
+fn tree_diff_capacity_hint(node: &DecodedNode, request: &TrackedStateTreeScanRequest) -> usize {
+    let row_count = decoded_node_row_count(node);
+    if request.include_tombstones
+        && request.schema_keys.is_empty()
+        && request.entity_pks.is_empty()
+        && request.file_ids.is_empty()
+    {
+        request
+            .limit
+            .map_or(row_count, |limit| limit.min(row_count))
+    } else {
+        0
+    }
 }
 
 fn parent_index_for_child_index(
@@ -2646,16 +2906,16 @@ fn parent_index_for_child_index(
     child_index: usize,
 ) -> usize {
     let key = if child_index < old_children.len() {
-        old_children[child_index].first_key.as_slice()
+        old_children[child_index].first_key.as_ref()
     } else {
         old_children
             .last()
-            .map(|child| child.last_key.as_slice())
+            .map(|child| child.last_key.as_ref())
             .unwrap_or_default()
     };
     old_parents
         .iter()
-        .position(|parent| parent.last_key.as_slice() >= key)
+        .position(|parent| parent.last_key.as_ref() >= key)
         .unwrap_or_else(|| old_parents.len().saturating_sub(1))
 }
 
@@ -2665,7 +2925,7 @@ fn child_range_for_parent(
 ) -> Result<Range<usize>, LixError> {
     let start = old_children
         .iter()
-        .position(|child| child.last_key.as_slice() >= parent.first_key.as_slice())
+        .position(|child| child.last_key.as_ref() >= parent.first_key.as_ref())
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -2690,8 +2950,8 @@ fn decoded_leaf_summary(
     leaf: &DecodedLeafNodeRef,
 ) -> ChildSummary {
     ChildSummary {
-        first_key: leaf.first_key().map(<[u8]>::to_vec).unwrap_or_default(),
-        last_key: leaf.last_key().map(<[u8]>::to_vec).unwrap_or_default(),
+        first_key: leaf.first_key_owned().unwrap_or_default(),
+        last_key: leaf.last_key_owned().unwrap_or_default(),
         child_hash: hash,
         subtree_count: leaf.len() as u64,
     }
@@ -2842,11 +3102,11 @@ fn lexicographic_successor(bytes: &[u8]) -> Option<Vec<u8>> {
 fn child_summary_overlaps_scan_ranges(child: &ChildSummary, ranges: &[EncodedScanRange]) -> bool {
     ranges.is_empty()
         || ranges.iter().any(|range| {
-            child.last_key.as_slice() >= range.start.as_slice()
+            child.last_key.as_ref() >= range.start.as_slice()
                 && range
                     .end
                     .as_ref()
-                    .is_none_or(|end| child.first_key.as_slice() < end.as_slice())
+                    .is_none_or(|end| child.first_key.as_ref() < end.as_slice())
         })
 }
 
@@ -3136,6 +3396,11 @@ mod tests {
             .await
             .expect("sparse diff should run");
         assert_eq!(sparse.len(), 1);
+        assert!(
+            sparse.row_capacity() <= 16,
+            "one emitted row retained capacity for the 10k-row root: {}",
+            sparse.row_capacity()
+        );
         assert_eq!(
             tree_chunk_reads.load(Ordering::Relaxed),
             base.tree_height * 2,
@@ -3282,13 +3547,67 @@ mod tests {
                 &TrackedStateTreeScanRequest::default(),
             )
             .await
-            .expect("hierarchical diff should run");
+            .expect("hierarchical diff should run")
+            .into_rows_for_test();
         let expected = naive_tree_diff(&base_rows, &changed_rows);
 
         assert_eq!(
             actual, expected,
             "frontier diff must match ordered map diff"
         );
+    }
+
+    #[tokio::test]
+    async fn root_backed_one_sided_diff_matches_naive_diff_in_both_directions() {
+        let storage = StorageAdapter::new(Memory::new());
+        let tree = TrackedStateTree::with_options(TrackedStateTreeOptions {
+            target_chunk_bytes: 256,
+            min_chunk_bytes: 128,
+            max_chunk_bytes: 512,
+        });
+        let rows = (0..256usize)
+            .map(|index| {
+                (
+                    key("schema", Some("file"), &format!("entity-{index:05}")),
+                    value(&format!("change-{index}"), Some("{}")),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let root = apply_mutations_for_test(
+            &tree,
+            &storage,
+            None,
+            rows.iter()
+                .map(|(key, value)| mutation(key, value))
+                .collect(),
+            None,
+        )
+        .await
+        .expect("one-sided fixture should build");
+        assert!(
+            root.tree_height > 1,
+            "fixture must exercise recursive root traversal"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("diff read should open");
+        let request = TrackedStateTreeScanRequest::default();
+        let added = TrackedStateTree::with_options(tree.options.clone())
+            .diff(&read, None, Some(&root.root_id), &request)
+            .await
+            .expect("empty-to-root diff should run")
+            .into_rows_for_test();
+        let removed = TrackedStateTree::with_options(tree.options.clone())
+            .diff(&read, Some(&root.root_id), None, &request)
+            .await
+            .expect("root-to-empty diff should run")
+            .into_rows_for_test();
+        let empty = BTreeMap::new();
+
+        assert_eq!(added, naive_tree_diff(&empty, &rows));
+        assert_eq!(removed, naive_tree_diff(&rows, &empty));
     }
 
     #[tokio::test]
@@ -3339,13 +3658,15 @@ mod tests {
                 &TrackedStateTreeScanRequest::default(),
             )
             .await
-            .expect("height-mismatched diff should run");
+            .expect("height-mismatched diff should run")
+            .into_rows_for_test();
 
         assert_eq!(
             actual,
             vec![TrackedStateTreeDiffEntry {
+                key: inserted_key,
                 before: None,
-                after: Some((inserted_key, inserted_value)),
+                after: Some(inserted_value),
             }]
         );
     }
@@ -3904,9 +4225,9 @@ mod tests {
         let encoded_changed_key = encode_key(&changed_key);
         let encoded_changed_value = encode_value(&changed_value);
         let index = canonical_entries
-            .binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_changed_key))
+            .binary_search_by(|entry| entry.key.as_ref().cmp(&encoded_changed_key))
             .expect("changed key should exist");
-        canonical_entries[index].value = encoded_changed_value;
+        canonical_entries[index].value = encoded_changed_value.into();
         let canonical = tree
             .build_tree_from_entries(canonical_entries)
             .expect("canonical root should build");
@@ -3955,13 +4276,13 @@ mod tests {
         let encoded_inserted_key = encode_key(&inserted_key);
         let encoded_inserted_value = encode_value(&inserted_value);
         let index = canonical_entries
-            .binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_inserted_key))
+            .binary_search_by(|entry| entry.key.as_ref().cmp(&encoded_inserted_key))
             .expect_err("inserted key should not exist");
         canonical_entries.insert(
             index,
             EncodedLeafEntry {
-                key: encoded_inserted_key,
-                value: encoded_inserted_value,
+                key: encoded_inserted_key.into(),
+                value: encoded_inserted_value.into(),
             },
         );
         let expected_entries = canonical_entries.clone();
@@ -4034,9 +4355,9 @@ mod tests {
             let encoded_key = encode_key(&key);
             let encoded_value = encode_value(&value);
             let index = canonical_entries
-                .binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_key))
+                .binary_search_by(|entry| entry.key.as_ref().cmp(&encoded_key))
                 .expect("updated key should exist");
-            canonical_entries[index].value = encoded_value;
+            canonical_entries[index].value = encoded_value.into();
         }
         let canonical = tree
             .build_tree_from_entries(canonical_entries)
@@ -4101,13 +4422,13 @@ mod tests {
             let encoded_key = encode_key(&key);
             let encoded_value = encode_value(&value);
             let index = canonical_entries
-                .binary_search_by(|entry| entry.key.as_slice().cmp(&encoded_key))
+                .binary_search_by(|entry| entry.key.as_ref().cmp(&encoded_key))
                 .expect_err("inserted key should not exist");
             canonical_entries.insert(
                 index,
                 EncodedLeafEntry {
-                    key: encoded_key,
-                    value: encoded_value,
+                    key: encoded_key.into(),
+                    value: encoded_value.into(),
                 },
             );
         }
@@ -4147,7 +4468,13 @@ mod tests {
             .expect("read should open");
         let mut writes = storage.new_write_set();
         let result = tree
-            .apply_mutations(&read, &mut writes, base_root, mutations, commit_id)
+            .apply_mutations(
+                &read,
+                &mut writes,
+                base_root,
+                TrackedStateMutationBatch::from_shared(mutations),
+                commit_id,
+            )
             .await?;
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -4176,8 +4503,9 @@ mod tests {
             .filter_map(|key| match (before.get(&key), after.get(&key)) {
                 (Some(left), Some(right)) if left == right => None,
                 (left, right) => Some(TrackedStateTreeDiffEntry {
-                    before: left.cloned().map(|value| (key.clone(), value)),
-                    after: right.cloned().map(|value| (key, value)),
+                    key,
+                    before: left.cloned(),
+                    after: right.cloned(),
                 }),
             })
             .collect()
@@ -4188,8 +4516,8 @@ mod tests {
             .map(|index| {
                 let key = key("schema", None, &format!("entity-{index:03}"));
                 EncodedLeafEntry {
-                    key: encode_key(&key),
-                    value: encode_value(&value(change_id, Some("{}"))),
+                    key: encode_key(&key).into(),
+                    value: encode_value(&value(change_id, Some("{}"))).into(),
                 }
             })
             .collect()
@@ -4204,12 +4532,12 @@ mod tests {
                 let first_key = group
                     .entries
                     .first()
-                    .map(|entry| entry.key.clone())
+                    .map(|entry| entry.key.to_vec())
                     .unwrap_or_default();
                 let last_key = group
                     .entries
                     .last()
-                    .map(|entry| entry.key.clone())
+                    .map(|entry| entry.key.to_vec())
                     .unwrap_or_default();
                 (first_key, last_key, group.entries.len())
             })

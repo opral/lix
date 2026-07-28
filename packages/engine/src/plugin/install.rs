@@ -4,7 +4,7 @@
 //! `lix_registered_schema` rows and the original archive is stored under the
 //! reserved plugin filesystem root.
 
-use serde_json::{Value as JsonValue, json};
+use serde_json::json;
 
 use crate::LixError;
 use crate::plugin::{
@@ -12,7 +12,7 @@ use crate::plugin::{
     plugin_storage_archive_file_id,
 };
 use crate::schema::registered_schema_entity_pk;
-use crate::transaction::types::{TransactionJson, TransactionWriteRow};
+use crate::transaction::types::{RawWriteBatch, TransactionJson};
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
@@ -21,12 +21,12 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 /// The transaction keeps the original archive bytes as the filesystem/CAS
 /// artifact. This plan owns the single validated extraction used to create the
 /// registry row, schema rows, and extracted component CAS entry.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct PluginArchiveInstallPlan {
     pub plugin_key: String,
     pub archive_file_id: String,
     pub parsed: ParsedPluginArchive,
-    pub schema_rows: Vec<TransactionWriteRow>,
+    pub schema_rows: RawWriteBatch,
 }
 
 pub(crate) fn plugin_install_plan_from_archive_path(
@@ -73,49 +73,35 @@ fn plugin_schema_rows(
     branch_id: &str,
     global: bool,
     untracked: bool,
-) -> Result<Vec<TransactionWriteRow>, LixError> {
+) -> Result<RawWriteBatch, LixError> {
     if parsed.schemas.len() != parsed.schema_keys.len() {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "Parsed plugin schemas and schema keys must have the same length",
         ));
     }
-    parsed
-        .schemas
-        .iter()
-        .zip(&parsed.schema_keys)
-        .map(|(schema, schema_key)| {
-            registered_schema_row(schema, schema_key, branch_id, global, untracked)
-        })
-        .collect()
-}
-
-fn registered_schema_row(
-    schema: &JsonValue,
-    schema_key: &str,
-    branch_id: &str,
-    global: bool,
-    untracked: bool,
-) -> Result<TransactionWriteRow, LixError> {
-    let entity_pk = registered_schema_entity_pk(schema_key)?;
-    Ok(TransactionWriteRow {
-        entity_pk: Some(entity_pk),
-        schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-        file_id: None,
-        snapshot: Some(TransactionJson::from_value(
-            json!({ "value": schema }),
-            "plugin install registered schema snapshot",
-        )?),
-        metadata: None,
-        origin: None,
-        created_at: None,
-        updated_at: None,
-        global,
-        change_id: None,
-        commit_id: None,
-        untracked,
-        branch_id: branch_id.to_string(),
-    })
+    let mut rows = RawWriteBatch::with_capacity(parsed.schemas.len());
+    for (schema, schema_key) in parsed.schemas.iter().zip(&parsed.schema_keys) {
+        rows.push_parts(
+            Some(registered_schema_entity_pk(schema_key)?),
+            REGISTERED_SCHEMA_KEY.into(),
+            None,
+            Some(TransactionJson::from_value(
+                json!({ "value": schema }),
+                "plugin install registered schema snapshot",
+            )?),
+            None,
+            None,
+            None,
+            None,
+            global,
+            None,
+            None,
+            untracked,
+            branch_id.into(),
+        );
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -162,12 +148,12 @@ mod tests {
         assert_eq!(plan.parsed.wasm_bytes, WASM);
         assert_eq!(plan.parsed.wasm_hash, BlobHash::from_content(WASM));
         assert_eq!(plan.schema_rows.len(), 1);
-        assert_eq!(plan.schema_rows[0].schema_key, "lix_registered_schema");
-        assert_eq!(plan.schema_rows[0].branch_id, "draft");
+        let schema_row = plan.schema_rows.row(0);
+        assert_eq!(schema_row.schema_key, "lix_registered_schema");
+        assert_eq!(schema_row.branch_id, "draft");
         assert_eq!(
-            plan.schema_rows[0]
+            schema_row
                 .snapshot
-                .as_ref()
                 .expect("schema install row needs a snapshot")["value"]["x-lix-key"],
             "plugin_test_note"
         );

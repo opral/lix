@@ -1,3 +1,5 @@
+#![allow(clippy::large_futures)]
+
 use std::path::Path;
 use std::time::Instant;
 
