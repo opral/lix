@@ -1926,7 +1926,7 @@ fn validate_primary_key_identity(
 #[derive(Default)]
 struct PendingConstraintIndexes {
     unique_values: BTreeMap<PendingUniqueKey, EntityPk>,
-    identity_targets: Vec<PendingIdentityTarget>,
+    identity_targets: HashSet<DomainRowIdentity>,
     fk_targets: BTreeMap<PendingForeignKeyTargetKey, Vec<PendingForeignKeyTarget>>,
     fk_references: BTreeMap<PendingForeignKeyReferenceTarget, Vec<PendingForeignKeyReference>>,
     tombstones: Vec<PendingTombstone>,
@@ -1953,9 +1953,7 @@ impl PendingConstraintIndexes {
     }
 
     fn remember_identity_target(&mut self, row: PreparedValidationRow<'_>) {
-        self.identity_targets.push(PendingIdentityTarget {
-            identity: row.domain_row_identity(),
-        });
+        self.identity_targets.insert(row.domain_row_identity());
     }
 
     fn remember_primary_key_target(
@@ -2082,14 +2080,15 @@ impl PendingConstraintIndexes {
 
     fn replaces_committed_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
         self.identity_targets
-            .iter()
-            .any(|target| target.identity.matches_live_row_ref(row))
+            .contains(&DomainRowIdentity::in_domain(
+                Domain::for_live_row_ref(row),
+                row.schema_key().to_string(),
+                row.entity_pk().clone(),
+            ))
     }
 
     fn has_identity_target(&self, identity: &DomainRowIdentity) -> bool {
-        self.identity_targets
-            .iter()
-            .any(|target| target.identity == *identity)
+        self.identity_targets.contains(identity)
     }
 
     fn has_reachable_identity_target(&self, identity: &DomainRowIdentity) -> bool {
@@ -2196,11 +2195,6 @@ impl PendingConstraintIndexes {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingTombstone {
-    identity: DomainRowIdentity,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PendingIdentityTarget {
     identity: DomainRowIdentity,
 }
 
