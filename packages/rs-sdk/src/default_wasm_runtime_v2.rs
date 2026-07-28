@@ -2223,6 +2223,7 @@ mod tests {
         let limits = WasmTransitionLimits::default();
         let snapshot = match row.snapshot_content {
             WasmHostBytes::Inline(bytes) => bytes,
+            WasmHostBytes::CanonicalJson { normalized, .. } => normalized.as_bytes().to_vec(),
             WasmHostBytes::Source(_) => panic!("small row snapshot must be inline"),
         };
         let snapshot = String::from_utf8(snapshot)
@@ -2349,6 +2350,7 @@ mod tests {
 
         let snapshot = match row.snapshot_content {
             WasmHostBytes::Inline(bytes) => bytes,
+            WasmHostBytes::CanonicalJson { normalized, .. } => normalized.as_bytes().to_vec(),
             WasmHostBytes::Source(_) => panic!("small row snapshot must be inline"),
         };
         let snapshot = String::from_utf8(snapshot)
