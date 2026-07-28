@@ -88,7 +88,7 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let engine =
-        open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry).await?;
+        open_or_initialize_engine(options.storage, options.wasm_runtime, telemetry, None).await?;
     let session = engine.open_workspace_session().await?;
     Ok(Lix { engine, session })
 }
@@ -100,6 +100,27 @@ where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     open_lix(OpenLixOptions::new(storage)).await
+}
+
+/// Opens a workspace with explicit per-Store memory and live-Store limits for
+/// Component API v2 plugins.
+pub async fn open_lix_with_storage_and_plugin_v2_resource_limits<StorageImpl>(
+    storage: StorageImpl,
+    max_memory_bytes: u64,
+    max_live_stores: usize,
+) -> Result<Lix<StorageImpl>, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let engine = open_or_initialize_engine(
+        storage,
+        None,
+        None,
+        Some((max_memory_bytes, max_live_stores)),
+    )
+    .await?;
+    let session = engine.open_workspace_session().await?;
+    Ok(Lix { engine, session })
 }
 
 impl<StorageImpl> Lix<StorageImpl>
@@ -477,15 +498,23 @@ pub(crate) async fn open_or_initialize_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    plugin_v2_resource_limits: Option<(u64, usize)>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    match new_engine(storage.clone(), wasm_runtime.clone(), telemetry.clone()).await {
+    match new_engine(
+        storage.clone(),
+        wasm_runtime.clone(),
+        telemetry.clone(),
+        plugin_v2_resource_limits,
+    )
+    .await
+    {
         Ok(engine) => Ok(engine),
         Err(error) if error.code == "LIX_ERROR_NOT_INITIALIZED" => {
             Engine::initialize(storage.clone()).await?;
-            new_engine(storage, wasm_runtime, telemetry).await
+            new_engine(storage, wasm_runtime, telemetry, plugin_v2_resource_limits).await
         }
         Err(error) => Err(error),
     }
@@ -495,6 +524,7 @@ async fn new_engine<StorageImpl>(
     storage: StorageImpl,
     wasm_runtime: Option<Arc<dyn WasmRuntime>>,
     telemetry: Option<Arc<dyn TelemetrySink>>,
+    plugin_v2_resource_limits: Option<(u64, usize)>,
 ) -> Result<Engine<StorageImpl>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -510,6 +540,9 @@ where
     }
     if let Some(telemetry) = telemetry {
         options = options.with_telemetry(telemetry);
+    }
+    if let Some((max_memory_bytes, max_live_stores)) = plugin_v2_resource_limits {
+        options = options.with_plugin_v2_resource_limits(max_memory_bytes, max_live_stores);
     }
     Engine::new_with_options(storage, options).await
 }

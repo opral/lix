@@ -19,7 +19,8 @@ pub use client_state::ClientState;
 #[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
 pub use filesystem::{LocalFilesystem, LocalFilesystemOpenOptions};
 pub use lix::{
-    Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage, open_lix_with_telemetry,
+    Lix, LixTransaction, OpenLixOptions, open_lix, open_lix_with_storage,
+    open_lix_with_storage_and_plugin_v2_resource_limits, open_lix_with_telemetry,
 };
 pub use lix_engine::telemetry::{
     CallbackTelemetrySink, CompletedTelemetrySpan, TelemetryAttribute, TelemetrySink,
