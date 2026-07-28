@@ -3,10 +3,8 @@ use async_trait::async_trait;
 use crate::LixError;
 #[cfg(test)]
 use crate::live_state::MaterializedLiveStateBatchBuilder;
-use crate::live_state::{LiveStateExactBatchRequest, LiveStateRowRequest, LiveStateScanRequest};
-use crate::live_state::{
-    MaterializedLiveStateBatch, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-};
+use crate::live_state::{LiveStateExactBatchRequest, LiveStateScanRequest};
+use crate::live_state::{MaterializedLiveStateBatch, MaterializedLiveStateExactBatch};
 
 /// Minimal engine read model for transaction planning and SQL providers.
 ///
@@ -56,12 +54,6 @@ pub(crate) trait LiveStateReader: Send + Sync {
         request.filter.untracked = Some(false);
         self.scan_batch(&request).await
     }
-
-    #[allow(dead_code)]
-    async fn load_row(
-        &self,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError>;
 
     /// Loads concrete visible identities while preserving request alignment.
     ///

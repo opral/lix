@@ -656,13 +656,6 @@ where
         Self::scan_batch(self, request).await
     }
 
-    async fn load_row(
-        &self,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        Self::load_row(self, request).await
-    }
-
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,

@@ -996,7 +996,7 @@ mod tests {
 
     use super::*;
     use crate::common::LixTimestamp;
-    use crate::live_state::{LiveStateRowRequest, MaterializedLiveStateRow};
+    use crate::live_state::MaterializedLiveStateRow;
     use datafusion::common::Column;
 
     struct RowsLiveStateReader {
@@ -1017,13 +1017,6 @@ mod tests {
             _request: &LiveStateScanRequest,
         ) -> Result<crate::live_state::MaterializedLiveStateBatch, LixError> {
             Ok(self.rows.clone().into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 
@@ -1064,13 +1057,6 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>()
                 .into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 

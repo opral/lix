@@ -7,9 +7,9 @@ use crate::LixError;
 use crate::catalog::{CatalogContext, CatalogSnapshot, TransactionCatalog};
 use crate::domain::Domain;
 use crate::live_state::{
-    LiveStateExactBatchRequest, LiveStateReader, LiveStateRowRequest, LiveStateScanRequest,
-    MaterializedLiveStateBatch, MaterializedLiveStateExactBatch, MaterializedLiveStateRow,
-    StagedLiveStateRows, overlay_load_exact_batch, overlay_scan_batch, overlay_scan_tracked_batch,
+    LiveStateExactBatchRequest, LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch,
+    MaterializedLiveStateExactBatch, StagedLiveStateRows, overlay_load_exact_batch,
+    overlay_scan_batch, overlay_scan_tracked_batch,
 };
 use crate::transaction::staging::PreparedStateRowOverlay;
 
@@ -128,28 +128,6 @@ where
         overlay_scan_tracked_batch(self.base, self.staged, request).await
     }
 
-    async fn load_row(
-        &self,
-        request: &LiveStateRowRequest,
-    ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-        let rows = self
-            .scan_batch(&LiveStateScanRequest {
-                filter: crate::live_state::LiveStateFilter {
-                    schema_keys: vec![request.schema_key.clone()],
-                    entity_pks: vec![request.entity_pk.clone()],
-                    branch_ids: vec![request.branch_id.clone()],
-                    file_ids: vec![request.file_id.clone()],
-                    ..Default::default()
-                },
-                limit: Some(1),
-                ..Default::default()
-            })
-            .await?;
-        Ok(rows
-            .get(0)
-            .map(crate::live_state::MaterializedLiveStateRowRef::to_owned))
-    }
-
     async fn load_exact_batch(
         &self,
         request: &LiveStateExactBatchRequest,
@@ -163,7 +141,7 @@ mod tests {
     use super::*;
     use crate::common::LixTimestamp;
     use crate::entity_pk::EntityPk;
-    use crate::live_state::LiveStateFilter;
+    use crate::live_state::{LiveStateFilter, MaterializedLiveStateRow};
 
     struct SplitCurrentAndTrackedReader {
         canonical: MaterializedLiveStateRow,
@@ -199,13 +177,6 @@ mod tests {
                 .into_iter()
                 .collect::<Vec<_>>()
                 .into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(Some(self.canonical.clone()))
         }
     }
 

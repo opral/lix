@@ -1814,8 +1814,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::live_state::{
         LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateRowFilter,
-        LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-        MaterializedLiveStateRow,
+        LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
     };
     use crate::sql2::WriteAccess;
     use crate::sql2::catalog::{
@@ -1841,13 +1840,6 @@ mod tests {
             _request: &LiveStateScanRequest,
         ) -> Result<MaterializedLiveStateBatch, LixError> {
             Ok(vec![].into())
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 

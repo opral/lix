@@ -5,8 +5,6 @@ use crate::functions::{
     DeterministicFunctionProvider, DeterministicSequence, FunctionProvider, FunctionProviderHandle,
     SystemFunctionProvider, state,
 };
-#[cfg(test)]
-use crate::live_state::LiveStateReader;
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 
 /// Execution-scoped runtime function context.
@@ -285,18 +283,17 @@ mod tests {
         // Deterministic mode must stamp the bookkeeping row from the
         // persisted sequence, never from the system clock; the persisted
         // sequence was empty, so next_sequence is 0 -> epoch.
-        let row = LiveStateReader::load_row(
-            &live_state.reader(&read),
-            &crate::live_state::LiveStateRowRequest {
+        let row = live_state
+            .reader(&read)
+            .load_row(&crate::live_state::LiveStateRowRequest {
                 schema_key: "lix_key_value".to_string(),
                 branch_id: GLOBAL_BRANCH_ID.to_string(),
                 entity_pk: EntityPk::single(DETERMINISTIC_SEQUENCE_KEY),
                 file_id: crate::NullableKeyFilter::Null,
-            },
-        )
-        .await
-        .expect("sequence row should load")
-        .expect("sequence row should exist");
+            })
+            .await
+            .expect("sequence row should load")
+            .expect("sequence row should exist");
         assert_eq!(
             row.created_at.to_string(),
             "1970-01-01T00:00:00.000Z",

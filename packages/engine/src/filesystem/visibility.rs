@@ -174,8 +174,7 @@ mod tests {
     use crate::common::LixTimestamp;
     use crate::filesystem::{FilesystemDescriptorKey, FilesystemRowContext};
     use crate::live_state::{
-        LiveStateReader, LiveStateRowRequest, LiveStateScanRequest, MaterializedLiveStateBatch,
-        MaterializedLiveStateRow,
+        LiveStateReader, LiveStateScanRequest, MaterializedLiveStateBatch, MaterializedLiveStateRow,
     };
 
     use super::{
@@ -447,13 +446,6 @@ mod tests {
                     .collect(),
             ))
         }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
-        }
     }
 
     struct RowsLiveStateReader {
@@ -489,13 +481,6 @@ mod tests {
                     .cloned()
                     .collect(),
             ))
-        }
-
-        async fn load_row(
-            &self,
-            _request: &LiveStateRowRequest,
-        ) -> Result<Option<MaterializedLiveStateRow>, LixError> {
-            Ok(None)
         }
     }
 
