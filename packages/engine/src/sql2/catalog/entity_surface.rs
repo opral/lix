@@ -44,6 +44,12 @@ pub(crate) struct EntitySurfaceSpec {
     pub(crate) primary_key_paths: Vec<Vec<String>>,
     pub(crate) columns: Vec<EntitySurfaceColumn>,
     pub(crate) defaults: crate::catalog::DefaultPlan,
+    /// Whether changing one row can invalidate another row.
+    ///
+    /// Homogeneous point updates may be lowered into one physical write batch
+    /// only when every row is independent. JSON Schema validation is row-local;
+    /// uniqueness and foreign-key declarations are the inter-row exceptions.
+    pub(crate) has_inter_row_constraints: bool,
 }
 
 impl EntitySurfaceSpec {
@@ -132,6 +138,14 @@ pub(crate) fn derive_entity_surface_spec_from_schema(
         primary_key_paths,
         columns,
         defaults: crate::catalog::DefaultPlan::from_schema(schema),
+        has_inter_row_constraints: ["x-lix-unique", "x-lix-foreign-keys"].into_iter().any(
+            |keyword| {
+                schema
+                    .get(keyword)
+                    .and_then(JsonValue::as_array)
+                    .is_some_and(|values| !values.is_empty())
+            },
+        ),
     })
 }
 

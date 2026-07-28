@@ -3810,6 +3810,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incremental_file_descriptor_delete_cascades_without_resurrection() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "branch";
+        let first_head = CommitId::for_test_label("file-cascade-first");
+        let delete_head = CommitId::for_test_label("file-cascade-delete");
+        let recreate_head = CommitId::for_test_label("file-cascade-recreate");
+        let file_pk = EntityPk::single("file-a");
+        let file_row_pk = EntityPk::single("file-row");
+        let unrelated_pk = EntityPk::single("unrelated-row");
+
+        let mut writes = StorageWriteSet::new();
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open initial file-cascade read");
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                None,
+                first_head,
+                &[
+                    TrackedHeadDeltaRef {
+                        schema_key: "lix_file_descriptor",
+                        file_id: None,
+                        entity_pk: &file_pk,
+                        change_id: ChangeId::for_test_label("file-create"),
+                        commit_id: first_head,
+                        deleted: false,
+                        created_at: ts("2026-01-01T00:00:00Z"),
+                        updated_at: ts("2026-01-01T00:00:00Z"),
+                        snapshot: JsonSlotRef::Inline("{\"name\":\"a\"}"),
+                        metadata: JsonSlotRef::None,
+                    },
+                    TrackedHeadDeltaRef {
+                        schema_key: "semantic",
+                        file_id: Some("file-a"),
+                        entity_pk: &file_row_pk,
+                        change_id: ChangeId::for_test_label("file-row-create"),
+                        commit_id: first_head,
+                        deleted: false,
+                        created_at: ts("2026-01-01T00:00:00Z"),
+                        updated_at: ts("2026-01-01T00:00:00Z"),
+                        snapshot: JsonSlotRef::Inline("{\"value\":1}"),
+                        metadata: JsonSlotRef::None,
+                    },
+                    TrackedHeadDeltaRef {
+                        schema_key: "semantic",
+                        file_id: Some("file-b"),
+                        entity_pk: &unrelated_pk,
+                        change_id: ChangeId::for_test_label("unrelated-create"),
+                        commit_id: first_head,
+                        deleted: false,
+                        created_at: ts("2026-01-01T00:00:00Z"),
+                        updated_at: ts("2026-01-01T00:00:00Z"),
+                        snapshot: JsonSlotRef::Inline("{\"value\":2}"),
+                        metadata: JsonSlotRef::None,
+                    },
+                ],
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage initial file state");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit initial file state");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open file-delete read");
+        let mut writes = StorageWriteSet::new();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(first_head),
+                delete_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "lix_file_descriptor",
+                    file_id: None,
+                    entity_pk: &file_pk,
+                    change_id: ChangeId::for_test_label("file-delete"),
+                    commit_id: delete_head,
+                    deleted: true,
+                    created_at: ts("2026-01-01T00:00:00Z"),
+                    updated_at: ts("2026-01-02T00:00:00Z"),
+                    snapshot: JsonSlotRef::None,
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage cascading file delete");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit cascading file delete");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open cascade verification read");
+        let mut including_tombstones = TrackedStateScanRequest::default();
+        including_tombstones.filter.include_tombstones = true;
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(branch_id, &delete_head.to_string(), &including_tombstones)
+            .await
+            .expect("scan cascaded state")
+            .expect("matching delete head");
+        let cascaded = rows
+            .iter()
+            .find(|row| row.entity_pk == file_row_pk)
+            .expect("file-scoped row remains as a visibility tombstone");
+        assert!(cascaded.deleted);
+        assert_eq!(
+            cascaded.change_id,
+            Some(ChangeId::for_test_label("file-delete"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.entity_pk == unrelated_pk && !row.deleted),
+            "unrelated file state must remain live"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open file-recreate read");
+        let mut writes = StorageWriteSet::new();
+        TrackedHeadContext::new()
+            .writer(&read, &mut writes)
+            .stage_commit(
+                branch_id,
+                Some(first_head),
+                recreate_head,
+                &[TrackedHeadDeltaRef {
+                    schema_key: "lix_file_descriptor",
+                    file_id: None,
+                    entity_pk: &file_pk,
+                    change_id: ChangeId::for_test_label("file-recreate"),
+                    commit_id: recreate_head,
+                    deleted: false,
+                    created_at: ts("2026-01-03T00:00:00Z"),
+                    updated_at: ts("2026-01-03T00:00:00Z"),
+                    snapshot: JsonSlotRef::Inline("{\"name\":\"a\"}"),
+                    metadata: JsonSlotRef::None,
+                }],
+                &BTreeSet::new(),
+                None,
+            )
+            .await
+            .expect("stage file recreation");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit file recreation");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open recreation verification read");
+        let rows = TrackedHeadContext::new()
+            .reader(read)
+            .scan_live_rows_if_current(
+                branch_id,
+                &recreate_head.to_string(),
+                &TrackedStateScanRequest::default(),
+            )
+            .await
+            .expect("scan recreated state")
+            .expect("matching recreate head");
+        assert!(
+            rows.iter().all(|row| row.entity_pk != file_row_pk),
+            "recreating a file descriptor must not resurrect old scoped state"
+        );
+    }
+
+    #[tokio::test]
     async fn incremental_guarded_insert_resurrects_tombstone_with_first_created_at() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";

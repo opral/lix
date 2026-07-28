@@ -24,6 +24,7 @@ pub(crate) const HOT_FILE_SPACE: StorageSpace =
 /// Reserved for the row-level first-before working-diff index.
 pub(crate) const HOT_DIFF_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
@@ -827,6 +828,17 @@ where
         for (identity, value) in identities.iter().zip(next_values) {
             stage_hot_mutation_value(self.writes, identity, value);
         }
+        stage_incremental_file_delete_cascades(
+            self.store,
+            self.writes,
+            branch_id,
+            generation,
+            &sorted,
+            working_diff_capture_checkpoint_commit_id,
+            &mut next_coverage,
+            &mut retired_untracked_json_refs,
+        )
+        .await?;
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
             retired_untracked_json_refs
@@ -936,6 +948,138 @@ where
         Ok(HotTrackedSnapshot {
             rows: final_tracked,
         })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stage_incremental_file_delete_cascades(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    generation: CommitId,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+    working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+    coverage: &mut WorkingDiffIndexCoverage,
+    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let explicit = deltas
+        .iter()
+        .map(|delta| HeadRowIdentity {
+            schema_key: delta.schema_key.to_string(),
+            entity_pk: delta.entity_pk.clone(),
+            file_id: delta.file_id.map(str::to_string),
+        })
+        .collect::<BTreeSet<_>>();
+    let mut cascades = BTreeMap::<String, &CurrentStateDeltaRef<'_>>::new();
+    for cascade in deltas {
+        let Some(file_id) = file_delete_cascade_id(cascade)? else {
+            continue;
+        };
+        cascades.insert(file_id.to_string(), cascade);
+    }
+    if cascades.is_empty() {
+        return Ok(());
+    }
+    let identities =
+        hot_load_file_scope_identities(store, branch_id, generation, &cascades).await?;
+    let values = hot_load_primary_identity_bytes(store, &identities).await?;
+    for (identity, previous) in identities.into_iter().zip(values) {
+        let row_identity = identity.clone().into_row_identity();
+        if explicit.contains(&row_identity) {
+            continue;
+        }
+        let cascade = cascades
+            .get(
+                identity
+                    .file_id
+                    .as_deref()
+                    .expect("file projection identity requires file id"),
+            )
+            .expect("file scan only returns requested cascade ids");
+        let Some(previous) = previous else {
+            return Err(head_value_error(
+                "hot file projection has no authoritative primary row",
+            ));
+        };
+        let existing = decode_head_value(&previous)?;
+        if (cascade.untracked && !existing.untracked) || existing.deleted {
+            continue;
+        }
+        let encoded = encode_hot_mutation_identity(
+            branch_id,
+            generation,
+            &identity.schema_key,
+            &identity.entity_pk,
+            identity.file_id.as_deref(),
+        );
+        if existing.untracked {
+            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
+            stage_hot_mutation_value(writes, &encoded, None);
+            continue;
+        }
+        let (baseline, newly_dirty) = next_cascade_working_diff_baseline(
+            working_diff_capture_checkpoint_commit_id,
+            existing,
+        )?;
+        if newly_dirty {
+            let checkpoint_commit_id = working_diff_capture_checkpoint_commit_id
+                .expect("new cascade dirty row requires active checkpoint");
+            let key = encode_hot_diff_key_parts(
+                branch_id,
+                checkpoint_commit_id,
+                generation,
+                &identity.schema_key,
+                &identity.entity_pk,
+                identity.file_id.as_deref(),
+            );
+            coverage
+                .add_encoded_group_key(&key)
+                .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
+            writes.put(
+                HOT_DIFF_SPACE,
+                StorageKey(Bytes::from(key)),
+                StorageValue {
+                    bytes: Bytes::new(),
+                },
+            );
+        }
+        let value = encode_head_value(&HeadValueRef {
+            change_id: cascade.change_id,
+            commit_id: cascade.commit_id,
+            untracked: false,
+            deleted: true,
+            created_at: existing.created_at,
+            updated_at: cascade.updated_at,
+            snapshot: JsonSlotRef::None,
+            metadata: JsonSlotRef::None,
+            working_diff_baseline: baseline,
+        })?;
+        stage_hot_mutation_value(writes, &encoded, Some(value));
+    }
+    Ok(())
+}
+
+fn next_cascade_working_diff_baseline(
+    active_checkpoint_commit_id: Option<CommitId>,
+    previous: HeadValueView<'_>,
+) -> Result<(WorkingDiffBaseline, bool), LixError> {
+    if active_checkpoint_commit_id.is_none() {
+        return Ok((WorkingDiffBaseline::Disabled, false));
+    }
+    match previous.working_diff_baseline {
+        WorkingDiffBaseline::Clean => {
+            let before = previous
+                .working_diff_version()
+                .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
+            Ok((WorkingDiffBaseline::BeforePresent(before), true))
+        }
+        WorkingDiffBaseline::BeforeAbsent => Ok((WorkingDiffBaseline::BeforeAbsent, false)),
+        WorkingDiffBaseline::BeforePresent(before) => {
+            Ok((WorkingDiffBaseline::BeforePresent(before), false))
+        }
+        WorkingDiffBaseline::Disabled => Err(head_value_error(
+            "active checkpoint generation contains a cascade member without a baseline",
+        )),
     }
 }
 
@@ -1089,6 +1233,7 @@ fn apply_complete_hot_snapshot_delta(
     absence_guards: &BTreeSet<TrackedStateKey>,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
+    apply_complete_file_delete_cascade(rows, delta, retired_untracked_json_refs)?;
     let identity = HeadRowIdentity {
         schema_key: delta.schema_key.to_string(),
         entity_pk: delta.entity_pk.clone(),
@@ -1116,6 +1261,67 @@ fn apply_complete_hot_snapshot_delta(
         );
     }
     Ok(())
+}
+
+fn apply_complete_file_delete_cascade(
+    rows: &mut BTreeMap<HeadRowIdentity, Vec<u8>>,
+    delta: &CurrentStateDeltaRef<'_>,
+    retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
+) -> Result<(), LixError> {
+    let Some(file_id) = file_delete_cascade_id(delta)? else {
+        return Ok(());
+    };
+    let identities = rows
+        .keys()
+        .filter(|identity| identity.file_id.as_deref() == Some(file_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    for identity in identities {
+        let Some(previous) = rows.get(&identity) else {
+            continue;
+        };
+        let existing = decode_head_value(previous)?;
+        if (delta.untracked && !existing.untracked) || existing.deleted {
+            continue;
+        }
+        if existing.untracked {
+            collect_hot_untracked_refs(existing, retired_untracked_json_refs);
+            rows.remove(&identity);
+            continue;
+        }
+        rows.insert(
+            identity,
+            encode_head_value(&HeadValueRef {
+                change_id: delta.change_id,
+                commit_id: delta.commit_id,
+                untracked: false,
+                deleted: true,
+                created_at: existing.created_at,
+                updated_at: delta.updated_at,
+                snapshot: JsonSlotRef::None,
+                metadata: JsonSlotRef::None,
+                working_diff_baseline: WorkingDiffBaseline::Disabled,
+            })?,
+        );
+    }
+    Ok(())
+}
+
+fn file_delete_cascade_id<'a>(
+    delta: &'a CurrentStateDeltaRef<'_>,
+) -> Result<Option<&'a str>, LixError> {
+    if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || delta.file_id.is_some() || !delta.deleted {
+        return Ok(None);
+    }
+    delta
+        .entity_pk
+        .as_single_string()
+        .map(Some)
+        .map_err(|error| {
+            head_value_error(&format!(
+                "file descriptor tombstone has invalid identity: {error}"
+            ))
+        })
 }
 
 fn normalize_complete_hot_snapshot_baselines(
@@ -1402,6 +1608,7 @@ fn stage_hot_bootstrap(
     }
     let mut retired_untracked_json_refs = BTreeSet::new();
     for delta in deltas {
+        apply_complete_file_delete_cascade(&mut rows, delta, &mut retired_untracked_json_refs)?;
         let identity = HeadRowIdentity {
             schema_key: delta.schema_key.to_string(),
             entity_pk: delta.entity_pk.clone(),
@@ -1570,6 +1777,57 @@ async fn hot_load_primary_identity_bytes(
         .into_iter()
         .map(|value| value.map(full_value_bytes).transpose())
         .collect()
+}
+
+async fn hot_load_file_scope_identities(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    generation: CommitId,
+    cascades: &BTreeMap<String, &CurrentStateDeltaRef<'_>>,
+) -> Result<Vec<HeadIdentity>, LixError> {
+    let scope = hot_scope_prefix(branch_id, generation);
+    let plan = ScanPlan::prefix(
+        HOT_FILE_SPACE,
+        StoragePrefix {
+            bytes: Bytes::from(scope.clone()),
+        },
+    );
+    let mut identities = Vec::new();
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let row = decode_hot_file_key_in_scope(entry.key.0.as_ref(), &scope)?;
+            if !row
+                .file_id
+                .as_ref()
+                .is_some_and(|file_id| cascades.contains_key(file_id))
+            {
+                continue;
+            }
+            identities.push(HeadIdentity {
+                branch_id: branch_id.to_string(),
+                generation,
+                schema_key: row.schema_key,
+                entity_pk: row.entity_pk,
+                file_id: row.file_id,
+            });
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(identities)
 }
 
 fn working_diff_baseline_before(
