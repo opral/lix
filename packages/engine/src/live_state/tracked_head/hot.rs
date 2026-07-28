@@ -867,7 +867,7 @@ where
         absence_guards: &BTreeSet<TrackedStateKey>,
         working_diff_capture_checkpoint_commit_id: Option<CommitId>,
         coverage: &mut WorkingDiffIndexCoverage,
-    ) -> Result<HotTrackedSnapshot, LixError> {
+    ) -> Result<(HotTrackedSnapshot, BTreeSet<String>), LixError> {
         let mut rows = parent_tracked.rows;
         let mut untracked_rows = match preserved_untracked_generation {
             Some(previous_generation) => {
@@ -911,7 +911,9 @@ where
         normalize_complete_hot_snapshot_baselines(&mut rows, tracked_baseline)?;
 
         let mut final_tracked = BTreeMap::new();
+        let mut schema_keys = BTreeSet::new();
         for (identity, bytes) in &rows {
+            schema_keys.insert(identity.schema_key.clone());
             if !decode_head_value(bytes)?.untracked {
                 final_tracked.insert(identity.clone(), bytes.clone());
             }
@@ -942,9 +944,12 @@ where
                 .map(JsonRef::from_hash_bytes),
         );
         *coverage = WorkingDiffIndexCoverage::default();
-        Ok(HotTrackedSnapshot {
-            rows: final_tracked,
-        })
+        Ok((
+            HotTrackedSnapshot {
+                rows: final_tracked,
+            },
+            schema_keys,
+        ))
     }
 }
 
@@ -2876,6 +2881,7 @@ mod tests {
                 head_commit_id: active_generation,
                 generation: active_generation,
                 current_state_revision: 0,
+                schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: Some(active_checkpoint),
                 created_at: timestamp(),
                 updated_at: timestamp(),
@@ -2901,6 +2907,7 @@ mod tests {
                 head_commit_id: stale_generation,
                 generation: stale_generation,
                 current_state_revision: 0,
+                schema_presence_bloom: [u64::MAX; 4],
                 working_diff_checkpoint_commit_id: None,
                 created_at: timestamp(),
                 updated_at: timestamp(),

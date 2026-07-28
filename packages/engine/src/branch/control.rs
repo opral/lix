@@ -7,6 +7,7 @@
 //! `lix_branch_ref` through the mutable live-state index.
 
 use bytes::Bytes;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::LixError;
 use crate::changelog::{ChangeId, CommitId};
@@ -18,9 +19,11 @@ use crate::storage_adapter::{
 };
 use crate::storage_codec;
 
-pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v7";
+pub(crate) const BRANCH_HEAD_CONTROL_NAMESPACE: &str = "branch.head_control.v8";
 pub(crate) const BRANCH_HEAD_CONTROL_SPACE: StorageSpace =
-    StorageSpace::new(StorageSpaceId(0x0004_001f), BRANCH_HEAD_CONTROL_NAMESPACE);
+    StorageSpace::new(StorageSpaceId(0x0004_0020), BRANCH_HEAD_CONTROL_NAMESPACE);
+
+const SCHEMA_PRESENCE_BLOOM_WORDS: usize = 4;
 
 /// The one mutable publication record for a branch.
 ///
@@ -46,6 +49,13 @@ pub(crate) struct BranchHeadControl {
     pub(crate) updated_at: LixTimestamp,
     /// Public `lixcol_change_id` for the last head publication.
     pub(crate) ref_change_id: ChangeId,
+    /// Conservative schema-presence summary for this complete hot generation.
+    ///
+    /// Bits are only added during in-place commits. Lifecycle publications
+    /// rebuild the summary from their complete snapshot. A false result can
+    /// therefore skip an otherwise-empty schema range scan; a collision only
+    /// falls back to the normal scan.
+    pub(crate) schema_presence_bloom: [u64; SCHEMA_PRESENCE_BLOOM_WORDS],
 }
 
 impl BranchHeadControl {
@@ -62,6 +72,37 @@ impl BranchHeadControl {
                 )
             })?;
         Ok(self)
+    }
+
+    pub(crate) fn note_schema(&mut self, schema_key: &str) {
+        let hash = xxh3_64(schema_key.as_bytes()).to_be_bytes();
+        for pair in hash.chunks_exact(2) {
+            let bit = usize::from(u16::from_be_bytes([pair[0], pair[1]]))
+                % (SCHEMA_PRESENCE_BLOOM_WORDS * u64::BITS as usize);
+            self.schema_presence_bloom[bit / u64::BITS as usize] |=
+                1_u64 << (bit % u64::BITS as usize);
+        }
+    }
+
+    pub(crate) fn note_schemas<'a>(&mut self, schema_keys: impl IntoIterator<Item = &'a str>) {
+        for schema_key in schema_keys {
+            self.note_schema(schema_key);
+        }
+    }
+
+    pub(crate) fn reset_schema_presence(&mut self) {
+        self.schema_presence_bloom = [0; SCHEMA_PRESENCE_BLOOM_WORDS];
+    }
+
+    pub(crate) fn may_have_schema(&self, schema_key: &str) -> bool {
+        let hash = xxh3_64(schema_key.as_bytes()).to_be_bytes();
+        hash.chunks_exact(2).all(|pair| {
+            let bit = usize::from(u16::from_be_bytes([pair[0], pair[1]]))
+                % (SCHEMA_PRESENCE_BLOOM_WORDS * u64::BITS as usize);
+            self.schema_presence_bloom[bit / u64::BITS as usize]
+                & (1_u64 << (bit % u64::BITS as usize))
+                != 0
+        })
     }
 }
 
@@ -290,6 +331,7 @@ mod tests {
             head_commit_id: CommitId::for_test_label("first-head"),
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: LixTimestamp::expect_parse("first created_at", "2026-01-01T00:00:00Z"),
             updated_at: LixTimestamp::expect_parse("first updated_at", "2026-01-01T00:00:00Z"),
@@ -299,6 +341,7 @@ mod tests {
             head_commit_id: CommitId::for_test_label("second-head"),
             generation: CommitId::for_test_label("first-generation"),
             current_state_revision: 1,
+            schema_presence_bloom: [u64::MAX; 4],
             working_diff_checkpoint_commit_id: None,
             created_at: first.created_at,
             updated_at: LixTimestamp::expect_parse("second updated_at", "2026-01-02T00:00:00Z"),
@@ -306,6 +349,15 @@ mod tests {
         };
         let branch_a = "branch-a".to_string();
         let branch_b = "branch-b".to_string();
+
+        let mut presence = first;
+        presence.schema_presence_bloom = [0; 4];
+        assert!(!presence.may_have_schema("present"));
+        presence.note_schema("present");
+        assert!(presence.may_have_schema("present"));
+        assert!(!presence.may_have_schema("absent"));
+        presence.reset_schema_presence();
+        assert!(!presence.may_have_schema("present"));
 
         let mut writes = storage.new_write_set();
         stage_branch_head_control(&mut writes, &branch_b, first)

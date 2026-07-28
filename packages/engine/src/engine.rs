@@ -564,7 +564,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn predecessor_v10_protocol_is_rejected() {
+    async fn predecessor_v15_protocol_is_rejected() {
         let storage = Memory::new();
         Engine::initialize(storage.clone())
             .await
@@ -574,7 +574,7 @@ mod tests {
         writes.put(
             crate::init::REPOSITORY_PROTOCOL_SPACE,
             crate::init::REPOSITORY_PROTOCOL_KEY,
-            &b"tracked-direct-plane.v10"[..],
+            &b"live-state.hot.v15"[..],
         );
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -582,7 +582,7 @@ mod tests {
             .expect("legacy protocol marker should commit");
 
         let Err(error) = Engine::new(storage).await else {
-            panic!("v10 repository must fail closed");
+            panic!("v15 repository must fail closed");
         };
         assert_eq!(error.code, "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT");
     }

@@ -11,6 +11,23 @@ use crate::live_state::{LiveStateExactBatchRequest, LiveStateRowRequest, LiveSta
 /// into sessions or SQL providers.
 #[async_trait]
 pub(crate) trait LiveStateReader: Send + Sync {
+    /// Scans committed rows for constraint validation.
+    ///
+    /// Durable readers can override this lane to use publication metadata for
+    /// a conservative empty-schema proof. Other readers preserve correctness
+    /// by falling back to their ordinary scan implementation.
+    async fn scan_constraint_rows(
+        &self,
+        request: &LiveStateScanRequest,
+        tracked_only: bool,
+    ) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+        if tracked_only {
+            self.scan_tracked_rows(request).await
+        } else {
+            self.scan_rows(request).await
+        }
+    }
+
     async fn scan_rows(
         &self,
         request: &LiveStateScanRequest,

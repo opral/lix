@@ -39,15 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V15 makes the complete hot current-state generation authoritative for both
-/// tracked and untracked rows. Untracked values have no separate index,
-/// presence marker, or standalone changelog record. Opening an older store
-/// must fail closed rather than mixing its former visibility rules with the
-/// unified current-state layout.
+/// V16 adds the branch-control schema-presence summary used to prove constraint
+/// source ranges empty. Opening an older store must fail closed before reading
+/// its v7 branch controls as though the v8 control space were authoritative.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v15";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"live-state.hot.v16";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -237,6 +235,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: global_branch_ref_change.id,
+            schema_presence_bloom: [0; 4],
         },
         branch_ref_change: global_branch_ref_change,
     };
@@ -256,6 +255,7 @@ pub(crate) fn plan_init_seed(functions: FunctionProviderHandle) -> Result<InitSe
             created_at: timestamp,
             updated_at: timestamp,
             ref_change_id: main_branch_ref_change.id,
+            schema_presence_bloom: [0; 4],
         },
         branch_ref_change: main_branch_ref_change,
     };
@@ -419,7 +419,9 @@ where
                     coverage: working_diff_coverage,
                 },
             )?;
-            stage_branch_head_control(&mut writes, &branch.branch_id, branch.control)?;
+            let mut control = branch.control;
+            control.note_schemas(head_deltas.iter().map(|delta| delta.schema_key));
+            stage_branch_head_control(&mut writes, &branch.branch_id, control)?;
         }
     }
     crate::catalog::stage_catalog_revision(&mut writes);
