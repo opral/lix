@@ -574,9 +574,8 @@ simulation_test!(
                 .execute(
                     &format!(
                         "SELECT lixcol_metadata \
-                         FROM lix_key_value_history \
-                         WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                           AND key = 'metadata-valid-object'"
+                         FROM lix_key_value_history('{commit_id}') \
+                           WHERE key = 'metadata-valid-object'"
                     ),
                     &[],
                 )

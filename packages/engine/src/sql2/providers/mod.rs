@@ -21,6 +21,7 @@ mod file;
 mod file_history;
 mod filesystem_history_path;
 mod filesystem_working_change;
+mod history_table_function;
 mod history_util;
 mod spec;
 mod upsert;
@@ -693,7 +694,9 @@ mod tests {
     use crate::json_store::JsonStoreContext;
     use crate::live_state::{LiveStateReader, LiveStateScanRequest};
     use crate::sql2::HistoryQuerySource;
-    use crate::sql2::catalog::{PublicCatalog, derive_entity_surface_spec_from_schema};
+    use crate::sql2::catalog::{
+        PublicCatalog, PublicSurfaceKind, derive_entity_surface_spec_from_schema,
+    };
     use crate::storage_adapter::{
         Memory, MemoryRead, SharedStorageAdapterRead, StorageAdapter, StorageReadOptions,
     };
@@ -1066,10 +1069,26 @@ mod tests {
         catalog: &PublicCatalog,
         surface_name: &str,
     ) {
-        let provider = session
-            .table_provider(surface_name)
-            .await
-            .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"));
+        let surface = catalog
+            .surface(surface_name)
+            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+        let provider = if matches!(
+            surface.kind,
+            PublicSurfaceKind::EntityHistory { .. }
+                | PublicSurfaceKind::FileHistory
+                | PublicSurfaceKind::DirectoryHistory
+        ) {
+            session
+                .table_function(surface_name)
+                .unwrap_or_else(|error| panic!("{surface_name} function should load: {error}"))
+                .create_table_provider(&[])
+                .unwrap_or_else(|error| panic!("{surface_name} function should bind: {error}"))
+        } else {
+            session
+                .table_provider(surface_name)
+                .await
+                .unwrap_or_else(|error| panic!("{surface_name} provider should load: {error}"))
+        };
         assert_surface_schema_matches_provider_schema(catalog, surface_name, provider.schema());
     }
 
@@ -1081,14 +1100,25 @@ mod tests {
         let surface = catalog
             .surface(surface_name)
             .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+        let history_surface = matches!(
+            surface.kind,
+            PublicSurfaceKind::EntityHistory { .. }
+                | PublicSurfaceKind::FileHistory
+                | PublicSurfaceKind::DirectoryHistory
+        );
         let catalog_column_names = surface
             .columns
             .iter()
+            .filter(|column| !history_surface || column.is_public())
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
         let provider_field_names = provider_schema
             .fields()
             .iter()
+            .filter(|field| {
+                !history_surface
+                    || field.name() != crate::sql2::history_route::HISTORY_COL_AS_OF_COMMIT_ID
+            })
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
         assert_eq!(
@@ -1096,14 +1126,16 @@ mod tests {
             "{surface_name} column order"
         );
 
-        let catalog_schema = catalog
-            .surface_schema(surface_name)
-            .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
-        assert_eq!(
-            catalog_schema.fields(),
-            provider_schema.fields(),
-            "{surface_name}"
-        );
+        if !history_surface {
+            let catalog_schema = catalog
+                .surface_schema(surface_name)
+                .unwrap_or_else(|| panic!("{surface_name} should be in catalog"));
+            assert_eq!(
+                catalog_schema.fields(),
+                provider_schema.fields(),
+                "{surface_name}"
+            );
+        }
     }
 
     async fn empty_history_query_source()

@@ -12,7 +12,8 @@ the question:
 | `<schema>_history`, `lix_file_history`, `lix_directory_history` | Which logical revisions are reachable from a commit? |
 | `lix_change` | Which retained changes exist anywhere in this workspace? |
 
-Typed history is schema-specific and commit-reachability scoped.
+Typed history is exposed through table-valued functions. It is schema-specific
+and commit-reachability scoped.
 `lix_change` is heterogeneous and workspace-wide. A change on an unmerged
 sibling branch can therefore appear in `lix_change` without appearing in
 history read from the active branch.
@@ -21,9 +22,10 @@ For the full surface grid, see [SQL Surfaces](./surfaces.md).
 
 ## Typed entity history
 
-A registered application schema such as `acme_task` has three typed relations:
+A registered application schema such as `acme_task` has two typed relations
+and one history function:
 `acme_task` for the active branch, `acme_task_by_branch` for explicit branch
-scope, and `acme_task_history` for branch-reachable history.
+scope, and `acme_task_history()` for branch-reachable history.
 
 History starts at the active branch head pinned for the statement or coherent
 read batch, so the common query needs no anchor predicate:
@@ -36,7 +38,7 @@ SELECT
   lixcol_observed_commit_id,
   lixcol_commit_created_at,
   lixcol_is_deleted
-FROM acme_task_history
+FROM acme_task_history()
 WHERE id = $1
 ORDER BY lixcol_depth;
 ```
@@ -56,14 +58,19 @@ Entity history adds these system columns:
 | `lixcol_origin_key` | Optional origin key attached to the source change. |
 | `lixcol_observed_commit_id` | The commit where this state was observed. |
 | `lixcol_commit_created_at` | When that commit was created. It never falls back to the change timestamp. |
-| `lixcol_as_of_commit_id` | The commit anchoring the history walk. |
 | `lixcol_depth` | `0` is the revision at the anchor; higher values walk back through reachable history. |
 | `lixcol_is_deleted` | `true` when the revision is a tombstone. |
 
-For time travel, use exact equality or a non-empty `IN` predicate on
-`lixcol_as_of_commit_id`. Ranges, `LIKE`, `NOT IN`, expressions around the
-anchor, and mixed `OR` conditions are rejected instead of silently using the
-pinned head.
+The anchor belongs to the relation, not to each result row. Call the function
+without an argument to use the pinned active head, or pass a commit id for
+time travel:
+
+```sql
+SELECT id, title, lixcol_depth
+FROM acme_task_history($1)
+WHERE id = $2
+ORDER BY lixcol_depth;
+```
 
 To inspect another branch, resolve its `commit_id` and bind it:
 
@@ -76,11 +83,10 @@ const commitId = branch.rows[0].value("commit_id").asText();
 
 const history = await lix.execute(
   `SELECT id, title, lixcol_depth
-     FROM acme_task_history
-    WHERE id = $1
-      AND lixcol_as_of_commit_id = $2
+     FROM acme_task_history($1)
+    WHERE id = $2
     ORDER BY lixcol_depth`,
-  ["t1", commitId],
+  [commitId, "t1"],
 );
 ```
 
@@ -89,7 +95,7 @@ order does not change the identity encoded by the schema:
 
 ```sql
 SELECT project_id, issue_number, title, lixcol_depth
-FROM acme_issue_history
+FROM acme_issue_history()
 WHERE project_id = 'launch'
   AND issue_number = '7'
 ORDER BY lixcol_depth;
@@ -104,7 +110,7 @@ Use a stable ID to follow an object across renames:
 
 ```sql
 SELECT path, name, lixcol_depth, lixcol_observed_commit_id
-FROM lix_file_history
+FROM lix_file_history()
 WHERE id = $1
 ORDER BY lixcol_depth;
 ```

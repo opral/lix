@@ -228,8 +228,8 @@ async fn v2_file_history_reads_durable_materialized_bytes_without_plugin_executi
     let result = history_lix
         .execute(
             "SELECT data, lixcol_depth \
-             FROM lix_file_history \
-             WHERE lixcol_as_of_commit_id = $1 AND id = $2 \
+             FROM lix_file_history($1) \
+             WHERE id = $2 \
              ORDER BY lixcol_depth \
              LIMIT 2",
             &[Value::Text(head), Value::Text(file_id)],

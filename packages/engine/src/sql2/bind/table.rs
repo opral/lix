@@ -351,7 +351,7 @@ mod tests {
         let catalog = catalog();
         let table = bind_public_table(
             &catalog,
-            &table_name("SELECT * FROM test_state_schema_history"),
+            &table_name("SELECT * FROM test_state_schema_history()"),
         )
         .expect("entity history surface should bind");
 

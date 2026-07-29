@@ -62,10 +62,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_as_of_commit_id, lixcol_is_deleted, lixcol_depth \
-                     FROM engine_history_schema_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_pk = lix_json('[\"history-entity\"]') \
+                    "SELECT id, count, active, meta, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_is_deleted, lixcol_depth \
+                     FROM engine_history_schema_history('{second_commit_id}') \
+                     WHERE lixcol_entity_pk = lix_json('[\"history-entity\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -83,7 +82,6 @@ simulation_test!(
                     Value::Json(json!({"source": "update"})),
                     Value::Json(json!(["history-entity"])),
                     Value::Text(second_commit_id.clone()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Boolean(false),
                     Value::Integer(0),
                 ],
@@ -94,7 +92,6 @@ simulation_test!(
                     Value::Json(json!({"source": "insert"})),
                     Value::Json(json!(["history-entity"])),
                     Value::Text(first_commit_id),
-                    Value::Text(second_commit_id),
                     Value::Boolean(false),
                     Value::Integer(1),
                 ],
@@ -135,16 +132,10 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
         )
         .await
         .expect("entity insert should succeed");
-    let active_head = engine
-        .load_branch_head_commit_id(sim.main_branch_id())
-        .await
-        .expect("active head should load")
-        .expect("active head should exist");
-
     let result = session
         .execute(
-            "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
-                 FROM engine_history_error_schema_history \
+            "SELECT id, lixcol_depth \
+                 FROM engine_history_error_schema_history() \
                  WHERE id = 'history-default'",
             &[],
         )
@@ -155,7 +146,6 @@ simulation_test!(entity_history_defaults_to_active_head, |sim| async move {
         result,
         vec![vec![
             Value::Text("history-default".to_string()),
-            Value::Text(active_head),
             Value::Integer(0),
         ]],
     );
@@ -191,7 +181,7 @@ simulation_test!(
                 .execute(
                     &format!(
                         "SELECT id \
-                         FROM engine_history_bare_error_schema_history \
+                         FROM engine_history_bare_error_schema_history() \
                          WHERE {retired} = lix_active_branch_commit_id()"
                     ),
                     &[],

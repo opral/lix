@@ -4729,8 +4729,8 @@ mod tests {
                 &[],
             ),
             (
-                "SELECT DISTINCT lixcol_as_of_commit_id \
-                 FROM lix_key_value_history \
+                "SELECT lixcol_depth \
+                 FROM lix_key_value_history() \
                  WHERE key = 'batch-read'",
                 &[],
             ),
@@ -4757,9 +4757,9 @@ mod tests {
         );
         assert_eq!(
             batch.results[2].rows()[0]
-                .get::<String>("lixcol_as_of_commit_id")
+                .get::<i64>("lixcol_depth")
                 .unwrap(),
-            batch.active_branch_commit_id
+            0
         );
     }
 
@@ -4842,7 +4842,7 @@ mod tests {
         );
 
         session
-            .execute("SELECT COUNT(*) AS rows FROM lix_key_value_history", &[])
+            .execute("SELECT COUNT(*) AS rows FROM lix_key_value_history()", &[])
             .await
             .expect("fixed history surface should execute");
         assert_eq!(

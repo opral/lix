@@ -187,9 +187,8 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .execute(
             &format!(
                 "SELECT id, path \
-                 FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                   AND lixcol_depth = 0 \
+                 FROM lix_file_history('{commit_id}') \
+                   WHERE lixcol_depth = 0 \
                    AND id = '3faa577b-02e3-7c30-8b7d-30a9698cba93'"
             ),
             &[],
@@ -289,9 +288,8 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
         .execute(
             &format!(
                 "SELECT path, lixcol_source_changes \
-                 FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                   AND lixcol_depth = 0 \
+                 FROM lix_file_history('{commit_id}') \
+                   WHERE lixcol_depth = 0 \
                    AND id = '626f756e-6465-842d-8669-6c6500000000'"
             ),
             &[],
@@ -379,9 +377,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_file_history('{rename_commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '70726f6a-6563-8469-8f6e-2d66696c6500'"
                 ),
                 &[],
@@ -409,9 +406,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_source_changes \
-                     FROM lix_directory_history \
-                     WHERE lixcol_as_of_commit_id = '{rename_commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_directory_history('{rename_commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = 'f6105c07-3ce2-7baf-884d-30da343db297'"
                 ),
                 &[],
@@ -442,9 +438,8 @@ simulation_test!(
         let moved = session
             .execute(
                 &format!(
-                    "SELECT path FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{move_commit_id}' \
-                       AND lixcol_depth = 0 \
+                    "SELECT path FROM lix_file_history('{move_commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '70726f6a-6563-8469-8f6e-2d66696c6500'"
                 ),
                 &[],
@@ -529,9 +524,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_file_history('{commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '67726f75-7065-842d-8669-6c6500000000'"
                 ),
                 &[],
@@ -568,9 +562,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_source_changes \
-                     FROM lix_directory_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_directory_history('{commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '46d97a70-d3ec-7d27-8b28-8c62f72869dd'"
                 ),
                 &[],
@@ -666,9 +659,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
-                       AND lixcol_depth = 1 \
+                     FROM lix_file_history('{merge_commit_id}') \
+                       WHERE lixcol_depth = 1 \
                        AND id = '616e6365-7374-8f72-8d73-69626c696e00' \
                      ORDER BY lixcol_observed_commit_id"
                 ),
@@ -744,9 +736,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_file_history('{delete_commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '72657374-6f72-852d-8669-6c6500000000'"
                 ),
                 &[],
@@ -810,9 +801,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, data, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{restore_commit_id}' \
-                       AND lixcol_depth = 0 \
+                     FROM lix_file_history('{restore_commit_id}') \
+                       WHERE lixcol_depth = 0 \
                        AND id = '72657374-6f72-852d-8669-6c6500000000'"
                 ),
                 &[],
@@ -896,10 +886,9 @@ simulation_test!(
 
         let result = session
             .execute(
-                "SELECT id, path, name, data, lixcol_as_of_commit_id, lixcol_depth \
-                 FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = $1 \
-                   AND id = $2 \
+                "SELECT id, path, name, data, lixcol_depth \
+                 FROM lix_file_history($1) \
+                   WHERE id = $2 \
                    AND path LIKE $3 \
                  ORDER BY lixcol_depth",
                 &[
@@ -923,7 +912,6 @@ simulation_test!(
                     Value::Text("/docs/readme-renamed.md".to_string()),
                     Value::Text("readme-renamed.md".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
@@ -931,7 +919,6 @@ simulation_test!(
                     Value::Text("/docs/guides/readme.md".to_string()),
                     Value::Text("readme.md".to_string()),
                     Value::Blob(b"hello".to_vec().into()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
             ],
@@ -940,9 +927,8 @@ simulation_test!(
         let old_path_result = session
             .execute(
                 "SELECT id, path, lixcol_depth \
-                 FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = $1 \
-                   AND path = '/docs/guides/readme.md' \
+                 FROM lix_file_history($1) \
+                   WHERE path = '/docs/guides/readme.md' \
                  ORDER BY lixcol_depth",
                 &[Value::Text(second_commit_id.clone())],
             )
@@ -961,9 +947,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id = '68697374-6f72-892d-8669-6c6500000000' \
+                     FROM lix_file_history('{second_commit_id}') \
+                       WHERE id = '68697374-6f72-892d-8669-6c6500000000' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -990,9 +975,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{first_commit_id}' \
-                       AND path LIKE '/missing/%'"
+                     FROM lix_file_history('{first_commit_id}') \
+                       WHERE path LIKE '/missing/%'"
                 ),
                 &[],
             )
@@ -1031,9 +1015,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, data \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND path = '/empty-history.txt' \
+                     FROM lix_file_history('{commit_id}') \
+                       WHERE path = '/empty-history.txt' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -1122,9 +1105,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
-                       AND id = '6469616d-6f6e-842d-8669-6c6500000000' \
+                     FROM lix_file_history('{merge_commit_id}') \
+                       WHERE id = '6469616d-6f6e-842d-8669-6c6500000000' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
                 ),
@@ -1215,12 +1197,10 @@ simulation_test!(
         let result = session
             .execute(
                 "SELECT file.id, file.path, directory.id \
-                 FROM lix_file_history AS file \
-                 JOIN lix_directory_history AS directory \
+                 FROM lix_file_history() AS file \
+                 JOIN lix_directory_history() AS directory \
                    ON file.directory_id = directory.id \
-                 WHERE file.lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-                   AND directory.lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-                   AND file.path = '/joined/old.txt'",
+                 WHERE file.path = '/joined/old.txt'",
                 &[],
             )
             .await
@@ -1269,9 +1249,8 @@ simulation_test!(lix_file_history_reads_bound_id_in_list, |sim| async move {
     let result = session
         .execute(
             "SELECT id, path, data \
-                 FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = $1 \
-                   AND id IN ($2, $3) \
+                 FROM lix_file_history($1) \
+                   WHERE id IN ($2, $3) \
                  ORDER BY id",
             &[
                 Value::Text(commit_id),
@@ -1337,8 +1316,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, path, lixcol_depth \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
+                     FROM lix_file_history('{commit_id}') \
                      ORDER BY lixcol_depth \
                      LIMIT 1"
                 ),
@@ -1390,9 +1368,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, path, data \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND path LIKE '/target/%' \
+                     FROM lix_file_history('{commit_id}') \
+                       WHERE path LIKE '/target/%' \
                      LIMIT 1"
                 ),
                 &[],
@@ -1429,16 +1406,10 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
         )
         .await
         .expect("file insert should succeed");
-    let active_head = engine
-        .load_branch_head_commit_id(sim.main_branch_id())
-        .await
-        .expect("active head should load")
-        .expect("active head should exist");
-
     let result = session
         .execute(
-            "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
-                 FROM lix_file_history \
+            "SELECT id, lixcol_depth \
+                 FROM lix_file_history() \
                  WHERE id = '68697374-6f72-892d-8465-6661756c7401'",
             &[],
         )
@@ -1449,7 +1420,6 @@ simulation_test!(lix_file_history_defaults_to_active_head, |sim| async move {
         result,
         vec![vec![
             Value::Text("68697374-6f72-892d-8465-6661756c7401".to_string()),
-            Value::Text(active_head),
             Value::Integer(0),
         ]],
     );
@@ -1493,9 +1463,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, data, lixcol_depth \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND id = '6f726469-6e61-8279-8d68-6973746f7200' \
+                     FROM lix_file_history('{commit_id}') \
+                       WHERE id = '6f726469-6e61-8279-8d68-6973746f7200' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -1552,9 +1521,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT id, path, data, lixcol_source_changes \
-                     FROM lix_file_history \
-                     WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                       AND id = '68697374-6f72-892d-8669-6c652d626c00' \
+                     FROM lix_file_history('{commit_id}') \
+                       WHERE id = '68697374-6f72-892d-8669-6c652d626c00' \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -1641,8 +1609,7 @@ simulation_test!(
                 .execute(
                     &format!(
                         "SELECT {retired} \
-                         FROM lix_file_history \
-                         WHERE lixcol_as_of_commit_id = '{commit_id}'"
+                         FROM lix_file_history('{commit_id}')"
                     ),
                     &[],
                 )

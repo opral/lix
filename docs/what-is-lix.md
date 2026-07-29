@@ -64,7 +64,7 @@ activity:
 ```sql
 -- Which revisions of this task are reachable from the active branch?
 SELECT id, title, lixcol_depth, lixcol_is_deleted
-FROM acme_task_history
+FROM acme_task_history()
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```

@@ -50,10 +50,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, parent_id, name, lixcol_as_of_commit_id, lixcol_depth \
-                     FROM lix_directory_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id IN ('68697374-6f72-892d-8469-722d646f6300', '68697374-6f72-892d-8469-722d67756900') \
+                    "SELECT id, path, parent_id, name, lixcol_depth \
+                     FROM lix_directory_history('{second_commit_id}') \
+                       WHERE id IN ('68697374-6f72-892d-8469-722d646f6300', '68697374-6f72-892d-8469-722d67756900') \
                      ORDER BY lixcol_depth, id"
                 ),
                 &[],
@@ -69,7 +68,6 @@ simulation_test!(
                     Value::Text("/docs/guides/".to_string()),
                     Value::Text("68697374-6f72-892d-8469-722d646f6300".to_string()),
                     Value::Text("guides".to_string()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
@@ -77,7 +75,6 @@ simulation_test!(
                     Value::Text("/docs/".to_string()),
                     Value::Null,
                     Value::Text("docs".to_string()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Integer(1),
                 ],
             ],
@@ -87,9 +84,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT lixcol_source_changes \
-                     FROM lix_directory_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND id = '68697374-6f72-892d-8469-722d67756900' \
+                     FROM lix_directory_history('{second_commit_id}') \
+                       WHERE id = '68697374-6f72-892d-8469-722d67756900' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -156,16 +152,10 @@ simulation_test!(
             )
             .await
             .expect("directory insert should succeed");
-        let active_head = engine
-            .load_branch_head_commit_id(sim.main_branch_id())
-            .await
-            .expect("active head should load")
-            .expect("active head should exist");
-
         let result = session
             .execute(
-                "SELECT id, lixcol_as_of_commit_id, lixcol_depth \
-                 FROM lix_directory_history \
+                "SELECT id, lixcol_depth \
+                 FROM lix_directory_history() \
                  WHERE id = '68697374-6f72-892d-8465-6661756c7401'",
                 &[],
             )
@@ -176,7 +166,6 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Text("68697374-6f72-892d-8465-6661756c7401".to_string()),
-                Value::Text(active_head),
                 Value::Integer(0),
             ]],
         );
@@ -252,9 +241,8 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT path, lixcol_observed_commit_id, lixcol_depth \
-                     FROM lix_directory_history \
-                     WHERE lixcol_as_of_commit_id = '{merge_commit_id}' \
-                       AND id = '6469616d-6f6e-842d-8469-720000000000' \
+                     FROM lix_directory_history('{merge_commit_id}') \
+                       WHERE id = '6469616d-6f6e-842d-8469-720000000000' \
                        AND lixcol_depth = 1 \
                      ORDER BY lixcol_observed_commit_id"
                 ),
@@ -338,10 +326,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_as_of_commit_id, lixcol_depth \
-	                 FROM lix_directory_history \
-	                 WHERE lixcol_as_of_commit_id = '{delete_commit_id}' \
-	                   AND lixcol_entity_pk IN (lix_json('[\"01940000-0000-7000-8000-000000000001\"]'), lix_json('[\"01940000-0000-7000-8000-000000000002\"]')) \
+					"SELECT id, path, name, lixcol_is_deleted, lixcol_source_changes, lixcol_depth \
+	                 FROM lix_directory_history('{delete_commit_id}') \
+	                   WHERE lixcol_entity_pk IN (lix_json('[\"01940000-0000-7000-8000-000000000001\"]'), lix_json('[\"01940000-0000-7000-8000-000000000002\"]')) \
 	                   AND lixcol_depth = 0 \
 	                 ORDER BY lixcol_entity_pk"
 				),
@@ -389,8 +376,7 @@ simulation_test!(
                 })
                 .collect::<BTreeSet<_>>();
             assert_eq!(actual_source_ids, expected_source_ids);
-            assert_eq!(row.values()[5], Value::Text(delete_commit_id.clone()));
-            assert_eq!(row.values()[6], Value::Integer(0));
+            assert_eq!(row.values()[5], Value::Integer(0));
         }
     }
 );

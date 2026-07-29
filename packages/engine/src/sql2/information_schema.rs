@@ -15,10 +15,12 @@ use datafusion::prelude::SessionContext;
 
 use crate::LixError;
 
+use super::catalog::PublicSurfaceKind;
 use super::catalog::{PublicCatalog, PublicColumnInsertPolicy};
 use super::result_metadata::field_is_json;
 
 const LIX_VALUE_KIND_JSON: &str = "JSON";
+const TABLE_FUNCTIONS: &str = "table_functions";
 
 /// Installs Lix's SQL-level column contract while retaining DataFusion's other
 /// standard information-schema views.
@@ -118,9 +120,15 @@ impl LixInformationSchemaProvider {
                 }
             }
 
-            for table_name in INFORMATION_SCHEMA_TABLES {
-                let table_schema = if *table_name == "columns" {
+            for table_name in INFORMATION_SCHEMA_TABLES
+                .iter()
+                .copied()
+                .chain(std::iter::once(TABLE_FUNCTIONS))
+            {
+                let table_schema = if table_name == "columns" {
                     Arc::clone(&schema)
+                } else if table_name == TABLE_FUNCTIONS {
+                    table_functions_schema()
                 } else {
                     delegate
                         .table(table_name)
@@ -145,6 +153,71 @@ impl LixInformationSchemaProvider {
         let batch = rows.finish(Arc::clone(&schema))?;
         Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
     }
+
+    fn table_functions_table(&self) -> Result<Arc<dyn TableProvider>> {
+        let schema = table_functions_schema();
+        let mut function_catalog = Vec::new();
+        let mut function_schema = Vec::new();
+        let mut function_name = Vec::new();
+        let mut argument_signature = Vec::new();
+        let mut result_column = Vec::new();
+        let mut ordinal_position = Vec::new();
+        let mut is_nullable = Vec::new();
+        let mut data_type = Vec::new();
+        let mut lix_value_kind = Vec::new();
+
+        for surface in self.public_catalog.surfaces().filter(|surface| {
+            matches!(
+                surface.kind,
+                PublicSurfaceKind::EntityHistory { .. }
+                    | PublicSurfaceKind::FileHistory
+                    | PublicSurfaceKind::DirectoryHistory
+            )
+        }) {
+            let provider_schema = self
+                .public_catalog
+                .history_surface_schema(&surface.name)
+                .ok_or_else(|| {
+                    DataFusionError::Execution(format!(
+                        "history function '{}' is missing its result schema",
+                        surface.name
+                    ))
+                })?;
+            for (position, column) in surface
+                .columns
+                .iter()
+                .filter(|column| column.is_public())
+                .enumerate()
+            {
+                let field = provider_schema.field_with_name(&column.name)?;
+                function_catalog.push(self.public_catalog_name.clone());
+                function_schema.push(self.public_schema_name.clone());
+                function_name.push(surface.name.clone());
+                argument_signature.push("() | (as_of TEXT)".to_string());
+                result_column.push(column.name.clone());
+                ordinal_position.push((position + 1) as u64);
+                is_nullable.push(if column.read_nullable { "YES" } else { "NO" }.to_string());
+                data_type.push(public_sql_type(field.data_type()));
+                lix_value_kind.push(field_is_json(field).then(|| LIX_VALUE_KIND_JSON.to_string()));
+            }
+        }
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(function_catalog)),
+                Arc::new(StringArray::from(function_schema)),
+                Arc::new(StringArray::from(function_name)),
+                Arc::new(StringArray::from(argument_signature)),
+                Arc::new(StringArray::from(result_column)),
+                Arc::new(UInt64Array::from(ordinal_position)),
+                Arc::new(StringArray::from(is_nullable)),
+                Arc::new(StringArray::from(data_type)),
+                Arc::new(StringArray::from(lix_value_kind)),
+            ],
+        )?;
+        Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+    }
 }
 
 #[async_trait]
@@ -157,12 +230,16 @@ impl SchemaProvider for LixInformationSchemaProvider {
         INFORMATION_SCHEMA_TABLES
             .iter()
             .map(|name| (*name).to_string())
+            .chain(std::iter::once(TABLE_FUNCTIONS.to_string()))
             .collect()
     }
 
     async fn table(&self, name: &str) -> Result<Option<Arc<dyn TableProvider>>> {
         if name.eq_ignore_ascii_case("columns") {
             return self.columns_table().await.map(Some);
+        }
+        if name.eq_ignore_ascii_case(TABLE_FUNCTIONS) {
+            return self.table_functions_table().map(Some);
         }
         let catalog_list = self.catalog_list.upgrade().ok_or_else(|| {
             DataFusionError::Execution("SQL catalog closed while reading information_schema".into())
@@ -176,7 +253,22 @@ impl SchemaProvider for LixInformationSchemaProvider {
         INFORMATION_SCHEMA_TABLES
             .iter()
             .any(|candidate| candidate.eq_ignore_ascii_case(name))
+            || name.eq_ignore_ascii_case(TABLE_FUNCTIONS)
     }
+}
+
+fn table_functions_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("function_catalog", DataType::Utf8, false),
+        Field::new("function_schema", DataType::Utf8, false),
+        Field::new("function_name", DataType::Utf8, false),
+        Field::new("argument_signature", DataType::Utf8, false),
+        Field::new("result_column", DataType::Utf8, false),
+        Field::new("ordinal_position", DataType::UInt64, false),
+        Field::new("is_nullable", DataType::Utf8, false),
+        Field::new("data_type", DataType::Utf8, false),
+        Field::new("lix_value_kind", DataType::Utf8, true),
+    ]))
 }
 
 fn columns_schema() -> SchemaRef {

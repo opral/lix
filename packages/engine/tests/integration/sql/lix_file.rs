@@ -2600,9 +2600,8 @@ async fn file_descriptor_event_count(
     let result = session
         .execute(
             &format!(
-                "SELECT lixcol_source_changes FROM lix_file_history \
-                 WHERE lixcol_as_of_commit_id = '{commit_id}' \
-                   AND lixcol_depth = 0 \
+                "SELECT lixcol_source_changes FROM lix_file_history('{commit_id}') \
+                   WHERE lixcol_depth = 0 \
                    AND id = '{file_id}'"
             ),
             &[],

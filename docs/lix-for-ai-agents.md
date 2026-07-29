@@ -47,7 +47,7 @@ agent did. Query the typed history relation for each application schema:
 ```sql
 SELECT id, title, status, lixcol_depth,
        lixcol_observed_commit_id, lixcol_is_deleted
-FROM acme_task_history
+FROM acme_task_history()
 ORDER BY lixcol_depth, id;
 ```
 

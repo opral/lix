@@ -66,12 +66,11 @@ export function registerMemoryStorageContract({
 				});
 				await expect(
 					lix.execute(
-						"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+						"SELECT id FROM lix_file_history('one', 'two')",
 					),
 				).rejects.toMatchObject({
 					name: "LixError",
 					code: "LIX_UNSUPPORTED_SQL",
-					hint: expect.stringContaining("pinned active branch head"),
 				});
 			} finally {
 				await lix.close();
@@ -179,7 +178,7 @@ export function registerMemoryStorageContract({
 							params: ["batch-rolled-back", "before failure"],
 						},
 						{
-							sql: "SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+							sql: "SELECT id FROM lix_file_history('one', 'two')",
 						},
 						{
 							sql: "INSERT INTO lix_key_value (key, value) VALUES ($1, $2)",

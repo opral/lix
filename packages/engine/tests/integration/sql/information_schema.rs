@@ -375,11 +375,11 @@ simulation_test!(
 
         let history_contract = session
             .execute(
-                "SELECT column_name, is_nullable, lix_insert_policy \
-                 FROM information_schema.columns \
-                 WHERE table_name = 'engine_column_contract_history' \
-                   AND column_name IN ('id', 'title') \
-                 ORDER BY column_name",
+                "SELECT result_column, is_nullable \
+                 FROM information_schema.table_functions \
+                 WHERE function_name = 'engine_column_contract_history' \
+                   AND result_column IN ('id', 'title') \
+                 ORDER BY result_column",
                 &[],
             )
             .await
@@ -387,15 +387,10 @@ simulation_test!(
         assert_rows_eq(
             history_contract,
             vec![
-                vec![
-                    Value::Text("id".to_string()),
-                    Value::Text("NO".to_string()),
-                    Value::Text("READ_ONLY".to_string()),
-                ],
+                vec![Value::Text("id".to_string()), Value::Text("NO".to_string())],
                 vec![
                     Value::Text("title".to_string()),
                     Value::Text("YES".to_string()),
-                    Value::Text("READ_ONLY".to_string()),
                 ],
             ],
         );
@@ -1407,9 +1402,8 @@ simulation_test!(
         assert_rows_eq(
             session
                 .execute(
-                    "SELECT count FROM engine_bigint_contract_history \
-                     WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-                       AND lixcol_entity_pk = lix_json('[\"integral-real\"]')",
+                    "SELECT count FROM engine_bigint_contract_history() \
+                       WHERE lixcol_entity_pk = lix_json('[\"integral-real\"]')",
                     &[],
                 )
                 .await

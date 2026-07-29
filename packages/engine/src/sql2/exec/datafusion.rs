@@ -19,9 +19,14 @@ use datafusion::logical_expr::registry::FunctionRegistry;
 use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, LogicalPlanBuilder, Operator};
 use datafusion::prelude::SessionContext;
 use datafusion::sql::parser::Statement as DataFusionStatement;
+use datafusion::sql::sqlparser::ast::{
+    Expr as SqlExpr, FunctionArg, FunctionArgExpr, TableFactor, Value as SqlValue, Visit, VisitMut,
+    Visitor, VisitorMut,
+};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::marker::PhantomData;
+use std::ops::ControlFlow;
 
 use crate::branch::BranchHead;
 use crate::functions::FunctionContext;
@@ -59,6 +64,7 @@ pub(crate) struct DataFusionLogicalPlan {
     pub(super) plan: LogicalPlan,
     pub(super) notices: Vec<LixNotice>,
     pub(super) json_predicate_params: BTreeSet<usize>,
+    pub(super) expected_parameter_count: usize,
 }
 
 pub(crate) struct SessionReadSqlResult {
@@ -135,16 +141,21 @@ pub(crate) async fn execute_read_statement_in_session_from_parsed(
     statement: DataFusionStatement,
     params: &[Value],
 ) -> Result<SqlQueryResult, LixError> {
-    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement).await?;
+    let plan = create_logical_plan_in_session_from_parsed(session, sql, statement, params).await?;
     execute_logical_plan(plan, params).await
 }
 
 async fn create_logical_plan_in_session_from_parsed(
     session: &ReadSqlSession<'_>,
     sql: &str,
-    statement: DataFusionStatement,
+    mut statement: DataFusionStatement,
+    params: &[Value],
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
+    let parameter_names = statement_parameter_names(&statement)?;
+    let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
+    validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
+    bind_table_function_parameters(&mut statement, params)?;
     let plan = create_logical_plan_from_statement(&session.session, statement).await?;
     validate_supported_logical_plan(&plan)?;
     validate_json_predicates_in_logical_plan(&plan)?;
@@ -156,6 +167,7 @@ async fn create_logical_plan_in_session_from_parsed(
         plan,
         notices: Vec::new(),
         json_predicate_params,
+        expected_parameter_count,
     }))
 }
 
@@ -174,9 +186,10 @@ pub(crate) async fn execute_transaction_read_statement_from_parsed(
     }
     // Same fence as session reads, with the transaction overlay available
     // during planning/execution but not returned to the caller.
-    let plan =
-        create_transaction_read_logical_plan_from_parsed(read_ctx, write_ctx, sql, statement)
-            .await?;
+    let plan = create_transaction_read_logical_plan_from_parsed(
+        read_ctx, write_ctx, sql, statement, params,
+    )
+    .await?;
     execute_logical_plan(plan, params).await
 }
 
@@ -184,9 +197,14 @@ async fn create_transaction_read_logical_plan_from_parsed(
     read_ctx: &impl SqlExecutionContext,
     write_ctx: &mut dyn SqlWriteExecutionContext,
     sql: &str,
-    statement: DataFusionStatement,
+    mut statement: DataFusionStatement,
+    params: &[Value],
 ) -> Result<SqlLogicalPlan, LixError> {
     crate::sql2::bind_read_statement(sql, &statement)?;
+    let parameter_names = statement_parameter_names(&statement)?;
+    let expected_parameter_count = expected_positional_parameter_count(&parameter_names)?;
+    validate_parameter_count_values(expected_parameter_count, &parameter_names, params.len())?;
+    bind_table_function_parameters(&mut statement, params)?;
     let session = build_transaction_read_session(read_ctx, write_ctx, &statement).await?;
     let plan = create_logical_plan_from_statement(&session, statement).await?;
     validate_supported_logical_plan(&plan)?;
@@ -199,6 +217,7 @@ async fn create_transaction_read_logical_plan_from_parsed(
         plan,
         notices: Vec::new(),
         json_predicate_params,
+        expected_parameter_count,
     }))
 }
 
@@ -890,8 +909,9 @@ async fn execute_logical_plan(
         plan,
         notices,
         json_predicate_params,
+        expected_parameter_count,
     } = plan;
-    validate_parameter_count(&plan, params.len())?;
+    debug_assert_eq!(expected_parameter_count, params.len());
     validate_json_predicate_params(&json_predicate_params, params)?;
 
     let mut dataframe = session
@@ -1953,6 +1973,14 @@ fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<()
         .get_parameter_names()
         .map_err(datafusion_error_to_lix_error)?;
     let expected_count = expected_positional_parameter_count(&parameter_names)?;
+    validate_parameter_count_values(expected_count, &parameter_names, param_count)
+}
+
+fn validate_parameter_count_values(
+    expected_count: usize,
+    parameter_names: &HashSet<String>,
+    param_count: usize,
+) -> Result<(), LixError> {
     if param_count == expected_count {
         return Ok(());
     }
@@ -1969,6 +1997,128 @@ fn validate_parameter_count(plan: &LogicalPlan, param_count: usize) -> Result<()
         "provided_param_count": param_count,
         "placeholders": sorted_parameter_names(&parameter_names),
     })))
+}
+
+fn statement_parameter_names(statement: &DataFusionStatement) -> Result<HashSet<String>, LixError> {
+    struct ParameterVisitor {
+        names: HashSet<String>,
+    }
+
+    impl Visitor for ParameterVisitor {
+        type Break = ();
+
+        fn pre_visit_expr(&mut self, expression: &SqlExpr) -> ControlFlow<Self::Break> {
+            if let SqlExpr::Value(value) = expression
+                && let SqlValue::Placeholder(name) = &value.value
+            {
+                self.names.insert(name.clone());
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visit(
+        statement: &DataFusionStatement,
+        visitor: &mut ParameterVisitor,
+    ) -> Result<(), LixError> {
+        match statement {
+            DataFusionStatement::Statement(statement) => {
+                let _ = statement.visit(visitor);
+                Ok(())
+            }
+            DataFusionStatement::Explain(explain) => visit(explain.statement.as_ref(), visitor),
+            _ => Err(LixError::new(
+                LixError::CODE_UNSUPPORTED_SQL,
+                "SQL statement is not supported by Lix SQL",
+            )),
+        }
+    }
+
+    let mut visitor = ParameterVisitor {
+        names: HashSet::new(),
+    };
+    visit(statement, &mut visitor)?;
+    Ok(visitor.names)
+}
+
+fn bind_table_function_parameters(
+    statement: &mut DataFusionStatement,
+    params: &[Value],
+) -> Result<(), LixError> {
+    struct TableFunctionParameterBinder<'a> {
+        params: &'a [Value],
+    }
+
+    impl VisitorMut for TableFunctionParameterBinder<'_> {
+        type Break = Box<LixError>;
+
+        fn pre_visit_table_factor(
+            &mut self,
+            table_factor: &mut TableFactor,
+        ) -> ControlFlow<Self::Break> {
+            let TableFactor::Table {
+                args: Some(arguments),
+                ..
+            } = table_factor
+            else {
+                return ControlFlow::Continue(());
+            };
+            for argument in &mut arguments.args {
+                let FunctionArg::Unnamed(FunctionArgExpr::Expr(expression)) = argument else {
+                    continue;
+                };
+                let SqlExpr::Value(value) = expression else {
+                    continue;
+                };
+                let SqlValue::Placeholder(name) = &value.value else {
+                    continue;
+                };
+                let Some(index) = name
+                    .strip_prefix('$')
+                    .and_then(|raw| raw.parse::<usize>().ok())
+                    .and_then(|index| index.checked_sub(1))
+                else {
+                    return ControlFlow::Break(Box::new(LixError::new(
+                        LixError::CODE_PARSE_ERROR,
+                        format!("unsupported SQL parameter placeholder '{name}'"),
+                    )));
+                };
+                let Some(param) = self.params.get(index) else {
+                    return ControlFlow::Break(Box::new(LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        format!("missing SQL parameter ${}", index + 1),
+                    )));
+                };
+                let Value::Text(text) = param else {
+                    return ControlFlow::Break(Box::new(LixError::new(
+                        LixError::CODE_TYPE_MISMATCH,
+                        "history table function as_of argument must be text",
+                    )));
+                };
+                *expression = SqlExpr::value(SqlValue::SingleQuotedString(text.clone()));
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    fn visit(
+        statement: &mut DataFusionStatement,
+        visitor: &mut TableFunctionParameterBinder<'_>,
+    ) -> Result<(), LixError> {
+        let result = match statement {
+            DataFusionStatement::Statement(statement) => statement.visit(visitor),
+            DataFusionStatement::Explain(explain) => {
+                return visit(explain.statement.as_mut(), visitor);
+            }
+            _ => return Ok(()),
+        };
+        match result {
+            ControlFlow::Continue(()) => Ok(()),
+            ControlFlow::Break(error) => Err(*error),
+        }
+    }
+
+    visit(statement, &mut TableFunctionParameterBinder { params })
 }
 
 fn expected_positional_parameter_count(
@@ -3595,10 +3745,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, count, lixcol_entity_pk, lixcol_as_of_commit_id, lixcol_depth \
-	             FROM test_state_schema_history \
-	             WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
-	               AND lixcol_entity_pk = lix_json('[\"entity-history\"]')"
+                    "SELECT value, count, lixcol_entity_pk, lixcol_depth \
+	             FROM test_state_schema_history('{head_commit_id}') \
+	             WHERE lixcol_entity_pk = lix_json('[\"entity-history\"]')"
                 ),
                 &[],
             )
@@ -3608,20 +3757,13 @@ mod tests {
 
         assert_eq!(
             columns,
-            vec![
-                "value",
-                "count",
-                "lixcol_entity_pk",
-                "lixcol_as_of_commit_id",
-                "lixcol_depth",
-            ]
+            vec!["value", "count", "lixcol_entity_pk", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], Value::Text("A".to_string()));
         assert_eq!(rows[0][1], Value::Integer(7));
         assert_eq!(rows[0][2], Value::Json(json!(["entity-history"])));
-        assert_eq!(rows[0][3], Value::Text(head_commit_id));
-        assert!(matches!(rows[0][4], Value::Integer(_)));
+        assert!(matches!(rows[0][3], Value::Integer(_)));
     }
 
     #[tokio::test]
@@ -3632,9 +3774,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, parent_id, name, path, lixcol_as_of_commit_id, lixcol_depth \
-             FROM lix_directory_history \
-             WHERE id = '01920000-0000-7000-8000-0000000000d3' AND lixcol_as_of_commit_id = '{head_commit_id}'"
+                    "SELECT id, parent_id, name, path, lixcol_depth \
+             FROM lix_directory_history('{head_commit_id}') \
+             WHERE id = '01920000-0000-7000-8000-0000000000d3'"
                 ),
                 &[],
             )
@@ -3648,14 +3790,7 @@ mod tests {
 
         assert_eq!(
             columns,
-            vec![
-                "id",
-                "parent_id",
-                "name",
-                "path",
-                "lixcol_as_of_commit_id",
-                "lixcol_depth",
-            ]
+            vec!["id", "parent_id", "name", "path", "lixcol_depth",]
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(
@@ -3665,16 +3800,14 @@ mod tests {
         assert_eq!(rows[0][1], Value::Null);
         assert_eq!(rows[0][2], Value::Text("docs".to_string()));
         assert_eq!(rows[0][3], Value::Text("/docs/".to_string()));
-        assert_eq!(rows[0][4], Value::Text(head_commit_id.clone()));
-        assert!(matches!(rows[0][5], Value::Integer(_)));
+        assert!(matches!(rows[0][4], Value::Integer(_)));
 
         let name_filtered_result = session
             .execute(
                 &format!(
                     "SELECT id \
-             FROM lix_directory_history \
-             WHERE name = 'docs' \
-               AND lixcol_as_of_commit_id = '{head_commit_id}'"
+             FROM lix_directory_history('{head_commit_id}') \
+             WHERE name = 'docs'"
                 ),
                 &[],
             )
@@ -3694,10 +3827,9 @@ mod tests {
         let result = session
             .execute(
                 &format!(
-                    "SELECT id, path, data, lixcol_as_of_commit_id, lixcol_depth \
-             FROM lix_file_history \
+                    "SELECT id, path, data, lixcol_depth \
+             FROM lix_file_history('{head_commit_id}') \
              WHERE id = '01920000-0000-7000-8000-0000000000a2' \
-               AND lixcol_as_of_commit_id = '{head_commit_id}' \
                AND data IS NOT NULL \
              ORDER BY lixcol_depth",
                 ),
@@ -3711,16 +3843,7 @@ mod tests {
         );
         let (columns, rows) = rows_from_execute_result(result);
 
-        assert_eq!(
-            columns,
-            vec![
-                "id",
-                "path",
-                "data",
-                "lixcol_as_of_commit_id",
-                "lixcol_depth",
-            ]
-        );
+        assert_eq!(columns, vec!["id", "path", "data", "lixcol_depth",]);
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0][0],
@@ -3728,16 +3851,14 @@ mod tests {
         );
         assert_eq!(rows[0][1], Value::Text("/docs/readme.md".to_string()));
         assert_eq!(rows[0][2], Value::Blob(b"hello".to_vec().into()));
-        assert_eq!(rows[0][3], Value::Text(head_commit_id.clone()));
-        assert!(matches!(rows[0][4], Value::Integer(_)));
+        assert!(matches!(rows[0][3], Value::Integer(_)));
 
         let path_filtered_result = session
             .execute(
                 &format!(
                     "SELECT id \
-             FROM lix_file_history \
-             WHERE path = '/docs/readme.md' \
-               AND lixcol_as_of_commit_id = '{head_commit_id}'"
+             FROM lix_file_history('{head_commit_id}') \
+             WHERE path = '/docs/readme.md'"
                 ),
                 &[],
             )
