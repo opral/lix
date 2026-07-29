@@ -10,9 +10,9 @@ use encoding_rs::Encoding;
 use markdown_syntax::ast as md;
 use markdown_syntax::{LineEnding, SerializeOptions, Span, SyntaxOptions};
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedMarkdown {
@@ -154,11 +154,12 @@ fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginErro
         .into_iter()
         .map(|span| span.start..span.end)
         .collect();
+    let parse_ids = ParseIds::default();
     let children = output
         .document
         .children
         .iter()
-        .map(|block| tree_from_block(block, source))
+        .map(|block| tree_from_block(block, source, &parse_ids))
         .collect::<Result<Vec<_>, _>>()?;
     let root = NodeTree {
         node: NodeSnapshot {
@@ -431,10 +432,31 @@ fn detected_line_ending(source: &str) -> &'static str {
     if saw_crlf && !saw_other { "crlf" } else { "lf" }
 }
 
-fn new_tree(kind: NodeKind, payload: Value, format: Value, children: Vec<NodeTree>) -> NodeTree {
+#[derive(Default)]
+struct ParseIds(Cell<u32>);
+
+impl ParseIds {
+    fn next(&self) -> String {
+        let ordinal = self.0.get();
+        self.0.set(
+            ordinal
+                .checked_add(1)
+                .expect("one Markdown parse cannot contain more than u32::MAX identified nodes"),
+        );
+        format!("~{ordinal:x}")
+    }
+}
+
+fn new_tree(
+    ids: &ParseIds,
+    kind: NodeKind,
+    payload: Value,
+    format: Value,
+    children: Vec<NodeTree>,
+) -> NodeTree {
     NodeTree {
         node: NodeSnapshot {
-            id: Uuid::now_v7().to_string(),
+            id: ids.next(),
             kind,
             parent_id: None,
             order_key: None,
@@ -445,20 +467,26 @@ fn new_tree(kind: NodeKind, payload: Value, format: Value, children: Vec<NodeTre
     }
 }
 
-fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginError> {
+fn tree_from_block(
+    block: &md::Block,
+    source: &str,
+    ids: &ParseIds,
+) -> Result<NodeTree, PluginError> {
     let empty = || json!({});
     match block {
         md::Block::Paragraph(node) => Ok(new_tree(
+            ids,
             NodeKind::Paragraph,
-            inline_payload(leaf_inlines_from_ast(&node.children, source)?),
+            inline_payload(leaf_inlines_from_ast(&node.children, source, ids)?),
             empty(),
             Vec::new(),
         )),
         md::Block::Heading(node) => Ok(new_tree(
+            ids,
             NodeKind::Heading,
             json!({
                 "depth": node.depth,
-                "inline": leaf_inlines_from_ast(&node.children, source)?,
+                "inline": leaf_inlines_from_ast(&node.children, source, ids)?,
             }),
             json!({
                 "style": match node.kind {
@@ -469,6 +497,7 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             Vec::new(),
         )),
         md::Block::ThematicBreak(node) => Ok(new_tree(
+            ids,
             NodeKind::ThematicBreak,
             empty(),
             json!({
@@ -481,6 +510,7 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             Vec::new(),
         )),
         md::Block::Frontmatter(node) => Ok(new_tree(
+            ids,
             NodeKind::Frontmatter,
             json!({
                 "kind": match node.kind {
@@ -493,15 +523,17 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             Vec::new(),
         )),
         md::Block::BlockQuote(node) => Ok(new_tree(
+            ids,
             NodeKind::BlockQuote,
             empty(),
             empty(),
             node.children
                 .iter()
-                .map(|child| tree_from_block(child, source))
+                .map(|child| tree_from_block(child, source, ids))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         md::Block::List(node) => Ok(new_tree(
+            ids,
             NodeKind::List,
             json!({
                 "ordered": node.ordered,
@@ -513,7 +545,7 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             }),
             node.children
                 .iter()
-                .map(|item| tree_from_list_item(item, source))
+                .map(|item| tree_from_list_item(item, source, ids))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         md::Block::CodeBlock(node) => {
@@ -529,6 +561,7 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
                 }),
             };
             Ok(new_tree(
+                ids,
                 NodeKind::CodeBlock,
                 json!({
                     "value": normalized_code_block_value(node, source),
@@ -539,12 +572,14 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             ))
         }
         md::Block::HtmlBlock(node) => Ok(new_tree(
+            ids,
             NodeKind::HtmlBlock,
             json!({ "value": node.value }),
             empty(),
             Vec::new(),
         )),
         md::Block::Definition(node) => Ok(new_tree(
+            ids,
             NodeKind::Definition,
             json!({
                 "identifier": node.identifier,
@@ -559,15 +594,16 @@ fn tree_from_block(block: &md::Block, source: &str) -> Result<NodeTree, PluginEr
             Vec::new(),
         )),
         md::Block::FootnoteDefinition(node) => Ok(new_tree(
+            ids,
             NodeKind::FootnoteDefinition,
             json!({ "identifier": node.identifier }),
             json!({ "label": node.label }),
             node.children
                 .iter()
-                .map(|child| tree_from_block(child, source))
+                .map(|child| tree_from_block(child, source, ids))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
-        md::Block::Table(node) => tree_from_table(node, source),
+        md::Block::Table(node) => tree_from_table(node, source, ids),
         unsupported => Err(PluginError::InvalidInput(format!(
             "GFM parser produced unsupported block node: {unsupported:?}"
         ))),
@@ -582,23 +618,33 @@ fn normalize_embedded_line_endings(value: &str) -> String {
     value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
-fn tree_from_list_item(node: &md::ListItem, source: &str) -> Result<NodeTree, PluginError> {
+fn tree_from_list_item(
+    node: &md::ListItem,
+    source: &str,
+    ids: &ParseIds,
+) -> Result<NodeTree, PluginError> {
     Ok(new_tree(
+        ids,
         NodeKind::ListItem,
         json!({ "checked": node.checked }),
         json!({}),
         node.children
             .iter()
-            .map(|child| tree_from_block(child, source))
+            .map(|child| tree_from_block(child, source, ids))
             .collect::<Result<Vec<_>, _>>()?,
     ))
 }
 
-fn tree_from_table(node: &md::Table, source: &str) -> Result<NodeTree, PluginError> {
+fn tree_from_table(
+    node: &md::Table,
+    source: &str,
+    ids: &ParseIds,
+) -> Result<NodeTree, PluginError> {
     let mut children = Vec::new();
     let mut column_ids = Vec::new();
     for alignment in &node.alignments {
         let column = new_tree(
+            ids,
             NodeKind::TableColumn,
             json!({
                 "alignment": match alignment {
@@ -623,37 +669,50 @@ fn tree_from_table(node: &md::Table, source: &str) -> Result<NodeTree, PluginErr
                 )
             })?;
             cells.push(new_tree(
+                ids,
                 NodeKind::TableCell,
                 json!({
                     "column_id": column_id,
-                    "inline": leaf_inlines_from_ast(&cell.children, source)?,
+                    "inline": leaf_inlines_from_ast(&cell.children, source, ids)?,
                 }),
                 json!({}),
                 Vec::new(),
             ));
         }
         children.push(new_tree(
+            ids,
             NodeKind::TableRow,
             json!({ "role": if row_index == 0 { "header" } else { "body" } }),
             json!({}),
             cells,
         ));
     }
-    Ok(new_tree(NodeKind::Table, json!({}), json!({}), children))
+    Ok(new_tree(
+        ids,
+        NodeKind::Table,
+        json!({}),
+        json!({}),
+        children,
+    ))
 }
 
-fn inlines_from_ast(nodes: &[md::Inline], source: &str) -> Result<Vec<InlineNode>, PluginError> {
+fn inlines_from_ast(
+    nodes: &[md::Inline],
+    source: &str,
+    ids: &ParseIds,
+) -> Result<Vec<InlineNode>, PluginError> {
     nodes
         .iter()
-        .map(|node| inline_from_ast(node, source))
+        .map(|node| inline_from_ast(node, source, ids))
         .collect()
 }
 
 fn leaf_inlines_from_ast(
     nodes: &[md::Inline],
     source: &str,
+    ids: &ParseIds,
 ) -> Result<Vec<InlineNode>, PluginError> {
-    let mut inlines = inlines_from_ast(nodes, source)?;
+    let mut inlines = inlines_from_ast(nodes, source, ids)?;
     if let Some(InlineNode {
         content: InlineContent::Text { value },
         ..
@@ -668,7 +727,11 @@ fn leaf_inlines_from_ast(
     Ok(inlines)
 }
 
-fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, PluginError> {
+fn inline_from_ast(
+    node: &md::Inline,
+    source: &str,
+    ids: &ParseIds,
+) -> Result<InlineNode, PluginError> {
     let (id, content) = match node {
         md::Inline::Text(node) => (
             None,
@@ -677,11 +740,11 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Escape(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Escape { value: node.value },
         ),
         md::Inline::CharacterReference(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::CharacterReference {
                 value: node.value.clone(),
                 format: CharacterReferenceFormat {
@@ -690,27 +753,27 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Emphasis(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Emphasis {
-                children: inlines_from_ast(&node.children, source)?,
+                children: inlines_from_ast(&node.children, source, ids)?,
                 format: DelimiterFormat {
                     marker: delimiter_from_span(node.meta.span, source, "*"),
                 },
             },
         ),
         md::Inline::Strong(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Strong {
-                children: inlines_from_ast(&node.children, source)?,
+                children: inlines_from_ast(&node.children, source, ids)?,
                 format: DelimiterFormat {
                     marker: delimiter_from_span(node.meta.span, source, "**"),
                 },
             },
         ),
         md::Inline::Delete(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Delete {
-                children: inlines_from_ast(&node.children, source)?,
+                children: inlines_from_ast(&node.children, source, ids)?,
                 format: DeleteFormat {
                     marker: match node.marker {
                         md::DeleteMarker::SingleTilde => "~",
@@ -721,7 +784,7 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Code(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Code {
                 value: node.value.clone(),
                 format: InlineCodeFormat {
@@ -731,11 +794,11 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Link(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Link {
                 destination: node.destination.clone(),
                 title: node.title.clone(),
-                children: inlines_from_ast(&node.children, source)?,
+                children: inlines_from_ast(&node.children, source, ids)?,
                 format: ResourceFormat {
                     destination: link_destination_name(node.destination_kind).to_string(),
                     title: node.title_kind.map(link_title_name).map(str::to_string),
@@ -743,11 +806,11 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Image(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Image {
                 destination: node.destination.clone(),
                 title: node.title.clone(),
-                alt: inlines_from_ast(&node.alt, source)?,
+                alt: inlines_from_ast(&node.alt, source, ids)?,
                 format: ResourceFormat {
                     destination: link_destination_name(node.destination_kind).to_string(),
                     title: node.title_kind.map(link_title_name).map(str::to_string),
@@ -755,10 +818,10 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::LinkReference(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::LinkReference {
                 identifier: node.identifier.clone(),
-                children: inlines_from_ast(&node.children, source)?,
+                children: inlines_from_ast(&node.children, source, ids)?,
                 format: ReferenceFormat {
                     label: node.label.clone(),
                     kind: reference_kind_name(node.kind).to_string(),
@@ -766,10 +829,10 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::ImageReference(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::ImageReference {
                 identifier: node.identifier.clone(),
-                alt: inlines_from_ast(&node.alt, source)?,
+                alt: inlines_from_ast(&node.alt, source, ids)?,
                 format: ReferenceFormat {
                     label: node.label.clone(),
                     kind: reference_kind_name(node.kind).to_string(),
@@ -777,7 +840,7 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Autolink(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Autolink {
                 destination: node.destination.clone(),
                 format: match &node.kind {
@@ -793,14 +856,14 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::Html(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::Html {
                 value: node.value.clone(),
             },
         ),
         md::Inline::SoftBreak(_) => (None, InlineContent::SoftBreak),
         md::Inline::LineBreak(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::LineBreak {
                 format: LineBreakFormat {
                     kind: match node.kind {
@@ -812,7 +875,7 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
             },
         ),
         md::Inline::FootnoteReference(node) => (
-            Some(new_inline_id()),
+            Some(ids.next()),
             InlineContent::FootnoteReference {
                 identifier: node.identifier.clone(),
                 format: FootnoteReferenceFormat {
@@ -827,10 +890,6 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
         }
     };
     Ok(InlineNode { id, content })
-}
-
-fn new_inline_id() -> String {
-    Uuid::now_v7().to_string()
 }
 
 fn delimiter_from_span(span: Option<Span>, source: &str, fallback: &str) -> String {
