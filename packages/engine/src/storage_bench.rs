@@ -322,19 +322,6 @@ where
     accounting
 }
 
-/// Streams accounting for one named storage space without touching unrelated
-/// spaces. Use this when a benchmark reports a single layout component.
-pub async fn layout_space_accounting<R>(read: &R, space_name: &str) -> StorageLayoutAccounting
-where
-    R: StorageAdapterRead,
-{
-    let space = *native_storage_spaces()
-        .iter()
-        .find(|space| space.name == space_name)
-        .expect("space name should exist");
-    scan_layout_space(read, space).await
-}
-
 /// Per-row (key, value bytes) inventory of one space.
 ///
 /// Equivalence tests compare these inventories byte-for-byte, so the scan
@@ -541,9 +528,6 @@ mod tests {
             .into_iter()
             .find(|space| space.space == crate::changelog::COMMIT_SPACE.name)
             .expect("commit space is accounted");
-        let targeted =
-            super::layout_space_accounting(&read, crate::changelog::COMMIT_SPACE.name).await;
-
         assert_eq!(accounting.rows, inventory.len() as u64);
         assert_eq!(
             accounting.key_bytes,
@@ -559,9 +543,6 @@ mod tests {
                 .map(|(_, value)| value.len() as u64)
                 .sum::<u64>()
         );
-        assert_eq!(targeted.rows, accounting.rows);
-        assert_eq!(targeted.key_bytes, accounting.key_bytes);
-        assert_eq!(targeted.value_bytes, accounting.value_bytes);
     }
 
     #[tokio::test]
