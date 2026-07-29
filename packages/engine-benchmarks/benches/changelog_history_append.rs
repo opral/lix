@@ -10,7 +10,6 @@ use lix_engine::storage::{
     ReadOptions, ScanChunk, ScanOptions, SpaceId, StorageError, StorageRead, StorageWrite,
     WriteOptions,
 };
-use lix_engine::storage_bench::StorageLayoutAccounting;
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
 use tempfile::TempDir;
@@ -123,7 +122,7 @@ async fn run_case(
     stage_timings.sort_unstable();
     commit_timings.sort_unstable();
     total_timings.sort_unstable();
-    let layout = fixture.seed_layout();
+    let expected_seed_index_mapping_rows = fixture.expected_seed_index_mapping_rows();
     let sample_count = u64::try_from(samples).expect("benchmark sample count should fit in u64");
 
     println!(
@@ -135,8 +134,7 @@ async fn run_case(
          get_many_calls_per_op={},get_many_keys_per_op={},\
          scan_calls_per_op={},scan_rows_per_op={},scan_value_bytes_per_op={},\
          put_batches_per_op={},puts_per_op={},write_bytes_per_op={},\
-         commit_change_id_index_rows={},commit_change_id_index_mapping_rows={},\
-         commit_change_id_index_key_bytes={},commit_change_id_index_value_bytes={}",
+         expected_seed_commit_change_id_index_mapping_rows={}",
         micros(percentile(&stage_timings, 50, 100)),
         micros(percentile(&stage_timings, 95, 100)),
         micros(percentile(&stage_timings, 99, 100)),
@@ -157,10 +155,7 @@ async fn run_case(
         io.put_batches / sample_count,
         io.puts / sample_count,
         io.write_bytes / sample_count,
-        layout.rows,
-        layout.rows.saturating_sub(1),
-        layout.key_bytes,
-        layout.value_bytes,
+        expected_seed_index_mapping_rows,
     );
 }
 
@@ -372,7 +367,7 @@ where
     store: changelog_bench::BenchStore<CountingStorage<S>>,
     _temp_dir: TempDir,
     stats: Arc<Mutex<IoStats>>,
-    seed_layout: StorageLayoutAccounting,
+    seed_index_mapping_rows: u64,
     history_commit_change_id: String,
     version: u64,
 }
@@ -417,16 +412,14 @@ where
             seeded_commits += batch_commits;
             batch_index += 1;
         }
-        let seed_layout =
-            changelog_bench::layout_space_accounting(&store, "changelog.commit_change_id")
-                .await
-                .expect("measure changelog change-ID layout");
         *stats.lock().expect("io stats mutex") = IoStats::default();
         Self {
             store,
             _temp_dir: temp_dir,
             stats,
-            seed_layout,
+            seed_index_mapping_rows: history_commits
+                .try_into()
+                .expect("history commit count should fit in u64"),
             history_commit_change_id: format!("{first_batch_name}-commit-0:commit"),
             version: 0,
         }
@@ -480,8 +473,8 @@ where
         *self.stats.lock().expect("io stats mutex")
     }
 
-    fn seed_layout(&self) -> StorageLayoutAccounting {
-        self.seed_layout
+    fn expected_seed_index_mapping_rows(&self) -> u64 {
+        self.seed_index_mapping_rows
     }
 }
 
@@ -548,10 +541,10 @@ impl Fixture {
         }
     }
 
-    fn seed_layout(&self) -> StorageLayoutAccounting {
+    fn expected_seed_index_mapping_rows(&self) -> u64 {
         match self {
-            Self::Rocks(fixture) => fixture.seed_layout(),
-            Self::Slate(fixture) => fixture.seed_layout(),
+            Self::Rocks(fixture) => fixture.expected_seed_index_mapping_rows(),
+            Self::Slate(fixture) => fixture.expected_seed_index_mapping_rows(),
         }
     }
 }
