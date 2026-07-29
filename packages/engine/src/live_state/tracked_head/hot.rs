@@ -1866,6 +1866,41 @@ where
             false,
             None,
             None,
+            false,
+        )
+        .await
+    }
+
+    /// Publishes a checkpoint into the already-visible generation.
+    ///
+    /// The checkpoint selected refs are the complete dirty set for the
+    /// interval. Rewriting only those rows to `Clean` starts the next epoch
+    /// without copying every unchanged HOT row into a fresh generation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_checkpoint_current_state(
+        &mut self,
+        branch_id: &str,
+        generation: CommitId,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        checkpoint_commit_id: CommitId,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            Some(generation),
+            new_head,
+            deltas,
+            absence_guards,
+            None,
+            None,
+            Some(checkpoint_commit_id),
+            coverage,
+            false,
+            None,
+            None,
+            true,
         )
         .await
     }
@@ -1910,6 +1945,7 @@ where
                     true,
                     validated_absent_file_id,
                     None,
+                    false,
                 )
                 .await;
         }
@@ -1927,6 +1963,7 @@ where
             true,
             validated_absent_file_id,
             Some(absence_guards),
+            false,
         )
         .await
     }
@@ -1946,6 +1983,7 @@ where
         absence_guards_validated: bool,
         validated_absent_file_id: Option<&str>,
         borrowed_absence_guards: Option<&[TrackedStateKeyRef<'_>]>,
+        reset_working_diff_baselines: bool,
     ) -> Result<CommitId, LixError> {
         let generation = parent_generation.unwrap_or(new_head);
         let sorted = {
@@ -2059,7 +2097,14 @@ where
                     &mut retired_untracked_json_refs,
                 );
             }
-            created_ats.push(existing.created_at);
+            created_ats.push(if reset_working_diff_baselines && !delta.untracked {
+                // Checkpoint selection canonicalizes newly added rows to the
+                // changelog timestamp and preserves the original timestamp
+                // for modified/removed rows.
+                delta.created_at
+            } else {
+                existing.created_at
+            });
         }
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
@@ -2133,17 +2178,20 @@ where
                 // is always disabled. Do not decode the row a second time merely
                 // to rediscover that fact; the first decode above already handled
                 // retention validation and `created_at` preservation.
-                let (working_diff_baseline, newly_dirty) =
-                    if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
-                        let previous = previous.as_deref().map(decode_head_value).transpose()?;
-                        next_hot_working_diff_baseline(
-                            working_diff_capture_checkpoint_commit_id,
-                            delta,
-                            previous,
-                        )?
-                    } else {
-                        (WorkingDiffBaseline::Disabled, false)
-                    };
+                let (working_diff_baseline, newly_dirty) = if reset_working_diff_baselines
+                    && !delta.untracked
+                {
+                    (WorkingDiffBaseline::Clean, false)
+                } else if working_diff_capture_checkpoint_commit_id.is_some() && !delta.untracked {
+                    let previous = previous.as_deref().map(decode_head_value).transpose()?;
+                    next_hot_working_diff_baseline(
+                        working_diff_capture_checkpoint_commit_id,
+                        delta,
+                        previous,
+                    )?
+                } else {
+                    (WorkingDiffBaseline::Disabled, false)
+                };
                 if newly_dirty {
                     let key = append_hot_diff_key_parts(
                         &mut diff_key_bytes,
@@ -2190,6 +2238,7 @@ where
             generation,
             &sorted,
             working_diff_capture_checkpoint_commit_id,
+            reset_working_diff_baselines,
             &mut next_coverage,
             &mut retired_untracked_json_refs,
         )
@@ -2302,6 +2351,7 @@ async fn stage_incremental_file_delete_cascades(
     generation: CommitId,
     deltas: &[&CurrentStateDeltaRef<'_>],
     working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+    reset_working_diff_baselines: bool,
     coverage: &mut WorkingDiffIndexCoverage,
     retired_untracked_json_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
@@ -2414,10 +2464,11 @@ async fn stage_incremental_file_delete_cascades(
             mutations.file_deletes.push(file_key);
             continue;
         }
-        let (baseline, newly_dirty) = next_cascade_working_diff_baseline(
-            working_diff_capture_checkpoint_commit_id,
-            existing,
-        )?;
+        let (baseline, newly_dirty) = if reset_working_diff_baselines {
+            (WorkingDiffBaseline::Clean, false)
+        } else {
+            next_cascade_working_diff_baseline(working_diff_capture_checkpoint_commit_id, existing)?
+        };
         if newly_dirty {
             let key = append_hot_diff_key_parts(
                 &mut diff_key_bytes,
@@ -5961,6 +6012,7 @@ mod tests {
             generation,
             &deltas,
             None,
+            false,
             &mut coverage,
             &mut retired_untracked_json_refs,
         )
