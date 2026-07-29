@@ -59,7 +59,10 @@ const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
 const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
-const DEFAULT_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+// Keep indexes and Bloom filters resident across batched point validation.
+// A tiny metadata cache repeatedly fetched multi-megabyte filters once the
+// repository crossed the first large-SST boundary.
+const DEFAULT_METADATA_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
