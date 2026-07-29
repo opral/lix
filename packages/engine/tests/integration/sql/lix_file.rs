@@ -7,6 +7,171 @@ use serde_json::json;
 use super::assert_rows_eq;
 
 simulation_test!(
+    file_descriptor_changes_always_carry_their_file_id,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let file_id = "66696c65-2d69-8464-8000-000000000001";
+        let directory_id = "64697265-6374-846f-8000-000000000001";
+
+        session
+            .execute(
+                &format!("INSERT INTO lix_directory (id, path) VALUES ('{directory_id}', '/docs')"),
+                &[],
+            )
+            .await
+            .expect("directory creation should succeed");
+        session
+            .execute(
+                &format!("UPDATE lix_directory SET path = '/notes' WHERE id = '{directory_id}'"),
+                &[],
+            )
+            .await
+            .expect("directory rename should succeed");
+        session
+            .execute(
+                &format!(
+                    "INSERT INTO lix_file (id, path, data) \
+                     VALUES ('{file_id}', '/readme.md', X'68656C6C6F')"
+                ),
+                &[],
+            )
+            .await
+            .expect("file creation should succeed");
+
+        assert_eq!(
+            super::select_rows(
+                &session,
+                &format!(
+                    "SELECT DISTINCT schema_key, file_id \
+                     FROM lix_change \
+                     WHERE file_id = '{file_id}' \
+                       AND schema_key IN ('lix_file_descriptor', 'lix_binary_blob_ref') \
+                     ORDER BY schema_key"
+                ),
+            )
+            .await,
+            vec![
+                vec![
+                    Value::Text("lix_binary_blob_ref".to_string()),
+                    Value::Text(file_id.to_string()),
+                ],
+                vec![
+                    Value::Text("lix_file_descriptor".to_string()),
+                    Value::Text(file_id.to_string()),
+                ],
+            ],
+            "a natural file_id filter must return content and descriptor changes",
+        );
+        assert_eq!(
+            super::select_rows(
+                &session,
+                &format!(
+                    "SELECT file_id \
+                     FROM lix_change \
+                     WHERE schema_key = 'lix_directory_descriptor' \
+                       AND entity_pk = lix_json('[\"{directory_id}\"]') \
+                     ORDER BY created_at"
+                ),
+            )
+            .await,
+            vec![vec![Value::Null], vec![Value::Null]],
+            "directory creation and rename remain namespace-level",
+        );
+
+        let baseline = session
+            .create_checkpoint()
+            .await
+            .expect("baseline checkpoint should succeed")
+            .commit_id;
+        session
+            .execute(
+                &format!("UPDATE lix_file SET path = '/notes/readme.md' WHERE id = '{file_id}'"),
+                &[],
+            )
+            .await
+            .expect("moving a file under an existing directory should succeed");
+        let renamed_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("renamed head should load")
+            .expect("renamed head should exist")
+            .to_string();
+
+        assert_eq!(
+            super::select_rows(
+                &session,
+                &format!(
+                    "SELECT schema_key, file_id \
+                     FROM lix_working_diff \
+                     WHERE file_id = '{file_id}' \
+                       AND schema_key = 'lix_file_descriptor'"
+                ),
+            )
+            .await,
+            vec![vec![
+                Value::Text("lix_file_descriptor".to_string()),
+                Value::Text(file_id.to_string()),
+            ]],
+            "a pending rename must be visible through a natural working-diff file filter",
+        );
+        assert_eq!(
+            super::select_rows(
+                &session,
+                &format!(
+                    "SELECT schema_key, file_id \
+                     FROM lix_diff('{baseline}', '{renamed_head}') \
+                     WHERE file_id = '{file_id}' \
+                       AND schema_key = 'lix_file_descriptor'"
+                ),
+            )
+            .await,
+            vec![vec![
+                Value::Text("lix_file_descriptor".to_string()),
+                Value::Text(file_id.to_string()),
+            ]],
+            "a pending rename must be visible through a natural historical diff file filter",
+        );
+
+        session
+            .execute(&format!("DELETE FROM lix_file WHERE id = '{file_id}'"), &[])
+            .await
+            .expect("file deletion should succeed");
+        let descriptor_changes = super::select_rows(
+            &session,
+            &format!(
+                "SELECT file_id, snapshot_content \
+                 FROM lix_change \
+                 WHERE file_id = '{file_id}' \
+                   AND schema_key = 'lix_file_descriptor' \
+                 ORDER BY created_at"
+            ),
+        )
+        .await;
+        assert_eq!(descriptor_changes.len(), 3);
+        assert!(
+            descriptor_changes
+                .iter()
+                .all(|row| row[0] == Value::Text(file_id.to_string()))
+        );
+        assert_eq!(
+            descriptor_changes
+                .iter()
+                .filter(|row| row[1] == Value::Null)
+                .count(),
+            1,
+            "exactly the deletion descriptor change is a tombstone",
+        );
+    }
+);
+
+simulation_test!(
     lix_file_update_can_compare_the_read_only_change_id,
     |sim| async move {
         let engine = sim.boot_engine().await;

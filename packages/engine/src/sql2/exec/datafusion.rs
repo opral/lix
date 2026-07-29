@@ -3190,7 +3190,7 @@ mod tests {
             entity_pk: crate::entity_pk::EntityPk::uuid_from_canonical(entity_pk)
                 .expect("fixture file ID should be a UUID"),
             schema_key: "lix_file_descriptor".to_string(),
-            file_id: None,
+            file_id: Some(entity_pk.to_string()),
             snapshot_content: Some(
                 json!({
                     "id": entity_pk,
@@ -5029,7 +5029,10 @@ mod tests {
             descriptor.metadata.as_deref(),
             Some(r#"{"source":"upload"}"#)
         );
-        assert_eq!(descriptor.file_id, None);
+        assert_eq!(
+            descriptor.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-000000000322")
+        );
         let snapshot: JsonValue = serde_json::from_str(
             descriptor
                 .snapshot_content
@@ -5650,7 +5653,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_file_data_update_by_id_updates_same_path_in_every_matching_scope() {
+    async fn execute_sql_file_data_update_by_id_updates_same_path_in_every_matching_durability_lane()
+     {
         let root = live_file_row(
             "01920000-0000-7000-8000-0000000000d2",
             "01920000-0000-7000-8000-0000000000a1",
@@ -5663,7 +5667,9 @@ mod tests {
             None,
             "shared.md",
         );
-        scoped.file_id = Some("01920000-0000-7000-8000-000000000342".to_string());
+        scoped.untracked = true;
+        scoped.change_id = None;
+        scoped.commit_id = None;
         let rows = vec![root, scoped];
         let (mut fast_ctx, fast_staged, _) = counting_write_context(rows.clone());
         let (mut datafusion_ctx, datafusion_staged, _) = counting_write_context(rows);

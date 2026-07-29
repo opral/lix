@@ -125,6 +125,32 @@ impl FilesystemDescriptorKey {
         }
     }
 
+    pub(crate) fn from_file_descriptor_live_row(
+        row: &MaterializedLiveStateRow,
+        descriptor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id: row.branch_id.to_string(),
+            global: row.global,
+            untracked: row.untracked,
+            file_id: None,
+            descriptor_id: descriptor_id.into(),
+        }
+    }
+
+    pub(crate) fn from_file_descriptor_live_row_ref(
+        row: MaterializedLiveStateRowRef<'_>,
+        descriptor_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            branch_id: row.branch_id().to_owned(),
+            global: row.global(),
+            untracked: row.untracked(),
+            file_id: None,
+            descriptor_id: descriptor_id.into(),
+        }
+    }
+
     pub(crate) fn in_same_scope(&self, descriptor_id: &str) -> Self {
         Self {
             branch_id: self.branch_id.clone(),
@@ -284,7 +310,10 @@ impl DirectoryDescriptorWriteIntent {
             self.id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             Some(JsonValue::Object(snapshot)),
-            self.context,
+            FilesystemRowContext {
+                file_id: None,
+                ..self.context
+            },
         );
     }
 }
@@ -313,10 +342,13 @@ impl FileDescriptorWriteIntent {
         snapshot.insert("name".to_string(), JsonValue::String(self.name));
         append_partial_state_row(
             rows,
-            self.id,
+            self.id.clone(),
             FILE_DESCRIPTOR_SCHEMA_KEY,
             Some(JsonValue::Object(snapshot)),
-            self.context,
+            FilesystemRowContext {
+                file_id: self.id,
+                ..self.context
+            },
         );
     }
 }
@@ -1434,7 +1466,10 @@ pub(crate) fn plan_file_delete(input: FileDeleteInput) -> FilesystemDeletePlan {
         &mut rows,
         input.file_id.clone(),
         FILE_DESCRIPTOR_SCHEMA_KEY,
-        input.context.clone(),
+        FilesystemRowContext {
+            file_id: Some(input.file_id.clone()),
+            ..input.context.clone()
+        },
     );
 
     if input.has_blob_ref {
@@ -1453,7 +1488,10 @@ pub(crate) fn plan_directory_delete(input: DirectoryDeleteInput) -> FilesystemDe
         &mut rows,
         input.directory_id,
         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
-        input.context,
+        FilesystemRowContext {
+            file_id: None,
+            ..input.context
+        },
     );
     FilesystemDeletePlan { rows, count: 1 }
 }
@@ -1491,14 +1529,14 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
         } else {
             row.branch_id()
         };
-        let resolver_key = filesystem_storage_scope_key(
-            storage_branch_id,
-            row.global(),
-            row.untracked(),
-            row.file_id(),
-        );
         match row.schema_key() {
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY => {
+                let resolver_key = filesystem_storage_scope_key(
+                    storage_branch_id,
+                    row.global(),
+                    row.untracked(),
+                    None,
+                );
                 let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
                     .map_err(|error| {
                         LixError::new(
@@ -1516,6 +1554,12 @@ pub(crate) fn directory_path_resolvers_from_state_batch(
                 );
             }
             FILE_DESCRIPTOR_SCHEMA_KEY => {
+                let resolver_key = filesystem_storage_scope_key(
+                    storage_branch_id,
+                    row.global(),
+                    row.untracked(),
+                    None,
+                );
                 let snapshot: FileDescriptorSnapshot = serde_json::from_str(snapshot_content)
                     .map_err(|error| {
                         LixError::new(
@@ -2559,7 +2603,7 @@ mod tests {
         );
         assert_eq!(directory_row.global, true);
         assert_eq!(directory_row.untracked, true);
-        assert_eq!(directory_row.file_id.as_deref(), Some("context-file"));
+        assert_eq!(directory_row.file_id, None);
         assert_eq!(directory_row.metadata.as_ref(), Some(&metadata));
 
         let file_row = file_descriptor_write_row(FileDescriptorWriteIntent {
@@ -2579,7 +2623,7 @@ mod tests {
                 .get("id")
                 .is_none()
         );
-        assert_eq!(file_row.file_id.as_deref(), Some("context-file"));
+        assert_eq!(file_row.file_id, None);
         assert_eq!(file_row.metadata.as_ref(), Some(&metadata));
 
         let mut resolver =
@@ -2613,7 +2657,7 @@ mod tests {
         assert_eq!(descriptor.untracked, true);
         assert_eq!(
             descriptor.file_id.map(crate::common::SharedStr::as_str),
-            Some("context-file")
+            Some("01920000-0000-7000-8000-0000000000d2")
         );
         assert_eq!(descriptor.metadata, Some(&metadata));
 
@@ -2765,14 +2809,6 @@ mod tests {
                 None,
                 "{\"id\":\"01920000-0000-7000-8000-000000000413\",\"parent_id\":null,\"name\":\"docs\"}",
             ),
-            live_directory_row_with_scope(
-                "dir-file-scoped",
-                "01920000-0000-7000-8000-0000000000a1",
-                false,
-                false,
-                Some("scope-file".to_string()),
-                "{\"id\":\"dir-file-scoped\",\"parent_id\":null,\"name\":\"docs\"}",
-            ),
         ];
 
         let rows = MaterializedLiveStateBatch::from_rows(rows);
@@ -2798,12 +2834,6 @@ mod tests {
             true,
             None,
         );
-        let file_scoped_key = super::filesystem_storage_scope_key(
-            "01920000-0000-7000-8000-0000000000a1",
-            false,
-            false,
-            Some("scope-file"),
-        );
         let literal_null_file_id_key = super::filesystem_storage_scope_key(
             "01920000-0000-7000-8000-0000000000a1",
             false,
@@ -2814,7 +2844,6 @@ mod tests {
         assert_ne!(branch_a_key, branch_b_key);
         assert_ne!(branch_a_key, global_key);
         assert_ne!(branch_a_key, untracked_key);
-        assert_ne!(branch_a_key, file_scoped_key);
         assert_ne!(branch_a_key, literal_null_file_id_key);
 
         assert_eq!(
@@ -2849,14 +2878,6 @@ mod tests {
                 .unwrap(),
             Some("01920000-0000-7000-8000-000000000413")
         );
-        assert_eq!(
-            resolvers
-                .get(&file_scoped_key)
-                .unwrap()
-                .directory_id("/docs")
-                .unwrap(),
-            Some("dir-file-scoped")
-        );
     }
 
     #[test]
@@ -2879,7 +2900,10 @@ mod tests {
             descriptor.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(descriptor.file_id, None);
+        assert_eq!(
+            descriptor.file_id.map(crate::common::SharedStr::as_str),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(descriptor.snapshot, None);
 
         let blob_ref = plan

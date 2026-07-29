@@ -707,7 +707,7 @@ impl RootlessCascadeIndex {
         key: TrackedStateKeyRef<'_>,
         value: &TrackedStateIndexValue,
     ) -> Result<(), LixError> {
-        if key.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || key.file_id.is_some() || !value.deleted {
+        if key.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !value.deleted {
             return Ok(());
         }
         let start = self.file_id_arena.len();
@@ -1801,7 +1801,7 @@ where
         let mut candidates = winners
             .iter()
             .filter_map(|(identity, change_id)| {
-                if identity.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || identity.file_id.is_some() {
+                if identity.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY {
                     return None;
                 }
                 let value = row_map.get(identity)?;
@@ -2181,10 +2181,7 @@ where
                         )
                     })?;
                 let key = row.key_ref();
-                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                    && key.file_id.is_none()
-                    && row.value().deleted
-                {
+                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.value().deleted {
                     cascade_capacity += 1;
                 }
             }
@@ -2263,7 +2260,7 @@ where
                     .expect("first-parent interval key/value columns are aligned");
                 let decoded_key = decode_key_shared(encoded_key)?;
                 let key = decoded_key.as_ref();
-                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && key.file_id.is_none() {
+                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
                     overlay.insert_cascade_if_absent(key, value)?;
                 }
             }
@@ -2466,10 +2463,7 @@ where
                         )
                     })?;
                 let key = row.key_ref();
-                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                    && key.file_id.is_none()
-                    && row.value().deleted
-                {
+                if key.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.value().deleted {
                     cascade_capacity = cascade_capacity.saturating_add(1);
                 }
             }
@@ -2599,7 +2593,7 @@ where
             })?;
             descriptor_key_builder.push(TrackedStateKeyRef {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
-                file_id: None,
+                file_id: Some(file_id.as_str()),
                 entity_pk: &entity_pk,
             });
         }
@@ -3154,10 +3148,7 @@ where
             )?;
             let mut cascades = BTreeMap::<String, &TrackedStateDeltaRef<'_>>::new();
             for delta in &deltas {
-                if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY
-                    || delta.file_id.is_some()
-                    || !delta.deleted
-                {
+                if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !delta.deleted {
                     continue;
                 }
                 let file_id = delta.entity_pk.as_single_string_owned().map_err(|error| {
@@ -3647,7 +3638,7 @@ fn file_descriptor_key_for_file_scoped_key(
         .map(|file_id| {
             Ok(TrackedStateKey {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                file_id: None,
+                file_id: Some(file_id.to_string()),
                 entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -3677,7 +3668,7 @@ fn file_delete_cascade_ref(
     key: TrackedStateKeyRef<'_>,
     value: &TrackedStateIndexValue,
 ) -> Result<Option<String>, LixError> {
-    if key.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || key.file_id.is_some() || !value.deleted {
+    if key.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !value.deleted {
         return Ok(None);
     }
     key.entity_pk
@@ -3820,7 +3811,7 @@ fn tracked_state_winner_identity_for_diff_row(
 fn cascade_payload_key(file_id: &str) -> TrackedStateKey {
     TrackedStateKey {
         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-        file_id: None,
+        file_id: Some(file_id.to_string()),
         entity_pk: EntityPk::uuid_from_canonical(file_id)
             .unwrap_or_else(|_| EntityPk::single(file_id)),
     }
@@ -3848,7 +3839,7 @@ fn tracked_state_winner_identity_for_diff_parts(
         TrackedStateRowWinnerKind::FileDeleteCascade => Ok(TrackedStateRowWinner {
             identity: TrackedStateIdentity {
                 schema_key: change.schema_key.clone(),
-                file_id: None,
+                file_id: change.file_id.clone(),
                 entity_pk: change.entity_pk.clone(),
             },
             file_delete_cascade: true,
@@ -3870,11 +3861,7 @@ fn tracked_state_winner_kind_for_diff_parts(
     {
         return Ok(TrackedStateRowWinnerKind::Direct);
     }
-    if change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-        && change.file_id.is_none()
-        && change.snapshot.is_none()
-        && deleted
-    {
+    if change.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && change.snapshot.is_none() && deleted {
         let cascade_file_id = change.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::unknown(format!(
                 "tracked-state cascade change '{}' has invalid file descriptor identity: {error}",
@@ -4111,7 +4098,7 @@ mod tests {
             .insert_cascade_if_absent(
                 TrackedStateKeyRef {
                     schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
-                    file_id: None,
+                    file_id: Some(FILE_ID),
                     entity_pk: &descriptor_pk,
                 },
                 &cascade,
@@ -4236,7 +4223,7 @@ mod tests {
             .insert_descriptor(
                 TrackedStateKeyRef {
                     schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
-                    file_id: None,
+                    file_id: Some(FILE_ID),
                     entity_pk: &descriptor_pk,
                 },
                 &cascade,
@@ -4327,7 +4314,7 @@ mod tests {
                 .insert_descriptor(
                     TrackedStateKeyRef {
                         schema_key: FILE_DESCRIPTOR_SCHEMA_KEY,
-                        file_id: None,
+                        file_id: Some(&file_id),
                         entity_pk: &descriptor_pk,
                     },
                     &cascade_value,
@@ -4829,6 +4816,7 @@ mod tests {
         let mut descriptor =
             tombstone(FILE_ID, "change-cascade-descriptor", "cascade-append-child");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
         let mut tail = row("entity-tail", "change-cascade-tail", "cascade-append-child");
         tail.schema_key = "z_schema".to_string();
         let child_rows = [descriptor, tail];
@@ -6792,6 +6780,7 @@ mod tests {
         descriptor.entity_pk =
             EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
         semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
@@ -6869,6 +6858,7 @@ mod tests {
         descriptor.entity_pk =
             EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
         semantic.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
@@ -7019,6 +7009,7 @@ mod tests {
         descriptor.entity_pk =
             EntityPk::uuid_from_canonical(FILE_ID).expect("fixture file ID is canonical");
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
+        descriptor.file_id = Some(FILE_ID.to_string());
         let mut semantic = row("line-1", "semantic-create", "initial");
         semantic.file_id = Some(FILE_ID.to_string());
         let mut retired = row("retired-blob", "retired-create", "initial");

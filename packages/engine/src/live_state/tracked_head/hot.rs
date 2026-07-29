@@ -1486,7 +1486,7 @@ fn apply_complete_file_delete_cascade(
 }
 
 fn file_delete_cascade_id(delta: &CurrentStateDeltaRef<'_>) -> Result<Option<String>, LixError> {
-    if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || delta.file_id.is_some() || !delta.deleted {
+    if delta.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || !delta.deleted {
         return Ok(None);
     }
     delta
