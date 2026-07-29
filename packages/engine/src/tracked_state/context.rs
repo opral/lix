@@ -1772,7 +1772,8 @@ where
                     identity, parent.commit_id
                 )));
             };
-            if let Some(file_id) = parent_key.file_id.as_ref()
+            if !parent_value.deleted
+                && let Some(file_id) = parent_key.file_id.as_ref()
                 && let Some(cascade_change_id) = file_delete_cascades.get(file_id)
             {
                 if value.deleted && &value.change_id == cascade_change_id {
@@ -7020,27 +7021,44 @@ mod tests {
         descriptor.schema_key = FILE_DESCRIPTOR_SCHEMA_KEY.to_string();
         let mut semantic = row("line-1", "semantic-create", "initial");
         semantic.file_id = Some(FILE_ID.to_string());
+        let mut retired = row("retired-blob", "retired-create", "initial");
+        retired.file_id = Some(FILE_ID.to_string());
         write_root_for_test(
             &storage,
             &tracked_state,
             "initial",
             None,
-            &[descriptor.clone(), semantic],
+            &[descriptor.clone(), semantic, retired.clone()],
         )
         .await
         .expect("initial root should write");
+
+        retired.snapshot_content = None;
+        retired.deleted = true;
+        retired.change_id = ChangeId::for_test_label("retired-delete");
+        retired.commit_id = CommitId::for_test_label("prior-delete");
+        retired.updated_at = "2026-01-02T00:00:00Z".to_string();
+        write_root_for_test(
+            &storage,
+            &tracked_state,
+            "prior-delete",
+            Some("initial"),
+            std::slice::from_ref(&retired),
+        )
+        .await
+        .expect("prior file-scoped tombstone root should write");
 
         let mut descriptor_delete = descriptor.clone();
         descriptor_delete.snapshot_content = None;
         descriptor_delete.deleted = true;
         descriptor_delete.change_id = ChangeId::for_test_label("descriptor-delete");
         descriptor_delete.commit_id = CommitId::for_test_label("delete");
-        descriptor_delete.updated_at = "2026-01-02T00:00:00Z".to_string();
+        descriptor_delete.updated_at = "2026-01-03T00:00:00Z".to_string();
         write_root_for_test(
             &storage,
             &tracked_state,
             "delete",
-            Some("initial"),
+            Some("prior-delete"),
             &[descriptor_delete],
         )
         .await
@@ -7048,7 +7066,7 @@ mod tests {
 
         descriptor.change_id = ChangeId::for_test_label("descriptor-recreate");
         descriptor.commit_id = CommitId::for_test_label("recreate");
-        descriptor.updated_at = "2026-01-03T00:00:00Z".to_string();
+        descriptor.updated_at = "2026-01-04T00:00:00Z".to_string();
         write_root_for_test(
             &storage,
             &tracked_state,
@@ -7059,7 +7077,7 @@ mod tests {
         .await
         .expect("recreate root should write");
 
-        for commit_id in ["delete", "recreate"] {
+        for commit_id in ["prior-delete", "delete", "recreate"] {
             let read = storage
                 .begin_read(StorageReadOptions::default())
                 .await
@@ -7097,6 +7115,7 @@ mod tests {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        entity_pks: vec![EntityPk::single("line-1")],
                         ..Default::default()
                     },
                 },
@@ -7115,6 +7134,7 @@ mod tests {
                     filter: crate::tracked_state::TrackedStateFilter {
                         schema_keys: vec!["test_schema".to_string()],
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
+                        entity_pks: vec![EntityPk::single("line-1")],
                         include_tombstones: true,
                         ..Default::default()
                     },
