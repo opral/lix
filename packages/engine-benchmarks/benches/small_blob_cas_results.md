@@ -124,3 +124,36 @@ The exact-case binaries had SHA-256
 `eb0cbbd5d2f1a6acf11589c73175fb8a326f0a0a6eb31353dc4e0bd2097da8e4`
 (candidate). The combined raw-result SHA-256 is
 `86f828358d38bff5f4a82d3a0bd956d079b2162efa9e7e2823db4d24e88594e3`.
+
+## Inline manifests through 128 KiB
+
+Date: 2026-07-29
+
+OpenClaw has another 23,049 unique blobs (2,088,120,165 logical bytes) above
+64 KiB and at or below 128 KiB. Extending the manifest-probed inline layout to
+this band again replaces one manifest, payload, and presence row with one
+manifest row.
+
+Seven counterbalanced baseline/candidate process pairs used fresh temporary
+databases per exact case, 300 warmups, and 3,000 timed samples. The values are
+the median per-run p50:
+
+| Backend | Operation | 64 KiB limit p50 | 128 KiB limit p50 | Change |
+| ------- | --------- | ---------------: | ----------------: | -----: |
+| RocksDB | New-content write | 226,571 ns | 231,737 ns | 2.3% slower |
+| RocksDB | Repeat write | 22,230 ns | 24,293 ns | 9.3% slower |
+| RocksDB | Hot read | 5,938 ns | 4,917 ns | **17.2% faster** |
+| SlateDB | New-content write | 111,402 ns | 106,846 ns | 4.1% faster |
+| SlateDB | Repeat write | 35,839 ns | 21,460 ns | **40.1% faster** |
+| SlateDB | Hot read | 6,970 ns | 6,249 ns | **10.3% faster** |
+
+The logical shape drops from three rows and 96 key bytes to one row and 32 key
+bytes per unique blob in this band. Encoded value bytes remain nearly flat
+(131,119 to 131,084 bytes for the measured high-entropy 128 KiB payload).
+
+The exact-case binaries had SHA-256
+`29725d7f58f0ce28830e958bd0186756b8d5ff28e08a3cafbd057e7f79786ccf`
+(baseline) and
+`3e2d86c24a18491b352bbcd77d8a0c6417ab0d9fd881efe8a209d52799500866`
+(candidate). The combined raw-result SHA-256 is
+`e78b2dcd263addb7cff669f43779c9c24a86828d4b407ce3e0ab82e2862bc174`.
