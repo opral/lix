@@ -4293,7 +4293,7 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
     assert_eq!(successor_counters.guest_export_calls, 1);
     assert_eq!(successor_counters.durable_semantic_changes, 1);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
-    assert_eq!(
+    assert!(
         lix.execute(
             "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
             &[],
@@ -4303,8 +4303,7 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
         .rows()[0]
             .get::<String>("element_json")
             .unwrap()
-            .contains("123.5"),
-        true
+            .contains("123.5")
     );
     assert!(
         lix.execute(

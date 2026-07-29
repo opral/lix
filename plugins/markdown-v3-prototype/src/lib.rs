@@ -1,4 +1,5 @@
 //! Fused Markdown experiment for Component API v3.
+#![allow(dead_code)]
 
 #[path = "../../markdown-v2/src/core.rs"]
 mod core;

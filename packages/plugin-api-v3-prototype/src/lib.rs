@@ -237,6 +237,7 @@ pub struct TransitionSummary {
     pub payload_bytes: u64,
 }
 
+#[derive(Debug)]
 pub struct OpenFile<'a> {
     pub file: FileInfo,
     pub source: Source<'a>,
@@ -279,6 +280,7 @@ pub trait FormatPlugin: 'static {
 }
 
 #[doc(hidden)]
+#[derive(Debug)]
 pub struct Component<P>(PhantomData<P>);
 
 impl<P: FormatPlugin> Guest for Component<P> {

@@ -2688,6 +2688,7 @@ impl Document {
 /// This keeps only the submitted bytes and scan drafts while typed pages are
 /// emitted. It deliberately skips the persistent chunk index, identity maps,
 /// and overlay structures that are useful only to a later warm transition.
+#[allow(dead_code)]
 pub struct ColdInitialImport {
     bytes: Vec<u8>,
     rows: Vec<RowDraft>,
@@ -2695,6 +2696,7 @@ pub struct ColdInitialImport {
     next_row: usize,
 }
 
+#[allow(dead_code)]
 impl ColdInitialImport {
     pub fn open(bytes: Vec<u8>, path: Option<&str>) -> Result<Self, String> {
         if bytes.len() > u32::MAX as usize {

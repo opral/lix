@@ -1,4 +1,5 @@
 //! Fused initial-import CSV experiment for Component API v3.
+#![allow(dead_code)]
 
 #[path = "../../csv-v2/src/core.rs"]
 mod core;

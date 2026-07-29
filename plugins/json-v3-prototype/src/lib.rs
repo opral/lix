@@ -1,4 +1,5 @@
 //! Fused JSON experiment for Component API v3.
+#![allow(dead_code)]
 
 #[path = "../../json-v2/src/core.rs"]
 mod core;
@@ -65,7 +66,7 @@ fn emit_changes<I>(
     sink: &mut sdk::Sink<'_>,
 ) -> sdk::Result<()>
 where
-    I: IntoIterator<Item = std::result::Result<EntityChange, String>>,
+    I: IntoIterator<Item = Result<EntityChange, String>>,
 {
     let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
     for change in changes {
