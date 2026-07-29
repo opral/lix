@@ -10,9 +10,13 @@ use encoding_rs::Encoding;
 use markdown_syntax::ast as md;
 use markdown_syntax::{LineEnding, SerializeOptions, Span, SyntaxOptions};
 use serde_json::{Value, json};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ops::Range;
-use uuid::Uuid;
+
+thread_local! {
+    static PARSE_ID_ORDINAL: Cell<u64> = const { Cell::new(0) };
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedMarkdown {
@@ -123,6 +127,7 @@ fn fully_escape_orphan_table_delimiters(rendered: Vec<u8>) -> Vec<u8> {
 }
 
 fn parse_markdown_source_once(source: &str) -> Result<ParsedMarkdown, PluginError> {
+    PARSE_ID_ORDINAL.set(0);
     let mut options = SyntaxOptions::gfm();
     options.constructs.frontmatter = true;
     options.parse.preserve_character_escapes = true;
@@ -434,7 +439,7 @@ fn detected_line_ending(source: &str) -> &'static str {
 fn new_tree(kind: NodeKind, payload: Value, format: Value, children: Vec<NodeTree>) -> NodeTree {
     NodeTree {
         node: NodeSnapshot {
-            id: Uuid::now_v7().to_string(),
+            id: new_parse_id(),
             kind,
             parent_id: None,
             order_key: None,
@@ -830,7 +835,19 @@ fn inline_from_ast(node: &md::Inline, source: &str) -> Result<InlineNode, Plugin
 }
 
 fn new_inline_id() -> String {
-    Uuid::now_v7().to_string()
+    new_parse_id()
+}
+
+fn new_parse_id() -> String {
+    PARSE_ID_ORDINAL.with(|ordinal| {
+        let current = ordinal.get();
+        ordinal.set(
+            current
+                .checked_add(1)
+                .expect("one Markdown parse cannot allocate more than u64::MAX temporary IDs"),
+        );
+        format!("~{current:x}")
+    })
 }
 
 fn delimiter_from_span(span: Option<Span>, source: &str, fallback: &str) -> String {

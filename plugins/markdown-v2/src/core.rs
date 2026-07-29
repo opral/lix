@@ -227,17 +227,25 @@ fn render_tree_with_lexical_fallback(root: &NodeTree) -> Result<Vec<u8>, PluginE
 
 fn detect_changes_for_markdown(
     before: &Projection,
-    mut after: ParsedMarkdown,
+    after: ParsedMarkdown,
     namespace: IdNamespace,
 ) -> Result<Vec<DetectedChange>, PluginError> {
-    let generated_ids = collect_generated_ids(&after.root);
     let before_root = if before.nodes_by_id.is_empty() {
         None
     } else {
         Some(before.to_tree()?)
     };
+    detect_changes_for_markdown_tree(before_root.as_ref(), after, namespace)
+}
+
+fn detect_changes_for_markdown_tree(
+    before_root: Option<&NodeTree>,
+    mut after: ParsedMarkdown,
+    namespace: IdNamespace,
+) -> Result<Vec<DetectedChange>, PluginError> {
+    let generated_ids = collect_generated_ids(&after.root);
     let mut replacements = BTreeMap::new();
-    if let Some(before_root) = &before_root {
+    if let Some(before_root) = before_root {
         let old_hashes = SubtreeHashes::from_tree(before_root);
         let new_hashes = SubtreeHashes::from_tree(&after.root);
         let mut global_subtrees = HashMap::<SubtreeHash, Vec<&NodeTree>>::new();
@@ -289,7 +297,8 @@ fn detect_changes_for_markdown(
         replace_column_ids(&mut node.payload, &replacements);
     });
     let after_nodes = flatten_tree(&after.root);
-    diff_projections(before, &after_nodes)
+    let before_nodes = before_root.map(flatten_tree_refs).unwrap_or_default();
+    diff_tree_nodes(&before_nodes, &after_nodes)
 }
 
 fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
@@ -1244,15 +1253,27 @@ fn flatten_tree(root: &NodeTree) -> BTreeMap<String, NodeSnapshot> {
     output
 }
 
-fn diff_projections(
-    before: &Projection,
+fn flatten_tree_refs(root: &NodeTree) -> BTreeMap<&str, &NodeSnapshot> {
+    fn visit<'a>(tree: &'a NodeTree, output: &mut BTreeMap<&'a str, &'a NodeSnapshot>) {
+        output.insert(tree.node.id.as_str(), &tree.node);
+        for child in &tree.children {
+            visit(child, output);
+        }
+    }
+    let mut output = BTreeMap::new();
+    visit(root, &mut output);
+    output
+}
+
+fn diff_tree_nodes(
+    before: &BTreeMap<&str, &NodeSnapshot>,
     after: &BTreeMap<String, NodeSnapshot>,
 ) -> Result<Vec<DetectedChange>, PluginError> {
     let mut changes = Vec::new();
-    for id in before.nodes_by_id.keys() {
-        if !after.contains_key(id) {
+    for id in before.keys() {
+        if !after.contains_key(*id) {
             changes.push(DetectedChange {
-                entity_pk: vec![id.clone()],
+                entity_pk: vec![(*id).to_owned()],
                 schema_key: NODE_SCHEMA_KEY.to_string(),
                 snapshot_content: None,
                 metadata: None,
@@ -1260,7 +1281,8 @@ fn diff_projections(
         }
     }
     for (id, node) in after {
-        if before.nodes_by_id.get(id) == Some(node) {
+        let previous = before.get(id.as_str()).copied();
+        if previous == Some(node) {
             continue;
         }
         let snapshot_content = serde_json::to_string(node).map_err(|error| {
@@ -1270,7 +1292,7 @@ fn diff_projections(
             entity_pk: vec![id.clone()],
             schema_key: NODE_SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content),
-            metadata: change_metadata(before.nodes_by_id.get(id), node),
+            metadata: change_metadata(previous, node),
         });
     }
     Ok(changes)
@@ -2062,13 +2084,11 @@ impl Document {
                 data: bytes,
             };
             let current_root = self.tree.materialize();
-            let before = Projection {
-                nodes_by_id: flatten_tree(&current_root),
-            };
             let mut parsed = parse_file(&file)?;
             retain_noncanonical_source(&mut parsed, &file.data)?;
             let top_level_ranges = Arc::new(parsed.top_level_ranges.clone());
-            let detected = detect_changes_for_markdown(&before, parsed, namespace)?;
+            let detected =
+                detect_changes_for_markdown_tree(Some(&current_root), parsed, namespace)?;
             let root = projection_after_detected_changes(&current_root, &detected)?.to_tree()?;
             (detected, top_level_ranges, PersistentTree::new(root))
         };
