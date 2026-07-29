@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.9.0 - 2026-07-29
+
+### Minor
+
+- Directory paths now use the same canonical syntax as file paths.
+
+  Non-root paths must not end with `/`; the typed file or directory surface determines the entity kind. Applications must remove trailing slashes from directory path values.
+- Turn automatic edit history into deliberate checkpoints.
+
+  The SDK can create milestones, SQL can query checkpoint history and working changes, and Lix automatically cleans up superseded automatic commits after a recovery window.
+- Lix is substantially faster and more storage-efficient for large files and workspaces.
+
+  v0.9 adds indexed and batched file operations, faster SQL reads and writes, compressed native storage, lower-copy blob handling, and more efficient tracked-state merges. Remote clients also transfer localized file and query changes instead of repeatedly sending complete payloads.
+
+  This release changes the tracked-state and SlateDB physical formats. Existing repositories created by older engine versions must be recreated.
+- History relations are now table-valued functions with explicit commit arguments.
+
+  Use `example_history()` for history from the active head or `example_history($commit)` for an explicit head. The former `lixcol_as_of_commit_id` result column and predicate-based anchor API have been removed.
+- Structured files now merge incrementally through the new Component v2 plugin platform.
+
+  Reference plugins for CSV and TSV, JSON, Markdown, Excalidraw, and Git-compatible text turn localized file edits into sparse semantic changes without reparsing or rendering the complete document. Concurrent edits merge at the entity level, and plugin authors can build on the same public Rust API used by the bundled plugins.
+- Git replay can now target RocksDB or SlateDB and compare the full semantic plugin path with an explicit no-plugin control. Replay profiles identify the selected adapter and include per-commit WASM transition work counters.
+- Run Lix workspaces remotely with live, low-latency clients.
+
+  `openLix()` can connect to the versioned Lix HTTP protocol for SQL, branches, atomic batches, binary file operations, and multiplexed live queries. Each client gets an isolated branch-pinned session, retries writes safely, persists private local state locally, and sends compact deltas for localized edits.
+- Plugin-backed atomic imports now scale independently of document count. The engine automatically reuses its bounded live-Store working set for fresh and existing documents while preserving actively contested same-file leases, so callers no longer need a special single-writer ingestion API or actor-retention policy. Retained session observations also recover from benign working-set eviction when their exact durable semantic root is unchanged.
+- Lix SQL and history are more capable and easier to use.
+
+  History queries now default to the active branch head and correctly reconstruct files and directories across merges. The public catalog is smaller, `information_schema.columns` is the authoritative type contract, and the SDK adds atomic SQL batches alongside `DELETE ... RETURNING`, `LIKE` and `ILIKE`, and binary casts.
+
+  Applications using the removed generic state tables, low-level filesystem tables, or former filesystem-history provenance columns must migrate to the typed schema, logical file, and `lixcol_source_changes` surfaces.
+
+### Patch
+
+- The Git text WASM plugin now writes base64 content directly into its final JSON snapshot buffer, avoiding a duplicate large allocation for minified files. WASM Stores retain a bounded 128 MiB ceiling so warm updates of large minified documents can materialize their successor without exhausting linear memory.
+- Reduced SlateDB storage and read I/O by compressing newly written SST data with Zstandard.
+- Git history replay now installs the bundled CSV plugin alongside the other format plugins, so CSV and TSV files are eagerly materialized as semantic rows.
+- Improved 32–64 KiB binary file reads and repeat writes on RocksDB and SlateDB.
+
+  Lix now stores this common size band in one inline manifest and uses a key-only manifest probe to avoid repeated payload rewrites.
+- File-constrained semantic plugin reads now use the transaction overlay's candidate index instead of scanning every staged row.
+- Schema-constrained semantic plugin reads now use the transaction overlay's candidate index instead of scanning unrelated staged rows.
+- Improved 64–128 KiB binary file reads and reduced their storage rows on RocksDB and SlateDB.
+
+  Lix now includes this size band in its manifest-probed inline layout.
+- Fresh independent WASM plugin documents now open and drain concurrently within the bounded live-Store working set. Create-reservation preflights use aligned batch reads, while semantic rows are still eagerly validated and persisted.
+
 ## 0.8.4 - 2026-07-16
 
 ### Patch
