@@ -61,14 +61,14 @@ use crate::live_state::{
     overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
-    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES,
-    FileBytesSha256, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
-    PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
-    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentType,
-    PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
-    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
+    PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
+    PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit,
+    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -3091,13 +3091,15 @@ where
                     return None;
                 }
                 let file_key = PluginFileWriteKey::from(write);
-                (owners.get(&file_key).is_none() && selected_plugins.contains_key(&file_key))
+                (!owners.contains_key(&file_key) && selected_plugins.contains_key(&file_key))
                     .then_some(index)
             })
             .collect::<Vec<_>>();
 
-        for file_indices in fresh_file_indices.chunks(DEFAULT_MAX_LIVE_PLUGIN_STORES) {
+        let fresh_parallelism = self.plugin_host.max_live_plugin_stores();
+        for file_indices in fresh_file_indices.chunks(fresh_parallelism) {
             let mut prepared_opens = Vec::with_capacity(file_indices.len());
+            let mut prepared_session_keys = BTreeSet::new();
             for &file_index in file_indices {
                 let write = &file_data[file_index];
                 let path = write
@@ -3138,11 +3140,12 @@ where
                     owner_change_id,
                     semantic_chainable: false,
                 };
-                if self
-                    .pending_plugin_actor_publications
-                    .iter()
-                    .chain(reconciliation.actor_publications.iter())
-                    .any(|publication| publication.session_key() == &view.session_key)
+                if !prepared_session_keys.insert(view.session_key.clone())
+                    || self
+                        .pending_plugin_actor_publications
+                        .iter()
+                        .chain(reconciliation.actor_publications.iter())
+                        .any(|publication| publication.session_key() == &view.session_key)
                 {
                     return Err(LixError::new(
                         LixError::CODE_CONSTRAINT_VIOLATION,
