@@ -395,7 +395,6 @@ impl TinyRng {
         self.state
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn usize(&mut self, upper: usize) -> usize {
         // Use the better-mixed upper half; the low bits of an LCG cycle under
         // consecutive power-of-two modulo draws.
