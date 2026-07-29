@@ -4961,11 +4961,13 @@ where
         &mut self,
         command: DiffCommand,
         diff_ids: Vec<String>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let selections = diff_ids
             .iter()
             .map(|diff_id| {
-                crate::tracked_state::decode_diff_id(diff_id).map(|sides| (diff_id.as_str(), sides))
+                crate::tracked_state::decode_diff_id(diff_id)
+                    .map(|sides| (diff_id.as_str(), sides))
+                    .map_err(|_| stale_or_unknown_diff_id())
             })
             .collect::<Result<Vec<_>, _>>()?;
         let change_ids = selections
@@ -5076,17 +5078,7 @@ where
                 None => current.as_ref().is_none_or(|row| row.deleted),
             };
             if !current_matches {
-                let actual = current
-                    .as_ref()
-                    .and_then(|row| row.change_id)
-                    .map_or_else(|| "absent".to_string(), |id| id.to_string());
-                let expected = expected.map_or_else(|| "absent".to_string(), |id| id.to_string());
-                return Err(LixError::new(
-                    LixError::CODE_CONSTRAINT_VIOLATION,
-                    format!(
-                        "stale diff_id '{diff_id}': current change is {actual}, expected {expected}"
-                    ),
-                ));
+                return Err(stale_or_unknown_diff_id());
             }
             if let Some(target) = target {
                 required_diff_change(&records, target, diff_id)?;
@@ -5153,13 +5145,19 @@ where
             })
             .await?;
         }
-        Ok(diff_ids.len() as u64)
+        Ok(crate::sql2::DiffCommandOutcome {
+            rows_affected: diff_ids.len() as u64,
+            commit_id: self
+                .staged_writes
+                .commit_id_for_branch(&branch_id)?
+                .map(|commit_id| commit_id.to_string()),
+        })
     }
 
     async fn execute_checkpoint_selection(
         &mut self,
         diff_ids: Vec<String>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let branch_id = self.active_branch_id.clone();
         let (previous_recovery, mut gc_state) =
             self.checkpoint_publication_state(&branch_id).await?;
@@ -5233,11 +5231,7 @@ where
         let selected = selected.finish();
         let unselected = unselected.finish();
         if matched != requested {
-            let unknown = requested.difference(&matched).next().expect("sets differ");
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                format!("checkpoint selection contains stale or unknown diff_id '{unknown}'"),
-            ));
+            return Err(stale_or_unknown_diff_id());
         }
         let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
         gc_state.checkpoint_sequence =
@@ -5260,7 +5254,7 @@ where
             })
             .await?;
             self.stage_checkpoint_commit(
-                branch_id,
+                branch_id.clone(),
                 previous_checkpoint_commit_id,
                 head_commit_id,
                 interval_has_commits,
@@ -5285,7 +5279,7 @@ where
             self.staged_writes
                 .add_checkpoint_publication(CheckpointPublication {
                     recovery_ref: CheckpointRecoveryRef {
-                        branch_id,
+                        branch_id: branch_id.clone(),
                         recovered_head_commit_id: head_commit_id,
                         checkpoint_commit_id,
                         interval_has_commits,
@@ -5293,7 +5287,13 @@ where
                     gc_state,
                 })?;
         }
-        Ok(diff_ids.len() as u64)
+        Ok(crate::sql2::DiffCommandOutcome {
+            rows_affected: diff_ids.len() as u64,
+            commit_id: self
+                .staged_writes
+                .commit_id_for_branch(&branch_id)?
+                .map(|commit_id| commit_id.to_string()),
+        })
     }
 
     pub(crate) async fn execute_diff_command_query_owned(
@@ -5301,7 +5301,7 @@ where
         command: DiffCommand,
         query_sql: String,
         params: Vec<Value>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         let statement = crate::sql2::parse_statement(&query_sql)?;
         let result = self
             .execute_read_sql_statement(query_sql, statement, params)
@@ -5326,10 +5326,10 @@ where
             diff_ids.push(diff_id.clone());
         }
         if diff_ids.is_empty() {
-            return Err(LixError::new(
-                LixError::CODE_CONSTRAINT_VIOLATION,
-                "diff command selection is empty",
-            ));
+            return Ok(crate::sql2::DiffCommandOutcome {
+                rows_affected: 0,
+                commit_id: None,
+            });
         }
         self.execute_diff_command(command, diff_ids).await
     }
@@ -5338,14 +5338,16 @@ where
 fn required_diff_change<'a>(
     records: &'a HashMap<ChangeId, ChangeRecord>,
     change_id: ChangeId,
-    diff_id: &str,
+    _diff_id: &str,
 ) -> Result<&'a ChangeRecord, LixError> {
-    records.get(&change_id).ok_or_else(|| {
-        LixError::new(
-            LixError::CODE_CONSTRAINT_VIOLATION,
-            format!("diff_id '{diff_id}' references missing change '{change_id}'"),
-        )
-    })
+    records.get(&change_id).ok_or_else(stale_or_unknown_diff_id)
+}
+
+fn stale_or_unknown_diff_id() -> LixError {
+    LixError::new(
+        LixError::CODE_CONSTRAINT_VIOLATION,
+        "stale or unknown diff_id; re-evaluate the source diff and retry",
+    )
 }
 
 fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
@@ -6026,13 +6028,19 @@ where
         &mut self,
         command: DiffCommand,
         diff_ids: Vec<String>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
         match command {
             DiffCommand::Revert | DiffCommand::Apply => {
                 self.execute_apply_or_revert(command, diff_ids).await
             }
             DiffCommand::CreateCheckpoint => self.execute_checkpoint_selection(diff_ids).await,
         }
+    }
+
+    fn staged_commit_id(&self, branch_id: &str) -> Result<Option<String>, LixError> {
+        self.staged_writes
+            .commit_id_for_branch(branch_id)
+            .map(|commit_id| commit_id.map(|commit_id| commit_id.to_string()))
     }
 }
 

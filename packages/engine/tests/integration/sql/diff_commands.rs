@@ -38,12 +38,13 @@ simulation_test!(
 
         let working = select_rows(
             &session,
-            "SELECT diff_id, entity_pk FROM lix_working_diff \
+            "SELECT diff_id, entity_pk, diff_type FROM lix_working_diff \
          WHERE schema_key = 'lix_key_value' ORDER BY entity_pk",
         )
         .await;
         assert_eq!(working.len(), 2);
         assert!(matches!(&working[0][0], Value::Text(id) if id.starts_with("d1.")));
+        assert_eq!(working[0][2], Value::Text("added".to_string()));
 
         let values_error = session
             .execute(
@@ -54,17 +55,24 @@ simulation_test!(
             .expect_err("command sinks must reject VALUES");
         assert_eq!(values_error.code, LixError::CODE_UNSUPPORTED_SQL);
 
-        session
+        let selected_diff_id = working[0][0].clone();
+        let reverted = session
             .execute(
                 "INSERT INTO lix_revert (diff_id) \
-             SELECT diff_id FROM lix_working_diff \
-             WHERE schema_key = 'lix_key_value' \
-             ORDER BY entity_pk \
-             LIMIT 1",
-                &[],
+                 SELECT diff_id \
+                 FROM VALUES ($1) AS selected(diff_id) \
+                 RETURNING commit_id",
+                &[selected_diff_id],
             )
             .await
             .expect("selected revert should succeed");
+        assert_eq!(reverted.rows_affected(), 1);
+        assert_eq!(reverted.columns(), &["commit_id"]);
+        assert_eq!(reverted.len(), 1);
+        assert!(matches!(
+            reverted.get(&reverted.rows()[0], "commit_id"),
+            Some(Value::Text(commit_id)) if !commit_id.is_empty()
+        ));
         assert_eq!(
             select_rows(
                 &session,
@@ -88,12 +96,13 @@ simulation_test!(
         assert_eq!(historical_rows[0][1], Value::Null);
         assert!(matches!(historical_rows[0][2], Value::Text(_)));
 
-        session
+        let applied = session
             .execute(
                 "INSERT INTO lix_apply (diff_id) \
                  SELECT diff_id FROM lix_diff($1, $2) \
                  WHERE schema_key = 'lix_key_value' \
-                   AND entity_pk = lix_json('[\"a\"]')",
+                   AND entity_pk = lix_json('[\"a\"]') \
+                 RETURNING commit_id",
                 &[
                     Value::Text(baseline.clone()),
                     Value::Text(original_head.to_string()),
@@ -101,6 +110,9 @@ simulation_test!(
             )
             .await
             .expect("selected historical apply should succeed");
+        assert_eq!(applied.rows_affected(), 1);
+        assert_eq!(applied.columns(), &["commit_id"]);
+        assert_eq!(applied.len(), 1);
 
         let stale = session
             .execute(
@@ -116,13 +128,18 @@ simulation_test!(
             .await
             .expect_err("strict apply must reject a moved head");
         assert_eq!(stale.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(
+            stale.message,
+            "stale or unknown diff_id; re-evaluate the source diff and retry"
+        );
 
-        session
+        let checkpointed = session
             .execute(
                 "INSERT INTO lix_create_checkpoint (diff_id) \
              SELECT diff_id FROM lix_working_diff \
              WHERE schema_key = $1 \
-               AND entity_pk = lix_json($2)",
+               AND entity_pk = lix_json($2) \
+             RETURNING commit_id",
                 &[
                     Value::Text("lix_key_value".to_string()),
                     Value::Text("[\"a\"]".to_string()),
@@ -130,6 +147,9 @@ simulation_test!(
             )
             .await
             .expect("partial checkpoint should succeed");
+        assert_eq!(checkpointed.rows_affected(), 1);
+        assert_eq!(checkpointed.columns(), &["commit_id"]);
+        assert_eq!(checkpointed.len(), 1);
 
         assert_eq!(
             select_rows(
@@ -151,5 +171,29 @@ simulation_test!(
                 vec![Value::Text("b".to_string()), Value::Json(json!("two"))],
             ]
         );
+
+        let head_before_empty = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head before empty selection should load")
+            .expect("head before empty selection should exist");
+        let empty = session
+            .execute(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM lix_working_diff WHERE 1 = 0 \
+                 RETURNING commit_id",
+                &[],
+            )
+            .await
+            .expect("empty diff selection should be a successful no-op");
+        assert_eq!(empty.rows_affected(), 0);
+        assert_eq!(empty.columns(), &["commit_id"]);
+        assert!(empty.is_empty());
+        let head_after_empty = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("head after empty selection should load")
+            .expect("head after empty selection should exist");
+        assert_eq!(head_after_empty, head_before_empty);
     }
 );

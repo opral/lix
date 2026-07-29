@@ -35,6 +35,12 @@ pub(crate) enum DiffCommand {
     CreateCheckpoint,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DiffCommandOutcome {
+    pub(crate) rows_affected: u64,
+    pub(crate) commit_id: Option<String>,
+}
+
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 
@@ -174,11 +180,15 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         &mut self,
         _command: DiffCommand,
         _diff_ids: Vec<String>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<DiffCommandOutcome, LixError> {
         Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "diff commands are not supported by this write context",
         ))
+    }
+
+    fn staged_commit_id(&self, _branch_id: &str) -> Result<Option<String>, LixError> {
+        Ok(None)
     }
 }
 
@@ -349,7 +359,7 @@ impl SqlWriteContext {
         &self,
         command: DiffCommand,
         diff_ids: Vec<String>,
-    ) -> Result<u64, LixError> {
+    ) -> Result<DiffCommandOutcome, LixError> {
         let _guard = self.gate.lock().await;
         unsafe {
             self.ptr

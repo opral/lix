@@ -37,9 +37,10 @@ pub(crate) use bind::{
 };
 pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
-    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext,
-    WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
+    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
+    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
+    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
+    WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};

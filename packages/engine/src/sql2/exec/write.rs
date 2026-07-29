@@ -40,7 +40,11 @@ pub(crate) struct WriteLogicalPlan {
 
 pub(crate) fn diff_command_query(
     plan: &SqlLogicalPlan,
-) -> Option<(crate::sql2::DiffCommand, String)> {
+) -> Option<(
+    crate::sql2::DiffCommand,
+    String,
+    Option<crate::sql2::bind::write::BoundReturning>,
+)> {
     let SqlLogicalPlan::Write(write) = plan else {
         return None;
     };
@@ -51,7 +55,11 @@ pub(crate) fn diff_command_query(
     else {
         return None;
     };
-    Some((command, query.query.to_string()))
+    Some((
+        command,
+        query.query.to_string(),
+        write.plan.bound.returning.clone(),
+    ))
 }
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ Lix represents a diff as rows. `lix_working_diff` compares the active branch
 head with its latest checkpoint. `lix_diff` compares any two commits:
 
 ```sql
-SELECT diff_id, entity_pk, schema_key, file_id, change_kind,
+SELECT diff_id, entity_pk, schema_key, file_id, diff_type,
        before_change_id, after_change_id
 FROM lix_diff($1, $2);
 ```
@@ -48,9 +48,21 @@ WHERE file_id <> $1;
 ```
 
 The source is a normal SQL query, so filters, joins, ordering, and limits stay
-inside the database. `INSERT ... VALUES` is intentionally rejected: a client
-must select diff rows rather than copy opaque IDs out and send them back.
-Selecting zero rows is an error.
+inside the database. Applications may also retain a selection and submit it
+through DataFusion's `VALUES` relation:
+
+```sql
+INSERT INTO lix_revert (diff_id)
+SELECT diff_id
+FROM VALUES ($1), ($2), ($3) AS selected(diff_id);
+```
+
+Direct `INSERT ... VALUES` remains intentionally rejected. Every command must
+use `INSERT ... SELECT`; the query may read a Lix relation, a `VALUES`
+relation, a CTE, or another valid query.
+
+An empty selection is a successful zero-row operation. It does not create a
+commit and does not require a preflight query.
 
 Each statement is atomic. Revert and apply use strict compare-and-set
 semantics: every selected entity must still be on the side from which the
@@ -60,6 +72,20 @@ changing the branch.
 A partial checkpoint commits the selected state as a checkpoint and preserves
 the unselected working state in a child commit. Both commits and the branch-head
 move publish atomically. Checkpoint naming is not part of this API.
+
+Every command supports `RETURNING commit_id`:
+
+```sql
+INSERT INTO lix_apply (diff_id)
+SELECT diff_id
+FROM lix_diff($1, $2)
+WHERE file_id = $3
+RETURNING commit_id;
+```
+
+For a non-empty selection, the affected-row count and returned-row count equal
+the number of consumed diffs. Every returned row contains the same
+engine-created commit ID. An empty selection returns zero rows.
 
 These command names describe state transformations. They are not a session
 undo/redo stack.

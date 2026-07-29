@@ -251,7 +251,7 @@ impl PublicCatalog {
                 ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
-                ("change_kind", false),
+                ("diff_type", false),
                 ("before_change_id", true),
                 ("after_change_id", true),
             ]),
@@ -265,7 +265,7 @@ impl PublicCatalog {
                 ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
-                ("change_kind", false),
+                ("diff_type", false),
                 ("before_change_id", true),
                 ("after_change_id", true),
                 ("lixcol_branch_id", false),
@@ -280,7 +280,10 @@ impl PublicCatalog {
             self.insert(surface(
                 name,
                 kind,
-                vec![PublicColumn::public_insert_only("diff_id", false)],
+                vec![
+                    PublicColumn::public_insert_only("diff_id", false),
+                    PublicColumn::public_read_only("commit_id", false),
+                ],
                 SurfaceCapabilities {
                     insert: true,
                     update: false,
@@ -447,7 +450,7 @@ fn working_change_schema(by_branch: bool) -> SchemaRef {
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("change_kind", DataType::Utf8, false),
+        Field::new("diff_type", DataType::Utf8, false),
         Field::new("before_change_id", DataType::Utf8, true),
         Field::new("after_change_id", DataType::Utf8, true),
     ];

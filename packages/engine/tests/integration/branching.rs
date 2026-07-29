@@ -859,7 +859,7 @@ simulation_test!(
         assert_key_value(&main, "main-merge-target", Some("\"main\"")).await;
         let working_changes = main
             .execute(
-                "SELECT entity_pk, change_kind \
+                "SELECT entity_pk, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY entity_pk",
