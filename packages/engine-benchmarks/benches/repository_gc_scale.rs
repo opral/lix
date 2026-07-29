@@ -346,6 +346,7 @@ async fn measure<StorageImpl>(
         io.listed_objects,
         directory_bytes(Path::new(path)),
     );
+    print_io_categories("measure", backend, history_changes, commit_width, io);
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -379,6 +380,61 @@ fn print_setup(
         io.list_operations,
         io.listed_objects,
         directory_bytes(Path::new(path)),
+    );
+    print_io_categories("setup", backend, history_changes, commit_width, io);
+}
+
+fn print_io_categories(
+    phase: &str,
+    backend: Backend,
+    history_changes: usize,
+    commit_width: usize,
+    io: SlateDBIoSnapshot,
+) {
+    println!(
+        "repository_gc_scale_io,phase={phase},backend={backend},\
+         history_changes={history_changes},commit_width={commit_width},\
+         wal_read_objects={},wal_read_bytes={},wal_write_objects={},wal_write_bytes={},\
+         compacted_read_objects={},compacted_read_bytes={},\
+         compacted_write_objects={},compacted_write_bytes={},\
+         manifest_read_objects={},manifest_read_bytes={},\
+         manifest_write_objects={},manifest_write_bytes={},\
+         compactions_read_objects={},compactions_read_bytes={},\
+         compactions_write_objects={},compactions_write_bytes={},\
+         other_read_objects={},other_read_bytes={},\
+         other_write_objects={},other_write_bytes={},\
+         main_read_requests={},main_write_requests={},\
+         reader_read_requests={},reader_write_requests={},\
+         compactor_read_requests={},compactor_write_requests={},\
+         gc_read_requests={},gc_write_requests={}",
+        io.wal.read_objects,
+        io.wal.read_bytes,
+        io.wal.write_objects,
+        io.wal.write_bytes,
+        io.compacted.read_objects,
+        io.compacted.read_bytes,
+        io.compacted.write_objects,
+        io.compacted.write_bytes,
+        io.manifest.read_objects,
+        io.manifest.read_bytes,
+        io.manifest.write_objects,
+        io.manifest.write_bytes,
+        io.compactions.read_objects,
+        io.compactions.read_bytes,
+        io.compactions.write_objects,
+        io.compactions.write_bytes,
+        io.other.read_objects,
+        io.other.read_bytes,
+        io.other.write_objects,
+        io.other.write_bytes,
+        io.main.read_requests,
+        io.main.write_requests,
+        io.reader.read_requests,
+        io.reader.write_requests,
+        io.compactor.read_requests,
+        io.compactor.write_requests,
+        io.gc.read_requests,
+        io.gc.write_requests,
     );
 }
 
