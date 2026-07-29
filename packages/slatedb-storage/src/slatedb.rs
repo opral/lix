@@ -37,7 +37,7 @@ use slatedb::config::{
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
-use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, WriteBatch};
+use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
@@ -384,6 +384,7 @@ pub struct SlateDBRead {
     publication_view: Option<PublicationView>,
     durability: ReadDurability,
     point_cache: SnapshotPointCache,
+    scan_cursor: Mutex<Option<ScanCursor>>,
 }
 
 #[allow(missing_debug_implementations)]
@@ -1040,6 +1041,7 @@ impl Storage for SlateDB {
                 publication_view,
                 durability: opts.durability,
                 point_cache: self.point_cache.clone(),
+                scan_cursor: Mutex::new(None),
             })
         }
     }
@@ -1395,6 +1397,7 @@ impl StorageRead for SlateDBRead {
                 });
             }
 
+            let cursor_range = range.clone();
             let range = physical_range(space, range)?;
             let resume_after = opts
                 .resume_after
@@ -1435,11 +1438,29 @@ impl StorageRead for SlateDBRead {
                     })
                     .await;
             }
-            let mut iter = Some(
-                self.worker
-                    .call_read(move |_db| open_snapshot_scan(snapshot, bounds, durability))
-                    .await?,
-            );
+            let cursor = self
+                .scan_cursor
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .filter(|cursor| {
+                    cursor.space == space
+                        && cursor.range == cursor_range
+                        && cursor.projection == opts.projection
+                        && opts.resume_after.as_ref() == Some(&cursor.expected_resume_after)
+                });
+            let (iter, pending) = if let Some(cursor) = cursor {
+                (cursor.iter, cursor.pending)
+            } else {
+                (
+                    self.worker
+                        .call_read(move |_db| open_snapshot_scan(snapshot, bounds, durability))
+                        .await?,
+                    None,
+                )
+            };
+            let mut iter = Some(iter);
+            let mut pending = pending;
             let mut all_entries = Vec::with_capacity(opts.page_size());
 
             loop {
@@ -1449,15 +1470,23 @@ impl StorageRead for SlateDBRead {
                 let current_iter = iter
                     .take()
                     .expect("slatedb scan iterator is present until scan returns");
+                let current_pending = pending.take();
                 let projection = opts.projection;
                 let batch = self
                     .worker
                     .call_read(move |_db| {
-                        scan_snapshot_batch(current_iter, batch_limit, projection, lookahead)
+                        scan_snapshot_batch(
+                            current_iter,
+                            current_pending,
+                            batch_limit,
+                            projection,
+                            lookahead,
+                        )
                     })
                     .await?;
                 let ScanBatch {
                     iter: next_iter,
+                    pending: next_pending,
                     entries,
                     state,
                 } = batch;
@@ -1476,12 +1505,32 @@ impl StorageRead for SlateDBRead {
                         });
                     }
                     ScanBatchState::HasMore => {
+                        let expected_resume_after = all_entries
+                            .last()
+                            .expect("non-empty SlateDB page has a continuation key")
+                            .key
+                            .clone();
+                        *self
+                            .scan_cursor
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(ScanCursor {
+                                space,
+                                range: cursor_range,
+                                projection: opts.projection,
+                                expected_resume_after,
+                                iter: next_iter,
+                                pending: next_pending,
+                            });
                         return Ok(ScanChunk {
                             entries: all_entries,
                             has_more: true,
                         });
                     }
-                    ScanBatchState::MoreUnknown => iter = Some(next_iter),
+                    ScanBatchState::MoreUnknown => {
+                        iter = Some(next_iter);
+                        pending = next_pending;
+                    }
                 }
             }
         }
@@ -2286,8 +2335,18 @@ async fn get_snapshot_value(
 
 struct ScanBatch {
     iter: DbIterator,
+    pending: Option<KeyValue>,
     entries: Vec<(Key, ProjectedValue)>,
     state: ScanBatchState,
+}
+
+struct ScanCursor {
+    space: SpaceId,
+    range: KeyRange,
+    projection: CoreProjection,
+    expected_resume_after: Key,
+    iter: DbIterator,
+    pending: Option<KeyValue>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2311,15 +2370,22 @@ async fn open_snapshot_scan(
 
 async fn scan_snapshot_batch(
     mut iter: DbIterator,
+    mut pending: Option<KeyValue>,
     limit_rows: usize,
     projection: CoreProjection,
     lookahead: bool,
 ) -> Result<ScanBatch, StorageError> {
     let mut entries = Vec::with_capacity(limit_rows);
     while entries.len() < limit_rows {
-        let Some(row) = iter.next().await.map_err(slatedb_error)? else {
+        let row = if pending.is_some() {
+            pending.take()
+        } else {
+            iter.next().await.map_err(slatedb_error)?
+        };
+        let Some(row) = row else {
             return Ok(ScanBatch {
                 iter,
+                pending: None,
                 entries,
                 state: ScanBatchState::Exhausted,
             });
@@ -2339,7 +2405,8 @@ async fn scan_snapshot_batch(
     }
 
     let state = if lookahead {
-        if iter.next().await.map_err(slatedb_error)?.is_some() {
+        pending = iter.next().await.map_err(slatedb_error)?;
+        if pending.is_some() {
             ScanBatchState::HasMore
         } else {
             ScanBatchState::Exhausted
@@ -2349,6 +2416,7 @@ async fn scan_snapshot_batch(
     };
     Ok(ScanBatch {
         iter,
+        pending,
         entries,
         state,
     })
@@ -3008,6 +3076,79 @@ mod tests {
             .values,
             vec![None]
         );
+    }
+
+    #[test]
+    fn snapshot_scan_cursor_preserves_lookahead_and_falls_back_safely() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-snapshot-scan-cursor",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open cursor-test storage");
+        let space = SpaceId(7);
+        let keys = [b"a", b"b", b"c"].map(|bytes| Key(Bytes::from_static(bytes)));
+        let mut write = block_on(storage.begin_write(WriteOptions::default()))
+            .expect("begin cursor-test write");
+        block_on(
+            write.put_many(
+                space,
+                PutBatch {
+                    entries: keys
+                        .iter()
+                        .cloned()
+                        .map(|key| PutEntry {
+                            value: StoredValue {
+                                bytes: key.0.clone(),
+                            },
+                            key,
+                        })
+                        .collect(),
+                },
+            ),
+        )
+        .expect("stage cursor-test rows");
+        block_on(write.commit()).expect("commit cursor-test rows");
+
+        let read =
+            block_on(storage.begin_read(ReadOptions::default())).expect("begin cursor-test read");
+        let range = KeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        };
+        let scan = |resume_after, projection| {
+            block_on(read.scan(
+                space,
+                range.clone(),
+                ScanOptions {
+                    projection,
+                    limit_rows: 1,
+                    resume_after,
+                },
+            ))
+            .expect("scan cursor-test page")
+        };
+
+        let first = scan(None, CoreProjection::FullValue);
+        assert_eq!(first.entries[0].key, keys[0]);
+        assert!(first.has_more);
+        let second = scan(Some(keys[0].clone()), CoreProjection::FullValue);
+        assert_eq!(second.entries[0].key, keys[1]);
+        assert!(second.has_more);
+
+        // A changed projection cannot reuse the cursor, but stateless fallback
+        // must preserve the same continuation semantics.
+        let third = scan(Some(keys[1].clone()), CoreProjection::KeyOnly);
+        assert_eq!(third.entries[0].key, keys[2]);
+        assert_eq!(third.entries[0].value, ProjectedValue::KeyOnly);
+        assert!(!third.has_more);
+
+        // Starting over abandons any cached continuation without affecting
+        // correctness, and the new scan can itself resume through the cursor.
+        let restarted = scan(None, CoreProjection::FullValue);
+        assert_eq!(restarted.entries[0].key, keys[0]);
+        let restarted_second = scan(Some(keys[0].clone()), CoreProjection::FullValue);
+        assert_eq!(restarted_second.entries[0].key, keys[1]);
     }
 
     #[test]
