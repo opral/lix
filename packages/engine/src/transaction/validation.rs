@@ -2351,6 +2351,10 @@ async fn validate_committed_delete_restrictions(
     schema_catalog: &CatalogSnapshot,
     pending_constraints: &PendingConstraintIndexes,
 ) -> Result<(), LixError> {
+    let mut normal_batches = BTreeMap::<
+        NormalDeleteRestrictionBatchKey,
+        BTreeMap<UniqueConstraintValue, Vec<DomainRowIdentity>>,
+    >::new();
     let mut state_batches =
         BTreeMap::<StateDeleteRestrictionBatchKey, Vec<DomainRowIdentity>>::new();
     for tombstone in &pending_constraints.tombstones {
@@ -2359,14 +2363,27 @@ async fn validate_committed_delete_restrictions(
             continue;
         }
         for reference in delete_plan.foreign_key_references {
-            validate_committed_normal_delete_restriction(
+            let Some(deleted_value) = committed_deleted_row_value(
                 input.live_state,
-                pending_constraints,
                 tombstone,
-                &reference.source_key,
-                &reference.foreign_key,
+                &reference.foreign_key.referenced_properties,
             )
-            .await?;
+            .await?
+            else {
+                continue;
+            };
+            for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+                normal_batches
+                    .entry(NormalDeleteRestrictionBatchKey {
+                        source_key: reference.source_key.clone(),
+                        source_domain,
+                        local_properties: reference.foreign_key.local_properties.clone(),
+                    })
+                    .or_default()
+                    .entry(deleted_value.clone())
+                    .or_default()
+                    .push(tombstone.identity.clone());
+            }
         }
         for reference in delete_plan.state_foreign_key_references {
             for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
@@ -2381,6 +2398,12 @@ async fn validate_committed_delete_restrictions(
             }
         }
     }
+    validate_committed_normal_delete_restriction_batches(
+        input.live_state,
+        pending_constraints,
+        normal_batches,
+    )
+    .await?;
     validate_committed_state_surface_delete_restriction_batches(
         input.live_state,
         pending_constraints,
@@ -2391,30 +2414,25 @@ async fn validate_committed_delete_restrictions(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct StateDeleteRestrictionBatchKey {
+struct NormalDeleteRestrictionBatchKey {
     source_key: SchemaCatalogKey,
     source_domain: Domain,
-    foreign_key: StateDeleteReferencePlan,
+    local_properties: Vec<Vec<String>>,
 }
 
-async fn validate_committed_normal_delete_restriction(
+async fn validate_committed_normal_delete_restriction_batches(
     live_state: &dyn LiveStateReader,
     pending_constraints: &PendingConstraintIndexes,
-    tombstone: &PendingTombstone,
-    source_key: &SchemaCatalogKey,
-    foreign_key: &ForeignKeyPlan,
+    batches: BTreeMap<
+        NormalDeleteRestrictionBatchKey,
+        BTreeMap<UniqueConstraintValue, Vec<DomainRowIdentity>>,
+    >,
 ) -> Result<(), LixError> {
-    let Some(deleted_value) =
-        committed_deleted_row_value(live_state, tombstone, &foreign_key.referenced_properties)
-            .await?
-    else {
-        return Ok(());
-    };
-    for source_domain in tombstone.identity.domain().fk_source_domains_for_target() {
+    for (batch, tombstones_by_value) in batches {
         let rows = scan_committed_constraint_rows(
             live_state,
-            &source_domain,
-            vec![source_key.schema_key.clone()],
+            &batch.source_domain,
+            vec![batch.source_key.schema_key.clone()],
             Vec::new(),
             false,
         )
@@ -2431,22 +2449,32 @@ async fn validate_committed_normal_delete_restriction(
                 continue;
             };
             let snapshot = parse_committed_snapshot(row, snapshot_content)?;
-            if UniqueConstraintValue::from_snapshot_non_null(
-                &snapshot,
-                &foreign_key.local_properties,
-            )
-            .as_ref()
-                == Some(&deleted_value)
-            {
-                return Err(committed_delete_restriction_error(
-                    &tombstone.identity,
-                    row,
-                    &foreign_key.local_properties,
-                )?);
-            }
+            let Some(value) =
+                UniqueConstraintValue::from_snapshot_non_null(&snapshot, &batch.local_properties)
+            else {
+                continue;
+            };
+            let Some(tombstone) = tombstones_by_value
+                .get(&value)
+                .and_then(|tombstones| tombstones.first())
+            else {
+                continue;
+            };
+            return Err(committed_delete_restriction_error(
+                tombstone,
+                row,
+                &batch.local_properties,
+            )?);
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StateDeleteRestrictionBatchKey {
+    source_key: SchemaCatalogKey,
+    source_domain: Domain,
+    foreign_key: StateDeleteReferencePlan,
 }
 
 async fn validate_committed_state_surface_delete_restriction_batches(
@@ -6429,6 +6457,47 @@ mod tests {
             .expect_err("delete should be restricted by same-branch references");
 
         assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+    }
+
+    #[tokio::test]
+    async fn validation_batches_committed_delete_reference_scans_by_constraint_scope() {
+        let visible_schemas = vec![fk_parent_schema(), fk_child_schema()];
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut parent_one_delete = fk_parent_row("parent-1", branch_id);
+        parent_one_delete.snapshot = None;
+        let mut parent_two_delete = fk_parent_row("parent-2", branch_id);
+        parent_two_delete.snapshot = None;
+        let live_state = CountingStaticLiveStateReader {
+            rows: vec![
+                MaterializedLiveStateRow::from(fk_parent_row("parent-1", branch_id)),
+                MaterializedLiveStateRow::from(fk_parent_row("parent-2", branch_id)),
+                MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-2", branch_id)),
+            ],
+            scan_count: AtomicUsize::new(0),
+        };
+        let staged_writes = PreparedWriteSet {
+            state_rows: prepared_rows![parent_one_delete, parent_two_delete],
+            ..empty_staged_write_set()
+        };
+        let validation_set = staged_writes.validation_set_for_tests();
+        let catalog = CatalogSnapshot::from_visible_schemas(&visible_schemas)
+            .expect("foreign-key schemas should compile");
+        let mut pending_constraints = PendingConstraintIndexes::default();
+        for row in validation_set.rows() {
+            pending_constraints.remember_tombstone(row);
+        }
+        let input = TransactionValidationInput::new(&validation_set, &catalog, &live_state);
+
+        let error = validate_committed_delete_restrictions(&input, &catalog, &pending_constraints)
+            .await
+            .expect_err("either deleted target must still reject a committed reference");
+
+        assert_eq!(error.code, LixError::CODE_FOREIGN_KEY);
+        assert_eq!(
+            live_state.scan_count.load(Ordering::Relaxed),
+            3,
+            "two target point loads should share the committed source-schema scan"
+        );
     }
 
     #[tokio::test]
