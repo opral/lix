@@ -577,10 +577,15 @@ fn env_nonnegative_u64(name: &str, default: u64) -> u64 {
 }
 
 fn env_nonnegative_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} must be a non-negative integer")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("{name} must contain valid UTF-8")
+        }
+    }
 }
 
 fn directory_bytes(path: &Path) -> u64 {
