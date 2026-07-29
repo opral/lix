@@ -191,12 +191,14 @@ interface api {
 
   record file-transition {
     successor: own<transaction>,
-    changes: own<change-cursor>,
+    first-changes: list<entity-change>,
+    changes: option<own<change-cursor>>,
   }
 
   record entity-transition {
     successor: own<transaction>,
-    edits: own<edit-cursor>,
+    first-edits: list<byte-edit>,
+    edits: option<own<edit-cursor>>,
   }
 
   record open-file-input {

@@ -1345,6 +1345,13 @@ fn build_chunks(drafts: Vec<RowDraft>, next_key: &mut u32) -> Result<Vec<ChunkRe
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V3RowIndexRecord {
+    pub row_start: u32,
+    pub row_len: u32,
+    pub id: String,
+}
+
 #[derive(Debug)]
 struct DocumentInner {
     blob: PersistentBlob,
@@ -1930,6 +1937,22 @@ impl Document {
 
     pub fn dialect(&self) -> Dialect {
         self.0.dialect
+    }
+
+    pub fn v3_row_index_records(&self) -> Vec<V3RowIndexRecord> {
+        self.0
+            .index
+            .locations()
+            .map(|location| {
+                let row_start = self.0.index.row_start(location);
+                let row_end = self.0.index.row_end(location);
+                V3RowIndexRecord {
+                    row_start,
+                    row_len: row_end - row_start,
+                    id: self.row_id(location),
+                }
+            })
+            .collect()
     }
 
     pub fn file_changed(
@@ -3823,6 +3846,10 @@ fn canonical_row_snapshot(snapshot: &RowSnapshot) -> Result<Vec<u8>, String> {
     write_canonical_json_string(&mut output, &snapshot.order_key);
     output.push(b'}');
     Ok(output)
+}
+
+pub fn encode_row_snapshot(snapshot: &RowSnapshot) -> Result<Vec<u8>, String> {
+    canonical_row_snapshot(snapshot)
 }
 
 pub fn parse_row_snapshot(bytes: &[u8]) -> Result<RowSnapshot, String> {

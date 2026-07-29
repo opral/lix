@@ -153,7 +153,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
         input: OpenFileInput,
     ) -> std::result::Result<FileTransition, PluginError> {
         P::open_file(budget, input)
-            .map(file_transition)
+            .and_then(|result| file_transition(result, budget.limits().max_page_bytes))
             .map_err(plugin_error)
     }
 
@@ -162,7 +162,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
         input: FileUpdate,
     ) -> std::result::Result<FileTransition, PluginError> {
         P::file_changed(budget, input)
-            .map(file_transition)
+            .and_then(|result| file_transition(result, budget.limits().max_page_bytes))
             .map_err(plugin_error)
     }
 
@@ -171,7 +171,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
         input: OpenEntitiesInput,
     ) -> std::result::Result<EntityTransition, PluginError> {
         P::open_entities(budget, input)
-            .map(entity_transition)
+            .and_then(|result| entity_transition(result, budget.limits().max_page_bytes))
             .map_err(plugin_error)
     }
 
@@ -180,7 +180,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
         input: EntityUpdate,
     ) -> std::result::Result<EntityTransition, PluginError> {
         P::entities_changed(budget, input)
-            .map(entity_transition)
+            .and_then(|result| entity_transition(result, budget.limits().max_page_bytes))
             .map_err(plugin_error)
     }
 }
@@ -206,28 +206,50 @@ impl GuestEditCursor for AuthorEditCursor {
     }
 }
 
-fn file_transition(result: FileResult) -> FileTransition {
-    FileTransition {
+fn file_transition(result: FileResult, max_bytes: u32) -> Result<FileTransition> {
+    let (first_changes, remaining) =
+        split_first_page(result.changes, max_bytes, entity_change_bytes)?;
+    Ok(FileTransition {
         successor: result.successor,
-        changes: ChangeCursor::new(AuthorChangeCursor {
-            state: RefCell::new(CursorState {
-                pending: result.changes.into(),
-                eof: false,
-            }),
+        first_changes,
+        changes: (!remaining.is_empty()).then(|| {
+            ChangeCursor::new(AuthorChangeCursor {
+                state: RefCell::new(CursorState {
+                    pending: remaining,
+                    eof: false,
+                }),
+            })
         }),
-    }
+    })
 }
 
-fn entity_transition(result: EntityResult) -> EntityTransition {
-    EntityTransition {
+fn entity_transition(result: EntityResult, max_bytes: u32) -> Result<EntityTransition> {
+    let (first_edits, remaining) = split_first_page(result.edits, max_bytes, byte_edit_bytes)?;
+    Ok(EntityTransition {
         successor: result.successor,
-        edits: EditCursor::new(AuthorEditCursor {
-            state: RefCell::new(CursorState {
-                pending: result.edits.into(),
-                eof: false,
-            }),
+        first_edits,
+        edits: (!remaining.is_empty()).then(|| {
+            EditCursor::new(AuthorEditCursor {
+                state: RefCell::new(CursorState {
+                    pending: remaining,
+                    eof: false,
+                }),
+            })
         }),
-    }
+    })
+}
+
+fn split_first_page<T>(
+    values: Vec<T>,
+    max_bytes: u32,
+    measure: impl Copy + Fn(&T) -> u64,
+) -> Result<(Vec<T>, VecDeque<T>)> {
+    let mut state = CursorState {
+        pending: values.into(),
+        eof: false,
+    };
+    let first = next_page(&mut state, max_bytes, measure)?.unwrap_or_default();
+    Ok((first, state.pending))
 }
 
 fn next_page<T>(

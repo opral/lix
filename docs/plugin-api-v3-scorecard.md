@@ -86,9 +86,9 @@ water.
 
 | input | v3 p50 | v3 p95 | host unique arena | guest high water | total owned | reduction vs v2 JSON total | boundary | file bytes read |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 10,485,760 B | 780.825 µs | 1,019.114 µs | 10,485,789 B | 1,179,648 B | 11,665,437 B | 3.185× | 50 B | 1 B |
+| 10,485,760 B | 120.420 µs | 133.490 µs | 10,485,789 B | 1,179,648 B | 11,665,437 B | 3.185× | 73 B | 1 B |
 
-This control clears both architectural targets: its p95 is 5.397× faster than
+This control clears both architectural targets: its p95 is 41.202× faster than
 the 5.500 ms verified-splice v2 JSON engine control, and its total ownership is
 below the 12,386,304-byte memory ceiling. It is not the JSON acceptance row:
 the control has one synthetic entity and a tiny state page. The production
@@ -118,14 +118,14 @@ Profile-driven changes were measured independently:
 | --- | ---: | ---: | ---: | ---: | --- |
 | full durable-entity rehydrate | 417.805 ms | 16,068,062 B | 16,067,609 B | 80,633,725 B | fail |
 | 1 MiB scalar locator window | 23.479 ms | 244,397 B | 403 B | 83,066,349 B before eviction accounting | fail |
-| 64 KiB locator + immutable Merkle map pages | 1.348 ms | 16,440 B | 403 B | 7,220,338 B | pass latency/memory |
+| 64 KiB locator + immutable Merkle map pages, inline first result | 0.253 ms | 16,440 B | 403 B | 3,294,928 B | pass latency/memory |
 
-The 2,000-sample runtime row has a 1.001 ms p50 and 1.348 ms p95. Against the
-stricter 5.500 ms v2 engine control it is **4.080× faster**. A separate
-counting-allocator run (100 warmups, 200 measured samples) reported 1.022 ms
-p50 / 1.240 ms p95, 6,040,690 resident host bytes, 1,179,648 bytes of guest
+The 2,000-sample runtime row has a 0.228 ms p50 and 0.253 ms p95. Against the
+stricter 5.500 ms v2 engine control it is **21.739× faster**. A separate
+counting-allocator run (100 warmups, 200 measured samples) reported 0.276 ms
+p50 / 0.315 ms p95, 2,115,280 resident host bytes, 1,179,648 bytes of guest
 linear-memory high water, and an 82,267-byte p95 transient live-allocation
-delta. That is 7,302,605 peak owned bytes: **5.088× less** than the conservative
+delta. That is 3,377,195 peak owned bytes: **11.003× less** than the conservative
 37,158,912-byte v2 total. Logical durable content is reported separately as
 27,041,487 bytes; immutable backing is compressed while decoded pages are
 evictable.
@@ -150,7 +150,47 @@ cargo test -p lix_sdk --lib \
   --release -- --ignored --nocapture
 
 cargo test -p lix_sdk_tests --test e2e \
-  v3_json_ten_mib_affected_page_allocator_benchmark \
+    v3_json_ten_mib_affected_page_allocator_benchmark \
+  --release -- --ignored --nocapture
+```
+
+## Real CSV v3 affected-page result
+
+The CSV lane retains the production `csv_v2_table` and `csv_v2_row` schemas and
+220,001-entity granularity on the exact 10,680,000-byte / 220,000-row fixture.
+The v2 and v3 distribution runs each use 100 warmups and 2,000 samples.
+
+| implementation | p50 | p95 | guest high water | boundary |
+| --- | ---: | ---: | ---: | ---: |
+| v2 retained document | 0.906 ms | 1.187 ms | 53,018,624 B | 212 B |
+| v3 full durable-row rehydrate | 1,857.198 ms | 1,887.603 ms | 119,537,664 B | 43,240,342 B |
+| v3 affected row page | 0.453 ms | 0.537 ms | 1,179,648 B | 16,594 B |
+| v3 affected row page, counting allocator (200 samples) | 0.309 ms | 0.365 ms | 1,179,648 B | 16,594 B |
+
+The allocator-instrumented v3 p95 is **3.252× faster** than v2. Packing durable
+map values into compressed immutable semantic pages, then collecting
+unreachable transition pages before eviction, leaves 3,084,539 resident host
+bytes. Including guest high water and the 112,877-byte p95 transient
+live-allocation delta gives 4,377,064 peak owned bytes: **16.604× less** than
+the conservative 72,677,056-byte v2 total.
+
+As with JSON, CSV's hot boundary is a regression from an already-retained v2
+document (16,594 versus 212 bytes). The result passes the requested latency and
+memory gates, but not the overall boundary-materialization acceptance rule.
+
+Reproduction:
+
+```sh
+cargo test -p lix_sdk --lib \
+  csv_v2_ten_mib_warm_edit_benchmark \
+  --release -- --ignored --nocapture
+
+cargo test -p lix_sdk --lib \
+  csv_v3_ten_mib_affected_page_benchmark \
+  --release -- --ignored --nocapture
+
+cargo test -p lix_sdk_tests --test e2e \
+  v3_csv_ten_mib_affected_page_allocator_benchmark \
   --release -- --ignored --nocapture
 ```
 
@@ -173,10 +213,10 @@ Every row is an independent pass/fail gate. “Pending” is not a pass.
 
 | format | workload | v2 p95/control | required v3 p95 | conservative v2 total memory | required v3 total memory |
 | --- | --- | ---: | ---: | ---: | ---: |
-| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms; actual 1.348 ms | 37,158,912 B | ≤12,386,304 B; allocator-backed actual 7,302,605 B |
+| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms; actual 0.315 ms allocator p95 | 37,158,912 B | ≤12,386,304 B; actual 3,377,195 B |
 | JSON | 10 MiB ordinary public-SQL warm scalar edit | 8.602 ms p95 | ≤4.301 ms | 37,158,912 B | ≤12,386,304 B |
 | Markdown | `vscode-docs` one-commit replay | 9.220 s | ≤4.610 s | ≥105,643,782 B | ≤35,214,594 B |
-| CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |
+| CSV | 10.68 MiB warm row edit | 1.187 ms p95 | ≤0.594 ms; actual 0.365 ms allocator p95 | 72,677,056 B | ≤24,225,685 B; actual 4,377,064 B |
 | Excalidraw | large element/file edit | pending baseline | pending | pending baseline | pending |
 
 The final scorecard also requires cold import, warm entity edit, eviction

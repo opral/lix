@@ -1,0 +1,15 @@
+{
+  "key": "plugin_csv_v3",
+  "runtime": "wasm-component-v3",
+  "api_version": "3.0.0",
+  "materialization": "blob",
+  "match": {
+    "path_glob": "*.{csv,tsv}",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/csv_v2_table.json",
+    "schema/csv_v2_row.json"
+  ]
+}

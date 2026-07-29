@@ -134,6 +134,9 @@ struct ActiveTransition {
     eof: bool,
     seen_entity_keys: BTreeSet<Vec<u8>>,
     previous_edit_end: u64,
+    buffered_changes: Option<Vec<bindings::exports::lix::plugin::api::EntityChange>>,
+    buffered_edits: Option<Vec<bindings::exports::lix::plugin::api::ByteEdit>>,
+    has_guest_cursor: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -306,7 +309,10 @@ impl WasmtimeV3Actor {
     ) -> Result<WasmV3FileTransition, LixError> {
         let transaction = value.successor;
         let cursor_handle = self.allocate_handle()?;
-        self.cursors.insert(cursor_handle, value.changes);
+        let has_guest_cursor = value.changes.is_some();
+        if let Some(cursor) = value.changes {
+            self.cursors.insert(cursor_handle, cursor);
+        }
         let transition_handle = self.allocate_handle()?;
         self.transitions.insert(
             transition_handle,
@@ -318,6 +324,9 @@ impl WasmtimeV3Actor {
                 eof: false,
                 seen_entity_keys: BTreeSet::new(),
                 previous_edit_end: 0,
+                buffered_changes: (!value.first_changes.is_empty()).then_some(value.first_changes),
+                buffered_edits: None,
+                has_guest_cursor,
             },
         );
         Ok(WasmV3FileTransition {
@@ -333,7 +342,10 @@ impl WasmtimeV3Actor {
     ) -> Result<WasmV3EntityTransition, LixError> {
         let transaction = value.successor;
         let cursor_handle = self.allocate_handle()?;
-        self.cursors.insert(cursor_handle, value.edits);
+        let has_guest_cursor = value.edits.is_some();
+        if let Some(cursor) = value.edits {
+            self.cursors.insert(cursor_handle, cursor);
+        }
         let transition_handle = self.allocate_handle()?;
         self.transitions.insert(
             transition_handle,
@@ -345,6 +357,9 @@ impl WasmtimeV3Actor {
                 eof: false,
                 seen_entity_keys: BTreeSet::new(),
                 previous_edit_end: 0,
+                buffered_changes: None,
+                buffered_edits: (!value.first_edits.is_empty()).then_some(value.first_edits),
+                has_guest_cursor,
             },
         );
         Ok(WasmV3EntityTransition {
@@ -561,30 +576,38 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             self.transitions.insert(transition.0, active);
             return Ok(None);
         }
-        let cursor_resource = *self
-            .cursors
-            .get(&cursor.0)
-            .ok_or_else(|| v3_invalid_plugin("unknown v3 change cursor"))?;
-        self.prepare_nested_call(&active)?;
-        let guest = self.guest.clone();
-        let result = call_sync_guest(|| {
-            guest.change_cursor().call_next(
-                self.store_mut()?,
-                cursor_resource,
-                Resource::new_borrow(active.budget_rep),
-                max_bytes,
-            )
-        });
-        let page = match result {
-            Ok(Ok(page)) => page,
-            Ok(Err(error)) => {
-                let error = Self::plugin_error("v3 change-cursor.next", error);
-                self.abort_active(active)?;
-                return Err(error);
-            }
-            Err(error) => {
-                self.retire();
-                return Err(wasm_runtime_error("v3 change cursor trapped", error));
+        let page = if let Some(page) = active.buffered_changes.take() {
+            Some(page)
+        } else if !active.has_guest_cursor {
+            active.eof = true;
+            self.transitions.insert(transition.0, active);
+            return Ok(None);
+        } else {
+            let cursor_resource = *self
+                .cursors
+                .get(&cursor.0)
+                .ok_or_else(|| v3_invalid_plugin("unknown v3 change cursor"))?;
+            self.prepare_nested_call(&active)?;
+            let guest = self.guest.clone();
+            let result = call_sync_guest(|| {
+                guest.change_cursor().call_next(
+                    self.store_mut()?,
+                    cursor_resource,
+                    Resource::new_borrow(active.budget_rep),
+                    max_bytes,
+                )
+            });
+            match result {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    let error = Self::plugin_error("v3 change-cursor.next", error);
+                    self.abort_active(active)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.retire();
+                    return Err(wasm_runtime_error("v3 change cursor trapped", error));
+                }
             }
         };
         let Some(page) = page else {
@@ -646,6 +669,9 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
                 format_only: change.format_only,
             });
         }
+        if !active.has_guest_cursor {
+            active.eof = true;
+        }
         self.transitions.insert(transition.0, active);
         Ok(Some(output))
     }
@@ -661,30 +687,38 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             self.transitions.insert(transition.0, active);
             return Ok(None);
         }
-        let cursor_resource = *self
-            .cursors
-            .get(&cursor.0)
-            .ok_or_else(|| v3_invalid_plugin("unknown v3 edit cursor"))?;
-        self.prepare_nested_call(&active)?;
-        let guest = self.guest.clone();
-        let result = call_sync_guest(|| {
-            guest.edit_cursor().call_next(
-                self.store_mut()?,
-                cursor_resource,
-                Resource::new_borrow(active.budget_rep),
-                max_bytes,
-            )
-        });
-        let page = match result {
-            Ok(Ok(page)) => page,
-            Ok(Err(error)) => {
-                let error = Self::plugin_error("v3 edit-cursor.next", error);
-                self.abort_active(active)?;
-                return Err(error);
-            }
-            Err(error) => {
-                self.retire();
-                return Err(wasm_runtime_error("v3 edit cursor trapped", error));
+        let page = if let Some(page) = active.buffered_edits.take() {
+            Some(page)
+        } else if !active.has_guest_cursor {
+            active.eof = true;
+            self.transitions.insert(transition.0, active);
+            return Ok(None);
+        } else {
+            let cursor_resource = *self
+                .cursors
+                .get(&cursor.0)
+                .ok_or_else(|| v3_invalid_plugin("unknown v3 edit cursor"))?;
+            self.prepare_nested_call(&active)?;
+            let guest = self.guest.clone();
+            let result = call_sync_guest(|| {
+                guest.edit_cursor().call_next(
+                    self.store_mut()?,
+                    cursor_resource,
+                    Resource::new_borrow(active.budget_rep),
+                    max_bytes,
+                )
+            });
+            match result {
+                Ok(Ok(page)) => page,
+                Ok(Err(error)) => {
+                    let error = Self::plugin_error("v3 edit-cursor.next", error);
+                    self.abort_active(active)?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    self.retire();
+                    return Err(wasm_runtime_error("v3 edit cursor trapped", error));
+                }
             }
         };
         let Some(page) = page else {
@@ -742,6 +776,9 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
                 delete_len: edit.delete_len,
                 insert: edit.insert,
             });
+        }
+        if !active.has_guest_cursor {
+            active.eof = true;
         }
         self.transitions.insert(transition.0, active);
         Ok(Some(output))
@@ -950,11 +987,12 @@ fn entity_change_bytes(
     Ok(bytes)
 }
 
-fn call_sync_guest<T: Send>(call: impl FnOnce() -> T + Send) -> T {
-    std::thread::scope(|scope| match scope.spawn(call).join() {
-        Ok(value) => value,
-        Err(panic) => std::panic::resume_unwind(panic),
-    })
+fn call_sync_guest<T>(call: impl FnOnce() -> T) -> T {
+    // API v3 components import only the arena interface and cannot invoke
+    // WASI's blocking adapter. Calling them directly avoids one OS-thread
+    // spawn per boundary while the v2 compatibility runtime retains its
+    // broader WASI-safe trampoline.
+    call()
 }
 
 fn v3_invalid_plugin(message: impl Into<String>) -> LixError {
@@ -1926,6 +1964,7 @@ mod tests {
             actor.finish_transition(opened.transition).await.unwrap();
         assert_eq!(cold_change_count, 39_871);
         drop(actor);
+        store.retain_reachable(&accepted);
         store.evict_resident_pages();
         let mut actor = factory
             .instantiate_actor()
@@ -2017,6 +2056,169 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[ignore = "manual release-mode CSV v3 affected-page scorecard"]
+    async fn csv_v3_ten_mib_affected_page_benchmark() {
+        const WARMUPS: usize = 100;
+        const SAMPLES: usize = 2_000;
+        const ROWS: usize = 220_000;
+        const V2_CSV_TOTAL_BYTES: usize = 72_677_056;
+
+        let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_plugin_csv_v3");
+        let wasm = std::fs::read(wasm_path).expect("CSV v3 component should be readable");
+        let runtime = WasmtimePluginRuntime::new().expect("Wasmtime runtime should initialize");
+        let factory = runtime
+            .compile_component_v3(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 128 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(120_000),
+                },
+            )
+            .await
+            .expect("CSV v3 should compile");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("CSV v3 should instantiate");
+        let bytes = csv_ten_mib_fixture();
+        let edit_offset = 110_000usize * 49 + 16;
+        assert_eq!(bytes[edit_offset], b'1');
+        let store = ArenaStore::default();
+        let imported = Root::import(
+            store.clone(),
+            "csv-v3-generation",
+            &bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let descriptor = WasmV3FileDescriptor {
+            path: Some("/ten-mib.csv".to_owned()),
+            media_type: Some("text/csv".to_owned()),
+            plugin_key: "plugin_csv_v3".to_owned(),
+            generation: "csv-v3-generation".to_owned(),
+        };
+        let limits = WasmV3TransitionLimits {
+            max_page_bytes: 1024 * 1024,
+            max_pages: 2_048,
+            max_total_bytes: 256 * 1024 * 1024,
+            deadline_nanoseconds: 120_000_000_000,
+        };
+        let opened = actor
+            .open_file(
+                limits,
+                WasmV3OpenFileInput {
+                    descriptor: descriptor.clone(),
+                    accepted: imported.clone(),
+                    successor: imported.transaction(),
+                    creates: creates(),
+                },
+            )
+            .await
+            .expect("cold import CSV v3");
+        let mut cold_changes = 0usize;
+        while let Some(page) = actor
+            .next_change_page(opened.transition, opened.changes, 1024 * 1024)
+            .await
+            .expect("drain cold CSV changes")
+        {
+            cold_changes += page.len();
+        }
+        assert_eq!(cold_changes, ROWS + 1);
+        let (mut accepted, cold_counters) = actor
+            .finish_transition(opened.transition)
+            .await
+            .expect("commit cold CSV import");
+        drop(actor);
+        store.retain_reachable(&accepted);
+        store.evict_resident_pages();
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("cold instantiate CSV v3 after eviction");
+
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut replacement = b'x';
+        let mut last_counters = WasmV3TransitionCounters::default();
+        for sample in 0..WARMUPS + SAMPLES {
+            let mut transaction = accepted.transaction();
+            transaction.edit_bytes(ByteEdit {
+                offset: edit_offset as u64,
+                delete_len: 1,
+                insert: vec![replacement],
+            });
+            let started = Instant::now();
+            let updated = actor
+                .file_changed(
+                    limits,
+                    WasmV3FileUpdate {
+                        before_descriptor: descriptor.clone(),
+                        after_descriptor: descriptor.clone(),
+                        before: accepted.clone(),
+                        edits: vec![WasmV3InputSplice {
+                            offset: edit_offset as u64,
+                            delete_len: 1,
+                            insert: WasmV3InputBytes::Inline(vec![replacement]),
+                        }],
+                        successor: transaction,
+                        creates: creates(),
+                    },
+                )
+                .await
+                .expect("run CSV v3 edit");
+            let mut changes = 0usize;
+            while let Some(page) = actor
+                .next_change_page(updated.transition, updated.changes, 1024 * 1024)
+                .await
+                .expect("drain warm CSV changes")
+            {
+                changes += page.len();
+            }
+            assert_eq!(changes, 1);
+            (accepted, last_counters) = actor
+                .finish_transition(updated.transition)
+                .await
+                .expect("commit warm CSV successor");
+            if sample >= WARMUPS {
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            replacement = if replacement == b'x' { b'y' } else { b'x' };
+        }
+        samples.sort_unstable();
+        let p50_ns = percentile(&samples, 50);
+        let p95_ns = percentile(&samples, 95);
+        let total_owned_bytes = store
+            .resident_page_bytes()
+            .saturating_add(last_counters.guest_linear_memory_high_water_bytes as usize);
+        eprintln!(
+            "csv_v3_affected_page bytes={} rows={ROWS} warmups={WARMUPS} samples={SAMPLES} \
+             p50_ms={:.3} p95_ms={:.3} host_resident_bytes={} host_logical_durable_bytes={} \
+             guest_high_water_bytes={} total_owned_bytes={} memory_reduction_vs_v2={:.3} \
+             boundary_bytes={} entity_page_reads={} entity_page_bytes={} cold_boundary_bytes={}",
+            bytes.len(),
+            p50_ns as f64 / 1_000_000.0,
+            p95_ns as f64 / 1_000_000.0,
+            store.resident_page_bytes(),
+            store.unique_page_bytes(),
+            last_counters.guest_linear_memory_high_water_bytes,
+            total_owned_bytes,
+            V2_CSV_TOTAL_BYTES as f64 / total_owned_bytes as f64,
+            last_counters.component_boundary_bytes,
+            last_counters.entity_page_reads,
+            last_counters.entity_page_bytes,
+            cold_counters.component_boundary_bytes,
+        );
+        assert!(matches!(
+            accepted
+                .bytes
+                .read(edit_offset as u64, 1)
+                .unwrap()
+                .as_slice(),
+            [b'x'] | [b'y']
+        ));
+    }
+
     fn percentile(samples: &[u64], percentile: usize) -> u64 {
         let rank = (samples.len() * percentile).div_ceil(100);
         samples[rank.saturating_sub(1)]
@@ -2057,6 +2259,18 @@ mod tests {
         bytes.push(b'}');
         assert_eq!(bytes.len(), TARGET_BYTES);
         (bytes, edit_offset.unwrap())
+    }
+
+    fn csv_ten_mib_fixture() -> Vec<u8> {
+        const ROWS: usize = 220_000;
+        const LONG: &[u8] = b"000000000000000,1111111111,2222222222,3333333333\n";
+        const SHORT: &[u8] = b"00000000000000,1111111111,2222222222,3333333333\n";
+        let mut bytes = Vec::with_capacity(10_680_000);
+        for index in 0..ROWS {
+            bytes.extend_from_slice(if index < 120_000 { LONG } else { SHORT });
+        }
+        assert_eq!(bytes.len(), 10_680_000);
+        bytes
     }
 
     fn splitmix64(mut state: u64) -> u64 {

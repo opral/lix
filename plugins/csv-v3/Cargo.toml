@@ -1,0 +1,23 @@
+[package]
+name = "plugin_csv_v3"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "CSV plugin for the host-owned Lix Wasm Component v3 arena API"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lix_plugin_api_v3 = { workspace = true }
+plugin_csv_core = { path = "../csv-core", version = "0.8.4" }

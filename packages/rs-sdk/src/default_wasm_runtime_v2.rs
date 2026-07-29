@@ -3170,6 +3170,146 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "large-file CSV v2 warm-edit latency scorecard"]
+    async fn csv_v2_ten_mib_warm_edit_benchmark() {
+        const WARMUPS: usize = 100;
+        const SAMPLES: usize = 2_000;
+        let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2");
+        let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
+        let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
+        let factory = runtime
+            .compile_component_v2(wasm, WasmLimits::default())
+            .await
+            .expect("CSV v2 component should compile");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("CSV v2 actor should instantiate");
+        let limits = WasmTransitionLimits {
+            total_deadline_nanoseconds: 120_000_000_000,
+            ..WasmTransitionLimits::default()
+        };
+        let before = Arc::new(large_csv_bytes());
+        let opened = actor
+            .open_file(
+                limits,
+                WasmOpenFileInput {
+                    descriptor: memory_probe_descriptor(),
+                    file: Arc::new(TestByteSource(before.clone())),
+                    creates: WasmCreateContext {
+                        high: 0x4c49_5832,
+                        low: 0,
+                    },
+                },
+            )
+            .await
+            .expect("open CSV v2 benchmark base");
+        while actor
+            .next_change_page(opened.transition, opened.changes, limits.max_page_bytes)
+            .await
+            .expect("drain CSV v2 cold changes")
+            .is_some()
+        {}
+        let cold_counters = actor
+            .finish_transition(opened.transition)
+            .await
+            .expect("finish CSV v2 cold import");
+        let base_document = opened.document;
+        let edited_offset = 110_000usize * 49 + 16;
+        let mut after_x = before.as_ref().clone();
+        after_x[edited_offset] = b'x';
+        let mut after_y = before.as_ref().clone();
+        after_y[edited_offset] = b'y';
+        let after_x = Arc::new(after_x);
+        let after_y = Arc::new(after_y);
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut last_counters = WasmTransitionCounters::default();
+        for sample in 0..WARMUPS + SAMPLES {
+            let replacement = if sample % 2 == 0 { b'x' } else { b'y' };
+            let after = if replacement == b'x' {
+                after_x.clone()
+            } else {
+                after_y.clone()
+            };
+            let detection_base = actor
+                .fork_document(base_document)
+                .await
+                .expect("fork CSV v2 benchmark base");
+            let started = Instant::now();
+            let transition = actor
+                .file_changed(
+                    detection_base,
+                    limits,
+                    WasmFileUpdate {
+                        before_descriptor: memory_probe_descriptor(),
+                        after_descriptor: memory_probe_descriptor(),
+                        before: Arc::new(TestByteSource(before.clone())),
+                        edits: vec![lix_engine::wasm::v2::WasmInputSplice {
+                            offset: edited_offset as u64,
+                            delete_len: 1,
+                            insert: WasmInputBytes::Inline(vec![replacement]),
+                        }],
+                        after: Arc::new(TestByteSource(after)),
+                        creates: WasmCreateContext {
+                            high: 0x4c49_5832,
+                            low: 1,
+                        },
+                    },
+                )
+                .await
+                .expect("run CSV v2 warm edit");
+            let mut changes = 0usize;
+            while let Some(page) = actor
+                .next_change_page(
+                    transition.transition,
+                    transition.changes,
+                    limits.max_page_bytes,
+                )
+                .await
+                .expect("drain CSV v2 warm changes")
+            {
+                changes += page.changes.entity_change_count();
+            }
+            assert_eq!(changes, 1);
+            last_counters = actor
+                .finish_transition(transition.transition)
+                .await
+                .expect("finish CSV v2 warm edit");
+            if sample >= WARMUPS {
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            actor
+                .drop_document(transition.document)
+                .await
+                .expect("drop CSV v2 warm successor");
+            actor
+                .drop_document(detection_base)
+                .await
+                .expect("drop CSV v2 benchmark fork");
+        }
+        samples.sort_unstable();
+        let percentile = |value: usize| {
+            let rank = (samples.len() * value).div_ceil(100);
+            samples[rank.saturating_sub(1)]
+        };
+        eprintln!(
+            "csv_v2_warm_edit bytes={} rows={LARGE_CSV_ROWS} warmups={WARMUPS} samples={SAMPLES} \
+             p50_ms={:.3} p95_ms={:.3} guest_high_water_bytes={} boundary_bytes={} \
+             cold_guest_high_water_bytes={}",
+            before.len(),
+            percentile(50) as f64 / 1_000_000.0,
+            percentile(95) as f64 / 1_000_000.0,
+            last_counters.guest_linear_memory_high_water_bytes,
+            last_counters.component_boundary_bytes,
+            cold_counters.guest_linear_memory_high_water_bytes,
+        );
+        actor
+            .drop_document(base_document)
+            .await
+            .expect("drop CSV v2 benchmark base");
+    }
+
+    #[tokio::test]
     #[ignore = "large-file acceptance gate"]
     async fn csv_v2_cold_open_and_warm_edit_retain_64_mib_efficiency_invariant() {
         let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {

@@ -2099,6 +2099,7 @@ async fn v3_json_ten_mib_affected_page_allocator_benchmark() {
         .await
         .expect("commit cold JSON v3 import");
     drop(actor);
+    store.retain_reachable(&accepted);
     store.evict_resident_pages();
     let mut actor = factory
         .instantiate_actor()
@@ -2184,6 +2185,170 @@ async fn v3_json_ten_mib_affected_page_allocator_benchmark() {
     assert!(
         peak_owned <= V3_TARGET_BYTES,
         "JSON v3 must clear 3x memory including transient allocations"
+    );
+}
+
+#[tokio::test]
+#[ignore = "10.68 MiB v3 CSV allocator and resident-memory benchmark"]
+async fn v3_csv_ten_mib_affected_page_allocator_benchmark() {
+    const WARMUPS: usize = 100;
+    const SAMPLES: usize = 200;
+    const V2_CONSERVATIVE_TOTAL_BYTES: u64 = 72_677_056;
+    const V3_TARGET_BYTES: u64 = V2_CONSERVATIVE_TOTAL_BYTES / 3;
+
+    let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_plugin_csv_v3");
+    let wasm = std::fs::read(wasm_path).expect("read CSV v3 component");
+    let runtime = lix_sdk::default_wasm_runtime().expect("initialize default Wasmtime runtime");
+    let factory = runtime
+        .compile_component_v3(
+            wasm,
+            WasmLimits {
+                max_memory_bytes: 128 * 1024 * 1024,
+                max_fuel: None,
+                timeout_ms: Some(120_000),
+            },
+        )
+        .await
+        .expect("compile CSV v3 component");
+    let mut actor = factory
+        .instantiate_actor()
+        .await
+        .expect("instantiate CSV v3");
+    let bytes = csv_ten_mib_fixture();
+    let edit_offset = 110_000usize * 49 + 16;
+    let store = V3Store::default();
+    let imported = V3Root::import(
+        store.clone(),
+        "csv-v3-generation",
+        &bytes,
+        std::iter::empty(),
+        std::iter::empty(),
+    );
+    let descriptor = WasmV3FileDescriptor {
+        path: Some("/ten-mib.csv".to_owned()),
+        media_type: Some("text/csv".to_owned()),
+        plugin_key: "plugin_csv_v3".to_owned(),
+        generation: "csv-v3-generation".to_owned(),
+    };
+    let limits = WasmV3TransitionLimits {
+        max_page_bytes: 1024 * 1024,
+        max_pages: 2_048,
+        max_total_bytes: 256 * 1024 * 1024,
+        deadline_nanoseconds: 120_000_000_000,
+    };
+    let creates = WasmV3CreateContext {
+        high: 0x1234_5678_9abc_def0,
+        low: 0x0fed_cba9_8765_4321,
+    };
+    let opened = actor
+        .open_file(
+            limits,
+            WasmV3OpenFileInput {
+                descriptor: descriptor.clone(),
+                accepted: imported.clone(),
+                successor: imported.transaction(),
+                creates,
+            },
+        )
+        .await
+        .expect("cold import CSV v3");
+    while actor
+        .next_change_page(opened.transition, opened.changes, 1024 * 1024)
+        .await
+        .expect("drain cold CSV changes")
+        .is_some()
+    {}
+    let (mut accepted, _) = actor
+        .finish_transition(opened.transition)
+        .await
+        .expect("commit cold CSV import");
+    drop(actor);
+    store.retain_reachable(&accepted);
+    store.evict_resident_pages();
+    let mut actor = factory
+        .instantiate_actor()
+        .await
+        .expect("cold instantiate CSV v3 after eviction");
+
+    let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+    let mut peak_live_deltas = Vec::with_capacity(SAMPLES);
+    let mut replacement = b'x';
+    let mut last_counters = WasmV3TransitionCounters::default();
+    for sample in 0..WARMUPS + SAMPLES {
+        let mut transaction = accepted.transaction();
+        transaction.edit_bytes(V3ByteEdit {
+            offset: edit_offset as u64,
+            delete_len: 1,
+            insert: vec![replacement],
+        });
+        let allocation_scope = (sample >= WARMUPS).then(AllocationScope::start);
+        let started = Instant::now();
+        let updated = actor
+            .file_changed(
+                limits,
+                WasmV3FileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor.clone(),
+                    before: accepted.clone(),
+                    edits: vec![WasmV3InputSplice {
+                        offset: edit_offset as u64,
+                        delete_len: 1,
+                        insert: WasmV3InputBytes::Inline(vec![replacement]),
+                    }],
+                    successor: transaction,
+                    creates,
+                },
+            )
+            .await
+            .expect("run affected-page CSV edit");
+        let mut changes = 0usize;
+        while let Some(page) = actor
+            .next_change_page(updated.transition, updated.changes, 1024 * 1024)
+            .await
+            .expect("drain affected CSV changes")
+        {
+            changes += page.len();
+        }
+        assert_eq!(changes, 1);
+        (accepted, last_counters) = actor
+            .finish_transition(updated.transition)
+            .await
+            .expect("commit affected CSV successor");
+        let elapsed = started.elapsed();
+        if let Some(scope) = allocation_scope {
+            let allocations = scope.finish();
+            elapsed_ns.push(elapsed.as_nanos() as u64);
+            peak_live_deltas.push(allocations.peak_live_bytes_delta);
+        }
+        replacement = if replacement == b'x' { b'y' } else { b'x' };
+    }
+    elapsed_ns.sort_unstable();
+    peak_live_deltas.sort_unstable();
+    let p95_index = (SAMPLES * 95).div_ceil(100) - 1;
+    let p50_ns = elapsed_ns[SAMPLES / 2];
+    let p95_ns = elapsed_ns[p95_index];
+    let p95_peak_live_delta = peak_live_deltas[p95_index];
+    let resident_owned =
+        store.resident_page_bytes() as u64 + last_counters.guest_linear_memory_high_water_bytes;
+    let peak_owned = resident_owned + p95_peak_live_delta;
+    eprintln!(
+        "csv_v3_allocator bytes={} warmups={WARMUPS} samples={SAMPLES} p50_ms={:.3} \
+         p95_ms={:.3} host_resident_bytes={} guest_high_water_bytes={} \
+         p95_transient_live_bytes={} peak_owned_bytes={} reduction_vs_v2={:.3} boundary_bytes={}",
+        bytes.len(),
+        p50_ns as f64 / 1_000_000.0,
+        p95_ns as f64 / 1_000_000.0,
+        store.resident_page_bytes(),
+        last_counters.guest_linear_memory_high_water_bytes,
+        p95_peak_live_delta,
+        peak_owned,
+        V2_CONSERVATIVE_TOTAL_BYTES as f64 / peak_owned as f64,
+        last_counters.component_boundary_bytes,
+    );
+    assert!(p95_ns <= 594_000, "CSV v3 must clear 2x latency");
+    assert!(
+        peak_owned <= V3_TARGET_BYTES,
+        "CSV v3 must clear 3x memory including transient allocations"
     );
 }
 

@@ -158,7 +158,7 @@ struct StoredPage {
 
 #[cfg(not(target_family = "wasm"))]
 fn compress_page(bytes: &[u8]) -> Vec<u8> {
-    zstd::bulk::compress(bytes, 1).expect("compressing an in-memory arena page cannot fail")
+    zstd::bulk::compress(bytes, 3).expect("compressing an in-memory arena page cannot fail")
 }
 
 #[cfg(target_family = "wasm")]
@@ -241,6 +241,21 @@ impl Store {
         }
     }
 
+    /// Removes content pages unreachable from the retained immutable root.
+    /// Production storage performs the same operation through durable
+    /// reachability/GC rather than retaining superseded transition pages.
+    pub fn retain_reachable(&self, root: &Root) {
+        let mut reachable = std::collections::HashSet::new();
+        collect_page_ids(&root.bytes, &mut reachable);
+        for (_, value) in root.entities.iter().chain(root.state.iter()) {
+            collect_page_ids(value, &mut reachable);
+        }
+        self.inner
+            .pages
+            .lock()
+            .retain(|id, _| reachable.contains(id));
+    }
+
     fn intern(&self, bytes: &[u8]) -> Digest {
         let id = digest(b"lix-plugin-v3/page\0", [bytes]);
         let mut pages = self.inner.pages.lock();
@@ -261,6 +276,14 @@ impl Store {
     }
 
     fn read_page(&self, id: Digest, range: Range<usize>) -> Result<Vec<u8>, Error> {
+        let output = self.read_page_untracked(id, range)?;
+        let mut metrics = self.inner.metrics.lock();
+        metrics.page_reads = metrics.page_reads.saturating_add(1);
+        metrics.page_bytes_read = metrics.page_bytes_read.saturating_add(output.len() as u64);
+        Ok(output)
+    }
+
+    fn read_page_untracked(&self, id: Digest, range: Range<usize>) -> Result<Vec<u8>, Error> {
         let mut pages = self.inner.pages.lock();
         let page = pages.get_mut(&id).ok_or(Error::MissingPage(id))?;
         if page.resident.is_none() {
@@ -274,10 +297,6 @@ impl Store {
             .get(range)
             .ok_or(Error::InvalidPageRange)?;
         let output = selected.to_vec();
-        drop(pages);
-        let mut metrics = self.inner.metrics.lock();
-        metrics.page_reads = metrics.page_reads.saturating_add(1);
-        metrics.page_bytes_read = metrics.page_bytes_read.saturating_add(output.len() as u64);
         Ok(output)
     }
 
@@ -397,6 +416,19 @@ impl ByteArena {
                 break;
             }
             logical = segment_end;
+        }
+        Ok(output)
+    }
+
+    fn materialize_untracked(&self) -> Result<Vec<u8>, Error> {
+        let mut output =
+            Vec::with_capacity(usize::try_from(self.len).map_err(|_| Error::RangeOverflow)?);
+        for segment in self.segments.iter() {
+            output.extend_from_slice(&self.store.read_page_untracked(
+                segment.page,
+                usize::try_from(segment.offset).expect("u32 fits usize")
+                    ..usize::try_from(segment.offset + segment.len).expect("u32 fits usize"),
+            )?);
         }
         Ok(output)
     }
@@ -554,6 +586,7 @@ impl MapArena {
     }
 
     fn from_entries(store: Store, entries: BTreeMap<Vec<u8>, ByteArena>) -> Self {
+        let entries = pack_map_values(&store, entries);
         let len = entries.len();
         let pages = entries
             .into_iter()
@@ -727,6 +760,65 @@ impl MapArena {
         }
         Ok(arena)
     }
+}
+
+fn pack_map_values(
+    store: &Store,
+    entries: BTreeMap<Vec<u8>, ByteArena>,
+) -> BTreeMap<Vec<u8>, ByteArena> {
+    let mut output = BTreeMap::new();
+    let mut pending = Vec::<(Vec<u8>, ByteArena, Vec<u8>)>::new();
+    let mut pending_bytes = 0usize;
+
+    let flush = |pending: &mut Vec<(Vec<u8>, ByteArena, Vec<u8>)>,
+                 output: &mut BTreeMap<Vec<u8>, ByteArena>| {
+        if pending.is_empty() {
+            return;
+        }
+        let mut packed = Vec::with_capacity(pending.iter().map(|(_, _, bytes)| bytes.len()).sum());
+        for (_, _, bytes) in pending.iter() {
+            packed.extend_from_slice(bytes);
+        }
+        let page = store.intern(&packed);
+        let mut offset = 0u32;
+        for (key, original, bytes) in pending.drain(..) {
+            let len = u32::try_from(bytes.len()).expect("packed map value page fits u32");
+            output.insert(
+                key,
+                ByteArena {
+                    store: store.clone(),
+                    len: u64::from(len),
+                    segments: Arc::from([Segment { page, offset, len }]),
+                    id: original.id,
+                },
+            );
+            offset += len;
+        }
+    };
+
+    for (key, value) in entries {
+        let bytes = value
+            .materialize_untracked()
+            .expect("newly constructed map values are readable");
+        if bytes.len() > store.page_bytes() {
+            flush(&mut pending, &mut output);
+            pending_bytes = 0;
+            output.insert(key, value);
+            continue;
+        }
+        if pending_bytes + bytes.len() > store.page_bytes() {
+            flush(&mut pending, &mut output);
+            pending_bytes = 0;
+        }
+        pending_bytes += bytes.len();
+        pending.push((key, value, bytes));
+    }
+    flush(&mut pending, &mut output);
+    output
+}
+
+fn collect_page_ids(arena: &ByteArena, output: &mut std::collections::HashSet<Digest>) {
+    output.extend(arena.segments.iter().map(|segment| segment.page));
 }
 
 #[derive(Debug, Clone)]
@@ -916,11 +1008,12 @@ impl ByteArena {
     }
 
     fn reopen(store: Store, archived: &ArchivedByteArena) -> Result<Self, Error> {
-        let arena = Self::from_segments(store, archived.len, archived.segments.clone());
-        if arena.id != archived.id {
-            return Err(Error::CorruptArchive);
-        }
-        Ok(arena)
+        Ok(Self {
+            store,
+            len: archived.len,
+            segments: archived.segments.clone().into(),
+            id: archived.id,
+        })
     }
 }
 
