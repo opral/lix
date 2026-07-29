@@ -64,6 +64,8 @@ const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
 const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
 const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+const WRITE_PIPELINE_MAX_PENDING_ENTRIES: usize = 1024 * 1024;
+const WRITE_PIPELINE_MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
 const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
 const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LOCAL_SST_CONTENT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -662,8 +664,11 @@ struct WritePipelineState {
     draining: bool,
     visible: VecDeque<Arc<PublishedWrite>>,
     active_views: BTreeMap<(u64, u64), usize>,
+    snapshot_fetches: usize,
     newest_snapshot_sequence: u64,
     next_publication_id: u64,
+    pending_entries: usize,
+    pending_bytes: usize,
     terminal_error: Option<StorageError>,
     latest_snapshot: Option<Arc<DbSnapshot>>,
 }
@@ -673,6 +678,7 @@ struct QueuedWrite {
     published: Arc<PublishedWrite>,
     completion: Arc<WriteCompletion>,
     await_durable: bool,
+    weight_bytes: usize,
 }
 
 struct PublishedWrite {
@@ -686,6 +692,11 @@ struct PublicationView {
     worker: Option<SlateDBWorker>,
     snapshot_sequence: u64,
     publication_id: u64,
+}
+
+struct SnapshotFetch {
+    pipeline: WritePipeline,
+    worker: SlateDBWorker,
 }
 
 struct WriteCompletion {
@@ -758,17 +769,28 @@ impl WritePipeline {
         error.map_or(Ok(()), Err)
     }
 
-    async fn snapshot(&self, worker: &SlateDBWorker) -> Result<Arc<DbSnapshot>, StorageError> {
+    async fn snapshot(
+        &self,
+        worker: &SlateDBWorker,
+    ) -> Result<(Arc<DbSnapshot>, Option<SnapshotFetch>), StorageError> {
         let publication_id = {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(snapshot) = state.latest_snapshot.clone() {
                 worker.check_open_fast()?;
-                return Ok(snapshot);
+                return Ok((snapshot, None));
             }
+            state.snapshot_fetches = state
+                .snapshot_fetches
+                .checked_add(1)
+                .expect("SlateDB snapshot fetch overflow");
             state.next_publication_id
+        };
+        let fetch = SnapshotFetch {
+            pipeline: self.clone(),
+            worker: worker.clone(),
         };
         let snapshot = worker
             .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
@@ -790,7 +812,7 @@ impl WritePipeline {
         } else {
             worker.check_open_fast()?;
         }
-        Ok(snapshot)
+        Ok((snapshot, Some(fetch)))
     }
 
     fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
@@ -913,6 +935,24 @@ impl Drop for PublicationView {
     }
 }
 
+impl Drop for SnapshotFetch {
+    fn drop(&mut self) {
+        let mut state = self
+            .pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.snapshot_fetches = state
+            .snapshot_fetches
+            .checked_sub(1)
+            .expect("SlateDB snapshot fetches should be balanced");
+        let newest_snapshot_sequence = state.newest_snapshot_sequence;
+        let retired = cleanup_publications(&mut state, newest_snapshot_sequence);
+        drop(state);
+        self.worker.defer_publication_drop(retired);
+    }
+}
+
 fn publication_visible_to_view(
     write: &PublishedWrite,
     snapshot_sequence: u64,
@@ -930,7 +970,8 @@ fn cleanup_publications(
     let mut retired = Vec::new();
     while state.visible.front().is_some_and(|write| {
         let persisted = write.persisted_sequence.load(Ordering::Acquire);
-        persisted != PENDING_WRITE_SEQUENCE
+        state.snapshot_fetches == 0
+            && persisted != PENDING_WRITE_SEQUENCE
             && persisted <= newest_snapshot_sequence
             && !state
                 .active_views
@@ -957,6 +998,11 @@ fn snapshot_covers_persisted_publications(
         let persisted = write.persisted_sequence.load(Ordering::Acquire);
         persisted != PENDING_WRITE_SEQUENCE && persisted <= snapshot_sequence
     })
+}
+
+fn write_pipeline_should_backpressure(pending_entries: usize, pending_bytes: usize) -> bool {
+    pending_entries >= WRITE_PIPELINE_MAX_PENDING_ENTRIES
+        || pending_bytes >= WRITE_PIPELINE_MAX_PENDING_BYTES
 }
 
 impl SnapshotPointCache {
@@ -1327,7 +1373,7 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
             self.write_pipeline.terminal_error()?;
-            let snapshot = self.write_pipeline.snapshot(&self.worker).await?;
+            let (snapshot, snapshot_fetch) = self.write_pipeline.snapshot(&self.worker).await?;
             self.point_cache.observe_snapshot(snapshot.seq());
             let publication_view = if opts.durability == ReadDurability::Visible {
                 Some(
@@ -1337,6 +1383,7 @@ impl Storage for SlateDB {
             } else {
                 None
             };
+            drop(snapshot_fetch);
             self.write_pipeline.terminal_error()?;
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
@@ -1994,9 +2041,18 @@ impl StorageWrite for SlateDBWrite {
 
             worker.check_open()?;
             write_pipeline.terminal_error()?;
+            let overlay_entries = overlay.len();
+            let overlay_bytes = overlay
+                .iter()
+                .map(|(key, value)| {
+                    key.0
+                        .len()
+                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
+                })
+                .sum::<usize>();
             let overlay = Arc::new(overlay);
             let completion = Arc::new(WriteCompletion::new());
-            let start_drainer = {
+            let (start_drainer, apply_backpressure) = {
                 let mut state = write_pipeline
                     .state
                     .lock()
@@ -2019,27 +2075,39 @@ impl StorageWrite for SlateDBWrite {
                 });
                 state.tail = Some(Arc::clone(&completion));
                 state.visible.push_back(Arc::clone(&published));
+                state.pending_entries = state.pending_entries.saturating_add(overlay_entries);
+                state.pending_bytes = state.pending_bytes.saturating_add(overlay_bytes);
                 state.queued.push_back(QueuedWrite {
                     overlay,
                     published,
                     completion: Arc::clone(&completion),
                     await_durable,
+                    weight_bytes: overlay_bytes,
                 });
                 let start_drainer = !state.draining;
                 state.draining = true;
-                start_drainer
+                let apply_backpressure =
+                    write_pipeline_should_backpressure(state.pending_entries, state.pending_bytes);
+                (start_drainer, apply_backpressure)
             };
 
-            drop(writer_permit);
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
-                worker.spawn(move |db| drain_write_queue(db, task_pipeline, point_cache));
+                let publication_reclaimer = worker.publication_reclaimer();
+                worker.spawn(move |db| {
+                    drain_write_queue(db, task_pipeline, point_cache, publication_reclaimer)
+                });
             }
 
             // The writer gate protects precondition evaluation plus publication
             // into the ordered adapter pipeline. Once published, later writers
-            // observe this overlay without waiting for SlateDB's task rendezvous.
-            if await_durable {
+            // observe this overlay without waiting for SlateDB's task rendezvous,
+            // except at the high-water mark where the gate bounds queued memory.
+            if apply_backpressure {
+                completion.wait().await?;
+            }
+            drop(writer_permit);
+            if await_durable && !apply_backpressure {
                 completion.wait().await?;
             }
             Ok(CommitResult {
@@ -2054,7 +2122,12 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
-async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: SnapshotPointCache) {
+async fn drain_write_queue(
+    db: Arc<Db>,
+    pipeline: WritePipeline,
+    point_cache: SnapshotPointCache,
+    publication_reclaimer: PublicationReclaimer,
+) {
     loop {
         let writes = {
             let mut state = pipeline
@@ -2115,6 +2188,35 @@ async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: Sn
                     .store(*sequence, Ordering::Release);
             }
         }
+        let completed_entries = writes
+            .iter()
+            .map(|write| write.overlay.len())
+            .sum::<usize>();
+        let completed_bytes = writes.iter().map(|write| write.weight_bytes).sum::<usize>();
+        let retired = {
+            let mut state = pipeline
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pending_entries = state
+                .pending_entries
+                .checked_sub(completed_entries)
+                .expect("SlateDB pending write entries should be balanced");
+            state.pending_bytes = state
+                .pending_bytes
+                .checked_sub(completed_bytes)
+                .expect("SlateDB pending write bytes should be balanced");
+            if let Ok(sequence) = &result {
+                // A completed write is covered by every future SlateDB
+                // snapshot. Retain its publication only while an already
+                // active older view still needs the overlay.
+                state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(*sequence);
+                cleanup_publications(&mut state, *sequence)
+            } else {
+                Vec::new()
+            }
+        };
+        publication_reclaimer.defer(retired);
         for write in writes {
             if let Ok(sequence) = &result {
                 write.completion.complete(Ok(*sequence));
@@ -3229,6 +3331,22 @@ mod tests {
     }
 
     #[test]
+    fn bulk_write_pipeline_applies_entry_and_byte_backpressure() {
+        assert!(!write_pipeline_should_backpressure(
+            WRITE_PIPELINE_MAX_PENDING_ENTRIES - 1,
+            WRITE_PIPELINE_MAX_PENDING_BYTES - 1,
+        ));
+        assert!(write_pipeline_should_backpressure(
+            WRITE_PIPELINE_MAX_PENDING_ENTRIES,
+            0,
+        ));
+        assert!(write_pipeline_should_backpressure(
+            0,
+            WRITE_PIPELINE_MAX_PENDING_BYTES,
+        ));
+    }
+
+    #[test]
     fn opens_fresh_local_versioned_storage() {
         let directory = tempfile::tempdir().expect("create fresh local storage directory");
         let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
@@ -3236,7 +3354,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_reclaims_persisted_publications_before_the_next_read() {
+    fn completed_write_reclaims_publication_without_a_read_or_flush() {
         let storage = SlateDB::open_object_store_with_options(
             "test-flush-reclaims-publications",
             Arc::new(InMemory::new()),
@@ -3258,7 +3376,8 @@ mod tests {
         ))
         .expect("stage publication");
         block_on(write.commit()).expect("commit publication");
-        block_on(storage.flush()).expect("flush and reclaim publication");
+        block_on(storage.write_pipeline.wait_for_visible()).expect("wait for publication");
+        block_on(storage.worker.wait_for_reclamation()).expect("wait for publication reclamation");
 
         let state = storage
             .write_pipeline
@@ -4258,6 +4377,8 @@ mod tests {
         {
             let mut state = pipeline.state.lock().expect("lock publication state");
             state.next_publication_id = 1;
+            state.newest_snapshot_sequence = 2;
+            state.snapshot_fetches = 1;
             state.visible.push_back(published);
         }
 
@@ -4266,6 +4387,15 @@ mod tests {
         // must not discard the overlay before that fetch captures its view.
         drop(unrelated);
         let stale_fetch = pipeline.capture(1);
+        {
+            let mut state = pipeline.state.lock().expect("complete snapshot fetch");
+            state.snapshot_fetches = 0;
+            let retired = cleanup_publications(&mut state, 2);
+            assert!(
+                retired.is_empty(),
+                "the newly registered stale view still needs the publication"
+            );
+        }
 
         assert_eq!(
             pipeline.point_value(
