@@ -1,16 +1,13 @@
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-#[cfg(test)]
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
 
 use super::{PublicColumn, PublicSurfaceContract, PublicSurfaceKind, SurfaceCapabilities};
-#[cfg(test)]
 use crate::sql2::catalog::entity_surface_schema;
 use crate::sql2::catalog::{
     EntitySurfaceShape, EntitySurfaceSpec, derive_entity_surface_spec_from_schema,
@@ -25,7 +22,6 @@ use crate::sql2::history_route::{
 };
 #[cfg(test)]
 use crate::sql2::providers::filesystem_working_change_schema;
-#[cfg(test)]
 use crate::sql2::result_metadata::json_field;
 
 #[derive(Clone, Debug, Default)]
@@ -140,6 +136,19 @@ impl PublicCatalog {
                 entity_surface_schema(self.entity_spec(schema_key)?, EntitySurfaceShape::History)
             }
         })
+    }
+
+    pub(crate) fn history_surface_schema(&self, table_name: &str) -> Option<SchemaRef> {
+        let surface = self.surface(table_name)?;
+        match &surface.kind {
+            PublicSurfaceKind::FileHistory => Some(history_filesystem_schema(true)),
+            PublicSurfaceKind::DirectoryHistory => Some(history_filesystem_schema(false)),
+            PublicSurfaceKind::EntityHistory { schema_key } => Some(entity_surface_schema(
+                self.entity_spec(schema_key)?,
+                EntitySurfaceShape::History,
+            )),
+            _ => None,
+        }
     }
 
     pub(crate) fn require_surface(
@@ -458,7 +467,6 @@ fn filesystem_schema(by_branch: bool, include_data: bool) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-#[cfg(test)]
 fn history_filesystem_schema(include_data: bool) -> SchemaRef {
     let mut fields = if include_data {
         vec![
@@ -629,7 +637,7 @@ fn entity_system_columns(
 }
 
 fn entity_history_system_columns() -> Vec<PublicColumn> {
-    public_columns([
+    history_columns([
         (HISTORY_COL_ENTITY_PK, false),
         (HISTORY_COL_SCHEMA_KEY, false),
         (HISTORY_COL_FILE_ID, true),
@@ -647,7 +655,7 @@ fn entity_history_system_columns() -> Vec<PublicColumn> {
 }
 
 fn file_history_columns() -> Vec<PublicColumn> {
-    public_columns([
+    history_columns([
         ("id", false),
         ("path", true),
         ("directory_id", true),
@@ -664,7 +672,7 @@ fn file_history_columns() -> Vec<PublicColumn> {
 }
 
 fn directory_history_columns() -> Vec<PublicColumn> {
-    public_columns([
+    history_columns([
         ("id", false),
         ("path", true),
         ("parent_id", true),
@@ -677,6 +685,19 @@ fn directory_history_columns() -> Vec<PublicColumn> {
         (HISTORY_COL_DEPTH, false),
         (HISTORY_COL_IS_DELETED, false),
     ])
+}
+
+fn history_columns<const N: usize>(columns: [(&str, bool); N]) -> Vec<PublicColumn> {
+    columns
+        .into_iter()
+        .map(|(name, nullable)| {
+            if name == HISTORY_COL_AS_OF_COMMIT_ID {
+                PublicColumn::hidden(name, nullable)
+            } else {
+                PublicColumn::public_read_only(name, nullable)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

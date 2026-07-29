@@ -521,11 +521,7 @@ async fn transaction_read_can_query_history_surfaces() {
         .await
         .expect("transaction should begin");
     let result = tx
-        .execute(
-            "SELECT key FROM lix_key_value_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id()",
-            &[],
-        )
+        .execute("SELECT key FROM lix_key_value_history()", &[])
         .await
         .expect("transaction read should register history surfaces");
 

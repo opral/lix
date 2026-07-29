@@ -421,7 +421,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(inserted, "lixcol_metadata")).toEqual(metadata);
 	const fileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, insertedHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -450,7 +450,7 @@ test("execute originKey is exposed on change and history surfaces without metada
 	expect(get(txStamped, "origin_key")).toBe("tx-origin");
 	const txFileHistorySources = get(
 		await lix.execute(
-			"SELECT lixcol_source_changes FROM lix_file_history WHERE id = $1 AND lixcol_as_of_commit_id = $2 AND lixcol_depth = 0",
+			"SELECT lixcol_source_changes FROM lix_file_history($2) WHERE id = $1 AND lixcol_depth = 0",
 			[fileId, txHeadCommitId],
 		),
 		"lixcol_source_changes",
@@ -1234,10 +1234,10 @@ test("beginTransaction preserves handle after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history('one', 'two')",
 		),
 	).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_SQL",
+		code: "LIX_PARSE_ERROR",
 	});
 	await tx.rollback();
 
@@ -1265,10 +1265,10 @@ test("beginTransaction can continue after failed statement", async () => {
 	);
 	await expect(
 		tx.execute(
-			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history('one', 'two')",
 		),
 	).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_SQL",
+		code: "LIX_PARSE_ERROR",
 	});
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
@@ -1400,15 +1400,14 @@ test("engine errors cross the native boundary", async () => {
 
 	try {
 		await lix.execute(
-			"SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
+			"SELECT id FROM lix_file_history('one', 'two')",
 		);
 		throw new Error("expected history query to fail");
 	} catch (error) {
 		expect(error).toMatchObject({
 			name: "LixError",
-			code: "LIX_UNSUPPORTED_SQL",
+			code: "LIX_PARSE_ERROR",
 		});
-		expect((error as { hint?: string }).hint).toContain("pinned active branch head");
 	}
 
 	await lix.close();
@@ -1834,9 +1833,8 @@ test("lix_directory_history snapshot_content preserves JSON null after binary fi
 
 	const result = await lix.execute(
 		"SELECT lixcol_source_changes \
-		 FROM lix_directory_history \
+		 FROM lix_directory_history() \
 		 WHERE id = $1 \
-		   AND lixcol_as_of_commit_id = lix_active_branch_commit_id() \
 		 ORDER BY lixcol_depth \
 		 LIMIT 1",
 		["01920000-0000-7000-8000-000000000431"],

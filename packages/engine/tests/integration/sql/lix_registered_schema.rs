@@ -349,10 +349,8 @@ simulation_test!(
         for surface_name in [
             "lix_key_value",
             "lix_key_value_by_branch",
-            "lix_key_value_history",
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
-            "lix_registered_schema_history",
             "lix_checkpoint",
             "lix_checkpoint_by_branch",
             "lix_working_change",
@@ -367,6 +365,24 @@ simulation_test!(
                 "{surface_name} should remain public"
             );
         }
+        let history_functions = session
+            .execute(
+                "SELECT function_name \
+                 FROM information_schema.table_functions \
+                 WHERE function_name IN ('lix_key_value_history', 'lix_registered_schema_history') \
+                 GROUP BY function_name \
+                 ORDER BY function_name",
+                &[],
+            )
+            .await
+            .expect("history function metadata should load");
+        assert_rows_eq(
+            history_functions,
+            vec![
+                vec![Value::Text("lix_key_value_history".to_string())],
+                vec![Value::Text("lix_registered_schema_history".to_string())],
+            ],
+        );
         for surface_name in [
             "lix_state",
             "lix_state_by_branch",
@@ -548,10 +564,9 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_as_of_commit_id, lixcol_depth \
-                     FROM lix_registered_schema_history \
-                     WHERE lixcol_as_of_commit_id = '{second_commit_id}' \
-                       AND lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
+                    "SELECT value, lixcol_entity_pk, lixcol_observed_commit_id, lixcol_depth \
+                     FROM lix_registered_schema_history('{second_commit_id}') \
+                       WHERE lixcol_entity_pk = lix_json('[\"engine_schema_update_history\"]') \
                      ORDER BY lixcol_depth"
                 ),
                 &[],
@@ -566,14 +581,12 @@ simulation_test!(
                     Value::Json(amended_schema),
                     Value::Json(json!(["engine_schema_update_history"])),
                     Value::Text(second_commit_id.clone()),
-                    Value::Text(second_commit_id.clone()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Json(initial_schema),
                     Value::Json(json!(["engine_schema_update_history"])),
                     Value::Text(first_commit_id),
-                    Value::Text(second_commit_id),
                     Value::Integer(1),
                 ],
             ],

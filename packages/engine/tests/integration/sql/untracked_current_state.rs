@@ -304,9 +304,8 @@ simulation_test!(
         let tracked_history = session
             .execute(
                 &format!(
-                    "SELECT lixcol_change_id FROM lix_key_value_history \
-                     WHERE lixcol_as_of_commit_id = '{mixed_head}' \
-                       AND key = 'untracked-current-tx-tracked' \
+                    "SELECT lixcol_change_id FROM lix_key_value_history('{mixed_head}') \
+                       WHERE key = 'untracked-current-tx-tracked' \
                        AND lixcol_depth = 0"
                 ),
                 &[],
@@ -317,9 +316,8 @@ simulation_test!(
         let untracked_history = session
             .execute(
                 &format!(
-                    "SELECT lixcol_change_id FROM lix_key_value_history \
-                     WHERE lixcol_as_of_commit_id = '{mixed_head}' \
-                       AND key = 'untracked-current-tx-untracked'"
+                    "SELECT lixcol_change_id FROM lix_key_value_history('{mixed_head}') \
+                       WHERE key = 'untracked-current-tx-untracked'"
                 ),
                 &[],
             )

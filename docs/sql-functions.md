@@ -30,22 +30,21 @@ Returns the active branch id of the current SQL session. Branch-pinned clients t
 
 Returns the commit id at the tip of the **currently active** branch, as resolved when the SQL statement was planned.
 
-History surfaces (`<schema>_history`, `lix_file_history`, and
-`lix_directory_history`) use that same pinned active-branch head by default.
-No anchor predicate is needed for the common case:
+History table functions (`<schema>_history`, `lix_file_history`, and
+`lix_directory_history`) use that same pinned active-branch head when called
+without an argument:
 
 ```sql
 -- Walk one entity's history from the active branch's tip
 SELECT lixcol_depth, lixcol_observed_commit_id, title
-FROM acme_task_history
+FROM acme_task_history()
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
-For time travel, override the default with exact equality or a non-empty `IN`
-predicate on `lixcol_as_of_commit_id`. Other anchor predicates are rejected
-instead of falling back to the active head. For an arbitrary branch, resolve
-the commit id with one query and pass it as a parameter:
+For time travel, pass a commit id as the function argument. For an arbitrary
+branch, resolve the commit id with one query and bind it into the history
+function:
 
 ```ts
 const { rows } = await lix.execute(
@@ -56,9 +55,8 @@ const commitId = rows[0].value("commit_id").asText();
 
 await lix.execute(
   `SELECT lixcol_depth, title
-     FROM acme_task_history
-    WHERE lixcol_as_of_commit_id = $1
-      AND id = $2
+     FROM acme_task_history($1)
+    WHERE id = $2
     ORDER BY lixcol_depth`,
   [commitId, "t1"],
 );

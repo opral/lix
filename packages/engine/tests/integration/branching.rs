@@ -1092,9 +1092,8 @@ simulation_test!(
         let history = main
             .execute(
                 "SELECT value \
-	             FROM lix_key_value_history \
-	             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-	               AND key = 'merge-select-change' \
+	             FROM lix_key_value_history() \
+	               WHERE key = 'merge-select-change' \
 	             ORDER BY lixcol_depth",
                 &[],
             )

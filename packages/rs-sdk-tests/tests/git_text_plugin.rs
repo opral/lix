@@ -543,8 +543,8 @@ async fn assert_history_file<StorageImpl>(
 {
     let result = lix
         .execute(
-            "SELECT data FROM lix_file_history \
-             WHERE lixcol_as_of_commit_id = $1 AND id = $2 \
+            "SELECT data FROM lix_file_history($1) \
+             WHERE id = $2 \
              ORDER BY lixcol_depth",
             &[
                 Value::Text(as_of_commit_id.to_owned()),

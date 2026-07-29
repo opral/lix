@@ -8,9 +8,9 @@ Lix exposes logical application data through typed SQL relations:
 
 | Data | Active branch | Cross-branch | Branch-reachable history |
 | :-- | :-- | :-- | :-- |
-| Registered application entity `X` | `<schema>` | `<schema>_by_branch` | `<schema>_history` |
-| Files | `lix_file` | `lix_file_by_branch` | `lix_file_history` |
-| Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history` |
+| Registered application entity `X` | `<schema>` | `<schema>_by_branch` | `<schema>_history()` |
+| Files | `lix_file` | `lix_file_by_branch` | `lix_file_history()` |
+| Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history()` |
 | Working changes | `lix_working_change` | `lix_working_change_by_branch` | — |
 | File working changes | `lix_file_working_change` | `lix_file_working_change_by_branch` | — |
 | Directory working changes | `lix_directory_working_change` | `lix_directory_working_change_by_branch` | — |
@@ -30,6 +30,11 @@ The SQL engine is backed by DataFusion. Query
 `information_schema.columns` for the executable public contract instead of
 inferring types from Arrow or JSON Schema names. Lix reports the canonical SQL
 types `TEXT`, `BYTEA`, `BIGINT`, `DOUBLE PRECISION`, and `BOOLEAN`.
+
+History functions are discoverable through
+`information_schema.table_functions`, which reports their argument signature
+and result columns. They do not appear in `information_schema.tables` or
+`information_schema.columns`.
 
 JSON-backed columns remain SQL `TEXT` and are marked with
 `lix_value_kind = 'JSON'`. `is_nullable` describes values returned by reads;
@@ -73,7 +78,8 @@ Registering an application schema with `x-lix-key: "acme_task"` produces:
 | :-- | :-- |
 | `acme_task` | Read and mutate tasks on the active branch. |
 | `acme_task_by_branch` | Read or mutate tasks with an explicit `lixcol_branch_id`. |
-| `acme_task_history` | Read task revisions reachable from a commit. |
+| `acme_task_history()` | Read task revisions reachable from the active head. |
+| `acme_task_history($commit)` | Read task revisions reachable from an explicit commit. |
 
 User properties become ordinary typed columns:
 
@@ -89,20 +95,19 @@ implicitly to the active branch, while `_by_branch` adds
 
 History starts at the active branch head pinned for the statement or coherent
 read batch. It adds `lixcol_entity_pk`, `lixcol_observed_commit_id`,
-`lixcol_commit_created_at`, `lixcol_as_of_commit_id`, `lixcol_depth`, and
-`lixcol_is_deleted`, together with singular change provenance such as
-`lixcol_change_id`, `lixcol_change_created_at`, and `lixcol_origin_key`.
+`lixcol_commit_created_at`, `lixcol_depth`, and `lixcol_is_deleted`, together
+with singular change provenance such as `lixcol_change_id`,
+`lixcol_change_created_at`, and `lixcol_origin_key`.
 
 ```sql
 SELECT lixcol_depth, lixcol_observed_commit_id, title, done
-FROM acme_task_history
+FROM acme_task_history()
 WHERE id = 't1'
 ORDER BY lixcol_depth;
 ```
 
-Add exact `lixcol_as_of_commit_id = ...` or a non-empty
-`lixcol_as_of_commit_id IN (...)` only for time travel. Other anchor predicates
-are rejected instead of silently using the pinned head.
+Pass a commit id to the function for time travel. The anchor is not exposed as
+a result column.
 
 Typed history preserves every declared primary-key root on deletion rows,
 including nested JSON roots. For a composite key, constrain every public key
@@ -111,14 +116,14 @@ column for an exact entity lookup; Lix encodes identity in the schema's
 
 ```sql
 SELECT lixcol_depth, value, lixcol_is_deleted
-FROM localized_message_history
+FROM localized_message_history()
 WHERE key = 'welcome'
   AND locale = 'en'
 ORDER BY lixcol_depth;
 ```
 
-There are no bare history aliases. Every public history surface uses the
-`lixcol_` prefix and the `lixcol_as_of_commit_id` spelling.
+There are no bare history table aliases. Every public history read calls its
+table-valued function with zero or one commit-id argument.
 
 ## Schema discovery and interoperability
 
@@ -178,7 +183,7 @@ FROM lix_file
 WHERE path = '/orders.xlsx';
 
 SELECT lixcol_depth, lixcol_observed_commit_id, data, lixcol_source_changes
-FROM lix_file_history
+FROM lix_file_history()
 WHERE path = '/orders.xlsx'
 ORDER BY lixcol_depth;
 ```

@@ -4,7 +4,7 @@ use serde_json::json;
 use super::select_rows;
 
 simulation_test!(
-    history_surfaces_are_introspected_as_views,
+    history_functions_are_not_exposed_as_static_tables,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -41,58 +41,12 @@ simulation_test!(
         )
         .await;
 
-        let expected = [
-            "engine_history_table_type_history",
-            "lix_directory_history",
-            "lix_file_history",
-        ]
-        .into_iter()
-        .map(|table| {
-            vec![
-                Value::Text(table.to_string()),
-                Value::Text("VIEW".to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-        assert_eq!(rows, expected);
-
-        let provenance_columns = select_rows(
-            &session,
-            "SELECT table_name, column_name \
-             FROM information_schema.columns \
-             WHERE table_name IN ('lix_file_history', 'lix_directory_history') \
-               AND column_name IN (\
-                 'lixcol_source_changes',\
-                 'lixcol_schema_key',\
-                 'lixcol_file_id',\
-                 'lixcol_snapshot_content',\
-                 'lixcol_change_id',\
-                 'lixcol_origin_key',\
-                 'lixcol_metadata'\
-               ) \
-             ORDER BY table_name, column_name",
-        )
-        .await;
-        assert_eq!(
-            provenance_columns,
-            vec![
-                vec![
-                    Value::Text("lix_directory_history".to_string()),
-                    Value::Text("lixcol_source_changes".to_string()),
-                ],
-                vec![
-                    Value::Text("lix_file_history".to_string()),
-                    Value::Text("lixcol_source_changes".to_string()),
-                ],
-            ],
-            "composed histories expose aggregate provenance without singular aliases"
-        );
+        assert!(rows.is_empty());
     }
 );
 
 simulation_test!(
-    history_view_schemas_expose_tombstone_contract,
+    history_function_results_hide_the_anchor_column,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -116,63 +70,31 @@ simulation_test!(
             .await
             .expect("registered schema insert should succeed");
 
-        let rows = select_rows(
-            &session,
-            "SELECT table_name, column_name, is_nullable \
-             FROM information_schema.columns \
-             WHERE table_name IN (\
-               'lix_file_history',\
-               'lix_directory_history',\
-               'engine_history_contract_schema_history'\
-             ) \
-               AND (\
-                 column_name IN ('path', 'directory_id', 'parent_id', 'name', 'data', 'id', 'count', 'active', 'meta') \
-                 OR column_name IN ('lixcol_snapshot_content', 'lixcol_is_deleted', 'lixcol_source_changes')\
-               ) \
-             ORDER BY table_name, column_name",
-        )
-        .await;
-
-        let expected = vec![
-            ("engine_history_contract_schema_history", "active", "YES"),
-            ("engine_history_contract_schema_history", "count", "YES"),
-            ("engine_history_contract_schema_history", "id", "NO"),
-            (
-                "engine_history_contract_schema_history",
-                "lixcol_is_deleted",
-                "NO",
-            ),
-            (
-                "engine_history_contract_schema_history",
-                "lixcol_snapshot_content",
-                "YES",
-            ),
-            ("engine_history_contract_schema_history", "meta", "YES"),
-            ("lix_directory_history", "id", "NO"),
-            ("lix_directory_history", "lixcol_is_deleted", "NO"),
-            ("lix_directory_history", "lixcol_source_changes", "NO"),
-            ("lix_directory_history", "name", "YES"),
-            ("lix_directory_history", "parent_id", "YES"),
-            ("lix_directory_history", "path", "YES"),
-            ("lix_file_history", "data", "YES"),
-            ("lix_file_history", "directory_id", "YES"),
-            ("lix_file_history", "id", "NO"),
-            ("lix_file_history", "lixcol_is_deleted", "NO"),
-            ("lix_file_history", "lixcol_source_changes", "NO"),
-            ("lix_file_history", "name", "YES"),
-            ("lix_file_history", "path", "YES"),
-        ]
-        .into_iter()
-        .map(|(table, column, nullable)| {
-            vec![
-                Value::Text(table.to_string()),
-                Value::Text(column.to_string()),
-                Value::Text(nullable.to_string()),
-            ]
-        })
-        .collect::<Vec<_>>();
-
-        assert_eq!(rows, expected);
+        for sql in [
+            "SELECT * FROM lix_file_history() LIMIT 0",
+            "SELECT * FROM lix_directory_history() LIMIT 0",
+            "SELECT * FROM engine_history_contract_schema_history() LIMIT 0",
+        ] {
+            let result = session.execute(sql, &[]).await.expect("history function");
+            assert!(
+                !result
+                    .columns()
+                    .iter()
+                    .any(|column| column == "lixcol_as_of_commit_id")
+            );
+            assert!(
+                result
+                    .columns()
+                    .iter()
+                    .any(|column| column == "lixcol_depth")
+            );
+            assert!(
+                result
+                    .columns()
+                    .iter()
+                    .any(|column| column == "lixcol_is_deleted")
+            );
+        }
     }
 );
 
@@ -229,9 +151,8 @@ simulation_test!(typed_entity_history_exposes_tombstones, |sim| async move {
     let typed_rows = select_rows(
         &session,
         "SELECT id, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
-             FROM engine_history_conformance_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
+             FROM engine_history_conformance_history() \
+               WHERE lixcol_entity_pk = lix_json('[\"history-conformance-entity\"]') \
              ORDER BY lixcol_depth",
     )
     .await;
@@ -279,9 +200,8 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT key, value, lixcol_entity_pk, lixcol_snapshot_content, lixcol_depth \
-             FROM lix_key_value_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND key = 'history-pk-backfill' \
+             FROM lix_key_value_history() \
+               WHERE key = 'history-pk-backfill' \
              ORDER BY lixcol_depth",
         )
         .await;
@@ -357,9 +277,8 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT namespace, id, value, lixcol_snapshot_content, lixcol_depth \
-             FROM engine_history_composite_pk_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND namespace = 'messages' \
+             FROM engine_history_composite_pk_history() \
+               WHERE namespace = 'messages' \
                AND id = '7' \
              ORDER BY lixcol_depth",
         )
@@ -437,9 +356,8 @@ simulation_test!(
         let rows = select_rows(
             &session,
             "SELECT identity, value, lixcol_snapshot_content, lixcol_depth \
-             FROM engine_history_nested_pk_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND lix_json_get_text(identity, 'tenant') = 'acme' \
+             FROM engine_history_nested_pk_history() \
+               WHERE lix_json_get_text(identity, 'tenant') = 'acme' \
                AND lix_json_get_text(identity, 'id') = '7' \
              ORDER BY lixcol_depth",
         )
@@ -478,9 +396,9 @@ simulation_test!(
         let nullability = select_rows(
             &session,
             "SELECT is_nullable \
-             FROM information_schema.columns \
-             WHERE table_name = 'engine_history_nested_pk_history' \
-               AND column_name = 'identity'",
+             FROM information_schema.table_functions \
+             WHERE function_name = 'engine_history_nested_pk_history' \
+               AND result_column = 'identity'",
         )
         .await;
         assert_eq!(nullability, vec![vec![Value::Text("NO".to_string())]]);
@@ -525,9 +443,8 @@ simulation_test!(
         let file_rows = select_rows(
             &session,
             "SELECT id, path, name, data, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
-             FROM lix_file_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND id = '68697374-6f72-892d-836f-6e666f726d00' \
+             FROM lix_file_history() \
+               WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
         .await;
@@ -585,9 +502,8 @@ simulation_test!(
         let directory_rows = select_rows(
             &session,
             "SELECT id, path, parent_id, name, lixcol_entity_pk, lixcol_is_deleted, lixcol_depth \
-             FROM lix_directory_history \
-             WHERE lixcol_as_of_commit_id = lix_active_branch_commit_id() \
-               AND id = '68697374-6f72-892d-836f-6e666f726d00' \
+             FROM lix_directory_history() \
+               WHERE id = '68697374-6f72-892d-836f-6e666f726d00' \
                AND lixcol_depth = 0",
         )
         .await;
@@ -607,7 +523,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    typed_history_routes_exact_anchor_from_join_predicate,
+    typed_history_function_anchor_composes_with_joins,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -641,11 +557,10 @@ simulation_test!(
         let result = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_as_of_commit_id \
-                     FROM lix_key_value_history AS h \
+                    "SELECT h.lixcol_snapshot_content \
+                     FROM lix_key_value_history('{first_commit_id}') AS h \
                      JOIN lix_key_value AS active \
                        ON h.key = active.key \
-                      AND h.lixcol_as_of_commit_id = '{first_commit_id}' \
                      WHERE h.key = 'history-join-anchor'"
                 ),
                 &[],
@@ -657,20 +572,21 @@ simulation_test!(
                 .rows()
                 .iter()
                 .map(|row| row
-                    .get::<Value>("lixcol_as_of_commit_id")
-                    .expect("lixcol_as_of_commit_id"))
+                    .get::<Value>("lixcol_snapshot_content")
+                    .expect("lixcol_snapshot_content"))
                 .collect::<Vec<_>>(),
-            vec![Value::Text(first_commit_id.clone())]
+            vec![Value::Json(
+                json!({"key": "history-join-anchor", "value": "one"})
+            )]
         );
 
         let nullable_side = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
+                    "SELECT h.lixcol_snapshot_content \
                      FROM lix_branch AS b \
-                     LEFT JOIN lix_key_value_history AS h \
-                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
-                      AND h.key = 'history-join-anchor' \
+                     LEFT JOIN lix_key_value_history('{first_commit_id}') AS h \
+                       ON h.key = 'history-join-anchor' \
                      WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
                 ),
                 &[],
@@ -683,20 +599,18 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![
-                Value::Text(first_commit_id.clone()),
-                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
-            ]]
+            vec![vec![Value::Json(
+                json!({"key": "history-join-anchor", "value": "one"})
+            ),]]
         );
 
         let right_nullable_side = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
-                     FROM lix_key_value_history AS h \
+                    "SELECT h.lixcol_snapshot_content \
+                     FROM lix_key_value_history('{first_commit_id}') AS h \
                      RIGHT JOIN lix_branch AS b \
-                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
-                      AND h.key = 'history-join-anchor' \
+                       ON h.key = 'history-join-anchor' \
                      WHERE b.id = 'ffffffff-ffff-7fff-bfff-ffffffffffff'"
                 ),
                 &[],
@@ -709,19 +623,18 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![
-                Value::Text(first_commit_id.clone()),
-                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
-            ]]
+            vec![vec![Value::Json(
+                json!({"key": "history-join-anchor", "value": "one"})
+            ),]]
         );
 
         let semi_join = session
             .execute(
                 &format!(
-                    "SELECT h.lixcol_as_of_commit_id, h.lixcol_snapshot_content \
-                     FROM lix_key_value_history AS h \
+                    "SELECT h.lixcol_snapshot_content \
+                     FROM lix_key_value_history('{first_commit_id}') AS h \
                      LEFT SEMI JOIN lix_branch AS b \
-                       ON h.lixcol_as_of_commit_id = '{first_commit_id}' \
+                       ON true \
                      WHERE h.key = 'history-join-anchor'"
                 ),
                 &[],
@@ -734,22 +647,20 @@ simulation_test!(
                 .iter()
                 .map(|row| row.values().to_vec())
                 .collect::<Vec<_>>(),
-            vec![vec![
-                Value::Text(first_commit_id.clone()),
-                Value::Json(json!({"key": "history-join-anchor", "value": "one"})),
-            ]]
+            vec![vec![Value::Json(
+                json!({"key": "history-join-anchor", "value": "one"})
+            ),]]
         );
 
         let projected = session
             .execute(
                 &format!(
-                    "SELECT projected.anchor AS lixcol_as_of_commit_id \
+                    "SELECT projected.snapshot \
                      FROM (\
-                       SELECT key, lixcol_as_of_commit_id AS anchor \
-                       FROM lix_key_value_history\
+                       SELECT key, lixcol_snapshot_content AS snapshot \
+                       FROM lix_key_value_history('{first_commit_id}')\
                      ) AS projected \
-                     WHERE projected.anchor = '{first_commit_id}' \
-                       AND projected.key = 'history-join-anchor'"
+                     WHERE projected.key = 'history-join-anchor'"
                 ),
                 &[],
             )
@@ -759,17 +670,17 @@ simulation_test!(
             projected
                 .rows()
                 .iter()
-                .map(|row| row
-                    .get::<Value>("lixcol_as_of_commit_id")
-                    .expect("lixcol_as_of_commit_id"))
+                .map(|row| row.get::<Value>("snapshot").expect("snapshot"))
                 .collect::<Vec<_>>(),
-            vec![Value::Text(first_commit_id)]
+            vec![Value::Json(
+                json!({"key": "history-join-anchor", "value": "one"})
+            )]
         );
     }
 );
 
 simulation_test!(
-    history_surfaces_reject_unrouteable_anchor_predicates,
+    history_surfaces_require_function_anchors,
     |sim| async move {
         let engine = sim.boot_engine().await;
         let session = sim.wrap_session(
@@ -781,36 +692,15 @@ simulation_test!(
         );
 
         for sql in [
-            "SELECT key FROM lix_key_value_history WHERE lixcol_as_of_commit_id > 'cid_invalid'",
-            "SELECT key FROM lix_key_value_history WHERE lixcol_as_of_commit_id NOT IN ('cid_invalid')",
-            "SELECT key FROM lix_key_value_history WHERE lixcol_as_of_commit_id = 'cid_invalid' OR key = 'other'",
-            "SELECT h.key FROM lix_key_value_history AS h JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = b.commit_id",
-            "SELECT h.key FROM lix_key_value_history AS h JOIN lix_branch AS b ON h.lixcol_as_of_commit_id > b.commit_id",
-            "SELECT h.key FROM lix_key_value_history AS h LEFT JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
-            "SELECT h.key FROM lix_branch AS b RIGHT JOIN lix_key_value_history AS h ON h.lixcol_as_of_commit_id = 'cid_invalid'",
-            "SELECT h.key FROM lix_key_value_history AS h FULL JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
-            "SELECT h.key FROM lix_key_value_history AS h LEFT ANTI JOIN lix_branch AS b ON h.lixcol_as_of_commit_id = 'cid_invalid'",
-            "SELECT h.key FROM lix_branch AS b RIGHT ANTI JOIN lix_key_value_history AS h ON h.lixcol_as_of_commit_id = 'cid_invalid'",
-            "SELECT projected.key FROM (SELECT key, lixcol_as_of_commit_id AS anchor FROM lix_key_value_history) AS projected WHERE projected.anchor > 'cid_invalid'",
-            "SELECT limited.key FROM (SELECT key, lixcol_as_of_commit_id AS anchor FROM lix_key_value_history LIMIT 1) AS limited WHERE limited.anchor = 'cid_invalid'",
-            "SELECT id FROM lix_file_history WHERE lixcol_as_of_commit_id LIKE 'cid_%'",
-            "SELECT id FROM lix_directory_history WHERE lixcol_as_of_commit_id IS NULL",
+            "SELECT key FROM lix_key_value_history",
+            "SELECT lixcol_as_of_commit_id FROM lix_key_value_history()",
+            "SELECT key FROM lix_key_value_history('one', 'two')",
+            "SELECT key FROM lix_key_value_history(42)",
         ] {
-            let error = session
+            session
                 .execute(sql, &[])
                 .await
-                .expect_err("unrouteable history anchors must not fall back to the active head");
-            assert_eq!(error.code, lix_engine::LixError::CODE_UNSUPPORTED_SQL);
-            assert!(
-                error.to_string().contains("only supports exact equality"),
-                "unexpected error: {error}"
-            );
-            assert!(
-                error
-                    .hint()
-                    .is_some_and(|hint| hint.contains("pinned active branch head")),
-                "unexpected hint: {error:?}"
-            );
+                .expect_err("invalid history function usage must fail");
         }
     }
 );
@@ -839,7 +729,7 @@ simulation_test!(
             .execute(
                 "SELECT ordinary.lixcol_as_of_commit_id \
                  FROM (SELECT 'ordinary' AS lixcol_as_of_commit_id) AS ordinary \
-                 CROSS JOIN lix_key_value_history AS history \
+                 CROSS JOIN lix_key_value_history() AS history \
                  WHERE ordinary.lixcol_as_of_commit_id > 'a' \
                    AND history.key = 'collision' \
                  LIMIT 1",
@@ -900,12 +790,14 @@ simulation_test!(
         let in_rows = select_rows(
             &session,
             &format!(
-                "SELECT lixcol_as_of_commit_id, lixcol_depth, lixcol_snapshot_content \
-                 FROM lix_key_value_history \
-                 WHERE lixcol_as_of_commit_id IN ('{first_commit_id}', '{second_commit_id}') \
-                   AND key = 'history-multi-start' \
-                   AND lixcol_depth = 0 \
-                 ORDER BY lixcol_as_of_commit_id"
+                "SELECT '{first_commit_id}' AS anchor, lixcol_depth, lixcol_snapshot_content \
+                 FROM lix_key_value_history('{first_commit_id}') \
+                 WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
+                 UNION ALL \
+                 SELECT '{second_commit_id}' AS anchor, lixcol_depth, lixcol_snapshot_content \
+                 FROM lix_key_value_history('{second_commit_id}') \
+                 WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
+                 ORDER BY anchor"
             ),
         )
         .await;
@@ -923,19 +815,20 @@ simulation_test!(
                     Value::Json(json!({"key": "history-multi-start", "value": "two"})),
                 ],
             ],
-            "IN should allow multiple explicit history anchors"
+            "multiple history function calls can be unioned"
         );
 
         let or_rows = select_rows(
             &session,
             &format!(
-                "SELECT lixcol_as_of_commit_id \
-                 FROM lix_key_value_history \
-                 WHERE (lixcol_as_of_commit_id = '{first_commit_id}' \
-                        OR lixcol_as_of_commit_id = '{second_commit_id}') \
-                   AND key = 'history-multi-start' \
-                   AND lixcol_depth = 0 \
-                 ORDER BY lixcol_as_of_commit_id"
+                "SELECT '{first_commit_id}' AS anchor \
+                 FROM lix_key_value_history('{first_commit_id}') \
+                 WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
+                 UNION ALL \
+                 SELECT '{second_commit_id}' AS anchor \
+                 FROM lix_key_value_history('{second_commit_id}') \
+                 WHERE key = 'history-multi-start' AND lixcol_depth = 0 \
+                 ORDER BY anchor"
             ),
         )
         .await;
@@ -945,7 +838,7 @@ simulation_test!(
                 vec![Value::Text(first_commit_id)],
                 vec![Value::Text(second_commit_id)],
             ],
-            "OR should also allow multiple explicit history anchors"
+            "union preserves both explicit anchors"
         );
     }
 );
@@ -986,9 +879,8 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT key \
-                 FROM lix_key_value_history \
-                 WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
-                   AND key IN ('history-and-a', 'history-and-b') \
+                 FROM lix_key_value_history('{head_commit_id}') \
+                   WHERE key IN ('history-and-a', 'history-and-b') \
                    AND key = 'history-and-a'"
             ),
         )
@@ -1003,9 +895,8 @@ simulation_test!(
             &session,
             &format!(
                 "SELECT key \
-                 FROM lix_key_value_history \
-                 WHERE lixcol_as_of_commit_id = '{head_commit_id}' \
-                   AND key = 'history-and-a' \
+                 FROM lix_key_value_history('{head_commit_id}') \
+                   WHERE key = 'history-and-a' \
                    AND key = 'history-and-b'"
             ),
         )
