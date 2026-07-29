@@ -3285,6 +3285,7 @@ dependencies = [
  "lix_rocksdb_storage",
  "lix_sdk",
  "mimalloc",
+ "plugin_csv_v2",
  "plugin_excalidraw_v2",
  "plugin_git_text_v2",
  "plugin_markdown_incremental_v2",
