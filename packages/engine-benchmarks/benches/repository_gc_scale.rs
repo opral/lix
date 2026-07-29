@@ -265,16 +265,31 @@ async fn measure<StorageImpl>(
         .as_ref()
         .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     let mut timings = Vec::with_capacity(samples);
-    let mut last = RepositoryGcBenchResult::default();
+    let mut results = Vec::with_capacity(samples);
     for _ in 0..samples {
         let started = Instant::now();
-        last = plan_repository_gc_for_bench(&adapter)
+        let result = plan_repository_gc_for_bench(&adapter)
             .await
             .expect("measure repository-GC plan");
         timings.push(started.elapsed());
-        assert_eq!(last.swept_commits, expected_swept_commits);
+        assert_eq!(result.swept_commits, expected_swept_commits);
+        results.push(result);
     }
     timings.sort_unstable();
+    let last = *results.last().expect("repository-GC samples are positive");
+    let phase_percentiles = |select: fn(&RepositoryGcBenchResult) -> u64| {
+        let mut values = results.iter().map(select).collect::<Vec<_>>();
+        values.sort_unstable();
+        (
+            percentile_u64(&values, 50),
+            percentile_u64(&values, 95),
+            percentile_u64(&values, 99),
+        )
+    };
+    let root_discovery = phase_percentiles(|result| result.root_discovery_us);
+    let changelog = phase_percentiles(|result| result.changelog_us);
+    let tracked_root_stage = phase_percentiles(|result| result.tracked_root_stage_us);
+    let gc_total = phase_percentiles(|result| result.total_us);
     let io = counters
         .as_ref()
         .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot)
@@ -284,7 +299,10 @@ async fn measure<StorageImpl>(
          history_changes={history_changes},commit_width={commit_width},\
          swept_commits={},live_commits={},swept_standalone_changes={},swept_payloads={},\
          samples={samples},warmups={warmups},p50_ms={},p95_ms={},p99_ms={},\
-         root_discovery_us={},changelog_us={},tracked_root_stage_us={},gc_total_us={},\
+         root_discovery_p50_us={},root_discovery_p95_us={},root_discovery_p99_us={},\
+         changelog_p50_us={},changelog_p95_us={},changelog_p99_us={},\
+         tracked_root_stage_p50_us={},tracked_root_stage_p95_us={},tracked_root_stage_p99_us={},\
+         gc_total_p50_us={},gc_total_p95_us={},gc_total_p99_us={},\
          staged_puts={},staged_deletes={},staged_written_bytes={},\
          delete_descriptors={},delete_descriptor_capacity={},\
          key_inline_bytes={},key_inline_capacity={},\
@@ -298,10 +316,18 @@ async fn measure<StorageImpl>(
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),
         millis(percentile(&timings, 99)),
-        last.root_discovery_us,
-        last.changelog_us,
-        last.tracked_root_stage_us,
-        last.total_us,
+        root_discovery.0,
+        root_discovery.1,
+        root_discovery.2,
+        changelog.0,
+        changelog.1,
+        changelog.2,
+        tracked_root_stage.0,
+        tracked_root_stage.1,
+        tracked_root_stage.2,
+        gc_total.0,
+        gc_total.1,
+        gc_total.2,
         last.staged_puts,
         last.staged_deletes,
         last.staged_written_bytes,
@@ -357,6 +383,11 @@ fn print_setup(
 }
 
 fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn percentile_u64(sorted: &[u64], percentile: usize) -> u64 {
     let rank = sorted.len().saturating_mul(percentile).div_ceil(100);
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
