@@ -24,7 +24,9 @@ use crate::common::format_json_pointer;
 #[cfg(test)]
 use crate::common::parse_json_pointer;
 use crate::common::{json_pointer_get, validate_row_metadata};
-use crate::domain::{Domain, DomainFileScope, DomainRowIdentity};
+use crate::domain::{
+    Domain, DomainFileScope, DomainRowIdentity, committed_row_ref_is_exact_branch_scoped,
+};
 use crate::entity_pk::{EntityPk, EntityPkError, canonical_json_text};
 use crate::live_state::{
     LiveStateFilter, LiveStateProjection, LiveStateReader, LiveStateScanRequest,
@@ -2070,12 +2072,15 @@ impl PendingConstraintIndexes {
     }
 
     fn tombstones_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
-        if self.tombstone_identities.is_empty() {
-            return false;
-        }
-        self.tombstone_identities
-            .iter()
-            .any(|identity| identity.matches_live_row_ref(row))
+        !self.tombstone_identities.is_empty()
+            && committed_row_ref_is_exact_branch_scoped(row, row.branch_id())
+            && self
+                .tombstone_identities
+                .contains(&DomainRowIdentity::in_domain(
+                    Domain::for_live_row_ref(row),
+                    row.schema_key().to_string(),
+                    row.entity_pk().clone(),
+                ))
     }
 
     fn replaces_committed_identity(&self, row: MaterializedLiveStateRowRef<'_>) -> bool {
@@ -6709,6 +6714,31 @@ mod tests {
                 EntityPk::single("target-1"),
             ))
         );
+    }
+
+    #[test]
+    fn pending_indexes_match_tombstones_by_exact_committed_identity() {
+        let mut indexes = PendingConstraintIndexes::default();
+        let branch_id = "01920000-0000-7000-8000-0000000000a1";
+        let mut deleted = fk_child_row("child-1", "parent-1", branch_id);
+        deleted.snapshot = None;
+        indexes.remember_tombstone(PreparedValidationRow::State(deleted.borrowed()));
+
+        let committed =
+            MaterializedLiveStateRow::from(fk_child_row("child-1", "parent-1", branch_id));
+        let mut other_file = committed.clone();
+        other_file.file_id = Some("01920000-0000-7000-8000-0000000000b1".into());
+        let mut malformed_projection = committed.clone();
+        malformed_projection.global = true;
+        let batch = MaterializedLiveStateBatch::from_rows(vec![
+            committed,
+            other_file,
+            malformed_projection,
+        ]);
+
+        assert!(indexes.tombstones_identity(batch.row(0)));
+        assert!(!indexes.tombstones_identity(batch.row(1)));
+        assert!(!indexes.tombstones_identity(batch.row(2)));
     }
 
     #[test]
