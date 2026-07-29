@@ -21,6 +21,7 @@ use crate::storage::{PutBatch, PutEntry};
 use crate::storage_adapter::{
     BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
 };
+use crate::tracked_state::TrackedStateReadColumns;
 use crate::transaction::types::{PreparedStateBatch, PreparedStateRowRef, StageJson};
 
 use super::*;
@@ -631,11 +632,12 @@ async fn scan_certified_entity_batch_rows(
         .value;
     let content_count = contents.iter().flatten().count();
     let decode_limit = (content_count <= 1).then_some(limit).flatten();
-    let needs_snapshot = request
-        .read_columns
-        .columns
-        .iter()
-        .any(|column| column == "snapshot_content");
+    let needs_snapshot = request.read_columns.columns.is_empty()
+        || request
+            .read_columns
+            .columns
+            .iter()
+            .any(|column| column == "snapshot_content");
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
         limit.unwrap_or_else(|| contents.len().saturating_mul(1024)),
     );
@@ -829,9 +831,9 @@ fn decode_certified_entity_batch_rows(
             let quote_layout = rows.bytes(quote_layout_len)?;
             let field_count = rows.u16()?;
             let id = creates
-                .component(u64::from(local_ref))
+                .component_uuid_bytes(u64::from(local_ref))
                 .map_err(|error| head_value_error(error.to_string()))?;
-            let entity_pk = EntityPk::single(id.clone());
+            let entity_pk = EntityPk::uuid_from_bytes(id);
             let selected = request.filter.entity_pks.is_empty()
                 || request
                     .filter
@@ -864,7 +866,10 @@ fn decode_certified_entity_batch_rows(
                                 .collect(),
                         ),
                     );
-                    object.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+                    object.insert(
+                        "id".to_owned(),
+                        serde_json::Value::String(uuid::Uuid::from_bytes(id).to_string()),
+                    );
                     if !quote_layout.is_empty() || ending != 0 {
                         let mut layout = serde_json::Map::new();
                         if !quote_layout.is_empty() {
@@ -915,7 +920,7 @@ fn decode_certified_entity_batch_rows(
                 timestamp,
                 timestamp,
                 false,
-                Some(ChangeId::parse_lix(&id, "certified CSV change id")?),
+                Some(ChangeId::new(uuid::Uuid::from_bytes(id))),
                 Some(commit_id),
                 false,
                 branch_id,
@@ -997,9 +1002,9 @@ fn decode_certified_packet_rows(
             2 => {
                 let local_ref = record.u64()?;
                 let id = creates
-                    .component(local_ref)
+                    .component_uuid_bytes(local_ref)
                     .map_err(|error| head_value_error(error.to_string()))?;
-                (EntityPk::single(id.clone()), Some(id))
+                (EntityPk::uuid_from_bytes(id), Some(id))
             }
             _ => {
                 return Err(head_value_error(
@@ -1036,25 +1041,35 @@ fn decode_certified_packet_rows(
             continue;
         }
         let snapshot = if needs_snapshot {
-            let mut snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes)
-                .map_err(|error| head_value_error(format!("invalid certified JSON: {error}")))?;
-            let object = snapshot.as_object_mut().ok_or_else(|| {
-                head_value_error("certified create snapshot is not a JSON object")
-            })?;
             if let Some(id) = &created_id {
-                object.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+                let mut snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes)
+                    .map_err(|error| {
+                        head_value_error(format!("invalid certified JSON: {error}"))
+                    })?;
+                let object = snapshot.as_object_mut().ok_or_else(|| {
+                    head_value_error("certified create snapshot is not a JSON object")
+                })?;
+                object.insert(
+                    "id".to_owned(),
+                    serde_json::Value::String(uuid::Uuid::from_bytes(*id).to_string()),
+                );
+                let json = serde_json::to_vec(&snapshot)
+                    .map_err(|error| head_value_error(error.to_string()))?;
+                Some(
+                    SharedStr::from_utf8(Bytes::from(json))
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                )
+            } else {
+                Some(
+                    SharedStr::from_utf8(Bytes::copy_from_slice(snapshot_bytes))
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                )
             }
-            let json = serde_json::to_vec(&snapshot)
-                .map_err(|error| head_value_error(error.to_string()))?;
-            Some(
-                SharedStr::from_utf8(Bytes::from(json))
-                    .map_err(|error| head_value_error(error.to_string()))?,
-            )
         } else {
             None
         };
         let change_id = if let Some(id) = &created_id {
-            ChangeId::parse_lix(id, "certified packet change id")?
+            ChangeId::new(uuid::Uuid::from_bytes(*id))
         } else {
             let mut bytes = *commit_id.as_uuid().as_bytes();
             let ordinal = base_ordinal.saturating_add(decoded).to_be_bytes();
@@ -1461,7 +1476,77 @@ where
             }));
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        MaterializedLiveStateExactBatch::new(rows, slots)
+        if slots.iter().all(Option::is_some) {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+
+        // Certified immutable segments deliberately do not manufacture one
+        // HOT_ROW entry per semantic row. Exact validation reads still need
+        // to observe those identities—for example, a sparse plugin successor
+        // proving that a keyed update or foreign-key target already exists.
+        // Decode the matching segment rows only when the ordinary point-read
+        // index misses, then preserve the original request alignment.
+        let certified_request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: keys.iter().map(|key| key.schema_key.to_owned()).collect(),
+                entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
+                file_ids: keys
+                    .iter()
+                    .map(|key| {
+                        key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
+                            NullableKeyFilter::Value(file_id.to_owned())
+                        })
+                    })
+                    .collect(),
+                include_tombstones: true,
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: [
+                    projection.snapshot_content.then_some("snapshot_content"),
+                    projection.metadata.then_some("metadata"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect(),
+            },
+            limit: None,
+        };
+        let certified = scan_certified_entity_batch_rows(
+            &self.store,
+            branch_id,
+            generation,
+            &certified_request,
+            None,
+        )
+        .await?;
+        if certified.is_empty() {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+        let mut combined_slots = Vec::with_capacity(keys.len());
+        for (key, slot) in keys.iter().zip(slots) {
+            let row = slot.and_then(|slot| rows.get(slot as usize)).or_else(|| {
+                certified.iter().find(|row| {
+                    row.schema_key() == key.schema_key
+                        && row.entity_pk() == key.entity_pk
+                        && row.file_id() == key.file_id
+                })
+            });
+            combined_slots.push(
+                row.map(|row| {
+                    u32::try_from(builder.push_ref(row, None)).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "certified exact live-state result exceeds u32 rows",
+                        )
+                    })
+                })
+                .transpose()?,
+            );
+        }
+        MaterializedLiveStateExactBatch::new(builder.finish(), combined_slots)
     }
 
     pub(crate) async fn working_diff_epoch(

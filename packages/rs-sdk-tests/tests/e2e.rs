@@ -774,6 +774,212 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
 }
 
 #[tokio::test]
+async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
+    let root = tempfile::tempdir().expect("create v3 Markdown directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown_v3_prototype",
+        &build_markdown_v3_prototype_archive(),
+        &["markdown_node_v2"],
+    )
+    .await;
+
+    let path = "/component-v3.md";
+    let before = b"# Heading\n\nParagraph with **bold** text.\n".to_vec();
+    lix.reset_plugin_v2_transition_counters();
+    write_file(&lix, path, before.clone()).await.unwrap();
+    let open_counters = lix.plugin_v2_transition_counters();
+    assert_eq!(open_counters.guest_export_calls, 1);
+    assert_eq!(open_counters.durable_semantic_changes, 3);
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(before));
+    assert_eq!(
+        lix.execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        3
+    );
+
+    let after = b"# Heading\n\nParagraph with **bold** text and a tail.\n".to_vec();
+    lix.reset_plugin_v2_transition_counters();
+    write_file(&lix, path, after.clone()).await.unwrap();
+    let successor_counters = lix.plugin_v2_transition_counters();
+    assert_eq!(successor_counters.guest_export_calls, 1);
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
+    let current = lix
+        .execute(
+            "SELECT kind, payload_json FROM markdown_node_v2 ORDER BY kind",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.rows().len(), 3);
+    assert!(
+        current.rows().iter().any(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("a tail"))
+        }),
+        "the sparse successor must overlay the immutable opening segment"
+    );
+    let historical = lix
+        .execute(
+            "SELECT kind, payload_json FROM markdown_node_v2_history() \
+             WHERE lixcol_depth = 1 ORDER BY kind",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.rows().len(), 3);
+    assert!(
+        historical.rows().iter().any(|row| {
+            row.get::<String>("payload_json")
+                .is_ok_and(|payload| payload.contains("bold"))
+        }),
+        "the opening certified segment must remain queryable through history"
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(after),
+        "exact Markdown bytes must survive RocksDB reopen"
+    );
+    assert_eq!(
+        reopened
+            .execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        3
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "exact VS Code Docs d5badf Markdown transition v2 versus v3 benchmark"]
+async fn v3_markdown_vscode_api_exact_transition_benchmark() {
+    const BENCHMARK: &str = "v3_markdown_vscode_api_exact_transition_benchmark";
+    const PATH: &str = "/api/references/vscode-api.md";
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(3);
+    let before_path = std::env::var("LIX_VSCODE_API_BEFORE")
+        .unwrap_or_else(|_| "/tmp/vscode-api-before.md".to_owned());
+    let after_path = std::env::var("LIX_VSCODE_API_AFTER")
+        .unwrap_or_else(|_| "/tmp/vscode-api-after.md".to_owned());
+    let before = std::fs::read(&before_path)
+        .unwrap_or_else(|error| panic!("read VS Code before fixture {before_path}: {error}"));
+    let after = std::fs::read(&after_path)
+        .unwrap_or_else(|error| panic!("read VS Code after fixture {after_path}: {error}"));
+    assert_eq!(before.len(), 1_237_841);
+    assert_eq!(after.len(), 1_237_840);
+
+    let lanes = [
+        (
+            "v2_cursor",
+            "plugin_markdown_incremental_v2",
+            build_markdown_v2_plugin_archive(),
+        ),
+        (
+            "v3_push_sink",
+            "plugin_markdown_v3_prototype",
+            build_markdown_v3_prototype_archive(),
+        ),
+    ];
+    let mut expected_rows = None;
+    for (label, plugin_key, archive) in lanes {
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
+            continue;
+        }
+        let mut measurements = Vec::with_capacity(samples);
+        let mut elapsed_ms = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let root = tempfile::tempdir().expect("create VS Code Markdown benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            install_reference_plugin_in_blank_registry(
+                &lix,
+                plugin_key,
+                &archive,
+                &["markdown_node_v2"],
+            )
+            .await;
+            write_file(&lix, PATH, before.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{label} opening import failed: {error}"));
+
+            lix.reset_plugin_v2_transition_counters();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            write_file(&lix, PATH, after.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{label} successor failed: {error}"));
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let counters = lix.plugin_v2_transition_counters();
+            assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
+            let rows = lix
+                .execute("SELECT COUNT(*) AS count FROM markdown_node_v2", &[])
+                .await
+                .unwrap()
+                .rows()[0]
+                .get::<i64>("count")
+                .unwrap() as usize;
+            if let Some(expected) = expected_rows {
+                assert_eq!(rows, expected, "{label} semantic row count");
+            } else {
+                expected_rows = Some(rows);
+            }
+            if label == "v3_push_sink" {
+                assert_eq!(counters.guest_export_calls, 1);
+            }
+            eprintln!(
+                "vscode_markdown lane={label} sample={sample} elapsed_ms={:.3} \
+                 allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
+                 guest_exports={} imports={} boundary_mb={:.3} guest_high_water_mb={:.3} \
+                 semantic_changes={} full_rows_materialized={} rows={rows}",
+                measurement.elapsed_ms,
+                measurement.allocations.allocation_count,
+                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
+                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes as f64 / 1_000_000.0,
+                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+                counters.durable_semantic_changes,
+                counters.full_state_semantic_rows_materialized,
+            );
+            elapsed_ms.push(measurement.elapsed_ms);
+            measurements.push(measurement);
+            lix.close().await.unwrap();
+        }
+        elapsed_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "vscode_markdown lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3} p95_ms={:.3}",
+            p50_ms(&elapsed_ms),
+            p95_ms(&elapsed_ms)
+        );
+        emit_summary(
+            BENCHMARK,
+            label,
+            BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: expected_rows.unwrap_or_default(),
+            },
+            BenchmarkGate::BulkWrite,
+            &measurements,
+        );
+    }
+}
+
+#[tokio::test]
 async fn v2_markdown_merges_unrelated_entities_and_regenerates_derived_bytes() {
     let archive = build_markdown_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -4035,6 +4241,209 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
 }
 
 #[tokio::test]
+async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
+    let root = tempfile::tempdir().expect("create Excalidraw v3 RocksDB directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw_v3_prototype",
+        &build_excalidraw_v3_prototype_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+
+    let path = "/component-v3.excalidraw";
+    let before = br##"{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "https://excalidraw.com",
+  "elements": [
+    {"id":"a","type":"rectangle","x":1.25,"y":2,"width":100,"height":80,"isDeleted":false},
+    {"id":"b","type":"ellipse","x":20,"y":30,"width":50,"height":40,"isDeleted":false}
+  ],
+  "appState": {"gridSize":20,"viewBackgroundColor":"#ffffff"},
+  "files": {
+    "file-1": {"id":"file-1","mimeType":"image/png","dataURL":"data:image/png;base64,AA==","created":123}
+  }
+}
+"##
+    .to_vec();
+    lix.reset_plugin_v2_transition_counters();
+    write_file(&lix, path, before.clone()).await.unwrap();
+    let open_counters = lix.plugin_v2_transition_counters();
+    assert_eq!(open_counters.guest_export_calls, 1);
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(before.clone()));
+    assert_eq!(
+        lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        2
+    );
+
+    let after = String::from_utf8(before)
+        .unwrap()
+        .replacen(r#""x":1.25"#, r#""x":123.5"#, 1)
+        .into_bytes();
+    lix.reset_plugin_v2_transition_counters();
+    write_file(&lix, path, after.clone()).await.unwrap();
+    let successor_counters = lix.plugin_v2_transition_counters();
+    assert_eq!(successor_counters.guest_export_calls, 1);
+    assert_eq!(successor_counters.durable_semantic_changes, 1);
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
+    assert_eq!(
+        lix.execute(
+            "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+            .get::<String>("element_json")
+            .unwrap()
+            .contains("123.5"),
+        true
+    );
+    assert!(
+        lix.execute(
+            "SELECT element_json FROM excalidraw_element_history() \
+             WHERE id = 'a' AND lixcol_depth = 1",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+            .get::<String>("element_json")
+            .unwrap()
+            .contains("1.25")
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(after));
+    assert_eq!(
+        reopened
+            .execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        2
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "large Excalidraw local-edit transition v2 versus v3 benchmark"]
+async fn v3_excalidraw_large_transition_benchmark() {
+    const ELEMENTS: usize = 20_000;
+    const PATH: &str = "/large.excalidraw";
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(3);
+    let mut source = String::from(
+        r#"{"type":"excalidraw","version":2,"source":"https://excalidraw.com","elements":["#,
+    );
+    for index in 0..ELEMENTS {
+        if index != 0 {
+            source.push(',');
+        }
+        source.push_str(&format!(
+            r#"{{"id":"e-{index}","type":"rectangle","x":1.25,"y":2,"width":100,"height":80,"isDeleted":false}}"#
+        ));
+    }
+    source.push_str(r##"],"appState":{"viewBackgroundColor":"#ffffff"},"files":{}}"##);
+    let before = source.into_bytes();
+    let after = String::from_utf8(before.clone())
+        .unwrap()
+        .replacen(
+            r#""id":"e-10000","type":"rectangle","x":1.25"#,
+            r#""id":"e-10000","type":"rectangle","x":123.5"#,
+            1,
+        )
+        .into_bytes();
+    assert_eq!(before.len() + 1, after.len());
+
+    for (label, plugin_key, archive) in [
+        (
+            "v2_cursor",
+            "plugin_excalidraw_v2",
+            build_excalidraw_v2_plugin_archive(),
+        ),
+        (
+            "v3_push_sink",
+            "plugin_excalidraw_v3_prototype",
+            build_excalidraw_v3_prototype_archive(),
+        ),
+    ] {
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
+            continue;
+        }
+        let mut elapsed_ms = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let root = tempfile::tempdir().expect("create Excalidraw benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            install_reference_plugin_in_blank_registry(
+                &lix,
+                plugin_key,
+                &archive,
+                &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+            )
+            .await;
+            write_file(&lix, PATH, before.clone()).await.unwrap();
+
+            lix.reset_plugin_v2_transition_counters();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            write_file(&lix, PATH, after.clone()).await.unwrap();
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let counters = lix.plugin_v2_transition_counters();
+            assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
+            assert_eq!(
+                lix.execute("SELECT COUNT(*) AS count FROM excalidraw_element", &[])
+                    .await
+                    .unwrap()
+                    .rows()[0]
+                    .get::<i64>("count")
+                    .unwrap(),
+                ELEMENTS as i64
+            );
+            assert_eq!(counters.durable_semantic_changes, 1);
+            if label == "v3_push_sink" {
+                assert_eq!(counters.guest_export_calls, 1);
+            }
+            eprintln!(
+                "large_excalidraw lane={label} sample={sample} input_mb={:.3} \
+                 elapsed_ms={:.3} allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
+                 guest_exports={} imports={} boundary_mb={:.3} guest_high_water_mb={:.3}",
+                after.len() as f64 / 1_000_000.0,
+                measurement.elapsed_ms,
+                measurement.allocations.allocation_count,
+                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
+                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes as f64 / 1_000_000.0,
+                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+            );
+            elapsed_ms.push(measurement.elapsed_ms);
+            lix.close().await.unwrap();
+        }
+        elapsed_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "large_excalidraw lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3}",
+            elapsed_ms[elapsed_ms.len() / 2]
+        );
+    }
+}
+
+#[tokio::test]
 async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     let archive = build_excalidraw_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -5343,6 +5752,36 @@ fn build_markdown_v2_plugin_archive() -> Vec<u8> {
     writer.finish().unwrap().into_inner()
 }
 
+fn build_markdown_v3_prototype_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!(
+        "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_V3_PROTOTYPE_plugin_markdown_v3_prototype"
+    ));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built Markdown v3 prototype wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/markdown-v3-prototype/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/markdown_node_v2.json",
+            include_str!("../../../plugins/markdown-v2/schema/markdown_node_v2.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
 fn build_json_v2_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
         "CARGO_CDYLIB_FILE_PLUGIN_JSON_INCREMENTAL_V2_plugin_json_incremental_v2"
@@ -5761,6 +6200,45 @@ fn build_excalidraw_v2_plugin_archive() -> Vec<u8> {
         (
             "manifest.json",
             include_str!("../../../plugins/excalidraw-v2/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/excalidraw_scene.json",
+            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_scene.json").as_bytes(),
+        ),
+        (
+            "schema/excalidraw_element.json",
+            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_element.json")
+                .as_bytes(),
+        ),
+        (
+            "schema/excalidraw_file.json",
+            include_str!("../../../plugins/excalidraw-v2/schema/excalidraw_file.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn build_excalidraw_v3_prototype_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!(
+        "CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V3_PROTOTYPE_plugin_excalidraw_v3_prototype"
+    ));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built Excalidraw v3 plugin wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/excalidraw-v3-prototype/manifest.json").as_bytes(),
         ),
         (
             "schema/excalidraw_scene.json",

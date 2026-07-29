@@ -1027,6 +1027,10 @@ impl WasmCreateContext {
     }
 
     pub fn component(self, local_ref: u64) -> Result<String, LixError> {
+        Ok(uuid::Uuid::from_bytes(self.component_uuid_bytes(local_ref)?).to_string())
+    }
+
+    pub(crate) fn component_uuid_bytes(self, local_ref: u64) -> Result<[u8; 16], LixError> {
         let local_ref = u32::try_from(local_ref).map_err(|_| {
             invalid_param("v2 create local references must fit in an unsigned 32-bit integer")
         })?;
@@ -1034,7 +1038,7 @@ impl WasmCreateContext {
         bytes[..8].copy_from_slice(&self.high.to_be_bytes());
         bytes[8..12].copy_from_slice(&self.low.to_be_bytes());
         bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
-        Ok(uuid::Uuid::from_bytes(bytes).to_string())
+        Ok(bytes)
     }
 }
 

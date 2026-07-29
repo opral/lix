@@ -1287,6 +1287,22 @@ impl WasmComponentV2Actor for V3Actor {
                     if let Some(schema_keys) =
                         validate_created_packet_page(record_count, &payload).map_err(v3_error)?
                     {
+                        // Certified immutable segments are the ownership unit
+                        // for complete bulk state. Sparse successors stay as
+                        // ordinary row overlays: this lets validation observe
+                        // their durable base directly and avoids paying a new
+                        // segment/manifest lifecycle for one or two rows.
+                        if !cursor.complete_file_state {
+                            return PendingChangePage::Packet {
+                                record_count,
+                                payload,
+                                max_page_bytes,
+                                limits,
+                                creates,
+                            }
+                            .decode()
+                            .map(Some);
+                        }
                         if cursor
                             .certified_packet_creates
                             .is_some_and(|existing| existing != creates)
@@ -1456,6 +1472,10 @@ fn v3_transition_limits(
             .unwrap_or(u32::MAX)
             .max(limits.max_record_bytes),
     );
+    // v3 batches are the record envelope. Keeping the inherited v2 1 MiB
+    // record cap while advertising a 2 MiB push page rejects otherwise valid
+    // single-snapshot pages (notably Markdown lexical fallbacks).
+    limits.max_record_bytes = limits.max_page_bytes;
     limits.validate()
 }
 

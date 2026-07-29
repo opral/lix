@@ -250,6 +250,12 @@ impl EntityPk {
         })
     }
 
+    pub(crate) const fn uuid_from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            components: EntityPkComponents::Single(EntityPkComponent::Uuid(bytes)),
+        }
+    }
+
     pub(crate) fn from_external_parts(
         parts: Vec<String>,
         component_types: &[EntityPkComponentType],

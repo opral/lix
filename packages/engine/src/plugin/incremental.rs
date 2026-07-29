@@ -1702,6 +1702,8 @@ fn validate_certified_snapshot_packets(
 ) -> Result<(), LixError> {
     let mut rows = 0_u64;
     let mut encountered = BTreeSet::new();
+    let mut markdown_ids = BTreeSet::new();
+    let mut markdown_parent_ids = Vec::new();
     for page in &batch.pages {
         let mut page = CertifiedPacketReader::new(page);
         while !page.finished() {
@@ -1764,7 +1766,22 @@ fn validate_certified_snapshot_packets(
                             "certified create snapshot already contains its generated id",
                         ));
                     }
-                    let key = crate::wasm::WasmEntityKey::from_owned_parts(schema_key, vec![id]);
+                    let markdown_parent_id = if schema_key == "markdown_node_v2" {
+                        if object
+                            .get("parent_id")
+                            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
+                        {
+                            return Err(invalid_guest(
+                                "certified Markdown parent_id must be a string or null",
+                            ));
+                        }
+                        object
+                            .get("parent_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
                     let snapshot = serde_json::to_vec(&value).map_err(|error| {
                         invalid_guest(format!(
                             "certified create snapshot normalization failed: {error}"
@@ -1775,13 +1792,36 @@ fn validate_certified_snapshot_packets(
                             "certified batch schema '{schema_key}' has no validation plan"
                         ))
                     })?;
-                    plan.certify_or_normalize_v2_plugin_row(&snapshot, &key)?
-                        .ok_or_else(|| {
-                            invalid_guest(format!(
-                                "certified batch schema '{schema_key}' has no streaming validator"
-                            ))
-                        })?
-                        .normalized
+                    if schema_key == "markdown_node_v2" {
+                        if !batch.complete_file_state {
+                            return Err(invalid_guest(
+                                "sparse certified Markdown batches require a durable-base observation",
+                            ));
+                        }
+                        if let Err(errors) = plan.compiled_schema.validate(&value) {
+                            let details = errors
+                                .take(3)
+                                .map(|error| error.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(invalid_guest(format!(
+                                "certified Markdown snapshot failed schema validation: {details}"
+                            )));
+                        }
+                        markdown_ids.insert(id);
+                        markdown_parent_ids.extend(markdown_parent_id);
+                        None
+                    } else {
+                        let key =
+                            crate::wasm::WasmEntityKey::from_owned_parts(schema_key, vec![id]);
+                        plan.certify_or_normalize_v2_plugin_row(&snapshot, &key)?
+                            .ok_or_else(|| {
+                                invalid_guest(format!(
+                                    "certified batch schema '{schema_key}' has no streaming validator"
+                                ))
+                            })?
+                            .normalized
+                    }
                 }
                 _ => {
                     return Err(invalid_guest(
@@ -1815,6 +1855,14 @@ fn validate_certified_snapshot_packets(
         return Err(invalid_guest(
             "certified batch schema header does not match its records",
         ));
+    }
+    if let Some(parent_id) = markdown_parent_ids
+        .iter()
+        .find(|parent_id| !markdown_ids.contains(parent_id.as_str()))
+    {
+        return Err(invalid_guest(format!(
+            "certified Markdown parent_id '{parent_id}' is absent from the complete batch"
+        )));
     }
     Ok(())
 }

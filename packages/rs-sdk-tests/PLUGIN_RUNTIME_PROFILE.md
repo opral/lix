@@ -1,7 +1,7 @@
 # Cross-format Wasm plugin runtime profile
 
 Profiled on Linux x86-64 with Rust nightly 1.97.0. The release benchmarks were
-verified against `origin/main` at `57d619aad`. The exact VS Code Docs replay
+verified against `origin/main` at `c082f5f14`. The exact VS Code Docs replay
 uses commit `d5badf95f8ab16c4deb91199dc696f2293d93554`.
 
 ## Results
@@ -285,6 +285,60 @@ transport, validation, transaction staging, storage, and query consumption.
 Remaining production gates are historical/time-travel visibility,
 cold-successor operation after actor eviction, and equivalent codecs for
 Markdown and Excalidraw.
+
+## Cross-format successor profile
+
+The Markdown and Excalidraw v3 adapters use the same fused export and bounded
+packet sink as JSON. Complete opening state is one certified immutable batch;
+incremental changes are ordinary sparse row overlays. Correctness tests cover
+exact bytes, semantic projection, history, and RocksDB close/reopen for all
+three formats.
+
+The exact 1,237,840-byte VS Code API Markdown transition at
+`d5badf95f8ab16c4deb91199dc696f2293d93554` changes two of 3,808 semantic
+rows:
+
+| lane | p50 | p95 | host allocation | peak host allocation | exports / imports | guest high water |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Markdown v2 cursor | 883.3 ms | 947.1 ms | 32.2 MB | 11.2 MB | 3 / 0 | 102.4 MB |
+| Markdown v3 push | 900.2 ms | 918.4 ms | 174.7 MB | 21.0 MB | 1 / 1 | 102.4 MB |
+
+The fused transition therefore fails Prototype A's acceptance gate for this
+workload. Guest re-entry falls from three exports to one, but guest high-water
+memory and boundary bytes are unchanged. The Markdown parser/reconciler owns
+the runtime, while validation of the immutable opening segment amplifies host
+bytes. A read-facade cache experiment made this worse—1,225.7 ms, 710.3 MB
+cumulative allocation, and 44.7 MB peak—because the cache owner was shorter
+lived than the validation sequence and repeatedly hydrated the full segment.
+It was removed. Reuse must be transaction-scoped, or queries/validation must
+consume the encoded segment directly.
+
+A generated 1.849 MB Excalidraw document with 20,000 elements changes one
+element:
+
+| lane | p50 | host allocation | peak host allocation | exports / imports | guest high water |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Excalidraw v2 cursor | 229.7 ms | 5.0 MB | 3.0 MB | 3 / 0 | 42.1 MB |
+| Excalidraw v3 push | 237.5 ms | 73.4 MB | 7.7 MB | 1 / 1 | 41.8 MB |
+
+Heaptrack shows repeated certified-segment consumption on the semantic read
+path. Stable-primary-key packets now retain their already-certified canonical
+snapshot bytes directly instead of parsing and serializing them again. That
+improves later queries, but it does not change the transition allocation:
+the large v3 import actor is evicted, so its successor reconstructs the prior
+20,000-element document. This is a concrete cross-format acceptance case for
+`apply-cold-successor`, not for more cursor tuning.
+
+Current one-sample verification after the sparse-overlay policy:
+
+| workload | v2 | v3 | v3 peak host allocation | result |
+| --- | ---: | ---: | ---: | --- |
+| CSV, 10.68 MiB / 220,001 changes | 5.227 s baseline | 168.2 ms | 36.2 MB | 31.1x |
+| JSON, 10 MiB / 39,871 changes | 738.6 ms | 244.9 ms | 45.6 MB | 3.02x |
+
+Both bulk lanes use one guest export, bounded pages, exact byte and semantic
+checks, history where applicable, and RocksDB reopen. CSV creates no per-row
+history segments or locator records before hot publication.
 
 ## Reproduction
 

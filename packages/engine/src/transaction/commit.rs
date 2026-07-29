@@ -278,6 +278,16 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_head"
     ))
     .await?;
+    for file in &prepared_writes.file_data_writes {
+        let Some(control) = staged_hot_heads.controls.get_mut(&file.branch_id) else {
+            continue;
+        };
+        control.note_schemas(
+            file.certified_entity_batches()
+                .iter()
+                .flat_map(|batch| batch.schema_keys.iter().map(String::as_str)),
+        );
+    }
     stage_checkpoint_working_diff_epochs(
         &mut writes,
         &prepared_writes.checkpoint_publications,

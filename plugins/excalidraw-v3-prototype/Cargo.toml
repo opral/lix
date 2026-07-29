@@ -1,0 +1,26 @@
+[package]
+name = "plugin_excalidraw_v3_prototype"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Excalidraw prototype for the fused Lix Wasm Component API v3"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lix_order_key.workspace = true
+lix_plugin_api_v3_prototype = { workspace = true }
+serde_json = "1"
+uuid = { version = "1", features = ["std"] }
