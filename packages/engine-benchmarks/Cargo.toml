@@ -141,6 +141,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "fixed_live_history_scale"
+path = "benches/fixed_live_history_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "multi_space_point_read"
 path = "benches/multi_space_point_read.rs"
 harness = false
