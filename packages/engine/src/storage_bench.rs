@@ -51,6 +51,69 @@ pub struct CheckpointCommitScanBenchResult {
     pub pages: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryGcBenchResult {
+    pub live_commits: usize,
+    pub swept_commits: usize,
+    pub swept_standalone_changes: usize,
+    pub swept_payloads: usize,
+    pub staged_puts: u64,
+    pub staged_deletes: u64,
+    pub staged_written_bytes: u64,
+    pub delete_descriptors: usize,
+    pub delete_descriptor_capacity: usize,
+    pub key_inline_bytes: usize,
+    pub key_inline_capacity: usize,
+    pub key_shared_buffers: usize,
+    pub key_shared_bytes: usize,
+    pub key_shared_capacity: usize,
+    pub root_discovery_us: u64,
+    pub changelog_us: u64,
+    pub tracked_root_stage_us: u64,
+    pub total_us: u64,
+}
+
+/// Plans production repository GC without committing its staged sweep.
+///
+/// The returned arena sizes expose the planner's retained mutation footprint;
+/// dropping this function's local write set leaves the fixture unchanged for
+/// repeatable measurements.
+#[inline(never)]
+pub async fn plan_repository_gc_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    let mut writes = storage.new_write_set();
+    let plan = crate::gc::stage_repository_gc(read, &mut writes).await?;
+    let stats = writes.stats();
+    let arena = writes.arena_stats();
+    Ok(RepositoryGcBenchResult {
+        live_commits: plan.changelog.live.commits.len(),
+        swept_commits: plan.changelog.sweep.commits.len(),
+        swept_standalone_changes: plan.changelog.sweep.changes.len(),
+        swept_payloads: plan.changelog.sweep.json_payloads.len(),
+        staged_puts: stats.staged_puts,
+        staged_deletes: stats.staged_deletes,
+        staged_written_bytes: stats.written_bytes,
+        delete_descriptors: arena.delete_descriptors,
+        delete_descriptor_capacity: arena.delete_descriptor_capacity,
+        key_inline_bytes: arena.key_inline_bytes,
+        key_inline_capacity: arena.key_inline_capacity,
+        key_shared_buffers: arena.key_shared_buffers,
+        key_shared_bytes: arena.key_shared_bytes,
+        key_shared_capacity: arena.key_shared_capacity,
+        root_discovery_us: plan.profile.root_discovery_us,
+        changelog_us: plan.profile.changelog_us,
+        tracked_root_stage_us: plan.profile.tracked_root_stage_us,
+        total_us: plan.profile.total_us,
+    })
+}
+
 /// Scans public commit facts through the two checkpoint-history strategies.
 ///
 /// `Materialize` is the current production path for unbounded checkpoint
@@ -380,7 +443,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{CheckpointCommitScanBenchMode, scan_checkpoint_commits_for_bench};
+    use super::{
+        CheckpointCommitScanBenchMode, plan_repository_gc_for_bench,
+        scan_checkpoint_commits_for_bench,
+    };
+    use crate::Engine;
     use crate::changelog::bench::{append_ordered_commits, stage_append_once};
     use crate::storage_adapter::{Memory, StorageAdapter};
 
@@ -405,5 +472,34 @@ mod tests {
         assert_eq!(materialized.commits, 1_025);
         assert_eq!(materialized.pages, 2);
         assert_eq!(streamed, materialized);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_benchmark_plans_unreachable_commits_without_mutating() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("initialize engine");
+        let append = append_ordered_commits(100, 10).expect("build unreachable commit fixture");
+        stage_append_once(storage.clone(), &append)
+            .await
+            .expect("stage unreachable commit fixture");
+        let adapter = StorageAdapter::new(storage);
+
+        let first = plan_repository_gc_for_bench(&adapter)
+            .await
+            .expect("plan repository gc");
+        let second = plan_repository_gc_for_bench(&adapter)
+            .await
+            .expect("repeat repository gc plan");
+
+        assert_eq!(first.swept_commits, 10);
+        // Each unreachable commit removes its changelog record, exact-ID
+        // locator, and derived tracked-root record.
+        assert_eq!(first.staged_deletes, 30);
+        assert_eq!(first.key_shared_buffers, 3);
+        assert_eq!(first.key_shared_bytes, 30 * 16);
+        assert_eq!(second.swept_commits, first.swept_commits);
+        assert_eq!(second.staged_deletes, first.staged_deletes);
     }
 }

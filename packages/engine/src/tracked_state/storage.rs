@@ -555,10 +555,13 @@ pub(crate) fn stage_commit_root(
     Ok(())
 }
 
-pub(crate) fn stage_delete_commit_root(writes: &mut StorageWriteSet, commit_id: CommitId) {
-    writes.delete(
+pub(crate) fn stage_delete_commit_roots(
+    writes: &mut StorageWriteSet,
+    commit_ids: impl IntoIterator<Item = CommitId>,
+) {
+    writes.delete_batch(
         TRACKED_STATE_COMMIT_ROOT_SPACE,
-        key(commit_root_key(commit_id)),
+        commit_ids.into_iter().map(commit_root_key),
     );
 }
 
@@ -752,12 +755,12 @@ pub(crate) fn stage_delete_change_locators(
     writes: &mut StorageWriteSet,
     change_ids: impl IntoIterator<Item = crate::changelog::ChangeId>,
 ) {
-    for change_id in change_ids {
-        writes.delete(
-            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
-            key(change_id.as_uuid().as_bytes().to_vec()),
-        );
-    }
+    writes.delete_batch(
+        TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+        change_ids
+            .into_iter()
+            .map(|change_id| change_id.as_uuid().as_bytes().to_vec()),
+    );
 }
 
 pub(crate) async fn load_change_record_by_id(

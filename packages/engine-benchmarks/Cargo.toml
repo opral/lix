@@ -152,6 +152,12 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "repository_gc_scale"
+path = "benches/repository_gc_scale.rs"
+harness = false
+required-features = ["storage-benches", "slatedb"]
+
+[[bench]]
 name = "fixed_live_history_scale"
 path = "benches/fixed_live_history_scale.rs"
 harness = false

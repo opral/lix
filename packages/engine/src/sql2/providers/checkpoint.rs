@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::LixError;
 use crate::branch::{BranchHead, BranchRefReader};
-use crate::checkpoint::{checkpoint_history_for_branch, scan_checkpoint_commit_records};
+use crate::checkpoint::checkpoint_history_for_branch;
 use crate::commit_graph::CommitGraphReader;
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::history_route::{HistoryRoute, parse_history_filter};
@@ -21,13 +21,6 @@ use crate::tracked_state::TrackedStateContext;
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::file::{FileIdConstraint, exact_string_column_constraint_from_filters};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
-
-// Keep small UI pages page-bounded on the point-walk path. At and above this
-// boundary, a paged scan avoids enough serial remote LSM reads to outweigh
-// materializing the retained record map. The cutoff is a conservative
-// cross-backend tradeoff; the scale harness covers LIMIT 20, 128, and full
-// history on both SlateDB and RocksDB.
-const CHECKPOINT_HISTORY_RECORD_SCAN_LIMIT: usize = 64;
 
 pub(super) async fn register_checkpoint_provider<S>(
     session: &datafusion::prelude::SessionContext,
@@ -151,23 +144,6 @@ where
                         } else {
                             None
                         };
-                    let record_scan_limit = depth_scan_limit.or(provider_limit);
-                    // An unbounded history (including COUNT(*)) would otherwise
-                    // point-read one commit record per checkpoint. Scan the
-                    // immutable commit records once and reuse the map for all
-                    // selected branch heads. Small UI pages retain the
-                    // page-bounded point-walk path.
-                    let checkpoint_records = if record_scan_limit
-                        .is_none_or(|limit| limit >= CHECKPOINT_HISTORY_RECORD_SCAN_LIMIT)
-                    {
-                        Some(
-                            scan_checkpoint_commit_records(store.clone())
-                                .await
-                                .map_err(lix_error_to_datafusion_error)?,
-                        )
-                    } else {
-                        None
-                    };
                     let mut reader = commit_graph.lock().await;
                     let mut tracked = TrackedStateContext::new().reader(store);
                     let mut rows = Vec::new();
@@ -184,7 +160,10 @@ where
                             &head.commit_id,
                             &head.branch_id,
                             head_scan_limit,
-                            checkpoint_records.as_ref(),
+                            // Checkpoint commits directly parent the previous
+                            // checkpoint. Follow that sparse chain instead of
+                            // retaining every unrelated public commit fact.
+                            None,
                         )
                         .await
                         .map_err(lix_error_to_datafusion_error)?
