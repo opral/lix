@@ -2557,12 +2557,13 @@ mod tests {
     };
 
     use super::{
-        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaManifest,
-        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
-        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
-        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
-        commit_delta_manifest_key, decode_commit_delta_manifest, decode_commit_delta_with_payloads,
-        decode_commit_root, encode_commit_delta_manifest, encode_commit_delta_segment,
+        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaChangeLocator,
+        CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
+        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, commit_delta_manifest_key,
+        decode_commit_delta_manifest, decode_commit_delta_with_payloads, decode_commit_root,
+        encode_commit_delta_manifest, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_root, key,
         load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
         load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
@@ -2731,7 +2732,7 @@ mod tests {
     #[test]
     fn change_locator_codec_compacts_sequential_ids_and_round_trips_fallback_ids() {
         let sequential = CommitDeltaChangeLocator {
-            change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_u128(
+            change_id: ChangeId::new(uuid::Uuid::from_u128(
                 0x0192_0000_0000_7000_8000_0000_0000_0101,
             )),
             commit_id: CommitId::new(uuid::Uuid::from_u128(
@@ -2748,7 +2749,7 @@ mod tests {
         );
 
         let fallback = CommitDeltaChangeLocator {
-            change_id: crate::changelog::ChangeId::new(uuid::Uuid::from_u128(u128::MAX)),
+            change_id: ChangeId::new(uuid::Uuid::from_u128(u128::MAX)),
             commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
             segment_index: u32::MAX,
             ordinal: 127,
