@@ -20,6 +20,7 @@ const OPERATIONS: &[Operation] = &[Operation::UniqueAppend, Operation::Duplicate
 const DEFAULT_HISTORY_COMMITS: &[usize] = &[1_000, 5_000];
 const DEFAULT_WARMUPS: usize = 5;
 const DEFAULT_SAMPLES: usize = 31;
+const DEFAULT_SEED_BATCH_COMMITS: usize = 100_000;
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -63,6 +64,11 @@ async fn run() {
     let histories = env_usizes("LIX_CHANGELOG_HISTORY_COMMITS", DEFAULT_HISTORY_COMMITS);
     let warmups = env_usize("LIX_CHANGELOG_HISTORY_WARMUPS", DEFAULT_WARMUPS);
     let samples = env_usize("LIX_CHANGELOG_HISTORY_SAMPLES", DEFAULT_SAMPLES).max(1);
+    let seed_batch_commits = env_usize(
+        "LIX_CHANGELOG_HISTORY_SEED_BATCH_COMMITS",
+        DEFAULT_SEED_BATCH_COMMITS,
+    )
+    .max(1);
 
     for &backend in BACKENDS {
         if !selected("LIX_CHANGELOG_HISTORY_BACKENDS", &backend.to_string()) {
@@ -73,7 +79,15 @@ async fn run() {
                 if !selected("LIX_CHANGELOG_HISTORY_OPERATIONS", &operation.to_string()) {
                     continue;
                 }
-                run_case(backend, history_commits, operation, warmups, samples).await;
+                run_case(
+                    backend,
+                    history_commits,
+                    operation,
+                    warmups,
+                    samples,
+                    seed_batch_commits,
+                )
+                .await;
             }
         }
     }
@@ -85,8 +99,9 @@ async fn run_case(
     operation: Operation,
     warmups: usize,
     samples: usize,
+    seed_batch_commits: usize,
 ) {
-    let mut fixture = Fixture::new(backend, history_commits).await;
+    let mut fixture = Fixture::new(backend, history_commits, seed_batch_commits).await;
     for _ in 0..warmups {
         let append = fixture.prepare(operation);
         black_box(fixture.execute(operation, append).await);
@@ -112,10 +127,11 @@ async fn run_case(
     let sample_count = u64::try_from(samples).expect("benchmark sample count should fit in u64");
 
     println!(
-        "changelog_history_append,backend={backend},operation={operation},history_commits={history_commits},warmups={warmups},samples={samples},\
-         stage_p50_us={},stage_p95_us={},stage_mean_us={},\
-         commit_p50_us={},commit_p95_us={},commit_mean_us={},\
-         total_p50_us={},total_p95_us={},total_mean_us={},\
+        "changelog_history_append,backend={backend},operation={operation},history_commits={history_commits},\
+         seed_batch_commits={seed_batch_commits},warmups={warmups},samples={samples},\
+         stage_p50_us={},stage_p95_us={},stage_p99_us={},stage_mean_us={},\
+         commit_p50_us={},commit_p95_us={},commit_p99_us={},commit_mean_us={},\
+         total_p50_us={},total_p95_us={},total_p99_us={},total_mean_us={},\
          get_many_calls_per_op={},get_many_keys_per_op={},\
          scan_calls_per_op={},scan_rows_per_op={},scan_value_bytes_per_op={},\
          put_batches_per_op={},puts_per_op={},write_bytes_per_op={},\
@@ -123,12 +139,15 @@ async fn run_case(
          commit_change_id_index_key_bytes={},commit_change_id_index_value_bytes={}",
         micros(percentile(&stage_timings, 50, 100)),
         micros(percentile(&stage_timings, 95, 100)),
+        micros(percentile(&stage_timings, 99, 100)),
         micros(mean(&stage_timings)),
         micros(percentile(&commit_timings, 50, 100)),
         micros(percentile(&commit_timings, 95, 100)),
+        micros(percentile(&commit_timings, 99, 100)),
         micros(mean(&commit_timings)),
         micros(percentile(&total_timings, 50, 100)),
         micros(percentile(&total_timings, 95, 100)),
+        micros(percentile(&total_timings, 99, 100)),
         micros(mean(&total_timings)),
         io.get_many_calls / sample_count,
         io.get_many_keys / sample_count,
@@ -362,34 +381,53 @@ impl<S> BackendFixture<S>
 where
     S: Storage + Clone,
 {
-    async fn create(storage: S, temp_dir: TempDir, history_commits: usize) -> Self {
+    async fn create(
+        storage: S,
+        temp_dir: TempDir,
+        history_commits: usize,
+        seed_batch_commits: usize,
+    ) -> Self {
         let (storage, stats) = CountingStorage::new(storage);
         let history_name = "changelog-history";
-        let history =
-            changelog_bench::append_with_shape(history_name, history_commits, history_commits)
-                .expect("build changelog history append");
-        let store = changelog_bench::prepare_store(storage, &history)
+        let first_batch_name = format!("{history_name}-batch-0");
+        let first_batch_commits = history_commits.min(seed_batch_commits);
+        let first_batch = changelog_bench::append_with_shape(
+            &first_batch_name,
+            first_batch_commits,
+            first_batch_commits,
+        )
+        .expect("build first changelog history seed batch");
+        let store = changelog_bench::prepare_store(storage, &first_batch)
             .await
-            .expect("seed changelog history append");
-        let seed_layout = changelog_bench::layout_accounting(&store)
-            .await
-            .expect("measure changelog history layout")
-            .into_iter()
-            .find(|space| space.space == "changelog.commit_change_id")
-            .unwrap_or(StorageLayoutAccounting {
-                space_id: 0x0006_0004,
-                space: "changelog.commit_change_id",
-                rows: 0,
-                key_bytes: 0,
-                value_bytes: 0,
-            });
+            .expect("seed first changelog history batch");
+        drop(first_batch);
+        let mut seeded_commits = first_batch_commits;
+        let mut batch_index = 1usize;
+        while seeded_commits < history_commits {
+            let batch_commits = (history_commits - seeded_commits).min(seed_batch_commits);
+            let batch = changelog_bench::append_with_shape(
+                &format!("{history_name}-batch-{batch_index}"),
+                batch_commits,
+                batch_commits,
+            )
+            .expect("build changelog history seed batch");
+            changelog_bench::stage_append_to_store(&store, &batch)
+                .await
+                .expect("seed changelog history batch");
+            seeded_commits += batch_commits;
+            batch_index += 1;
+        }
+        let seed_layout =
+            changelog_bench::layout_space_accounting(&store, "changelog.commit_change_id")
+                .await
+                .expect("measure changelog change-ID layout");
         *stats.lock().expect("io stats mutex") = IoStats::default();
         Self {
             store,
             _temp_dir: temp_dir,
             stats,
             seed_layout,
-            history_commit_change_id: format!("{history_name}-commit-0:commit"),
+            history_commit_change_id: format!("{first_batch_name}-commit-0:commit"),
             version: 0,
         }
     }
@@ -453,7 +491,7 @@ enum Fixture {
 }
 
 impl Fixture {
-    async fn new(backend: Backend, history_commits: usize) -> Self {
+    async fn new(backend: Backend, history_commits: usize, seed_batch_commits: usize) -> Self {
         let temp_dir = tempfile::tempdir().expect("create changelog history benchmark directory");
         let database_path = temp_dir.path().join("database");
         match backend {
@@ -462,6 +500,7 @@ impl Fixture {
                     RocksDB::open(&database_path).expect("open benchmark RocksDB"),
                     temp_dir,
                     history_commits,
+                    seed_batch_commits,
                 )
                 .await,
             ),
@@ -470,6 +509,7 @@ impl Fixture {
                     SlateDB::open(&database_path).expect("open benchmark SlateDB"),
                     temp_dir,
                     history_commits,
+                    seed_batch_commits,
                 )
                 .await,
             ),

@@ -428,6 +428,20 @@ where
     Ok(crate::storage_bench::layout_accounting(&read).await)
 }
 
+pub async fn layout_space_accounting<StorageImpl>(
+    store: &BenchStore<StorageImpl>,
+    space_name: &str,
+) -> Result<crate::storage_bench::StorageLayoutAccounting, LixError>
+where
+    StorageImpl: BenchStorage + Sync,
+{
+    let read = store
+        .storage
+        .begin_read(StorageReadOptions::default())
+        .await?;
+    Ok(crate::storage_bench::layout_space_accounting(&read, space_name).await)
+}
+
 pub async fn stage_corpus_once<StorageImpl>(
     storage: StorageImpl,
     corpus: &BenchCorpus,
