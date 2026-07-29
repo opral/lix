@@ -64,7 +64,7 @@ simulation_test!(
             session
                 .execute(
                     "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                     VALUES ('6d657461-6461-8461-8d64-69722d696e00', '/6d657461-6461-8461-8d64-69722d696e00/', '{bad')",
+                     VALUES ('6d657461-6461-8461-8d64-69722d696e00', '/6d657461-6461-8461-8d64-69722d696e00', '{bad')",
                     &[],
                 )
                 .await
@@ -74,7 +74,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('6d657461-6461-8461-8d64-69722d757000', '/6d657461-6461-8461-8d64-69722d757000/')",
+                 VALUES ('6d657461-6461-8461-8d64-69722d757000', '/6d657461-6461-8461-8d64-69722d757000')",
                 &[],
             )
             .await
@@ -131,7 +131,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                 VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700/', $1)",
+                 VALUES ('6d657461-6461-8461-8d6e-6172726f7700', '/6d657461-6461-8461-8d6e-6172726f7700', $1)",
                 &[Value::Json(directory_metadata.clone())],
             )
             .await

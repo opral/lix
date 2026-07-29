@@ -207,7 +207,7 @@ fn analyze_engine_dependency_graph() -> EngineDependencyGraph {
         for absolute_path in rust_files_for_top_level_module(module_name) {
             let relative_path = absolute_path
                 .strip_prefix(src_root())
-                .expect("module source file should be inside src/")
+                .expect("module source file should be inside src")
                 .to_string_lossy()
                 .replace('\\', "/");
             if is_test_support_relative_path(&relative_path) {
@@ -1243,7 +1243,7 @@ fn production_source_files() -> Vec<(String, String)> {
         for absolute_path in rust_files_for_top_level_module(&module_name) {
             let relative_path = absolute_path
                 .strip_prefix(src_root())
-                .expect("module source file should be inside src/")
+                .expect("module source file should be inside src")
                 .to_string_lossy()
                 .replace('\\', "/");
             if is_test_support_relative_path(&relative_path) {
@@ -1946,10 +1946,10 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
 }
 
 fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
-    let in_scope_owner_root = relative_path.starts_with("live_state/")
-        || relative_path.starts_with("canonical/")
-        || relative_path.starts_with("binary_cas/")
-        || relative_path.starts_with("session/branch_ops/");
+    let in_scope_owner_root = relative_path.starts_with("live_state")
+        || relative_path.starts_with("canonical")
+        || relative_path.starts_with("binary_cas")
+        || relative_path.starts_with("session/branch_ops");
     let is_allowed_adapter_surface = relative_path.ends_with("/store.rs")
         || relative_path.ends_with("/store_sql.rs")
         || relative_path.ends_with("/storage.rs");
@@ -2031,9 +2031,9 @@ fn current_engine_owned_persistence_raw_storage_type_violations() -> Vec<RawStor
 }
 
 fn is_owner_persistence_root_path(relative_path: &str) -> bool {
-    relative_path.starts_with("live_state/")
-        || relative_path.starts_with("canonical/")
-        || relative_path.starts_with("binary_cas/")
+    relative_path.starts_with("live_state")
+        || relative_path.starts_with("canonical")
+        || relative_path.starts_with("binary_cas")
 }
 
 fn is_owner_sql_adapter_path(relative_path: &str) -> bool {
@@ -2082,7 +2082,7 @@ fn current_storage_import_outside_storage_adapter_violations() -> Vec<ImportPath
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if relative_path.starts_with("storage/") || relative_path.starts_with("storage_adapter/") {
+        if relative_path.starts_with("storage") || relative_path.starts_with("storage_adapter") {
             continue;
         }
 
@@ -2173,8 +2173,8 @@ fn is_owner_local_storage_path(relative_path: &str) -> bool {
 
 fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
     is_owner_local_storage_path(relative_path)
-        || relative_path.starts_with("sql/")
-        || relative_path.starts_with("execution/")
+        || relative_path.starts_with("sql")
+        || relative_path.starts_with("execution")
         || relative_path == "transaction/buffered_write_transaction.rs"
         || relative_path == "transaction/live_state_write_transaction.rs"
 }
@@ -2207,10 +2207,10 @@ fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations()
 }
 
 fn is_orchestration_runtime_path(relative_path: &str) -> bool {
-    relative_path.starts_with("api/")
-        || relative_path.starts_with("init/")
-        || relative_path.starts_with("session/")
-        || relative_path.starts_with("transaction/")
+    relative_path.starts_with("api")
+        || relative_path.starts_with("init")
+        || relative_path.starts_with("session")
+        || relative_path.starts_with("transaction")
 }
 
 fn current_scattered_internal_metadata_crud_outside_owner_storage_violations()
@@ -2281,7 +2281,7 @@ fn current_shared_persistence_root_files() -> Vec<String> {
         .into_iter()
         .filter_map(|(relative_path, _)| {
             relative_path
-                .starts_with("persistence/")
+                .starts_with("persistence")
                 .then_some(relative_path)
         })
         .collect()
@@ -2296,7 +2296,7 @@ fn current_sql2_datafusion_physical_execution_owner_violations() -> Vec<SqlRunti
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if !relative_path.starts_with("sql2/") || is_sql2_runtime_owner_path(&relative_path) {
+        if !relative_path.starts_with("sql2") || is_sql2_runtime_owner_path(&relative_path) {
             continue;
         }
 
@@ -2324,7 +2324,7 @@ fn current_sql2_data_sink_exec_violations() -> Vec<SqlRuntimeOwnershipViolation>
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if !relative_path.starts_with("sql2/") {
+        if !relative_path.starts_with("sql2") {
             continue;
         }
 
@@ -2347,7 +2347,7 @@ fn current_session_transaction_commit_boundary_violations() -> Vec<RawSqlExecuti
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if !(relative_path.starts_with("session/") || relative_path.starts_with("transaction/")) {
+        if !(relative_path.starts_with("session") || relative_path.starts_with("transaction")) {
             continue;
         }
 
@@ -2378,7 +2378,7 @@ fn current_schema_catalog_dependency_violations() -> Vec<ImportPathViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if !relative_path.starts_with("schema/") {
+        if !relative_path.starts_with("schema") {
             continue;
         }
 
@@ -2405,7 +2405,7 @@ fn current_schema_invalid_param_violations() -> Vec<RawSqlExecutionViolation> {
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {
-        if !relative_path.starts_with("schema/") {
+        if !relative_path.starts_with("schema") {
             continue;
         }
 
@@ -2701,7 +2701,7 @@ fn sql2_public_boundary_does_not_reintroduce_stringly_validation() {
     let mut violations = Vec::new();
 
     for (relative_path, source) in production_source_files() {
-        if !relative_path.starts_with("sql2/") {
+        if !relative_path.starts_with("sql2") {
             continue;
         }
         let stripped = strip_test_code(&source);

@@ -281,8 +281,8 @@ async fn git_text_plugin_rejects_path_only_moves_of_derived_files() {
         .execute(
             "UPDATE lix_directory SET path = $1 WHERE path = $2",
             &[
-                Value::Text("/new/".to_owned()),
-                Value::Text("/old/".to_owned()),
+                Value::Text("/new".to_owned()),
+                Value::Text("/old".to_owned()),
             ],
         )
         .await

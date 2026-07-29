@@ -645,7 +645,7 @@ test("importPaths validates paths and requires an opened storage", async () => {
 	const lix = await openLix({ storage });
 	await expect(storage.importPaths([""])).rejects.toThrow("non-empty strings");
 	await expect(storage.importPaths(["docs/"])).rejects.toThrow(
-		"file paths, not directory paths",
+		"must not end with a trailing slash",
 	);
 	await lix.close();
 	await expect(storage.importPaths(["note.md"])).rejects.toThrow(
@@ -784,7 +784,7 @@ test("fs storage on-demand sync does not create directories for missing imports"
 
 	const directories = await lix.execute(
 		"SELECT path FROM lix_directory WHERE path = $1",
-		["/missing/"],
+		["/missing"],
 	);
 	expect(directories.rows).toHaveLength(0);
 	expect(existsSync(join(dir, "missing"))).toBe(false);
@@ -984,9 +984,9 @@ test.skipIf(process.platform === "win32")(
 
 		const directories = await lix.execute(
 			"SELECT path FROM lix_directory WHERE path IN ($1, $2) ORDER BY path",
-			["/docs/", "/linked-docs/"],
+			["/docs", "/linked-docs"],
 		);
-		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs/"]);
+		expect(directories.rows.map((row) => row.get("path"))).toEqual(["/docs"]);
 		await lix.close();
 	},
 );

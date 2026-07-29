@@ -856,7 +856,7 @@ async fn filesystem_initial_import_uses_local_files_as_source_of_truth() {
             .as_deref(),
         Some(b"local".as_slice())
     );
-    assert!(readdir(&lix, "/empty/").await.unwrap().unwrap().is_empty());
+    assert!(readdir(&lix, "/empty").await.unwrap().unwrap().is_empty());
     assert_eq!(
         std::fs::read(tempdir.path().join("docs/readme.txt")).unwrap(),
         b"local"
@@ -1222,9 +1222,9 @@ async fn filesystem_initial_import_ignores_git_entries() {
             .as_deref(),
         Some(b"normal".as_slice())
     );
-    assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/.git").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/nested/.git/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/nested/.git").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/nested/.git/config").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
     assert!(tempdir.path().join(".git/config").is_file());
@@ -1263,7 +1263,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     write_file(&seed, "/old.txt", b"old".to_vec())
         .await
         .unwrap();
-    mkdir(&seed, "/old-empty/").await.unwrap();
+    mkdir(&seed, "/old-empty").await.unwrap();
     seed.close().await.unwrap();
     std::fs::remove_file(tempdir.path().join("old.txt")).unwrap();
     std::fs::remove_dir(tempdir.path().join("old-empty")).unwrap();
@@ -1271,7 +1271,7 @@ async fn filesystem_initial_import_deletes_lix_entries_missing_locally() {
     let lix = open_lix_with_filesystem(tempdir.path()).await;
 
     assert_eq!(read_file(&lix, "/old.txt").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/old-empty/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/old-empty").await.unwrap(), None);
     assert!(!tempdir.path().join("old.txt").exists());
     assert!(!tempdir.path().join("old-empty").exists());
     lix.close().await.unwrap();
@@ -1292,7 +1292,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     );
     wait_for_lix_file(&lix, "/pending-local.txt", Some(b"pending")).await;
 
-    mkdir(&lix, "/empty-sdk/").await.unwrap();
+    mkdir(&lix, "/empty-sdk").await.unwrap();
     assert!(tempdir.path().join("empty-sdk").is_dir());
 
     lix.execute(
@@ -1339,7 +1339,7 @@ async fn filesystem_materializes_sdk_sql_and_transaction_writes() {
     .unwrap();
     wait_for_disk_file(&tempdir.path().join("sql.txt"), None);
 
-    rm(&lix, "/empty-sdk/").await.unwrap();
+    rm(&lix, "/empty-sdk").await.unwrap();
     assert!(!tempdir.path().join("empty-sdk").exists());
     lix.close().await.unwrap();
 }
@@ -1459,7 +1459,7 @@ async fn filesystem_materializes_untracked_sdk_sql_writes() {
         "INSERT INTO lix_directory (id, path, lixcol_untracked) VALUES ($1, $2, true)",
         &[
             Value::Text("01920000-0000-7000-8000-000000000512".to_string()),
-            Value::Text("/untracked-dir/".to_string()),
+            Value::Text("/untracked-dir".to_string()),
         ],
     )
     .await
@@ -1482,13 +1482,13 @@ async fn filesystem_watcher_syncs_disk_changes_to_lix() {
     wait_for_lix_file(&lix, "/disk.txt", Some(b"changed")).await;
 
     std::fs::create_dir(tempdir.path().join("empty-disk")).unwrap();
-    wait_for_lix_directory(&lix, "/empty-disk/", true).await;
+    wait_for_lix_directory(&lix, "/empty-disk", true).await;
 
     std::fs::remove_file(tempdir.path().join("disk.txt")).unwrap();
     wait_for_lix_file(&lix, "/disk.txt", None).await;
 
     std::fs::remove_dir(tempdir.path().join("empty-disk")).unwrap();
-    wait_for_lix_directory(&lix, "/empty-disk/", false).await;
+    wait_for_lix_directory(&lix, "/empty-disk", false).await;
     lix.close().await.unwrap();
 }
 
@@ -1505,7 +1505,7 @@ async fn filesystem_watcher_ignores_git_entries_created_after_open() {
     std::fs::write(tempdir.path().join("marker.txt"), b"marker").unwrap();
 
     wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
-    assert_eq!(readdir(&lix, "/.git/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/.git").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/.git/config").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/docs/.git").await.unwrap(), None);
     lix.close().await.unwrap();
@@ -1603,7 +1603,7 @@ async fn filesystem_ignores_symlinks_on_initial_import() {
         Some(b"nested".as_slice())
     );
     assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
     assert!(
         std::fs::symlink_metadata(tempdir.path().join("link.txt"))
@@ -1675,7 +1675,7 @@ async fn filesystem_watcher_ignores_symlinks_created_after_open() {
 
     wait_for_lix_file(&lix, "/marker.txt", Some(b"marker")).await;
     assert_eq!(read_file(&lix, "/link.txt").await.unwrap(), None);
-    assert_eq!(readdir(&lix, "/linked-dir/").await.unwrap(), None);
+    assert_eq!(readdir(&lix, "/linked-dir").await.unwrap(), None);
     assert_eq!(read_file(&lix, "/linked-dir/file.txt").await.unwrap(), None);
     lix.close().await.unwrap();
 }

@@ -8,8 +8,8 @@
 //!
 //! Slash path shape:
 //!
-//! - File paths never end with `/`.
-//! - Directory paths always end with `/`.
+//! - Non-root paths never end with `/`; entity kind is carried by the typed
+//!   file or directory surface rather than encoded in path text.
 //! - Empty, `.`, and `..` segments are rejected because they do not name stable
 //!   Lix filesystem entries.
 //! - `/` is only a separator, so a standalone segment cannot contain `/`.
@@ -25,9 +25,8 @@
 //!
 //! - Raw input path: caller-provided path before structural parsing.
 //! - Path text: path after structural parsing; segment text is unchanged.
-//! - File path: slash-rendered path naming a file, without a trailing slash.
-//! - Directory path: slash-rendered path naming a directory, with a trailing
-//!   slash.
+//! - File path: slash-rendered path naming a file.
+//! - Directory path: slash-rendered path naming a directory.
 //! - Internal path form: the Unicode-bearing representation used by the engine.
 
 #![allow(
@@ -53,7 +52,7 @@ impl LixPath {
             return Err(PathError::InvalidRootUsage.into_lix_error());
         }
         if path.ends_with('/') {
-            return Err(PathError::UnexpectedTrailingSlashOnFilePath.into_lix_error());
+            return Err(PathError::UnexpectedTrailingSlash.into_lix_error());
         }
         path.split('/')
             .try_for_each(validate_segment)
@@ -68,11 +67,10 @@ impl LixPath {
             return Err(PathError::MissingLeadingSlash.into_lix_error());
         };
         if !path.is_empty() {
-            let Some(path_) = path.strip_suffix('/') else {
-                return Err(PathError::MissingTrailingSlashOnDirectoryPath.into_lix_error());
-            };
-            path_
-                .split('/')
+            if path.ends_with('/') {
+                return Err(PathError::UnexpectedTrailingSlash.into_lix_error());
+            }
+            path.split('/')
                 .try_for_each(validate_segment)
                 .map_err(PathError::into_lix_error)?;
         }
@@ -85,7 +83,7 @@ impl LixPath {
         (!self.segments.is_empty())
             .then_some(&self.segments)
             .into_iter()
-            .flat_map(|segments| segments.strip_suffix('/').unwrap_or(segments).split('/'))
+            .flat_map(|segments| segments.split('/'))
     }
 }
 
@@ -103,8 +101,7 @@ fn validate_segment(segment: &str) -> PathResult<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PathError {
     MissingLeadingSlash,
-    UnexpectedTrailingSlashOnFilePath,
-    MissingTrailingSlashOnDirectoryPath,
+    UnexpectedTrailingSlash,
     EmptySegment,
     DotSegment,
     SlashInSegment,
@@ -120,15 +117,10 @@ impl PathError {
                 "path must start with '/'",
                 Some("prefix the path with '/'"),
             ),
-            Self::UnexpectedTrailingSlashOnFilePath => (
-                "LIX_ERROR_PATH_UNEXPECTED_TRAILING_SLASH_ON_FILE",
-                "file path must not end with '/'",
-                Some("remove the trailing slash or use a directory path instead"),
-            ),
-            Self::MissingTrailingSlashOnDirectoryPath => (
-                "LIX_ERROR_PATH_MISSING_TRAILING_SLASH_ON_DIRECTORY",
-                "directory path must end with '/'",
-                Some("append a trailing slash or use a file path instead"),
+            Self::UnexpectedTrailingSlash => (
+                "LIX_ERROR_PATH_UNEXPECTED_TRAILING_SLASH",
+                "non-root path must not end with '/'",
+                Some("remove the trailing slash"),
             ),
             Self::EmptySegment => (
                 "LIX_ERROR_PATH_EMPTY_SEGMENT",
@@ -152,8 +144,8 @@ impl PathError {
             ),
             Self::InvalidDirectoryParentPath => (
                 "LIX_ERROR_PATH_INVALID_DIRECTORY_PARENT",
-                "directory parent path must be '/' or end with '/'",
-                Some("pass '/' or a path ending with '/' as the parent directory"),
+                "directory parent path must be absolute and must not end with '/'",
+                Some("pass '/' or a canonical directory path without a trailing slash"),
             ),
         };
 
@@ -186,8 +178,8 @@ pub(crate) fn compose_file_path(
     let parent_path = directory_path.unwrap_or("/");
     if parent_path == "/" {
         Ok(format!("/{name_text}"))
-    } else if parent_path.starts_with('/') && parent_path.ends_with('/') {
-        Ok(format!("{parent_path}{name_text}"))
+    } else if parent_path.starts_with('/') && !parent_path.ends_with('/') {
+        Ok(format!("{parent_path}/{name_text}"))
     } else {
         Err(PathError::InvalidDirectoryParentPath.into_lix_error())
     }
@@ -200,9 +192,9 @@ pub(crate) fn compose_directory_path(
     let name_text = renderable_segment_text(name).map_err(PathError::into_lix_error)?;
     let parent_path = parent_path.unwrap_or("/");
     if parent_path == "/" {
-        Ok(format!("/{name_text}/"))
-    } else if parent_path.starts_with('/') && parent_path.ends_with('/') {
-        Ok(format!("{parent_path}{name_text}/"))
+        Ok(format!("/{name_text}"))
+    } else if parent_path.starts_with('/') && !parent_path.ends_with('/') {
+        Ok(format!("{parent_path}/{name_text}"))
     } else {
         Err(PathError::InvalidDirectoryParentPath.into_lix_error())
     }

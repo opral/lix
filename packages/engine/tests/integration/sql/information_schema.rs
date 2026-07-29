@@ -773,7 +773,7 @@ simulation_test!(
             .expect("omitted file id should generate");
         session
             .execute(
-                "INSERT INTO lix_directory (path) VALUES ('/generated/')",
+                "INSERT INTO lix_directory (path) VALUES ('/generated')",
                 &[],
             )
             .await
@@ -791,7 +791,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (path) \
-                 SELECT '/query-generated/' \
+                 SELECT '/query-generated' \
                  FROM information_schema.tables \
                  WHERE table_name = 'lix_directory'",
                 &[],
@@ -871,14 +871,14 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (path) VALUES ('/excluded-directory-id/')",
+                "INSERT INTO lix_directory (path) VALUES ('/excluded-directory-id')",
                 &[],
             )
             .await
             .expect("directory id default seed should insert");
         let directory_before = session
             .execute(
-                "SELECT id FROM lix_directory WHERE path = '/excluded-directory-id/'",
+                "SELECT id FROM lix_directory WHERE path = '/excluded-directory-id'",
                 &[],
             )
             .await
@@ -889,7 +889,7 @@ simulation_test!(
         let directory_id = directory_id.clone();
         session
             .execute(
-                "INSERT INTO lix_directory (path) VALUES ('/excluded-directory-id/') \
+                "INSERT INTO lix_directory (path) VALUES ('/excluded-directory-id') \
                  ON CONFLICT (path) DO UPDATE SET name = excluded.id",
                 &[],
             )
@@ -1000,7 +1000,7 @@ simulation_test!(
 
         let query_generated_directory = session
             .execute(
-                "SELECT id FROM lix_directory WHERE path = '/query-generated/'",
+                "SELECT id FROM lix_directory WHERE path = '/query-generated'",
                 &[],
             )
             .await
@@ -1035,7 +1035,7 @@ simulation_test!(
                 LixError::CODE_TYPE_MISMATCH,
             ),
             (
-                "INSERT INTO lix_directory (id, path) VALUES (NULL, '/null-id/')",
+                "INSERT INTO lix_directory (id, path) VALUES (NULL, '/null-id')",
                 LixError::CODE_TYPE_MISMATCH,
             ),
             (
@@ -1044,7 +1044,7 @@ simulation_test!(
             ),
             (
                 "INSERT INTO lix_directory (id, path) \
-                 SELECT NULL, '/query-null-id/' \
+                 SELECT NULL, '/query-null-id' \
                  FROM information_schema.tables \
                  WHERE table_name = 'lix_directory'",
                 LixError::CODE_TYPE_MISMATCH,
@@ -1074,9 +1074,9 @@ simulation_test!(
             "INSERT INTO lix_file (path, lixcol_untracked) \
              VALUES ('/null-untracked-file.txt', NULL)",
             "INSERT INTO lix_directory (path, lixcol_global) \
-             VALUES ('/null-global-directory/', NULL)",
+             VALUES ('/null-global-directory', NULL)",
             "INSERT INTO lix_directory (path, lixcol_untracked) \
-             VALUES ('/null-untracked-directory/', NULL)",
+             VALUES ('/null-untracked-directory', NULL)",
         ] {
             let error = session
                 .execute(sql, &[])

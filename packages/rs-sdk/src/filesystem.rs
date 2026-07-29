@@ -60,19 +60,15 @@ impl FilesystemLayout {
         }
     }
 
-    fn local_path_to_lix_path(&self, path: &Path, is_directory: bool) -> Result<String, LixError> {
+    fn local_path_to_lix_path(&self, path: &Path) -> Result<String, LixError> {
         if path.starts_with(&self.lix_dir) {
-            let path = local_path_to_lix_path(&self.lix_dir, path, is_directory)?;
+            let path = local_path_to_lix_path(&self.lix_dir, path)?;
             if path == "/" {
-                return Ok(if is_directory {
-                    "/.lix/".to_string()
-                } else {
-                    "/.lix".to_string()
-                });
+                return Ok("/.lix".to_string());
             }
             return Ok(format!("/.lix{path}"));
         }
-        local_path_to_lix_path(&self.root, path, is_directory)
+        local_path_to_lix_path(&self.root, path)
     }
 
     fn local_base_for_path(&self, path: &Path) -> Option<&Path> {
@@ -272,11 +268,7 @@ impl FilesystemPathFilter {
     }
 
     fn includes_path(&self, path: &str) -> bool {
-        if path.ends_with('/') {
-            self.includes_directory(path)
-        } else {
-            self.includes_file(path)
-        }
+        self.includes_file(path) || self.includes_directory(path)
     }
 
     fn local_watch_paths(&self, layout: &FilesystemLayout) -> Result<Vec<PathBuf>, LixError> {
@@ -1541,14 +1533,14 @@ fn collect_local_directory_shallow(
             continue;
         }
         if file_type.is_dir() {
-            let Ok(lix_path) = layout.local_path_to_lix_path(&path, true) else {
+            let Ok(lix_path) = layout.local_path_to_lix_path(&path) else {
                 remember_unmanaged_local_path(layout, directory, &path, snapshot);
                 continue;
             };
             snapshot.directories.insert(lix_path);
             child_dirs.push(path);
         } else if file_type.is_file() {
-            let Ok(lix_path) = layout.local_path_to_lix_path(&path, false) else {
+            let Ok(lix_path) = layout.local_path_to_lix_path(&path) else {
                 remember_unmanaged_local_path(layout, directory, &path, snapshot);
                 continue;
             };
@@ -1630,7 +1622,7 @@ fn collect_lix_directory_snapshot(
     layout: &FilesystemLayout,
     snapshot: &mut Snapshot,
 ) -> Result<(), LixError> {
-    snapshot.directories.insert("/.lix/".to_string());
+    snapshot.directories.insert("/.lix".to_string());
     let child_dirs = collect_local_directory_shallow(layout, &layout.lix_dir, snapshot)?;
     let child_snapshot = collect_local_child_directories(layout, child_dirs)?;
     merge_snapshot(snapshot, child_snapshot);
@@ -1643,10 +1635,10 @@ fn remember_unmanaged_local_path(
     path: &Path,
     snapshot: &mut Snapshot,
 ) {
-    if let Ok(lix_path) = layout.local_path_to_lix_path(path, false) {
+    if let Ok(lix_path) = layout.local_path_to_lix_path(path) {
         snapshot.unmanaged_paths.insert(lix_path);
     } else if layout.local_base_for_path(directory) != Some(directory) {
-        if let Ok(parent_path) = layout.local_path_to_lix_path(directory, true) {
+        if let Ok(parent_path) = layout.local_path_to_lix_path(directory) {
             snapshot.unmanaged_paths.insert(parent_path);
         }
     }
@@ -1940,8 +1932,6 @@ fn snapshot_unmanaged_blocks_lix_path(snapshot: Option<&Snapshot>, path: &str) -
 }
 
 fn unmanaged_path_blocks_lix_path(unmanaged_path: &str, path: &str) -> bool {
-    let unmanaged_path = unmanaged_path.strip_suffix('/').unwrap_or(unmanaged_path);
-    let path = path.strip_suffix('/').unwrap_or(path);
     path == unmanaged_path
         || path
             .strip_prefix(unmanaged_path)
@@ -1986,11 +1976,7 @@ fn is_unmanaged_file_type(file_type: &std::fs::FileType) -> bool {
     file_type.is_symlink() || (!file_type.is_file() && !file_type.is_dir())
 }
 
-fn local_path_to_lix_path(
-    root: &Path,
-    path: &Path,
-    is_directory: bool,
-) -> Result<String, LixError> {
+fn local_path_to_lix_path(root: &Path, path: &Path) -> Result<String, LixError> {
     let relative = path.strip_prefix(root).map_err(|error| {
         let path = path.display();
         let root = root.display();
@@ -2015,11 +2001,7 @@ fn local_path_to_lix_path(
     if segments.is_empty() {
         return Ok("/".to_string());
     }
-    let mut lix_path = format!("/{}", segments.join("/"));
-    if is_directory {
-        lix_path.push('/');
-    }
-    Ok(lix_path)
+    Ok(format!("/{}", segments.join("/")))
 }
 
 fn normalize_filter_file_path(path: &str) -> Result<String, LixError> {
@@ -2052,14 +2034,12 @@ fn parent_lix_directory_path(path: &str) -> String {
     if index == 0 {
         "/".to_string()
     } else {
-        format!("{}/", &path[..index])
+        path[..index].to_string()
     }
 }
 
 fn lix_directory_contains_directory(parent: &str, child: &str) -> bool {
-    let parent = parent.trim_end_matches('/');
-    let child = child.trim_end_matches('/');
-    if parent.is_empty() {
+    if parent == "/" {
         return true;
     }
     child == parent
@@ -2073,7 +2053,7 @@ fn insert_parent_lix_directories(path: &str, snapshot: &mut Snapshot) {
     let mut directories = Vec::new();
     while directory != "/" {
         directories.push(directory.clone());
-        let parent = parent_lix_directory_path(directory.trim_end_matches('/'));
+        let parent = parent_lix_directory_path(&directory);
         if parent == directory {
             break;
         }
@@ -2090,7 +2070,6 @@ fn lix_path_to_local_path(root: &Path, path: &str) -> Result<PathBuf, LixError> 
     let body = path
         .strip_prefix('/')
         .ok_or_else(|| filesystem_error(format!("Lix path {path:?} is not absolute")))?;
-    let body = body.strip_suffix('/').unwrap_or(body);
     if body.is_empty() {
         return Ok(root.to_path_buf());
     }
@@ -2129,7 +2108,6 @@ fn is_plugin_storage_path(path: &str) -> bool {
 
 fn is_filesystem_metadata_path(path: &str) -> bool {
     path == "/.lix/.gitignore"
-        || path == "/.lix/.gitignore/"
         || is_filesystem_internal_path(path)
         || is_legacy_filesystem_metadata_path(path)
 }
@@ -2139,7 +2117,6 @@ fn is_filesystem_internal_path(path: &str) -> bool {
 }
 
 fn is_legacy_filesystem_metadata_path(path: &str) -> bool {
-    let path = path.strip_suffix('/').unwrap_or(path);
     path == "/.lix_system"
         || path.starts_with("/.lix_system/")
         || path
@@ -2154,7 +2131,7 @@ fn is_legacy_filesystem_sqlite_metadata_name(name: &str) -> bool {
 fn is_filesystem_sync_ignored_local_path(layout: &FilesystemLayout, path: &Path) -> bool {
     if path.starts_with(&layout.lix_dir) {
         return layout
-            .local_path_to_lix_path(path, path.is_dir())
+            .local_path_to_lix_path(path)
             .is_ok_and(|path| is_filesystem_sync_ignored_lix_path(&path));
     }
 
@@ -2190,7 +2167,6 @@ fn is_filesystem_sync_ignored_lix_path(path: &str) -> bool {
 }
 
 fn is_lix_storage_path(path: &str) -> bool {
-    let path = path.strip_suffix('/').unwrap_or(path);
     path == "/.lix" || path.starts_with("/.lix/")
 }
 
@@ -2581,17 +2557,36 @@ mod tests {
         let root = Path::new("root");
 
         assert_eq!(
-            local_path_to_lix_path(root, &root.join("bad%name.txt"), false).unwrap(),
+            local_path_to_lix_path(root, &root.join("bad%name.txt")).unwrap(),
             "/bad%name.txt"
         );
         assert_eq!(
-            local_path_to_lix_path(root, &root.join("#hash?.txt"), false).unwrap(),
+            local_path_to_lix_path(root, &root.join("#hash?.txt")).unwrap(),
             "/#hash?.txt"
         );
         assert_eq!(
-            local_path_to_lix_path(root, &root.join("dir%23"), true).unwrap(),
-            "/dir%23/"
+            local_path_to_lix_path(root, &root.join("dir%23")).unwrap(),
+            "/dir%23"
         );
+    }
+
+    #[test]
+    fn canonical_directory_containment_uses_segment_boundaries() {
+        assert!(lix_directory_contains_directory("/", "/docs"));
+        assert!(lix_directory_contains_directory("/docs", "/docs"));
+        assert!(lix_directory_contains_directory("/docs", "/docs/guides"));
+        assert!(!lix_directory_contains_directory("/docs", "/docs-old"));
+        assert!(!lix_directory_contains_directory("/docs", "/doc"));
+    }
+
+    #[test]
+    fn unmanaged_paths_block_only_the_same_path_or_descendants() {
+        assert!(unmanaged_path_blocks_lix_path("/docs", "/docs"));
+        assert!(unmanaged_path_blocks_lix_path("/docs", "/docs/readme.md"));
+        assert!(!unmanaged_path_blocks_lix_path(
+            "/docs",
+            "/docs-old/readme.md"
+        ));
     }
 
     #[cfg(unix)]
@@ -2600,7 +2595,7 @@ mod tests {
         let root = Path::new("root");
 
         assert_eq!(
-            local_path_to_lix_path(root, &root.join(r"a\b.txt"), false).unwrap(),
+            local_path_to_lix_path(root, &root.join(r"a\b.txt")).unwrap(),
             r"/a\b.txt"
         );
         assert_eq!(
@@ -2659,11 +2654,11 @@ mod tests {
         assert!(snapshot.directories.contains("/"));
         assert_eq!(snapshot.files.get("/root.txt").unwrap(), b"root");
         for index in 0..FILESYSTEM_PARALLEL_SNAPSHOT_MIN_DIRS {
-            assert!(snapshot.directories.contains(&format!("/dir-{index}/")));
+            assert!(snapshot.directories.contains(&format!("/dir-{index}")));
             assert!(
                 snapshot
                     .directories
-                    .contains(&format!("/dir-{index}/nested/"))
+                    .contains(&format!("/dir-{index}/nested"))
             );
             assert_eq!(
                 snapshot
@@ -2708,11 +2703,11 @@ mod tests {
 
         assert!(!path_filter.is_unfiltered());
         assert!(snapshot.directories.contains("/"));
-        assert!(!snapshot.directories.contains("/docs/"));
+        assert!(!snapshot.directories.contains("/docs"));
         assert!(!snapshot.files.contains_key("/root.md"));
         assert!(!snapshot.files.contains_key("/docs/note.markdown"));
-        assert!(snapshot.directories.contains("/.lix/"));
-        assert!(snapshot.directories.contains("/.lix/app_data/"));
+        assert!(snapshot.directories.contains("/.lix"));
+        assert!(snapshot.directories.contains("/.lix/app_data"));
         assert_eq!(
             snapshot.files.get("/.lix/app_data/test.bin").unwrap(),
             b"internal"

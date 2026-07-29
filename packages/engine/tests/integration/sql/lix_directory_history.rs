@@ -20,7 +20,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('68697374-6f72-892d-8469-722d646f6300', '/docs/')",
+                 VALUES ('68697374-6f72-892d-8469-722d646f6300', '/docs')",
                 &[],
             )
             .await
@@ -34,7 +34,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('68697374-6f72-892d-8469-722d67756900', '/docs/guides/')",
+                 VALUES ('68697374-6f72-892d-8469-722d67756900', '/docs/guides')",
                 &[],
             )
             .await
@@ -65,14 +65,14 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("68697374-6f72-892d-8469-722d67756900".to_string()),
-                    Value::Text("/docs/guides/".to_string()),
+                    Value::Text("/docs/guides".to_string()),
                     Value::Text("68697374-6f72-892d-8469-722d646f6300".to_string()),
                     Value::Text("guides".to_string()),
                     Value::Integer(0),
                 ],
                 vec![
                     Value::Text("68697374-6f72-892d-8469-722d646f6300".to_string()),
-                    Value::Text("/docs/".to_string()),
+                    Value::Text("/docs".to_string()),
                     Value::Null,
                     Value::Text("docs".to_string()),
                     Value::Integer(1),
@@ -147,7 +147,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default/')",
+                 VALUES ('68697374-6f72-892d-8465-6661756c7401', '/history-default')",
                 &[],
             )
             .await
@@ -184,7 +184,7 @@ simulation_test!(
             &engine,
         );
         main.execute(
-            "INSERT INTO lix_directory (id, path) VALUES ('6469616d-6f6e-842d-8469-720000000000', '/before/')",
+            "INSERT INTO lix_directory (id, path) VALUES ('6469616d-6f6e-842d-8469-720000000000', '/before')",
             &[],
         )
         .await
@@ -258,7 +258,7 @@ simulation_test!(
             .map(|row| {
                 assert_eq!(
                     row.get::<Value>("path").expect("path should decode"),
-                    Value::Text("/same/".to_string())
+                    Value::Text("/same".to_string())
                 );
                 assert_eq!(
                     row.get::<Value>("lixcol_depth")
@@ -296,7 +296,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('01940000-0000-7000-8000-000000000001', '/docs/')",
+                 VALUES ('01940000-0000-7000-8000-000000000001', '/docs')",
                 &[],
             )
             .await
@@ -304,7 +304,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('01940000-0000-7000-8000-000000000002', '/docs/guides/')",
+                 VALUES ('01940000-0000-7000-8000-000000000002', '/docs/guides')",
                 &[],
             )
             .await

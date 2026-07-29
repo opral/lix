@@ -478,7 +478,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/conformance/')",
+                 VALUES ('68697374-6f72-892d-836f-6e666f726d00', '/conformance')",
                 &[],
             )
             .await

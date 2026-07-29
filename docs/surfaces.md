@@ -207,15 +207,16 @@ Directories use the same three scopes:
 
 User columns are `id`, `path`, `parent_id`, and `name`. Directory history uses
 the same common history columns and structured `lixcol_source_changes`
-provenance as file history. Directory paths end with a slash (`/data/`, not
-`/data`).
+provenance as file history. Directory and file paths share the same canonical
+syntax: non-root paths do not end with a slash. The typed SQL surface determines
+whether `/data` names a directory or a file.
 
 An ancestor rename, move, deletion, or restoration creates a revision for each
 descendant directory whose composed path changed. Recursive deletion
 provenance includes both a descendant's own tombstone and relevant ancestor
 tombstones.
 
-Inserting a file at `/a/b/c.txt` creates `/a/` and `/a/b/` when needed. Insert
+Inserting a file at `/a/b/c.txt` creates `/a` and `/a/b` when needed. Insert
 directories explicitly only when they should exist before any file.
 
 ## `lix_change`: workspace-wide activity

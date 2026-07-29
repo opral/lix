@@ -1361,7 +1361,11 @@ fn reject_lix_directory_delete_plugin_storage_paths(
 }
 
 fn path_is_inside_directory(path: &str, directory_path: &str) -> bool {
-    directory_path == "/" || path.starts_with(directory_path)
+    directory_path == "/"
+        || path == directory_path
+        || path
+            .strip_prefix(directory_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn append_deduped_delete_plan(
@@ -2598,7 +2602,7 @@ mod tests {
         let paths = derive_directory_paths(records.iter().map(|row| (row.key.clone(), row)))
             .expect("path derivation should succeed");
 
-        assert_eq!(paths.get(&child_key), Some(&"/docs/guides/".to_string()));
+        assert_eq!(paths.get(&child_key), Some(&"/docs/guides".to_string()));
     }
 
     #[test]
@@ -2629,7 +2633,7 @@ mod tests {
                 .downcast_ref::<StringArray>()
                 .expect("path is string")
                 .value(1),
-            "/docs/guides/"
+            "/docs/guides"
         );
         assert_eq!(
             batch
@@ -2711,8 +2715,8 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("path column should be string data");
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(paths.value(0), "/docs/guides/");
-        assert_eq!(paths.value(1), "/docs/reference/");
+        assert_eq!(paths.value(0), "/docs/guides");
+        assert_eq!(paths.value(1), "/docs/reference");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
@@ -2781,8 +2785,8 @@ mod tests {
             .downcast_ref::<StringArray>()
             .expect("path column should be string data");
         assert_eq!(batch.num_rows(), 2);
-        assert_eq!(paths.value(0), "/docs/");
-        assert_eq!(paths.value(1), "/other/");
+        assert_eq!(paths.value(0), "/docs");
+        assert_eq!(paths.value(1), "/other");
         assert_eq!(path_index_requests.load(Ordering::SeqCst), 1);
         assert_eq!(live_state_scans.load(Ordering::SeqCst), 0);
     }
@@ -2872,7 +2876,7 @@ mod tests {
             .expect("existing directory rows should seed paths");
 
         let rows = lix_directory_write_rows_from_batch_with_path_resolvers(
-            &directory_path_insert_batch("/docs/nested/"),
+            &directory_path_insert_batch("/docs/nested"),
             None,
             "lix_directory",
             &mut resolvers,
@@ -3040,7 +3044,7 @@ mod tests {
             reject_scans: false,
         };
         let write_ctx = SqlWriteContext::new(&mut write_context);
-        let batch = directory_path_insert_batch("/docs/nested/");
+        let batch = directory_path_insert_batch("/docs/nested");
         let count = stage_directory_insert(write_ctx, BranchBinding::explicit(), batch)
             .await
             .expect("directory spec should stage path write");
@@ -3085,7 +3089,7 @@ mod tests {
             stage_active_directory_insert_with_path_index(
                 write_ctx,
                 filesystem_path_index,
-                active_directory_path_insert_batch("/docs/nested/"),
+                active_directory_path_insert_batch("/docs/nested"),
             )
             .await
             .expect("indexed directory path insert should stage without a live-state scan")
@@ -3122,7 +3126,7 @@ mod tests {
             stage_active_directory_insert_with_path_index(
                 write_ctx,
                 Arc::new(FailingFilesystemPathIndexReader),
-                active_directory_path_insert_batch("/docs/nested/"),
+                active_directory_path_insert_batch("/docs/nested"),
             )
             .await
             .expect("directory path insert should retain its live-state fallback")
@@ -3192,7 +3196,7 @@ mod tests {
             );
             spec.scan_conflict_candidates(
                 &write_ctx,
-                &active_directory_path_insert_batch("/docs/"),
+                &active_directory_path_insert_batch("/docs"),
                 &UpsertConflictTarget::path(&["path"]),
             )
             .await
@@ -3275,7 +3279,7 @@ mod tests {
             );
             spec.scan_conflict_candidates(
                 &write_ctx,
-                &active_directory_path_insert_batch("/docs/"),
+                &active_directory_path_insert_batch("/docs"),
                 &UpsertConflictTarget::path(&["path"]),
             )
             .await

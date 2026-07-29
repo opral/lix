@@ -104,7 +104,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 	const lix = await openLix();
 	try {
 		await lix.execute("INSERT INTO lix_directory (path) VALUES ($1)", [
-			"/docs/",
+			"/docs",
 		]);
 		await lix.execute("INSERT INTO lix_file (path, data) VALUES ($1, $2)", [
 			"/README.md",
@@ -123,7 +123,7 @@ test("executes a globally ordered union plan in browser WASM", async () => {
 
 		expect(rows).toEqual([
 			{ path: "/README.md", kind: "file" },
-			{ path: "/docs/", kind: "directory" },
+			{ path: "/docs", kind: "directory" },
 		]);
 	} finally {
 		await lix.close();

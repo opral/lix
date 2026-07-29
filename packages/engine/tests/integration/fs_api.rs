@@ -32,7 +32,7 @@ simulation_test!(
             None
         );
 
-        let entries = readdir(&session, "/docs/")
+        let entries = readdir(&session, "/docs")
             .await
             .expect("directory read should succeed")
             .expect("directory should exist");
@@ -203,21 +203,21 @@ simulation_test!(
             &engine,
         );
 
-        mkdir(&session, "/empty/nested/")
+        mkdir(&session, "/empty/nested")
             .await
             .expect("mkdir should create parents");
-        mkdir(&session, "/empty/nested/")
+        mkdir(&session, "/empty/nested")
             .await
             .expect("mkdir should be idempotent");
 
         assert_eq!(
-            readdir(&session, "/empty/nested/")
+            readdir(&session, "/empty/nested")
                 .await
                 .expect("directory read should succeed"),
             Some(Vec::new())
         );
         assert_eq!(
-            readdir(&session, "/missing/")
+            readdir(&session, "/missing")
                 .await
                 .expect("missing directory read should succeed"),
             None
@@ -283,7 +283,7 @@ simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
         .await
         .expect("nested write should succeed");
 
-    rm_path(&session, "/tmp/")
+    rm_path(&session, "/tmp")
         .await
         .expect("recursive directory delete should remove tree");
 
@@ -294,7 +294,7 @@ simulation_test!(sql_rm_file_and_recursive_directory, |sim| async move {
         None
     );
     assert_eq!(
-        readdir(&session, "/tmp/")
+        readdir(&session, "/tmp")
             .await
             .expect("directory read should succeed"),
         None
@@ -315,7 +315,7 @@ simulation_test!(sql_file_directory_path_constraints, |sim| async move {
         &engine,
     );
 
-    mkdir(&session, "/docs/")
+    mkdir(&session, "/docs")
         .await
         .expect("mkdir should succeed");
     write_file(&session, "/file.txt", b"file".to_vec())
@@ -325,7 +325,7 @@ simulation_test!(sql_file_directory_path_constraints, |sim| async move {
     write_file(&session, "/docs", b"nope".to_vec())
         .await
         .expect_err("file write over directory should fail");
-    mkdir(&session, "/file.txt/")
+    mkdir(&session, "/file.txt")
         .await
         .expect_err("directory create over file should fail");
 });
@@ -442,6 +442,11 @@ where
             &[Value::Text(path.to_string())],
         )
         .await?;
+    let child_prefix = if path == "/" {
+        "/".to_string()
+    } else {
+        format!("{path}/")
+    };
     let children = session
         .execute_sql(
             "SELECT path, 'file' AS kind FROM lix_file WHERE path LIKE $1 \
@@ -449,7 +454,7 @@ where
              SELECT path, 'directory' AS kind FROM lix_directory WHERE path LIKE $1 AND path != $2 \
              ORDER BY path",
             &[
-                Value::Text(format!("{path}%")),
+                Value::Text(format!("{child_prefix}%")),
                 Value::Text(path.to_string()),
             ],
         )
@@ -480,13 +485,17 @@ where
 }
 
 fn direct_child_name(parent: &str, child: &str) -> Option<String> {
-    let remainder = child.strip_prefix(parent)?;
+    let child_prefix = if parent == "/" {
+        "/".to_string()
+    } else {
+        format!("{parent}/")
+    };
+    let remainder = child.strip_prefix(&child_prefix)?;
     if remainder.is_empty() {
         return None;
     }
-    let trimmed = remainder.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed.contains('/') {
+    if remainder.contains('/') {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(remainder.to_string())
 }

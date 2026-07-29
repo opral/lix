@@ -1507,7 +1507,7 @@ mod tests {
                     .iter()
                     .map(|entry| entry.path.as_str())
                     .collect::<Vec<_>>(),
-                vec!["/docs/", "/docs/a.md"]
+                vec!["/docs", "/docs/a.md"]
             );
             let file = index
                 .exact_entries("/docs/a.md")
@@ -1585,7 +1585,7 @@ mod tests {
                 .iter()
                 .map(|entry| entry.path.as_str())
                 .collect::<Vec<_>>(),
-            vec!["/docs/", "/docs/", "/docs/a.md", "/docs/a.md", "/docs/b.md"]
+            vec!["/docs", "/docs", "/docs/a.md", "/docs/a.md", "/docs/b.md"]
         );
         assert!(index.estimated_heap_bytes() > 0);
     }
@@ -1966,8 +1966,8 @@ mod tests {
             )
             .expect("subtree delta should apply");
 
-        assert_eq!(next.exact_entries("/archive/").len(), 1);
-        assert_eq!(next.exact_entries("/archive/nested/").len(), 1);
+        assert_eq!(next.exact_entries("/archive").len(), 1);
+        assert_eq!(next.exact_entries("/archive/nested").len(), 1);
         assert_eq!(next.exact_entries("/archive/nested/inside.md").len(), 1);
         assert_eq!(next.exact_entries("/outside.md").len(), 1);
         assert!(next.exact_entries("/docs/nested/inside.md").is_empty());
@@ -2029,7 +2029,7 @@ mod tests {
                 Some(&[3]),
             )
             .expect("root recreation should apply");
-        assert_eq!(recreated.exact_entries("/recreated/").len(), 1);
+        assert_eq!(recreated.exact_entries("/recreated").len(), 1);
         assert_eq!(recreated.entries().len(), 1);
     }
 

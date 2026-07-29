@@ -358,15 +358,19 @@ impl SimFs {
 }
 
 fn direct_child_name(parent: &str, child: &str) -> Option<String> {
-    let remainder = child.strip_prefix(parent)?;
+    let child_prefix = if parent == "/" {
+        "/".to_string()
+    } else {
+        format!("{parent}/")
+    };
+    let remainder = child.strip_prefix(&child_prefix)?;
     if remainder.is_empty() {
         return None;
     }
-    let trimmed = remainder.trim_end_matches('/');
-    if trimmed.is_empty() || trimmed.contains('/') {
+    if remainder.contains('/') {
         return None;
     }
-    Some(trimmed.to_string())
+    Some(remainder.to_string())
 }
 
 /// Transaction wrapper that injects simulation behavior around normal execution.
@@ -499,7 +503,7 @@ fn end_of_nested_block_comment(comment_body: &str) -> Option<usize> {
             index += 2;
             continue;
         }
-        if rest.starts_with("*/") {
+        if rest.starts_with("*") {
             depth -= 1;
             index += 2;
             if depth == 0 {
