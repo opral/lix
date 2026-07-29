@@ -1,11 +1,13 @@
 //! Recursive stable-identity JSON guest for the Lix Wasm Component plugin API v2.
 
+#[cfg(feature = "component-v2")]
 mod bindings;
 mod core;
 
 pub use core::{
     ARRAY_ITEM_SCHEMA_KEY, ByteEdit, ChangeEffect, Document, EntityChange, EntityRecord,
     IdNamespace, InitialChanges, InputSplice, OBJECT_MEMBER_SCHEMA_KEY, ROOT_SCHEMA_KEY,
+    V3ScalarIndexRecord,
 };
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");

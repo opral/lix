@@ -1058,6 +1058,16 @@ fn node_layout_mut(nodes: &mut [Node], node: u32) -> &mut NodeLayout {
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
+/// Minimal host-arena acceleration record for locating one scalar without
+/// reconstructing the complete semantic graph in a cold Wasm instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V3ScalarIndexRecord {
+    pub value_start: u32,
+    pub value_len: u32,
+    pub schema_key: String,
+    pub entity_pk: Vec<String>,
+}
+
 #[derive(Debug)]
 struct DocumentInner {
     blob: PersistentBlob,
@@ -1153,6 +1163,29 @@ impl Document {
 
     pub fn sparse_properties_touched(&self) -> usize {
         self.0.sparse_nodes_touched
+    }
+
+    pub fn v3_scalar_index_records(&self) -> Result<Vec<V3ScalarIndexRecord>, String> {
+        self.0
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.kind.is_container())
+            .map(|(ordinal, node)| {
+                let (value_start, value_len) = self
+                    .0
+                    .spans
+                    .span(ordinal)
+                    .ok_or_else(|| "JSON node span is missing".to_owned())?;
+                let identity = node.identity();
+                Ok(V3ScalarIndexRecord {
+                    value_start,
+                    value_len,
+                    schema_key: identity.schema_key().to_owned(),
+                    entity_pk: identity.entity_pk(),
+                })
+            })
+            .collect()
     }
 
     pub fn file_changed(

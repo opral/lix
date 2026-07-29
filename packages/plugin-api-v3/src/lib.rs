@@ -19,8 +19,8 @@ wit_bindgen::generate!({
 });
 
 pub use exports::lix::plugin::api::{
-    ByteEdit, CreateContext, EntityChange, EntityUpdate, FileDescriptor, FileUpdate,
-    OpenEntitiesInput, OpenFileInput,
+    ByteEdit, ChangedEntity, CreateContext, EntityChange, EntityUpdate, FileDescriptor, FileUpdate,
+    InputBytes, InputSplice, OpenEntitiesInput, OpenFileInput,
 };
 use exports::lix::plugin::api::{
     ChangeCursor, EditCursor, EntityTransition, FileTransition, Guest, GuestChangeCursor,
@@ -48,6 +48,57 @@ impl Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+pub fn entity_key(schema_key: &str, entity_pk: &[String]) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    append_key_part(&mut output, schema_key.as_bytes())?;
+    for part in entity_pk {
+        append_key_part(&mut output, part.as_bytes())?;
+    }
+    Ok(output)
+}
+
+pub fn decode_entity_key(key: &[u8]) -> Result<(String, Vec<String>)> {
+    let mut offset = 0usize;
+    let schema_key = take_key_part(key, &mut offset)?;
+    let mut entity_pk = Vec::new();
+    while offset < key.len() {
+        entity_pk.push(take_key_part(key, &mut offset)?);
+    }
+    if entity_pk.is_empty() {
+        return Err(Error::invalid_input(
+            "v3 entity arena key has no primary-key components",
+        ));
+    }
+    Ok((schema_key, entity_pk))
+}
+
+fn append_key_part(output: &mut Vec<u8>, part: &[u8]) -> Result<()> {
+    let len = u32::try_from(part.len())
+        .map_err(|_| Error::invalid_input("v3 entity key component exceeds u32"))?;
+    output.extend_from_slice(&len.to_le_bytes());
+    output.extend_from_slice(part);
+    Ok(())
+}
+
+fn take_key_part(key: &[u8], offset: &mut usize) -> Result<String> {
+    let len_end = offset
+        .checked_add(4)
+        .ok_or_else(|| Error::invalid_input("v3 entity arena key overflowed"))?;
+    let len = key
+        .get(*offset..len_end)
+        .ok_or_else(|| Error::invalid_input("truncated v3 entity arena key length"))?;
+    let len = u32::from_le_bytes(len.try_into().expect("length slice is exactly four bytes"));
+    let value_end = len_end
+        .checked_add(len as usize)
+        .ok_or_else(|| Error::invalid_input("v3 entity arena key overflowed"))?;
+    let value = key
+        .get(len_end..value_end)
+        .ok_or_else(|| Error::invalid_input("truncated v3 entity arena key value"))?;
+    *offset = value_end;
+    String::from_utf8(value.to_vec())
+        .map_err(|_| Error::invalid_input("v3 entity arena key is not UTF-8"))
+}
 
 #[derive(Debug)]
 pub struct FileResult {
@@ -272,6 +323,20 @@ mod tests {
             next_page(&mut state, 25, byte_edit_bytes)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn entity_arena_key_round_trips_without_delimiter_ambiguity() {
+        let expected = (
+            "json_object_member".to_owned(),
+            vec!["a/b".to_owned(), "c".to_owned()],
+        );
+        let encoded = entity_key(&expected.0, &expected.1).unwrap();
+        assert_eq!(decode_entity_key(&encoded).unwrap(), expected);
+        assert_ne!(
+            entity_key("a", &["bc".to_owned()]).unwrap(),
+            entity_key("ab", &["c".to_owned()]).unwrap()
         );
     }
 }

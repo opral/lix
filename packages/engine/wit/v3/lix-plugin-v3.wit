@@ -35,6 +35,20 @@ interface arena {
     entries: list<tuple<bytes, bytes>>,
   }
 
+  /// Stable Merkle summary of one ordered durable-entity range. Guests can
+  /// merge-walk cold predecessor/successor views and decode only mismatches.
+  record semantic-page {
+    first-key: bytes,
+    last-key: bytes,
+    fingerprint: bytes,
+    record-count: u32,
+  }
+
+  record semantic-page-batch {
+    next-key: option<bytes>,
+    pages: list<semantic-page>,
+  }
+
   /// One accepted immutable version. The host may evict decoded pages while
   /// retaining the content-addressed root in durable storage.
   resource root {
@@ -54,6 +68,11 @@ interface arena {
       after-key: option<bytes>,
       max-bytes: u32,
     ) -> result<keyed-page, arena-error>;
+    scan-entity-pages: func(
+      budget: borrow<budget>,
+      after-key: option<bytes>,
+      max-pages: u32,
+    ) -> result<semantic-page-batch, arena-error>;
     get-state: func(
       budget: borrow<budget>,
       key: bytes,
@@ -86,6 +105,11 @@ interface arena {
       after-key: option<bytes>,
       max-bytes: u32,
     ) -> result<keyed-page, arena-error>;
+    scan-entity-pages: func(
+      budget: borrow<budget>,
+      after-key: option<bytes>,
+      max-pages: u32,
+    ) -> result<semantic-page-batch, arena-error>;
     get-state: func(
       budget: borrow<budget>,
       key: bytes,
@@ -163,6 +187,11 @@ interface api {
     format-only: bool,
   }
 
+  record changed-entity {
+    key: bytes,
+    format-only: bool,
+  }
+
   resource change-cursor {
     /// Returns complete sparse changes. `some([])` is invalid; keys are unique
     /// over the complete cursor and EOF is permanent.
@@ -217,7 +246,7 @@ interface api {
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
     before: own<root>,
-    changed-entity-keys: list<bytes>,
+    changed-entities: list<changed-entity>,
     successor: own<transaction>,
     creates: create-context,
   }

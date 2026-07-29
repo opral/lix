@@ -103,6 +103,50 @@ cargo test -p lix_sdk --lib \
   --release -- --ignored --nocapture
 ```
 
+## Real JSON v3 affected-page result
+
+The production JSON schemas and 39,871-entity granularity now run through the
+v3 Component ABI. The workload is the same deterministic 10,485,760-byte JSON
+fixture and one-byte scalar replacement used by the v2 control. The measured
+run performs 100 warmups and 2,000 samples. Before the warm run it drops the
+cold-import actor, evicts all decoded host pages, and instantiates a fresh Wasm
+actor so cold-import memory cannot masquerade as hot-path ownership.
+
+Profile-driven changes were measured independently:
+
+| implementation | p95 | boundary | entity bytes read | total resident owned payload | result |
+| --- | ---: | ---: | ---: | ---: | --- |
+| full durable-entity rehydrate | 417.805 ms | 16,068,062 B | 16,067,609 B | 80,633,725 B | fail |
+| 1 MiB scalar locator window | 23.479 ms | 244,397 B | 403 B | 83,066,349 B before eviction accounting | fail |
+| 64 KiB locator + immutable Merkle map pages | 1.348 ms | 16,440 B | 403 B | 7,220,338 B | pass latency/memory |
+
+The accepted row has a 1.001 ms p50 and 1.348 ms p95. Against the stricter
+5.500 ms v2 engine control it is **4.080× faster**. Its resident owned payload
+is 6,040,690 host bytes plus 1,179,648 bytes of guest linear-memory high water,
+or 7,220,338 bytes total: **5.147× less** than the conservative 37,158,912-byte
+v2 total. Logical durable content is reported separately as 27,041,487 bytes;
+immutable backing is compressed while decoded pages are evictable.
+
+The hot JSON boundary is not yet an acceptance win: 16,440 bytes is larger than
+v2's already-sparse 418-byte retained-document transition. It is 977× smaller
+than the first cold v3 rehydrate, but the locator representation still needs a
+point/range refinement. API v3 therefore remains unaccepted overall even
+though this JSON latency/memory row clears the requested 2×/3× gates.
+
+Durable entity maps are now fixed 256-record immutable Merkle pages. The WIT
+arena exposes ordered page ranges with stable fingerprints, first/last keys,
+and record counts. A cold plugin can merge-walk page summaries, skip identical
+predecessor ranges, and decode only mismatches; replacing one entity changes
+exactly one page fingerprint in the arena test.
+
+Reproduction:
+
+```sh
+cargo test -p lix_sdk --lib \
+  json_v3_ten_mib_affected_page_benchmark \
+  --release -- --ignored --nocapture
+```
+
 Reproduction:
 
 ```sh
@@ -122,7 +166,7 @@ Every row is an independent pass/fail gate. “Pending” is not a pass.
 
 | format | workload | v2 p95/control | required v3 p95 | conservative v2 total memory | required v3 total memory |
 | --- | --- | ---: | ---: | ---: | ---: |
-| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms | 37,158,912 B | ≤12,386,304 B |
+| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms; actual 1.348 ms | 37,158,912 B | ≤12,386,304 B; actual 7,220,338 B |
 | JSON | 10 MiB ordinary public-SQL warm scalar edit | 8.602 ms p95 | ≤4.301 ms | 37,158,912 B | ≤12,386,304 B |
 | Markdown | `vscode-docs` one-commit replay | 9.220 s | ≤4.610 s | ≥105,643,782 B | ≤35,214,594 B |
 | CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |
@@ -135,13 +179,14 @@ Wasm heap cannot hide host duplication.
 
 ## Decision
 
-The immutable host arena design and real Wasmtime v3 binding pass their
-architectural correctness and 2×/3× control gates. It is **not yet accepted as
-the production v3 hard cut**: the control is not a format port and therefore
-does not include JSON's real semantic rows or format-specific state pages.
+The immutable host arena design, real Wasmtime v3 binding, and production JSON
+format port pass their architectural correctness and JSON 2×/3× latency/memory
+gates. It is **not yet accepted as the production v3 hard cut**: JSON boundary
+materialization still regresses its exceptionally sparse v2 hot path, and the
+Markdown, CSV, and Excalidraw format rows remain pending.
 
 Accordingly this prototype keeps the production v2 runtime selected. The next
-implementation step is to move JSON's declared state pages behind the now-real
-transaction/root resources, followed by Markdown, CSV, and Excalidraw.
-Changing plugin manifests to v3 before those format rows pass would violate the
-stated acceptance rule.
+implementation step is to refine JSON's point locator and apply the same
+affected-page/fingerprint approach to Markdown, CSV, and Excalidraw. Changing
+plugin manifests to v3 before those format rows pass would violate the stated
+acceptance rule.

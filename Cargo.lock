@@ -3417,6 +3417,7 @@ dependencies = [
  "blake3",
  "parking_lot",
  "wit-parser 0.247.0",
+ "zstd",
 ]
 
 [[package]]
@@ -3449,6 +3450,7 @@ dependencies = [
  "notify-debouncer-full",
  "plugin_arena_fixture_v3",
  "plugin_csv_v2",
+ "plugin_json_incremental_v3",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -4334,6 +4336,15 @@ dependencies = [
  "lix_plugin_arena",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "plugin_json_incremental_v3"
+version = "0.8.4"
+dependencies = [
+ "lix_plugin_api_v3",
+ "plugin_json_incremental_v2",
+ "serde_json",
 ]
 
 [[package]]

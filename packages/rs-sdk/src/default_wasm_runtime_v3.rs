@@ -12,12 +12,12 @@ use std::time::Instant;
 use async_trait::async_trait;
 use lix_engine::LixError;
 use lix_engine::wasm::v3::{
-    Error as ArenaStoreError, KeyedPage, Root, Transaction, WasmComponentV3Actor,
-    WasmComponentV3Factory, WasmV3ByteEdit, WasmV3ChangeCursorHandle, WasmV3CreateContext,
-    WasmV3EditCursorHandle, WasmV3EntityChange, WasmV3EntityTransition, WasmV3EntityUpdate,
-    WasmV3FileDescriptor, WasmV3FileTransition, WasmV3FileUpdate, WasmV3InputBytes,
-    WasmV3OpenEntitiesInput, WasmV3OpenFileInput, WasmV3TransitionCounters, WasmV3TransitionHandle,
-    WasmV3TransitionLimits, entity_arena_key,
+    Error as ArenaStoreError, KeyedPage, Root, SemanticPageBatch, Transaction,
+    WasmComponentV3Actor, WasmComponentV3Factory, WasmV3ByteEdit, WasmV3ChangeCursorHandle,
+    WasmV3ChangedEntity, WasmV3CreateContext, WasmV3EditCursorHandle, WasmV3EntityChange,
+    WasmV3EntityTransition, WasmV3EntityUpdate, WasmV3FileDescriptor, WasmV3FileTransition,
+    WasmV3FileUpdate, WasmV3InputBytes, WasmV3OpenEntitiesInput, WasmV3OpenFileInput,
+    WasmV3TransitionCounters, WasmV3TransitionHandle, WasmV3TransitionLimits, entity_arena_key,
 };
 use wasmtime::component::{Component, Linker, Resource, ResourceAny};
 
@@ -99,7 +99,10 @@ impl V3BudgetResource {
                 self.counters.state_page_bytes =
                     self.counters.state_page_bytes.saturating_add(bytes);
             }
+            ArenaReadKind::Boundary => {}
         }
+        self.counters.component_boundary_bytes =
+            self.counters.component_boundary_bytes.saturating_add(bytes);
         Ok(())
     }
 }
@@ -112,6 +115,7 @@ enum ArenaReadKind {
     File,
     Entity,
     State,
+    Boundary,
 }
 
 struct WasmtimeV3Factory {
@@ -130,7 +134,6 @@ struct ActiveTransition {
     eof: bool,
     seen_entity_keys: BTreeSet<Vec<u8>>,
     previous_edit_end: u64,
-    counters: WasmV3TransitionCounters,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -315,7 +318,6 @@ impl WasmtimeV3Actor {
                 eof: false,
                 seen_entity_keys: BTreeSet::new(),
                 previous_edit_end: 0,
-                counters: WasmV3TransitionCounters::default(),
             },
         );
         Ok(WasmV3FileTransition {
@@ -343,7 +345,6 @@ impl WasmtimeV3Actor {
                 eof: false,
                 seen_entity_keys: BTreeSet::new(),
                 previous_edit_end: 0,
-                counters: WasmV3TransitionCounters::default(),
             },
         );
         Ok(WasmV3EntityTransition {
@@ -394,6 +395,15 @@ fn creates_to_binding(
     bindings::exports::lix::plugin::api::CreateContext {
         high: creates.high,
         low: creates.low,
+    }
+}
+
+fn changed_entity_to_binding(
+    changed: WasmV3ChangedEntity,
+) -> bindings::exports::lix::plugin::api::ChangedEntity {
+    bindings::exports::lix::plugin::api::ChangedEntity {
+        key: changed.key,
+        format_only: changed.format_only,
     }
 }
 
@@ -520,7 +530,11 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             before_descriptor: descriptor_to_binding(input.before_descriptor),
             after_descriptor: descriptor_to_binding(input.after_descriptor),
             before,
-            changed_entity_keys: input.changed_entity_keys,
+            changed_entities: input
+                .changed_entities
+                .into_iter()
+                .map(changed_entity_to_binding)
+                .collect(),
             successor,
             creates: creates_to_binding(input.creates),
         };
@@ -585,18 +599,41 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             ));
         }
 
-        let mut output = Vec::with_capacity(page.len());
+        let mut validated = Vec::with_capacity(page.len());
+        let mut page_bytes = 0_u64;
         for change in page {
-            let key = entity_arena_key(&change.schema_key, &change.entity_pk)?;
+            let key = match entity_arena_key(&change.schema_key, &change.entity_pk) {
+                Ok(key) => key,
+                Err(error) => {
+                    self.abort_active(active)?;
+                    return Err(error);
+                }
+            };
             if !active.seen_entity_keys.insert(key.clone()) {
                 self.abort_active(active)?;
                 return Err(v3_invalid_plugin("v3 change cursor repeated an entity key"));
             }
-            let page_bytes = entity_change_bytes(&change)?;
-            active.counters.component_boundary_bytes = active
-                .counters
-                .component_boundary_bytes
-                .saturating_add(page_bytes);
+            page_bytes = match entity_change_bytes(&change).and_then(|bytes| {
+                page_bytes
+                    .checked_add(bytes)
+                    .ok_or_else(|| v3_invalid_plugin("v3 change page size overflowed"))
+            }) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.abort_active(active)?;
+                    return Err(error);
+                }
+            };
+            validated.push((key, change));
+        }
+        if let Err(error) = self.charge_transition_output(active.budget_rep, page_bytes, max_bytes)
+        {
+            self.abort_active(active)?;
+            return Err(error);
+        }
+
+        let mut output = Vec::with_capacity(validated.len());
+        for (key, change) in validated {
             let transaction = self.transaction_by_rep_mut(active.transaction_rep)?;
             match &change.snapshot {
                 Some(snapshot) => transaction.upsert_entity(key, snapshot.clone()),
@@ -662,7 +699,8 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             ));
         }
 
-        let mut output = Vec::with_capacity(page.len());
+        let mut validated = Vec::with_capacity(page.len());
+        let mut page_bytes = 0_u64;
         for edit in page {
             let end = edit
                 .offset
@@ -674,12 +712,25 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
                     "v3 byte edits are not globally base-relative and ordered",
                 ));
             }
-            let page_bytes = 24_u64.saturating_add(edit.insert.len() as u64);
-            active.counters.component_boundary_bytes = active
-                .counters
-                .component_boundary_bytes
-                .saturating_add(page_bytes);
+            page_bytes =
+                match page_bytes.checked_add(24_u64.saturating_add(edit.insert.len() as u64)) {
+                    Some(bytes) => bytes,
+                    None => {
+                        self.abort_active(active)?;
+                        return Err(v3_invalid_plugin("v3 edit page size overflowed"));
+                    }
+                };
             active.previous_edit_end = end;
+            validated.push(edit);
+        }
+        if let Err(error) = self.charge_transition_output(active.budget_rep, page_bytes, max_bytes)
+        {
+            self.abort_active(active)?;
+            return Err(error);
+        }
+
+        let mut output = Vec::with_capacity(validated.len());
+        for edit in validated {
             self.transaction_by_rep_mut(active.transaction_rep)?
                 .edit_bytes(lix_engine::wasm::v3::ByteEdit {
                     offset: edit.offset,
@@ -717,7 +768,6 @@ impl WasmComponentV3Actor for WasmtimeV3Actor {
             .limits
             .linear_memory_high_water_bytes();
         let mut counters = self.budget_counters(active.budget_rep)?;
-        counters.component_boundary_bytes = active.counters.component_boundary_bytes;
         counters.guest_linear_memory_high_water_bytes = guest_high_water;
         let transaction = self.take_transaction(active.transaction_rep)?;
         self.drop_budget(active.budget_rep)?;
@@ -839,6 +889,28 @@ impl WasmtimeV3Actor {
             .counters)
     }
 
+    fn charge_transition_output(
+        &mut self,
+        budget_rep: u32,
+        bytes: u64,
+        max_bytes: u32,
+    ) -> Result<(), LixError> {
+        if bytes > u64::from(max_bytes) {
+            return Err(v3_invalid_plugin(format!(
+                "v3 guest output page exceeded {max_bytes} bytes"
+            )));
+        }
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| v3_invalid_plugin("v3 guest output size exceeds usize"))?;
+        self.store_mut()?
+            .data_mut()
+            .table
+            .get_mut(&Resource::<V3BudgetResource>::new_borrow(budget_rep))
+            .map_err(|error| wasm_runtime_error("missing v3 output budget", error))?
+            .charge(bytes, ArenaReadKind::Boundary)
+            .map_err(|error| v3_invalid_plugin(format!("v3 output budget failed: {error:?}")))
+    }
+
     fn drop_cursor(&mut self, handle: u64) -> Result<(), LixError> {
         if let Some(cursor) = self.cursors.remove(&handle) {
             cursor
@@ -895,6 +967,7 @@ fn v3_invalid_param(message: impl Into<String>) -> LixError {
 
 use bindings::lix::plugin::arena::{
     ArenaError, HostBudget, HostRoot, HostTransaction, KeyedPage as WitKeyedPage, Limits,
+    SemanticPage as WitSemanticPage, SemanticPageBatch as WitSemanticPageBatch,
 };
 
 impl HostBudget for WasiHostState {
@@ -1000,6 +1073,24 @@ impl HostRoot for WasiHostState {
         self.charge_page(&budget, page, ArenaReadKind::Entity)
     }
 
+    fn scan_entity_pages(
+        &mut self,
+        root: Resource<V3RootResource>,
+        budget: Resource<V3BudgetResource>,
+        after_key: Option<Vec<u8>>,
+        max_pages: u32,
+    ) -> Result<WitSemanticPageBatch, ArenaError> {
+        let pages = self
+            .table
+            .get(&root)
+            .map_err(unavailable)?
+            .0
+            .entities
+            .semantic_pages(after_key.as_deref(), max_pages)
+            .map_err(arena_error)?;
+        self.charge_semantic_pages(&budget, pages)
+    }
+
     fn get_state(
         &mut self,
         root: Resource<V3RootResource>,
@@ -1099,6 +1190,20 @@ impl HostTransaction for WasiHostState {
             .scan_entities(after_key.as_deref(), max_bytes as usize)
             .map_err(arena_error)?;
         self.charge_page(&budget, page, ArenaReadKind::Entity)
+    }
+
+    fn scan_entity_pages(
+        &mut self,
+        transaction: Resource<V3TransactionResource>,
+        budget: Resource<V3BudgetResource>,
+        after_key: Option<Vec<u8>>,
+        max_pages: u32,
+    ) -> Result<WitSemanticPageBatch, ArenaError> {
+        let pages = self
+            .transaction(&transaction)?
+            .semantic_entity_pages(after_key.as_deref(), max_pages)
+            .map_err(arena_error)?;
+        self.charge_semantic_pages(&budget, pages)
     }
 
     fn get_state(
@@ -1224,6 +1329,35 @@ impl WasiHostState {
         Ok(WitKeyedPage {
             next_key: page.next_key,
             entries: page.entries,
+        })
+    }
+
+    fn charge_semantic_pages(
+        &mut self,
+        budget: &Resource<V3BudgetResource>,
+        batch: SemanticPageBatch,
+    ) -> Result<WitSemanticPageBatch, ArenaError> {
+        let bytes = batch.pages.iter().try_fold(0usize, |total, page| {
+            total
+                .checked_add(page.first_key.len())
+                .and_then(|total| total.checked_add(page.last_key.len()))
+                .and_then(|total| total.checked_add(page.fingerprint.len()))
+                .and_then(|total| total.checked_add(4))
+                .ok_or(ArenaError::RecordTooLarge(u64::MAX))
+        })?;
+        self.charge_budget(budget, bytes, ArenaReadKind::Entity)?;
+        Ok(WitSemanticPageBatch {
+            next_key: batch.next_key,
+            pages: batch
+                .pages
+                .into_iter()
+                .map(|page| WitSemanticPage {
+                    first_key: page.first_key,
+                    last_key: page.last_key,
+                    fingerprint: page.fingerprint.to_vec(),
+                    record_count: page.record_count,
+                })
+                .collect(),
         })
     }
 }
@@ -1425,6 +1559,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_v3_preserves_exact_bytes_schema_keys_and_stable_identities() {
+        let Some(wasm_path) =
+            option_env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_INCREMENTAL_V3_plugin_json_incremental_v3")
+        else {
+            panic!("the JSON v3 artifact dependency must be available");
+        };
+        let wasm = std::fs::read(wasm_path).expect("JSON v3 component should be readable");
+        let runtime = WasmtimePluginRuntime::new().expect("Wasmtime runtime should initialize");
+        let factory = runtime
+            .compile_component_v3(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 16 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(10_000),
+                },
+            )
+            .await
+            .expect("JSON v3 should compile");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("JSON v3 should instantiate");
+
+        let before = br#"{"left":1,"right":[true]}"#.to_vec();
+        let store = ArenaStore::default();
+        let imported = Root::import(
+            store,
+            "json-v3-generation",
+            &before,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let descriptor = WasmV3FileDescriptor {
+            path: Some("/identity.json".to_owned()),
+            media_type: Some("application/json".to_owned()),
+            plugin_key: "plugin_json_incremental_v3".to_owned(),
+            generation: "json-v3-generation".to_owned(),
+        };
+        let limits = transition_limits();
+        let opened = actor
+            .open_file(
+                limits,
+                WasmV3OpenFileInput {
+                    descriptor: descriptor.clone(),
+                    accepted: imported.clone(),
+                    successor: imported.transaction(),
+                    creates: creates(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut cold_changes = Vec::new();
+        while let Some(page) = actor
+            .next_change_page(opened.transition, opened.changes, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            cold_changes.extend(page);
+        }
+        let (accepted, _) = actor.finish_transition(opened.transition).await.unwrap();
+        let accepted_keys = cold_changes
+            .iter()
+            .map(|change| entity_arena_key(&change.schema_key, &change.entity_pk).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(accepted.entities.len(), cold_changes.len());
+        assert_eq!(
+            cold_changes
+                .iter()
+                .map(|change| change.schema_key.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["json_array_item", "json_object_member", "json_root"])
+        );
+
+        let scalar_offset = before
+            .iter()
+            .position(|byte| *byte == b'1')
+            .expect("fixture scalar should exist");
+        let mut transaction = accepted.transaction();
+        transaction.edit_bytes(ByteEdit {
+            offset: scalar_offset as u64,
+            delete_len: 1,
+            insert: b"2".to_vec(),
+        });
+        let updated = actor
+            .file_changed(
+                limits,
+                WasmV3FileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor,
+                    before: accepted.clone(),
+                    edits: vec![WasmV3InputSplice {
+                        offset: scalar_offset as u64,
+                        delete_len: 1,
+                        insert: WasmV3InputBytes::Inline(b"2".to_vec()),
+                    }],
+                    successor: transaction,
+                    creates: WasmV3CreateContext {
+                        high: creates().high,
+                        low: creates().low + 1,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let mut warm_changes = Vec::new();
+        while let Some(page) = actor
+            .next_change_page(updated.transition, updated.changes, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            warm_changes.extend(page);
+        }
+        let (successor, _) = actor.finish_transition(updated.transition).await.unwrap();
+
+        let mut after = before.clone();
+        after[scalar_offset] = b'2';
+        assert_eq!(
+            successor.bytes.read(0, successor.bytes.len()).unwrap(),
+            after
+        );
+        assert_eq!(warm_changes.len(), 1);
+        assert_eq!(warm_changes[0].schema_key, "json_object_member");
+        assert_eq!(
+            successor
+                .entities
+                .keys()
+                .map(ToOwned::to_owned)
+                .collect::<BTreeSet<_>>(),
+            accepted_keys,
+            "a scalar edit must not churn any durable identity"
+        );
+        assert_eq!(
+            successor.state.get(b"json/v3/index-version").unwrap(),
+            Some(b"scalar-byte-windows-v1".to_vec())
+        );
+        assert_eq!(
+            accepted.bytes.read(0, accepted.bytes.len()).unwrap(),
+            before,
+            "the prior accepted root remains immutable"
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "manual release-mode v3 Component latency scorecard"]
     async fn v3_component_ten_mib_sparse_edit_benchmark() {
         const WARMUPS: usize = 100;
@@ -1574,9 +1852,219 @@ mod tests {
         assert_eq!(last_counters.file_page_bytes, 1);
     }
 
+    #[tokio::test]
+    #[ignore = "manual release-mode JSON v3 affected-page scorecard"]
+    async fn json_v3_ten_mib_affected_page_benchmark() {
+        const WARMUPS: usize = 100;
+        const SAMPLES: usize = 2_000;
+
+        let Some(wasm_path) =
+            option_env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_INCREMENTAL_V3_plugin_json_incremental_v3")
+        else {
+            panic!("the JSON v3 artifact dependency must be available");
+        };
+        let wasm = std::fs::read(wasm_path).expect("JSON v3 component should be readable");
+        let runtime = WasmtimePluginRuntime::new().expect("Wasmtime runtime should initialize");
+        let factory = runtime
+            .compile_component_v3(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 128 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(60_000),
+                },
+            )
+            .await
+            .expect("JSON v3 should compile");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("JSON v3 should instantiate");
+
+        let (bytes, edit_offset) = json_ten_mib_fixture();
+        let store = ArenaStore::default();
+        let imported = Root::import(
+            store.clone(),
+            "json-v3-generation",
+            &bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let descriptor = WasmV3FileDescriptor {
+            path: Some("/ten-mib.json".to_owned()),
+            media_type: Some("application/json".to_owned()),
+            plugin_key: "plugin_json_incremental_v3".to_owned(),
+            generation: "json-v3-generation".to_owned(),
+        };
+        let limits = WasmV3TransitionLimits {
+            max_page_bytes: 1024 * 1024,
+            max_pages: 2_048,
+            max_total_bytes: 128 * 1024 * 1024,
+            deadline_nanoseconds: 60_000_000_000,
+        };
+        let opened = actor
+            .open_file(
+                limits,
+                WasmV3OpenFileInput {
+                    descriptor: descriptor.clone(),
+                    accepted: imported.clone(),
+                    successor: imported.transaction(),
+                    creates: creates(),
+                },
+            )
+            .await
+            .unwrap();
+        let mut cold_change_count = 0usize;
+        while let Some(page) = actor
+            .next_change_page(opened.transition, opened.changes, 1024 * 1024)
+            .await
+            .unwrap()
+        {
+            cold_change_count += page.len();
+        }
+        let (mut accepted, cold_counters) =
+            actor.finish_transition(opened.transition).await.unwrap();
+        assert_eq!(cold_change_count, 39_871);
+        drop(actor);
+        store.evict_resident_pages();
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("JSON v3 should cold-instantiate after host eviction");
+
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut replacement = b'0';
+        let mut last_replacement = replacement;
+        let mut last_counters = WasmV3TransitionCounters::default();
+        for sample in 0..WARMUPS + SAMPLES {
+            let mut transaction = accepted.transaction();
+            transaction.edit_bytes(ByteEdit {
+                offset: edit_offset as u64,
+                delete_len: 1,
+                insert: vec![replacement],
+            });
+            let started = Instant::now();
+            let updated = actor
+                .file_changed(
+                    limits,
+                    WasmV3FileUpdate {
+                        before_descriptor: descriptor.clone(),
+                        after_descriptor: descriptor.clone(),
+                        before: accepted.clone(),
+                        edits: vec![WasmV3InputSplice {
+                            offset: edit_offset as u64,
+                            delete_len: 1,
+                            insert: WasmV3InputBytes::Inline(vec![replacement]),
+                        }],
+                        successor: transaction,
+                        creates: creates(),
+                    },
+                )
+                .await
+                .unwrap();
+            let mut change_count = 0usize;
+            while let Some(page) = actor
+                .next_change_page(updated.transition, updated.changes, 1024 * 1024)
+                .await
+                .unwrap()
+            {
+                change_count += page.len();
+            }
+            assert_eq!(change_count, 1);
+            (accepted, last_counters) = actor.finish_transition(updated.transition).await.unwrap();
+            last_replacement = replacement;
+            if sample >= WARMUPS {
+                samples.push(
+                    u64::try_from(started.elapsed().as_nanos())
+                        .expect("benchmark duration should fit u64"),
+                );
+            }
+            replacement = if replacement == b'0' { b'1' } else { b'0' };
+        }
+        samples.sort_unstable();
+        let p50_ns = percentile(&samples, 50);
+        let p95_ns = percentile(&samples, 95);
+        let total_owned_bytes = store
+            .resident_page_bytes()
+            .saturating_add(last_counters.guest_linear_memory_high_water_bytes as usize);
+        eprintln!(
+            "json_v3_affected_page bytes={} entities={cold_change_count} warmups={WARMUPS} \
+             samples={SAMPLES} p50_ms={:.3} p95_ms={:.3} host_resident_bytes={} \
+             host_logical_durable_bytes={} \
+             guest_high_water_bytes={} total_owned_bytes={} boundary_bytes={} \
+             entity_page_reads={} entity_page_bytes={} cold_boundary_bytes={} accepted={}",
+            bytes.len(),
+            p50_ns as f64 / 1_000_000.0,
+            p95_ns as f64 / 1_000_000.0,
+            store.resident_page_bytes(),
+            store.unique_page_bytes(),
+            last_counters.guest_linear_memory_high_water_bytes,
+            total_owned_bytes,
+            last_counters.component_boundary_bytes,
+            last_counters.entity_page_reads,
+            last_counters.entity_page_bytes,
+            cold_counters.component_boundary_bytes,
+            p95_ns <= 2_750_000 && total_owned_bytes <= V3_TOTAL_BYTES_TARGET,
+        );
+        assert_eq!(
+            accepted.bytes.read(edit_offset as u64, 1).unwrap(),
+            [last_replacement]
+        );
+        assert!(p95_ns <= 2_750_000, "JSON v3 must clear 2x latency");
+        assert!(
+            total_owned_bytes <= V3_TOTAL_BYTES_TARGET,
+            "JSON v3 must clear 3x resident owned payload"
+        );
+    }
+
     fn percentile(samples: &[u64], percentile: usize) -> u64 {
         let rank = (samples.len() * percentile).div_ceil(100);
         samples[rank.saturating_sub(1)]
+    }
+
+    fn json_ten_mib_fixture() -> (Vec<u8>, usize) {
+        const PROPERTY_COUNT: usize = 39_870;
+        const TARGET_BYTES: usize = 10 * 1024 * 1024;
+        const BASE_MEMBER_BYTES: usize = 44;
+        let base_bytes = 2 + PROPERTY_COUNT * BASE_MEMBER_BYTES + PROPERTY_COUNT - 1;
+        let padding = TARGET_BYTES - base_bytes;
+        let padding_per_property = padding / PROPERTY_COUNT;
+        let extra_padding_properties = padding % PROPERTY_COUNT;
+        let mut bytes = Vec::with_capacity(TARGET_BYTES);
+        let mut state = 0x6a73_6f6e_2d31_306du64;
+        let edited_index = PROPERTY_COUNT / 2;
+        let mut edit_offset = None;
+        bytes.push(b'{');
+        for index in 0..PROPERTY_COUNT {
+            if index > 0 {
+                bytes.push(b',');
+            }
+            state = splitmix64(state);
+            let first = state;
+            state = splitmix64(state);
+            let second = state as u32;
+            bytes.extend_from_slice(
+                format!("\"property_{index:06}\":\"{first:016x}{second:08x}").as_bytes(),
+            );
+            if index == edited_index {
+                edit_offset = Some(bytes.len() - 24);
+            }
+            let property_padding =
+                padding_per_property + usize::from(index < extra_padding_properties);
+            bytes.extend(std::iter::repeat_n(b'f', property_padding));
+            bytes.push(b'"');
+        }
+        bytes.push(b'}');
+        assert_eq!(bytes.len(), TARGET_BYTES);
+        (bytes, edit_offset.unwrap())
+    }
+
+    fn splitmix64(mut state: u64) -> u64 {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
     }
 
     fn unique_fixture() -> Vec<u8> {

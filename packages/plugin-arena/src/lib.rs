@@ -145,8 +145,37 @@ pub struct Store {
 #[derive(Debug)]
 struct StoreInner {
     page_bytes: usize,
-    pages: Mutex<HashMap<Digest, Arc<[u8]>>>,
+    pages: Mutex<HashMap<Digest, StoredPage>>,
     metrics: Mutex<Metrics>,
+}
+
+#[derive(Debug)]
+struct StoredPage {
+    compressed: Arc<[u8]>,
+    resident: Option<Arc<[u8]>>,
+    uncompressed_len: usize,
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn compress_page(bytes: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(bytes, 1).expect("compressing an in-memory arena page cannot fail")
+}
+
+#[cfg(target_family = "wasm")]
+fn compress_page(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn decompress_page(bytes: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
+    zstd::bulk::decompress(bytes, expected_len).map_err(|_| Error::CorruptArchive)
+}
+
+#[cfg(target_family = "wasm")]
+fn decompress_page(bytes: &[u8], expected_len: usize) -> Result<Vec<u8>, Error> {
+    (bytes.len() == expected_len)
+        .then(|| bytes.to_vec())
+        .ok_or(Error::CorruptArchive)
 }
 
 impl Default for Store {
@@ -188,15 +217,40 @@ impl Store {
             .pages
             .lock()
             .values()
-            .map(|page| page.len())
+            .map(|page| page.uncompressed_len)
             .sum()
+    }
+
+    /// Actual bytes retained by this in-process store after decoded page
+    /// eviction. Durable deployments can replace the compressed backing with
+    /// SQLite/blob storage without changing root identities.
+    pub fn resident_page_bytes(&self) -> usize {
+        self.inner
+            .pages
+            .lock()
+            .values()
+            .map(|page| {
+                page.compressed.len() + page.resident.as_ref().map_or(0, |resident| resident.len())
+            })
+            .sum()
+    }
+
+    pub fn evict_resident_pages(&self) {
+        for page in self.inner.pages.lock().values_mut() {
+            page.resident = None;
+        }
     }
 
     fn intern(&self, bytes: &[u8]) -> Digest {
         let id = digest(b"lix-plugin-v3/page\0", [bytes]);
         let mut pages = self.inner.pages.lock();
         if let std::collections::hash_map::Entry::Vacant(entry) = pages.entry(id) {
-            entry.insert(Arc::from(bytes));
+            let compressed = compress_page(bytes);
+            entry.insert(StoredPage {
+                compressed: Arc::from(compressed),
+                resident: Some(Arc::from(bytes)),
+                uncompressed_len: bytes.len(),
+            });
             let mut metrics = self.inner.metrics.lock();
             metrics.pages_interned = metrics.pages_interned.saturating_add(1);
             metrics.page_bytes_interned = metrics
@@ -207,9 +261,18 @@ impl Store {
     }
 
     fn read_page(&self, id: Digest, range: Range<usize>) -> Result<Vec<u8>, Error> {
-        let pages = self.inner.pages.lock();
-        let page = pages.get(&id).ok_or(Error::MissingPage(id))?;
-        let selected = page.get(range).ok_or(Error::InvalidPageRange)?;
+        let mut pages = self.inner.pages.lock();
+        let page = pages.get_mut(&id).ok_or(Error::MissingPage(id))?;
+        if page.resident.is_none() {
+            let bytes = decompress_page(&page.compressed, page.uncompressed_len)?;
+            page.resident = Some(Arc::from(bytes));
+        }
+        let selected = page
+            .resident
+            .as_ref()
+            .expect("resident page was populated")
+            .get(range)
+            .ok_or(Error::InvalidPageRange)?;
         let output = selected.to_vec();
         drop(pages);
         let mut metrics = self.inner.metrics.lock();
@@ -227,7 +290,11 @@ impl Store {
             .pages
             .lock()
             .entry(expected)
-            .or_insert_with(|| Arc::from(bytes));
+            .or_insert_with(|| StoredPage {
+                compressed: Arc::from(compress_page(bytes)),
+                resident: Some(Arc::from(bytes)),
+                uncompressed_len: bytes.len(),
+            });
         Ok(())
     }
 }
@@ -446,8 +513,39 @@ fn validate_edits(edits: &[ByteEdit], base_len: u64) -> Result<(), Error> {
 #[derive(Debug, Clone)]
 pub struct MapArena {
     store: Store,
-    entries: Arc<BTreeMap<Vec<u8>, ByteArena>>,
+    pages: Arc<Vec<MapPage>>,
+    len: usize,
     id: Digest,
+}
+
+const MAP_PAGE_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone)]
+struct MapPage {
+    entries: Arc<Vec<(Vec<u8>, ByteArena)>>,
+    id: Digest,
+}
+
+impl MapPage {
+    fn new(entries: Vec<(Vec<u8>, ByteArena)>) -> Self {
+        let mut parts = Vec::with_capacity(entries.len() * 2);
+        for (key, value) in &entries {
+            parts.push(key.clone());
+            parts.push(value.id.0.to_vec());
+        }
+        Self {
+            entries: Arc::new(entries),
+            id: digest(b"lix-plugin-v3/map-page\0", parts),
+        }
+    }
+
+    fn last_key(&self) -> &[u8] {
+        self.entries
+            .last()
+            .expect("map pages are never empty")
+            .0
+            .as_slice()
+    }
 }
 
 impl MapArena {
@@ -456,15 +554,25 @@ impl MapArena {
     }
 
     fn from_entries(store: Store, entries: BTreeMap<Vec<u8>, ByteArena>) -> Self {
-        let mut parts = Vec::with_capacity(entries.len() * 2);
-        for (key, value) in &entries {
-            parts.push(key.clone());
-            parts.push(value.id.0.to_vec());
-        }
-        let id = digest(b"lix-plugin-v3/map\0", parts);
+        let len = entries.len();
+        let pages = entries
+            .into_iter()
+            .collect::<Vec<_>>()
+            .chunks(MAP_PAGE_ENTRIES)
+            .map(|entries| MapPage::new(entries.to_vec()))
+            .collect();
+        Self::from_pages(store, pages, len)
+    }
+
+    fn from_pages(store: Store, pages: Vec<MapPage>, len: usize) -> Self {
+        let id = digest(
+            b"lix-plugin-v3/map\0",
+            pages.iter().map(|page| page.id.as_bytes()),
+        );
         Self {
             store,
-            entries: Arc::new(entries),
+            pages: Arc::new(pages),
+            len,
             id,
         }
     }
@@ -474,33 +582,96 @@ impl MapArena {
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.len
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.len == 0
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
-        self.entries
-            .get(key)
+        self.value(key)
             .map(|value| value.read(0, value.len()))
             .transpose()
     }
 
     pub fn value_id(&self, key: &[u8]) -> Option<Digest> {
-        self.entries.get(key).map(ByteArena::id)
+        self.value(key).map(ByteArena::id)
     }
 
     pub fn scan(&self, after_key: Option<&[u8]>, max_bytes: usize) -> Result<KeyedPage, Error> {
         scan_prospective(self, &BTreeMap::new(), after_key, max_bytes)
     }
 
+    pub fn semantic_pages(
+        &self,
+        after_key: Option<&[u8]>,
+        max_pages: u32,
+    ) -> Result<SemanticPageBatch, Error> {
+        if max_pages == 0 {
+            return Err(Error::LimitExceeded);
+        }
+        let first = after_key.map_or(0, |key| {
+            self.pages.partition_point(|page| page.last_key() <= key)
+        });
+        let selected = self.pages[first..]
+            .iter()
+            .take(usize::try_from(max_pages).unwrap_or(usize::MAX))
+            .map(|page| SemanticPage {
+                first_key: page
+                    .entries
+                    .first()
+                    .expect("map page is nonempty")
+                    .0
+                    .clone(),
+                last_key: page.entries.last().expect("map page is nonempty").0.clone(),
+                fingerprint: page.id.0,
+                record_count: u32::try_from(page.entries.len())
+                    .expect("map page entry bound fits u32"),
+            })
+            .collect::<Vec<_>>();
+        let consumed = first.saturating_add(selected.len());
+        Ok(SemanticPageBatch {
+            next_key: (consumed < self.pages.len()).then(|| {
+                selected
+                    .last()
+                    .expect("more pages implies one selected")
+                    .last_key
+                    .clone()
+            }),
+            pages: selected,
+        })
+    }
+
     fn apply(&self, changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Self {
         if changes.is_empty() {
             return self.clone();
         }
-        let mut entries = self.entries.as_ref().clone();
+        if changes
+            .iter()
+            .all(|(key, value)| value.is_some() && self.value(key).is_some())
+        {
+            let mut pages = self.pages.as_ref().clone();
+            for (key, value) in changes {
+                let page_index = pages.partition_point(|page| page.last_key() < key.as_slice());
+                let page = &mut pages[page_index];
+                let mut entries = page.entries.as_ref().clone();
+                let entry_index = entries
+                    .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key.as_slice()))
+                    .expect("the sparse replacement key was verified above");
+                entries[entry_index].1 = ByteArena::from_bytes(
+                    self.store.clone(),
+                    value.as_ref().expect("replacement was verified above"),
+                );
+                *page = MapPage::new(entries);
+            }
+            return Self::from_pages(self.store.clone(), pages, self.len);
+        }
+
+        let mut entries = self
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
         for (key, value) in changes {
             if let Some(value) = value {
                 entries.insert(
@@ -515,14 +686,27 @@ impl MapArena {
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
-        self.entries.keys().map(Vec::as_slice)
+        self.iter().map(|(key, _)| key.as_slice())
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &(Vec<u8>, ByteArena)> {
+        self.pages.iter().flat_map(|page| page.entries.iter())
+    }
+
+    fn value(&self, key: &[u8]) -> Option<&ByteArena> {
+        let page = self
+            .pages
+            .get(self.pages.partition_point(|page| page.last_key() < key))?;
+        page.entries
+            .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
+            .ok()
+            .map(|index| &page.entries[index].1)
     }
 
     fn archived(&self) -> ArchivedMap {
         ArchivedMap {
             id: self.id,
             entries: self
-                .entries
                 .iter()
                 .map(|(key, value)| (key.clone(), value.archived()))
                 .collect(),
@@ -625,10 +809,10 @@ impl Root {
     pub fn archive(&self) -> Result<Archive, Error> {
         let mut reachable = BTreeMap::new();
         collect_byte_pages(&self.bytes, &mut reachable)?;
-        for value in self.entities.entries.values() {
+        for (_, value) in self.entities.iter() {
             collect_byte_pages(value, &mut reachable)?;
         }
-        for value in self.state.entries.values() {
+        for (_, value) in self.state.iter() {
             collect_byte_pages(value, &mut reachable)?;
         }
         Ok(Archive {
@@ -655,18 +839,17 @@ impl Root {
         let mut keys = BTreeMap::<Vec<u8>, ()>::new();
         for key in base
             .entities
-            .entries
             .keys()
-            .chain(a.entities.entries.keys())
-            .chain(b.entities.entries.keys())
+            .chain(a.entities.keys())
+            .chain(b.entities.keys())
         {
-            keys.insert(key.clone(), ());
+            keys.insert(key.to_vec(), ());
         }
         let mut merged = BTreeMap::new();
         for key in keys.keys() {
-            let base_value = base.entities.entries.get(key);
-            let a_value = a.entities.entries.get(key);
-            let b_value = b.entities.entries.get(key);
+            let base_value = base.entities.value(key);
+            let a_value = a.entities.value(key);
+            let b_value = b.entities.value(key);
             let selected = if same_value(a_value, b_value) {
                 a_value
             } else if same_value(a_value, base_value) {
@@ -705,9 +888,13 @@ fn collect_byte_pages(
         let page = pages
             .get(&segment.page)
             .ok_or(Error::MissingPage(segment.page))?;
-        output
-            .entry(segment.page)
-            .or_insert_with(|| page.as_ref().to_vec());
+        if let std::collections::btree_map::Entry::Vacant(entry) = output.entry(segment.page) {
+            let bytes = match &page.resident {
+                Some(bytes) => bytes.as_ref().to_vec(),
+                None => decompress_page(&page.compressed, page.uncompressed_len)?,
+            };
+            entry.insert(bytes);
+        }
     }
     Ok(())
 }
@@ -792,6 +979,20 @@ pub struct KeyedPage {
     pub entries: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticPage {
+    pub first_key: Vec<u8>,
+    pub last_key: Vec<u8>,
+    pub fingerprint: [u8; 32],
+    pub record_count: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticPageBatch {
+    pub next_key: Option<Vec<u8>>,
+    pub pages: Vec<SemanticPage>,
+}
+
 impl Transaction {
     pub fn edit_bytes(&mut self, edit: ByteEdit) {
         self.byte_edits.push(edit);
@@ -844,6 +1045,16 @@ impl Transaction {
             after_key,
             max_bytes,
         )
+    }
+
+    pub fn semantic_entity_pages(
+        &self,
+        after_key: Option<&[u8]>,
+        max_pages: u32,
+    ) -> Result<SemanticPageBatch, Error> {
+        // Entity output has not been accepted while the guest is reconciling,
+        // so the staged successor aliases the predecessor's semantic pages.
+        self.base.entities.semantic_pages(after_key, max_pages)
     }
 
     pub fn get_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
@@ -899,9 +1110,13 @@ fn scan_prospective(
         return Err(Error::LimitExceeded);
     }
     let mut keys = BTreeMap::<Vec<u8>, ()>::new();
-    for key in base.entries.keys().chain(changes.keys()) {
+    for key in base
+        .keys()
+        .map(ToOwned::to_owned)
+        .chain(changes.keys().cloned())
+    {
         if after_key.is_none_or(|after| key.as_slice() > after) {
-            keys.insert(key.clone(), ());
+            keys.insert(key, ());
         }
     }
 
@@ -1070,6 +1285,44 @@ mod tests {
             .unwrap();
         assert_eq!(second.entries, vec![(b"row/3".to_vec(), b"three".to_vec())]);
         assert_eq!(second.next_key, None);
+    }
+
+    #[test]
+    fn semantic_page_fingerprints_skip_unchanged_ordered_ranges() {
+        let store = Store::new(64);
+        let entities = (0..600)
+            .map(|index| {
+                (
+                    format!("row/{index:04}").into_bytes(),
+                    format!("{{\"value\":{index}}}").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let root = Root::import(store, "generation-a", b"{}", entities, std::iter::empty());
+        let first = root.entities.semantic_pages(None, 1).unwrap();
+        assert_eq!(first.pages[0].record_count, 256);
+        let second = root
+            .entities
+            .semantic_pages(first.next_key.as_deref(), 8)
+            .unwrap();
+        assert_eq!(
+            second
+                .pages
+                .iter()
+                .map(|page| page.record_count)
+                .collect::<Vec<_>>(),
+            vec![256, 88]
+        );
+
+        let mut transaction = root.transaction();
+        transaction.upsert_entity(b"row/0300".to_vec(), b"{\"value\":\"changed\"}".to_vec());
+        let successor = transaction.commit().unwrap();
+        let before = root.entities.semantic_pages(None, 8).unwrap();
+        let after = successor.entities.semantic_pages(None, 8).unwrap();
+        assert_eq!(before.pages.len(), after.pages.len());
+        assert_eq!(before.pages[0].fingerprint, after.pages[0].fingerprint);
+        assert_ne!(before.pages[1].fingerprint, after.pages[1].fingerprint);
+        assert_eq!(before.pages[2].fingerprint, after.pages[2].fingerprint);
     }
 
     #[test]

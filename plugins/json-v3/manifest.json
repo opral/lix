@@ -1,0 +1,16 @@
+{
+  "key": "plugin_json_incremental_v3",
+  "runtime": "wasm-component-v3",
+  "api_version": "3.0.0",
+  "materialization": "blob",
+  "match": {
+    "path_glob": "*.json",
+    "content_type": "text"
+  },
+  "entry": "plugin.wasm",
+  "schemas": [
+    "schema/json_root.json",
+    "schema/json_object_member.json",
+    "schema/json_array_item.json"
+  ]
+}

@@ -19,5 +19,8 @@ workspace = true
 blake3 = "1"
 parking_lot = "0.12"
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+zstd = "0.13"
+
 [dev-dependencies]
 wit-parser = "0.247"

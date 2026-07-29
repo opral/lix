@@ -98,6 +98,12 @@ pub struct WasmV3ByteEdit {
     pub insert: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmV3ChangedEntity {
+    pub key: Vec<u8>,
+    pub format_only: bool,
+}
+
 #[derive(Debug)]
 pub struct WasmV3OpenFileInput {
     pub descriptor: WasmV3FileDescriptor,
@@ -129,7 +135,7 @@ pub struct WasmV3EntityUpdate {
     pub before_descriptor: WasmV3FileDescriptor,
     pub after_descriptor: WasmV3FileDescriptor,
     pub before: Root,
-    pub changed_entity_keys: Vec<Vec<u8>>,
+    pub changed_entities: Vec<WasmV3ChangedEntity>,
     pub successor: Transaction,
     pub creates: WasmV3CreateContext,
 }
