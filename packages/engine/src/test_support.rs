@@ -431,9 +431,19 @@ fn stage_test_commit_deltas_by_owner(
         let owner = delta.delta.commit_id;
         by_owner.entry(owner).or_default().push(*delta);
     }
+    let mut canonical_locators = BTreeMap::new();
     for owner_deltas in by_owner.values() {
-        crate::tracked_state::stage_commit_deltas(writes, owner_deltas)?;
+        let locators = crate::tracked_state::stage_commit_deltas(writes, owner_deltas)?;
+        for locator in locators {
+            canonical_locators
+                .entry(locator.change_id)
+                .or_insert(locator);
+        }
     }
+    crate::tracked_state::stage_change_locators(
+        writes,
+        &canonical_locators.into_values().collect::<Vec<_>>(),
+    );
     Ok(())
 }
 

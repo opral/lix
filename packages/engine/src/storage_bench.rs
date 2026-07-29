@@ -228,6 +228,7 @@ fn native_storage_spaces() -> &'static [crate::storage_adapter::StorageSpace] {
         crate::tracked_state::TRACKED_STATE_COMMIT_ROOT_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         crate::tracked_state::TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        crate::tracked_state::TRACKED_STATE_CHANGE_LOCATOR_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_SPACE,
         crate::binary_cas::kv::BINARY_CAS_MANIFEST_CHUNK_SPACE,
         crate::binary_cas::kv::BINARY_CAS_CHUNK_PRESENCE_SPACE,

@@ -45,7 +45,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"packed-commit-authority.v18";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"indexed-packed-history.v19";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
@@ -89,7 +89,7 @@ pub(crate) async fn repository_protocol_status(
 pub(crate) fn unsupported_repository_protocol_error() -> LixError {
     LixError::new(
         "LIX_ERROR_UNSUPPORTED_STORAGE_FORMAT",
-        "repository uses an unsupported live-state hot-index storage protocol; recreate the repository",
+        "repository uses an unsupported storage protocol; recreate the repository",
     )
 }
 
@@ -360,7 +360,8 @@ where
                 origin_key: change.origin_key.as_deref(),
             })
             .collect::<Vec<_>>();
-        crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
+        let locators = crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;
+        crate::tracked_state::stage_change_locators(&mut writes, &locators);
         tracked_state
             .writer(&read, &mut writes)
             .stage_commit_root(&receipt.initial_commit_id, None, root_deltas)

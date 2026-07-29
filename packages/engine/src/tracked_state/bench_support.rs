@@ -102,8 +102,9 @@ where
                 .iter()
                 .map(PackedHistoryDelta::as_commit_ref)
                 .collect::<Vec<_>>();
-            super::storage::stage_commit_deltas(&mut writes, &deltas)
+            let locators = super::storage::stage_commit_deltas(&mut writes, &deltas)
                 .expect("stage packed-history commit delta");
+            super::storage::stage_change_locators(&mut writes, &locators);
         }
         let (_commit, stats) = storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -134,6 +135,29 @@ where
         .await
         .expect("scan packed history")
         .len()
+}
+
+pub async fn load_packed_change<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    commit_index: usize,
+    row_index: usize,
+) -> bool
+where
+    StorageImpl: Storage,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin packed-history exact read"),
+    );
+    super::storage::load_change_record_by_id(
+        &read,
+        packed_history_change_id(commit_index, row_index),
+    )
+    .await
+    .expect("load packed-history change by id")
+    .is_some()
 }
 
 pub async fn packed_history_layout<StorageImpl>(
@@ -173,10 +197,8 @@ struct PackedHistoryDelta {
 impl PackedHistoryDelta {
     fn new(commit_index: usize, row_index: usize) -> Self {
         Self {
-            change_id: ChangeId::for_test_label(&format!(
-                "packed-history-change-{commit_index}-{row_index}"
-            )),
-            commit_id: CommitId::for_test_label(&format!("packed-history-commit-{commit_index}")),
+            change_id: packed_history_change_id(commit_index, row_index),
+            commit_id: CommitId::new(packed_history_uuid(commit_index, 0, 0x43)),
             entity_pk: EntityPk::single(format!(
                 "packed-history-entity-{commit_index}-{row_index}"
             )),
@@ -209,6 +231,45 @@ impl PackedHistoryDelta {
             origin_key: None,
         }
     }
+}
+
+fn packed_history_change_id(commit_index: usize, row_index: usize) -> ChangeId {
+    ChangeId::new(packed_history_uuid(commit_index, row_index, 0x68))
+}
+
+fn packed_history_uuid(commit_index: usize, ordinal: usize, discriminator: u8) -> uuid::Uuid {
+    let timestamp = 0x0192_0000_0000u64
+        .checked_add(u64::try_from(commit_index).expect("benchmark commit index fits u64"))
+        .expect("benchmark timestamp does not overflow");
+    static DETERMINISTIC_IDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let deterministic = *DETERMINISTIC_IDS.get_or_init(|| {
+        std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").map_or(true, |shape| shape != "system")
+    });
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&timestamp.to_be_bytes()[2..]);
+    if deterministic {
+        bytes[6] = 0x70;
+        bytes[7] = 0;
+    } else {
+        bytes[6] = 0x70 | u8::try_from((ordinal >> 8) & 0x0f).expect("ordinal nibble fits u8");
+        bytes[7] = u8::try_from(ordinal & 0xff).expect("ordinal byte fits u8");
+    }
+    let mixed = if deterministic {
+        (u64::try_from(commit_index).expect("commit index fits u64") << 20)
+            | (u64::try_from(ordinal).expect("ordinal fits u64") << 1)
+            | u64::from(discriminator == 0x68)
+    } else {
+        let mut mixed = (u64::try_from(commit_index).expect("commit index fits u64") << 16)
+            ^ u64::try_from(ordinal).expect("ordinal fits u64")
+            ^ u64::from(discriminator);
+        mixed = mixed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        mixed ^ (mixed >> 31)
+    };
+    bytes[8..].copy_from_slice(&mixed.to_be_bytes());
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
 }
 
 struct BenchWriteOutcome {
