@@ -10,7 +10,7 @@ use lix_engine::tracked_state::bench::{
     seed_packed_history_with_options,
 };
 use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const DEFAULT_CHANGES: &[usize] = &[100_000];
 const DEFAULT_COMMIT_WIDTHS: &[usize] = &[1, 10, 100, 10_000];
@@ -132,6 +132,7 @@ async fn run() {
                                     settle_ms,
                                     account_layout,
                                     skip_seed,
+                                    None,
                                     || async {
                                         storage.flush().expect("flush benchmark RocksDB");
                                     },
@@ -141,11 +142,14 @@ async fn run() {
                             Backend::SlateDB => {
                                 let dir = tempfile::tempdir()
                                     .expect("create SlateDB benchmark directory");
+                                let io_counters = SlateDBIoCounters::default();
                                 let path = persistent_root.as_ref().map_or_else(
                                     || dir.path().join("slatedb"),
                                     |root| root.join("slatedb"),
                                 );
-                                let storage = SlateDB::open(&path).expect("open benchmark SlateDB");
+                                let storage =
+                                    SlateDB::open_with_io_counters(&path, io_counters.clone())
+                                        .expect("open benchmark SlateDB");
                                 run_case(
                                     backend,
                                     storage.clone(),
@@ -165,6 +169,7 @@ async fn run() {
                                     settle_ms,
                                     account_layout,
                                     skip_seed,
+                                    Some(&io_counters),
                                     || async {
                                         if memtable_flush {
                                             storage
@@ -209,6 +214,7 @@ async fn run_case<S, Flush, FlushFuture>(
     settle_ms: u64,
     account_layout: bool,
     skip_seed: bool,
+    io_counters: Option<&SlateDBIoCounters>,
     flush_storage: Flush,
 ) where
     S: Storage + Clone,
@@ -218,6 +224,8 @@ async fn run_case<S, Flush, FlushFuture>(
     let adapter = StorageAdapter::new(storage);
     let id_shape =
         std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").unwrap_or_else(|_| "deterministic".into());
+    let seed_io_before =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     let seed_started = Instant::now();
     let shared_large_payload = matches!(payload, BenchPackedHistoryPayload::SharedLarge)
         .then(|| format!(r#"{{"payload":"{}"}}"#, "x".repeat(large_payload_bytes)));
@@ -241,14 +249,20 @@ async fn run_case<S, Flush, FlushFuture>(
         )
     };
     let seed_elapsed = seed_started.elapsed();
+    let seed_io_after =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     if flush {
         flush_storage().await;
     }
     if settle_ms > 0 {
         tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     }
+    let lifecycle_io_after =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     let backend_bytes = directory_bytes(storage_path);
+    let backend_objects = directory_objects(storage_path);
 
+    let scan_io_before = lifecycle_io_after;
     for _ in 0..warmups {
         assert_eq!(scan_packed_history(&adapter).await, changes);
     }
@@ -259,6 +273,8 @@ async fn run_case<S, Flush, FlushFuture>(
         timings.push(started.elapsed());
     }
     timings.sort_unstable();
+    let scan_io_after =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     let exact_commit_index = changes / commit_width / 2;
     let exact_row_index = commit_width / 2;
     for _ in 0..warmups {
@@ -271,6 +287,8 @@ async fn run_case<S, Flush, FlushFuture>(
         exact_timings.push(started.elapsed());
     }
     exact_timings.sort_unstable();
+    let exact_io_after =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
     // Account after timing so a layout scan cannot pre-warm the measured
     // storage pages. `warmups=0,samples=1` is therefore the cold profile.
     let layout = if account_layout {
@@ -278,6 +296,20 @@ async fn run_case<S, Flush, FlushFuture>(
     } else {
         Vec::new()
     };
+    let layout_io_after =
+        io_counters.map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot);
+    let seed_io = seed_io_after.saturating_sub(seed_io_before);
+    let lifecycle_io = lifecycle_io_after.saturating_sub(seed_io_after);
+    let scan_io = scan_io_after.saturating_sub(scan_io_before);
+    let exact_io = exact_io_after.saturating_sub(scan_io_after);
+    let layout_io = layout_io_after.saturating_sub(exact_io_after);
+    let logical_written_bytes = writes.map_or(0, |writes| writes.written_bytes);
+    let write_amplification = ratio(
+        seed_io.write_bytes.saturating_add(lifecycle_io.write_bytes),
+        logical_written_bytes,
+    );
+    let lifecycle_write_amplification = ratio(lifecycle_io.write_bytes, logical_written_bytes);
+    let storage_amplification = ratio(backend_bytes, logical_written_bytes);
     let manifest = find_layout(&layout, "tracked_state.commit_delta_manifest.v2");
     let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v2");
     let locators = find_layout(&layout, "tracked_state.change_locator.v1");
@@ -297,14 +329,20 @@ async fn run_case<S, Flush, FlushFuture>(
          segment_keys={},segment_key_bytes={},segment_value_bytes={},\
          locator_keys={},locator_key_bytes={},locator_value_bytes={},\
          json_payload_keys={},json_payload_key_bytes={},json_payload_value_bytes={},\
-         backend_bytes={backend_bytes}",
+         backend_bytes={backend_bytes},backend_objects={},storage_amplification={storage_amplification:.3},\
+         seed_object_reads={},seed_object_read_bytes={},seed_object_writes={},seed_object_write_bytes={},\
+         lifecycle_object_reads={},lifecycle_object_read_bytes={},lifecycle_object_writes={},lifecycle_object_write_bytes={},\
+         write_amplification={write_amplification:.3},lifecycle_write_amplification={lifecycle_write_amplification:.3},\
+         scan_object_reads={},scan_object_read_bytes={},scan_object_writes={},scan_object_write_bytes={},\
+         exact_object_reads={},exact_object_read_bytes={},exact_object_writes={},exact_object_write_bytes={},\
+         layout_object_reads={},layout_object_read_bytes={},layout_object_writes={},layout_object_write_bytes={}",
         shape_name(shape),
         payload_name(payload),
         writes.map_or_else(|| changes / commit_width, |writes| writes.commits),
         seed_elapsed.as_millis(),
         changes as f64 / seed_elapsed.as_secs_f64(),
         writes.map_or(0, |writes| writes.staged_puts),
-        writes.map_or(0, |writes| writes.written_bytes),
+        logical_written_bytes,
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),
         millis(percentile(&timings, 99)),
@@ -323,6 +361,27 @@ async fn run_case<S, Flush, FlushFuture>(
         json_payloads.rows,
         json_payloads.key_bytes,
         json_payloads.value_bytes,
+        backend_objects,
+        seed_io.read_objects,
+        seed_io.read_bytes,
+        seed_io.write_objects,
+        seed_io.write_bytes,
+        lifecycle_io.read_objects,
+        lifecycle_io.read_bytes,
+        lifecycle_io.write_objects,
+        lifecycle_io.write_bytes,
+        scan_io.read_objects,
+        scan_io.read_bytes,
+        scan_io.write_objects,
+        scan_io.write_bytes,
+        exact_io.read_objects,
+        exact_io.read_bytes,
+        exact_io.write_objects,
+        exact_io.write_bytes,
+        layout_io.read_objects,
+        layout_io.read_bytes,
+        layout_io.write_objects,
+        layout_io.write_bytes,
     );
 }
 
@@ -347,6 +406,14 @@ fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 {
+        f64::NAN
+    } else {
+        numerator as f64 / denominator as f64
+    }
 }
 
 fn shape_name(shape: BenchPackedHistoryShape) -> &'static str {
@@ -469,4 +536,28 @@ fn directory_bytes(path: &Path) -> u64 {
             })
             .sum()
     })
+}
+
+fn directory_objects(path: &Path) -> u64 {
+    std::fs::read_dir(path).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| {
+                if entry.metadata().is_ok_and(|metadata| metadata.is_dir()) {
+                    directory_objects(&entry.path())
+                } else {
+                    1
+                }
+            })
+            .sum()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn amplification_is_unavailable_without_a_logical_baseline() {
+        assert!(super::ratio(1, 0).is_nan());
+        assert_eq!(super::ratio(3, 2), 1.5);
+    }
 }
