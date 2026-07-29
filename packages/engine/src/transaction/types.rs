@@ -2505,7 +2505,7 @@ struct StagedCommitChangeColumns {
 #[derive(Debug, Clone)]
 pub(crate) struct StagedCommitChangeBatch {
     columns: Arc<StagedCommitChangeColumns>,
-    /// Present only when duplicate change ids were filtered while combining
+    /// Present only when duplicate identities were filtered while combining
     /// independently supplied batches. The normal merge/checkpoint path views
     /// every row directly and allocates no selection column.
     selection: Option<Arc<[u32]>>,
@@ -2694,16 +2694,21 @@ impl StagedCommitChangeRefs {
             return;
         }
 
-        // Deduplicate only while batches are combined, then drop the index.
+        // Deduplicate logical identities only while batches are combined,
+        // then drop the index. Eager plugin rows may legitimately share one
+        // source change id.
         // Unlike the former BTreeSet retained for the transaction lifetime,
         // this is one temporary contiguous table rather than one allocation
         // per selected mutation.
-        let mut change_ids =
+        let mut identities =
             HashSet::with_capacity(self.selected_change_count().saturating_add(batch.len()));
-        change_ids.extend(self.selected_changes().map(|change| change.change_id));
+        identities.extend(
+            self.selected_changes()
+                .map(|change| (change.schema_key(), change.file_id(), change.entity_pk())),
+        );
         let mut selected: Option<Vec<u32>> = None;
         for (row_index, change) in batch.iter().enumerate() {
-            if change_ids.insert(change.change_id) {
+            if identities.insert((change.schema_key(), change.file_id(), change.entity_pk())) {
                 if let Some(selected) = selected.as_mut() {
                     selected.push(
                         u32::try_from(row_index)
@@ -2822,6 +2827,63 @@ mod tests {
             finalized_clone.selected_change_batches[0]
                 .shares_storage_with(&staged.selected_change_batches[0]),
             "commit finalization clones must be O(1) batch-owner clones"
+        );
+    }
+
+    #[test]
+    fn selected_batches_dedupe_identity_not_source_change_id() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let source_commit = CommitId::for_test_label("shared-source");
+        let shared_change = ChangeId::for_test_label("shared-change");
+        let identities = TrackedStateDiffIdentity::from_key_batch(
+            ["entity-a", "entity-b"]
+                .into_iter()
+                .map(|entity| TrackedStateKey {
+                    schema_key: "schema".to_string(),
+                    file_id: Some("file".to_string()),
+                    entity_pk: EntityPk::single(entity),
+                })
+                .collect(),
+        )
+        .expect("identity batch should fit");
+
+        let mut first = StagedCommitChangeBatchBuilder::with_capacity(1);
+        first.push(
+            identities[0].clone(),
+            source_commit,
+            shared_change,
+            false,
+            timestamp,
+            timestamp,
+        );
+        let mut second = StagedCommitChangeBatchBuilder::with_capacity(2);
+        second.push(
+            identities[1].clone(),
+            source_commit,
+            shared_change,
+            false,
+            timestamp,
+            timestamp,
+        );
+        second.push(
+            identities[0].clone(),
+            source_commit,
+            ChangeId::for_test_label("duplicate-identity"),
+            false,
+            timestamp,
+            timestamp,
+        );
+
+        let mut staged = StagedCommitChangeRefs::default();
+        staged.add_selected_change_batch(first.finish());
+        staged.add_selected_change_batch(second.finish());
+        assert_eq!(staged.selected_change_count(), 2);
+        assert_eq!(
+            staged
+                .selected_changes()
+                .map(|change| change.change_id)
+                .collect::<Vec<_>>(),
+            vec![shared_change, shared_change]
         );
     }
 

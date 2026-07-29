@@ -21,6 +21,7 @@ pub(crate) use context::{ChangelogContext, ChangelogStoreReader, ChangelogStoreW
 pub(crate) use materialization::{
     ChangeRecordProjection, MaterializedChangeIdentity, MaterializedChangePayload,
     load_change_records, materialize_known_change_payloads,
+    materialize_known_change_payloads_in_order,
 };
 pub(crate) use store::{
     CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, change_key, commit_change_id_key,

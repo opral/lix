@@ -213,12 +213,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .await?;
 
     let selected_change_records = load_selected_change_records(read, &staged_commits).await?;
-    let selected_change_payloads = crate::changelog::materialize_known_change_payloads(
-        read,
-        selected_change_records.values().cloned(),
-        ChangeRecordProjection::full(),
-    )
-    .await?;
+    let selected_change_payloads =
+        materialize_selected_change_payloads(read, &selected_change_records).await?;
 
     stage_tracked_commit_delta_index(
         &mut writes,
@@ -442,6 +438,23 @@ struct StagedChangelogCommit {
     selected_change_batches: Vec<StagedCommitChangeBatch>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SelectedChangeKey {
+    source_commit_id: CommitId,
+    identity: TrackedStateKey,
+}
+
+fn selected_change_key(change_ref: StagedCommitChangeRef<'_>) -> SelectedChangeKey {
+    SelectedChangeKey {
+        source_commit_id: change_ref.source_commit_id,
+        identity: TrackedStateKey {
+            schema_key: change_ref.schema_key().to_owned(),
+            file_id: change_ref.file_id().map(str::to_owned),
+            entity_pk: change_ref.entity_pk().clone(),
+        },
+    }
+}
+
 fn selected_changes(
     batches: &[StagedCommitChangeBatch],
 ) -> impl Iterator<Item = StagedCommitChangeRef<'_>> + '_ {
@@ -548,21 +561,15 @@ fn validate_selected_change_refs(
         return Ok(());
     }
 
-    let mut change_ids = BTreeSet::new();
     let mut identities = BTreeSet::new();
     for &row_index in state_row_indices {
         let row = state_rows.row(row_index);
-        let change_id = row.change_id.ok_or_else(|| {
+        row.change_id.ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "tracked staged row is missing change_id before changelog append",
             )
         })?;
-        if !change_ids.insert(change_id) {
-            return Err(LixError::unknown(format!(
-                "commit '{commit_id}' has duplicate change ref '{change_id}'"
-            )));
-        }
         if !identities.insert((
             row.schema_key.as_str(),
             row.file_id.map(crate::common::SharedStr::as_str),
@@ -574,12 +581,6 @@ fn validate_selected_change_refs(
         }
     }
     for change_ref in selected_changes(selected_change_batches) {
-        if !change_ids.insert(change_ref.change_id) {
-            return Err(LixError::unknown(format!(
-                "commit '{commit_id}' has duplicate change ref '{}'",
-                change_ref.change_id
-            )));
-        }
         if !identities.insert((
             change_ref.schema_key(),
             change_ref.file_id(),
@@ -770,12 +771,18 @@ fn tracked_delta_from_selected_change_ref(
 fn tracked_commit_delta_from_selected_change_ref<'a>(
     change_ref: StagedCommitChangeRef<'a>,
     commit_id: CommitId,
-    record: &'a ChangeRecord,
+    record: Option<&'a ChangeRecord>,
 ) -> Result<TrackedStateCommitDeltaRef<'a>, LixError> {
-    if record.change_id != change_ref.change_id {
+    if record.is_some_and(|record| record.change_id != change_ref.change_id) {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "selected commit delta payload has the wrong change id",
+        ));
+    }
+    if record.is_none() && !change_ref.deleted {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "live selected commit delta is missing its payload",
         ));
     }
     Ok(TrackedStateCommitDeltaRef {
@@ -789,9 +796,13 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
             created_at: change_ref.created_at,
             updated_at: change_ref.updated_at,
         },
-        snapshot: record.snapshot.as_ref_slot(),
-        metadata: record.metadata.as_ref_slot(),
-        origin_key: record.origin_key.as_deref(),
+        snapshot: record.map_or(crate::json_store::JsonSlotRef::None, |record| {
+            record.snapshot.as_ref_slot()
+        }),
+        metadata: record.map_or(crate::json_store::JsonSlotRef::None, |record| {
+            record.metadata.as_ref_slot()
+        }),
+        origin_key: record.and_then(|record| record.origin_key.as_deref()),
         authored: false,
     })
 }
@@ -889,12 +900,18 @@ fn current_state_delta_from_engine_row(
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-) -> Result<HashMap<ChangeId, ChangeRecord>, LixError> {
+) -> Result<HashMap<SelectedChangeKey, ChangeRecord>, LixError> {
     let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
     for change_ref in staged_commits
         .values()
         .flat_map(|staged| selected_changes(&staged.selected_change_batches))
     {
+        // Identity and timestamps fully describe a selected tombstone.
+        // Historical rows may be absent or retain metadata, while checkpoint
+        // HOT tombstones must carry no payload.
+        if change_ref.deleted {
+            continue;
+        }
         by_source_commit
             .entry(change_ref.source_commit_id)
             .or_default()
@@ -913,15 +930,19 @@ async fn load_selected_change_records(
             .collect::<Vec<_>>();
         let loaded = load_commit_delta_change_records(read, source_commit_id, &keys).await?;
         for (change_ref, record) in change_refs.into_iter().zip(loaded) {
-            let record = record.ok_or_else(|| {
-                LixError::new(
+            let Some(record) = record else {
+                return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "selected change '{}' has no authoritative payload at source commit '{}'",
-                        change_ref.change_id, source_commit_id
+                        "selected change '{}' for ({:?}, {:?}, {:?}) has no authoritative payload at source commit '{}'",
+                        change_ref.change_id,
+                        change_ref.schema_key(),
+                        change_ref.file_id(),
+                        change_ref.entity_pk(),
+                        source_commit_id
                     ),
-                )
-            })?;
+                ));
+            };
             if record.change_id != change_ref.change_id
                 || record.schema_key != change_ref.schema_key()
                 || record.file_id.as_deref() != change_ref.file_id()
@@ -937,7 +958,8 @@ async fn load_selected_change_records(
                     ),
                 ));
             }
-            if let Some(existing) = records.insert(record.change_id, record.clone())
+            let key = selected_change_key(change_ref);
+            if let Some(existing) = records.insert(key, record.clone())
                 && existing != record
             {
                 return Err(LixError::new(
@@ -953,13 +975,42 @@ async fn load_selected_change_records(
     Ok(records)
 }
 
+async fn materialize_selected_change_payloads(
+    read: &(impl StorageAdapterRead + ?Sized),
+    records: &HashMap<SelectedChangeKey, ChangeRecord>,
+) -> Result<HashMap<SelectedChangeKey, crate::changelog::MaterializedChangePayload>, LixError> {
+    let ordered = records
+        .iter()
+        .map(|(key, record)| (key.clone(), record.clone()))
+        .collect::<Vec<_>>();
+    let payloads = crate::changelog::materialize_known_change_payloads_in_order(
+        read,
+        ordered.iter().map(|(_, record)| record.clone()),
+        ChangeRecordProjection::full(),
+    )
+    .await?;
+    ordered
+        .into_iter()
+        .zip(payloads)
+        .map(|((key, record), (change_id, payload))| {
+            if change_id != record.change_id {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "selected change payload order does not match its source record",
+                ));
+            }
+            Ok((key, payload))
+        })
+        .collect()
+}
+
 fn stage_tracked_commit_delta_index(
     writes: &mut StorageWriteSet,
     state_rows: &PreparedStateBatch,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    selected_change_records: &HashMap<ChangeId, ChangeRecord>,
+    selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
 ) -> Result<(), LixError> {
     for root in tracked_roots {
         let state_row_indices = tracked_row_indices_by_commit
@@ -984,17 +1035,8 @@ fn stage_tracked_commit_delta_index(
             )?);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
-            let record = selected_change_records
-                .get(&change_ref.change_id)
-                .ok_or_else(|| {
-                    LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "selected change '{}' lost its authoritative payload before delta staging",
-                            change_ref.change_id
-                        ),
-                    )
-                })?;
+            let key = selected_change_key(change_ref);
+            let record = selected_change_records.get(&key);
             deltas.push(tracked_commit_delta_from_selected_change_ref(
                 change_ref,
                 root.commit_id,
@@ -1120,7 +1162,7 @@ async fn build_lifecycle_tracked_snapshots(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    selected_payloads: &HashMap<ChangeId, crate::changelog::MaterializedChangePayload>,
+    selected_payloads: &HashMap<SelectedChangeKey, crate::changelog::MaterializedChangePayload>,
     insert_selection: &PreparedInsertSelection,
     required: &BTreeSet<CommitId>,
 ) -> Result<BTreeMap<CommitId, HotTrackedSnapshot>, LixError> {
@@ -1132,7 +1174,7 @@ async fn build_lifecycle_tracked_snapshots(
         .iter()
         .map(|root| (root.commit_id, root))
         .collect::<BTreeMap<_, _>>();
-    let mut prepared_by_change = HashMap::new();
+    let mut prepared_by_identity = HashMap::new();
     for row in state_rows.iter().filter(|row| !row.untracked) {
         let change_id = row.change_id.ok_or_else(|| {
             LixError::new(
@@ -1142,10 +1184,17 @@ async fn build_lifecycle_tracked_snapshots(
         })?;
         let live = MaterializedLiveStateRow::from(row);
         let tracked = MaterializedTrackedStateRow::try_from(&live)?;
-        if prepared_by_change.insert(change_id, tracked).is_some() {
+        let identity = TrackedStateKey {
+            schema_key: tracked.schema_key.clone(),
+            file_id: tracked.file_id.clone(),
+            entity_pk: tracked.entity_pk.clone(),
+        };
+        if prepared_by_identity.insert(identity, tracked).is_some() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                format!("tracked lifecycle snapshot contains duplicate change '{change_id}'"),
+                format!(
+                    "tracked lifecycle snapshot contains duplicate identity for change '{change_id}'"
+                ),
             ));
         }
     }
@@ -1198,8 +1247,9 @@ async fn build_lifecycle_tracked_snapshots(
             )
         })?;
         for change_ref in selected_changes(&staged.selected_change_batches) {
-            let source = prepared_by_change.get(&change_ref.change_id);
-            let payload = selected_payloads.get(&change_ref.change_id);
+            let key = selected_change_key(change_ref);
+            let source = prepared_by_identity.get(&key.identity);
+            let payload = selected_payloads.get(&key);
             let tracked =
                 lifecycle_selected_tracked_row(change_ref, root.commit_id, source, payload)?;
             apply_lifecycle_tracked_snapshot_row(&mut rows, tracked, false)?;
@@ -1460,6 +1510,14 @@ fn lifecycle_selected_tracked_row(
             row.snapshot_content.clone(),
             row.metadata.clone(),
         )
+    } else if change_ref.deleted && payload.is_none() {
+        (
+            change_ref.schema_key().to_owned(),
+            change_ref.entity_pk().clone(),
+            change_ref.file_id().map(str::to_owned),
+            None,
+            None,
+        )
     } else {
         let payload = payload.ok_or_else(|| {
             LixError::new(
@@ -1601,7 +1659,10 @@ async fn stage_tracked_head(
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
-    selected_change_payloads: &HashMap<ChangeId, crate::changelog::MaterializedChangePayload>,
+    selected_change_payloads: &HashMap<
+        SelectedChangeKey,
+        crate::changelog::MaterializedChangePayload,
+    >,
     insert_selection: &PreparedInsertSelection,
     certified_fresh_plugin_file_id: Option<&str>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
@@ -1672,11 +1733,12 @@ async fn stage_tracked_head(
         {
             let selected_rows = selected_changes(&staged.selected_change_batches)
                 .map(|change_ref| {
+                    let key = selected_change_key(change_ref);
                     lifecycle_selected_tracked_row(
                         change_ref,
                         root.commit_id,
                         None,
-                        selected_change_payloads.get(&change_ref.change_id),
+                        selected_change_payloads.get(&key),
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -3548,14 +3610,13 @@ mod tests {
         assert!(error.message.contains("duplicate change ref key"));
 
         let row = tracked_global_row("normal-change");
-        let error = validate_selected_change_refs(
+        validate_selected_change_refs(
             commit_id("test-uuid-1"),
             &prepared_rows![row],
             &[0],
             &[selected_change_batch("normal-change", "other-entity")],
         )
-        .expect_err("selected ref must not duplicate a normal row change id");
-        assert!(error.message.contains("duplicate change ref '"));
+        .expect("different semantic identities may share one source change id");
     }
 
     #[tokio::test]
