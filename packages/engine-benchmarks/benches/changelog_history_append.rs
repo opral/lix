@@ -589,10 +589,14 @@ impl Fixture {
     async fn apply_lifecycle(&self, lifecycle: Lifecycle) {
         match (self, lifecycle) {
             (_, Lifecycle::Visible) => {}
-            (Self::Rocks(fixture), Lifecycle::WalFlushed | Lifecycle::MemtableFlushed) => fixture
+            (Self::Rocks(fixture), Lifecycle::WalFlushed) => fixture
+                .storage
+                .flush_wal_for_diagnostics()
+                .expect("flush changelog-history RocksDB WAL"),
+            (Self::Rocks(fixture), Lifecycle::MemtableFlushed) => fixture
                 .storage
                 .flush()
-                .expect("flush changelog-history RocksDB"),
+                .expect("flush changelog-history RocksDB memtable"),
             (Self::Slate(fixture), Lifecycle::WalFlushed) => fixture
                 .storage
                 .flush()

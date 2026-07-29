@@ -129,6 +129,15 @@ impl RocksDB {
     pub fn flush(&self) -> Result<(), StorageError> {
         self.inner.db.flush().map_err(rocksdb_error)
     }
+
+    /// Flushes the WAL without forcing the active memtable into an SST.
+    ///
+    /// Storage lifecycle benchmarks use this to distinguish durable,
+    /// memory-resident reads from memtable-flushed reads.
+    #[doc(hidden)]
+    pub fn flush_wal_for_diagnostics(&self) -> Result<(), StorageError> {
+        self.inner.db.flush_wal(true).map_err(rocksdb_error)
+    }
 }
 
 impl Storage for RocksDB {
