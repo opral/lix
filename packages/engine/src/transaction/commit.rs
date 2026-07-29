@@ -311,10 +311,19 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .iter()
         .map(|commit| (commit.commit_id, commit.created_at))
         .collect::<BTreeMap<_, _>>();
+    let certified_files = prepared_writes
+        .file_data_writes
+        .iter()
+        .map(|file| crate::live_state::CertifiedEntityBatchFileRef {
+            branch_id: &file.branch_id,
+            file_id: &file.file_id,
+            batches: file.certified_entity_batches(),
+        })
+        .collect::<Vec<_>>();
     crate::live_state::stage_certified_entity_batches(
         read,
         &mut writes,
-        &prepared_writes.file_data_writes,
+        &certified_files,
         &staged_hot_heads.controls,
         &branch_control_observations,
         &commit_created_at,
@@ -825,6 +834,34 @@ fn current_state_delta_from_state_row(
             crate::transaction::types::StageJson::slot_ref,
         ),
     })
+}
+
+impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
+    fn row(&self, index: usize) -> crate::live_state::DeferredFreshHotRowRef<'_> {
+        let row = PreparedStateBatch::row(self, index);
+        crate::live_state::DeferredFreshHotRowRef {
+            branch_id: row.branch_id.as_str(),
+            delta: crate::live_state::CurrentStateDeltaRef {
+                schema_key: row.schema_key,
+                file_id: row.file_id.map(crate::common::SharedStr::as_str),
+                entity_pk: row.entity_pk,
+                change_id: row.change_id,
+                commit_id: row.commit_id,
+                untracked: row.untracked,
+                deleted: row.snapshot.is_none(),
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                snapshot: row.snapshot.map_or(
+                    crate::json_store::JsonSlotRef::None,
+                    crate::transaction::types::StageJson::slot_ref,
+                ),
+                metadata: row.metadata.map_or(
+                    crate::json_store::JsonSlotRef::None,
+                    crate::transaction::types::StageJson::slot_ref,
+                ),
+            },
+        }
+    }
 }
 
 fn current_state_delta_from_engine_row(

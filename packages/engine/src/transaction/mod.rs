@@ -13,6 +13,7 @@ pub mod bench {
     pub use super::bench_support::*;
 }
 
+pub(crate) use context::CertifiedHistoryStoreReader;
 #[cfg(test)]
 pub(crate) use context::CommitBoundaryGuard;
 pub(crate) use context::CommitBoundaryState;

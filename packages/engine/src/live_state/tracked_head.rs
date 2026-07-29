@@ -9,9 +9,10 @@
 mod hot;
 
 pub(crate) use hot::{
-    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_SPACE, DeferredFreshHotPlan,
-    HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot, scan_certified_history_rows,
-    stage_certified_entity_batches,
+    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_SPACE,
+    CertifiedEntityBatchFileRef, DeferredFreshHotPlan, DeferredFreshHotRowRef,
+    DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot,
+    scan_certified_history_rows, stage_certified_entity_batches,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

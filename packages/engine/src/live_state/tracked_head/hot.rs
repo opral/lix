@@ -17,12 +17,12 @@ use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
 
-use crate::storage::{PutBatch, PutEntry};
 use crate::storage_adapter::{
     BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
+    PutBatch, PutEntry,
 };
 use crate::tracked_state::TrackedStateReadColumns;
-use crate::transaction::types::{PreparedStateBatch, PreparedStateRowRef, StageJson};
+use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
@@ -53,6 +53,21 @@ const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
 const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
     [HOT_ROW_SPACE, HOT_FILE_SPACE, HOT_DIFF_SPACE];
 
+pub(crate) struct DeferredFreshHotRowRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) delta: CurrentStateDeltaRef<'a>,
+}
+
+pub(crate) trait DeferredFreshHotRows: Send + Sync {
+    fn row(&self, index: usize) -> DeferredFreshHotRowRef<'_>;
+}
+
+pub(crate) struct CertifiedEntityBatchFileRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) file_id: &'a str,
+    pub(crate) batches: &'a [WasmCertifiedEntityBatch],
+}
+
 /// A certified fresh-file hot-state publication whose row owner is attached
 /// only after every other commit materializer has finished reading it.
 ///
@@ -72,7 +87,7 @@ impl DeferredFreshHotPlan {
     pub(crate) fn new(
         branch_id: &str,
         generation: CommitId,
-        state_rows: &PreparedStateBatch,
+        state_rows: &dyn DeferredFreshHotRows,
         row_indices: &[usize],
         certified_file_id: &str,
         validated_absence_guards: &[TrackedStateKeyRef<'_>],
@@ -183,7 +198,7 @@ impl DeferredFreshHotPlan {
 
     pub(crate) fn into_source(
         self,
-        state_rows: Arc<PreparedStateBatch>,
+        state_rows: Arc<dyn DeferredFreshHotRows>,
     ) -> Box<dyn DeferredFinalPutSource> {
         Box::new(DeferredFreshHotSource {
             plan: self,
@@ -196,7 +211,7 @@ impl DeferredFreshHotPlan {
 
 struct DeferredFreshHotSource {
     plan: DeferredFreshHotPlan,
-    state_rows: Arc<PreparedStateBatch>,
+    state_rows: Arc<dyn DeferredFreshHotRows>,
     cursor: usize,
     pending_pages: VecDeque<DeferredFinalPutPage>,
 }
@@ -242,8 +257,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
         let mut key_capacity = 0_usize;
         let mut value_capacity = 0_usize;
         for &row_index in indices {
-            let row = self.state_rows.row(row_index);
-            let delta = deferred_fresh_delta_unchecked(row);
+            let delta = self.state_rows.row(row_index).delta;
             key_capacity = key_capacity.saturating_add(
                 encoded_hot_identity_key_len(
                     scope.len(),
@@ -279,8 +293,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
         let mut diff_key_ranges =
             Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| indices.len()));
         for &row_index in indices {
-            let row = self.state_rows.row(row_index);
-            let delta = deferred_fresh_delta_unchecked(row);
+            let delta = self.state_rows.row(row_index).delta;
             key_ranges.push(append_hot_mutation_identity(&mut key_bytes, &scope, &delta));
             value_ranges.push(
                 append_head_value(
@@ -363,52 +376,34 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
 }
 
 fn deferred_fresh_delta<'a>(
-    row: PreparedStateRowRef<'a>,
+    row: DeferredFreshHotRowRef<'a>,
     branch_id: &str,
     certified_file_id: &str,
     validated_absence_guards: &[TrackedStateKeyRef<'_>],
 ) -> Result<CurrentStateDeltaRef<'a>, LixError> {
-    let file_is_certified = row.file_id.map(SharedStr::as_str) == Some(certified_file_id);
+    let delta = row.delta;
+    let file_is_certified = delta.file_id == Some(certified_file_id);
     let identity_is_guarded = validated_absence_guards
         .binary_search_by(|guard| {
             guard
                 .schema_key
-                .cmp(row.schema_key.as_str())
-                .then_with(|| guard.entity_pk.cmp(row.entity_pk))
-                .then_with(|| guard.file_id.cmp(&row.file_id.map(SharedStr::as_str)))
+                .cmp(delta.schema_key)
+                .then_with(|| guard.entity_pk.cmp(delta.entity_pk))
+                .then_with(|| guard.file_id.cmp(&delta.file_id))
         })
         .is_ok();
-    if row.branch_id.as_str() != branch_id
-        || (!file_is_certified && !identity_is_guarded)
-        || row.untracked
+    if row.branch_id != branch_id || (!file_is_certified && !identity_is_guarded) || delta.untracked
     {
         return Err(head_value_error(
             "deferred fresh hot row escaped its certified or guarded identity scope",
         ));
     }
-    let delta = deferred_fresh_delta_unchecked(row);
     if delta.commit_id.is_none() || delta.change_id.is_none() {
         return Err(head_value_error(
             "deferred fresh hot tracked row is missing commit identity",
         ));
     }
     Ok(delta)
-}
-
-fn deferred_fresh_delta_unchecked(row: PreparedStateRowRef<'_>) -> CurrentStateDeltaRef<'_> {
-    CurrentStateDeltaRef {
-        schema_key: row.schema_key,
-        file_id: row.file_id.map(SharedStr::as_str),
-        entity_pk: row.entity_pk,
-        change_id: row.change_id,
-        commit_id: row.commit_id,
-        untracked: row.untracked,
-        deleted: row.snapshot.is_none(),
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        snapshot: row.snapshot.map_or(JsonSlotRef::None, StageJson::slot_ref),
-        metadata: row.metadata.map_or(JsonSlotRef::None, StageJson::slot_ref),
-    }
 }
 
 /// Publishes one immutable semantic owner per certified file batch.
@@ -419,7 +414,7 @@ fn deferred_fresh_delta_unchecked(row: PreparedStateRowRef<'_>) -> CurrentStateD
 pub(crate) async fn stage_certified_entity_batches(
     read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
-    file_writes: &[crate::transaction::types::TransactionFileData],
+    file_writes: &[CertifiedEntityBatchFileRef<'_>],
     controls: &BTreeMap<String, BranchHeadControl>,
     observations: &BTreeMap<String, crate::branch::BranchHeadControlObservation>,
     commit_created_at: &BTreeMap<CommitId, LixTimestamp>,
@@ -427,15 +422,15 @@ pub(crate) async fn stage_certified_entity_batches(
     let mut complete_manifest_suffixes = BTreeMap::<String, Vec<Vec<u8>>>::new();
     for file in file_writes {
         for batch in file
-            .certified_entity_batches()
+            .batches
             .iter()
             .filter(|batch| batch.complete_file_state)
         {
             let mut suffix = Vec::new();
-            append_batch_text(&mut suffix, &file.file_id)?;
+            append_batch_text(&mut suffix, file.file_id)?;
             suffix.extend_from_slice(&batch.format.to_le_bytes());
             complete_manifest_suffixes
-                .entry(file.branch_id.clone())
+                .entry(file.branch_id.to_owned())
                 .or_default()
                 .push(suffix);
         }
@@ -485,20 +480,20 @@ pub(crate) async fn stage_certified_entity_batches(
     }
 
     for file in file_writes {
-        if file.certified_entity_batches().is_empty() {
+        if file.batches.is_empty() {
             continue;
         }
-        let control = controls.get(&file.branch_id).ok_or_else(|| {
+        let control = controls.get(file.branch_id).ok_or_else(|| {
             head_value_error("certified entity batch has no published branch control")
         })?;
         let created_at = commit_created_at
             .get(&control.head_commit_id)
             .copied()
             .ok_or_else(|| head_value_error("certified entity batch has no commit timestamp"))?;
-        for batch in file.certified_entity_batches() {
+        for batch in file.batches {
             if batch.complete_file_state {
                 let mut manifest_prefix = control.generation.as_uuid().as_bytes().to_vec();
-                append_batch_text(&mut manifest_prefix, &file.file_id)?;
+                append_batch_text(&mut manifest_prefix, file.file_id)?;
                 manifest_prefix.extend_from_slice(&batch.format.to_le_bytes());
                 let prior_manifests = ScanPlan::prefix(
                     CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
@@ -513,7 +508,7 @@ pub(crate) async fn stage_certified_entity_batches(
                 }
             }
             let mut content_key = control.head_commit_id.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut content_key, &file.file_id)?;
+            append_batch_text(&mut content_key, file.file_id)?;
             content_key.extend_from_slice(&batch.format.to_le_bytes());
 
             let page_bytes = batch
@@ -549,7 +544,7 @@ pub(crate) async fn stage_certified_entity_batches(
             for schema_key in &batch.schema_keys {
                 append_batch_text(&mut value, schema_key)?;
             }
-            append_batch_text(&mut value, &file.file_id)?;
+            append_batch_text(&mut value, file.file_id)?;
             value.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
             append_batch_text(&mut value, &created_at.to_string())?;
             value.extend_from_slice(&batch.format.to_le_bytes());
@@ -577,7 +572,7 @@ pub(crate) async fn stage_certified_entity_batches(
                 },
             );
             let mut manifest_key = control.generation.as_uuid().as_bytes().to_vec();
-            append_batch_text(&mut manifest_key, &file.file_id)?;
+            append_batch_text(&mut manifest_key, file.file_id)?;
             manifest_key.extend_from_slice(&batch.format.to_le_bytes());
             manifest_key.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
             writes.put(
@@ -1258,6 +1253,13 @@ where
         if !page.value.entries.is_empty() {
             return Ok(true);
         }
+        // Format plugins cannot publish engine-owned schemas. Avoid probing
+        // certified plugin segments when validation asks about a missing
+        // system schema; durable-function setup relies on this point-read-only
+        // path staying free of unrelated storage scans.
+        if schema_key.starts_with("lix_") {
+            return Ok(false);
+        }
         let certified = scan_certified_entity_batch_rows(
             &self.store,
             branch_id,
@@ -1477,6 +1479,9 @@ where
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
         if slots.iter().all(Option::is_some) {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+        if keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
             return MaterializedLiveStateExactBatch::new(rows, slots);
         }
 

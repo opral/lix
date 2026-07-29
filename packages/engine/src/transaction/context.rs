@@ -84,9 +84,10 @@ use crate::session::{
     encode_receipt, load_workspace_branch_id_from_index,
 };
 use crate::sql2::{
-    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
-    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource,
+    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
+    HistoryQuerySource, MaterializedChange, SessionFileViewKey, SessionFileViewMutation,
+    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -97,7 +98,8 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateStoreReader,
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateScanRequest,
+    TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -115,6 +117,50 @@ use crate::transaction::types::{
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
+
+pub(crate) struct CertifiedHistoryStoreReader<S> {
+    store: S,
+}
+
+impl<S> CertifiedHistoryStoreReader<S> {
+    pub(crate) const fn new(store: S) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<S> CertifiedHistoryReader for CertifiedHistoryStoreReader<S>
+where
+    S: StorageAdapterRead + Send + Sync,
+{
+    async fn scan(
+        &self,
+        commit_ids: &BTreeSet<CommitId>,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
+        Ok(
+            crate::live_state::scan_certified_history_rows(&self.store, commit_ids, request)
+                .await?
+                .into_iter()
+                .filter_map(|row| {
+                    Some(CertifiedHistoryChange {
+                        commit_id: row.commit_id?,
+                        change: MaterializedChange {
+                            id: row.change_id?.to_string(),
+                            entity_pk: row.entity_pk,
+                            schema_key: row.schema_key,
+                            file_id: row.file_id,
+                            snapshot_content: row.snapshot_content,
+                            metadata: row.metadata,
+                            created_at: row.created_at.to_string(),
+                            origin_key: None,
+                        },
+                    })
+                })
+                .collect(),
+        )
+    }
+}
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
@@ -5538,6 +5584,9 @@ where
         HistoryQuerySource {
             store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
+            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
+                self.read_store.clone(),
+            ))),
             default_as_of_commit_id,
         }
     }

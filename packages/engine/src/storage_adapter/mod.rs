@@ -32,6 +32,7 @@ pub use crate::storage::{
     ScanOptions as StorageScanOptions, SpaceId as StorageSpaceId, Storage, StorageError,
     StorageRead, StoredValue as StorageValue, WriteOptions as StorageWriteOptions,
 };
+pub(crate) use crate::storage::{PutBatch, PutEntry};
 
 pub use context::StorageAdapter;
 pub use point::{PointReadPlan, PointValues, RequestedToUnique, RequestedToUniqueRef};

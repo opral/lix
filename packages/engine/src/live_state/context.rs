@@ -642,12 +642,7 @@ where
         tracked_only: bool,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         if tracked_only {
-            // Constraint validation must consult immutable certified segments
-            // even when an older branch-control bloom predates their schema
-            // publication. The scan itself still uses the schema filter and
-            // segment manifests, so this avoids a false negative without
-            // materializing unrelated semantic rows.
-            self.scan_tracked_batch_with_schema_presence(request, false)
+            self.scan_tracked_batch_with_schema_presence(request, true)
                 .await
         } else {
             self.scan_batch_with_schema_presence(request, true).await
