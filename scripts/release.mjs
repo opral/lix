@@ -218,7 +218,12 @@ export function updatePackageVersion(root, version) {
 		);
 	}
 	for (const packageName of JS_SDK_NATIVE_PACKAGES) {
-		delete lock.packages?.[`node_modules/${packageName}`];
+		const lockedPackage = lock.packages?.[`node_modules/${packageName}`];
+		if (!lockedPackage) continue;
+		const unscopedName = packageName.split("/").at(-1);
+		lockedPackage.version = version;
+		lockedPackage.resolved = `https://registry.npmjs.org/${packageName}/-/${unscopedName}-${version}.tgz`;
+		delete lockedPackage.integrity;
 	}
 	writeJson(root, lockPath, lock);
 }
