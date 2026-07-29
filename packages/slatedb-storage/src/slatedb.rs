@@ -1440,14 +1440,16 @@ async fn check_preconditions(
     let write_pipeline = write_pipeline.clone();
     let read_pipeline = write_pipeline.clone();
     let point_cache = point_cache.clone();
-    let capture_worker = worker.clone();
+    let (snapshot, snapshot_fetch) = write_pipeline.snapshot(worker).await?;
+    let snapshot_sequence = snapshot.seq();
+    point_cache.observe_snapshot(snapshot_sequence);
+    let publication_view = read_pipeline.capture_with_worker(worker.clone(), snapshot_sequence);
+    // Keep the fetch guard alive until the publication view is registered.
+    // Otherwise a concurrent drainer can retire an overlay between obtaining
+    // the snapshot and capturing the view that makes that overlay visible.
+    drop(snapshot_fetch);
     let matches = worker
-        .call_read(move |db| async move {
-            let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-            let snapshot_sequence = snapshot.seq();
-            point_cache.observe_snapshot(snapshot_sequence);
-            let publication_view =
-                read_pipeline.capture_with_worker(capture_worker, snapshot_sequence);
+        .call_read(move |_db| async move {
             let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
             let mut index = 0;
