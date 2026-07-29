@@ -37,6 +37,7 @@ use slatedb::config::{
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
+use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
@@ -46,8 +47,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
 use std::io::{Read, Seek, SeekFrom};
 
 const DB_PATH: &str = "db";
-const LZ4_FORMAT_PATH: &str = "lix-lz4-v1";
+const SEGMENTED_FORMAT_PATH: &str = "lix-space-segments-v2";
 const SPACE_PREFIX_LEN: usize = 4;
+const SPACE_PREFIX_EXTRACTOR_NAME: &str = "lix-storage-space-be32-v1";
 const MAX_SLATEDB_KEY_LEN: usize = u16::MAX as usize;
 const RUNTIME_WORKER_THREADS: usize = 2;
 const POINT_READ_CONCURRENCY: usize = 64;
@@ -65,6 +67,22 @@ const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
 const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
 const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LOCAL_SST_CONTENT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Debug)]
+struct StorageSpacePrefixExtractor;
+
+impl PrefixExtractor for StorageSpacePrefixExtractor {
+    fn name(&self) -> &str {
+        SPACE_PREFIX_EXTRACTOR_NAME
+    }
+
+    fn prefix_len(&self, target: &PrefixTarget) -> Option<usize> {
+        let len = match target {
+            PrefixTarget::Point(bytes) | PrefixTarget::Prefix(bytes) => bytes.len(),
+        };
+        (len >= SPACE_PREFIX_LEN).then_some(SPACE_PREFIX_LEN)
+    }
+}
 
 #[derive(Debug)]
 pub struct SlateDBFactory {
@@ -2238,8 +2256,9 @@ fn open_slatedb(
     options: SlateDBObjectStoreOptions,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
-        let physical_db_path = join_db_path(&db_path, LZ4_FORMAT_PATH);
-        let mut builder = Db::builder(physical_db_path, object_store);
+        let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
+        let mut builder = Db::builder(physical_db_path, object_store)
+            .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor));
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
             settings.object_store_cache_options = ObjectStoreCacheOptions {
@@ -2901,6 +2920,20 @@ mod tests {
     }
 
     #[test]
+    fn storage_space_extractor_uses_the_four_byte_physical_prefix() {
+        let extractor = StorageSpacePrefixExtractor;
+        assert_eq!(extractor.name(), SPACE_PREFIX_EXTRACTOR_NAME);
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Point(Bytes::from_static(b"\0\0\0\x07key"))),
+            Some(SPACE_PREFIX_LEN)
+        );
+        assert_eq!(
+            extractor.prefix_len(&PrefixTarget::Prefix(Bytes::from_static(b"\0\0\0"))),
+            None
+        );
+    }
+
+    #[test]
     fn disk_cache_parts_match_scan_read_ahead() {
         assert_eq!(OBJECT_STORE_CACHE_PART_SIZE_BYTES, SCAN_READ_AHEAD_BYTES);
     }
@@ -3046,7 +3079,7 @@ mod tests {
 
         let first = block_on(storage.worker.call_read(|db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-            snapshot.get(b"key").await.map_err(slatedb_error)
+            snapshot.get(b"\0\0\0\x07key").await.map_err(slatedb_error)
         }))
         .expect("warm raw SlateDB SST read");
         assert_eq!(first, Some(Bytes::from_static(b"value")));
@@ -3057,7 +3090,7 @@ mod tests {
         let reader = std::thread::spawn(move || {
             let result = block_on(reader_storage.worker.call_read(|db| async move {
                 let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-                snapshot.get(b"key").await.map_err(slatedb_error)
+                snapshot.get(b"\0\0\0\x07key").await.map_err(slatedb_error)
             }));
             result_tx.send(result).expect("send warm raw read result");
         });
@@ -3076,20 +3109,21 @@ mod tests {
     }
 
     fn seed_compacted_sst(inner: Arc<InMemory>, db_path: &str) {
-        let physical_db_path = join_db_path(db_path, LZ4_FORMAT_PATH);
+        let physical_db_path = join_db_path(db_path, SEGMENTED_FORMAT_PATH);
         Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("build raw SlateDB test runtime")
             .block_on(async {
                 let db = Db::builder(physical_db_path, inner.clone())
+                    .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
                     .with_settings(slatedb_settings())
                     .with_db_cache_disabled()
                     .build()
                     .await
                     .expect("open raw SlateDB");
                 let mut batch = WriteBatch::new();
-                batch.put(b"key", b"value");
+                batch.put(b"\0\0\0\x07key", b"value");
                 db.write_with_options(
                     batch,
                     &SlateDBWriteOptions {
@@ -3110,7 +3144,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_storage_uses_versioned_lz4_format() {
+    fn fresh_storage_uses_versioned_segmented_format() {
         let store = Arc::new(InMemory::new());
         let db_path = "test-lz4-physical-format";
         let space = SpaceId(7);
@@ -3137,17 +3171,29 @@ mod tests {
         .expect("stage LZ4 row");
         block_on(write.commit()).expect("commit LZ4 row");
         block_on(storage.flush()).expect("flush LZ4 row");
-        block_on(storage.worker.call(|db| async move {
+        block_on(storage.worker.call(move |db| async move {
             db.flush_with_options(FlushOptions {
                 flush_type: FlushType::MemTable,
             })
             .await
             .map_err(slatedb_error)?;
+            assert_eq!(
+                db.manifest().segment_extractor_name(),
+                Some(SPACE_PREFIX_EXTRACTOR_NAME),
+                "new physical database must persist the Lix storage-space extractor"
+            );
             assert!(
                 db.manifest()
-                    .l0()
+                    .segment(&space.0.to_be_bytes())
+                    .is_some_and(|segment| !segment.l0().is_empty()),
+                "the row must be isolated in its storage-space segment"
+            );
+            assert!(
+                db.manifest()
+                    .segments()
                     .iter()
-                    .any(|view| { view.sst.info.compression_codec == Some(CompressionCodec::Lz4) }),
+                    .flat_map(|segment| segment.l0())
+                    .any(|view| view.sst.info.compression_codec == Some(CompressionCodec::Lz4)),
                 "new physical SST must record the LZ4 codec"
             );
             Ok(())
@@ -3155,7 +3201,7 @@ mod tests {
         .expect("flush and inspect LZ4 SST");
         drop(storage);
 
-        let physical_prefix = format!("{db_path}/{LZ4_FORMAT_PATH}/");
+        let physical_prefix = format!("{db_path}/{SEGMENTED_FORMAT_PATH}/");
         let object_paths = block_on(async {
             let mut objects = store.list(None);
             let mut paths = Vec::new();
@@ -3174,7 +3220,7 @@ mod tests {
             object_paths
                 .iter()
                 .all(|path| path.starts_with(&physical_prefix)),
-            "all objects must use the versioned LZ4 namespace: {object_paths:?}"
+            "all objects must use the versioned segmented namespace: {object_paths:?}"
         );
     }
 
