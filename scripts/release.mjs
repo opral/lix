@@ -217,6 +217,9 @@ export function updatePackageVersion(root, version) {
 			JS_SDK_NATIVE_PACKAGES.map((packageName) => [packageName, version]),
 		);
 	}
+	for (const packageName of JS_SDK_NATIVE_PACKAGES) {
+		delete lock.packages?.[`node_modules/${packageName}`];
+	}
 	writeJson(root, lockPath, lock);
 }
 

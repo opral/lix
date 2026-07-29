@@ -180,7 +180,14 @@ test("updatePackageVersion pins native optional dependencies", () => {
 				version: "0.6.0",
 				lockfileVersion: 3,
 				requires: true,
-				packages: { "": { name: "@lix-js/sdk", version: "0.6.0" } },
+				packages: {
+					"": { name: "@lix-js/sdk", version: "0.6.0" },
+					"node_modules/@lix-js/sdk-linux-x64": {
+						version: "0.6.0",
+						resolved: "https://registry.npmjs.org/@lix-js/sdk-linux-x64/-/sdk-linux-x64-0.6.0.tgz",
+						optional: true,
+					},
+				},
 			},
 			null,
 			"\t",
@@ -193,4 +200,5 @@ test("updatePackageVersion pins native optional dependencies", () => {
 	const lock = JSON.parse(readFileSync(join(root, "packages", "js-sdk", "package-lock.json"), "utf8"));
 	assert.equal(packageJson.optionalDependencies["@lix-js/sdk-linux-x64"], "0.7.0");
 	assert.equal(lock.packages[""].optionalDependencies["@lix-js/sdk-darwin-arm64"], "0.7.0");
+	assert.equal(lock.packages["node_modules/@lix-js/sdk-linux-x64"], undefined);
 });
