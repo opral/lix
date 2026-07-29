@@ -440,7 +440,7 @@ where
         if args.verify_state {
             let verify_started = Instant::now();
             apply_prepared_to_expected_state(&mut expected_state_by_id, &prepared);
-            verify_commit_state_hashes(&lix, &expected_state_by_id, commit_sha)?;
+            verify_commit_changes(&lix, &expected_state_by_id, &prepared, commit_sha)?;
             let verify_elapsed_ms = duration_to_ms(verify_started.elapsed());
             phase_totals.verify_ms += verify_elapsed_ms;
             verify_ms = Some(verify_elapsed_ms);
@@ -791,7 +791,7 @@ where
     }
     if verify_state {
         apply_prepared_to_expected_state(expected_state_by_id, &prepared);
-        verify_commit_state_hashes(lix, expected_state_by_id, parent_commit)?;
+        verify_commit_changes(lix, expected_state_by_id, &prepared, parent_commit)?;
     }
     Ok(prepared.inserts.len())
 }
@@ -1694,106 +1694,91 @@ fn apply_prepared_to_expected_state(
     }
 }
 
-fn verify_commit_state_hashes<StorageImpl>(
+fn verify_commit_changes<StorageImpl>(
     lix: &Lix<StorageImpl>,
     expected_state_by_id: &HashMap<String, ExpectedFile>,
+    prepared: &PreparedBatch,
     commit_sha: &str,
 ) -> Result<(), CliError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    let params: &[Value] = &[];
-    let result = db::block_on(lix.execute(
-        "SELECT id, path, data, lixcol_metadata FROM lix_file \
-         WHERE path NOT LIKE '/.lix/plugins/%'",
-        params,
-    ))
-    .map_err(|err| {
-        CliError::msg(format!(
-            "failed to query replay state for verification: {err}"
-        ))
-    })?;
-    let rows = result.rows();
-    if rows.len() != expected_state_by_id.len() {
-        return Err(CliError::msg(format!(
-            "state mismatch at {commit_sha}: row count differs (lix={}, expected={})",
-            rows.len(),
-            expected_state_by_id.len()
-        )));
-    }
+    let affected_ids = prepared
+        .deletes
+        .iter()
+        .chain(prepared.inserts.iter().map(|row| &row.id))
+        .chain(prepared.updates.iter().map(|row| &row.id))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
 
-    let mut seen = HashSet::<String>::new();
-    for (index, row) in rows.iter().enumerate() {
-        if row.values().len() < 4 {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: row {index} has fewer than 4 columns"
-            )));
-        }
-
-        let id = value_to_string(
-            row.get_index(0)
-                .ok_or_else(|| CliError::msg(format!("missing verify.id[{index}]")))?,
-            &format!("verify.id[{index}]"),
-        )?;
-        let path = value_to_string(
-            row.get_index(1)
-                .ok_or_else(|| CliError::msg(format!("missing verify.path[{index}]")))?,
-            &format!("verify.path[{index}]"),
-        )?;
-        let data = value_to_optional_blob(
-            row.get_index(2)
-                .ok_or_else(|| CliError::msg(format!("missing verify.data[{index}]")))?,
-            &format!("verify.data[{index}]"),
-        )?;
-        let metadata = value_to_json(
-            row.get_index(3)
-                .ok_or_else(|| CliError::msg(format!("missing verify.metadata[{index}]")))?,
-            &format!("verify.metadata[{index}]"),
-        )?;
-
-        let expected = expected_state_by_id.get(&id).ok_or_else(|| {
+    for affected_chunk in affected_ids.chunks(500) {
+        let placeholders = vec!["?"; affected_chunk.len()].join(", ");
+        let sql = format!(
+            "SELECT id, path, data, lixcol_metadata FROM lix_file \
+             WHERE id IN ({placeholders})"
+        );
+        let params = affected_chunk
+            .iter()
+            .cloned()
+            .map(Value::Text)
+            .collect::<Vec<_>>();
+        let result = db::block_on(lix.execute(&sql, &params)).map_err(|err| {
             CliError::msg(format!(
-                "state mismatch at {commit_sha}: unexpected file id in lix state: {id}"
+                "failed to query changed replay state for verification: {err}"
             ))
         })?;
-        if expected.path != path {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: path differs for id {id} (lix={path}, expected={})",
-                expected.path
-            )));
-        }
-        if mode_is_gitlink(&expected.git_mode) {
-            if data.is_some_and(|bytes| !bytes.is_empty()) {
+        let mut seen = HashSet::<String>::new();
+        for (index, row) in result.rows().iter().enumerate() {
+            if row.values().len() < 4 {
                 return Err(CliError::msg(format!(
-                    "state mismatch at {commit_sha}: gitlink {id} has non-empty synthetic payload"
+                    "state mismatch at {commit_sha}: changed row {index} has fewer than 4 columns"
                 )));
             }
-        } else {
-            let hash = data.map(sha256_hex);
-            if expected.sha256 != hash {
+
+            let id = value_to_string(
+                row.get_index(0)
+                    .ok_or_else(|| CliError::msg(format!("missing verify.id[{index}]")))?,
+                &format!("verify.id[{index}]"),
+            )?;
+            let path = value_to_string(
+                row.get_index(1)
+                    .ok_or_else(|| CliError::msg(format!("missing verify.path[{index}]")))?,
+                &format!("verify.path[{index}]"),
+            )?;
+            let data = value_to_optional_blob(
+                row.get_index(2)
+                    .ok_or_else(|| CliError::msg(format!("missing verify.data[{index}]")))?,
+                &format!("verify.data[{index}]"),
+            )?;
+            let metadata = value_to_json(
+                row.get_index(3)
+                    .ok_or_else(|| CliError::msg(format!("missing verify.metadata[{index}]")))?,
+                &format!("verify.metadata[{index}]"),
+            )?;
+
+            let expected = expected_state_by_id.get(&id).ok_or_else(|| {
+                CliError::msg(format!(
+                    "state mismatch at {commit_sha}: deleted file id remains in Lix state: {id}"
+                ))
+            })?;
+            if expected.path != path {
                 return Err(CliError::msg(format!(
-                    "state mismatch at {commit_sha}: hash differs for id {id}"
+                    "state mismatch at {commit_sha}: path differs for id {id} (lix={path}, expected={})",
+                    expected.path
+                )));
+            }
+            verify_file_manifest_entry(&path, data, &metadata, expected, commit_sha)?;
+            seen.insert(id);
+        }
+        for id in affected_chunk {
+            if expected_state_by_id.contains_key(id) && !seen.contains(id) {
+                return Err(CliError::msg(format!(
+                    "state mismatch at {commit_sha}: changed file id is missing from Lix state: {id}"
                 )));
             }
         }
-        if metadata.get("git_mode").and_then(serde_json::Value::as_str) != Some(&expected.git_mode)
-            || metadata.get("git_oid").and_then(serde_json::Value::as_str)
-                != Some(&expected.git_oid)
-        {
-            return Err(CliError::msg(format!(
-                "state mismatch at {commit_sha}: Git metadata differs for id {id}"
-            )));
-        }
-
-        seen.insert(id);
-    }
-
-    if seen.len() != expected_state_by_id.len() {
-        return Err(CliError::msg(format!(
-            "state mismatch at {commit_sha}: missing rows (lix={}, expected={})",
-            seen.len(),
-            expected_state_by_id.len()
-        )));
     }
 
     Ok(())
