@@ -124,3 +124,87 @@ The exact-case binaries had SHA-256
 `eb0cbbd5d2f1a6acf11589c73175fb8a326f0a0a6eb31353dc4e0bd2097da8e4`
 (candidate). The combined raw-result SHA-256 is
 `86f828358d38bff5f4a82d3a0bd956d079b2162efa9e7e2823db4d24e88594e3`.
+
+## Inline manifests through 128 KiB
+
+Date: 2026-07-29
+
+OpenClaw has another 23,049 unique blobs (2,088,120,165 logical bytes) above
+64 KiB and at or below 128 KiB. Extending the manifest-probed inline layout to
+this band again replaces one manifest, payload, and presence row with one
+manifest row.
+
+Seven counterbalanced baseline/candidate process pairs used fresh temporary
+databases per exact case, 300 warmups, and 3,000 timed samples. The values are
+the median per-run p50:
+
+| Backend | Operation | 64 KiB limit p50 | 128 KiB limit p50 | Change |
+| ------- | --------- | ---------------: | ----------------: | -----: |
+| RocksDB | New-content write | 226,571 ns | 231,737 ns | 2.3% slower |
+| RocksDB | Repeat write | 22,230 ns | 24,293 ns | 9.3% slower |
+| RocksDB | Hot read | 5,938 ns | 4,917 ns | **17.2% faster** |
+| SlateDB | New-content write | 111,402 ns | 106,846 ns | 4.1% faster |
+| SlateDB | Repeat write | 35,839 ns | 21,460 ns | **40.1% faster** |
+| SlateDB | Hot read | 6,970 ns | 6,249 ns | **10.3% faster** |
+
+The logical shape drops from three rows and 96 key bytes to one row and 32 key
+bytes per unique blob in this band. Encoded value bytes remain nearly flat
+(131,119 to 131,084 bytes for the measured high-entropy 128 KiB payload).
+
+The exact-case binaries had SHA-256
+`29725d7f58f0ce28830e958bd0186756b8d5ff28e08a3cafbd057e7f79786ccf`
+(baseline) and
+`3e2d86c24a18491b352bbcd77d8a0c6417ab0d9fd881efe8a209d52799500866`
+(candidate). The combined raw-result SHA-256 is
+`e78b2dcd263addb7cff669f43779c9c24a86828d4b407ce3e0ab82e2862bc174`.
+
+### Rejected 256 KiB extension
+
+The same seven-pair protocol tested extending inline manifests through
+256 KiB. This is rejected because it moves the larger value into the manifest
+space and materially regresses RocksDB:
+
+| Backend | Operation | 128 KiB limit p50 | 256 KiB limit p50 | Change |
+| ------- | --------- | ---------------: | ----------------: | -----: |
+| RocksDB | New-content write | 412,075 ns | 413,457 ns | 0.3% slower |
+| RocksDB | Repeat write | 39,174 ns | 48,827 ns | **24.6% slower** |
+| RocksDB | Hot read | 10,473 ns | 12,798 ns | **22.2% slower** |
+| SlateDB | New-content write | 204,020 ns | 203,700 ns | 0.2% faster |
+| SlateDB | Repeat write | 52,703 ns | 43,640 ns | **17.2% faster** |
+| SlateDB | Hot read | 8,581 ns | 8,151 ns | 5.0% faster |
+
+The exact-case binaries had SHA-256
+`1ead339d48e6f3e351e88376eebdfc58031c4fd6bbf673c4d0719d6c7e65b949`
+(baseline) and
+`7224531462d84fd4d87d0928719ca3bf5caab195c1ab36e3eaa8950117a9a3f1`
+(candidate). The combined raw-result SHA-256 is
+`add3c863a4e22fb4494a9eb4f327230939d388e2870ad1c9452c3ee542f0e39e`.
+
+### OpenClaw end-to-end check
+
+The storage-neutral Git replay profiler from PR #925 replayed OpenClaw commit
+`c5c50a2141f2cdd805ae9b70a14a2e66dabac9b6` with all text, CSV, and Markdown
+plugins enabled. This commit changes 3,423 paths and eagerly persists 559,701
+semantic changes. Three counterbalanced pairs compared #925 alone with #925
+plus the 64 KiB and 128 KiB layout changes:
+
+| Backend | Metric | Baseline median | Layout stack median | Change |
+| ------- | ------ | --------------: | ------------------: | -----: |
+| RocksDB | Timed replay | 17,830.306 ms | 17,919.724 ms | 0.5% slower |
+| RocksDB | Parent bootstrap | 1,488.259 ms | 1,416.860 ms | 4.8% faster |
+| RocksDB | Final flush | 1,720.548 ms | 1,729.472 ms | 0.5% slower |
+| SlateDB | Timed replay | 17,618.113 ms | 17,823.678 ms | 1.2% slower |
+| SlateDB | Parent bootstrap | 1,388.375 ms | 1,387.330 ms | 0.1% faster |
+| SlateDB | Final flush | 4,410.714 ms | 4,576.873 ms | 3.8% slower |
+
+Final physical size was effectively flat: RocksDB changed from 136,500,209 to
+136,503,305 bytes and SlateDB from 341,107,956 to 341,168,511 bytes. This
+confirms that plugin reconciliation and validation, rather than binary CAS
+layout, dominate this pathological commit.
+
+The exact replay binaries had SHA-256
+`9b99f9ac44bd4e3c06913fadc375d5bba1d6c65039d7d9f01ceb0635e210f19b`
+(baseline) and
+`eb4df3645df61d65213e706034efebe39db92b04f68df00f688f24910da2ffca`
+(layout stack). The ordered profile-hash manifest SHA-256 is
+`23f3b0551cc4b729895871e7b6c5976ee27402182614ab4222807ecb5145473c`.

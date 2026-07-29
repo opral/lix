@@ -1882,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_layout_stops_at_the_64kib_boundary() {
+    fn inline_layout_stops_at_the_128kib_boundary() {
         let at_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES];
         let above_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES + 1];
 
