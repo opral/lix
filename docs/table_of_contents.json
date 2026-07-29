@@ -10,6 +10,7 @@
     { "path": "./semantic-changes.md", "label": "Semantic Changes" },
     { "path": "./versions.md", "label": "Versions & Merging" },
     { "path": "./checkpoints.md", "label": "Checkpoints" },
+    { "path": "./diff-commands.md", "label": "Diff Commands" },
     { "path": "./history.md", "label": "Change History" },
     { "path": "./surfaces.md", "label": "SQL Surfaces" }
   ],

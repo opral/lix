@@ -44,7 +44,7 @@ async fn main() -> Result<(), LixError> {
     let working = lix
         .execute(
             "SELECT entity_pk, schema_key, change_kind
-             FROM lix_working_change",
+             FROM lix_working_diff",
             &[],
         )
         .await?;
@@ -73,7 +73,7 @@ async fn main() -> Result<(), LixError> {
 
     let remaining = lix
         .execute(
-            "SELECT COUNT(*) AS count FROM lix_working_change",
+            "SELECT COUNT(*) AS count FROM lix_working_diff",
             &[],
         )
         .await?;
@@ -101,8 +101,8 @@ Checkpointing has eight read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_working_change` | Active branch | `entity_pk`, `schema_key`, `file_id`, `change_kind`, `before_change_id`, `after_change_id` |
-| `lix_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
+| `lix_working_diff` | Active branch | `diff_id`, `entity_pk`, `schema_key`, `file_id`, `change_kind`, `before_change_id`, `after_change_id` |
+| `lix_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_file_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
 | `lix_file_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_directory_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
@@ -116,10 +116,10 @@ Use the unqualified surfaces for the common active-branch workflow. Use their
 
 `change_kind` is `added`, `modified`, or `removed`. Working changes compare the
 current branch head with that branch's newest checkpoint. Creating a checkpoint
-makes the current head the new baseline, so `lix_working_change` is empty until
+makes the current head the new baseline, so `lix_working_diff` is empty until
 another tracked change is committed.
 
-`lix_working_change` reports canonical source changes, like `lix_change`.
+`lix_working_diff` reports canonical source changes, like `lix_change`.
 Use `lix_file_working_change` and `lix_directory_working_change` for composed
 filesystem revisions. They return one row per logical file or directory,
 preserve a deleted entry's old location in `previous_path`, and expand ancestor
@@ -147,6 +147,6 @@ FROM lix_checkpoint_by_branch
 ORDER BY lixcol_branch_id, lixcol_depth;
 ```
 
-All eight relations are read-only. Create checkpoints through
-`lix.create_checkpoint().await?`; `INSERT`, `UPDATE`, and `DELETE` against the
-checkpoint or working-change surfaces are rejected.
+All eight relations are read-only. Create a checkpoint for every working diff
+through `lix.create_checkpoint().await?`, or checkpoint a SQL-selected subset
+through `lix_create_checkpoint`. See [Diff commands](./diff-commands.md).

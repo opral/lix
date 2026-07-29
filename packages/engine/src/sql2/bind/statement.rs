@@ -534,7 +534,18 @@ fn bind_insert_input(
     let Some(source) = source else {
         return Err(super::error::unsupported("INSERT source is required"));
     };
-    reject_unsupported_insert_query_clauses(source)?;
+    if matches!(source.body.as_ref(), SetExpr::Values(_)) {
+        reject_unsupported_insert_values_query_clauses(source)?;
+    }
+    if matches!(
+        surface_kind,
+        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
+    ) && matches!(source.body.as_ref(), SetExpr::Values(_))
+    {
+        return Err(super::error::unsupported(
+            "diff command sinks require INSERT ... SELECT; INSERT ... VALUES is not supported",
+        ));
+    }
     let SetExpr::Values(values) = source.body.as_ref() else {
         if matches!(
             surface_kind,
@@ -645,7 +656,7 @@ fn bind_insert_value_expr(expr: &Expr, params: &mut ParamBinder) -> Result<Bound
     }
 }
 
-fn reject_unsupported_insert_query_clauses(source: &Query) -> Result<(), LixError> {
+fn reject_unsupported_insert_values_query_clauses(source: &Query) -> Result<(), LixError> {
     if source.with.is_some()
         || source.order_by.is_some()
         || source.limit_clause.is_some()
@@ -1260,14 +1271,21 @@ fn bound_write_target(kind: &PublicSurfaceKind) -> BoundWriteTarget {
             BoundWriteTarget::Directory(DirectoryWriteSurface::ByBranch)
         }
         PublicSurfaceKind::Branch => BoundWriteTarget::Branch,
+        PublicSurfaceKind::Revert => {
+            BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert)
+        }
+        PublicSurfaceKind::Apply => BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply),
+        PublicSurfaceKind::CreateCheckpoint => {
+            BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint)
+        }
         PublicSurfaceKind::EntityHistory { .. }
         | PublicSurfaceKind::FileHistory
         | PublicSurfaceKind::DirectoryHistory
         | PublicSurfaceKind::Change
         | PublicSurfaceKind::Checkpoint
         | PublicSurfaceKind::CheckpointByBranch
-        | PublicSurfaceKind::WorkingChange
-        | PublicSurfaceKind::WorkingChangeByBranch
+        | PublicSurfaceKind::WorkingDiff
+        | PublicSurfaceKind::WorkingDiffByBranch
         | PublicSurfaceKind::FileWorkingChange
         | PublicSurfaceKind::FileWorkingChangeByBranch
         | PublicSurfaceKind::DirectoryWorkingChange

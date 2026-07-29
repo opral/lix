@@ -395,7 +395,7 @@ simulation_test!(
                 .await
                 .expect("history-free current-state mutation should succeed");
             let working_diff = session
-                .execute("SELECT COUNT(*) FROM lix_working_change", &[])
+                .execute("SELECT COUNT(*) FROM lix_working_diff", &[])
                 .await
                 .expect("working diff should read");
             assert_eq!(

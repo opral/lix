@@ -105,8 +105,15 @@ impl PublicCatalog {
             ])),
             PublicSurfaceKind::Checkpoint => checkpoint_schema(false),
             PublicSurfaceKind::CheckpointByBranch => checkpoint_schema(true),
-            PublicSurfaceKind::WorkingChange => working_change_schema(false),
-            PublicSurfaceKind::WorkingChangeByBranch => working_change_schema(true),
+            PublicSurfaceKind::WorkingDiff => working_change_schema(false),
+            PublicSurfaceKind::WorkingDiffByBranch => working_change_schema(true),
+            PublicSurfaceKind::Revert
+            | PublicSurfaceKind::Apply
+            | PublicSurfaceKind::CreateCheckpoint => Arc::new(Schema::new(vec![Field::new(
+                "diff_id",
+                DataType::Utf8,
+                false,
+            )])),
             PublicSurfaceKind::FileWorkingChange | PublicSurfaceKind::DirectoryWorkingChange => {
                 filesystem_working_change_schema(false)
             }
@@ -237,9 +244,10 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_working_change",
-            PublicSurfaceKind::WorkingChange,
+            "lix_working_diff",
+            PublicSurfaceKind::WorkingDiff,
             public_columns([
+                ("diff_id", false),
                 ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
@@ -250,9 +258,10 @@ impl PublicCatalog {
             SurfaceCapabilities::read_only(),
         ))?;
         self.insert(surface(
-            "lix_working_change_by_branch",
-            PublicSurfaceKind::WorkingChangeByBranch,
+            "lix_working_diff_by_branch",
+            PublicSurfaceKind::WorkingDiffByBranch,
             public_columns([
+                ("diff_id", false),
                 ("entity_pk", false),
                 ("schema_key", false),
                 ("file_id", true),
@@ -263,6 +272,22 @@ impl PublicCatalog {
             ]),
             SurfaceCapabilities::read_only(),
         ))?;
+        for (name, kind) in [
+            ("lix_revert", PublicSurfaceKind::Revert),
+            ("lix_apply", PublicSurfaceKind::Apply),
+            ("lix_create_checkpoint", PublicSurfaceKind::CreateCheckpoint),
+        ] {
+            self.insert(surface(
+                name,
+                kind,
+                vec![PublicColumn::public_insert_only("diff_id", false)],
+                SurfaceCapabilities {
+                    insert: true,
+                    update: false,
+                    delete: false,
+                },
+            ))?;
+        }
         for (name, kind, by_branch) in [
             (
                 "lix_file_working_change",
@@ -418,6 +443,7 @@ fn checkpoint_schema(by_branch: bool) -> SchemaRef {
 #[cfg(test)]
 fn working_change_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
+        Field::new("diff_id", DataType::Utf8, false),
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),

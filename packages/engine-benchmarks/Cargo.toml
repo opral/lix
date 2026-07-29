@@ -123,6 +123,11 @@ harness = false
 required-features = ["storage-benches", "slatedb"]
 
 [[bench]]
+name = "diff_commands"
+path = "benches/diff_commands.rs"
+harness = false
+
+[[bench]]
 name = "small_blob_cas"
 path = "benches/small_blob_cas.rs"
 harness = false

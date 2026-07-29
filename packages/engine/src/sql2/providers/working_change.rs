@@ -16,6 +16,7 @@ use crate::live_state::TrackedHeadContext;
 use crate::sql2::result_metadata::json_field;
 use crate::sql2::{SqlChangelogQuerySource, WriteAccess};
 use crate::storage_adapter::StorageAdapterRead;
+use crate::tracked_state::encode_diff_id;
 use crate::tracked_state::{
     TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateFilter,
 };
@@ -67,9 +68,9 @@ where
 {
     fn table_name(&self) -> &str {
         if self.by_branch {
-            "lix_working_change_by_branch"
+            "lix_working_diff_by_branch"
         } else {
-            "lix_working_change"
+            "lix_working_diff"
         }
     }
 
@@ -199,6 +200,10 @@ where
                                 continue;
                             }
                             rows.push(WorkingChangeSqlRow {
+                                diff_id: encode_diff_id(
+                                    entry.before.as_ref().map(|row| row.change_id),
+                                    entry.after.as_ref().map(|row| row.change_id),
+                                ),
                                 entity_pk: entry.identity.entity_pk().as_json_array_text(),
                                 schema_key: entry.identity.schema_key().to_owned(),
                                 file_id: entry.identity.file_id().map(str::to_owned),
@@ -289,6 +294,7 @@ fn string_constraint_values(constraint: FileIdConstraint) -> Option<Vec<String>>
 
 pub(super) fn working_change_schema(by_branch: bool) -> SchemaRef {
     let mut fields = vec![
+        Field::new("diff_id", DataType::Utf8, false),
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
@@ -303,6 +309,7 @@ pub(super) fn working_change_schema(by_branch: bool) -> SchemaRef {
 }
 
 struct WorkingChangeSqlRow {
+    diff_id: Result<String, LixError>,
     entity_pk: Result<String, LixError>,
     schema_key: String,
     file_id: Option<String>,
@@ -314,6 +321,10 @@ struct WorkingChangeSqlRow {
 
 static WORKING_CHANGE_COLS: ColumnTable<WorkingChangeSqlRow> = ColumnTable {
     columns: &[
+        (
+            "diff_id",
+            Col::Utf8Fallible(|row| row.diff_id.clone().map(Some)),
+        ),
         (
             "entity_pk",
             Col::Utf8Fallible(|row| row.entity_pk.clone().map(Some)),

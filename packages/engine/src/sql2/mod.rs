@@ -37,16 +37,16 @@ pub(crate) use bind::{
 };
 pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
-    ChangelogQuerySource, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
-    WriteContextBranchRefReader, WriteContextLiveStateReader,
+    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext,
+    WriteAccess, WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};
 #[allow(unused_imports)]
 pub(crate) use exec::{
     SqlLogicalPlan, create_write_logical_plan_from_template,
-    create_write_plan_template_from_parsed, execute_read_statement_from_parsed,
+    create_write_plan_template_from_parsed, diff_command_query, execute_read_statement_from_parsed,
     execute_read_statement_in_session_from_parsed, execute_transaction_read_statement_from_parsed,
     execute_write_logical_plan_parameter_batch, execute_write_logical_plan_result_with_metadata,
     parameter_record_batch, prepare_read_session, prepare_read_session_at_head,
@@ -63,7 +63,6 @@ pub(crate) use exec::{
 pub(crate) use file_view::{
     SessionFileViewKey, SessionFileViewMutation, SessionFileViews, SessionPluginFileView,
 };
-#[cfg(test)]
 pub(crate) use parse::parse_statement;
 pub(crate) use plan::plan_write;
 pub(crate) use planning_cache::SqlPlanningCache;

@@ -66,7 +66,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT entity_pk, schema_key, change_kind \
-                 FROM lix_working_change ORDER BY schema_key, entity_pk",
+                 FROM lix_working_diff ORDER BY schema_key, entity_pk",
             )
             .await,
             vec![vec![
@@ -79,7 +79,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT entity_pk, schema_key, change_kind \
-                 FROM lix_working_change \
+                 FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_pk = lix_json('[\"checkpoint-key\"]')",
             )
@@ -94,7 +94,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT entity_pk \
-                 FROM lix_working_change \
+                 FROM lix_working_diff \
                  WHERE schema_key = 'other_schema'",
             )
             .await
@@ -115,7 +115,7 @@ simulation_test!(
         );
 
         assert_eq!(
-            select_rows(&session, "SELECT COUNT(*) FROM lix_working_change").await,
+            select_rows(&session, "SELECT COUNT(*) FROM lix_working_diff").await,
             vec![vec![Value::Integer(0)]]
         );
         assert_eq!(
@@ -210,8 +210,8 @@ simulation_test!(
             "INSERT INTO lix_checkpoint (commit_id, created_at, lixcol_depth) \
              VALUES ('fake', '2026-01-01T00:00:00Z', 0)",
             "UPDATE lix_checkpoint SET created_at = 'fake'",
-            "DELETE FROM lix_working_change",
-            "UPDATE lix_working_change_by_branch SET change_kind = 'fake'",
+            "DELETE FROM lix_working_diff",
+            "UPDATE lix_working_diff_by_branch SET change_kind = 'fake'",
             "DELETE FROM lix_file_working_change",
             "UPDATE lix_directory_working_change_by_branch SET change_kind = 'fake'",
         ] {
@@ -266,7 +266,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT entity_pk, change_kind \
-                 FROM lix_working_change \
+                 FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY entity_pk",
             )
@@ -287,7 +287,7 @@ simulation_test!(
             select_rows(
                 &session,
                 "SELECT change_kind \
-                 FROM lix_working_change \
+                 FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_pk = lix_json('[\"working-removed\"]')",
             )

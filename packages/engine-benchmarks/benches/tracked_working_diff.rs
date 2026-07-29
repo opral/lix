@@ -3,7 +3,7 @@
 //! Two-phase populated tracked-working-diff benchmark for storage adapters.
 //!
 //! The fixture deliberately remains *between* checkpoints. The old checkpoint
-//! scale harness only measured `lix_working_change` after a checkpoint, when
+//! scale harness only measured `lix_working_diff` after a checkpoint, when
 //! there is no interval to diff. This harness records the real common shapes:
 //! repeated edits to a small working set and disjoint edits across a large
 //! working set.
@@ -49,7 +49,7 @@ const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
 const WORKING_DIFF_SQL: &str = "SELECT entity_pk, schema_key, change_kind, before_change_id, after_change_id \
-    FROM lix_working_change ORDER BY schema_key, entity_pk";
+    FROM lix_working_diff ORDER BY schema_key, entity_pk";
 
 #[derive(Clone, Copy)]
 enum Shape {
@@ -498,7 +498,7 @@ async fn measure<StorageImpl>(
     );
 }
 
-/// Measures the cold historical diff path rather than `lix_working_change`'s
+/// Measures the cold historical diff path rather than `lix_working_diff`'s
 /// serving-head accelerator. The setup checkpoint is a durable root and the
 /// later ordinary commits are rootless, which makes this a populated
 /// first-parent replay interval.

@@ -4,6 +4,7 @@ mod codec;
 mod commit_root_rebuild;
 mod context;
 mod diff;
+mod diff_id;
 mod merge;
 mod row_materialization;
 mod storage;
@@ -16,6 +17,7 @@ pub(crate) use diff::{
     TrackedStateDiff, TrackedStateDiffEntry, TrackedStateDiffIdentity, TrackedStateDiffKind,
     TrackedStateDiffRequest, TrackedStateDiffRow, TrackedStatePayloadBatch, TrackedStatePayloadRef,
 };
+pub(crate) use diff_id::{decode_diff_id, encode_diff_id};
 pub(crate) use merge::{
     TrackedStateMergeConflict, TrackedStateMergePick, TrackedStateMergePlan,
     merge_payload_fallback_ids, plan_merge,

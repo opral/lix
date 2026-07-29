@@ -56,7 +56,15 @@ pub(crate) struct TransactionWriteBuffer {
     first_commit_parent_override_by_branch: Mutex<BTreeMap<String, CommitId>>,
     checkpoint_publications: Mutex<Vec<CheckpointPublication>>,
     extra_commit_parents_by_branch: Mutex<BTreeMap<String, Vec<CommitId>>>,
+    intermediate_commits: Mutex<Vec<StagedIntermediateCommit>>,
     file_data_writes: Mutex<Vec<TransactionFileData>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StagedIntermediateCommit {
+    pub(crate) branch_id: String,
+    pub(crate) parent_commit_id: CommitId,
+    pub(crate) change_refs: StagedCommitChangeRefs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -183,6 +191,7 @@ pub(crate) struct PreparedWriteSet {
     pub(crate) first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
     pub(crate) checkpoint_publications: Vec<CheckpointPublication>,
     pub(crate) extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
+    pub(crate) intermediate_commits: Vec<StagedIntermediateCommit>,
     pub(crate) file_data_writes: Vec<TransactionFileData>,
 }
 
@@ -611,6 +620,7 @@ impl TransactionWriteBuffer {
             first_commit_parent_override_by_branch: Mutex::new(BTreeMap::new()),
             checkpoint_publications: Mutex::new(Vec::new()),
             extra_commit_parents_by_branch: Mutex::new(BTreeMap::new()),
+            intermediate_commits: Mutex::new(Vec::new()),
             file_data_writes: Mutex::new(Vec::new()),
         }
     }
@@ -882,6 +892,12 @@ impl TransactionWriteBuffer {
                 "failed to acquire transaction staged extra commit parents lock",
             )
         })?;
+        let mut intermediate_commits_guard = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
         let mut first_parent_overrides_guard = self
             .first_commit_parent_override_by_branch
             .lock()
@@ -919,6 +935,7 @@ impl TransactionWriteBuffer {
             ),
             checkpoint_publications: std::mem::take(&mut *checkpoint_publications_guard),
             extra_commit_parents_by_branch: std::mem::take(&mut *extra_parents_guard),
+            intermediate_commits: std::mem::take(&mut *intermediate_commits_guard),
             file_data_writes: std::mem::take(&mut *file_data_guard),
         })
     }
@@ -1009,6 +1026,117 @@ impl TransactionWriteBuffer {
         change_refs.allow_empty();
         change_refs.add_selected_change_batch(selected_changes);
         Ok(change_refs.commit_id.to_string())
+    }
+
+    pub(crate) fn stage_intermediate_commit(
+        &self,
+        branch_id: String,
+        parent_commit_id: CommitId,
+        selected_changes: StagedCommitChangeBatch,
+    ) -> Result<CommitId, LixError> {
+        let timestamp = self.functions.call_timestamp();
+        let mut change_refs = StagedCommitChangeRefs::new(
+            CommitId::from(self.functions.call_uuid_v7()),
+            ChangeId::from(self.functions.call_uuid_v7()),
+            ChangeId::from(self.functions.call_uuid_v7()),
+            timestamp,
+        );
+        change_refs.allow_empty();
+        change_refs.add_selected_change_batch(selected_changes);
+        let commit_id = change_refs.commit_id;
+        self.intermediate_commits
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged intermediate commits lock",
+                )
+            })?
+            .push(StagedIntermediateCommit {
+                branch_id,
+                parent_commit_id,
+                change_refs,
+            });
+        Ok(commit_id)
+    }
+
+    pub(crate) fn stage_intermediate_rows(
+        &self,
+        commit_id: CommitId,
+        mut batch: PreparedStateBatch,
+    ) -> Result<(), LixError> {
+        let mut intermediate_commits = self.intermediate_commits.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged intermediate commits lock",
+            )
+        })?;
+        let commit = intermediate_commits
+            .iter_mut()
+            .find(|commit| commit.change_refs.commit_id == commit_id)
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("unknown staged intermediate commit '{commit_id}'"),
+                )
+            })?;
+        if batch
+            .iter()
+            .any(|row| row.branch_id.as_str() != commit.branch_id || row.untracked)
+        {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "intermediate commit row has an incompatible branch or durability",
+            ));
+        }
+        for index in 0..batch.len() {
+            batch.set_commit_id(index, Some(commit_id));
+        }
+        let identities = batch
+            .iter()
+            .map(PreparedStateRowIdentity::from)
+            .collect::<Vec<_>>();
+        self.ensure_identity_index(true)?;
+        let mut rows = self.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::Indexed {
+            rows,
+            insert_selection,
+            by_identity,
+            by_candidate,
+        } = &mut *rows
+        else {
+            unreachable!("intermediate row staging requires the identity index");
+        };
+        if identities
+            .iter()
+            .any(|identity| by_identity.contains_key(identity))
+        {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "intermediate checkpoint marker overlaps an existing staged row",
+            ));
+        }
+        let start = rows.len();
+        let count = batch.len();
+        insert_selection.reserve_rows(count, false);
+        for _ in 0..count {
+            insert_selection.push_not_insert();
+        }
+        rows.append(batch);
+        for (offset, identity) in identities.into_iter().enumerate() {
+            let index = start + offset;
+            let slot = RowSlot::State(index);
+            let row = rows.row(index);
+            by_candidate.insert(row, slot);
+            by_identity.insert(identity, slot);
+        }
+        commit.change_refs.add_change_count(count);
+        Ok(())
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
