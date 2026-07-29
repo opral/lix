@@ -1524,40 +1524,65 @@ pub struct Document {
 #[derive(Clone, Debug)]
 struct PersistentTree {
     base: Arc<NodeTree>,
-    top_level_overrides: Arc<BTreeMap<usize, NodeSnapshot>>,
+    root_override: Option<Arc<NodeSnapshot>>,
+    top_level_overrides: Arc<BTreeMap<usize, Arc<NodeTree>>>,
 }
 
 impl PersistentTree {
     fn new(root: NodeTree) -> Self {
         Self {
             base: Arc::new(root),
+            root_override: None,
             top_level_overrides: Arc::new(BTreeMap::new()),
         }
     }
 
     fn root_node(&self) -> &NodeSnapshot {
-        &self.base.node
+        self.root_override.as_deref().unwrap_or(&self.base.node)
     }
 
     fn top_level_node(&self, index: usize) -> Option<&NodeSnapshot> {
-        self.top_level_overrides
-            .get(&index)
-            .or_else(|| self.base.children.get(index).map(|child| &child.node))
+        self.top_level_tree(index).map(|tree| &tree.node)
     }
 
-    fn replace_top_level(&self, index: usize, node: NodeSnapshot) -> Self {
+    fn top_level_tree(&self, index: usize) -> Option<&NodeTree> {
+        self.top_level_overrides
+            .get(&index)
+            .map(Arc::as_ref)
+            .or_else(|| self.base.children.get(index))
+    }
+
+    fn replace_top_level_node(&self, index: usize, node: NodeSnapshot) -> Self {
+        let mut tree = self
+            .top_level_tree(index)
+            .expect("base top-level Markdown tree exists")
+            .clone();
+        tree.node = node;
+        self.replace_top_level_tree(index, tree, None)
+    }
+
+    fn replace_top_level_tree(
+        &self,
+        index: usize,
+        tree: NodeTree,
+        root: Option<NodeSnapshot>,
+    ) -> Self {
         let mut overrides = self.top_level_overrides.as_ref().clone();
-        overrides.insert(index, node);
+        overrides.insert(index, Arc::new(tree));
         Self {
             base: Arc::clone(&self.base),
+            root_override: root.map(Arc::new).or_else(|| self.root_override.clone()),
             top_level_overrides: Arc::new(overrides),
         }
     }
 
     fn materialize(&self) -> NodeTree {
         let mut root = self.base.as_ref().clone();
-        for (&index, node) in self.top_level_overrides.iter() {
-            root.children[index].node.clone_from(node);
+        if let Some(node) = &self.root_override {
+            root.node.clone_from(node);
+        }
+        for (&index, tree) in self.top_level_overrides.iter() {
+            root.children[index].clone_from(tree);
         }
         root
     }
@@ -2068,6 +2093,10 @@ impl Document {
             self.try_paragraph_replacement(splices, &successor_bytes, namespace)?
         {
             incremental
+        } else if let Some(incremental) =
+            self.try_top_level_replacement(splices, &successor_bytes, namespace)?
+        {
+            incremental
         } else {
             let bytes = successor_bytes.materialize();
             let file = File {
@@ -2228,7 +2257,7 @@ impl Document {
             delete_len: u64::try_from(range.end - range.start).expect("usize fits u64"),
             insert: Arc::new(fragment),
         }];
-        let successor_tree = self.tree.replace_top_level(block_index, new);
+        let successor_tree = self.tree.replace_top_level_node(block_index, new);
         Ok(Some((
             bytes,
             Arc::new(top_level_ranges),
@@ -2333,7 +2362,7 @@ impl Document {
                 metadata: change_metadata(Some(&old.node), &new.node),
             }]
         };
-        let successor_tree = self.tree.replace_top_level(block_index, new.node.clone());
+        let successor_tree = self.tree.replace_top_level_tree(block_index, new, None);
         Ok(Some((
             detected,
             Arc::clone(&self.top_level_ranges),
@@ -2341,9 +2370,136 @@ impl Document {
         )))
     }
 
+    /// Reparse one complete top-level block when a single edit is fully
+    /// contained by that block.
+    ///
+    /// The full parser remains the correctness fallback for edits that cross
+    /// block boundaries or alter line structure. A successful local parse is
+    /// accepted only when it produces exactly one block and renders byte-for-
+    /// byte to the successor fragment. Reconciliation then runs over a
+    /// document containing only the changed block, preserving stable subtree
+    /// identities without cloning or parsing unrelated siblings.
+    fn try_top_level_replacement(
+        &self,
+        splices: &[InputSplice<'_>],
+        bytes: &PersistentBytes,
+        namespace: IdNamespace,
+    ) -> Result<Option<(Vec<DetectedChange>, Arc<Vec<Range<usize>>>, PersistentTree)>, PluginError>
+    {
+        let [splice] = splices else {
+            return Ok(None);
+        };
+        let offset = usize::try_from(splice.offset)
+            .map_err(|_| PluginError::InvalidInput("Markdown splice offset is too large".into()))?;
+        let delete_len = usize::try_from(splice.delete_len).map_err(|_| {
+            PluginError::InvalidInput("Markdown splice delete length is too large".into())
+        })?;
+        let delete_end = offset.checked_add(delete_len).ok_or_else(|| {
+            PluginError::InvalidInput("Markdown splice delete range overflowed".into())
+        })?;
+        if splice.insert.contains(&b'\n')
+            || splice.insert.contains(&b'\r')
+            || self
+                .bytes
+                .range(offset..delete_end)?
+                .iter()
+                .any(|byte| matches!(byte, b'\n' | b'\r'))
+        {
+            return Ok(None);
+        }
+        let Some((block_index, range)) =
+            self.top_level_ranges.iter().enumerate().find(|(_, range)| {
+                range.start <= offset && offset < range.end && delete_end <= range.end
+            })
+        else {
+            return Ok(None);
+        };
+        let delta = isize::try_from(splice.insert.len()).expect("usize fits isize")
+            - isize::try_from(delete_len).expect("usize fits isize");
+        let successor_end = range
+            .end
+            .checked_add_signed(delta)
+            .ok_or_else(|| PluginError::Internal("Markdown block range shift overflow".into()))?;
+        let fragment_bytes = bytes.range(range.start..successor_end)?;
+        let fragment = std::str::from_utf8(&fragment_bytes).map_err(|error| {
+            PluginError::InvalidInput(format!(
+                "file.data must be valid UTF-8 for an incremental Markdown edit: {error}"
+            ))
+        })?;
+        let mut replacement = parse_markdown_source(fragment)?;
+        if replacement.root.children.len() != 1
+            || render_tree(&replacement.root)? != fragment.as_bytes()
+        {
+            return Ok(None);
+        }
+
+        let old_block = self
+            .tree
+            .top_level_tree(block_index)
+            .expect("base top-level Markdown tree exists")
+            .clone();
+        if !node_kinds_are_identity_compatible(
+            old_block.node.kind,
+            replacement.root.children[0].node.kind,
+        ) {
+            return Ok(None);
+        }
+        let old_root = NodeTree {
+            node: self.tree.root_node().clone(),
+            children: vec![old_block],
+        };
+        let mut new_root_node = self.tree.root_node().clone();
+        if new_root_node.format.get(LEXICAL_FALLBACK_FIELD).is_some() {
+            let format = new_root_node.format.as_object_mut().ok_or_else(|| {
+                PluginError::Internal("Markdown document format must be an object".into())
+            })?;
+            format.insert(
+                LEXICAL_FALLBACK_FIELD.to_owned(),
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(bytes.materialize()),
+                ),
+            );
+        }
+        replacement.root.node.payload = new_root_node.payload;
+        replacement.root.node.format = new_root_node.format;
+        let before = ProjectionView::from_tree(&old_root);
+        let (detected, mut reconciled) =
+            detect_changes_for_markdown(&before, Some(&old_root), replacement, namespace)?;
+        let reconciled_block = reconciled.children.pop().ok_or_else(|| {
+            PluginError::Internal("incremental Markdown parse lost its changed block".into())
+        })?;
+        if !reconciled.children.is_empty() {
+            return Err(PluginError::Internal(
+                "incremental Markdown parse produced multiple changed blocks".into(),
+            ));
+        }
+
+        let mut top_level_ranges = self.top_level_ranges.as_ref().clone();
+        top_level_ranges[block_index].end = successor_end;
+        if delta != 0 {
+            for following in &mut top_level_ranges[block_index + 1..] {
+                following.start = following.start.checked_add_signed(delta).ok_or_else(|| {
+                    PluginError::Internal("Markdown block range shift overflow".into())
+                })?;
+                following.end = following.end.checked_add_signed(delta).ok_or_else(|| {
+                    PluginError::Internal("Markdown block range shift overflow".into())
+                })?;
+            }
+        }
+        let successor_tree =
+            self.tree
+                .replace_top_level_tree(block_index, reconciled_block, Some(reconciled.node));
+        Ok(Some((detected, Arc::new(top_level_ranges), successor_tree)))
+    }
+
     #[cfg(test)]
     pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
         self.bytes.materialize()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_base_tree_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.tree.base, &other.tree.base)
     }
 }
 

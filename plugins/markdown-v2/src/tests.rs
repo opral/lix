@@ -356,6 +356,65 @@ fn localized_text_edit_emits_one_sparse_complete_entity_upsert() {
 }
 
 #[test]
+fn localized_frontmatter_edit_reuses_noncanonical_document_tree() {
+    let before =
+        b"---\nDateApproved: 6/10/2020\n---\n\n\n# Title\n\nA large untouched suffix.\n".to_vec();
+    let (document, initial) = Document::open_file(
+        before.clone(),
+        Some("frontmatter.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .unwrap();
+    let root = initial
+        .iter()
+        .find(|change| {
+            change.snapshot.as_ref().is_some_and(|snapshot| {
+                serde_json::from_slice::<Value>(snapshot)
+                    .is_ok_and(|wire| wire["kind"] == "document")
+            })
+        })
+        .expect("document root must be emitted");
+    assert!(
+        root.snapshot.as_ref().is_some_and(|snapshot| {
+            serde_json::from_slice::<Value>(snapshot).is_ok_and(|wire| {
+                wire["format_json"]
+                    .as_str()
+                    .is_some_and(|format| format.contains("lexical_fallback_base64"))
+            })
+        }),
+        "fixture must exercise exact-byte lexical fallback"
+    );
+    let offset = before
+        .windows(b"6/10".len())
+        .position(|window| window == b"6/10")
+        .unwrap();
+    let (after, changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(offset).unwrap(),
+                delete_len: u64::try_from("6/10".len()).unwrap(),
+                insert: b"7/9",
+            }],
+            IdNamespace::from_halves(3, 4),
+        )
+        .unwrap();
+    let expected = String::from_utf8(before)
+        .unwrap()
+        .replacen("6/10", "7/9", 1)
+        .into_bytes();
+    assert_eq!(after.accepted_bytes(), expected);
+    assert!(
+        after.shares_base_tree_with(&document),
+        "localized successor must retain the untouched document tree"
+    );
+    assert_eq!(
+        changes.len(),
+        2,
+        "only frontmatter and the exact-byte root fallback should change"
+    );
+}
+
+#[test]
 fn incremental_paragraph_edit_preserves_unrelated_entities_after_cold_reopen() {
     let source = b"# Title\n\nAlpha paragraph\n\nBravo paragraph\n\nCharlie paragraph\n".to_vec();
     let (_, initial) = Document::open_file(
