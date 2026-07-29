@@ -497,6 +497,8 @@ mod tests {
         // Each unreachable commit removes its changelog record, exact-ID
         // locator, and derived tracked-root record.
         assert_eq!(first.staged_deletes, 30);
+        assert_eq!(first.key_shared_buffers, 3);
+        assert_eq!(first.key_shared_bytes, 30 * 16);
         assert_eq!(second.swept_commits, first.swept_commits);
         assert_eq!(second.staged_deletes, first.staged_deletes);
     }

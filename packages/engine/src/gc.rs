@@ -422,9 +422,10 @@ where
     // content-addressed maintenance work, but delta rows have no shared
     // ownership and must be reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    for commit_id in &sweep_tracked_commit_roots {
-        crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
-    }
+    crate::tracked_state::stage_delete_commit_roots(
+        writes,
+        sweep_tracked_commit_roots.iter().copied(),
+    );
     // Old serving generations are derived data. Removing them in the same
     // atomic sweep as their untracked payload-root withdrawal prevents stale
     // branch generations from accumulating indefinitely.
@@ -689,29 +690,27 @@ where
         .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
+    writes.delete_batch(
+        COMMIT_SPACE,
+        sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
+    );
     for commit_id in &sweep_commits {
-        writes.delete(
-            COMMIT_SPACE,
-            StorageKey(Bytes::from(commit_key(*commit_id))),
-        );
         if let Some(entry) = packed.commits.get(commit_id) {
             crate::tracked_state::stage_delete_commit_delta_inventory_entry(
                 writes, *commit_id, entry,
             )?;
         }
     }
-    for change_id in &sweep_commit_change_ids {
-        writes.delete(
-            COMMIT_CHANGE_ID_SPACE,
-            StorageKey(Bytes::from(commit_change_id_key(*change_id))),
-        );
-    }
-    for change_id in &sweep_changes {
-        writes.delete(
-            CHANGE_SPACE,
-            StorageKey(Bytes::from(change_key(*change_id))),
-        );
-    }
+    writes.delete_batch(
+        COMMIT_CHANGE_ID_SPACE,
+        sweep_commit_change_ids
+            .iter()
+            .map(|change_id| commit_change_id_key(*change_id)),
+    );
+    writes.delete_batch(
+        CHANGE_SPACE,
+        sweep_changes.iter().map(|change_id| change_key(*change_id)),
+    );
     JsonStoreContext::new()
         .writer()
         .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
