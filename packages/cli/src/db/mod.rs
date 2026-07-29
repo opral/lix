@@ -160,7 +160,7 @@ fn validate_lix_file_path(path: &Path) -> Result<(), CliError> {
 }
 
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime should initialize")

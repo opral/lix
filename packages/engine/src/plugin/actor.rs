@@ -186,6 +186,10 @@ impl PluginActorCache {
         })
     }
 
+    pub(crate) fn capacity(&self) -> usize {
+        self.capacity.get()
+    }
+
     /// Serializes cold actor construction. The gate is workspace-wide rather
     /// than per-key because cold opens are uncommon and may otherwise retain
     /// multiple full semantic snapshots plus Wasm Stores concurrently.
