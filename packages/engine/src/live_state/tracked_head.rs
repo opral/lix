@@ -2380,6 +2380,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn working_diff_reads_mixed_direct_and_segmented_hot_indexes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let branch_id = "mixed-hot-diff";
+        let checkpoint = CommitId::for_test_label("mixed-checkpoint");
+        let direct_head = CommitId::for_test_label("mixed-direct");
+        let segmented_head = CommitId::for_test_label("mixed-segmented");
+        let mut coverage = WorkingDiffIndexCoverage::default();
+
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            None,
+            checkpoint,
+            &[],
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let direct_entities = (0..32)
+            .map(|index| EntityPk::single(format!("direct-{index:03}")))
+            .collect::<Vec<_>>();
+        let direct = direct_entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity_pk)| {
+                working_diff_delta(
+                    entity_pk,
+                    None,
+                    &format!("direct-{index}"),
+                    direct_head,
+                    false,
+                    "{\"value\":\"direct\"}",
+                    None,
+                    "2026-01-02T00:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            direct_head,
+            &direct,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let segmented_entities = (0..96)
+            .map(|index| EntityPk::single(format!("segmented-{index:03}")))
+            .collect::<Vec<_>>();
+        let segmented = segmented_entities
+            .iter()
+            .enumerate()
+            .map(|(index, entity_pk)| {
+                working_diff_delta(
+                    entity_pk,
+                    None,
+                    &format!("segmented-{index}"),
+                    segmented_head,
+                    false,
+                    "{\"value\":\"segmented\"}",
+                    None,
+                    "2026-01-03T00:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        publish_working_diff_commit(
+            &storage,
+            branch_id,
+            Some(checkpoint),
+            segmented_head,
+            &segmented,
+            checkpoint,
+            &mut coverage,
+        )
+        .await;
+
+        let diff = read_working_diff(
+            &storage,
+            branch_id,
+            segmented_head,
+            checkpoint,
+            checkpoint,
+            &TrackedStateDiffRequest::default(),
+        )
+        .await;
+        assert_eq!(coverage.group_count, 128);
+        assert_eq!(diff.diff.entries.len(), 128);
+        assert!(
+            diff.diff
+                .entries
+                .iter()
+                .all(|entry| entry.kind == TrackedStateDiffKind::Added)
+        );
+    }
+
+    #[tokio::test]
     async fn working_diff_clean_delete_then_restore_is_net_empty() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
