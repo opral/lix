@@ -14,7 +14,7 @@ use crate::entity_pk::EntityPk;
 use crate::json_store::JsonRef;
 use crate::live_state::MaterializedLiveStateRow;
 use crate::tracked_state::TrackedStateDiffIdentity;
-use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef};
+use crate::wasm::{WasmCanonicalJson, WasmCanonicalJsonCertificateRef, WasmCertifiedEntityBatch};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
@@ -1102,6 +1102,8 @@ pub(crate) struct TransactionFileData {
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
     auxiliary_payloads: Vec<BlobPayload>,
+    /// Certified v3 semantic owners which remain encoded through commit.
+    certified_entity_batches: Vec<WasmCertifiedEntityBatch>,
 }
 
 impl TransactionFileData {
@@ -1128,6 +1130,7 @@ impl TransactionFileData {
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
             auxiliary_payloads: Vec::new(),
+            certified_entity_batches: Vec::new(),
         }
     }
 
@@ -1163,6 +1166,14 @@ impl TransactionFileData {
 
     pub(crate) fn add_auxiliary_payload(&mut self, data: impl Into<crate::Blob>) {
         self.auxiliary_payloads.push(BlobPayload::from_bytes(data));
+    }
+
+    pub(crate) fn set_certified_entity_batches(&mut self, batches: Vec<WasmCertifiedEntityBatch>) {
+        self.certified_entity_batches = batches;
+    }
+
+    pub(crate) fn certified_entity_batches(&self) -> &[WasmCertifiedEntityBatch] {
+        &self.certified_entity_batches
     }
 
     pub(crate) fn data(&self) -> &[u8] {
@@ -1804,6 +1815,23 @@ impl PreparedStateBatch {
         let json_capacity = row_capacity
             .checked_mul(2)
             .expect("prepared JSON column capacity overflowed");
+        Self::with_column_capacities(row_capacity, json_capacity, row_capacity)
+    }
+
+    /// Reserves exact dense row/JSON columns while keeping interned strings
+    /// bounded by a small initial dictionary. Plugin imports commonly contain
+    /// hundreds of thousands of rows but only one branch, file, schema, and
+    /// origin key; reserving one hash bucket and string slot per row creates a
+    /// large empty representation of those repeated values.
+    pub(crate) fn with_dense_capacity(row_capacity: usize, json_capacity: usize) -> Self {
+        Self::with_column_capacities(row_capacity, json_capacity, row_capacity.min(1_024))
+    }
+
+    fn with_column_capacities(
+        row_capacity: usize,
+        json_capacity: usize,
+        string_capacity: usize,
+    ) -> Self {
         Self {
             slots: Vec::with_capacity(row_capacity),
             entity_pks: Vec::with_capacity(row_capacity),
@@ -1812,8 +1840,8 @@ impl PreparedStateBatch {
             // five entries per row made the empty dictionary dominate peak
             // memory on the happy path. Pathological all-distinct columns can
             // grow this bounded hint a fixed handful of times.
-            strings: Vec::with_capacity(row_capacity),
-            string_index: HashMap::with_capacity(row_capacity),
+            strings: Vec::with_capacity(string_capacity),
+            string_index: HashMap::with_capacity(string_capacity),
             json: Vec::with_capacity(json_capacity),
             // Origin dictionaries are absent for ordinary SQL/direct writes
             // and typically contain only a few shared descriptors. Allocate

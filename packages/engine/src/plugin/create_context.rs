@@ -199,6 +199,7 @@ pub(crate) fn materialize_keyless_creates(
         let WasmEntityChange::Create {
             schema_key,
             local_ref,
+            resolved_key,
             snapshot_content,
         } = change
         else {
@@ -211,6 +212,30 @@ pub(crate) fn materialize_keyless_creates(
                 "validated keyless creates must own parsed canonical snapshots",
             ));
         };
+        if let Some(key) = resolved_key.take() {
+            if key.schema_key.as_str() != schema_key
+                || key.entity_pk.len() != 1
+                || key.entity_pk[0].as_str() != id
+            {
+                return Err(invalid_id(format!(
+                    "resolved keyless create for schema '{schema_key}' does not match its create context"
+                )));
+            }
+            if canonical.certificate().is_none() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "resolved keyless create did not retain its schema-validation certificate",
+                ));
+            }
+            *change = WasmEntityChange::Upsert {
+                entity: WasmEntity {
+                    key,
+                    snapshot_content: WasmHostBytes::CanonicalJson(canonical.clone()),
+                },
+                effect: WasmChangeEffect::Content,
+            };
+            continue;
+        }
         let mut snapshot = canonical.value().as_object().cloned().ok_or_else(|| {
             invalid_id(format!(
                 "keyless create snapshot for schema '{schema_key}' must be an object"
@@ -589,6 +614,7 @@ mod tests {
         WasmEntityChange::Create {
             schema_key: "csv_row".to_string(),
             local_ref,
+            resolved_key: None,
             snapshot_content: canonical(json!({})),
         }
     }
@@ -655,6 +681,7 @@ mod tests {
             changes: vec![WasmEntityChange::Create {
                 schema_key: "other".to_string(),
                 local_ref: 0,
+                resolved_key: None,
                 snapshot_content: WasmHostBytes::Inline(Vec::new().into()),
             }],
         };
@@ -705,6 +732,7 @@ mod tests {
             changes: vec![WasmEntityChange::Create {
                 schema_key: "csv_row".to_string(),
                 local_ref: 42,
+                resolved_key: None,
                 snapshot_content: canonical(json!({
                     "cells": ["Alice", "42"],
                     "order_key": "4000000000000001"

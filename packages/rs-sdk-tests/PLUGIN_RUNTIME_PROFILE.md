@@ -1,0 +1,308 @@
+# Cross-format Wasm plugin runtime profile
+
+Profiled on Linux x86-64 with Rust nightly 1.97.0. The release benchmarks were
+verified against `origin/main` at `57d619aad`. The exact VS Code Docs replay
+uses commit `d5badf95f8ab16c4deb91199dc696f2293d93554`.
+
+## Results
+
+| Workload | Time | Host allocation | Peak live host allocation | Process peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| JSON, 10 MiB / 39,871 rows, plugin import p50 | 1,099.9 ms | 696.6 MB | 186.6 MB | 486.6 MB |
+| JSON, same file-scoped rows without Wasm p50 | 1,003.2 ms | 872.8 MB | 223.3 MB | — |
+| JSON, same rows without file ownership p50 | 530.2 ms | 591.7 MB | 115.3 MB | — |
+| JSON, warm sparse byte edit p50 | 6.47 ms | 11.0 MB | 10.6 MB | 348.2 MB |
+| CSV v2, 10.68 MiB / 220,001 rows, plugin import p50 | 5,168.8 ms | 3.47 GB | 929.7 MB | 1.71 GB |
+| CSV v3 C, same fixture and output | 2,225.2 ms | 1.70 GB | 282.4 MB | — |
+| CSV, same file-scoped rows without Wasm p50 | 4,201.2 ms | 3.85 GB | 995.9 MB | — |
+| v3 A, fused packet-v1 CSV import p50 | 5,041.6 ms | 3.47 GB | 929.7 MB | 1.62 GB |
+| v3 B, typed CSV batch import p50 | 4,576.1 ms | 3.52 GB | 927.8 MB | 1.55 GB |
+| v3 B + certified import/storage-retention cuts, p50 | 2,325.2 ms | 1.73 GB | 448.4 MB | — |
+| CSV warm edit, v2 returned cursor, p50 | 1.909 ms | 1.433 MB | 1.090 MB | — |
+| CSV warm edit, v3 push sink, p50 | 1.217 ms | 1.433 MB | 1.090 MB | — |
+| Markdown, VS Code Docs failing transition | 8,700.5 ms execute | — | — | 97.63 MiB guest |
+
+The JSON plugin is only 1.096x slower than inserting the same file-scoped
+semantic rows directly. CSV is 1.24x slower. Bulk imports therefore cannot
+become 2-5x faster through parser or Wasm tuning alone: the current
+file-scoped semantic storage path is already the dominant floor.
+
+The JSON no-file control is 1.89x faster than the file-scoped control. This
+isolates a large cost in ownership validation, tracked-state materialization,
+and per-row transaction staging.
+
+The CSV import allocates 3.47 GB on the host for 10.68 MB of input and reaches
+929.7 MB of live host allocation. Direct insertion is even larger. This is a
+storage/materialization problem, not a Wasm 128 MiB guest-memory problem.
+
+## v3 prototype results
+
+The prototypes use the same RocksDB import, schemas, ownership rules,
+transaction validation, atomic commit, exact source-byte assertion, and exact
+220,001 durable-change assertion as v2.
+
+| Candidate | p50 | Speedup vs matched v2 | Boundary bytes | Peak live allocation |
+| --- | ---: | ---: | ---: | ---: |
+| matched v2 packet-v1 | 5,168.8 ms | 1.00x | 39.4 MB | 929.7 MB |
+| A: one fused call, fixed actor thread | 5,041.6 ms | 1.025x | 39.4 MB | 929.7 MB |
+| B: fused typed CSV batches | 4,576.1 ms | 1.130x | 28.2 MB | 927.8 MB |
+| B + certified import/storage-retention cuts | 2,325.2 ms | 2.223x | 31.4 MB | 448.4 MB |
+| C: deferred storage-native lowering | 2,225.2 ms | 2.323x | 31.4 MB | 282.4 MB |
+
+Prototype A enters the guest once and creates one persistent executor thread.
+It therefore passes the structural scheduling gates but fails the performance
+gate: removing re-entry is not material for a 220k-row transaction once
+reconciliation and storage dominate.
+
+Prototype B emits bounded batches of row ordinals, order ranks, decoded cells,
+and lexical layout. Wasm creates neither row UUID strings nor row JSON
+snapshots. Boundary traffic falls 28.5%, but the host immediately rebuilds
+220k canonical entity snapshots for the unchanged v2 transaction path.
+Cumulative host allocation therefore does not fall and peak live allocation
+moves by only 0.2%. This is direct evidence that a storage-native sink is
+required; typed transport alone merely moves materialization across the Wasm
+boundary.
+
+For a warm one-byte CSV transition, replacing the returned guest change cursor
+with an imported host push sink reduced three guest exports
+(`file-changed`, `next(Some)`, `next(None)`) to one. Across 25 paired,
+alternating-order RocksDB samples, p50 improved from 1.909 ms to 1.217 ms
+(1.57x) and p95 from 2.539 ms to 1.466 ms (1.73x). Exact bytes, 20,000
+semantic rows, and one durable change per sample matched. Peak and cumulative
+host allocation were flat, confirming that cursor removal is a control-flow
+win; memory falls only when the host sink lowers pages directly instead of
+retaining an adapter vector for generic reconciliation.
+
+The follow-on prototype certifies the exact fresh-plugin import shape, avoids
+the generic O(rows) transaction validation index, removes retained physical
+RocksDB point keys on the final write lane, bounds prepared dictionaries, and
+evicts large completed v3 import actors before materialization. Five samples
+were 2,276.4, 2,317.2, 2,325.2, 2,336.5, and 2,770.1 ms. This clears the 2x
+time gate without weakening exact-byte, exact-row, ownership, validation, or
+atomicity checks.
+
+It does not clear the 3x memory gate. Allocation readings at phase close were:
+
+| Materialization boundary | Live Rust allocation |
+| --- | ---: |
+| changelog staged | 161.6 MB |
+| tracked roots staged | 233.0 MB |
+| hot deltas and absence guards built | 270.8 MB |
+| expanded hot identities built | 335.9 MB |
+| hot values encoded | 457.2 MB |
+
+The measured scope starts with roughly 8.8 MB live, yielding the reported
+448.4 MB peak delta. Prototype C now retains one compact semantic owner and
+lowers 4,096-row chunks into the atomic backend transaction, so expanded
+storage identities and encoded current-state values exist for only one page.
+Five samples were 2,181.2, 2,199.7, 2,225.2, 2,237.2, and 2,556.2 ms. Peak
+live host allocation was 282.4 MB. Prototype C therefore clears both hard
+gates: 2.32x faster and 3.29x lower peak allocation than v2. The deferred
+encoder also preserves the active checkpoint's `BeforeAbsent` baseline,
+sparse dirty-key index and coverage proof, plus the validated unscoped
+descriptor INSERT.
+
+## Component boundary profile
+
+The VS Code Docs Markdown transition has:
+
+| Counter | Value |
+| --- | ---: |
+| Source bytes read | 3,273,092 |
+| Component-boundary bytes | 27,832,278 |
+| Packet records | 25,656 |
+| Semantic rows materialized | 25,362 |
+| Durable semantic changes | 294 |
+| Full document reparses/renders | 151 / 151 |
+| Guest high-water memory | 102,367,232 bytes |
+
+That is 8.5x byte amplification and 86x row amplification relative to the
+durable changes.
+
+A 999 Hz sampled profile recorded about 51,000 short-lived `lix` threads.
+`call_sync_guest` currently spawns and joins an OS thread for every synchronous
+component method. The dominant sampled leaf was Linux `clone3`, followed by
+mmap/mprotect/munmap and Wasmtime per-thread signal initialization. This cost
+is shared by Markdown, CSV, JSON, and Excalidraw.
+
+A deliberately unsafe direct-call prototype retained Wasm but removed the
+per-method thread:
+
+| 17-document control | Current | Direct-call prototype | Speedup |
+| --- | ---: | ---: | ---: |
+| CSV | 30.26 ms | 17.29 ms | 1.75x |
+| Text | 21.71 ms | 12.27 ms | 1.77x |
+| Excalidraw | 23.49 ms | 14.42 ms | 1.63x |
+| Voluntary context switches | 295 | 43 | 6.9x fewer |
+
+The direct call is not shippable: it blocks a current-thread Tokio runtime, and
+serializing a 1,184-document Markdown batch regressed 922 ms to 1,723 ms.
+The result proves the overhead but also shows that the replacement must retain
+bounded parallelism.
+
+## Recommended hard cut: plugin API v3
+
+No backward compatibility should be carried on the hot path.
+
+1. Replace the resource-method conversation with one bulk transition call per
+   file operation. Pass source edits, the required semantic projection, and
+   transition context in one typed binary request; return one typed change
+   batch plus a materialization proof.
+2. Execute component calls on a fixed actor executor pool, or use a genuinely
+   async Wasmtime component boundary. Never create an OS thread per WIT method.
+3. Replace packet-v1 row records and JSON-in-JSON snapshots with a typed binary
+   batch: dictionary-coded schema/file IDs, fixed-width local refs, column
+   vectors, and offset/data buffers for variable fields.
+4. Add a compact, content-addressed per-file actor checkpoint. Cold hydration
+   should read one checkpoint plus changes after its root, rather than
+   materializing every semantic row and replaying them through packet cursors.
+5. Add a storage-native file entity batch. Validate ownership once per batch,
+   sort once, lower once, and persist packed column buffers/ranges rather than
+   independently staging and validating every semantic row.
+6. Preserve the existing sparse edit path. The 10 MiB JSON edit is already
+   6.47 ms; optimize its full-buffer allocation separately with borrowed input
+   ranges or host attachments.
+
+### Cold-successor is distinct from checkpoint hydration
+
+The full-history profile exposes a more important cache-miss operation than
+ordinary hydration. A 16-actor cache can repeatedly evict files in a wide
+history. Reconstructing and rendering the previous document before parsing its
+successor turns durable semantic rows into transient plugin state even though
+the caller only needs the successor.
+
+API v3 should expose three different operations:
+
+1. `apply-warm(document, edit, source, sink)` for an actor already in memory;
+2. `apply-cold-successor(durable-entities, new-source, sink)` for an evicted
+   actor, producing the successor directly without rendering the predecessor;
+3. `hydrate(durable-entities)` only when a retained document is actually
+   needed for a later read or semantic edit.
+
+The scheduler should route cache misses during replay to cold-successor and run
+independent files through a bounded, memory-budgeted worker pool. Checkpoints
+then optimize the remaining true hydration operations as `checkpoint + tail`;
+they are not a substitute for removing predecessor reconstruction from the
+successor path.
+
+On the measured wide Markdown replay, only 16 actors are resident while
+5.29 million semantic rows are reconstructed for 414,928 durable changes:
+12.7x row amplification. This changes the expected v3 replay model from
+“optimize hydration” to “avoid hydration on the successor path.” Parallelism
+alone remains bounded by the serial work and increases concurrent actor RSS;
+cold-successor removes the work before bounded parallel scheduling is applied.
+
+## Expected ceiling
+
+| Cut | Target workload | Expected result |
+| --- | --- | --- |
+| Fused transition + fixed executor | Small files and many-file commits | 1.5-2x |
+| Packed entity batch + batch ownership validation | Bulk CSV/JSON imports | 2-3x, much lower host allocation |
+| Actor checkpoints | Cold edits and histories wider than the 16-actor cache | 2-5x and lower boundary traffic |
+| Parser arenas/local IDs | Format-specific memory peaks | Useful where copies remain, but not the shared multiplier |
+
+The 2-5x target is credible only as an API/runtime/storage redesign. For bulk
+imports, the Wasm plugin layer itself is currently just 9.6% of JSON time and
+19.7% of CSV time relative to their direct file-scoped controls.
+
+## Large CSV/JSON v3 push profile
+
+JSON v3 reuses the JSON v2 parser and packet-v1 snapshots. Seven release
+samples on the 10 MiB / 39,871-entity flat-object import produced:
+
+| lane | p50 | p95 | exports | imports | peak host allocation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| JSON v2 cursor | 675.7 ms | 767.0 ms | 17 | 10 | 85.7 MB |
+| JSON v3 push | 600.4 ms | 652.1 ms | 1 | 9 | 85.6 MB |
+
+The final bulk JSON lane is 1.13x faster at p50 and 1.18x faster at p95.
+One fused export and eight 2 MiB sink pages replace seventeen v2 guest exports.
+
+Three follow-up cuts were profiled. v3 sources return a complete ABI-addressable
+input from one import, avoiding ten extra imports and a guest-side
+chunk-assembly copy. A two-page producer/consumer channel drains sink pages
+while the sole guest export is still entered. Finally, a large CSV open uses a
+one-shot scan view and never builds a persistent document/index that the
+engine's large-import policy would immediately evict.
+
+Import calls fell from 26 to 9 for JSON and from 29 to 11 for CSV. Seven
+10.68 MiB CSV samples had a 2.066 s p50, 2.50x faster than the matched
+5.169 s v2 lane. Peak remained 282.4 MB, 3.29x below v2, and JSON remained
+85.6 MB.
+
+| phase | JSON | CSV |
+| --- | ---: | ---: |
+| plugin drain complete | 63.0 MB | 198.4 MB |
+| tracked-head publication | 94.1 MB | 235.0 MB |
+| measured peak delta | 85.6 MB | 282.4 MB |
+
+CSV guest linear-memory high water fell from 53.0 MB to 41.2 MB (22%) after
+removing the unused persistent cold-import document. The unchanged host peak
+shows that the remaining peak is downstream of the Component boundary. A real next step
+must replace the complete `ValidatedFileTransition.changes` owner with a
+transaction-native page-backed batch, preserve transition-wide uniqueness and
+rollback metadata separately, and let storage lowering consume those pages
+without a `Vec<EntityChange>` materialization.
+
+A follow-up experiment made the deferred RocksDB encoder the unique owner of
+the prepared batch and released canonical snapshot owners after each 4,096-row
+page was encoded. It did not change peak (282.4 MB) and regressed p50 from
+2.127 s to 2.253 s, so it was removed. This rules out retained snapshot arenas
+as the remaining peak and keeps the next cut focused on eliminating the
+complete generic/prepared row representation, not incrementally clearing its
+already-shared payloads.
+
+## Immutable entity-batch segment result
+
+The next prototype removed that generic row representation. A v3 transition
+may now hand the transaction a bounded, host-certified encoded batch. The
+engine validates its schema membership, packet framing, primary keys, and
+canonical snapshots before commit. Current-state queries decode the immutable
+segment lazily; RocksDB receives one batch owner rather than one hot row,
+history segment, and locator per semantic entity.
+
+Five release samples after this cut:
+
+| workload | old lane p50 | segment p50 | segment p95 | peak live allocation | cumulative allocation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| CSV, 10.68 MiB / 220,000 rows | 5.227 s | 129.4 ms | 171.8 ms | 36.1 MB | 65.5 MB |
+| JSON, 10 MiB / 39,871 entities | 625.6 ms | 258.0 ms | 273.5 ms | 45.5 MB | 103.4 MB |
+
+CSV is 40.4x faster than the original storage-materializing lane and uses
+about 26x less peak live host allocation than its approximately 930 MB
+baseline. JSON is 2.43x faster than the current v2 cursor and uses 47% less
+peak live host allocation. CSV performs about 33,400 host allocations instead
+of approximately 4.04 million.
+
+Both gates use durable RocksDB writes and verify exact file bytes, exact
+semantic cardinality, an exact projected semantic row, and close/reopen query
+persistence. JSON additionally retains the engine's streaming schema and
+primary-key validation rather than trusting the Wasm guest's certificate.
+
+This establishes that fused control flow alone is not the bulk multiplier.
+The large win comes from preserving one encoded semantic owner through plugin
+transport, validation, transaction staging, storage, and query consumption.
+Remaining production gates are historical/time-travel visibility,
+cold-successor operation after actor eviction, and equivalent codecs for
+Markdown and Excalidraw.
+
+## Reproduction
+
+```sh
+cargo test --release -p lix_sdk_tests --test e2e --no-run
+
+E2E_BIN="$(find target/release/deps -maxdepth 1 -type f -executable \
+  -name 'e2e-*' -print -quit)"
+
+"$E2E_BIN" --ignored --exact \
+  v2_json_ten_mib_rocksdb_import_parity_benchmark \
+  --nocapture --test-threads=1
+
+"$E2E_BIN" --ignored --exact \
+  v2_csv_ten_mib_rocksdb_import_parity_benchmark \
+  --nocapture --test-threads=1
+
+"$E2E_BIN" --ignored --exact \
+  v2_json_ten_mib_ordinary_sql_byte_edit_benchmark \
+  --nocapture --test-threads=1
+```

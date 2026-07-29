@@ -41,6 +41,7 @@ use crate::transaction::types::{
 };
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 use tracing::Instrument as _;
 
 type RowIndex = usize;
@@ -257,7 +258,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         "lix.perf.materialization.tracked_roots"
     ))
     .await?;
-    let staged_hot_heads = stage_tracked_head(
+    let mut staged_hot_heads = stage_tracked_head(
         read,
         &mut writes,
         &state_rows,
@@ -296,6 +297,33 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &branch_control_observations,
     )
     .await?;
+    let commit_created_at = commit_rows
+        .iter()
+        .map(|commit| (commit.commit_id, commit.created_at))
+        .collect::<BTreeMap<_, _>>();
+    crate::live_state::stage_certified_entity_batches(
+        read,
+        &mut writes,
+        &prepared_writes.file_data_writes,
+        &staged_hot_heads.controls,
+        &branch_control_observations,
+        &commit_created_at,
+    )
+    .await?;
+    if !staged_hot_heads.deferred_fresh_hot_plans.is_empty() {
+        if staged_hot_heads.deferred_fresh_hot_plans.len() != 1 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "one certified fresh import produced multiple deferred hot publications",
+            ));
+        }
+        let state_rows = Arc::new(state_rows);
+        let plan = staged_hot_heads
+            .deferred_fresh_hot_plans
+            .pop()
+            .expect("one deferred fresh hot publication was counted");
+        writes.stage_deferred_final_put_source(plan.into_source(state_rows))?;
+    }
     if filesystem_view_changed {
         stage_path_index_revision(&mut writes);
     }
@@ -943,6 +971,7 @@ fn stage_tracked_commit_delta_index(
 struct StagedHotHeads {
     controls: BTreeMap<String, BranchHeadControl>,
     tracked_snapshots: BTreeMap<CommitId, HotTrackedSnapshot>,
+    deferred_fresh_hot_plans: Vec<crate::live_state::DeferredFreshHotPlan>,
 }
 
 /// Returns the commit snapshots that must be materialized before publication.
@@ -1560,6 +1589,7 @@ async fn stage_tracked_head(
         .collect::<BTreeSet<_>>();
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
+    let mut deferred_fresh_hot_plans = Vec::new();
 
     for root in tracked_roots_parent_first(tracked_roots)?
         .into_iter()
@@ -1590,17 +1620,6 @@ async fn stage_tracked_head(
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let mut tracked_deltas = {
-            let _span = tracing::debug_span!(
-                target: "lix_perf",
-                "lix.perf.materialization.tracked_head.deltas"
-            )
-            .entered();
-            state_row_indices
-                .iter()
-                .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
-                .collect::<Result<Vec<_>, _>>()?
-        };
         let selected_materialization = if !staged.selected_change_batches.is_empty()
             && !tracked_snapshots.contains_key(&root.commit_id)
         {
@@ -1636,30 +1655,6 @@ async fn stage_tracked_head(
         } else {
             None
         };
-        if let Some((selected_rows, selected_snapshots, selected_metadata)) =
-            &selected_materialization
-        {
-            tracked_deltas.extend(
-                selected_changes(&staged.selected_change_batches)
-                    .zip(selected_rows)
-                    .zip(selected_snapshots.iter().zip(selected_metadata))
-                    .map(|((change_ref, row), (snapshot, metadata))| {
-                        crate::live_state::CurrentStateDeltaRef {
-                            schema_key: &row.schema_key,
-                            file_id: row.file_id.as_deref(),
-                            entity_pk: &row.entity_pk,
-                            change_id: Some(change_ref.change_id),
-                            commit_id: Some(root.commit_id),
-                            untracked: false,
-                            deleted: change_ref.deleted,
-                            created_at: change_ref.created_at,
-                            updated_at: change_ref.updated_at,
-                            snapshot: snapshot.as_ref_slot(),
-                            metadata: metadata.as_ref_slot(),
-                        }
-                    }),
-            );
-        }
         let mut untracked_deltas = state_rows
             .iter()
             .filter(|row| {
@@ -1781,6 +1776,87 @@ async fn stage_tracked_head(
             .as_ref()
             .map(|epoch| epoch.coverage)
             .unwrap_or_default();
+        let can_defer_fresh_hot = certified_fresh_plugin_file_id.is_some()
+            && tracked_roots.len() == 1
+            && state_row_indices.len() == state_rows.len()
+            && staged.selected_change_batches.is_empty()
+            && selected_materialization.is_none()
+            && untracked_deltas.is_empty()
+            && engine_rows.is_empty()
+            && explicit_branch_targets.is_empty()
+            && checkpoint_epochs.is_empty();
+        if can_defer_fresh_hot {
+            let certified_file_id = certified_fresh_plugin_file_id
+                .expect("deferred fresh hot publication requires its certificate");
+            deferred_fresh_hot_plans.push(crate::live_state::DeferredFreshHotPlan::new(
+                &root.branch_id,
+                parent_generation,
+                state_rows,
+                state_row_indices,
+                certified_file_id,
+                &absence_guards,
+                working_diff_capture_checkpoint_commit_id,
+                &mut coverage,
+            )?);
+            if let Some(epoch) = working_diff_epoch {
+                let next_epoch = TrackedWorkingDiffEpoch {
+                    checkpoint_commit_id: epoch.checkpoint_commit_id,
+                    generation: parent_generation,
+                    coverage,
+                };
+                if next_epoch != epoch {
+                    stage_tracked_working_diff_epoch(writes, &root.branch_id, next_epoch)?;
+                }
+            }
+            let mut control = normal_branch_head_control(
+                root,
+                parent_control,
+                parent_generation,
+                working_diff_checkpoint_commit_id,
+            )?;
+            control.note_schemas(
+                state_row_indices
+                    .iter()
+                    .map(|&row_index| state_rows.row(row_index).schema_key.as_str()),
+            );
+            insert_direct_branch_control(&mut controls, &root.branch_id, control)?;
+            continue;
+        }
+        let mut tracked_deltas = {
+            let _span = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.materialization.tracked_head.deltas"
+            )
+            .entered();
+            state_row_indices
+                .iter()
+                .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        if let Some((selected_rows, selected_snapshots, selected_metadata)) =
+            &selected_materialization
+        {
+            tracked_deltas.extend(
+                selected_changes(&staged.selected_change_batches)
+                    .zip(selected_rows)
+                    .zip(selected_snapshots.iter().zip(selected_metadata))
+                    .map(|((change_ref, row), (snapshot, metadata))| {
+                        crate::live_state::CurrentStateDeltaRef {
+                            schema_key: &row.schema_key,
+                            file_id: row.file_id.as_deref(),
+                            entity_pk: &row.entity_pk,
+                            change_id: Some(change_ref.change_id),
+                            commit_id: Some(root.commit_id),
+                            untracked: false,
+                            deleted: change_ref.deleted,
+                            created_at: change_ref.created_at,
+                            updated_at: change_ref.updated_at,
+                            snapshot: snapshot.as_ref_slot(),
+                            metadata: metadata.as_ref_slot(),
+                        }
+                    }),
+            );
+        }
         let mut deltas = tracked_deltas;
         deltas.extend(untracked_deltas);
         // Every absence guard above is derived from one of these exact
@@ -1934,6 +2010,7 @@ async fn stage_tracked_head(
     Ok(StagedHotHeads {
         controls,
         tracked_snapshots,
+        deferred_fresh_hot_plans,
     })
 }
 

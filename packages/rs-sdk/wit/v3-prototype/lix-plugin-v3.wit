@@ -1,0 +1,116 @@
+package lix:plugin@3.0.0;
+
+interface host {
+  type bytes = list<u8>;
+
+  variant host-error {
+    invalid-range,
+    limit-exceeded(string),
+    rejected(string),
+  }
+
+  resource source {
+    len: func() -> u64;
+    read: func(offset: u64, length: u32) -> result<bytes, host-error>;
+  }
+
+  record change-page {
+    format-version: u16,
+    record-count: u32,
+    payload: bytes,
+  }
+
+  record csv-row-batch {
+    row-count: u32,
+    payload: bytes,
+  }
+
+  resource transition-sink {
+    emit-changes: func(page: change-page) -> result<_, host-error>;
+    emit-csv-rows: func(batch: csv-row-batch) -> result<_, host-error>;
+  }
+}
+
+interface api {
+  use host.{bytes, source, transition-sink};
+
+  variant plugin-error {
+    invalid-input(string),
+    limit-exceeded(string),
+    internal(string),
+  }
+
+  record file-descriptor {
+    path: option<string>,
+    media-type: option<string>,
+  }
+
+  record create-context {
+    high: u64,
+    low: u32,
+  }
+
+  record open-file-input {
+    descriptor: file-descriptor,
+    file: own<source>,
+    creates: create-context,
+    max-batch-bytes: u32,
+  }
+
+  record source-range {
+    offset: u64,
+    length: u64,
+  }
+
+  variant input-bytes {
+    inline(bytes),
+    after-range(source-range),
+  }
+
+  record input-splice {
+    offset: u64,
+    delete-len: u64,
+    insert: input-bytes,
+  }
+
+  record file-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<source>,
+    edits: list<input-splice>,
+    after: own<source>,
+    creates: create-context,
+    max-batch-bytes: u32,
+  }
+
+  record transition-summary {
+    entity-count: u64,
+    batch-count: u32,
+    payload-bytes: u64,
+  }
+
+  resource document {
+    fork: func() -> own<document>;
+    /// The guest stays entered while it pushes every bounded change page into
+    /// the host sink. No guest-owned change cursor crosses the boundary.
+    file-changed: func(
+      input: file-update,
+      sink: borrow<transition-sink>,
+    ) -> result<file-transition, plugin-error>;
+  }
+
+  record file-transition {
+    document: own<document>,
+    summary: transition-summary,
+  }
+
+  open-file: func(
+    input: open-file-input,
+    sink: borrow<transition-sink>,
+  ) -> result<file-transition, plugin-error>;
+}
+
+world plugin {
+  import host;
+  export api;
+}

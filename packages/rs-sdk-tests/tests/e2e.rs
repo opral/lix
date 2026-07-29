@@ -25,8 +25,8 @@ use tracing_subscriber::layer::{Context as TracingContext, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 use benchmark_metrics::{
-    AllocationScope, BenchmarkFixture, BenchmarkGate, BenchmarkMeasurement, emit_sample,
-    emit_summary,
+    AllocationScope, BenchmarkFixture, BenchmarkGate, BenchmarkMeasurement, current_live_bytes,
+    emit_sample, emit_summary,
 };
 
 #[derive(Clone, Default)]
@@ -38,6 +38,7 @@ struct PerfSpanCollector {
 struct PerfSpanSample {
     name: &'static str,
     elapsed: Duration,
+    live_bytes_at_close: u64,
 }
 
 #[derive(Debug)]
@@ -78,6 +79,8 @@ fn is_import_perf_span(name: &str) -> bool {
             | "lix.perf.materialization.hot.values"
             | "lix.perf.materialization.hot.stage"
             | "lix.perf.storage_lowering"
+            | "lix.perf.storage_lowering.deferred_next_page"
+            | "lix.perf.storage_lowering.deferred_put_page"
             | "lix.perf.transaction_prepare_rows"
             | "lix.perf.transaction_path_preflight"
             | "lix.perf.transaction_buffer_stage"
@@ -104,6 +107,20 @@ impl PerfSpanCollector {
             *aggregate.entry(sample.name).or_insert(0.0) += sample.elapsed.as_secs_f64() * 1_000.0;
         }
         aggregate
+    }
+
+    fn take_close_live_bytes(&self) -> BTreeMap<&'static str, u64> {
+        let samples = self
+            .samples
+            .lock()
+            .expect("performance span collector should not poison");
+        let mut live = BTreeMap::<&'static str, u64>::new();
+        for sample in samples.iter() {
+            live.entry(sample.name)
+                .and_modify(|current| *current = (*current).max(sample.live_bytes_at_close))
+                .or_insert(sample.live_bytes_at_close);
+        }
+        live
     }
 }
 
@@ -145,6 +162,7 @@ where
             .push(PerfSpanSample {
                 name: started.name,
                 elapsed: started.started.elapsed(),
+                live_bytes_at_close: current_live_bytes(),
             });
     }
 }
@@ -2894,6 +2912,586 @@ async fn v2_csv_ten_mib_rocksdb_import_parity_benchmark() {
     );
 }
 
+/// Prototype B retains the fused call and existing engine storage path, but
+/// sends CSV rows as bounded typed batches without guest-side JSON snapshots.
+#[tokio::test]
+#[ignore = "Component v3 Prototype B typed CSV batch import benchmark"]
+async fn v3_prototype_b_csv_ten_mib_typed_batch_benchmark() {
+    const CSV_ROW_COUNT: usize = 220_000;
+    const FILE_ID: &str = "019a0000-0000-7000-8000-000000000320";
+    const FILE_PATH: &str = "/v3-prototype-b.csv";
+    const BENCHMARK: &str = "v3_prototype_b_csv_ten_mib_typed_batch_benchmark";
+
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5);
+    let archive = build_csv_v3_prototype_archive();
+    let source = csv_ten_mib_fixture();
+    let fixture = BenchmarkFixture {
+        input_bytes: source.len(),
+        logical_rows: CSV_ROW_COUNT + 1,
+    };
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let mut measurements = Vec::with_capacity(samples);
+    let mut elapsed_ms = Vec::with_capacity(samples);
+
+    for sample in 0..samples {
+        let root = tempfile::tempdir().expect("create v3 Prototype B benchmark directory");
+        let lix = open_lix_with_rocksdb(root.path()).await;
+        install_reference_plugin_in_blank_registry(
+            &lix,
+            "plugin_csv_v3_prototype",
+            &archive,
+            &["csv_v2_table", "csv_v2_row"],
+        )
+        .await;
+
+        lix.reset_plugin_v2_transition_counters();
+        collector.clear();
+        let input = source.clone();
+        let allocation_scope = AllocationScope::start();
+        let started = Instant::now();
+        let inserted = lix
+            .execute(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(FILE_ID.to_owned()),
+                    Value::Text(FILE_PATH.to_owned()),
+                    Value::Blob(input.into()),
+                ],
+            )
+            .await
+            .expect("v3 Prototype B CSV import should succeed");
+        let measurement = BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+        assert_eq!(inserted.rows_affected(), 1, "v3 sample {sample}");
+
+        let counters = lix.plugin_v2_transition_counters();
+        assert_eq!(
+            counters.guest_export_calls, 1,
+            "Prototype B must enter the guest exactly once"
+        );
+        assert_eq!(
+            counters.actor_executor_threads_created, 1,
+            "Prototype B must create one persistent actor executor, not one thread per import"
+        );
+        assert_eq!(
+            counters.packet_records,
+            (CSV_ROW_COUNT + 1) as u64,
+            "Prototype B must retain exact typed-batch row cardinality"
+        );
+        assert_eq!(
+            counters.durable_semantic_changes,
+            (CSV_ROW_COUNT + 1) as u64,
+            "Prototype B must commit the exact semantic row count"
+        );
+        assert!(
+            counters.packet_pages > 1,
+            "the large fixture must exercise bounded push pages"
+        );
+        assert_eq!(
+            read_file(&lix, FILE_PATH)
+                .await
+                .expect("v3 Prototype B file should read"),
+            Some(source.clone()),
+            "Prototype B must preserve exact file bytes"
+        );
+        let row_count = lix
+            .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+            .await
+            .expect("v3 Prototype B semantic rows should query")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("CSV row count must be an integer");
+        assert_eq!(row_count, CSV_ROW_COUNT as i64);
+        let projected = lix
+            .execute(
+                "SELECT lixcol_entity_pk, id, order_key, cells \
+                 FROM csv_v2_row WHERE lixcol_file_id = $1 LIMIT 1",
+                &[Value::Text(FILE_ID.to_owned())],
+            )
+            .await
+            .expect("v3 certified CSV row should project after commit");
+        assert_eq!(projected.len(), 1);
+        let projected = &projected.rows()[0];
+        let id = projected
+            .get::<String>("id")
+            .expect("certified CSV id should project");
+        assert_eq!(
+            projected
+                .get::<serde_json::Value>("lixcol_entity_pk")
+                .expect("certified CSV primary key should project"),
+            serde_json::json!([id]),
+        );
+        assert_eq!(
+            projected
+                .get::<serde_json::Value>("cells")
+                .expect("certified CSV cells should project"),
+            serde_json::json!(["000000000000000", "1111111111", "2222222222", "3333333333"]),
+        );
+
+        let phase_close_live_bytes = collector.take_close_live_bytes();
+        eprintln!(
+            "v3_prototype_b_phases sample={sample} elapsed_ms={:.3} \
+             guest_export_calls={} actor_executor_threads_created={} \
+             source_sink_import_calls={} packet_pages={} packet_records={} \
+             boundary_bytes={} guest_high_water_bytes={} phase_close_live_bytes={:?} phases_ms={:?}",
+            measurement.elapsed_ms,
+            counters.guest_export_calls,
+            counters.actor_executor_threads_created,
+            counters.component_import_calls,
+            counters.packet_pages,
+            counters.packet_records,
+            counters.component_boundary_bytes,
+            counters.guest_linear_memory_high_water_bytes,
+            phase_close_live_bytes,
+            collector.take_aggregate_millis(),
+        );
+        emit_sample(
+            BENCHMARK,
+            "typed_csv_batches",
+            sample,
+            fixture,
+            BenchmarkGate::BulkWrite,
+            measurement,
+        );
+        elapsed_ms.push(measurement.elapsed_ms);
+        measurements.push(measurement);
+        lix.close().await.expect("close v3 Prototype B benchmark");
+        let reopened = open_lix_with_rocksdb(root.path()).await;
+        let reopened_count = reopened
+            .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+            .await
+            .expect("reopened certified CSV rows should query")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("reopened CSV row count must be an integer");
+        assert_eq!(reopened_count, CSV_ROW_COUNT as i64);
+        reopened
+            .close()
+            .await
+            .expect("close reopened v3 Prototype B benchmark");
+    }
+
+    elapsed_ms.sort_by(f64::total_cmp);
+    eprintln!(
+        "v3_prototype_b_csv_ten_mib bytes={} rows={} samples={samples} \
+         raw_ms={elapsed_ms:?} p50_ms={:.3} p95_ms={:.3}",
+        source.len(),
+        CSV_ROW_COUNT + 1,
+        p50_ms(&elapsed_ms),
+        p95_ms(&elapsed_ms),
+    );
+    emit_summary(
+        BENCHMARK,
+        "typed_csv_batches",
+        fixture,
+        BenchmarkGate::BulkWrite,
+        &measurements,
+    );
+}
+
+/// Matched large JSON import through the v2 returned cursor and the v3
+/// host-imported push sink. Both lanes use the same parser and packet-v1
+/// encoding, so this isolates control-flow and runtime materialization.
+#[tokio::test]
+#[ignore = "10 MiB JSON v2 cursor versus v3 push-sink import benchmark"]
+async fn v3_json_ten_mib_push_sink_benchmark() {
+    const FILE_ID: &str = "019a0000-0000-7000-8000-000000000330";
+    const FILE_PATH: &str = "/v3-json-large.json";
+    const BENCHMARK: &str = "v3_json_ten_mib_push_sink_benchmark";
+
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5);
+    let source = json_ten_mib_flat_fixture().0;
+    let projected_key = format!("property_{:06}", JSON_TEN_MIB_PROPERTY_COUNT / 2);
+    let parsed_source: serde_json::Value =
+        serde_json::from_slice(&source).expect("benchmark JSON should parse");
+    let projected_scalar = serde_json::to_string(
+        parsed_source
+            .get(&projected_key)
+            .expect("projected benchmark property should exist"),
+    )
+    .expect("projected benchmark scalar should encode");
+    let fixture = BenchmarkFixture {
+        input_bytes: source.len(),
+        logical_rows: JSON_TEN_MIB_PROPERTY_COUNT + 1,
+    };
+    let lanes = [
+        (
+            "v2_cursor",
+            "plugin_json_incremental_v2",
+            build_json_v2_plugin_archive(),
+        ),
+        (
+            "v3_push_sink",
+            "plugin_json_v3_prototype",
+            build_json_v3_prototype_archive(),
+        ),
+    ];
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+
+    for (label, plugin_key, archive) in lanes {
+        let mut measurements = Vec::with_capacity(samples);
+        let mut elapsed_ms = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let root = tempfile::tempdir().expect("create JSON v3 benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            install_reference_plugin_in_blank_registry(
+                &lix,
+                plugin_key,
+                &archive,
+                &["json_root", "json_object_member", "json_array_item"],
+            )
+            .await;
+
+            lix.reset_plugin_v2_transition_counters();
+            collector.clear();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            let inserted = lix
+                .execute(
+                    "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                    &[
+                        Value::Text(FILE_ID.to_owned()),
+                        Value::Text(FILE_PATH.to_owned()),
+                        Value::Blob(source.clone().into()),
+                    ],
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{label} JSON import failed: {error}"));
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            assert_eq!(inserted.rows_affected(), 1, "{label} sample {sample}");
+            let counters = lix.plugin_v2_transition_counters();
+            if label == "v3_push_sink" {
+                assert_eq!(counters.guest_export_calls, 1);
+            }
+            assert_eq!(
+                counters.durable_semantic_changes,
+                (JSON_TEN_MIB_PROPERTY_COUNT + 1) as u64
+            );
+            assert_eq!(
+                read_file(&lix, FILE_PATH).await.unwrap(),
+                Some(source.clone())
+            );
+            let members = lix
+                .execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+                .await
+                .expect("count JSON members")
+                .rows()[0]
+                .get::<i64>("count")
+                .expect("JSON member count must be an integer");
+            assert_eq!(members, JSON_TEN_MIB_PROPERTY_COUNT as i64);
+            let projected = lix
+                .execute(
+                    "SELECT key, kind, scalar_json FROM json_object_member WHERE key = $1",
+                    &[Value::Text(projected_key.clone())],
+                )
+                .await
+                .expect("project exact JSON member");
+            assert_eq!(projected.rows().len(), 1);
+            assert_eq!(
+                projected.rows()[0].get::<String>("key").unwrap(),
+                projected_key
+            );
+            assert_eq!(projected.rows()[0].get::<String>("kind").unwrap(), "string");
+            assert_eq!(
+                projected.rows()[0].get::<String>("scalar_json").unwrap(),
+                projected_scalar
+            );
+            let history_count = lix
+                .execute(
+                    "SELECT COUNT(*) AS count FROM json_object_member_history()",
+                    &[],
+                )
+                .await
+                .expect("certified JSON rows should participate in history")
+                .rows()[0]
+                .get::<i64>("count")
+                .expect("JSON history count must be an integer");
+            assert_eq!(history_count, JSON_TEN_MIB_PROPERTY_COUNT as i64);
+            eprintln!(
+                "v3_json_large_phases lane={label} sample={sample} elapsed_ms={:.3} \
+                 guest_exports={} imports={} pages={} records={} boundary_bytes={} \
+                 guest_high_water_bytes={} phase_close_live_bytes={:?} phases_ms={:?}",
+                measurement.elapsed_ms,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.packet_pages,
+                counters.packet_records,
+                counters.component_boundary_bytes,
+                counters.guest_linear_memory_high_water_bytes,
+                collector.take_close_live_bytes(),
+                collector.take_aggregate_millis(),
+            );
+            emit_sample(
+                BENCHMARK,
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::BulkWrite,
+                measurement,
+            );
+            elapsed_ms.push(measurement.elapsed_ms);
+            measurements.push(measurement);
+            lix.close().await.expect("close JSON benchmark");
+            let reopened = open_lix_with_rocksdb(root.path()).await;
+            let reopened_count = reopened
+                .execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+                .await
+                .expect("reopened JSON members should query")
+                .rows()[0]
+                .get::<i64>("count")
+                .expect("reopened JSON member count must be an integer");
+            assert_eq!(reopened_count, JSON_TEN_MIB_PROPERTY_COUNT as i64);
+            reopened
+                .close()
+                .await
+                .expect("close reopened JSON benchmark");
+        }
+        elapsed_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "v3_json_ten_mib lane={label} samples={samples} raw_ms={elapsed_ms:?} \
+             p50_ms={:.3} p95_ms={:.3}",
+            p50_ms(&elapsed_ms),
+            p95_ms(&elapsed_ms)
+        );
+        emit_summary(
+            BENCHMARK,
+            label,
+            fixture,
+            BenchmarkGate::BulkWrite,
+            &measurements,
+        );
+    }
+}
+
+#[tokio::test]
+async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
+    let root = tempfile::tempdir().expect("create v3 JSON successor directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_v3_prototype",
+        &build_json_v3_prototype_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/v3-json-successor.json";
+    let before = br#"{"a":"one","b":"two"}"#.to_vec();
+    write_file(&lix, path, before.clone()).await.unwrap();
+    assert_eq!(
+        lix.execute("SELECT COUNT(*) AS count FROM json_object_member", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<i64>("count")
+            .unwrap(),
+        2
+    );
+
+    let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+    write_file(&lix, path, after.clone()).await.unwrap();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after));
+    let current = lix
+        .execute(
+            "SELECT key, scalar_json FROM json_object_member ORDER BY key",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(current.rows().len(), 2);
+    assert_eq!(current.rows()[0].get::<String>("key").unwrap(), "a");
+    assert_eq!(
+        current.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""ONE""#
+    );
+    assert_eq!(current.rows()[1].get::<String>("key").unwrap(), "b");
+
+    let historical = lix
+        .execute(
+            "SELECT key, scalar_json FROM json_object_member_history() \
+             WHERE lixcol_depth = 1 ORDER BY key",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(historical.rows().len(), 2);
+    assert_eq!(
+        historical.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""one""#
+    );
+    lix.close().await.unwrap();
+}
+
+/// Matched warm file transitions over the same CSV implementation. v2 returns
+/// a guest change cursor and requires `next(Some)` plus `next(None)` exports;
+/// v3 pushes the same packet page into a borrowed host sink before its single
+/// `file-changed` export returns.
+#[tokio::test]
+#[ignore = "Component v2 change cursor versus v3 push-sink benchmark"]
+async fn v3_file_changed_push_sink_benchmark() {
+    const SAMPLES: usize = 25;
+    const ROW_COUNT: usize = 20_000;
+    const ROW: &[u8] = b"000000000000000,1111111111,2222222222,3333333333\n";
+    const BENCHMARK: &str = "v3_file_changed_push_sink_benchmark";
+
+    let mut source = Vec::with_capacity(ROW_COUNT * ROW.len());
+    for _ in 0..ROW_COUNT {
+        source.extend_from_slice(ROW);
+    }
+    let fixture = BenchmarkFixture {
+        input_bytes: source.len(),
+        logical_rows: 1,
+    };
+    let v2_root = tempfile::tempdir().expect("create v2 push-sink benchmark directory");
+    let v3_root = tempfile::tempdir().expect("create v3 push-sink benchmark directory");
+    let v2 = open_lix_with_rocksdb(v2_root.path()).await;
+    let v3 = open_lix_with_rocksdb(v3_root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &v2,
+        "plugin_csv_v2",
+        &build_csv_v2_plugin_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+    install_reference_plugin_in_blank_registry(
+        &v3,
+        "plugin_csv_v3_prototype",
+        &build_csv_v3_prototype_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+    let v2_path = "/cursor.csv";
+    let v3_path = "/push-sink.csv";
+    write_file(&v2, v2_path, source.clone())
+        .await
+        .expect("v2 benchmark import should succeed");
+    write_file(&v3, v3_path, source.clone())
+        .await
+        .expect("v3 benchmark import should succeed");
+    assert_eq!(read_file(&v2, v2_path).await.unwrap(), Some(source.clone()));
+    assert_eq!(read_file(&v3, v3_path).await.unwrap(), Some(source.clone()));
+
+    let mut v2_bytes = source.clone();
+    let mut v3_bytes = source;
+    let mut v2_measurements = Vec::with_capacity(SAMPLES);
+    let mut v3_measurements = Vec::with_capacity(SAMPLES);
+    let mut v2_ms = Vec::with_capacity(SAMPLES);
+    let mut v3_ms = Vec::with_capacity(SAMPLES);
+    let mut v2_export_calls = Vec::with_capacity(SAMPLES);
+    let mut v3_export_calls = Vec::with_capacity(SAMPLES);
+
+    for sample in 0..SAMPLES {
+        let next = if sample % 2 == 0 { b'9' } else { b'0' };
+        let lanes = if sample % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        };
+        for push_sink in lanes {
+            let (lix, path, bytes) = if push_sink {
+                (&v3, v3_path, &mut v3_bytes)
+            } else {
+                (&v2, v2_path, &mut v2_bytes)
+            };
+            bytes[0] = next;
+            lix.reset_plugin_v2_transition_counters();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            write_file(lix, path, bytes.clone())
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{} sample {sample} should succeed: {error:?}",
+                        if push_sink { "v3" } else { "v2" }
+                    )
+                });
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let counters = lix.plugin_v2_transition_counters();
+            assert_eq!(counters.packet_records, 1, "sample {sample}");
+            assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
+            if push_sink {
+                assert_eq!(
+                    counters.guest_export_calls, 1,
+                    "v3 must use one guest export"
+                );
+                v3_export_calls.push(counters.guest_export_calls);
+                v3_ms.push(measurement.elapsed_ms);
+                v3_measurements.push(measurement);
+            } else {
+                assert_eq!(
+                    counters.guest_export_calls, 3,
+                    "v2 must call file-changed, next(Some), and next(None)"
+                );
+                v2_export_calls.push(counters.guest_export_calls);
+                v2_ms.push(measurement.elapsed_ms);
+                v2_measurements.push(measurement);
+            }
+        }
+    }
+
+    assert_eq!(read_file(&v2, v2_path).await.unwrap(), Some(v2_bytes));
+    assert_eq!(read_file(&v3, v3_path).await.unwrap(), Some(v3_bytes));
+    let v2_row_count = v2
+        .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+        .await
+        .expect("v2 semantic rows should query")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("v2 row count should be integer");
+    let v3_row_count = v3
+        .execute("SELECT COUNT(*) AS count FROM csv_v2_row", &[])
+        .await
+        .expect("v3 semantic rows should query")
+        .rows()[0]
+        .get::<i64>("count")
+        .expect("v3 row count should be integer");
+    assert_eq!(v2_row_count, ROW_COUNT as i64);
+    assert_eq!(v3_row_count, ROW_COUNT as i64);
+
+    v2_ms.sort_by(f64::total_cmp);
+    v3_ms.sort_by(f64::total_cmp);
+    eprintln!(
+        "v3_file_changed_push_sink bytes={} rows={} samples={SAMPLES} \
+         v2_raw_ms={v2_ms:?} v2_p50_ms={:.3} v2_guest_exports={} \
+         v3_raw_ms={v3_ms:?} v3_p50_ms={:.3} v3_guest_exports={} speedup={:.3}",
+        fixture.input_bytes,
+        ROW_COUNT,
+        p50_ms(&v2_ms),
+        v2_export_calls[0],
+        p50_ms(&v3_ms),
+        v3_export_calls[0],
+        p50_ms(&v2_ms) / p50_ms(&v3_ms),
+    );
+    emit_summary(
+        BENCHMARK,
+        "v2_guest_cursor",
+        fixture,
+        BenchmarkGate::ElapsedRegression,
+        &v2_measurements,
+    );
+    emit_summary(
+        BENCHMARK,
+        "v3_push_sink",
+        fixture,
+        BenchmarkGate::ElapsedRegression,
+        &v3_measurements,
+    );
+    v2.close().await.expect("close v2 benchmark");
+    v3.close().await.expect("close v3 benchmark");
+}
+
 #[tokio::test]
 #[ignore = "10 MiB JSON public-SQL read benchmark on RocksDB"]
 async fn v2_json_ten_mib_rocksdb_read_benchmark() {
@@ -4641,6 +5239,78 @@ fn build_csv_v2_plugin_archive() -> Vec<u8> {
         include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
         None,
     )
+}
+
+fn build_csv_v3_prototype_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!(
+        "CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_PROTOTYPE_plugin_csv_v3_prototype"
+    ));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built CSV v3 prototype wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/csv-v3-prototype/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/csv_v2_table.json",
+            include_str!("../../../plugins/csv-v2/schema/csv_v2_table.json").as_bytes(),
+        ),
+        (
+            "schema/csv_v2_row.json",
+            include_str!("../../../plugins/csv-v2/schema/csv_v2_row.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn build_json_v3_prototype_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!(
+        "CARGO_CDYLIB_FILE_PLUGIN_JSON_V3_PROTOTYPE_plugin_json_v3_prototype"
+    ));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built JSON v3 prototype wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/json-v3-prototype/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/json_root.json",
+            include_str!("../../../plugins/json-v2/schema/json_root.json").as_bytes(),
+        ),
+        (
+            "schema/json_object_member.json",
+            include_str!("../../../plugins/json-v2/schema/json_object_member.json").as_bytes(),
+        ),
+        (
+            "schema/json_array_item.json",
+            include_str!("../../../plugins/json-v2/schema/json_array_item.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
 }
 
 fn build_markdown_v2_plugin_archive() -> Vec<u8> {

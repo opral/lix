@@ -8,6 +8,7 @@ use crate::storage::{
 use crate::storage_adapter::{StorageSpace, StorageWriteSetStats};
 use ahash::RandomState;
 use bytes::Bytes;
+use tracing::Instrument as _;
 
 type FastHashBuilder = RandomState;
 
@@ -69,16 +70,54 @@ impl IntoStorageValue for &[u8] {
     }
 }
 
-#[derive(Clone, Debug)]
 pub struct StorageWriteSet {
     groups: Vec<StorageWriteGroup>,
     group_index: HashMap<SpaceId, usize, FastHashBuilder>,
+    deferred_final_puts: Vec<Box<dyn DeferredFinalPutSource>>,
     stats: StorageWriteSetStats,
     // Domain stores can seal a write lane after planning a destructive sweep.
     // The flag carries no storage representation; it only prevents a later
     // domain writer sharing this canonical write set from invalidating the
     // sweep's reachability proof before commit.
     changelog_gc_sealed: bool,
+}
+
+impl fmt::Debug for StorageWriteSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageWriteSet")
+            .field("groups", &self.groups)
+            .field(
+                "deferred_final_put_sources",
+                &self.deferred_final_puts.len(),
+            )
+            .field("stats", &self.stats)
+            .field("changelog_gc_sealed", &self.changelog_gc_sealed)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One bounded page produced by a storage-native owner at final lowering.
+///
+/// The source has already validated logical uniqueness and ownership. Pages
+/// are deliberately restricted to final point puts so they cannot interact
+/// with a later range deletion in the same backend transaction.
+pub(crate) struct DeferredFinalPutPage {
+    pub(crate) space: StorageSpace,
+    pub(crate) entries: PutBatch,
+}
+
+/// Compact transaction-owned data that expands only at the backend boundary.
+///
+/// This is the storage-native escape hatch for large certified batches. The
+/// ordinary write set remains the general representation; a deferred source
+/// is accepted only when its target spaces have no ordinary mutations.
+pub(crate) trait DeferredFinalPutSource: Send {
+    fn target_spaces(&self) -> &[StorageSpace];
+    fn put_count(&self) -> u64;
+    fn written_bytes(&self) -> u64;
+    fn backend_capacity_hint_bytes(&self) -> usize;
+    fn next_page(&mut self) -> Option<DeferredFinalPutPage>;
 }
 
 #[derive(Clone, Debug)]
@@ -205,15 +244,18 @@ impl StorageWriteSet {
                 expected_spaces,
                 FastHashBuilder::with_seeds(0, 0, 0, 0),
             ),
+            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.groups
-            .iter()
-            .all(|group| group.puts.is_empty() && group.deletes.is_empty())
+        self.deferred_final_puts.is_empty()
+            && self
+                .groups
+                .iter()
+                .all(|group| group.puts.is_empty() && group.deletes.is_empty())
     }
 
     /// Conservative encoded-size hint for contiguous backend write batches.
@@ -222,7 +264,7 @@ impl StorageWriteSet {
     /// length prefixes for current backends. The fixed tail covers the batch
     /// header and the mutation-revision record appended by the adapter.
     pub(crate) fn backend_batch_capacity_hint_bytes(&self) -> usize {
-        self.groups.iter().fold(64_usize, |total, group| {
+        let ordinary = self.groups.iter().fold(64_usize, |total, group| {
             let puts = group.puts.iter().fold(0_usize, |bytes, put| {
                 bytes
                     .saturating_add(group.key_bytes(put.key).len())
@@ -235,7 +277,12 @@ impl StorageWriteSet {
                     .saturating_add(16)
             });
             total.saturating_add(puts).saturating_add(deletes)
-        })
+        });
+        self.deferred_final_puts
+            .iter()
+            .fold(ordinary, |total, source| {
+                total.saturating_add(source.backend_capacity_hint_bytes())
+            })
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
@@ -345,6 +392,44 @@ impl StorageWriteSet {
         self.stats.staged_puts += staged_puts;
         self.stats.staged_deletes += staged_deletes;
         self.stats.written_bytes += written_bytes;
+    }
+
+    /// Retains a compact, already-validated owner until backend lowering.
+    ///
+    /// Deferred sources are intentionally exclusive per target space. This
+    /// makes their no-duplicate certificate compositional with the ordinary
+    /// write-set validator instead of silently bypassing mutations staged by
+    /// another domain writer.
+    pub(crate) fn stage_deferred_final_put_source(
+        &mut self,
+        source: Box<dyn DeferredFinalPutSource>,
+    ) -> Result<(), StorageWriteSetError> {
+        for &space in source.target_spaces() {
+            if self
+                .group_index
+                .get(&space.id)
+                .and_then(|index| self.groups.get(*index))
+                .is_some_and(|group| !group.puts.is_empty() || !group.deletes.is_empty())
+                || self.deferred_final_puts.iter().any(|existing| {
+                    existing
+                        .target_spaces()
+                        .iter()
+                        .any(|target| target.id == space.id)
+                })
+            {
+                return Err(StorageWriteSetError::DuplicateMutation {
+                    space,
+                    key: Key(Bytes::new()),
+                });
+            }
+        }
+        self.stats.staged_puts = self.stats.staged_puts.saturating_add(source.put_count());
+        self.stats.written_bytes = self
+            .stats
+            .written_bytes
+            .saturating_add(source.written_bytes());
+        self.deferred_final_puts.push(source);
+        Ok(())
     }
 
     /// Retains one contiguous content-addressed batch while coalescing puts
@@ -471,6 +556,7 @@ impl StorageWriteSet {
     pub fn extend(&mut self, other: Self) {
         let Self {
             groups,
+            deferred_final_puts,
             stats,
             changelog_gc_sealed,
             ..
@@ -480,6 +566,27 @@ impl StorageWriteSet {
             let space = group.space;
             let target = self.group_mut(space);
             target.append(group);
+        }
+        for source in deferred_final_puts {
+            for &space in source.target_spaces() {
+                assert!(
+                    self.group_index
+                        .get(&space.id)
+                        .and_then(|index| self.groups.get(*index))
+                        .is_none_or(|group| group.puts.is_empty() && group.deletes.is_empty()),
+                    "extended deferred spaces remain exclusive"
+                );
+                assert!(
+                    self.deferred_final_puts.iter().all(|existing| {
+                        existing
+                            .target_spaces()
+                            .iter()
+                            .all(|target| target.id != space.id)
+                    }),
+                    "extended deferred sources remain exclusive"
+                );
+            }
+            self.deferred_final_puts.push(source);
         }
         self.stats.staged_puts += stats.staged_puts;
         self.stats.staged_deletes += stats.staged_deletes;
@@ -632,7 +739,10 @@ impl StorageWriteSet {
         W: StorageWrite,
     {
         let Self {
-            groups, mut stats, ..
+            groups,
+            mut deferred_final_puts,
+            mut stats,
+            ..
         } = self;
 
         for group in groups {
@@ -663,7 +773,7 @@ impl StorageWriteSet {
                 stats.put_batches += 1;
                 stats.storage_calls += 1;
                 write
-                    .put_many(space.id, PutBatch { entries: puts })
+                    .put_many_final(space.id, PutBatch { entries: puts })
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -672,6 +782,29 @@ impl StorageWriteSet {
                 stats.storage_calls += 1;
                 write
                     .delete_many(space.id, &deletes)
+                    .await
+                    .map_err(StorageWriteSetError::Storage)?;
+            }
+        }
+
+        for source in &mut deferred_final_puts {
+            while let Some(page) = tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.storage_lowering.deferred_next_page"
+            )
+            .in_scope(|| source.next_page())
+            {
+                if page.entries.entries.is_empty() {
+                    continue;
+                }
+                stats.put_batches += 1;
+                stats.storage_calls += 1;
+                write
+                    .put_many_final(page.space.id, page.entries)
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.storage_lowering.deferred_put_page"
+                    ))
                     .await
                     .map_err(StorageWriteSetError::Storage)?;
             }
@@ -773,6 +906,7 @@ impl Default for StorageWriteSet {
         Self {
             groups: Vec::new(),
             group_index: HashMap::with_hasher(FastHashBuilder::with_seeds(0, 0, 0, 0)),
+            deferred_final_puts: Vec::new(),
             stats: StorageWriteSetStats::default(),
             changelog_gc_sealed: false,
         }

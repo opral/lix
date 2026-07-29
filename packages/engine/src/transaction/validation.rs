@@ -501,7 +501,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
             .is_empty()
         || !prepared_writes.extra_commit_parents_by_branch.is_empty()
         || !prepared_writes.checkpoint_publications.is_empty()
-        || prepared_writes.insert_selection.len() != 2
+        || !(1..=2).contains(&prepared_writes.insert_selection.len())
     {
         return None;
     }
@@ -542,7 +542,7 @@ pub(crate) fn fresh_plugin_file_import_certificate(
                     != Some(file_data.file_id.as_str())
                     || row.entity_pk.as_single_string_owned().ok().as_deref()
                         != Some(file_data.file_id.as_str())
-                    || row.origin.is_some()
+                    || !(row.origin.is_none() || plugin_reconciliation_update(row))
                     || row.facts.requires_transaction_validation
                     || blob_ref.replace((row_index, row)).is_some()
                 {
@@ -577,17 +577,21 @@ pub(crate) fn fresh_plugin_file_import_certificate(
     else {
         return None;
     };
+    let descriptor_selected = prepared_insert_selection_matches_row(
+        &prepared_writes.insert_selection,
+        descriptor_index,
+        descriptor,
+    );
+    let blob_ref_selected = prepared_insert_selection_matches_row(
+        &prepared_writes.insert_selection,
+        blob_ref_index,
+        blob_ref,
+    );
+    let blob_ref_is_internal_update = plugin_reconciliation_update(blob_ref);
     if plugin_owner_count != 1
-        || !prepared_insert_selection_matches_row(
-            &prepared_writes.insert_selection,
-            descriptor_index,
-            descriptor,
-        )
-        || !prepared_insert_selection_matches_row(
-            &prepared_writes.insert_selection,
-            blob_ref_index,
-            blob_ref,
-        )
+        || !descriptor_selected
+        || prepared_writes.insert_selection.len() != 1 + usize::from(blob_ref_selected)
+        || blob_ref_selected == blob_ref_is_internal_update
     {
         return None;
     }
@@ -7860,10 +7864,10 @@ mod tests {
         blob_ref.global = false;
         blob_ref.facts.row_content_validated = true;
         // Reconciliation replaces the provisional planner blob ref with this
-        // exact materialization and intentionally leaves its public origin
-        // empty; stage_write still records it as an INSERT under the outer
-        // lix_file INSERT mode.
-        blob_ref.origin = None;
+        // exact materialization as an internal update. The public descriptor
+        // remains the INSERT identity whose absence proves this is a fresh
+        // file incarnation.
+        blob_ref.origin = Some(plugin_reconciliation_update_origin());
 
         let mut owner = staged_row(
             "lix_key_value",
@@ -7912,7 +7916,6 @@ mod tests {
             crate::transaction::types::StagedCommitChangeRefs::default(),
         );
         writes.remember_insert_identity_for_tests(&descriptor);
-        writes.remember_insert_identity_for_tests(&blob_ref);
         writes
     }
 

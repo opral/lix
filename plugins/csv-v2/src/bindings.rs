@@ -195,5 +195,5 @@ fn core_edits(edits: Vec<CoreByteEdit>) -> sdk::Edits {
     sdk::edits(edits.into_iter().map(sdk_edit))
 }
 
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_family = "wasm", feature = "component-v2"))]
 lix_plugin_api_v2::export_v2!(CsvPlugin);

@@ -1,0 +1,21 @@
+[package]
+name = "lix_plugin_api_v3_prototype"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Prototype fused push API for Lix Wasm Component plugins"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+readme = "README.md"
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+wit-bindgen = "0.57"

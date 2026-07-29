@@ -8,9 +8,12 @@ use datafusion::logical_expr::{Expr, Operator};
 use tokio::sync::Mutex;
 
 use crate::LixError;
+use crate::NullableKeyFilter;
 use crate::changelog::CommitId;
 use crate::commit_graph::{CommitGraphChangeHistoryRequest, CommitGraphReader};
 use crate::entity_pk::EntityPk;
+use crate::live_state::scan_certified_history_rows;
+use crate::tracked_state::{TrackedStateFilter, TrackedStateReadColumns, TrackedStateScanRequest};
 
 use super::SqlHistoryQuerySource;
 use crate::sql2::change_materialization::{MaterializedChange, materialize_located_history_change};
@@ -375,19 +378,18 @@ where
             let entries = guard
                 .change_history_from_commit(&as_of_commit_id, &request)
                 .await?;
-            let reachable_commits = if metadata_projection.commit_created_at {
-                guard.reachable_commits(&as_of_commit_id).await?
-            } else {
-                Vec::new()
-            };
+            let reachable_commits = guard.reachable_commits(&as_of_commit_id).await?;
             (entries, reachable_commits)
         };
-        let commit_created_at_by_id = reachable_commits
-            .into_iter()
+        let reachable_by_id = reachable_commits
+            .iter()
             .map(|reachable| {
                 (
                     reachable.commit.commit_id,
-                    reachable.commit.change.created_at.to_string(),
+                    (
+                        reachable.depth,
+                        reachable.commit.change.created_at.to_string(),
+                    ),
                 )
             })
             .collect::<BTreeMap<_, _>>();
@@ -396,8 +398,9 @@ where
             let change = materialize_located_history_change(&mut json_reader, entry.change).await?;
             let commit_created_at = if metadata_projection.commit_created_at {
                 Some(
-                    commit_created_at_by_id
+                    reachable_by_id
                         .get(&entry.observed_commit_id)
+                        .map(|(_, created_at)| created_at)
                         .cloned()
                         .ok_or_else(|| {
                             LixError::new(
@@ -418,6 +421,75 @@ where
                 observed_commit_id: entry.observed_commit_id.to_string(),
                 as_of_commit_id: entry.start_commit_id.to_string(),
                 depth: entry.depth,
+            });
+        }
+
+        let certified_commit_ids = reachable_by_id
+            .iter()
+            .filter(|(_, (depth, _))| {
+                request.min_depth.is_none_or(|minimum| *depth >= minimum)
+                    && request.max_depth.is_none_or(|maximum| *depth <= maximum)
+            })
+            .map(|(commit_id, _)| *commit_id)
+            .collect();
+        let certified_request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: request.schema_keys.clone(),
+                entity_pks: request.entity_pks.clone(),
+                file_ids: request
+                    .file_ids
+                    .iter()
+                    .cloned()
+                    .map(NullableKeyFilter::Value)
+                    .collect(),
+                include_tombstones: true,
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: vec!["snapshot_content".to_owned(), "metadata".to_owned()],
+            },
+            limit: None,
+        };
+        let existing_change_ids = rows
+            .iter()
+            .map(|entry| entry.change.id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for row in scan_certified_history_rows(
+            &query_source.store,
+            &certified_commit_ids,
+            &certified_request,
+        )
+        .await?
+        {
+            let Some(commit_id) = row.commit_id else {
+                continue;
+            };
+            let Some(change_id) = row.change_id else {
+                continue;
+            };
+            let change_id = change_id.to_string();
+            if existing_change_ids.contains(&change_id) {
+                continue;
+            }
+            let Some((depth, commit_created_at)) = reachable_by_id.get(&commit_id) else {
+                continue;
+            };
+            rows.push(HistoryEntry {
+                change: MaterializedChange {
+                    id: change_id,
+                    entity_pk: row.entity_pk,
+                    schema_key: row.schema_key,
+                    file_id: row.file_id,
+                    snapshot_content: row.snapshot_content,
+                    metadata: row.metadata,
+                    created_at: row.created_at.to_string(),
+                    origin_key: None,
+                },
+                observed_commit_id: commit_id.to_string(),
+                commit_created_at: metadata_projection
+                    .commit_created_at
+                    .then(|| commit_created_at.clone()),
+                as_of_commit_id: as_of_commit_id.to_string(),
+                depth: *depth,
             });
         }
     }

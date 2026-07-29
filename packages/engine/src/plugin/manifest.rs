@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::wasm::WASM_COMPONENT_V2_API_VERSION;
+use crate::wasm::{WASM_COMPONENT_V2_API_VERSION, WASM_COMPONENT_V3_PROTOTYPE_API_VERSION};
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -138,11 +138,13 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
 /// durable-registry boundaries. The latter matters because registry snapshots
 /// can outlive the process that originally validated an archive.
 pub(crate) fn validate_runtime_api_version(manifest: &PluginManifest) -> Result<(), LixError> {
-    if manifest.api_version != WASM_COMPONENT_V2_API_VERSION {
+    if manifest.api_version != WASM_COMPONENT_V2_API_VERSION
+        && manifest.api_version != WASM_COMPONENT_V3_PROTOTYPE_API_VERSION
+    {
         return Err(LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
-                "wasm-component-v2 requires api_version '{WASM_COMPONENT_V2_API_VERSION}', got '{}'",
+                "wasm-component-v2 requires api_version '{WASM_COMPONENT_V2_API_VERSION}' or experimental '{WASM_COMPONENT_V3_PROTOTYPE_API_VERSION}', got '{}'",
                 manifest.api_version
             ),
         ));
@@ -265,6 +267,24 @@ mod tests {
         assert_eq!(validated.manifest.key, "plugin_json");
         assert_eq!(validated.manifest.runtime, PluginRuntime::WasmComponentV2);
         assert_eq!(validated.manifest.entry, "plugin.wasm");
+    }
+
+    #[test]
+    fn parses_experimental_v3_manifest() {
+        let validated = parse_plugin_manifest_json(
+            r#"{
+                "key":"plugin_csv_v3_prototype",
+                "runtime":"wasm-component-v2",
+                "api_version":"3.0.0",
+                "materialization":"blob",
+                "match":{"path_glob":"*.csv"},
+                "entry":"plugin.wasm",
+                "schemas":["schema/csv_row.json"]
+            }"#,
+        )
+        .expect("experimental v3 manifest should parse");
+
+        assert_eq!(validated.manifest.api_version, "3.0.0");
     }
 
     #[test]

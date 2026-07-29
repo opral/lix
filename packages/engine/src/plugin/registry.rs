@@ -133,6 +133,10 @@ impl PluginRegistryEntry {
         self.materialization
     }
 
+    pub(crate) fn api_version(&self) -> &str {
+        &self.api_version
+    }
+
     pub(crate) fn schema_keys(&self) -> &[String] {
         &self.schema_keys
     }
