@@ -4188,7 +4188,10 @@ fn prepare_lix_file_rows(
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
+                let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                    row,
+                    snapshot.id.clone(),
+                );
                 file_rows.insert(
                     key.clone(),
                     FileDescriptorRecord {
@@ -4433,7 +4436,7 @@ fn lix_file_record_batch_from_path_selection(
             "lixcol_file_id" => Arc::new(StringArray::from(
                 entries
                     .iter()
-                    .map(|entry| entry.key.file_id())
+                    .map(|entry| Some(entry.id()))
                     .collect::<Vec<_>>(),
             )),
             "lixcol_global" => Arc::new(BooleanArray::from(
@@ -7603,7 +7606,6 @@ mod tests {
             "01920000-0000-7000-8000-0000000000b1",
             r#"{"id":"01920000-0000-7000-8000-000000000522","directory_id":null,"name":"readme.md"}"#,
         );
-        target.file_id = Some("remote-01920000-0000-7000-8000-000000000522".to_string());
         target.untracked = true;
         let index = Arc::new(
             path_index_from_rows(vec![
@@ -7678,7 +7680,7 @@ mod tests {
         assert_eq!(string_value("id"), "01920000-0000-7000-8000-000000000522");
         assert_eq!(
             string_value("lixcol_file_id"),
-            "remote-01920000-0000-7000-8000-000000000522"
+            "01920000-0000-7000-8000-000000000522"
         );
         assert!(!boolean_value("lixcol_global"));
         assert!(boolean_value("lixcol_untracked"));
@@ -8911,7 +8913,7 @@ mod tests {
         MaterializedLiveStateRow {
             entity_pk: typed_entity_pk,
             schema_key: super::FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            file_id: None,
+            file_id: Some(entity_pk.to_string()),
             snapshot_content: Some(snapshot_content.into()),
             metadata: None,
             deleted: false,
@@ -9074,6 +9076,7 @@ mod tests {
                 .to_string(),
         );
         row.schema_key = "lix_key_value".to_string();
+        row.file_id = None;
         row
     }
 
@@ -9703,62 +9706,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_projection_keeps_same_id_descriptors_in_distinct_file_scopes() {
+    async fn file_projection_sets_descriptor_file_id_to_own_id() {
         let blob_reader = Arc::new(CapturingWriteContext::default()) as Arc<dyn BlobDataReader>;
-        let mut scoped_file = live_file_row(
-            "01920000-0000-7000-8000-0000000000d2",
-            "01920000-0000-7000-8000-0000000000b1",
-            "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"scoped.md\"}",
-        );
-        scoped_file.file_id = Some("01920000-0000-7000-8000-000000000342".to_string());
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
             None,
             true,
-            vec![
-                live_file_row(
-                    "01920000-0000-7000-8000-0000000000d2",
-                    "01920000-0000-7000-8000-0000000000b1",
-                    "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
-                ),
-                scoped_file,
-            ],
+            vec![live_file_row(
+                "01920000-0000-7000-8000-0000000000d2",
+                "01920000-0000-7000-8000-0000000000b1",
+                "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
+            )],
         )
         .await
-        .expect("same descriptor id in different file scopes should project");
+        .expect("file descriptor should project");
 
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 1);
         let file_id_column = batch
             .column(batch.schema().index_of("lixcol_file_id").unwrap())
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("lixcol_file_id should be string array");
-        let values = (0..batch.num_rows())
-            .map(|index| {
-                if file_id_column.is_null(index) {
-                    None
-                } else {
-                    Some(file_id_column.value(index).to_string())
-                }
-            })
-            .collect::<Vec<_>>();
-        assert!(values.contains(&None));
-        assert!(values.contains(&Some("01920000-0000-7000-8000-000000000342".to_string())));
+        assert_eq!(
+            file_id_column.value(0),
+            "01920000-0000-7000-8000-0000000000d2"
+        );
     }
 
     #[tokio::test]
-    async fn file_projection_reuses_loaded_blob_for_duplicate_blob_ref_keys() {
+    async fn file_projection_matches_blob_ref_by_descriptor_file_id() {
         let data = b"shared data".to_vec();
         let blob_hash = BlobHash::from_content(&data).to_hex();
         let blob_reader =
             Arc::new(StaticBlobReader::from_blobs(vec![data.clone()])) as Arc<dyn BlobDataReader>;
-        let mut scoped_file = live_file_row(
-            "01920000-0000-7000-8000-0000000000d2",
-            "01920000-0000-7000-8000-0000000000b1",
-            "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"scoped.md\"}",
-        );
-        scoped_file.file_id = Some("01920000-0000-7000-8000-000000000342".to_string());
         let batch = super::lix_file_record_batch(
             &super::lix_file_schema(),
             &blob_reader,
@@ -9770,7 +9751,6 @@ mod tests {
                     "01920000-0000-7000-8000-0000000000b1",
                     "{\"id\":\"01920000-0000-7000-8000-0000000000d2\",\"directory_id\":null,\"name\":\"root.md\"}",
                 ),
-                scoped_file,
                 live_blob_ref_row(
                     "01920000-0000-7000-8000-0000000000d2",
                     "01920000-0000-7000-8000-0000000000b1",
@@ -9781,14 +9761,14 @@ mod tests {
             ],
         )
         .await
-        .expect("duplicate blob-ref keys should project data for every descriptor");
+        .expect("blob ref should project data for its descriptor");
 
         let data_column = batch
             .column(batch.schema().index_of("data").unwrap())
             .as_any()
             .downcast_ref::<LargeBinaryArray>()
             .expect("data should be large binary array");
-        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(batch.num_rows(), 1);
         for index in 0..batch.num_rows() {
             assert!(!data_column.is_null(index));
             assert_eq!(data_column.value(index), data.as_slice());
@@ -11004,7 +10984,10 @@ mod tests {
             descriptor.entity_pk,
             Some(&uuid_pk("01920000-0000-7000-8000-0000000000d2"))
         );
-        assert_eq!(descriptor.file_id, None);
+        assert_eq!(
+            descriptor.file_id.map(crate::common::SharedStr::as_str),
+            Some("01920000-0000-7000-8000-0000000000d2")
+        );
         assert_eq!(descriptor.snapshot, None);
 
         let blob_ref = staged

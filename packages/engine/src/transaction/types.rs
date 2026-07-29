@@ -648,6 +648,11 @@ impl RawWriteBatch {
         self.slots[index].change_id = ordinal;
     }
 
+    pub(crate) fn set_file_id(&mut self, index: usize, file_id: Option<SharedStr>) {
+        let ordinal = self.intern_optional_string(file_id);
+        self.slots[index].file_id = ordinal;
+    }
+
     /// Retains rows in source order and compacts the aligned mutable columns.
     ///
     /// Dictionaries remain shared until more than half their slots are dead;

@@ -17,9 +17,7 @@ use crate::transaction::types::TransactionWriteRow;
 use crate::transaction::types::{PreparedRowFacts, RawWriteBatch, RawWriteRowRef, TransactionJson};
 
 pub(crate) const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-#[cfg(test)]
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
-#[cfg(test)]
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 
 /// Compact side columns produced while normalizing a row in place.
@@ -115,6 +113,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 row_index,
                 Some(TransactionJson::from_certified_shared_normalized_row_content(normalized)),
             );
+            canonicalize_descriptor_file_id(rows, row_index)?;
             return Ok(NormalizedRowFacts {
                 schema_plan_id,
                 facts: PreparedRowFacts {
@@ -136,6 +135,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
                 "certified replacement row is missing its proven entity identity",
             ));
         }
+        canonicalize_descriptor_file_id(rows, row_index)?;
         return Ok(NormalizedRowFacts {
             schema_plan_id,
             facts: PreparedRowFacts {
@@ -216,6 +216,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
     }
 
     rows.set_snapshot(row_index, normalized_snapshot);
+    canonicalize_descriptor_file_id(rows, row_index)?;
     Ok(NormalizedRowFacts {
         schema_plan_id,
         facts: PreparedRowFacts {
@@ -223,6 +224,37 @@ pub(crate) fn normalize_raw_write_row_in_place(
             requires_transaction_validation,
         },
     })
+}
+
+fn canonicalize_descriptor_file_id(
+    rows: &mut RawWriteBatch,
+    row_index: usize,
+) -> Result<(), LixError> {
+    let row = rows.row(row_index);
+    let file_id = match row.schema_key.as_str() {
+        FILE_DESCRIPTOR_SCHEMA_KEY => {
+            let entity_pk = row
+                .entity_pk
+                .expect("normalized row has an entity identity");
+            Some(
+                entity_pk
+                    .as_single_string_owned()
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_SCHEMA_VALIDATION,
+                            format!(
+                                "lix_file_descriptor identity must contain its file id: {error}"
+                            ),
+                        )
+                    })?
+                    .into(),
+            )
+        }
+        DIRECTORY_DESCRIPTOR_SCHEMA_KEY => None,
+        _ => return Ok(()),
+    };
+    rows.set_file_id(row_index, file_id);
+    Ok(())
 }
 
 fn validate_normalized_row_content(
@@ -897,6 +929,10 @@ mod tests {
         let file = normalize_test_row(file, &mut catalog, functions()).expect("normalize file");
         let file_snapshot = normalized_snapshot(&file);
         assert_eq!(file_snapshot["name"], "Cafe\u{301}.txt");
+        assert_eq!(
+            file.file_id.as_deref(),
+            Some("01920000-0000-7000-8000-0000000000c1")
+        );
 
         let directory = TransactionWriteRow {
             entity_pk: None,
@@ -906,6 +942,7 @@ mod tests {
                 "parent_id": null,
                 "name": "Cafe\u{301}",
             }))),
+            file_id: Some("must-be-cleared".into()),
             global: false,
             ..base_stage_row()
         };
@@ -913,6 +950,7 @@ mod tests {
             normalize_test_row(directory, &mut catalog, functions()).expect("normalize directory");
         let directory_snapshot = normalized_snapshot(&directory);
         assert_eq!(directory_snapshot["name"], "Cafe\u{301}");
+        assert_eq!(directory.file_id, None);
 
         let bidi = TransactionWriteRow {
             entity_pk: None,

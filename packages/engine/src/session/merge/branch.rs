@@ -1035,7 +1035,7 @@ where
         .map(|file_id| {
             Ok(TrackedStateKey {
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-                file_id: None,
+                file_id: Some(file_id.clone()),
                 entity_pk: EntityPk::uuid_from_canonical(file_id).map_err(|error| {
                     LixError::new(
                         LixError::CODE_INTERNAL_ERROR,
@@ -1872,7 +1872,7 @@ mod tests {
         MaterializedTrackedStateRow {
             entity_pk: EntityPk::single(file_id),
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_owned(),
-            file_id: None,
+            file_id: Some(file_id.to_string()),
             snapshot_content: Some(
                 json!({
                     "id": file_id,

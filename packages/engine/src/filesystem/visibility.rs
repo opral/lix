@@ -84,7 +84,10 @@ impl VisibleFilesystem {
                             format!("invalid lix_file_descriptor snapshot JSON: {error}"),
                         )
                     })?;
-                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                        row,
+                        snapshot.id.clone(),
+                    );
                     visible
                         .files_by_directory_id
                         .entry(snapshot.directory_id.map(|id| key.in_same_scope(&id)))

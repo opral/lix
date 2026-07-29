@@ -367,7 +367,10 @@ impl FilesystemPathIndex {
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    let key = FilesystemDescriptorKey::from_live_row_ref(row, snapshot.id.clone());
+                    let key = FilesystemDescriptorKey::from_file_descriptor_live_row_ref(
+                        row,
+                        snapshot.id.clone(),
+                    );
                     file_rows.push((
                         key,
                         FileRecord {
@@ -735,13 +738,22 @@ impl FilesystemPathIndex {
                 !entry.key.global()
                     && entry.key.branch_id() == row.branch_id.as_ref()
                     && entry.key.is_untracked() == row.untracked
-                    && entry.key.file_id() == row.file_id.as_deref()
+                    && entry.key.file_id()
+                        == if kind == FilesystemPathKind::File {
+                            None
+                        } else {
+                            row.file_id.as_deref()
+                        }
             })
         {
             return Ok(());
         }
 
-        let key = FilesystemDescriptorKey::from_live_row(row, descriptor_id);
+        let key = if kind == FilesystemPathKind::File {
+            FilesystemDescriptorKey::from_file_descriptor_live_row(row, descriptor_id)
+        } else {
+            FilesystemDescriptorKey::from_live_row(row, descriptor_id)
+        };
         let identity = FilesystemPathEntryIdentity {
             kind,
             key: key.clone(),

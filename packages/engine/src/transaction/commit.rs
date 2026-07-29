@@ -1443,10 +1443,7 @@ fn apply_lifecycle_tracked_snapshot_row(
     mut next: MaterializedTrackedStateRow,
     require_absence: bool,
 ) -> Result<(), LixError> {
-    if next.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-        && next.file_id.is_none()
-        && next.snapshot_content.is_none()
-    {
+    if next.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && next.snapshot_content.is_none() {
         let file_id = next.entity_pk.as_single_string_owned().map_err(|error| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -2722,10 +2719,8 @@ async fn stage_tracked_roots(
                 .iter()
                 .filter_map(|&row_index| {
                     let row = state_rows.row(row_index);
-                    (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
-                        && row.file_id.is_none()
-                        && row.snapshot.is_none())
-                    .then_some(row)
+                    (row.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY && row.snapshot.is_none())
+                        .then_some(row)
                 })
                 .map(|row| {
                     let delta = tracked_delta_from_state_row(row)?;
@@ -3181,7 +3176,7 @@ mod tests {
         let descriptor_delete = MaterializedTrackedStateRow {
             entity_pk: EntityPk::single("file-a"),
             schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-            file_id: None,
+            file_id: Some("file-a".to_string()),
             snapshot_content: None,
             metadata: None,
             deleted: true,
@@ -3252,7 +3247,7 @@ mod tests {
         let mut uncovered_descriptor_insert =
             tracked_branch_row(branch_id, "uncovered-descriptor-insert");
         uncovered_descriptor_insert.schema_key = "lix_file_descriptor".into();
-        uncovered_descriptor_insert.file_id = None;
+        uncovered_descriptor_insert.file_id = Some("certified-file".into());
         uncovered_descriptor_insert.entity_pk = EntityPk::single("certified-file");
 
         let rows = vec![
@@ -3288,18 +3283,11 @@ mod tests {
 
         assert_eq!(
             guards,
-            BTreeSet::from([
-                TrackedStateKey {
-                    schema_key: "lix_file_descriptor".to_string(),
-                    file_id: None,
-                    entity_pk: EntityPk::single("certified-file"),
-                },
-                TrackedStateKey {
-                    schema_key: "uncovered_schema".to_string(),
-                    file_id: Some("other-file".to_string()),
-                    entity_pk: EntityPk::single("uncovered-file"),
-                },
-            ]),
+            BTreeSet::from([TrackedStateKey {
+                schema_key: "uncovered_schema".to_string(),
+                file_id: Some("other-file".to_string()),
+                entity_pk: EntityPk::single("uncovered-file"),
+            }]),
             "only INSERT identities outside the certified file scope still need row-owned guards"
         );
     }
@@ -3328,6 +3316,11 @@ mod tests {
             schema_key: "uncovered_schema".to_string(),
             file_id: Some("other-file".to_string()),
             entity_pk: EntityPk::single("uncovered-file"),
+        }));
+        assert!(guards.contains(&TrackedStateKey {
+            schema_key: "lix_file_descriptor".to_string(),
+            file_id: Some("certified-file".to_string()),
+            entity_pk: EntityPk::single("certified-file"),
         }));
     }
 

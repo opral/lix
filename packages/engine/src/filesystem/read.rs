@@ -56,7 +56,13 @@ impl FilesystemIndex {
                                 "invalid lix_file_descriptor snapshot JSON: {error}"
                             ))
                         })?;
-                    file_rows.push((snapshot, scope));
+                    file_rows.push((
+                        snapshot,
+                        RowScope {
+                            file_id: None,
+                            ..scope
+                        },
+                    ));
                 }
                 BLOB_REF_SCHEMA_KEY => {
                     let snapshot: BlobRefSnapshot = serde_json::from_str(snapshot_content)
@@ -397,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn from_live_rows_resolves_directories_by_storage_scope() {
+    fn from_live_rows_resolves_directories_by_branch_scope() {
         let index = filesystem_index_from_rows(vec![
             directory_row(
                 "dir-shared",
@@ -407,19 +413,19 @@ mod tests {
                 "dir-shared",
                 DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                 r#"{"id":"dir-shared","parent_id":null,"name":"scoped"}"#,
-                "01920000-0000-7000-8000-0000000000a1",
+                "01920000-0000-7000-8000-0000000000b1",
                 false,
-                Some("01920000-0000-7000-8000-000000000342".to_string()),
+                None,
             ),
             file_row(
                 "01920000-0000-7000-8000-000000000142",
                 r#"{"id":"01920000-0000-7000-8000-000000000142","directory_id":"dir-shared","name":"root.txt"}"#,
             ),
             live_row_with_scope(
-                "file-scoped",
+                "01920000-0000-7000-8000-000000000342",
                 FILE_DESCRIPTOR_SCHEMA_KEY,
-                r#"{"id":"file-scoped","directory_id":"dir-shared","name":"scoped.txt"}"#,
-                "01920000-0000-7000-8000-0000000000a1",
+                r#"{"id":"01920000-0000-7000-8000-000000000342","directory_id":"dir-shared","name":"scoped.txt"}"#,
+                "01920000-0000-7000-8000-0000000000b1",
                 false,
                 Some("01920000-0000-7000-8000-000000000342".to_string()),
             ),
@@ -451,7 +457,14 @@ mod tests {
     }
 
     fn file_row(entity_pk: &str, snapshot_content: &str) -> MaterializedLiveStateRow {
-        live_row(entity_pk, FILE_DESCRIPTOR_SCHEMA_KEY, snapshot_content)
+        live_row_with_scope(
+            entity_pk,
+            FILE_DESCRIPTOR_SCHEMA_KEY,
+            snapshot_content,
+            "01920000-0000-7000-8000-0000000000a1",
+            false,
+            Some(entity_pk.to_string()),
+        )
     }
 
     fn live_row(

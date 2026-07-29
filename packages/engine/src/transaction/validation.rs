@@ -523,7 +523,8 @@ pub(crate) fn fresh_plugin_file_import_certificate(
 
         match row.schema_key.as_str() {
             FILE_DESCRIPTOR_SCHEMA_KEY => {
-                if row.file_id.is_some()
+                if row.file_id.map(crate::common::SharedStr::as_str)
+                    != Some(file_data.file_id.as_str())
                     || row.entity_pk.as_single_string_owned().ok().as_deref()
                         != Some(file_data.file_id.as_str())
                     || !filesystem_planner_validated_insert(&PreparedValidationRow::State(row))
@@ -934,7 +935,7 @@ async fn filesystem_namespace_domain_changed(
         .iter()
         .copied()
         .filter(|row| {
-            row.domain() == *domain
+            prepared_filesystem_row_is_in_domain(*row, domain)
                 && (row.schema_key() == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
                     || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY)
         })
@@ -1045,6 +1046,7 @@ fn staged_filesystem_namespace_domains(
                 || row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         })
         .map(|row| row.domain())
+        .map(|domain| Domain::any_file(domain.branch_id().to_string(), domain.untracked()))
         .collect()
 }
 
@@ -1084,6 +1086,10 @@ fn committed_filesystem_row_is_in_domain(
         && domain.contains_ref(row)
 }
 
+fn prepared_filesystem_row_is_in_domain(row: PreparedValidationRow<'_>, domain: &Domain) -> bool {
+    row.branch_id() == domain.branch_id() && row.untracked() == domain.untracked()
+}
+
 fn apply_staged_filesystem_namespace_rows(
     staged_rows: &[PreparedValidationRow<'_>],
     domain: &Domain,
@@ -1092,7 +1098,7 @@ fn apply_staged_filesystem_namespace_rows(
     for row in staged_rows {
         if (row.schema_key() != DIRECTORY_DESCRIPTOR_SCHEMA_KEY
             && row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY)
-            || row.domain() != *domain
+            || !prepared_filesystem_row_is_in_domain(*row, domain)
         {
             continue;
         }
@@ -1589,7 +1595,7 @@ impl PendingFileDescriptorIndex {
     fn from_rows(staged_rows: &[PreparedValidationRow<'_>]) -> Self {
         let mut index = Self::default();
         for row in staged_rows {
-            if row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY || row.file_id().is_some() {
+            if row.schema_key() != FILE_DESCRIPTOR_SCHEMA_KEY {
                 continue;
             }
             if row.entity_pk().as_single_string_owned().is_ok() {
@@ -1612,7 +1618,7 @@ impl PendingFileDescriptorIndex {
         let entity_pk = EntityPk::uuid_from_canonical(file_id).ok()?;
         self.by_identity
             .get(&DomainRowIdentity::in_domain(
-                domain.with_exact_file_scope(None),
+                domain.with_exact_file_scope(Some(file_id.to_string())),
                 FILE_DESCRIPTOR_SCHEMA_KEY,
                 entity_pk,
             ))
@@ -1678,7 +1684,7 @@ impl FileOwnerReferenceValidator {
         domain: &Domain,
         file_id: &str,
     ) -> Result<bool, LixError> {
-        let descriptor_domain = domain.with_exact_file_scope(None);
+        let descriptor_domain = domain.with_exact_file_scope(Some(file_id.to_string()));
         let key = FileOwnerDescriptorKey {
             domain: descriptor_domain.clone(),
             file_id: file_id.to_string(),
@@ -1716,7 +1722,7 @@ async fn committed_file_descriptor_exists_in_domain(
     Ok(row.snapshot_content().is_some()
         && row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
         && row.entity_pk() == &entity_pk
-        && row.file_id().is_none())
+        && row.file_id() == Some(file_id))
 }
 
 fn missing_file_owner_reference_error(
@@ -2045,7 +2051,7 @@ impl PendingConstraintIndexes {
             };
             let target = PendingForeignKeyReferenceTarget::Key(PendingForeignKeyTargetKey {
                 schema_key: foreign_key.referenced_schema.schema_key.clone(),
-                domain: row.domain(),
+                domain: foreign_key_target_domain(row, foreign_key),
                 pointer_group: foreign_key.referenced_properties.clone(),
                 value: local_value,
             });
@@ -2642,7 +2648,7 @@ fn validate_pending_normal_foreign_key(
 ) -> Result<Option<UnresolvedForeignKeyCheck>, LixError> {
     let key = PendingForeignKeyTargetKey {
         schema_key: foreign_key.referenced_schema.schema_key.clone(),
-        domain: row.domain(),
+        domain: foreign_key_target_domain(row, foreign_key),
         pointer_group: foreign_key.referenced_properties.clone(),
         value: local_value,
     };
@@ -2655,6 +2661,19 @@ fn validate_pending_normal_foreign_key(
         source_pointer_group: foreign_key.local_properties.clone(),
         target: UnresolvedForeignKeyTarget::Key(key),
     }))
+}
+
+fn foreign_key_target_domain(
+    row: PreparedValidationRow<'_>,
+    foreign_key: &ForeignKeyPlan,
+) -> Domain {
+    if row.schema_key() == FILE_DESCRIPTOR_SCHEMA_KEY
+        && foreign_key.referenced_schema.schema_key == DIRECTORY_DESCRIPTOR_SCHEMA_KEY
+    {
+        row.domain().with_exact_file_scope(None)
+    } else {
+        row.domain()
+    }
 }
 
 fn validate_pending_state_surface_foreign_key(
@@ -7711,7 +7730,7 @@ mod tests {
         );
         row.entity_pk =
             EntityPk::uuid_from_canonical(file_id).expect("fixture file ID should be a UUID");
-        row.file_id = None;
+        row.file_id = Some(file_id.into());
         row.branch_id = branch_id.into();
         row.global = branch_id == crate::GLOBAL_BRANCH_ID;
         row
