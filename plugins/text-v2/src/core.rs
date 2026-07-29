@@ -7,7 +7,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use lix_order_key::OrderKey;
 use lix_plugin_api_v2 as lix;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub(crate) const LINE_SCHEMA_KEY: &str = "git_text_line_v2";
 const GIT_TEXT_SCAN_BYTES: usize = 8_000;
@@ -93,7 +93,7 @@ impl Iterator for AllUpserts {
 
 impl ExactSizeIterator for AllUpserts {}
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LineSnapshot {
     id: String,
@@ -550,12 +550,36 @@ impl Line {
     }
 
     pub(crate) fn snapshot_bytes(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(&LineSnapshot {
-            id: self.id.clone(),
-            order_key: self.order_key.to_snapshot_string(),
-            content_base64: URL_SAFE_NO_PAD.encode(self.bytes.as_slice()),
-        })
-        .map_err(|error| format!("failed to serialize line snapshot: {error}"))
+        let id = serde_json::to_vec(&self.id)
+            .map_err(|error| format!("failed to serialize line ID: {error}"))?;
+        let order_key = serde_json::to_vec(&self.order_key.to_snapshot_string())
+            .map_err(|error| format!("failed to serialize line order key: {error}"))?;
+        let content_len = base64::encoded_len(self.bytes.len(), false)
+            .ok_or_else(|| "base64 line snapshot length overflow".to_owned())?;
+        let prefix_len = b"{\"id\":".len()
+            + id.len()
+            + b",\"order_key\":".len()
+            + order_key.len()
+            + b",\"content_base64\":\"".len();
+        let capacity = prefix_len
+            .checked_add(content_len)
+            .and_then(|length| length.checked_add(b"\"}".len()))
+            .ok_or_else(|| "line snapshot length overflow".to_owned())?;
+
+        let mut snapshot = Vec::with_capacity(capacity);
+        snapshot.extend_from_slice(b"{\"id\":");
+        snapshot.extend_from_slice(&id);
+        snapshot.extend_from_slice(b",\"order_key\":");
+        snapshot.extend_from_slice(&order_key);
+        snapshot.extend_from_slice(b",\"content_base64\":\"");
+        let content_start = snapshot.len();
+        snapshot.resize(content_start + content_len, 0);
+        let written = URL_SAFE_NO_PAD
+            .encode_slice(self.bytes.as_slice(), &mut snapshot[content_start..])
+            .map_err(|error| format!("failed to base64-encode line snapshot: {error}"))?;
+        snapshot.truncate(content_start + written);
+        snapshot.extend_from_slice(b"\"}");
+        Ok(snapshot)
     }
 
     fn from_snapshot(snapshot: &[u8]) -> Result<Self, String> {
