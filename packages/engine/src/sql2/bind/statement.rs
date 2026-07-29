@@ -108,6 +108,7 @@ pub(super) fn bind_insert_bound(
         insert.source.as_deref(),
         &mut params,
     )?;
+    let returning = bind_insert_returning(&table, insert.returning.as_ref(), &mut params)?;
     let conflict = bind_insert_conflict(insert.on.as_ref(), &table, &mut params)?;
     if conflict.is_some() {
         if !matches!(
@@ -139,7 +140,7 @@ pub(super) fn bind_insert_bound(
         predicate: BoundPredicate::True,
         assignments: Vec::new(),
         conflict,
-        returning: None,
+        returning,
         params: params.into_map(),
         branch_scope,
     })
@@ -274,6 +275,50 @@ fn bind_delete_returning(
     Ok(Some(BoundReturning { items }))
 }
 
+fn bind_insert_returning(
+    table: &BoundTable,
+    returning: Option<&Vec<SelectItem>>,
+    params: &mut ParamBinder,
+) -> Result<Option<BoundReturning>, LixError> {
+    let Some(returning) = returning else {
+        return Ok(None);
+    };
+    if !matches!(
+        table.surface.kind,
+        PublicSurfaceKind::Revert | PublicSurfaceKind::Apply | PublicSurfaceKind::CreateCheckpoint
+    ) {
+        return Err(super::error::unsupported(
+            "INSERT RETURNING is only supported for diff command sinks",
+        ));
+    }
+
+    let mut items = Vec::with_capacity(returning.len());
+    for item in returning {
+        let (sql_expr, output_name) = match item {
+            SelectItem::UnnamedExpr(expr) => (expr, "commit_id".to_string()),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, normalize_identifier(alias)),
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                return Err(super::error::unsupported(
+                    "diff command INSERT RETURNING only supports commit_id",
+                ));
+            }
+        };
+        let expr = bind_expr(table, sql_expr, params)?;
+        if !matches!(&expr, BoundExpr::Column(column) if column.name == "commit_id") {
+            return Err(super::error::unsupported(
+                "diff command INSERT RETURNING only supports commit_id",
+            ));
+        }
+        items.push(BoundReturningItem { expr, output_name });
+    }
+    if items.is_empty() {
+        return Err(super::error::unsupported(
+            "diff command INSERT RETURNING requires commit_id",
+        ));
+    }
+    Ok(Some(BoundReturning { items }))
+}
+
 fn reject_returning_wildcard_options(options: &WildcardAdditionalOptions) -> Result<(), LixError> {
     if options.opt_ilike.is_some()
         || options.opt_exclude.is_some()
@@ -318,11 +363,6 @@ fn reject_unsupported_insert_clauses(insert: &Insert) -> Result<(), LixError> {
     if insert.partitioned.is_some() || !insert.after_columns.is_empty() {
         return Err(super::error::unsupported(
             "partitioned INSERT is not supported",
-        ));
-    }
-    if insert.returning.is_some() {
-        return Err(super::error::unsupported(
-            "INSERT RETURNING is not supported",
         ));
     }
     if insert.replace_into {
@@ -2193,6 +2233,41 @@ mod tests {
                 output_name,
             }] if param.index == 2 && output_name == "marker"
         ));
+    }
+
+    #[test]
+    fn bind_statement_allows_only_commit_id_for_diff_command_insert_returning() {
+        let bound = bind_statement(
+            &parse_statement(
+                "INSERT INTO lix_revert (diff_id) \
+                 SELECT diff_id FROM lix_working_diff \
+                 RETURNING commit_id AS created_commit_id",
+            ),
+            &[],
+            "branch1",
+        )
+        .expect("diff command RETURNING commit_id should bind");
+        assert!(matches!(
+            bound
+                .returning
+                .expect("RETURNING should be bound")
+                .items
+                .as_slice(),
+            [BoundReturningItem {
+                expr: BoundExpr::Column(column),
+                output_name,
+            }] if column.name == "commit_id" && output_name == "created_commit_id"
+        ));
+
+        for sql in [
+            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING diff_id",
+            "INSERT INTO lix_revert (diff_id) SELECT diff_id FROM lix_working_diff RETURNING *",
+            "INSERT INTO lix_file (path) VALUES ('readme.md') RETURNING id",
+        ] {
+            let error = bind_statement(&parse_statement(sql), &[], "branch1")
+                .expect_err("unsupported INSERT RETURNING shape should fail");
+            assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL, "{sql}");
+        }
     }
 
     #[test]

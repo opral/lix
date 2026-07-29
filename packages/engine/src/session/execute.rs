@@ -2371,11 +2371,11 @@ async fn execute_prepared_transaction_write<StorageImpl>(
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
-    if let Some((command, query_sql)) = sql2::diff_command_query(&plan) {
-        let count = transaction
+    if let Some((command, query_sql, returning)) = sql2::diff_command_query(&plan) {
+        let outcome = transaction
             .execute_diff_command_query_owned(command, query_sql, params.to_vec())
             .await?;
-        return Ok(sql2::SqlWriteResult::affected(count));
+        return sql2::SqlWriteResult::diff_command(outcome, returning.as_ref());
     }
     sql2::execute_write_logical_plan_result_with_metadata(transaction, plan, params, metadata).await
 }

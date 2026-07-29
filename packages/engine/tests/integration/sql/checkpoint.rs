@@ -65,7 +65,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, change_kind \
+                "SELECT entity_pk, schema_key, diff_type \
                  FROM lix_working_diff ORDER BY schema_key, entity_pk",
             )
             .await,
@@ -78,7 +78,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, schema_key, change_kind \
+                "SELECT entity_pk, schema_key, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_pk = lix_json('[\"checkpoint-key\"]')",
@@ -211,7 +211,7 @@ simulation_test!(
              VALUES ('fake', '2026-01-01T00:00:00Z', 0)",
             "UPDATE lix_checkpoint SET created_at = 'fake'",
             "DELETE FROM lix_working_diff",
-            "UPDATE lix_working_diff_by_branch SET change_kind = 'fake'",
+            "UPDATE lix_working_diff_by_branch SET diff_type = 'fake'",
             "DELETE FROM lix_file_working_change",
             "UPDATE lix_directory_working_change_by_branch SET change_kind = 'fake'",
         ] {
@@ -265,7 +265,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT entity_pk, change_kind \
+                "SELECT entity_pk, diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY entity_pk",
@@ -286,7 +286,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT change_kind \
+                "SELECT diff_type \
                  FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_pk = lix_json('[\"working-removed\"]')",

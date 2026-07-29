@@ -77,13 +77,12 @@ impl TableSpec for DiffCommandSpec {
             Box::pin(async move {
                 let diff_ids = diff_ids_from_batches(&batches)?;
                 if diff_ids.is_empty() {
-                    return Err(DataFusionError::Execution(
-                        "diff command selection is empty".to_string(),
-                    ));
+                    return Ok(0);
                 }
                 write_ctx
                     .execute_diff_command(command, diff_ids)
                     .await
+                    .map(|outcome| outcome.rows_affected)
                     .map_err(lix_error_to_datafusion_error)
             })
         })))
@@ -91,11 +90,10 @@ impl TableSpec for DiffCommandSpec {
 }
 
 fn command_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "diff_id",
-        DataType::Utf8,
-        false,
-    )]))
+    Arc::new(Schema::new(vec![
+        Field::new("diff_id", DataType::Utf8, false),
+        Field::new("commit_id", DataType::Utf8, false),
+    ]))
 }
 
 fn diff_ids_from_batches(batches: &[RecordBatch]) -> Result<Vec<String>> {

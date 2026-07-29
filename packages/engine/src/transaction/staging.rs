@@ -1055,6 +1055,23 @@ impl TransactionWriteBuffer {
         Ok(())
     }
 
+    pub(crate) fn commit_id_for_branch(
+        &self,
+        branch_id: &str,
+    ) -> Result<Option<CommitId>, LixError> {
+        Ok(self
+            .commit_change_refs_by_branch
+            .lock()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "failed to acquire transaction staged commit change refs lock",
+                )
+            })?
+            .get(branch_id)
+            .map(|change_refs| change_refs.commit_id))
+    }
+
     /// Overrides the normal branch-head first parent for a staged commit.
     ///
     /// Checkpoint compaction uses the previous checkpoint as the new commit's

@@ -28,6 +28,45 @@ impl SqlWriteResult {
             returning: Some(returning),
         }
     }
+
+    pub(crate) fn diff_command(
+        outcome: crate::sql2::DiffCommandOutcome,
+        returning: Option<&crate::sql2::bind::write::BoundReturning>,
+    ) -> Result<Self, crate::LixError> {
+        let Some(returning) = returning else {
+            return Ok(Self::affected(outcome.rows_affected));
+        };
+        let rows = match outcome.commit_id {
+            Some(commit_id) => (0..outcome.rows_affected)
+                .map(|_| {
+                    returning
+                        .items
+                        .iter()
+                        .map(|_| crate::Value::Text(commit_id.clone()))
+                        .collect()
+                })
+                .collect(),
+            None if outcome.rows_affected == 0 => Vec::new(),
+            None => {
+                return Err(crate::LixError::new(
+                    crate::LixError::CODE_INTERNAL_ERROR,
+                    "diff command staged rows without a commit ID",
+                ));
+            }
+        };
+        Ok(Self::returning(
+            outcome.rows_affected,
+            SqlQueryResult {
+                columns: returning
+                    .items
+                    .iter()
+                    .map(|item| item.output_name.clone())
+                    .collect(),
+                rows,
+                notices: Vec::new(),
+            },
+        ))
+    }
 }
 
 pub(crate) use datafusion::{

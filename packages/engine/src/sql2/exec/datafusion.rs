@@ -957,12 +957,16 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
         .map_err(datafusion_error_to_lix_error)?;
     let table_schema = table.schema();
     let state = session.state();
-    let returning = datafusion_delete_returning(
-        &session,
-        table_schema.as_ref(),
-        plan.bound.returning.as_ref(),
-        params,
-    )?;
+    let returning = if plan.bound.op == BoundWriteOp::Delete {
+        datafusion_delete_returning(
+            &session,
+            table_schema.as_ref(),
+            plan.bound.returning.as_ref(),
+            params,
+        )?
+    } else {
+        None
+    };
 
     let exec = match plan.bound.op {
         BoundWriteOp::Insert => {
@@ -1057,6 +1061,17 @@ pub(crate) async fn execute_datafusion_write_logical_plan(
     let result =
         query_result_from_batches(&[Field::new("count", DataType::UInt64, false)], &batches)?;
     let rows_affected = affected_rows_from_query_result(result)?;
+    if matches!(plan.bound.target, BoundWriteTarget::DiffCommand(_)) {
+        let outcome = crate::sql2::DiffCommandOutcome {
+            rows_affected,
+            commit_id: if rows_affected == 0 {
+                None
+            } else {
+                ctx.staged_commit_id(ctx.active_branch_id())?
+            },
+        };
+        return SqlWriteResult::diff_command(outcome, plan.bound.returning.as_ref());
+    }
     match returning {
         Some(returning) => {
             let batch = returning
@@ -2671,6 +2686,21 @@ mod tests {
                 .push(CapturedStageWrite { rows });
             Ok(TransactionWriteOutcome { count })
         }
+
+        async fn execute_diff_command(
+            &mut self,
+            _command: crate::sql2::DiffCommand,
+            diff_ids: Vec<String>,
+        ) -> Result<crate::sql2::DiffCommandOutcome, LixError> {
+            Ok(crate::sql2::DiffCommandOutcome {
+                rows_affected: diff_ids.len() as u64,
+                commit_id: (!diff_ids.is_empty()).then(|| "commit-diff-command".to_string()),
+            })
+        }
+
+        fn staged_commit_id(&self, _branch_id: &str) -> Result<Option<String>, LixError> {
+            Ok(Some("commit-diff-command".to_string()))
+        }
     }
 
     #[async_trait]
@@ -2897,6 +2927,47 @@ mod tests {
                 .deltas
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn diff_command_returning_executes_through_datafusion() {
+        let mut ctx = DummySqlWriteExecutionContext {
+            active_branch_id: "01920000-0000-7000-8000-0000000000a1",
+            blob_reader: Arc::new(StaticBlobReader { bytes: Vec::new() }),
+            live_state: Arc::new(CapturingRowsLiveStateReader {
+                rows: Vec::new(),
+                requests: Arc::new(Mutex::new(Vec::new())),
+            }),
+            staged_writes: Arc::new(Mutex::new(CapturingStagedWrites::default())),
+            schema_definitions: Vec::new(),
+        };
+        let plan = create_write_logical_plan(
+            &mut ctx,
+            "INSERT INTO lix_revert (diff_id) \
+             SELECT diff_id FROM VALUES ('d1.test') AS selected(diff_id) \
+             RETURNING commit_id",
+        )
+        .await
+        .expect("diff command RETURNING should plan");
+        let (result, path) = crate::sql2::execute_write_logical_plan_with_mode_and_trace_result(
+            &mut ctx,
+            plan,
+            &[],
+            WriteExecutorMode::ForceDataFusion,
+        )
+        .await
+        .expect("diff command RETURNING should execute through DataFusion");
+
+        assert_eq!(path, WriteExecutorPath::DataFusion);
+        assert_eq!(result.rows_affected, 1);
+        assert_eq!(
+            result.returning,
+            Some(crate::SqlQueryResult {
+                columns: vec!["commit_id".to_string()],
+                rows: vec![vec![Value::Text("commit-diff-command".to_string())]],
+                notices: Vec::new(),
+            })
         );
     }
 

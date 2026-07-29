@@ -169,7 +169,7 @@ where
                             entity_pk: entry.identity.entity_pk().as_json_array_text(),
                             schema_key: entry.identity.schema_key().to_owned(),
                             file_id: entry.identity.file_id().map(str::to_owned),
-                            change_kind: match entry.kind {
+                            diff_type: match entry.kind {
                                 TrackedStateDiffKind::Added => "added",
                                 TrackedStateDiffKind::Modified => "modified",
                                 TrackedStateDiffKind::Removed => "removed",
@@ -242,7 +242,7 @@ fn diff_schema() -> SchemaRef {
         json_field("entity_pk", false),
         Field::new("schema_key", DataType::Utf8, false),
         Field::new("file_id", DataType::Utf8, true),
-        Field::new("change_kind", DataType::Utf8, false),
+        Field::new("diff_type", DataType::Utf8, false),
         Field::new("before_change_id", DataType::Utf8, true),
         Field::new("after_change_id", DataType::Utf8, true),
     ]))
@@ -253,7 +253,7 @@ struct DiffSqlRow {
     entity_pk: Result<String, LixError>,
     schema_key: String,
     file_id: Option<String>,
-    change_kind: &'static str,
+    diff_type: &'static str,
     before_change_id: Option<String>,
     after_change_id: Option<String>,
 }
@@ -270,7 +270,7 @@ static DIFF_COLS: ColumnTable<DiffSqlRow> = ColumnTable {
         ),
         ("schema_key", Col::Utf8(|row| Some(&row.schema_key))),
         ("file_id", Col::Utf8(|row| row.file_id.as_deref())),
-        ("change_kind", Col::Utf8(|row| Some(row.change_kind))),
+        ("diff_type", Col::Utf8(|row| Some(row.diff_type))),
         (
             "before_change_id",
             Col::Utf8(|row| row.before_change_id.as_deref()),

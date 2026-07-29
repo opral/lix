@@ -43,7 +43,7 @@ async fn main() -> Result<(), LixError> {
 
     let working = lix
         .execute(
-            "SELECT entity_pk, schema_key, change_kind
+            "SELECT entity_pk, schema_key, diff_type
              FROM lix_working_diff",
             &[],
         )
@@ -52,8 +52,8 @@ async fn main() -> Result<(), LixError> {
     for row in working.rows() {
         let entity_pk = row.get::<serde_json::Value>("entity_pk")?;
         let schema_key = row.get::<String>("schema_key")?;
-        let change_kind = row.get::<String>("change_kind")?;
-        println!("{change_kind} {schema_key} {entity_pk}");
+        let diff_type = row.get::<String>("diff_type")?;
+        println!("{diff_type} {schema_key} {entity_pk}");
     }
 
     let checkpoint = lix.create_checkpoint().await?;
@@ -101,7 +101,7 @@ Checkpointing has eight read-only SQL surfaces:
 
 | Surface | Scope | Columns |
 | :-- | :-- | :-- |
-| `lix_working_diff` | Active branch | `diff_id`, `entity_pk`, `schema_key`, `file_id`, `change_kind`, `before_change_id`, `after_change_id` |
+| `lix_working_diff` | Active branch | `diff_id`, `entity_pk`, `schema_key`, `file_id`, `diff_type`, `before_change_id`, `after_change_id` |
 | `lix_working_diff_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
 | `lix_file_working_change` | Active branch | `id`, `path`, `previous_path`, `change_kind` |
 | `lix_file_working_change_by_branch` | All branches | The same columns plus `lixcol_branch_id` |
@@ -114,7 +114,7 @@ Use the unqualified surfaces for the common active-branch workflow. Use their
 `_by_branch` counterparts to inspect multiple branches in one query;
 `lixcol_branch_id` identifies the branch represented by each row.
 
-`change_kind` is `added`, `modified`, or `removed`. Working changes compare the
+`diff_type` is `added`, `modified`, or `removed`. Working changes compare the
 current branch head with that branch's newest checkpoint. Creating a checkpoint
 makes the current head the new baseline, so `lix_working_diff` is empty until
 another tracked change is committed.
