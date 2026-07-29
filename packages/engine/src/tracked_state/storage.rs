@@ -56,8 +56,12 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = Storag
     StorageSpaceId(0x0004_001a),
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
 );
+/// Keep every high-volume packed-history plane below the live-row spaces
+/// (`0x0004_001b..=0x0004_001d`). Backends order the space prefix first, so a
+/// locator above those spaces makes each mixed manifest/locator SST overlap
+/// unrelated live-state point reads.
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0004_0021),
+    StorageSpaceId(0x0004_0018),
     TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
 );
 
@@ -2804,6 +2808,21 @@ mod tests {
             metadata,
             origin_key,
             authored: true,
+        }
+    }
+
+    #[test]
+    fn packed_history_spaces_do_not_span_the_live_state_key_range() {
+        const FIRST_LIVE_STATE_SPACE: [u8; 4] = 0x0004_001b_u32.to_be_bytes();
+        for space in [
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        ] {
+            assert!(
+                space.physical_prefix() < FIRST_LIVE_STATE_SPACE,
+                "{space} would make packed-history SSTs overlap live-state keys"
+            );
         }
     }
 
