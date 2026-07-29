@@ -11,7 +11,7 @@ use lix_engine::storage::{
     WriteOptions,
 };
 use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 use tempfile::TempDir;
 
 const BACKENDS: &[Backend] = &[Backend::Rocks, Backend::Slate];
@@ -42,6 +42,23 @@ enum Operation {
     DuplicateRejected,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum Lifecycle {
+    Visible,
+    WalFlushed,
+    MemtableFlushed,
+}
+
+impl Display for Lifecycle {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Visible => formatter.write_str("visible"),
+            Self::WalFlushed => formatter.write_str("wal_flushed"),
+            Self::MemtableFlushed => formatter.write_str("memtable_flushed"),
+        }
+    }
+}
+
 impl Display for Operation {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -68,6 +85,8 @@ async fn run() {
         DEFAULT_SEED_BATCH_COMMITS,
     )
     .max(1);
+    let lifecycle = env_lifecycle();
+    let settle_ms = env_usize("LIX_CHANGELOG_HISTORY_SETTLE_MS", 0);
 
     for &backend in BACKENDS {
         if !selected("LIX_CHANGELOG_HISTORY_BACKENDS", &backend.to_string()) {
@@ -85,6 +104,8 @@ async fn run() {
                     warmups,
                     samples,
                     seed_batch_commits,
+                    lifecycle,
+                    settle_ms,
                 )
                 .await;
             }
@@ -99,14 +120,24 @@ async fn run_case(
     warmups: usize,
     samples: usize,
     seed_batch_commits: usize,
+    lifecycle: Lifecycle,
+    settle_ms: usize,
 ) {
     let mut fixture = Fixture::new(backend, history_commits, seed_batch_commits).await;
+    fixture.apply_lifecycle(lifecycle).await;
+    tokio::time::sleep(Duration::from_millis(
+        settle_ms
+            .try_into()
+            .expect("settle milliseconds should fit in u64"),
+    ))
+    .await;
     for _ in 0..warmups {
         let append = fixture.prepare(operation);
         black_box(fixture.execute(operation, append).await);
     }
 
     fixture.reset_io();
+    let physical_io_before = fixture.physical_io();
     let mut stage_timings = Vec::with_capacity(samples);
     let mut commit_timings = Vec::with_capacity(samples);
     let mut total_timings = Vec::with_capacity(samples);
@@ -119,6 +150,7 @@ async fn run_case(
         commit_timings.push(timing.commit_elapsed);
     }
     let io = fixture.io();
+    let physical_io = fixture.physical_io().saturating_sub(physical_io_before);
     stage_timings.sort_unstable();
     commit_timings.sort_unstable();
     total_timings.sort_unstable();
@@ -127,13 +159,19 @@ async fn run_case(
 
     println!(
         "changelog_history_append,backend={backend},operation={operation},history_commits={history_commits},\
-         seed_batch_commits={seed_batch_commits},warmups={warmups},samples={samples},\
+         seed_batch_commits={seed_batch_commits},lifecycle={lifecycle},settle_ms={settle_ms},\
+         warmups={warmups},samples={samples},\
          stage_p50_us={},stage_p95_us={},stage_p99_us={},stage_mean_us={},\
          commit_p50_us={},commit_p95_us={},commit_p99_us={},commit_mean_us={},\
          total_p50_us={},total_p95_us={},total_p99_us={},total_mean_us={},\
          get_many_calls_per_op={},get_many_keys_per_op={},\
          scan_calls_per_op={},scan_rows_per_op={},scan_value_bytes_per_op={},\
          put_batches_per_op={},puts_per_op={},write_bytes_per_op={},\
+         physical_read_objects={},physical_read_bytes={},\
+         physical_manifest_read_objects={},physical_manifest_read_bytes={},\
+         physical_compacted_read_objects={},physical_compacted_read_bytes={},\
+         physical_other_read_objects={},physical_other_read_bytes={},\
+         physical_reader_read_requests={},physical_main_read_requests={},\
          expected_seed_commit_change_id_index_mapping_rows={}",
         micros(percentile(&stage_timings, 50, 100)),
         micros(percentile(&stage_timings, 95, 100)),
@@ -155,6 +193,16 @@ async fn run_case(
         io.put_batches / sample_count,
         io.puts / sample_count,
         io.write_bytes / sample_count,
+        physical_io.read_objects,
+        physical_io.read_bytes,
+        physical_io.manifest.read_objects,
+        physical_io.manifest.read_bytes,
+        physical_io.compacted.read_objects,
+        physical_io.compacted.read_bytes,
+        physical_io.other.read_objects,
+        physical_io.other.read_bytes,
+        physical_io.reader.read_requests,
+        physical_io.main.read_requests,
         expected_seed_index_mapping_rows,
     );
 }
@@ -193,6 +241,17 @@ fn env_usizes(name: &str, default: &[usize]) -> Vec<usize> {
         default.to_vec()
     } else {
         values
+    }
+}
+
+fn env_lifecycle() -> Lifecycle {
+    match std::env::var("LIX_CHANGELOG_HISTORY_LIFECYCLE").as_deref() {
+        Ok("wal_flushed") => Lifecycle::WalFlushed,
+        Ok("memtable_flushed") => Lifecycle::MemtableFlushed,
+        Ok("visible") | Err(_) => Lifecycle::Visible,
+        Ok(value) => panic!(
+            "LIX_CHANGELOG_HISTORY_LIFECYCLE must be visible, wal_flushed, or memtable_flushed; got {value}"
+        ),
     }
 }
 
@@ -365,8 +424,10 @@ where
     S: Storage + Clone,
 {
     store: changelog_bench::BenchStore<CountingStorage<S>>,
+    storage: S,
     _temp_dir: TempDir,
     stats: Arc<Mutex<IoStats>>,
+    physical_io: Option<SlateDBIoCounters>,
     seed_index_mapping_rows: u64,
     history_commit_change_id: String,
     version: u64,
@@ -381,7 +442,9 @@ where
         temp_dir: TempDir,
         history_commits: usize,
         seed_batch_commits: usize,
+        physical_io: Option<SlateDBIoCounters>,
     ) -> Self {
+        let lifecycle_storage = storage.clone();
         let (storage, stats) = CountingStorage::new(storage);
         let history_name = "changelog-history";
         let first_batch_name = format!("{history_name}-batch-0");
@@ -415,8 +478,10 @@ where
         *stats.lock().expect("io stats mutex") = IoStats::default();
         Self {
             store,
+            storage: lifecycle_storage,
             _temp_dir: temp_dir,
             stats,
+            physical_io,
             seed_index_mapping_rows: history_commits
                 .try_into()
                 .expect("history commit count should fit in u64"),
@@ -476,6 +541,12 @@ where
     fn expected_seed_index_mapping_rows(&self) -> u64 {
         self.seed_index_mapping_rows
     }
+
+    fn physical_io(&self) -> SlateDBIoSnapshot {
+        self.physical_io
+            .as_ref()
+            .map_or_else(SlateDBIoSnapshot::default, SlateDBIoCounters::snapshot)
+    }
 }
 
 enum Fixture {
@@ -494,18 +565,48 @@ impl Fixture {
                     temp_dir,
                     history_commits,
                     seed_batch_commits,
+                    None,
                 )
                 .await,
             ),
-            Backend::Slate => Self::Slate(
-                BackendFixture::create(
-                    SlateDB::open(&database_path).expect("open benchmark SlateDB"),
-                    temp_dir,
-                    history_commits,
-                    seed_batch_commits,
+            Backend::Slate => {
+                let physical_io = SlateDBIoCounters::default();
+                Self::Slate(
+                    BackendFixture::create(
+                        SlateDB::open_with_io_counters(&database_path, physical_io.clone())
+                            .expect("open benchmark SlateDB"),
+                        temp_dir,
+                        history_commits,
+                        seed_batch_commits,
+                        Some(physical_io),
+                    )
+                    .await,
                 )
-                .await,
-            ),
+            }
+        }
+    }
+
+    async fn apply_lifecycle(&self, lifecycle: Lifecycle) {
+        match (self, lifecycle) {
+            (_, Lifecycle::Visible) => {}
+            (Self::Rocks(fixture), Lifecycle::WalFlushed) => fixture
+                .storage
+                .flush_wal_for_diagnostics()
+                .expect("flush changelog-history RocksDB WAL"),
+            (Self::Rocks(fixture), Lifecycle::MemtableFlushed) => fixture
+                .storage
+                .flush()
+                .expect("flush changelog-history RocksDB memtable"),
+            (Self::Slate(fixture), Lifecycle::WalFlushed) => fixture
+                .storage
+                .flush()
+                .await
+                .expect("flush changelog-history SlateDB WAL"),
+            (Self::Slate(fixture), Lifecycle::MemtableFlushed) => fixture
+                .storage
+                .flush_memtable_for_diagnostics()
+                .await
+                .expect("flush changelog-history SlateDB memtable"),
         }
     }
 
@@ -545,6 +646,13 @@ impl Fixture {
         match self {
             Self::Rocks(fixture) => fixture.expected_seed_index_mapping_rows(),
             Self::Slate(fixture) => fixture.expected_seed_index_mapping_rows(),
+        }
+    }
+
+    fn physical_io(&self) -> SlateDBIoSnapshot {
+        match self {
+            Self::Rocks(fixture) => fixture.physical_io(),
+            Self::Slate(fixture) => fixture.physical_io(),
         }
     }
 }
