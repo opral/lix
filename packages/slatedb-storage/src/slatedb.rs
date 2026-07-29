@@ -1020,9 +1020,21 @@ impl SlateDB {
     pub async fn flush(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
         self.worker.wait_for_reclamation().await?;
-        self.worker
-            .call(|db| async move { db.flush().await.map_err(slatedb_error) })
-            .await
+        let snapshot_sequence = self
+            .worker
+            .call(|db| async move {
+                db.flush().await.map_err(slatedb_error)?;
+                db.snapshot()
+                    .await
+                    .map(|snapshot| snapshot.seq())
+                    .map_err(slatedb_error)
+            })
+            .await?;
+        drop(
+            self.write_pipeline
+                .capture_with_worker(self.worker.clone(), snapshot_sequence),
+        );
+        self.worker.wait_for_reclamation().await
     }
 
     /// Forces the active and immutable memtables into SSTs for storage-layout
@@ -1036,15 +1048,25 @@ impl SlateDB {
     pub async fn flush_memtable_for_diagnostics(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
         self.worker.wait_for_reclamation().await?;
-        self.worker
+        let snapshot_sequence = self
+            .worker
             .call(|db| async move {
                 db.flush_with_options(FlushOptions {
                     flush_type: FlushType::MemTable,
                 })
                 .await
-                .map_err(slatedb_error)
+                .map_err(slatedb_error)?;
+                db.snapshot()
+                    .await
+                    .map(|snapshot| snapshot.seq())
+                    .map_err(slatedb_error)
             })
-            .await
+            .await?;
+        drop(
+            self.write_pipeline
+                .capture_with_worker(self.worker.clone(), snapshot_sequence),
+        );
+        self.worker.wait_for_reclamation().await
     }
 }
 
@@ -1771,9 +1793,7 @@ impl StorageWrite for SlateDBWrite {
             drop(writer_permit);
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
-                let reclaimer = worker.publication_reclaimer();
-                worker
-                    .spawn(move |db| drain_write_queue(db, task_pipeline, point_cache, reclaimer));
+                worker.spawn(move |db| drain_write_queue(db, task_pipeline, point_cache));
             }
 
             // The writer gate protects precondition evaluation plus publication
@@ -1794,12 +1814,7 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
-async fn drain_write_queue(
-    db: Arc<Db>,
-    pipeline: WritePipeline,
-    point_cache: SnapshotPointCache,
-    reclaimer: PublicationReclaimer,
-) {
+async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: SnapshotPointCache) {
     loop {
         let writes = {
             let mut state = pipeline
@@ -1860,20 +1875,6 @@ async fn drain_write_queue(
                     .store(*sequence, Ordering::Release);
             }
         }
-        let retired = {
-            let mut state = pipeline
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            result.as_ref().map_or_else(
-                |_| Vec::new(),
-                |sequence| {
-                    state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(*sequence);
-                    cleanup_publications(&mut state, *sequence)
-                },
-            )
-        };
-        reclaimer.defer(retired);
         for write in writes {
             if let Ok(sequence) = &result {
                 write.completion.complete(Ok(*sequence));

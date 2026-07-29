@@ -1905,6 +1905,15 @@ fn write_target_table_name(plan: &LogicalWritePlan) -> Result<String, LixError> 
             Ok("lix_directory_by_branch".to_string())
         }
         BoundWriteTarget::Branch => Ok("lix_branch".to_string()),
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Revert) => {
+            Ok("lix_revert".to_string())
+        }
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::Apply) => {
+            Ok("lix_apply".to_string())
+        }
+        BoundWriteTarget::DiffCommand(crate::sql2::DiffCommand::CreateCheckpoint) => {
+            Ok("lix_create_checkpoint".to_string())
+        }
         BoundWriteTarget::Entity(_) => Err(LixError::new(
             LixError::CODE_UNSUPPORTED_SQL,
             "sql2 DataFusion reference writer does not support this entity write",
@@ -2835,11 +2844,14 @@ mod tests {
         assert_eq!(
             table_names,
             vec![
+                "lix_apply",
                 "lix_branch",
+                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_directory_by_branch",
                 "lix_file",
                 "lix_file_by_branch",
+                "lix_revert",
             ]
         );
     }

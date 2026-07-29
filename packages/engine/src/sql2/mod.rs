@@ -33,7 +33,7 @@ mod write_normalization;
 pub(crate) use bind::bind_statement;
 pub(crate) use bind::{
     BoundStatementRoute, bind_read_statement, bind_statement_route, bind_statement_with_catalog,
-    bind_table_function_params, statement_has_durable_runtime_function,
+    statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::PublicCatalog;
 pub(crate) use context::{
