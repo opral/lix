@@ -839,8 +839,8 @@ mod tests {
     };
     use crate::tracked_state::{
         TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
-        load_change_record_by_id, scan_commit_delta_inventory, stage_change_locators,
-        stage_commit_deltas,
+        load_change_record_by_id, scan_change_records_from_commit_deltas,
+        scan_commit_delta_inventory, stage_change_locators, stage_commit_deltas,
     };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
@@ -1237,7 +1237,10 @@ mod tests {
             .await
             .expect("authority GC changelog fixture should stage");
         drop(writer);
-        let live_deltas = commit_delta_refs(live_parent, std::slice::from_ref(&live_member));
+        let mut live_deltas = commit_delta_refs(live_parent, std::slice::from_ref(&live_member));
+        // The surviving copy is a merge/checkpoint selection. Once the
+        // original owner dies, GC promotes it through locator relocation.
+        live_deltas[0].authored = false;
         stage_commit_deltas(&mut writes, &live_deltas).expect("live packed member should stage");
         let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
         let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
@@ -1316,6 +1319,19 @@ mod tests {
                 .await
                 .expect("dead locator lookup should succeed")
                 .is_none()
+        );
+        let canonical_changes = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("post-GC packed changes should stream");
+        assert!(
+            canonical_changes
+                .iter()
+                .any(|change| change.change_id == live_member.change_id)
+        );
+        assert!(
+            canonical_changes
+                .iter()
+                .all(|change| change.change_id != dead_only_member.change_id)
         );
         let inventory = scan_commit_delta_inventory(&read)
             .await
@@ -1538,6 +1554,7 @@ mod tests {
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                authored: true,
             })
             .collect()
     }

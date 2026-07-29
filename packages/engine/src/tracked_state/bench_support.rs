@@ -131,10 +131,14 @@ where
             .await
             .expect("begin packed-history scan"),
     );
-    super::storage::scan_change_records_from_commit_deltas(&read)
-        .await
-        .expect("scan packed history")
-        .len()
+    let mut count = 0usize;
+    super::storage::visit_change_records_from_commit_deltas(&read, |_| {
+        count += 1;
+        Ok(())
+    })
+    .await
+    .expect("scan packed history");
+    count
 }
 
 pub async fn load_packed_change<StorageImpl>(
@@ -229,6 +233,7 @@ impl PackedHistoryDelta {
             snapshot: crate::json_store::JsonSlotRef::None,
             metadata: crate::json_store::JsonSlotRef::None,
             origin_key: None,
+            authored: true,
         }
     }
 }

@@ -698,6 +698,7 @@ fn tracked_commit_delta_from_state_row(
             crate::transaction::types::StageJson::slot_ref,
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
+        authored: true,
     })
 }
 
@@ -742,6 +743,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         snapshot: record.snapshot.as_ref_slot(),
         metadata: record.metadata.as_ref_slot(),
         origin_key: record.origin_key.as_deref(),
+        authored: false,
     })
 }
 

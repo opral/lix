@@ -60,6 +60,7 @@ pub(crate) struct TrackedStateCommitDeltaRef<'a> {
     pub(crate) snapshot: crate::json_store::JsonSlotRef<'a>,
     pub(crate) metadata: crate::json_store::JsonSlotRef<'a>,
     pub(crate) origin_key: Option<&'a str>,
+    pub(crate) authored: bool,
 }
 
 /// One ordered tracked-root mutation with its insert-collision contract.

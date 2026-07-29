@@ -257,6 +257,7 @@ pub(crate) async fn stage_tracked_root_from_materialized(
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                authored: true,
             }
         })
         .collect::<Vec<_>>();
@@ -334,6 +335,7 @@ pub(crate) async fn stage_rootless_tracked_commit_from_materialized(
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                authored: true,
             }
         })
         .collect::<Vec<_>>();
@@ -407,6 +409,7 @@ pub(crate) async fn stage_tracked_root_from_materialized_with_parents(
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                authored: true,
             }
         })
         .collect::<Vec<_>>();
