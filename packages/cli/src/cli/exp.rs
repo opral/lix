@@ -1,4 +1,4 @@
-use clap::{Args, Subcommand, ValueHint, value_parser};
+use clap::{Args, Subcommand, ValueEnum, ValueHint, value_parser};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -9,8 +9,38 @@ pub struct ExpCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ExpSubcommand {
-    /// Replay Git history into a RocksDB-backed Lix database.
+    /// Replay Git history into a storage-backed Lix database.
     GitReplay(ExpGitReplayArgs),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GitReplayStorage {
+    Rocksdb,
+    Slatedb,
+}
+
+impl GitReplayStorage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rocksdb => "rocksdb",
+            Self::Slatedb => "slatedb",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum GitReplayPlugins {
+    All,
+    None,
+}
+
+impl GitReplayPlugins {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -19,9 +49,17 @@ pub struct ExpGitReplayArgs {
     #[arg(long, value_hint = ValueHint::DirPath)]
     pub repo_path: PathBuf,
 
-    /// Empty output directory for the replayed RocksDB database.
+    /// Empty output directory for the replayed database.
     #[arg(long, value_hint = ValueHint::DirPath)]
-    pub output_rocksdb_path: PathBuf,
+    pub output_path: PathBuf,
+
+    /// Storage adapter used for the replay.
+    #[arg(long, value_enum, default_value_t = GitReplayStorage::Rocksdb)]
+    pub storage: GitReplayStorage,
+
+    /// Install all bundled semantic plugins or run the no-plugin control.
+    #[arg(long, value_enum, default_value_t = GitReplayPlugins::All)]
+    pub plugins: GitReplayPlugins,
 
     /// One branch or ref whose first-parent history will be replayed.
     #[arg(long, default_value = "main")]
