@@ -1237,7 +1237,7 @@ test("beginTransaction preserves handle after failed statement", async () => {
 			"SELECT id FROM lix_file_history('one', 'two')",
 		),
 	).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_SQL",
+		code: "LIX_PARSE_ERROR",
 	});
 	await tx.rollback();
 
@@ -1268,7 +1268,7 @@ test("beginTransaction can continue after failed statement", async () => {
 			"SELECT id FROM lix_file_history('one', 'two')",
 		),
 	).rejects.toMatchObject({
-		code: "LIX_UNSUPPORTED_SQL",
+		code: "LIX_PARSE_ERROR",
 	});
 	await tx.execute(
 		"INSERT INTO crm_task (id, title, done, meta) VALUES ($1, $2, $3, lix_json($4))",
@@ -1406,7 +1406,7 @@ test("engine errors cross the native boundary", async () => {
 	} catch (error) {
 		expect(error).toMatchObject({
 			name: "LixError",
-			code: "LIX_UNSUPPORTED_SQL",
+			code: "LIX_PARSE_ERROR",
 		});
 	}
 

@@ -634,7 +634,7 @@ async fn execute_batch_is_atomic_and_returns_ordered_results() {
         ])
         .await
         .expect_err("middle batch statement should fail");
-    assert_eq!(error.code, LixError::CODE_UNSUPPORTED_SQL);
+    assert_eq!(error.code, LixError::CODE_PARSE_ERROR);
     assert!(
         error
             .details

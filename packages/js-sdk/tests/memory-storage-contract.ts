@@ -70,7 +70,7 @@ export function registerMemoryStorageContract({
 					),
 				).rejects.toMatchObject({
 					name: "LixError",
-					code: "LIX_UNSUPPORTED_SQL",
+					code: "LIX_PARSE_ERROR",
 				});
 			} finally {
 				await lix.close();
@@ -187,7 +187,7 @@ export function registerMemoryStorageContract({
 					]),
 				).rejects.toMatchObject({
 					name: "LixError",
-					code: "LIX_UNSUPPORTED_SQL",
+					code: "LIX_PARSE_ERROR",
 					details: { statementIndex: 1 },
 				});
 				const rolledBack = await lix.execute(
