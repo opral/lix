@@ -4048,7 +4048,10 @@ fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
         &context.branch_id,
         context.global,
         context.untracked,
-        context.file_id.as_deref(),
+        // `file_id` is descriptor ownership, not filesystem namespace scope.
+        // Directory resolvers are shared by every file in the same durability
+        // and branch lane.
+        None,
     )
 }
 

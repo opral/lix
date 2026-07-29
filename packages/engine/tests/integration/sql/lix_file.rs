@@ -92,11 +92,11 @@ simulation_test!(
             .commit_id;
         session
             .execute(
-                &format!("UPDATE lix_file SET path = '/notes.md' WHERE id = '{file_id}'"),
+                &format!("UPDATE lix_file SET path = '/notes/readme.md' WHERE id = '{file_id}'"),
                 &[],
             )
             .await
-            .expect("file rename should succeed");
+            .expect("moving a file under an existing directory should succeed");
         let renamed_head = engine
             .load_branch_head_commit_id(sim.main_branch_id())
             .await
