@@ -216,6 +216,34 @@ pub fn append_with_shape(
     direct_append_with_shape(name, commit_count, change_count)
 }
 
+/// Builds commit-only public facts with production-shaped monotonic UUIDv7
+/// keys. This avoids turning benchmark label hashing into random-LSM ingest.
+pub fn append_ordered_commits(
+    first_commit_index: usize,
+    commit_count: usize,
+) -> Result<BenchAppend, LixError> {
+    let mut append = ChangelogAppend::default();
+    append.commits.reserve(commit_count);
+    for offset in 0..commit_count {
+        let commit_index = first_commit_index
+            .checked_add(offset)
+            .ok_or_else(|| LixError::unknown("ordered benchmark commit index overflow"))?;
+        append.commits.push(CommitRecord {
+            format_version: 1,
+            commit_id: CommitId::new(ordered_bench_uuid(commit_index, 0)),
+            parent_commit_ids: Vec::new(),
+            tracked_state_rootless: false,
+            change_id: ChangeId::new(ordered_bench_uuid(commit_index, 1)),
+            author_account_ids: Vec::new(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-05-20T00:00:00Z",
+            ),
+        });
+    }
+    Ok(BenchAppend { append })
+}
+
 pub fn append_1c_with_commit_change_id(
     name: &str,
     commit_change_id: &str,
@@ -576,6 +604,21 @@ fn direct_append_with_shape(
     Ok(BenchAppend { append })
 }
 
+fn ordered_bench_uuid(index: usize, discriminator: u8) -> uuid::Uuid {
+    let timestamp = 0x0192_0000_0000u64
+        .checked_add(u64::try_from(index).expect("benchmark commit index fits u64"))
+        .expect("benchmark timestamp does not overflow");
+    let mut bytes = [0u8; 16];
+    bytes[..6].copy_from_slice(&timestamp.to_be_bytes()[2..]);
+    bytes[6] = 0x70;
+    bytes[7] = 0;
+    let suffix = (u64::try_from(index).expect("benchmark commit index fits u64") << 1)
+        | u64::from(discriminator);
+    bytes[8..].copy_from_slice(&suffix.to_be_bytes());
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes)
+}
+
 impl BenchCorpus {
     fn from_append_batches(append_batches: Vec<BenchAppend>) -> Self {
         let commit_ids = append_batches
@@ -718,5 +761,26 @@ impl std::ops::AddAssign for BenchWriteStats {
         self.puts += rhs.puts;
         self.deletes += rhs.deletes;
         self.bytes_written += rhs.bytes_written;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_ordered_commits;
+
+    #[test]
+    fn ordered_commit_fixture_uses_monotonic_distinct_v7_ids() {
+        let append = append_ordered_commits(100, 3).expect("build ordered commits");
+        let commits = &append.append.commits;
+
+        assert_eq!(commits.len(), 3);
+        assert!(commits.windows(2).all(|pair| {
+            pair[0].commit_id < pair[1].commit_id && pair[0].change_id < pair[1].change_id
+        }));
+        assert!(commits.iter().all(|commit| {
+            commit.commit_id.as_uuid().get_version_num() == 7
+                && commit.change_id.as_uuid().get_version_num() == 7
+                && commit.commit_id.as_uuid() != commit.change_id.as_uuid()
+        }));
     }
 }

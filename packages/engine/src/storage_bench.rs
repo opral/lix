@@ -39,6 +39,141 @@ pub struct TrackedHistoricalDiffBenchResult {
     pub right_has_durable_root: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointCommitScanBenchMode {
+    Materialize,
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointCommitScanBenchResult {
+    pub commits: usize,
+    pub pages: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryGcBenchResult {
+    pub live_commits: usize,
+    pub swept_commits: usize,
+    pub swept_standalone_changes: usize,
+    pub swept_payloads: usize,
+    pub staged_puts: u64,
+    pub staged_deletes: u64,
+    pub staged_written_bytes: u64,
+    pub delete_descriptors: usize,
+    pub delete_descriptor_capacity: usize,
+    pub key_inline_bytes: usize,
+    pub key_inline_capacity: usize,
+    pub key_shared_buffers: usize,
+    pub key_shared_bytes: usize,
+    pub key_shared_capacity: usize,
+    pub root_discovery_us: u64,
+    pub changelog_us: u64,
+    pub tracked_root_stage_us: u64,
+    pub total_us: u64,
+}
+
+/// Plans production repository GC without committing its staged sweep.
+///
+/// The returned arena sizes expose the planner's retained mutation footprint;
+/// dropping this function's local write set leaves the fixture unchanged for
+/// repeatable measurements.
+#[inline(never)]
+pub async fn plan_repository_gc_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Result<RepositoryGcBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    let read = crate::storage_adapter::SharedStorageAdapterRead::new(
+        storage.begin_read(ReadOptions::default()).await?,
+    );
+    let mut writes = storage.new_write_set();
+    let plan = crate::gc::stage_repository_gc(read, &mut writes).await?;
+    let stats = writes.stats();
+    let arena = writes.arena_stats();
+    Ok(RepositoryGcBenchResult {
+        live_commits: plan.changelog.live.commits.len(),
+        swept_commits: plan.changelog.sweep.commits.len(),
+        swept_standalone_changes: plan.changelog.sweep.changes.len(),
+        swept_payloads: plan.changelog.sweep.json_payloads.len(),
+        staged_puts: stats.staged_puts,
+        staged_deletes: stats.staged_deletes,
+        staged_written_bytes: stats.written_bytes,
+        delete_descriptors: arena.delete_descriptors,
+        delete_descriptor_capacity: arena.delete_descriptor_capacity,
+        key_inline_bytes: arena.key_inline_bytes,
+        key_inline_capacity: arena.key_inline_capacity,
+        key_shared_buffers: arena.key_shared_buffers,
+        key_shared_bytes: arena.key_shared_bytes,
+        key_shared_capacity: arena.key_shared_capacity,
+        root_discovery_us: plan.profile.root_discovery_us,
+        changelog_us: plan.profile.changelog_us,
+        tracked_root_stage_us: plan.profile.tracked_root_stage_us,
+        total_us: plan.profile.total_us,
+    })
+}
+
+/// Scans public commit facts through the two checkpoint-history strategies.
+///
+/// `Materialize` is the current production path for unbounded checkpoint
+/// history. `Stream` is a bounded-memory baseline over the same storage rows,
+/// page size, codec, and read snapshot.
+#[inline(never)]
+pub async fn scan_checkpoint_commits_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    mode: CheckpointCommitScanBenchMode,
+) -> Result<CheckpointCommitScanBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    const PAGE_SIZE: usize = 1_024;
+
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    match mode {
+        CheckpointCommitScanBenchMode::Materialize => {
+            let records = crate::checkpoint::scan_checkpoint_commit_records(read).await?;
+            Ok(CheckpointCommitScanBenchResult {
+                commits: records.len(),
+                pages: records.len().div_ceil(PAGE_SIZE),
+            })
+        }
+        CheckpointCommitScanBenchMode::Stream => {
+            let mut reader = crate::changelog::ChangelogContext::new().reader(read);
+            let mut commits = 0usize;
+            let mut pages = 0usize;
+            let mut start_after = None::<String>;
+            loop {
+                let batch = crate::changelog::ChangelogReader::scan_commits(
+                    &mut reader,
+                    crate::changelog::CommitScanRequest {
+                        start_after: start_after.as_deref(),
+                        limit: Some(PAGE_SIZE),
+                    },
+                )
+                .await?;
+                commits = commits.checked_add(batch.entries.len()).ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint benchmark commit count overflow",
+                    )
+                })?;
+                pages = pages.checked_add(1).ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint benchmark page count overflow",
+                    )
+                })?;
+                let Some(next) = batch.next_start_after else {
+                    break;
+                };
+                start_after = Some(next.to_string());
+            }
+            Ok(CheckpointCommitScanBenchResult { commits, pages })
+        }
+    }
+}
+
 /// Diffs two tracked commits through the production historical reader.
 ///
 /// This is compiled only with `storage-benches`; it intentionally provides a
@@ -303,5 +438,68 @@ where
             resume_after.is_some(),
             "storage scan reported more rows without a resume key"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CheckpointCommitScanBenchMode, plan_repository_gc_for_bench,
+        scan_checkpoint_commits_for_bench,
+    };
+    use crate::Engine;
+    use crate::changelog::bench::{append_ordered_commits, stage_append_once};
+    use crate::storage_adapter::{Memory, StorageAdapter};
+
+    #[tokio::test]
+    async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {
+        let storage = Memory::new();
+        let append = append_ordered_commits(0, 1_025).expect("build commit fixture");
+        stage_append_once(storage.clone(), &append)
+            .await
+            .expect("stage commit fixture");
+        let adapter = StorageAdapter::new(storage);
+
+        let materialized =
+            scan_checkpoint_commits_for_bench(&adapter, CheckpointCommitScanBenchMode::Materialize)
+                .await
+                .expect("materialize checkpoint commit records");
+        let streamed =
+            scan_checkpoint_commits_for_bench(&adapter, CheckpointCommitScanBenchMode::Stream)
+                .await
+                .expect("stream checkpoint commit records");
+
+        assert_eq!(materialized.commits, 1_025);
+        assert_eq!(materialized.pages, 2);
+        assert_eq!(streamed, materialized);
+    }
+
+    #[tokio::test]
+    async fn repository_gc_benchmark_plans_unreachable_commits_without_mutating() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("initialize engine");
+        let append = append_ordered_commits(100, 10).expect("build unreachable commit fixture");
+        stage_append_once(storage.clone(), &append)
+            .await
+            .expect("stage unreachable commit fixture");
+        let adapter = StorageAdapter::new(storage);
+
+        let first = plan_repository_gc_for_bench(&adapter)
+            .await
+            .expect("plan repository gc");
+        let second = plan_repository_gc_for_bench(&adapter)
+            .await
+            .expect("repeat repository gc plan");
+
+        assert_eq!(first.swept_commits, 10);
+        // Each unreachable commit removes its changelog record, exact-ID
+        // locator, and derived tracked-root record.
+        assert_eq!(first.staged_deletes, 30);
+        assert_eq!(first.key_shared_buffers, 3);
+        assert_eq!(first.key_shared_bytes, 30 * 16);
+        assert_eq!(second.swept_commits, first.swept_commits);
+        assert_eq!(second.staged_deletes, first.staged_deletes);
     }
 }
