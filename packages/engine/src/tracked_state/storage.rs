@@ -57,7 +57,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = Storag
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
 );
 pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::new(
-    StorageSpaceId(0x0004_001b),
+    StorageSpaceId(0x0004_0021),
     TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
 );
 
@@ -2559,11 +2559,11 @@ mod tests {
     use super::{
         COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaChangeLocator,
         CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
-        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-        TRACKED_STATE_COMMIT_ROOT_MAGIC, TRACKED_STATE_COMMIT_ROOT_SPACE,
-        TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay, commit_delta_manifest_key,
-        decode_commit_delta_manifest, decode_commit_delta_with_payloads, decode_commit_root,
-        encode_commit_delta_manifest, encode_commit_delta_segment,
+        TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
+        TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
+        commit_delta_manifest_key, decode_commit_delta_manifest, decode_commit_delta_with_payloads,
+        decode_commit_root, encode_commit_delta_manifest, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_root, key,
         load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
         load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
@@ -4041,6 +4041,7 @@ mod tests {
             TRACKED_STATE_COMMIT_ROOT_SPACE,
             TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,
