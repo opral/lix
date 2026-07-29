@@ -39,6 +39,78 @@ pub struct TrackedHistoricalDiffBenchResult {
     pub right_has_durable_root: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointCommitScanBenchMode {
+    Materialize,
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointCommitScanBenchResult {
+    pub commits: usize,
+    pub pages: usize,
+}
+
+/// Scans public commit facts through the two checkpoint-history strategies.
+///
+/// `Materialize` is the current production path for unbounded checkpoint
+/// history. `Stream` is a bounded-memory baseline over the same storage rows,
+/// page size, codec, and read snapshot.
+#[inline(never)]
+pub async fn scan_checkpoint_commits_for_bench<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    mode: CheckpointCommitScanBenchMode,
+) -> Result<CheckpointCommitScanBenchResult, crate::LixError>
+where
+    StorageImpl: Storage,
+{
+    const PAGE_SIZE: usize = 1_024;
+
+    let read = storage.begin_read(ReadOptions::default()).await?;
+    match mode {
+        CheckpointCommitScanBenchMode::Materialize => {
+            let records = crate::checkpoint::scan_checkpoint_commit_records(read).await?;
+            Ok(CheckpointCommitScanBenchResult {
+                commits: records.len(),
+                pages: records.len().div_ceil(PAGE_SIZE),
+            })
+        }
+        CheckpointCommitScanBenchMode::Stream => {
+            let mut reader = crate::changelog::ChangelogContext::new().reader(read);
+            let mut commits = 0usize;
+            let mut pages = 0usize;
+            let mut start_after = None::<String>;
+            loop {
+                let batch = crate::changelog::ChangelogReader::scan_commits(
+                    &mut reader,
+                    crate::changelog::CommitScanRequest {
+                        start_after: start_after.as_deref(),
+                        limit: Some(PAGE_SIZE),
+                    },
+                )
+                .await?;
+                commits = commits.checked_add(batch.entries.len()).ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint benchmark commit count overflow",
+                    )
+                })?;
+                pages = pages.checked_add(1).ok_or_else(|| {
+                    crate::LixError::new(
+                        crate::LixError::CODE_INTERNAL_ERROR,
+                        "checkpoint benchmark page count overflow",
+                    )
+                })?;
+                let Some(next) = batch.next_start_after else {
+                    break;
+                };
+                start_after = Some(next.to_string());
+            }
+            Ok(CheckpointCommitScanBenchResult { commits, pages })
+        }
+    }
+}
+
 /// Diffs two tracked commits through the production historical reader.
 ///
 /// This is compiled only with `storage-benches`; it intentionally provides a
@@ -303,5 +375,35 @@ where
             resume_after.is_some(),
             "storage scan reported more rows without a resume key"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CheckpointCommitScanBenchMode, scan_checkpoint_commits_for_bench};
+    use crate::changelog::bench::{append_ordered_commits, stage_append_once};
+    use crate::storage_adapter::{Memory, StorageAdapter};
+
+    #[tokio::test]
+    async fn checkpoint_commit_scan_baseline_matches_materialized_records_across_pages() {
+        let storage = Memory::new();
+        let append = append_ordered_commits(0, 1_025).expect("build commit fixture");
+        stage_append_once(storage.clone(), &append)
+            .await
+            .expect("stage commit fixture");
+        let adapter = StorageAdapter::new(storage);
+
+        let materialized =
+            scan_checkpoint_commits_for_bench(&adapter, CheckpointCommitScanBenchMode::Materialize)
+                .await
+                .expect("materialize checkpoint commit records");
+        let streamed =
+            scan_checkpoint_commits_for_bench(&adapter, CheckpointCommitScanBenchMode::Stream)
+                .await
+                .expect("stream checkpoint commit records");
+
+        assert_eq!(materialized.commits, 1_025);
+        assert_eq!(materialized.pages, 2);
+        assert_eq!(streamed, materialized);
     }
 }
