@@ -860,7 +860,7 @@ simulation_test!(
         let working_changes = main
             .execute(
                 "SELECT entity_pk, change_kind \
-                 FROM lix_working_change \
+                 FROM lix_working_diff \
                  WHERE schema_key = 'lix_key_value' \
                  ORDER BY entity_pk",
                 &[],

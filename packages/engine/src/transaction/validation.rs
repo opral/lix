@@ -7236,6 +7236,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         }
     }

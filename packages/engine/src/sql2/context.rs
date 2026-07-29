@@ -28,6 +28,13 @@ use crate::wasm::UnsupportedWasmRuntime;
 
 use super::{PublicCatalog, SessionFileViews};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DiffCommand {
+    Revert,
+    Apply,
+    CreateCheckpoint,
+}
+
 pub(crate) type SqlChangelogQuerySource<S> = ChangelogQuerySource<S>;
 pub(crate) type SqlHistoryQuerySource<S> = HistoryQuerySource<S>;
 
@@ -162,6 +169,17 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError>;
+
+    async fn execute_diff_command(
+        &mut self,
+        _command: DiffCommand,
+        _diff_ids: Vec<String>,
+    ) -> Result<u64, LixError> {
+        Err(LixError::new(
+            LixError::CODE_UNSUPPORTED_SQL,
+            "diff commands are not supported by this write context",
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -323,6 +341,23 @@ impl SqlWriteContext {
                 .as_mut()
                 .unwrap()
                 .stage_write(write)
+                .await
+        }
+    }
+
+    pub(crate) async fn execute_diff_command(
+        &self,
+        command: DiffCommand,
+        diff_ids: Vec<String>,
+    ) -> Result<u64, LixError> {
+        let _guard = self.gate.lock().await;
+        unsafe {
+            self.ptr
+                .0
+                .as_ptr()
+                .as_mut()
+                .unwrap()
+                .execute_diff_command(command, diff_ids)
                 .await
         }
     }

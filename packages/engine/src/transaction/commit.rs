@@ -138,6 +138,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         prepared_writes.commit_change_refs_by_branch,
         prepared_writes.first_commit_parent_override_by_branch,
         prepared_writes.extra_commit_parents_by_branch,
+        prepared_writes.intermediate_commits,
         commit_parent_heads,
     )
     .instrument(tracing::debug_span!(
@@ -154,6 +155,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     // published control.
     let branch_head_changes = tracked_roots
         .iter()
+        .filter(|root| root.publish_head)
         .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
     let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
@@ -1562,7 +1564,10 @@ async fn stage_tracked_head(
     let tracked_head = TrackedHeadContext::new();
     let mut controls = BTreeMap::new();
 
-    for root in tracked_roots_parent_first(tracked_roots)? {
+    for root in tracked_roots_parent_first(tracked_roots)?
+        .into_iter()
+        .filter(|root| root.publish_head)
+    {
         let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
@@ -2150,14 +2155,22 @@ fn stage_checkpoint_working_diff_epochs(
                 ),
             )
         })?;
-        if control.head_commit_id != recovery.checkpoint_commit_id {
+        if control.working_diff_checkpoint_commit_id != Some(recovery.checkpoint_commit_id) {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
-                    "checkpoint '{}' does not match staged hot control '{}' for '{}'",
-                    recovery.checkpoint_commit_id, control.head_commit_id, recovery.branch_id
+                    "checkpoint '{}' does not match staged working-diff baseline for '{}'",
+                    recovery.checkpoint_commit_id, recovery.branch_id
                 ),
             ));
+        }
+        // A partial checkpoint publishes a child head whose unselected
+        // changes remain dirty relative to the intermediate checkpoint. The
+        // empty HOT epoch is valid only when the checkpoint itself is the
+        // published head; otherwise the historical diff path reconstructs
+        // the remaining working diff from the two durable roots.
+        if control.head_commit_id != recovery.checkpoint_commit_id {
+            continue;
         }
         stage_tracked_working_diff_epoch(
             writes,
@@ -2379,15 +2392,6 @@ async fn stage_branch_head_control_publications(
                     ),
                 )
             })?;
-            if control.head_commit_id != *checkpoint_commit_id {
-                return Err(LixError::new(
-                    LixError::CODE_INTERNAL_ERROR,
-                    format!(
-                        "checkpoint '{}' does not match published branch head '{}' for '{}'",
-                        checkpoint_commit_id, control.head_commit_id, branch_id
-                    ),
-                ));
-            }
             control.working_diff_checkpoint_commit_id = Some(*checkpoint_commit_id);
         }
         let observation = observations.get(branch_id).ok_or_else(|| {
@@ -2628,6 +2632,7 @@ async fn observe_branch_head_controls(
 ) -> Result<BTreeMap<String, BranchHeadControlObservation>, LixError> {
     let mut branch_ids = tracked_roots
         .iter()
+        .filter(|root| root.publish_head)
         .map(|root| root.branch_id.clone())
         .collect::<BTreeSet<_>>();
     for row in state_rows {
@@ -2945,16 +2950,42 @@ struct PendingTrackedRoot {
     /// Metadata for the public synthesized `lix_branch_ref` row.
     ref_change_id: ChangeId,
     ref_updated_at: LixTimestamp,
+    publish_head: bool,
 }
 
 async fn finalize_commit_rows(
     commit_change_refs_by_branch: BTreeMap<String, StagedCommitChangeRefs>,
     first_commit_parent_override_by_branch: BTreeMap<String, CommitId>,
     extra_commit_parents_by_branch: BTreeMap<String, Vec<CommitId>>,
+    intermediate_commits: Vec<crate::transaction::staging::StagedIntermediateCommit>,
     commit_parent_heads: &BTreeMap<String, Option<CommitId>>,
 ) -> Result<FinalizedCommitRows, LixError> {
     let mut commit_rows = Vec::new();
     let mut tracked_roots = Vec::new();
+
+    for intermediate in intermediate_commits {
+        let change_refs = intermediate.change_refs;
+        let commit_id = change_refs.commit_id;
+        let created_at = change_refs.created_at;
+        let commit_change_id = change_refs.commit_change_id;
+        let branch_ref_change_id = change_refs.branch_ref_change_id;
+        let selected_change_batches = change_refs.into_selected_change_batches();
+        commit_rows.push(FinalizedCommitRow {
+            commit_id,
+            parent_commit_ids: vec![intermediate.parent_commit_id],
+            created_at,
+            change_id: commit_change_id,
+            selected_change_batches,
+        });
+        tracked_roots.push(PendingTrackedRoot {
+            branch_id: intermediate.branch_id,
+            commit_id,
+            parent_commit_id: Some(intermediate.parent_commit_id),
+            ref_change_id: branch_ref_change_id,
+            ref_updated_at: created_at,
+            publish_head: false,
+        });
+    }
 
     for (branch_id, change_refs) in commit_change_refs_by_branch {
         if change_refs.is_empty() && !change_refs.allow_empty {
@@ -3004,6 +3035,7 @@ async fn finalize_commit_rows(
             parent_commit_id,
             ref_change_id: branch_ref_change_id,
             ref_updated_at: timestamp,
+            publish_head: true,
         });
     }
 
@@ -3049,6 +3081,12 @@ pub(crate) async fn resolve_prepared_commit_parent_heads(
                 .extra_commit_parents_by_branch
                 .keys()
                 .map(String::as_str),
+        )
+        .chain(
+            prepared_writes
+                .intermediate_commits
+                .iter()
+                .map(|commit| commit.branch_id.as_str()),
         )
         .collect::<BTreeSet<_>>();
     required_branch_ids.extend(commit_parent_branch_ids.iter().copied());
@@ -3229,6 +3267,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         };
         for row in &rows {
@@ -3428,6 +3467,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -3625,6 +3665,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -3662,6 +3703,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -3698,6 +3740,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -3735,6 +3778,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -3794,6 +3838,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         };
         let mut read = storage
@@ -4070,6 +4115,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4122,6 +4168,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4174,6 +4221,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4218,6 +4266,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4379,6 +4428,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4423,6 +4473,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4483,6 +4534,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4658,6 +4710,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4701,6 +4754,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4753,6 +4807,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4813,6 +4868,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4885,6 +4941,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -4924,6 +4981,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5037,6 +5095,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5205,6 +5264,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5274,6 +5334,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5304,6 +5365,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5351,6 +5413,7 @@ mod tests {
                     first_commit_parent_override_by_branch: BTreeMap::new(),
                     checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
+                    intermediate_commits: Vec::new(),
                     file_data_writes: Vec::new(),
                 },
             )
@@ -5382,6 +5445,7 @@ mod tests {
                     first_commit_parent_override_by_branch: BTreeMap::new(),
                     checkpoint_publications: Vec::new(),
                     extra_commit_parents_by_branch: BTreeMap::new(),
+                    intermediate_commits: Vec::new(),
                     file_data_writes: Vec::new(),
                 },
             )
@@ -5427,6 +5491,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5570,6 +5635,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
         )
@@ -5638,6 +5704,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             BTreeMap::new(),
+            Vec::new(),
             &BTreeMap::from([(
                 GLOBAL_BRANCH_ID.to_string(),
                 Some(CommitId::for_test_label("initial-commit")),
@@ -5671,6 +5738,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             BTreeMap::new(),
+            Vec::new(),
             &BTreeMap::new(),
         )
         .await
@@ -5689,6 +5757,7 @@ mod tests {
             )]),
             BTreeMap::new(),
             BTreeMap::new(),
+            Vec::new(),
             &BTreeMap::from([(
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("previous-commit")),
@@ -5719,6 +5788,7 @@ mod tests {
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 vec![CommitId::for_test_label("source-head")],
             )]),
+            Vec::new(),
             &BTreeMap::from([(
                 "01920000-0000-7000-8000-0000000000a1".to_string(),
                 Some(CommitId::for_test_label("target-head")),
@@ -5757,6 +5827,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
             true,
@@ -5788,6 +5859,7 @@ mod tests {
                 first_commit_parent_override_by_branch: BTreeMap::new(),
                 checkpoint_publications: Vec::new(),
                 extra_commit_parents_by_branch: BTreeMap::new(),
+                intermediate_commits: Vec::new(),
                 file_data_writes: Vec::new(),
             },
             true,
@@ -5814,6 +5886,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         }
     }
@@ -5854,6 +5927,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         }
     }

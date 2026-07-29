@@ -38,6 +38,7 @@ pub(crate) enum BoundWriteTarget {
     File(FileWriteSurface),
     Directory(DirectoryWriteSurface),
     Branch,
+    DiffCommand(crate::sql2::DiffCommand),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

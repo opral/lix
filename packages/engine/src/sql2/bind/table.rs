@@ -236,6 +236,7 @@ mod tests {
             "lix_account",
             "lix_account_by_branch",
             "lix_account_history",
+            "lix_apply",
             "lix_branch",
             "lix_branch_descriptor",
             "lix_branch_descriptor_by_branch",
@@ -253,6 +254,7 @@ mod tests {
             "lix_commit_by_branch",
             "lix_commit_edge",
             "lix_commit_edge_by_branch",
+            "lix_create_checkpoint",
             "lix_directory",
             "lix_directory_by_branch",
             "lix_directory_history",
@@ -275,8 +277,9 @@ mod tests {
             "lix_registered_schema",
             "lix_registered_schema_by_branch",
             "lix_registered_schema_history",
-            "lix_working_change",
-            "lix_working_change_by_branch",
+            "lix_revert",
+            "lix_working_diff",
+            "lix_working_diff_by_branch",
         ];
 
         assert_eq!(actual, expected);
@@ -294,8 +297,8 @@ mod tests {
             "lix_registered_schema_history",
             "lix_checkpoint",
             "lix_checkpoint_by_branch",
-            "lix_working_change",
-            "lix_working_change_by_branch",
+            "lix_working_diff",
+            "lix_working_diff_by_branch",
         ] {
             assert!(
                 catalog.surface(surface_name).is_some(),

@@ -11,7 +11,7 @@ Lix exposes logical application data through typed SQL relations:
 | Registered application entity `X` | `<schema>` | `<schema>_by_branch` | `<schema>_history()` |
 | Files | `lix_file` | `lix_file_by_branch` | `lix_file_history()` |
 | Directories | `lix_directory` | `lix_directory_by_branch` | `lix_directory_history()` |
-| Working changes | `lix_working_change` | `lix_working_change_by_branch` | — |
+| Working diffs | `lix_working_diff` | `lix_working_diff_by_branch` | `lix_diff(from_commit, to_commit)` |
 | File working changes | `lix_file_working_change` | `lix_file_working_change_by_branch` | — |
 | Directory working changes | `lix_directory_working_change` | `lix_directory_working_change_by_branch` | — |
 | Checkpoints | `lix_checkpoint` | `lix_checkpoint_by_branch` | — |
@@ -20,9 +20,9 @@ Lix exposes logical application data through typed SQL relations:
 shared workspace metadata, and `lix_change` provides workspace-wide activity.
 There is no generic `lix_state*` SQL family.
 
-The checkpoint and working-change surfaces are read-only. See
-[Checkpoints](./checkpoints.md) for their columns, branch scoping, and Rust SDK
-workflow.
+The checkpoint and diff relations are read-only. Their `diff_id` rows can feed
+the `lix_revert`, `lix_apply`, and `lix_create_checkpoint` command sinks. See
+[Checkpoints](./checkpoints.md) and [Diff commands](./diff-commands.md).
 
 ## The executable column contract
 

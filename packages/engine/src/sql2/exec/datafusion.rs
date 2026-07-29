@@ -2092,7 +2092,7 @@ fn bind_table_function_parameters(
                 let Value::Text(text) = param else {
                     return ControlFlow::Break(Box::new(LixError::new(
                         LixError::CODE_TYPE_MISMATCH,
-                        "history table function as_of argument must be text",
+                        "table function arguments must be text",
                     )));
                 };
                 *expression = SqlExpr::value(SqlValue::SingleQuotedString(text.clone()));

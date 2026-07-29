@@ -38,6 +38,22 @@ pub(crate) struct WriteLogicalPlan {
     pub(super) plan: LogicalWritePlan,
 }
 
+pub(crate) fn diff_command_query(
+    plan: &SqlLogicalPlan,
+) -> Option<(crate::sql2::DiffCommand, String)> {
+    let SqlLogicalPlan::Write(write) = plan else {
+        return None;
+    };
+    let BoundWriteTarget::DiffCommand(command) = write.plan.bound.target else {
+        return None;
+    };
+    let crate::sql2::bind::write::BoundWriteInput::Query { query, .. } = &write.plan.bound.input
+    else {
+        return None;
+    };
+    Some((command, query.query.to_string()))
+}
+
 #[cfg(test)]
 pub(crate) async fn create_write_logical_plan(
     ctx: &mut dyn SqlWriteExecutionContext,

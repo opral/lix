@@ -933,7 +933,7 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_before = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_change \
+                "SELECT COUNT(*) AS entries FROM lix_working_diff \
                  WHERE schema_key = 'json_pointer'",
                 &[],
             )
@@ -973,7 +973,7 @@ mod tests {
             .expect("changelog count should be numeric");
         let diff_after = session
             .execute(
-                "SELECT COUNT(*) AS entries FROM lix_working_change \
+                "SELECT COUNT(*) AS entries FROM lix_working_diff \
                  WHERE schema_key = 'json_pointer'",
                 &[],
             )

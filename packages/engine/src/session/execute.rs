@@ -872,7 +872,7 @@ where
                         let result = async {
                             let tx_plan = transaction
                                 .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                            let result = sql2::execute_write_logical_plan_result_with_metadata(
+                            let result = execute_prepared_transaction_write(
                                 transaction,
                                 tx_plan,
                                 &params,
@@ -1001,7 +1001,7 @@ where
                     let result = async {
                         let tx_plan = transaction
                             .prepare_sql_write_logical_plan(&sql_for_planning, &statement)?;
-                        let result = sql2::execute_write_logical_plan_result_with_metadata(
+                        let result = execute_prepared_transaction_write(
                             transaction,
                             tx_plan,
                             &params,
@@ -2353,18 +2353,31 @@ where
     let previous_origin_key = transaction.replace_origin_key(options.origin_key);
     let result = async {
         let tx_plan = transaction.prepare_sql_write_logical_plan(sql, &statement)?;
-        let result = sql2::execute_write_logical_plan_result_with_metadata(
-            transaction,
-            tx_plan,
-            params,
-            &metadata,
-        )
-        .await?;
+        let result =
+            execute_prepared_transaction_write(transaction, tx_plan, params, &metadata).await?;
         Ok(ExecuteResult::from_sql_write_result(result))
     }
     .await;
     transaction.replace_origin_key(previous_origin_key);
     result
+}
+
+async fn execute_prepared_transaction_write<StorageImpl>(
+    transaction: &mut crate::transaction::Transaction<StorageImpl>,
+    plan: sql2::SqlLogicalPlan,
+    params: &[Value],
+    metadata: &ExecuteStatementMetadata,
+) -> Result<sql2::SqlWriteResult, LixError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    if let Some((command, query_sql)) = sql2::diff_command_query(&plan) {
+        let count = transaction
+            .execute_diff_command_query_owned(command, query_sql, params.to_vec())
+            .await?;
+        return Ok(sql2::SqlWriteResult::affected(count));
+    }
+    sql2::execute_write_logical_plan_result_with_metadata(transaction, plan, params, metadata).await
 }
 
 /// Returns true only when SQL directly delivers one file's bytes to the
@@ -3197,7 +3210,7 @@ where
                 .await
         }
         sql2::BoundStatementRoute::Read => transaction
-            .execute_read_sql_statement(sql, statement, params)
+            .execute_read_sql_statement(sql.to_string(), statement, params.to_vec())
             .await
             .map(ExecuteResult::from_sql_query_result),
     }

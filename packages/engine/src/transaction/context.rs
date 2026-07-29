@@ -4,7 +4,7 @@
     clippy::needless_pass_by_ref_mut
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -28,7 +28,14 @@ use crate::catalog::{
     CatalogContext, CatalogFingerprint, CatalogSnapshot, SchemaPlanId, load_catalog_revision,
     stage_catalog_revision,
 };
-use crate::changelog::{ChangeId, CommitId};
+use crate::changelog::{
+    ChangeId, ChangeRecord, ChangeRecordProjection, CommitId, load_change_records,
+    materialize_known_change_payloads,
+};
+use crate::checkpoint::{
+    CHECKPOINT_MARKER_SCHEMA_KEY, checkpoint_history_from_head, checkpoint_marker_stage_row,
+    latest_checkpoint_at_head,
+};
 use crate::commit_graph::{CommitGraphContext, CommitGraphStoreReader};
 use crate::common::{LixTimestamp, SharedStr};
 use crate::domain::Domain;
@@ -77,9 +84,9 @@ use crate::session::{
     encode_receipt, load_workspace_branch_id_from_index,
 };
 use crate::sql2::{
-    ChangelogQuerySource, HistoryQuerySource, SessionFileViewKey, SessionFileViewMutation,
-    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
-    SqlHistoryQuerySource,
+    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
+    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
+    SqlExecutionContext, SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -89,7 +96,9 @@ use crate::storage_adapter::{
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
-use crate::tracked_state::{TrackedStateContext, TrackedStateDiffRequest, TrackedStateStoreReader};
+use crate::tracked_state::{
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateStoreReader,
+};
 use crate::transaction::commit;
 use crate::transaction::normalization::{
     NormalizedRowFacts, REGISTERED_SCHEMA_KEY, normalize_raw_write_row_in_place,
@@ -101,8 +110,8 @@ use crate::transaction::staging::{
 };
 use crate::transaction::types::{
     PreparedRowFacts, PreparedStateBatch, PreparedTransactionWrite, RawWriteBatch, RawWriteRowRef,
-    StagedCommitChangeBatch, TransactionFileData, TransactionJson, TransactionWrite,
-    TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
+    StagedCommitChangeBatch, StagedCommitChangeBatchBuilder, TransactionFileData, TransactionJson,
+    TransactionWrite, TransactionWriteMode, TransactionWriteOperation, TransactionWriteOrigin,
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
@@ -4412,9 +4421,9 @@ where
 
     pub(crate) async fn execute_read_sql_statement(
         &mut self,
-        sql: &str,
+        sql: String,
         statement: DataFusionStatement,
-        params: &[Value],
+        params: Vec<Value>,
     ) -> Result<SqlQueryResult, LixError> {
         let storage = self.storage.clone();
         let read = storage.begin_read(StorageReadOptions::default()).await?;
@@ -4446,7 +4455,7 @@ where
                 plugin_host,
             };
             let result = crate::sql2::execute_transaction_read_statement_from_parsed(
-                &read_ctx, self, sql, statement, params,
+                &read_ctx, self, &sql, statement, &params,
             )
             .await;
             drop(read_ctx);
@@ -4523,7 +4532,7 @@ where
     /// Loads the branch-local recovery root and repository-global maintenance
     /// state from one storage snapshot.
     pub(crate) async fn checkpoint_publication_state(
-        &self,
+        &mut self,
         branch_id: &str,
     ) -> Result<(Option<CheckpointRecoveryRef>, CheckpointGcState), LixError> {
         let read = self
@@ -4548,7 +4557,7 @@ where
 
     /// Creates a tracked-state reader scoped to this write transaction.
     pub(crate) async fn tracked_state_reader(
-        &self,
+        &mut self,
     ) -> TrackedStateStoreReader<SharedStorageAdapterRead<StorageImpl::Read<'_>>> {
         let read = self
             .storage
@@ -4600,6 +4609,439 @@ where
             .expect("open transaction read scope");
         CommitGraphContext::new().reader(SharedStorageAdapterRead::new(read))
     }
+
+    async fn execute_apply_or_revert(
+        &mut self,
+        command: DiffCommand,
+        diff_ids: Vec<String>,
+    ) -> Result<u64, LixError> {
+        let selections = diff_ids
+            .iter()
+            .map(|diff_id| {
+                crate::tracked_state::decode_diff_id(diff_id).map(|sides| (diff_id.as_str(), sides))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let change_ids = selections
+            .iter()
+            .flat_map(|(_, sides)| [sides.before, sides.after])
+            .flatten()
+            .collect::<BTreeSet<_>>();
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let packed_records =
+            futures_util::future::try_join_all(change_ids.iter().copied().map(|change_id| {
+                let read = &read;
+                async move {
+                    crate::tracked_state::load_change_record_by_id(read, change_id)
+                        .await
+                        .map(|record| (change_id, record))
+                }
+            }))
+            .await?;
+        let mut records = packed_records
+            .into_iter()
+            .filter_map(|(change_id, record)| record.map(|record| (change_id, record)))
+            .collect::<HashMap<_, _>>();
+        let missing = change_ids
+            .into_iter()
+            .filter(|change_id| !records.contains_key(change_id))
+            .collect::<Vec<_>>();
+        records.extend(load_change_records(&read, missing.into_iter()).await?);
+        let mut payloads = materialize_known_change_payloads(
+            &read,
+            records.values().cloned(),
+            ChangeRecordProjection::full(),
+        )
+        .await?;
+        drop(read);
+        let branch_id = self.active_branch_id.clone();
+        let mut identities = BTreeSet::new();
+        let mut plans = Vec::with_capacity(selections.len());
+        for (diff_id, sides) in selections {
+            let before = sides
+                .before
+                .map(|id| required_diff_change(&records, id, diff_id))
+                .transpose()?;
+            let after = sides
+                .after
+                .map(|id| required_diff_change(&records, id, diff_id))
+                .transpose()?;
+            let identity = diff_record_identity(before.or(after).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    format!("diff_id '{diff_id}' has no resolvable side"),
+                )
+            })?);
+            if let (Some(before), Some(after)) = (before, after)
+                && diff_record_identity(before) != diff_record_identity(after)
+            {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!("diff_id '{diff_id}' joins changes for different entities"),
+                ));
+            }
+            if !identities.insert(identity.clone()) {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    "diff command selection contains more than one row for the same entity",
+                ));
+            }
+            let (expected, target) = match command {
+                DiffCommand::Revert => (sides.after, sides.before),
+                DiffCommand::Apply => (sides.before, sides.after),
+                DiffCommand::CreateCheckpoint => unreachable!(),
+            };
+            plans.push((diff_id, identity, expected, target));
+        }
+        let request = LiveStateExactBatchRequest {
+            rows: plans
+                .iter()
+                .map(
+                    |(_, (schema_key, entity_pk, file_id), _, _)| LiveStateExactRowRequest {
+                        schema_key: schema_key.clone(),
+                        branch_id: branch_id.clone(),
+                        entity_pk: entity_pk.clone(),
+                        file_id: file_id.clone(),
+                    },
+                )
+                .collect(),
+            projection: LiveStateProjection::default(),
+            untracked: Some(false),
+            include_tombstones: true,
+        };
+        let current = self
+            .load_visible_exact_live_state_batch(&request)
+            .await?
+            .into_rows();
+        let mut target_change_ids = Vec::new();
+        let mut rows = RawWriteBatch::with_capacity(plans.len());
+        for ((diff_id, (schema_key, entity_pk, file_id), expected, target), current) in
+            plans.into_iter().zip(current)
+        {
+            let current_matches = match expected {
+                Some(expected) => current
+                    .as_ref()
+                    .and_then(|row| row.change_id)
+                    .is_some_and(|change_id| change_id == expected),
+                None => current.as_ref().is_none_or(|row| row.deleted),
+            };
+            if !current_matches {
+                let actual = current
+                    .as_ref()
+                    .and_then(|row| row.change_id)
+                    .map_or_else(|| "absent".to_string(), |id| id.to_string());
+                let expected = expected.map_or_else(|| "absent".to_string(), |id| id.to_string());
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "stale diff_id '{diff_id}': current change is {actual}, expected {expected}"
+                    ),
+                ));
+            }
+            if let Some(target) = target {
+                required_diff_change(&records, target, diff_id)?;
+                target_change_ids.push(target);
+            } else {
+                rows.push(TransactionWriteRow {
+                    entity_pk: Some(entity_pk),
+                    schema_key: schema_key.into(),
+                    file_id: file_id.map(Into::into),
+                    snapshot: None,
+                    metadata: None,
+                    origin: None,
+                    created_at: None,
+                    updated_at: None,
+                    global: false,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: false,
+                    branch_id: branch_id.clone().into(),
+                });
+            }
+        }
+        if !target_change_ids.is_empty() {
+            for change_id in target_change_ids {
+                let payload = payloads.remove(&change_id).ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        format!("materialized diff target '{change_id}' is missing"),
+                    )
+                })?;
+                let identity = payload.identity.ok_or_else(|| {
+                    LixError::new(
+                        LixError::CODE_INTERNAL_ERROR,
+                        "materialized diff target is missing its identity",
+                    )
+                })?;
+                rows.push(TransactionWriteRow {
+                    entity_pk: Some(identity.entity_pk),
+                    schema_key: identity.schema_key.into(),
+                    file_id: identity.file_id.map(Into::into),
+                    snapshot: parse_materialized_diff_json(
+                        payload.snapshot_content,
+                        "diff target",
+                    )?,
+                    metadata: parse_materialized_diff_json(
+                        payload.metadata,
+                        "diff target metadata",
+                    )?,
+                    origin: None,
+                    created_at: None,
+                    updated_at: None,
+                    global: false,
+                    change_id: None,
+                    commit_id: None,
+                    untracked: false,
+                    branch_id: branch_id.clone().into(),
+                });
+            }
+        }
+        if !rows.is_empty() {
+            self.stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows,
+            })
+            .await?;
+        }
+        Ok(diff_ids.len() as u64)
+    }
+
+    async fn execute_checkpoint_selection(
+        &mut self,
+        diff_ids: Vec<String>,
+    ) -> Result<u64, LixError> {
+        let branch_id = self.active_branch_id.clone();
+        let (previous_recovery, mut gc_state) =
+            self.checkpoint_publication_state(&branch_id).await?;
+        let head_commit_id = self
+            .load_branch_head(&branch_id)
+            .await?
+            .ok_or_else(|| LixError::branch_not_found(&branch_id, "create checkpoint", "target"))?;
+        let direct_checkpoint = {
+            let mut tracked = self.tracked_state_reader().await;
+            latest_checkpoint_at_head(&mut tracked, &head_commit_id, &branch_id).await?
+        };
+        let previous_checkpoint_commit_id = match direct_checkpoint {
+            Some(commit_id) => commit_id,
+            None => {
+                let mut graph = self.commit_graph_reader().await;
+                checkpoint_history_from_head(&mut graph, &head_commit_id)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("branch '{branch_id}' has no checkpoint baseline"),
+                        )
+                    })?
+                    .commit_id
+            }
+        };
+        let diff = {
+            let mut tracked = self.tracked_state_reader().await;
+            tracked
+                .diff_commits(
+                    &previous_checkpoint_commit_id.to_string(),
+                    &head_commit_id.to_string(),
+                    &TrackedStateDiffRequest::default(),
+                )
+                .await?
+        };
+        let requested = diff_ids.iter().cloned().collect::<BTreeSet<_>>();
+        if requested.len() != diff_ids.len() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "checkpoint selection contains duplicate diff_id rows",
+            ));
+        }
+        let mut matched = BTreeSet::new();
+        let mut selected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+        let mut unselected = StagedCommitChangeBatchBuilder::with_capacity(diff.entries.len());
+        for entry in diff
+            .entries
+            .into_iter()
+            .filter(|entry| entry.identity.schema_key() != CHECKPOINT_MARKER_SCHEMA_KEY)
+        {
+            let diff_id = crate::tracked_state::encode_diff_id(
+                entry.before.as_ref().map(|row| row.change_id),
+                entry.after.as_ref().map(|row| row.change_id),
+            )?;
+            let target = entry.after.ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!("working diff '{diff_id}' has no target row"),
+                )
+            })?;
+            if requested.contains(&diff_id) {
+                matched.insert(diff_id);
+                push_checkpoint_selected_change(&mut selected, target, entry.kind);
+            } else {
+                push_checkpoint_selected_change(&mut unselected, target, entry.kind);
+            }
+        }
+        let selected = selected.finish();
+        let unselected = unselected.finish();
+        if matched != requested {
+            let unknown = requested.difference(&matched).next().expect("sets differ");
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                format!("checkpoint selection contains stale or unknown diff_id '{unknown}'"),
+            ));
+        }
+        let interval_has_commits = head_commit_id != previous_checkpoint_commit_id;
+        gc_state.checkpoint_sequence =
+            gc_state.checkpoint_sequence.checked_add(1).ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "checkpoint sequence overflow",
+                )
+            })?;
+        if let Some(previous_recovery) = previous_recovery {
+            gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
+        }
+
+        if unselected.is_empty() {
+            let mut marker_rows = RawWriteBatch::with_capacity(1);
+            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
+            self.stage_write(TransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: marker_rows,
+            })
+            .await?;
+            self.stage_checkpoint_commit(
+                branch_id,
+                previous_checkpoint_commit_id,
+                head_commit_id,
+                interval_has_commits,
+                gc_state,
+                selected,
+            )?;
+        } else {
+            let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
+                branch_id.clone(),
+                previous_checkpoint_commit_id,
+                selected,
+            )?;
+            let mut marker_rows = RawWriteBatch::with_capacity(1);
+            marker_rows.push(checkpoint_marker_stage_row(&branch_id));
+            let marker = self.prepare_transaction_rows(marker_rows).await?;
+            self.staged_writes
+                .stage_intermediate_rows(checkpoint_commit_id, marker)?;
+            self.staged_writes
+                .stage_selected_commit_change_refs(branch_id.clone(), unselected)?;
+            self.staged_writes
+                .set_first_commit_parent(branch_id.clone(), checkpoint_commit_id)?;
+            self.staged_writes
+                .add_checkpoint_publication(CheckpointPublication {
+                    recovery_ref: CheckpointRecoveryRef {
+                        branch_id,
+                        recovered_head_commit_id: head_commit_id,
+                        checkpoint_commit_id,
+                        interval_has_commits,
+                    },
+                    gc_state,
+                })?;
+        }
+        Ok(diff_ids.len() as u64)
+    }
+
+    pub(crate) async fn execute_diff_command_query_owned(
+        &mut self,
+        command: DiffCommand,
+        query_sql: String,
+        params: Vec<Value>,
+    ) -> Result<u64, LixError> {
+        let statement = crate::sql2::parse_statement(&query_sql)?;
+        let result = self
+            .execute_read_sql_statement(query_sql, statement, params)
+            .await?;
+        if result.columns.len() != 1 {
+            return Err(LixError::new(
+                LixError::CODE_TYPE_MISMATCH,
+                format!(
+                    "diff command query must return exactly one column, got {}",
+                    result.columns.len()
+                ),
+            ));
+        }
+        let mut diff_ids = Vec::with_capacity(result.rows.len());
+        for row in result.rows {
+            let [Value::Text(diff_id)] = row.as_slice() else {
+                return Err(LixError::new(
+                    LixError::CODE_TYPE_MISMATCH,
+                    "diff command query must return non-null text diff_id values",
+                ));
+            };
+            diff_ids.push(diff_id.clone());
+        }
+        if diff_ids.is_empty() {
+            return Err(LixError::new(
+                LixError::CODE_CONSTRAINT_VIOLATION,
+                "diff command selection is empty",
+            ));
+        }
+        self.execute_diff_command(command, diff_ids).await
+    }
+}
+
+fn required_diff_change<'a>(
+    records: &'a HashMap<ChangeId, ChangeRecord>,
+    change_id: ChangeId,
+    diff_id: &str,
+) -> Result<&'a ChangeRecord, LixError> {
+    records.get(&change_id).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_CONSTRAINT_VIOLATION,
+            format!("diff_id '{diff_id}' references missing change '{change_id}'"),
+        )
+    })
+}
+
+fn diff_record_identity(record: &ChangeRecord) -> (String, EntityPk, Option<String>) {
+    (
+        record.schema_key.clone(),
+        record.entity_pk.clone(),
+        record.file_id.clone(),
+    )
+}
+
+fn parse_materialized_diff_json(
+    json: Option<SharedStr>,
+    context: &str,
+) -> Result<Option<TransactionJson>, LixError> {
+    json.map(|json| {
+        let value = serde_json::from_str(json.as_ref()).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("failed to materialize {context} JSON: {error}"),
+            )
+        })?;
+        TransactionJson::from_value(value, context)
+    })
+    .transpose()
+}
+
+fn push_checkpoint_selected_change(
+    selected: &mut StagedCommitChangeBatchBuilder,
+    row: crate::tracked_state::TrackedStateDiffRow,
+    kind: TrackedStateDiffKind,
+) {
+    let created_at = match kind {
+        TrackedStateDiffKind::Added => row.updated_at,
+        TrackedStateDiffKind::Modified | TrackedStateDiffKind::Removed => row.created_at,
+    };
+    selected.push(
+        row.identity,
+        row.commit_id,
+        row.change_id,
+        row.deleted,
+        created_at,
+        row.updated_at,
+    );
 }
 
 fn incremental_filesystem_index_enabled() -> bool {
@@ -5231,6 +5673,19 @@ where
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
+    }
+
+    async fn execute_diff_command(
+        &mut self,
+        command: DiffCommand,
+        diff_ids: Vec<String>,
+    ) -> Result<u64, LixError> {
+        match command {
+            DiffCommand::Revert | DiffCommand::Apply => {
+                self.execute_apply_or_revert(command, diff_ids).await
+            }
+            DiffCommand::CreateCheckpoint => self.execute_checkpoint_selection(diff_ids).await,
+        }
     }
 }
 
@@ -7951,6 +8406,7 @@ mod tests {
             first_commit_parent_override_by_branch: BTreeMap::new(),
             checkpoint_publications: Vec::new(),
             extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
             file_data_writes: Vec::new(),
         };
 

@@ -13,8 +13,11 @@ mod branch;
 mod change;
 mod checkpoint;
 mod columns;
+mod diff;
 mod directory;
 mod directory_history;
+pub(crate) use diff::register_diff_function;
+mod diff_command;
 mod entity;
 mod entity_history;
 mod file;
@@ -359,7 +362,7 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::WorkingChange => {
+            PublicSurfaceKind::WorkingDiff => {
                 working_change::register_working_change_provider(
                     session,
                     &surface.name,
@@ -370,7 +373,7 @@ where
                 )
                 .await?;
             }
-            PublicSurfaceKind::WorkingChangeByBranch => {
+            PublicSurfaceKind::WorkingDiffByBranch => {
                 working_change::register_working_change_provider(
                     session,
                     &surface.name,
@@ -511,7 +514,10 @@ where
             }
             PublicSurfaceKind::EntityBase { .. }
             | PublicSurfaceKind::EntityByBranch { .. }
-            | PublicSurfaceKind::EntityHistory { .. } => {}
+            | PublicSurfaceKind::EntityHistory { .. }
+            | PublicSurfaceKind::Revert
+            | PublicSurfaceKind::Apply
+            | PublicSurfaceKind::CreateCheckpoint => {}
         }
     }
     let needs_entity_history = catalog.surfaces().any(|surface| {
@@ -652,11 +658,38 @@ async fn register_write_from_catalog(
                 )
                 .await?;
             }
+            PublicSurfaceKind::Revert => {
+                diff_command::register_diff_command_provider(
+                    session,
+                    &surface.name,
+                    crate::sql2::DiffCommand::Revert,
+                    write_ctx.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::Apply => {
+                diff_command::register_diff_command_provider(
+                    session,
+                    &surface.name,
+                    crate::sql2::DiffCommand::Apply,
+                    write_ctx.clone(),
+                )
+                .await?;
+            }
+            PublicSurfaceKind::CreateCheckpoint => {
+                diff_command::register_diff_command_provider(
+                    session,
+                    &surface.name,
+                    crate::sql2::DiffCommand::CreateCheckpoint,
+                    write_ctx.clone(),
+                )
+                .await?;
+            }
             PublicSurfaceKind::Change
             | PublicSurfaceKind::Checkpoint
             | PublicSurfaceKind::CheckpointByBranch
-            | PublicSurfaceKind::WorkingChange
-            | PublicSurfaceKind::WorkingChangeByBranch
+            | PublicSurfaceKind::WorkingDiff
+            | PublicSurfaceKind::WorkingDiffByBranch
             | PublicSurfaceKind::FileWorkingChange
             | PublicSurfaceKind::FileWorkingChangeByBranch
             | PublicSurfaceKind::DirectoryWorkingChange
@@ -870,28 +903,31 @@ mod tests {
                 "lix_file_history",
                 "lix_file_working_change",
                 "lix_file_working_change_by_branch",
-                "lix_working_change",
-                "lix_working_change_by_branch",
+                "lix_working_diff",
+                "lix_working_diff_by_branch",
                 "phase8_entity_history",
             ]
         );
         assert_eq!(
             writable,
             vec![
+                "lix_apply",
                 "lix_branch",
+                "lix_create_checkpoint",
                 "lix_directory",
                 "lix_directory_by_branch",
                 "lix_file",
                 "lix_file_by_branch",
+                "lix_revert",
                 "phase8_entity",
                 "phase8_entity_by_branch",
             ]
         );
         assert_eq!(read_only.len() + writable.len(), catalog.surfaces().count());
-        assert_eq!(all_read + writable.len(), 26, "previous construction count");
+        assert_eq!(all_read + writable.len(), 32, "previous construction count");
         assert_eq!(
             read_only.len() + writable.len(),
-            19,
+            22,
             "new construction count"
         );
     }
@@ -910,7 +946,7 @@ mod tests {
             .map(|surface| surface.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(all_writable, 5, "previous standalone write count");
+        assert_eq!(all_writable, 8, "previous standalone write count");
         assert_eq!(selected_writable, vec!["lix_file"]);
     }
 
@@ -980,12 +1016,12 @@ mod tests {
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_working_change",
+            "lix_working_diff",
             working_change::working_change_schema(false),
         );
         assert_surface_schema_matches_provider_schema(
             &catalog,
-            "lix_working_change_by_branch",
+            "lix_working_diff_by_branch",
             working_change::working_change_schema(true),
         );
         assert_surface_schema_matches_provider_schema(
