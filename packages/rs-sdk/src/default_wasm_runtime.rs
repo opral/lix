@@ -23,6 +23,8 @@ use wasmtime_wasi::{
 
 #[path = "default_wasm_runtime_v2.rs"]
 mod v2_runtime;
+#[path = "default_wasm_runtime_v3.rs"]
+mod v3_runtime;
 
 const COMPILED_COMPONENT_CACHE_CAPACITY: usize = 16;
 const MAX_PLUGIN_INSTANCES: usize = 64;
@@ -394,6 +396,14 @@ impl WasmRuntime for WasmtimePluginRuntime {
         limits: WasmLimits,
     ) -> Result<Arc<dyn lix_engine::wasm::v2::WasmComponentV2Factory>, LixError> {
         v2_runtime::compile_component(self, bytes, limits).await
+    }
+
+    async fn compile_component_v3(
+        &self,
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn lix_engine::wasm::v3::WasmComponentV3Factory>, LixError> {
+        v3_runtime::compile_component(self, bytes, limits).await
     }
 }
 

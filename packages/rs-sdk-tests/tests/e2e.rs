@@ -167,6 +167,18 @@ impl WasmRuntime for HistoryRejectingRuntime {
             "file history must not execute a plugin",
         ))
     }
+
+    async fn compile_component_v3(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn lix_engine::wasm::v3::WasmComponentV3Factory>, LixError> {
+        self.compile_calls.fetch_add(1, Ordering::SeqCst);
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "file history must not execute a plugin",
+        ))
+    }
 }
 
 #[tokio::test]

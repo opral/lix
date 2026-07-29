@@ -492,6 +492,10 @@ impl MapArena {
         self.entries.get(key).map(ByteArena::id)
     }
 
+    pub fn scan(&self, after_key: Option<&[u8]>, max_bytes: usize) -> Result<KeyedPage, Error> {
+        scan_prospective(self, &BTreeMap::new(), after_key, max_bytes)
+    }
+
     fn apply(&self, changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> Self {
         if changes.is_empty() {
             return self.clone();
@@ -780,6 +784,14 @@ pub struct Transaction {
     generation: Option<Arc<str>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyedPage {
+    /// The last key returned when more entries remain. Pass this value as the
+    /// next call's exclusive `after_key`.
+    pub next_key: Option<Vec<u8>>,
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
 impl Transaction {
     pub fn edit_bytes(&mut self, edit: ByteEdit) {
         self.byte_edits.push(edit);
@@ -805,6 +817,53 @@ impl Transaction {
         self.generation = Some(generation.into());
     }
 
+    pub fn file_len(&self) -> Result<u64, Error> {
+        Ok(self.candidate_bytes()?.len())
+    }
+
+    /// Reads the verified prospective file, not the accepted base. The host
+    /// can stage sparse byte edits before the guest runs, and the guest only
+    /// materializes the ranges needed by its format-specific incremental
+    /// parser.
+    pub fn read_file(&self, offset: u64, length: u64) -> Result<Vec<u8>, Error> {
+        self.candidate_bytes()?.read(offset, length)
+    }
+
+    pub fn get_entity(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        get_prospective(&self.base.entities, &self.entity_changes, key)
+    }
+
+    pub fn scan_entities(
+        &self,
+        after_key: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<KeyedPage, Error> {
+        scan_prospective(
+            &self.base.entities,
+            &self.entity_changes,
+            after_key,
+            max_bytes,
+        )
+    }
+
+    pub fn get_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        get_prospective(&self.base.state, &self.state_changes, key)
+    }
+
+    pub fn scan_state(
+        &self,
+        after_key: Option<&[u8]>,
+        max_bytes: usize,
+    ) -> Result<KeyedPage, Error> {
+        scan_prospective(&self.base.state, &self.state_changes, after_key, max_bytes)
+    }
+
+    fn candidate_bytes(&self) -> Result<ByteArena, Error> {
+        let mut edits = self.byte_edits.clone();
+        edits.sort_by_key(|edit| edit.offset);
+        self.base.bytes.apply(&edits)
+    }
+
     pub fn commit(mut self) -> Result<Root, Error> {
         self.byte_edits.sort_by_key(|edit| edit.offset);
         let bytes = self.base.bytes.apply(&self.byte_edits)?;
@@ -819,6 +878,69 @@ impl Transaction {
     }
 }
 
+fn get_prospective(
+    base: &MapArena,
+    changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, Error> {
+    match changes.get(key) {
+        Some(value) => Ok(value.clone()),
+        None => base.get(key),
+    }
+}
+
+fn scan_prospective(
+    base: &MapArena,
+    changes: &BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+    after_key: Option<&[u8]>,
+    max_bytes: usize,
+) -> Result<KeyedPage, Error> {
+    if max_bytes == 0 {
+        return Err(Error::LimitExceeded);
+    }
+    let mut keys = BTreeMap::<Vec<u8>, ()>::new();
+    for key in base.entries.keys().chain(changes.keys()) {
+        if after_key.is_none_or(|after| key.as_slice() > after) {
+            keys.insert(key.clone(), ());
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut bytes = 0usize;
+    let mut has_more = false;
+    for key in keys.keys() {
+        let Some(value) = get_prospective(base, changes, key)? else {
+            continue;
+        };
+        let entry_bytes = key
+            .len()
+            .checked_add(value.len())
+            .ok_or(Error::RangeOverflow)?;
+        if entry_bytes > max_bytes && entries.is_empty() {
+            return Err(Error::LimitExceeded);
+        }
+        if bytes
+            .checked_add(entry_bytes)
+            .is_none_or(|total| total > max_bytes)
+        {
+            has_more = true;
+            break;
+        }
+        bytes += entry_bytes;
+        entries.push((key.clone(), value));
+    }
+    Ok(KeyedPage {
+        next_key: has_more.then(|| {
+            entries
+                .last()
+                .expect("a remaining entry implies one entry fit")
+                .0
+                .clone()
+        }),
+        entries,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     CorruptArchive,
@@ -828,6 +950,7 @@ pub enum Error {
     MissingPage(Digest),
     RangeOutOfBounds,
     RangeOverflow,
+    LimitExceeded,
 }
 
 impl fmt::Display for Error {
@@ -894,6 +1017,59 @@ mod tests {
         assert!(matches!(transaction.commit(), Err(Error::InvalidEdits)));
         assert_eq!(root.id(), original);
         assert!(root.entities.get(b"row/2").unwrap().is_none());
+    }
+
+    #[test]
+    fn transaction_reads_verified_successor_without_publishing_it() {
+        let (store, root) = fixture();
+        let mut transaction = root.transaction();
+        transaction.edit_bytes(ByteEdit {
+            offset: 4,
+            delete_len: 4,
+            insert: b"WXYZ".to_vec(),
+        });
+        transaction.upsert_entity(b"row/2".to_vec(), b"{\"id\":2}".to_vec());
+        transaction.delete_entity(b"row/1".to_vec());
+        transaction.put_state(b"index/1".to_vec(), b"row/2@4".to_vec());
+
+        store.reset_metrics();
+        assert_eq!(transaction.file_len().unwrap(), 12);
+        assert_eq!(transaction.read_file(3, 6).unwrap(), b"dWXYZi");
+        assert_eq!(store.metrics().page_bytes_read, 6);
+        assert_eq!(transaction.get_entity(b"row/1").unwrap(), None);
+        assert_eq!(
+            transaction.get_entity(b"row/2").unwrap(),
+            Some(b"{\"id\":2}".to_vec())
+        );
+        assert_eq!(
+            transaction.get_state(b"index/1").unwrap(),
+            Some(b"row/2@4".to_vec())
+        );
+
+        // Prospective reads do not mutate the accepted root.
+        assert_eq!(
+            root.bytes.read(0, root.bytes.len()).unwrap(),
+            b"abcdefghijkl"
+        );
+        assert!(root.entities.get(b"row/2").unwrap().is_none());
+    }
+
+    #[test]
+    fn transaction_scans_prospective_maps_in_bounded_stable_pages() {
+        let (_store, root) = fixture();
+        let mut transaction = root.transaction();
+        transaction.delete_entity(b"row/1".to_vec());
+        transaction.upsert_entity(b"row/2".to_vec(), b"two".to_vec());
+        transaction.upsert_entity(b"row/3".to_vec(), b"three".to_vec());
+
+        let first = transaction.scan_entities(None, 8).unwrap();
+        assert_eq!(first.entries, vec![(b"row/2".to_vec(), b"two".to_vec())]);
+        assert_eq!(first.next_key, Some(b"row/2".to_vec()));
+        let second = transaction
+            .scan_entities(first.next_key.as_deref(), 10)
+            .unwrap();
+        assert_eq!(second.entries, vec![(b"row/3".to_vec(), b"three".to_vec())]);
+        assert_eq!(second.next_key, None);
     }
 
     #[test]

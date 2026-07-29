@@ -3404,6 +3404,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix_plugin_api_v3"
+version = "0.8.4"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "lix_plugin_arena"
 version = "0.8.4"
 dependencies = [
@@ -3440,6 +3447,7 @@ dependencies = [
  "lru",
  "mimalloc",
  "notify-debouncer-full",
+ "plugin_arena_fixture_v3",
  "plugin_csv_v2",
  "rusqlite",
  "serde_json",
@@ -4273,6 +4281,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51bae2ac328883f7acdfea3d66a7c35751187f870bc81f94563733a154d7a670"
 dependencies = [
  "plotters-backend",
+]
+
+[[package]]
+name = "plugin_arena_fixture_v3"
+version = "0.8.4"
+dependencies = [
+ "lix_plugin_api_v3",
 ]
 
 [[package]]

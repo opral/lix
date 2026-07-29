@@ -1,0 +1,19 @@
+[package]
+name = "lix_plugin_api_v3"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Author-facing Rust API for Lix Wasm Component v3 plugins"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+wit-bindgen = "0.57"

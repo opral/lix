@@ -1,7 +1,5 @@
 package lix:plugin@3.0.0;
 
-/// Host-owned immutable arenas. Resource handles are capabilities scoped to
-/// one plugin generation; they never expose storage addresses or host memory.
 interface arena {
   type bytes = list<u8>;
 
@@ -25,18 +23,11 @@ interface arena {
     remaining-nanoseconds: func() -> u64;
   }
 
-  record page {
-    ordinal: u64,
-    bytes: bytes,
-  }
-
   record keyed-page {
     next-key: option<bytes>,
     entries: list<tuple<bytes, bytes>>,
   }
 
-  /// One accepted immutable version. The host may evict decoded pages while
-  /// retaining the content-addressed root in durable storage.
   resource root {
     generation: func() -> string;
     file-len: func() -> u64;
@@ -65,11 +56,6 @@ interface arena {
     ) -> result<keyed-page, arena-error>;
   }
 
-  /// Host-staged successor. It is initially a structural alias of `before`
-  /// with the already verified candidate file rope. Guest calls may replace
-  /// only opaque state keys. The host applies validated semantic output to the
-  /// entity arena and publishes all three arenas as one root after every
-  /// output cursor reaches valid EOF. Dropping this resource rolls back.
   resource transaction {
     file-len: func() -> result<u64, arena-error>;
     read-file: func(
@@ -126,9 +112,6 @@ interface api {
     generation: string,
   }
 
-  /// Deterministic UUIDv7 namespace allocated by the host for one transition.
-  /// Plugins derive IDs by stable local ordinal; the seed contains no host
-  /// storage address or mutable global state.
   record create-context {
     high: u64,
     low: u64,
@@ -164,8 +147,6 @@ interface api {
   }
 
   resource change-cursor {
-    /// Returns complete sparse changes. `some([])` is invalid; keys are unique
-    /// over the complete cursor and EOF is permanent.
     next: func(
       budget: borrow<budget>,
       max-bytes: u32,
@@ -173,7 +154,6 @@ interface api {
   }
 
   resource edit-cursor {
-    /// All coordinates address the immutable accepted base in `root`.
     next: func(
       budget: borrow<budget>,
       max-bytes: u32,
@@ -222,9 +202,6 @@ interface api {
     creates: create-context,
   }
 
-  /// v3 has no guest-owned document resource. Every accepted version is a
-  /// host root; every operation returns a transaction that can publish exactly
-  /// one immutable successor after sparse output validation.
   open-file: func(budget: borrow<budget>, input: open-file-input)
     -> result<file-transition, plugin-error>;
   file-changed: func(budget: borrow<budget>, input: file-update)

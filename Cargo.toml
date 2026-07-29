@@ -32,6 +32,7 @@ lix_sqlite_storage = { path = "packages/sqlite-storage", version = "0.8.4" }
 lix_js_sdk = { path = "packages/js-sdk", version = "0.8.4" }
 lix_order_key = { path = "plugins/order-key", version = "0.8.4" }
 lix_plugin_api_v2 = { path = "packages/plugin-api", version = "0.8.4" }
+lix_plugin_api_v3 = { path = "packages/plugin-api-v3", version = "0.8.4" }
 lix_plugin_arena = { path = "packages/plugin-arena", version = "0.8.4" }
 lix_sdk = { path = "packages/rs-sdk", version = "0.8.4" }
 lix_server_protocol = { path = "packages/server-protocol", version = "0.8.4" }

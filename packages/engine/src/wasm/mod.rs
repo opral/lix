@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use crate::LixError;
 
 mod component_v2;
+mod component_v3;
 
 pub use component_v2::*;
+pub use component_v3::*;
 
 /// Public path for Component v2 runtime implementations.
 ///
@@ -20,9 +22,10 @@ pub mod v2 {
 /// Unlike v2 document handles, these values are independent of a Wasm Store
 /// and remain valid across branch switches, actor eviction, and cold reopen.
 pub mod v3 {
+    pub use super::component_v3::*;
     pub use lix_plugin_arena::{
-        Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
-        PerformanceMeasurement, REQUIRED_V3_MEMORY_REDUCTION, REQUIRED_V3_SPEEDUP, Root,
+        Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, KeyedPage, MapArena,
+        Metrics, PerformanceMeasurement, REQUIRED_V3_MEMORY_REDUCTION, REQUIRED_V3_SPEEDUP, Root,
         StatePageLayout, Store, Transaction, compare_to_v2,
     };
 }
@@ -62,6 +65,12 @@ pub trait WasmRuntime: Send + Sync {
         bytes: Vec<u8>,
         limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError>;
+
+    async fn compile_component_v3(
+        &self,
+        bytes: Vec<u8>,
+        limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentV3Factory>, LixError>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -77,6 +86,17 @@ impl WasmRuntime for UnsupportedWasmRuntime {
         Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             "plugin execution requires a configured WASM component v2 runtime",
+        ))
+    }
+
+    async fn compile_component_v3(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentV3Factory>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "plugin execution requires a configured WASM component v3 runtime",
         ))
     }
 }

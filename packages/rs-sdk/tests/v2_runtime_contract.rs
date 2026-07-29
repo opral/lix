@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use lix_sdk::{
     LixError, Memory, OpenLixOptions, WasmByteOutputsHandle, WasmChangeCursorHandle,
-    WasmChangePage, WasmComponentV2Actor, WasmComponentV2Factory, WasmDocumentHandle,
-    WasmEditCursorHandle, WasmEditPage, WasmEntityTransition, WasmEntityUpdate, WasmFileTransition,
-    WasmFileUpdate, WasmLimits, WasmOpenEntitiesInput, WasmOpenFileInput, WasmRuntime,
-    WasmTransitionHandle, WasmTransitionLimits, open_lix,
+    WasmChangePage, WasmComponentV2Actor, WasmComponentV2Factory, WasmComponentV3Factory,
+    WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage, WasmEntityTransition, WasmEntityUpdate,
+    WasmFileTransition, WasmFileUpdate, WasmLimits, WasmOpenEntitiesInput, WasmOpenFileInput,
+    WasmRuntime, WasmTransitionHandle, WasmTransitionLimits, open_lix,
 };
 
 struct EmbeddingRuntime;
@@ -20,6 +20,17 @@ impl WasmRuntime for EmbeddingRuntime {
         _limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
         Ok(Arc::new(EmbeddingFactory))
+    }
+
+    async fn compile_component_v3(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentV3Factory>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "the v2 embedding fixture does not compile v3 components",
+        ))
     }
 }
 

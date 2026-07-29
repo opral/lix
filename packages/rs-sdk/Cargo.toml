@@ -41,6 +41,7 @@ tokio = { version = "1", features = ["rt", "sync"] }
 
 [dev-dependencies]
 plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_arena_fixture_v3 = { path = "../../plugins/arena-fixture-v3", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 criterion = { package = "codspeed-criterion-compat", version = "4" }
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

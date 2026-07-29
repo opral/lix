@@ -74,6 +74,35 @@ v2/v3 measurement order, and reports per-operation distributions:
 | JSON | 160.260 / 177.839 µs | 32.779 / 40.240 µs | 4.419× | 2.000× | fail memory |
 | Excalidraw | 161.040 / 177.889 µs | 32.710 / 40.530 µs | 4.389× | 2.000× | fail memory |
 
+## Real v3 Component runtime control
+
+The arena is now bound through the actual Wasmtime Component Model and v3 WIT.
+A minimal guest with the same 10,485,760-byte input size performs 100 warmups
+and 2,000 measured one-byte transitions. Each transition crosses the exported
+guest function, reads the verified prospective transaction, drains a guest
+change cursor to permanent EOF, applies the complete entity snapshot, commits
+opaque state and bytes atomically, and reports the Wasmtime linear-memory high
+water.
+
+| input | v3 p50 | v3 p95 | host unique arena | guest high water | total owned | reduction vs v2 JSON total | boundary | file bytes read |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10,485,760 B | 780.825 µs | 1,019.114 µs | 10,485,789 B | 1,179,648 B | 11,665,437 B | 3.185× | 50 B | 1 B |
+
+This control clears both architectural targets: its p95 is 5.397× faster than
+the 5.500 ms verified-splice v2 JSON engine control, and its total ownership is
+below the 12,386,304-byte memory ceiling. It is not the JSON acceptance row:
+the control has one synthetic entity and a tiny state page. The production
+JSON port must retain its 39,870-property schema granularity and prove the same
+result with its real lexical-span, parent, and identity pages.
+
+Reproduction:
+
+```sh
+cargo test -p lix_sdk --lib \
+  v3_component_ten_mib_sparse_edit_benchmark \
+  --release -- --ignored --nocapture
+```
+
 Reproduction:
 
 ```sh
@@ -106,14 +135,13 @@ Wasm heap cannot hide host duplication.
 
 ## Decision
 
-The immutable host arena design passes its prototype correctness gates. It is
-**not yet accepted as the production v3 hard cut**: its conservative retained
-byte model improves by only 2×, below the required 3×, and the scorecard does
-not include a Wasmtime v3 binding or format-specific page codecs. The rope-only
-latency result cannot prove the required 2× end-to-end p95.
+The immutable host arena design and real Wasmtime v3 binding pass their
+architectural correctness and 2×/3× control gates. It is **not yet accepted as
+the production v3 hard cut**: the control is not a format port and therefore
+does not include JSON's real semantic rows or format-specific state pages.
 
 Accordingly this prototype keeps the production v2 runtime selected. The next
-implementation step is to bind the parsed WIT transaction/root resources in
-Wasmtime and move each declared format state page behind those resources.
-Changing plugin manifests to v3 before that evidence would violate the stated
-acceptance rule.
+implementation step is to move JSON's declared state pages behind the now-real
+transaction/root resources, followed by Markdown, CSV, and Excalidraw.
+Changing plugin manifests to v3 before those format rows pass would violate the
+stated acceptance rule.

@@ -1,0 +1,22 @@
+[package]
+name = "plugin_arena_fixture_v3"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "End-to-end Component fixture for the Lix Plugin API v3 arena runtime"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+lix_plugin_api_v3 = { workspace = true }
