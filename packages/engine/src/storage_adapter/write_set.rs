@@ -382,6 +382,37 @@ impl StorageWriteSet {
             .stage_delete(key.0);
     }
 
+    /// Stages delete keys in one contiguous retained buffer.
+    ///
+    /// Large maintenance sweeps should use this path instead of retaining one
+    /// separately allocated [`Bytes`] buffer per key.
+    pub fn delete_batch<S, I, K>(&mut self, space: S, keys: I)
+    where
+        S: IntoStorageSpace,
+        I: IntoIterator<Item = K>,
+        K: IntoStorageKey,
+    {
+        let mut key_bytes = Vec::new();
+        let mut deletes = Vec::new();
+        for key in keys {
+            let key = key.into_storage_key();
+            let start = key_bytes.len();
+            key_bytes.extend_from_slice(&key.0);
+            deletes.push(BufferRange::new(start, key_bytes.len() - start));
+        }
+        if deletes.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::new(),
+            Vec::new(),
+            deletes,
+        )
+        .expect("delete ranges originate in the supplied encoded key buffer");
+        self.stage_encoded_batch(space.into_storage_space(), batch);
+    }
+
     /// Reserves capacity for a storage space's grouped puts and deletes.
     ///
     /// This is most useful with canonical construction, where domain stores can
@@ -1157,6 +1188,32 @@ mod tests {
                 .map(|key| key.0.as_ptr() as usize)
                 .collect::<Vec<_>>(),
             delete_key_pointers
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_batch_retains_one_contiguous_key_buffer() {
+        let mut writes = StorageWriteSet::new();
+        writes.delete_batch(space(), [key("c"), key("a"), key("b")]);
+
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.delete_descriptors, 3);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, 3);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower contiguous delete batch");
+        let (_, deletes) = backend.deletes.pop().expect("one delete batch");
+        assert_eq!(
+            deletes.into_iter().map(|key| key.0).collect::<Vec<_>>(),
+            [
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c")
+            ]
         );
     }
 
