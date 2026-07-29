@@ -5,8 +5,9 @@ use std::time::{Duration, Instant};
 use lix_engine::storage::Storage;
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::tracked_state::bench::{
-    BenchLayoutAccounting, load_packed_change, packed_history_layout, scan_packed_history,
-    seed_packed_history,
+    BenchLayoutAccounting, BenchPackedHistoryOptions, BenchPackedHistoryPayload,
+    BenchPackedHistoryShape, load_packed_change, packed_history_layout, scan_packed_history,
+    seed_packed_history_with_options,
 };
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
@@ -17,6 +18,8 @@ const DEFAULT_STORAGE_BATCH_CHANGES: usize = 100_000;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_SAMPLES: usize = 5;
 const DEFAULT_EXACT_SAMPLES: usize = 1_001;
+const DEFAULT_LIVE_ENTITIES: usize = 10_000;
+const DEFAULT_LARGE_PAYLOAD_BYTES: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -44,6 +47,13 @@ fn main() {
 async fn run() {
     let changes = env_usizes("LIX_PACKED_HISTORY_CHANGES", DEFAULT_CHANGES);
     let commit_widths = env_usizes("LIX_PACKED_HISTORY_COMMIT_WIDTHS", DEFAULT_COMMIT_WIDTHS);
+    let shapes = env_shapes();
+    let payloads = env_payloads();
+    let live_entities = env_usize("LIX_PACKED_HISTORY_LIVE_ENTITIES", DEFAULT_LIVE_ENTITIES);
+    let large_payload_bytes = env_usize(
+        "LIX_PACKED_HISTORY_LARGE_PAYLOAD_BYTES",
+        DEFAULT_LARGE_PAYLOAD_BYTES,
+    );
     let storage_batch_changes = env_usize(
         "LIX_PACKED_HISTORY_STORAGE_BATCH_CHANGES",
         DEFAULT_STORAGE_BATCH_CHANGES,
@@ -53,6 +63,7 @@ async fn run() {
     let exact_samples = env_usize("LIX_PACKED_HISTORY_EXACT_SAMPLES", DEFAULT_EXACT_SAMPLES).max(1);
     let flush = env_bool("LIX_PACKED_HISTORY_FLUSH", true);
     let memtable_flush = env_bool("LIX_PACKED_HISTORY_MEMTABLE_FLUSH", false);
+    let settle_ms = env_nonnegative_usize("LIX_PACKED_HISTORY_SETTLE_MS", 0) as u64;
     let account_layout = env_bool("LIX_PACKED_HISTORY_ACCOUNT_LAYOUT", true);
     let skip_seed = env_bool("LIX_PACKED_HISTORY_SKIP_SEED", false);
     let persistent_root = std::env::var_os("LIX_PACKED_HISTORY_STORAGE_PATH").map(PathBuf::from);
@@ -66,6 +77,16 @@ async fn run() {
             commit_widths.len(),
             1,
             "persistent storage requires one commit width"
+        );
+        assert_eq!(
+            shapes.len(),
+            1,
+            "persistent storage requires one history shape"
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "persistent storage requires one payload shape"
         );
     }
 
@@ -81,67 +102,86 @@ async fn run() {
                     );
                     continue;
                 }
-                match backend {
-                    Backend::RocksDB => {
-                        let dir = tempfile::tempdir().expect("create RocksDB benchmark directory");
-                        let path = persistent_root.as_ref().map_or_else(
-                            || dir.path().join("rocksdb"),
-                            |root| root.join("rocksdb"),
-                        );
-                        let storage = RocksDB::open(&path).expect("open benchmark RocksDB");
-                        run_case(
-                            backend,
-                            storage.clone(),
-                            &path,
-                            change_count,
-                            commit_width,
-                            storage_batch_changes,
-                            warmups,
-                            samples,
-                            exact_samples,
-                            flush,
-                            false,
-                            account_layout,
-                            skip_seed,
-                            || async {
-                                storage.flush().expect("flush benchmark RocksDB");
-                            },
-                        )
-                        .await;
-                    }
-                    Backend::SlateDB => {
-                        let dir = tempfile::tempdir().expect("create SlateDB benchmark directory");
-                        let path = persistent_root.as_ref().map_or_else(
-                            || dir.path().join("slatedb"),
-                            |root| root.join("slatedb"),
-                        );
-                        let storage = SlateDB::open(&path).expect("open benchmark SlateDB");
-                        run_case(
-                            backend,
-                            storage.clone(),
-                            &path,
-                            change_count,
-                            commit_width,
-                            storage_batch_changes,
-                            warmups,
-                            samples,
-                            exact_samples,
-                            flush,
-                            memtable_flush,
-                            account_layout,
-                            skip_seed,
-                            || async {
-                                if memtable_flush {
-                                    storage
-                                        .flush_memtable_for_diagnostics()
-                                        .await
-                                        .expect("flush benchmark SlateDB memtable");
-                                } else {
-                                    storage.flush().await.expect("flush benchmark SlateDB WAL");
-                                }
-                            },
-                        )
-                        .await;
+                for &shape in &shapes {
+                    for &payload in &payloads {
+                        match backend {
+                            Backend::RocksDB => {
+                                let dir = tempfile::tempdir()
+                                    .expect("create RocksDB benchmark directory");
+                                let path = persistent_root.as_ref().map_or_else(
+                                    || dir.path().join("rocksdb"),
+                                    |root| root.join("rocksdb"),
+                                );
+                                let storage = RocksDB::open(&path).expect("open benchmark RocksDB");
+                                run_case(
+                                    backend,
+                                    storage.clone(),
+                                    &path,
+                                    change_count,
+                                    commit_width,
+                                    shape,
+                                    payload,
+                                    live_entities,
+                                    large_payload_bytes,
+                                    storage_batch_changes,
+                                    warmups,
+                                    samples,
+                                    exact_samples,
+                                    flush,
+                                    false,
+                                    settle_ms,
+                                    account_layout,
+                                    skip_seed,
+                                    || async {
+                                        storage.flush().expect("flush benchmark RocksDB");
+                                    },
+                                )
+                                .await;
+                            }
+                            Backend::SlateDB => {
+                                let dir = tempfile::tempdir()
+                                    .expect("create SlateDB benchmark directory");
+                                let path = persistent_root.as_ref().map_or_else(
+                                    || dir.path().join("slatedb"),
+                                    |root| root.join("slatedb"),
+                                );
+                                let storage = SlateDB::open(&path).expect("open benchmark SlateDB");
+                                run_case(
+                                    backend,
+                                    storage.clone(),
+                                    &path,
+                                    change_count,
+                                    commit_width,
+                                    shape,
+                                    payload,
+                                    live_entities,
+                                    large_payload_bytes,
+                                    storage_batch_changes,
+                                    warmups,
+                                    samples,
+                                    exact_samples,
+                                    flush,
+                                    memtable_flush,
+                                    settle_ms,
+                                    account_layout,
+                                    skip_seed,
+                                    || async {
+                                        if memtable_flush {
+                                            storage
+                                                .flush_memtable_for_diagnostics()
+                                                .await
+                                                .expect("flush benchmark SlateDB memtable");
+                                        } else {
+                                            storage
+                                                .flush()
+                                                .await
+                                                .expect("flush benchmark SlateDB WAL");
+                                        }
+                                    },
+                                )
+                                .await;
+                            }
+                        }
                     }
                 }
             }
@@ -156,12 +196,17 @@ async fn run_case<S, Flush, FlushFuture>(
     storage_path: &Path,
     changes: usize,
     commit_width: usize,
+    shape: BenchPackedHistoryShape,
+    payload: BenchPackedHistoryPayload,
+    live_entities: usize,
+    large_payload_bytes: usize,
     storage_batch_changes: usize,
     warmups: usize,
     samples: usize,
     exact_samples: usize,
     flush: bool,
     memtable_flush: bool,
+    settle_ms: u64,
     account_layout: bool,
     skip_seed: bool,
     flush_storage: Flush,
@@ -174,14 +219,33 @@ async fn run_case<S, Flush, FlushFuture>(
     let id_shape =
         std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").unwrap_or_else(|_| "deterministic".into());
     let seed_started = Instant::now();
+    let shared_large_payload = matches!(payload, BenchPackedHistoryPayload::SharedLarge)
+        .then(|| format!(r#"{{"payload":"{}"}}"#, "x".repeat(large_payload_bytes)));
     let writes = if skip_seed {
         None
     } else {
-        Some(seed_packed_history(&adapter, changes, commit_width, storage_batch_changes).await)
+        Some(
+            seed_packed_history_with_options(
+                &adapter,
+                changes,
+                commit_width,
+                storage_batch_changes,
+                BenchPackedHistoryOptions {
+                    shape,
+                    payload,
+                    live_entities,
+                    shared_large_payload: shared_large_payload.as_deref(),
+                },
+            )
+            .await,
+        )
     };
     let seed_elapsed = seed_started.elapsed();
     if flush {
         flush_storage().await;
+    }
+    if settle_ms > 0 {
+        tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     }
     let backend_bytes = directory_bytes(storage_path);
 
@@ -217,18 +281,25 @@ async fn run_case<S, Flush, FlushFuture>(
     let manifest = find_layout(&layout, "tracked_state.commit_delta_manifest.v2");
     let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v2");
     let locators = find_layout(&layout, "tracked_state.change_locator.v1");
+    let json_payloads = find_layout(&layout, "json_store.json");
 
     println!(
-        "packed_history_scale,backend={backend},id_shape={id_shape},changes={changes},commits={},commit_width={commit_width},\
+        "packed_history_scale,backend={backend},id_shape={id_shape},history_shape={},payload_shape={},\
+         live_entities={live_entities},large_payload_bytes={large_payload_bytes},\
+         changes={changes},commits={},commit_width={commit_width},\
          storage_batch_changes={storage_batch_changes},flushed={flush},warmups={warmups},samples={samples},\
-         memtable_flushed={memtable_flush},skip_seed={skip_seed},\
+         memtable_flushed={memtable_flush},settle_ms={settle_ms},skip_seed={skip_seed},\
          layout_accounted={account_layout},\
          exact_samples={exact_samples},seed_ms={},ingest_changes_per_second={:.1},staged_puts={},logical_written_bytes={},\
          scan_p50_ms={},scan_p95_ms={},scan_p99_ms={},\
          exact_p50_ms={},exact_p95_ms={},exact_p99_ms={},\
          manifest_keys={},manifest_key_bytes={},manifest_value_bytes={},\
          segment_keys={},segment_key_bytes={},segment_value_bytes={},\
-         locator_keys={},locator_key_bytes={},locator_value_bytes={},backend_bytes={backend_bytes}",
+         locator_keys={},locator_key_bytes={},locator_value_bytes={},\
+         json_payload_keys={},json_payload_key_bytes={},json_payload_value_bytes={},\
+         backend_bytes={backend_bytes}",
+        shape_name(shape),
+        payload_name(payload),
         writes.map_or_else(|| changes / commit_width, |writes| writes.commits),
         seed_elapsed.as_millis(),
         changes as f64 / seed_elapsed.as_secs_f64(),
@@ -249,6 +320,9 @@ async fn run_case<S, Flush, FlushFuture>(
         locators.rows,
         locators.key_bytes,
         locators.value_bytes,
+        json_payloads.rows,
+        json_payloads.key_bytes,
+        json_payloads.value_bytes,
     );
 }
 
@@ -273,6 +347,67 @@ fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
 
 fn millis(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000.0
+}
+
+fn shape_name(shape: BenchPackedHistoryShape) -> &'static str {
+    match shape {
+        BenchPackedHistoryShape::UniqueInserts => "unique_inserts",
+        BenchPackedHistoryShape::RepeatedUpdates => "repeated_updates",
+        BenchPackedHistoryShape::DeleteReinsert => "delete_reinsert",
+    }
+}
+
+fn payload_name(payload: BenchPackedHistoryPayload) -> &'static str {
+    match payload {
+        BenchPackedHistoryPayload::None => "none",
+        BenchPackedHistoryPayload::SmallInline => "small_inline",
+        BenchPackedHistoryPayload::SharedLarge => "shared_large",
+    }
+}
+
+fn env_shapes() -> Vec<BenchPackedHistoryShape> {
+    env_named_values(
+        "LIX_PACKED_HISTORY_SHAPES",
+        &[BenchPackedHistoryShape::UniqueInserts],
+        |value| match value {
+            "unique" | "unique_inserts" => Some(BenchPackedHistoryShape::UniqueInserts),
+            "repeated" | "repeated_updates" => Some(BenchPackedHistoryShape::RepeatedUpdates),
+            "delete_reinsert" | "deletes_reinserts" => {
+                Some(BenchPackedHistoryShape::DeleteReinsert)
+            }
+            _ => None,
+        },
+    )
+}
+
+fn env_payloads() -> Vec<BenchPackedHistoryPayload> {
+    env_named_values(
+        "LIX_PACKED_HISTORY_PAYLOADS",
+        &[BenchPackedHistoryPayload::None],
+        |value| match value {
+            "none" => Some(BenchPackedHistoryPayload::None),
+            "small" | "small_inline" => Some(BenchPackedHistoryPayload::SmallInline),
+            "large" | "shared_large" => Some(BenchPackedHistoryPayload::SharedLarge),
+            _ => None,
+        },
+    )
+}
+
+fn env_named_values<T: Copy>(
+    name: &str,
+    default: &[T],
+    parse: impl Fn(&str) -> Option<T>,
+) -> Vec<T> {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|value| parse(value.trim()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|values| !values.is_empty())
+        .unwrap_or_else(|| default.to_vec())
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

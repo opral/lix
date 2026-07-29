@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
@@ -39,6 +40,7 @@ use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
@@ -57,7 +59,10 @@ const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
 const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
-const DEFAULT_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+// Keep indexes and Bloom filters resident across batched point validation.
+// A tiny metadata cache repeatedly fetched multi-megabyte filters once the
+// repository crossed the first large-SST boundary.
+const DEFAULT_METADATA_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
@@ -120,9 +125,25 @@ pub struct SlateDBCacheOptions {
     pub metadata_cache_bytes: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone)]
 pub struct SlateDBIoCounters {
     inner: Arc<SlateDBIoCounterValues>,
+    metrics: Arc<DefaultMetricsRecorder>,
+}
+
+impl fmt::Debug for SlateDBIoCounters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("SlateDBIoCounters").finish()
+    }
+}
+
+impl Default for SlateDBIoCounters {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            metrics: Arc::new(DefaultMetricsRecorder::new()),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +156,19 @@ struct SlateDBIoCounterValues {
     listed_objects: AtomicU64,
     deleted_objects: AtomicU64,
     copied_objects: AtomicU64,
+    wal: SlateDBIoCategoryCounters,
+    compacted: SlateDBIoCategoryCounters,
+    manifest: SlateDBIoCategoryCounters,
+    compactions: SlateDBIoCategoryCounters,
+    other: SlateDBIoCategoryCounters,
+}
+
+#[derive(Debug, Default)]
+struct SlateDBIoCategoryCounters {
+    read_objects: AtomicU64,
+    read_bytes: AtomicU64,
+    write_objects: AtomicU64,
+    write_bytes: AtomicU64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -147,10 +181,34 @@ pub struct SlateDBIoSnapshot {
     pub listed_objects: u64,
     pub deleted_objects: u64,
     pub copied_objects: u64,
+    pub wal: SlateDBIoCategorySnapshot,
+    pub compacted: SlateDBIoCategorySnapshot,
+    pub manifest: SlateDBIoCategorySnapshot,
+    pub compactions: SlateDBIoCategorySnapshot,
+    pub other: SlateDBIoCategorySnapshot,
+    pub main: SlateDBIoComponentSnapshot,
+    pub reader: SlateDBIoComponentSnapshot,
+    pub compactor: SlateDBIoComponentSnapshot,
+    pub gc: SlateDBIoComponentSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlateDBIoCategorySnapshot {
+    pub read_objects: u64,
+    pub read_bytes: u64,
+    pub write_objects: u64,
+    pub write_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlateDBIoComponentSnapshot {
+    pub read_requests: u64,
+    pub write_requests: u64,
 }
 
 impl SlateDBIoCounters {
     pub fn snapshot(&self) -> SlateDBIoSnapshot {
+        let metrics = self.metrics.snapshot();
         SlateDBIoSnapshot {
             read_objects: self.inner.read_objects.load(Ordering::Relaxed),
             read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
@@ -160,6 +218,70 @@ impl SlateDBIoCounters {
             listed_objects: self.inner.listed_objects.load(Ordering::Relaxed),
             deleted_objects: self.inner.deleted_objects.load(Ordering::Relaxed),
             copied_objects: self.inner.copied_objects.load(Ordering::Relaxed),
+            wal: self.inner.wal.snapshot(),
+            compacted: self.inner.compacted.snapshot(),
+            manifest: self.inner.manifest.snapshot(),
+            compactions: self.inner.compactions.snapshot(),
+            other: self.inner.other.snapshot(),
+            main: component_snapshot(&metrics, "db"),
+            reader: component_snapshot(&metrics, "reader"),
+            compactor: component_snapshot(&metrics, "compactor"),
+            gc: component_snapshot(&metrics, "gc"),
+        }
+    }
+}
+
+fn component_snapshot(
+    metrics: &slatedb_common::metrics::Metrics,
+    component: &str,
+) -> SlateDBIoComponentSnapshot {
+    let mut snapshot = SlateDBIoComponentSnapshot::default();
+    for metric in metrics.by_name("slatedb.object_store.request_count") {
+        let label = |name: &str| {
+            metric
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+        };
+        if label("component") != Some(component) {
+            continue;
+        }
+        let MetricValue::Counter(value) = metric.value else {
+            continue;
+        };
+        match label("op") {
+            Some("get") => snapshot.read_requests = snapshot.read_requests.saturating_add(value),
+            Some("put") => snapshot.write_requests = snapshot.write_requests.saturating_add(value),
+            _ => {}
+        }
+    }
+    snapshot
+}
+
+impl SlateDBIoCounterValues {
+    fn category(&self, location: &ObjectPath) -> &SlateDBIoCategoryCounters {
+        let path = location.as_ref();
+        if path.split('/').any(|part| part == "wal") {
+            &self.wal
+        } else if path.split('/').any(|part| part == "compacted") {
+            &self.compacted
+        } else if path.split('/').any(|part| part == "manifest") {
+            &self.manifest
+        } else if path.split('/').any(|part| part == "compactions") {
+            &self.compactions
+        } else {
+            &self.other
+        }
+    }
+}
+
+impl SlateDBIoCategoryCounters {
+    fn snapshot(&self) -> SlateDBIoCategorySnapshot {
+        SlateDBIoCategorySnapshot {
+            read_objects: self.read_objects.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_objects: self.write_objects.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
         }
     }
 }
@@ -175,6 +297,35 @@ impl SlateDBIoSnapshot {
             listed_objects: self.listed_objects.saturating_sub(earlier.listed_objects),
             deleted_objects: self.deleted_objects.saturating_sub(earlier.deleted_objects),
             copied_objects: self.copied_objects.saturating_sub(earlier.copied_objects),
+            wal: self.wal.saturating_sub(earlier.wal),
+            compacted: self.compacted.saturating_sub(earlier.compacted),
+            manifest: self.manifest.saturating_sub(earlier.manifest),
+            compactions: self.compactions.saturating_sub(earlier.compactions),
+            other: self.other.saturating_sub(earlier.other),
+            main: self.main.saturating_sub(earlier.main),
+            reader: self.reader.saturating_sub(earlier.reader),
+            compactor: self.compactor.saturating_sub(earlier.compactor),
+            gc: self.gc.saturating_sub(earlier.gc),
+        }
+    }
+}
+
+impl SlateDBIoCategorySnapshot {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_objects: self.read_objects.saturating_sub(earlier.read_objects),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            write_objects: self.write_objects.saturating_sub(earlier.write_objects),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+        }
+    }
+}
+
+impl SlateDBIoComponentSnapshot {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_requests: self.read_requests.saturating_sub(earlier.read_requests),
+            write_requests: self.write_requests.saturating_sub(earlier.write_requests),
         }
     }
 }
@@ -199,6 +350,52 @@ struct CountingObjectStore {
     counters: SlateDBIoCounters,
 }
 
+#[derive(Debug)]
+struct CountingMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    counters: SlateDBIoCounters,
+    location: ObjectPath,
+    uploaded_bytes: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl MultipartUpload for CountingMultipartUpload {
+    fn put_part(&mut self, payload: PutPayload) -> object_store::UploadPart {
+        let bytes = payload.content_length() as u64;
+        let uploaded_bytes = Arc::clone(&self.uploaded_bytes);
+        self.inner
+            .put_part(payload)
+            .map(move |result| {
+                if result.is_ok() {
+                    uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                result
+            })
+            .boxed()
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let result = self.inner.complete().await?;
+        let bytes = self.uploaded_bytes.load(Ordering::Relaxed);
+        let category = self.counters.inner.category(&self.location);
+        self.counters
+            .inner
+            .write_objects
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inner
+            .write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        category.write_objects.fetch_add(1, Ordering::Relaxed);
+        category.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
+}
+
 impl fmt::Display for CountingObjectStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "counting {}", self.inner)
@@ -215,6 +412,7 @@ impl ObjectStore for CountingObjectStore {
     ) -> object_store::Result<PutResult> {
         let bytes = payload.content_length() as u64;
         let result = self.inner.put_opts(location, payload, options).await?;
+        let category = self.counters.inner.category(location);
         self.counters
             .inner
             .write_objects
@@ -223,6 +421,8 @@ impl ObjectStore for CountingObjectStore {
             .inner
             .write_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+        category.write_objects.fetch_add(1, Ordering::Relaxed);
+        category.write_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(result)
     }
 
@@ -231,7 +431,13 @@ impl ObjectStore for CountingObjectStore {
         location: &ObjectPath,
         options: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        self.inner.put_multipart_opts(location, options).await
+        let inner = self.inner.put_multipart_opts(location, options).await?;
+        Ok(Box::new(CountingMultipartUpload {
+            inner,
+            counters: self.counters.clone(),
+            location: location.clone(),
+            uploaded_bytes: Arc::new(AtomicU64::new(0)),
+        }))
     }
 
     async fn get_opts(
@@ -240,12 +446,15 @@ impl ObjectStore for CountingObjectStore {
         options: ObjectStoreGetOptions,
     ) -> object_store::Result<GetResult> {
         let mut result = self.inner.get_opts(location, options).await?;
+        let category = self.counters.inner.category(location);
         self.counters
             .inner
             .read_objects
             .fetch_add(1, Ordering::Relaxed);
+        category.read_objects.fetch_add(1, Ordering::Relaxed);
         if let GetResultPayload::Stream(payload) = result.payload {
             let counters = self.counters.clone();
+            let location = location.clone();
             result.payload = GetResultPayload::Stream(
                 payload
                     .map(move |item| {
@@ -254,12 +463,38 @@ impl ObjectStore for CountingObjectStore {
                                 .inner
                                 .read_bytes
                                 .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            counters
+                                .inner
+                                .category(&location)
+                                .read_bytes
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                         }
                         item
                     })
                     .boxed(),
             );
         }
+        Ok(result)
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        let result = self.inner.get_ranges(location, ranges).await?;
+        let bytes = result.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+        let category = self.counters.inner.category(location);
+        self.counters
+            .inner
+            .read_objects
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inner
+            .read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        category.read_objects.fetch_add(1, Ordering::Relaxed);
+        category.read_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(result)
     }
 
@@ -434,6 +669,22 @@ impl ObjectStore for DirectLocalReads {
             attributes: Attributes::default(),
             extensions: Extensions::default(),
         })
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        let mut result = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let options = ObjectStoreGetOptions {
+                range: Some(object_store::GetRange::Bounded(range.clone())),
+                ..ObjectStoreGetOptions::default()
+            };
+            result.push(self.get_opts(location, options).await?.bytes().await?);
+        }
+        Ok(result)
     }
 
     fn delete_stream(
@@ -1245,6 +1496,9 @@ impl SlateDB {
             inner: LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?,
             files: Mutex::new(DirectLocalFileCache::default()),
         });
+        let metrics = counters
+            .as_ref()
+            .map(|counters| Arc::clone(&counters.metrics));
         if let Some(counters) = counters {
             object_store = Arc::new(CountingObjectStore {
                 inner: object_store,
@@ -1256,6 +1510,7 @@ impl SlateDB {
             object_store,
             SlateDBObjectStoreOptions::default(),
             true,
+            metrics,
         )
         .map(|mut storage| {
             storage.path = path;
@@ -1268,7 +1523,7 @@ impl SlateDB {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
     ) -> Result<Self, StorageError> {
-        Self::open_object_store_with_read_dispatch(db_path, object_store, options, false)
+        Self::open_object_store_with_read_dispatch(db_path, object_store, options, false, None)
     }
 
     /// Opens SlateDB with a private current-thread read-dispatch choice.
@@ -1282,6 +1537,7 @@ impl SlateDB {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
         read_on_caller_current_thread: bool,
+        metrics: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Result<Self, StorageError> {
         validate_object_store_options(&options)?;
         let db_path = db_path.into();
@@ -1291,6 +1547,7 @@ impl SlateDB {
                 object_store,
                 options,
                 read_on_caller_current_thread,
+                metrics,
             )?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
@@ -2326,6 +2583,7 @@ impl SlateDBWorker {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
         read_on_caller_current_thread: bool,
+        metrics: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
         let reclamation = InFlightTracker::default();
@@ -2339,6 +2597,7 @@ impl SlateDBWorker {
                     db_path,
                     object_store,
                     options,
+                    metrics,
                     shutdown_rx,
                     opened_tx,
                     manager_in_flight,
@@ -2537,6 +2796,7 @@ fn run_slatedb_manager(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
+    metrics: Option<Arc<DefaultMetricsRecorder>>,
     shutdown: mpsc::Receiver<()>,
     opened: mpsc::Sender<Result<(Handle, Arc<Db>), StorageError>>,
     in_flight: InFlightTracker,
@@ -2555,7 +2815,7 @@ fn run_slatedb_manager(
         }
     };
 
-    let db = match open_slatedb(&runtime, db_path, object_store, options) {
+    let db = match open_slatedb(&runtime, db_path, object_store, options, metrics) {
         Ok(db) => db,
         Err(error) => {
             let _ = opened.send(Err(error));
@@ -2581,11 +2841,15 @@ fn open_slatedb(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
+    metrics: Option<Arc<DefaultMetricsRecorder>>,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
         let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
         let mut builder = Db::builder(physical_db_path, object_store)
             .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor));
+        if let Some(metrics) = metrics {
+            builder = builder.with_metrics_recorder(metrics);
+        }
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
             settings.object_store_cache_options = ObjectStoreCacheOptions {
@@ -3262,27 +3526,76 @@ mod tests {
             .await
             .expect("read counted object");
         assert_eq!(bytes, Bytes::from_static(b"payload"));
+        let ranges = store
+            .get_ranges(&path, &[0..2, 5..7])
+            .await
+            .expect("read counted object ranges");
+        assert_eq!(
+            ranges,
+            vec![Bytes::from_static(b"pa"), Bytes::from_static(b"ad")]
+        );
+        let multipart_path = ObjectPath::from("multipart.sst");
+        let mut multipart = store
+            .put_multipart_opts(&multipart_path, PutMultipartOptions::default())
+            .await
+            .expect("open counted multipart object");
+        multipart
+            .put_part(PutPayload::from_static(b"multi"))
+            .await
+            .expect("write counted multipart part");
+        multipart
+            .put_part(PutPayload::from_static(b"part"))
+            .await
+            .expect("write second counted multipart part");
+        multipart
+            .complete()
+            .await
+            .expect("complete counted multipart object");
         let listed = store
             .list(None)
             .try_collect::<Vec<_>>()
             .await
             .expect("list counted object");
-        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.len(), 2);
         store.delete(&path).await.expect("delete counted object");
 
         assert_eq!(
             counters.snapshot(),
             SlateDBIoSnapshot {
-                read_objects: 1,
-                read_bytes: 7,
-                write_objects: 1,
-                write_bytes: 7,
+                read_objects: 2,
+                read_bytes: 11,
+                write_objects: 2,
+                write_bytes: 16,
                 list_operations: 1,
-                listed_objects: 1,
+                listed_objects: 2,
                 deleted_objects: 1,
                 copied_objects: 0,
+                other: SlateDBIoCategorySnapshot {
+                    read_objects: 2,
+                    read_bytes: 11,
+                    write_objects: 2,
+                    write_bytes: 16,
+                },
+                ..SlateDBIoSnapshot::default()
             }
         );
+    }
+
+    #[test]
+    fn diagnostic_object_store_counters_classify_slatedb_paths() {
+        let counters = SlateDBIoCounterValues::default();
+        for (path, expected) in [
+            ("db/wal/1.sst", &counters.wal),
+            ("db/compacted/1.sst", &counters.compacted),
+            ("db/manifest/1.manifest", &counters.manifest),
+            ("db/compactions/1.compactions", &counters.compactions),
+            ("db/other/file", &counters.other),
+        ] {
+            assert!(std::ptr::eq(
+                counters.category(&ObjectPath::from(path)),
+                expected
+            ));
+        }
     }
 
     #[test]
