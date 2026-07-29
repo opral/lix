@@ -63,6 +63,7 @@ const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 // A tiny metadata cache repeatedly fetched multi-megabyte filters once the
 // repository crossed the first large-SST boundary.
 const DEFAULT_METADATA_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_UNFLUSHED_BYTES: usize = 128 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
@@ -2898,6 +2899,7 @@ fn slatedb_settings() -> Settings {
         .as_mut()
         .expect("default SlateDB settings enable compaction")
         .commit_compacted_interval = COMPACTOR_COMMIT_INTERVAL;
+    settings.max_unflushed_bytes = MAX_UNFLUSHED_BYTES;
     settings
 }
 
@@ -3615,6 +3617,13 @@ mod tests {
             slatedb_settings().compression_codec,
             Some(CompressionCodec::Lz4)
         );
+    }
+
+    #[test]
+    fn bounds_unflushed_memory_to_two_l0_tables() {
+        let settings = slatedb_settings();
+        assert_eq!(settings.max_unflushed_bytes, MAX_UNFLUSHED_BYTES);
+        assert_eq!(settings.max_unflushed_bytes, settings.l0_sst_size_bytes * 2);
     }
 
     #[test]
