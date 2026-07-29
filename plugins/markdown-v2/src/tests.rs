@@ -356,6 +356,102 @@ fn localized_text_edit_emits_one_sparse_complete_entity_upsert() {
 }
 
 #[test]
+fn sequential_localized_edits_read_the_latest_overridden_subtree() {
+    let before = b"Alpha words here\n\nUntouched\n".to_vec();
+    let (document, _) = Document::open_file(
+        before.clone(),
+        Some("sequential.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .unwrap();
+    let words = before
+        .windows(b"words".len())
+        .position(|window| window == b"words")
+        .unwrap();
+    let (first, _) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(words).unwrap(),
+                delete_len: u64::try_from("words".len()).unwrap(),
+                insert: b"localized",
+            }],
+            IdNamespace::from_halves(3, 4),
+        )
+        .unwrap();
+    let first_bytes = first.accepted_bytes();
+    let alpha = first_bytes
+        .windows(b"Alpha".len())
+        .position(|window| window == b"Alpha")
+        .unwrap();
+    let (second, changes) = first
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(alpha).unwrap(),
+                delete_len: 1,
+                insert: b"O",
+            }],
+            IdNamespace::from_halves(5, 6),
+        )
+        .unwrap();
+
+    assert_eq!(
+        second.accepted_bytes(),
+        b"Olpha localized here\n\nUntouched\n"
+    );
+    assert_eq!(changes.len(), 1, "{changes:#?}");
+    let snapshot = changes[0]
+        .snapshot
+        .as_deref()
+        .expect("paragraph remains live");
+    assert_eq!(
+        plain_text_from_snapshot(snapshot),
+        "Olpha localized here",
+        "the second edit must reconcile against the first edit's subtree"
+    );
+}
+
+#[test]
+fn localized_edit_falls_back_when_parser_range_exceeds_source_bytes() {
+    let before = b"```json5\n{}\n```\n\nDuring dev.\n\n## Notes\n\n- Monitor uses polling.\n- Stop with `Ctrl+C`.\n".to_vec();
+    let parsed = parse_markdown_source(std::str::from_utf8(&before).unwrap()).unwrap();
+    assert!(
+        parsed
+            .top_level_ranges
+            .iter()
+            .any(|range| range.end > before.len()),
+        "fixture must retain the parser's virtual final newline: {:?} for {} bytes",
+        parsed.top_level_ranges,
+        before.len()
+    );
+    let (document, _) = Document::open_file(
+        before.clone(),
+        Some("virtual-newline.md"),
+        IdNamespace::from_halves(1, 2),
+    )
+    .unwrap();
+    let offset = before
+        .windows(b"polling".len())
+        .position(|window| window == b"polling")
+        .unwrap();
+    let (after, changes) = document
+        .file_changed(
+            &[InputSplice {
+                offset: u64::try_from(offset).unwrap(),
+                delete_len: 1,
+                insert: b"P",
+            }],
+            IdNamespace::from_halves(3, 4),
+        )
+        .expect("an unsafe localized range must fall back to a full parse");
+
+    assert_eq!(
+        after.accepted_bytes(),
+        b"```json5\n{}\n```\n\nDuring dev.\n\n## Notes\n\n- Monitor uses Polling.\n- Stop with `Ctrl+C`.\n"
+    );
+    assert!(!changes.is_empty());
+}
+
+#[test]
 fn localized_frontmatter_edit_reuses_noncanonical_document_tree() {
     let before =
         b"---\nDateApproved: 6/10/2020\n---\n\n\n# Title\n\nA large untouched suffix.\n".to_vec();
