@@ -4,6 +4,7 @@ use crate::{
 };
 use base64::Engine as _;
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 fn assert_number_free(value: &Value) {
     match value {
@@ -367,7 +368,7 @@ fn incremental_paragraph_edit_preserves_unrelated_entities_after_cold_reopen() {
     let initial_ids = initial_records
         .iter()
         .map(|record| record.entity_pk.clone())
-        .collect::<std::collections::BTreeSet<_>>();
+        .collect::<BTreeSet<_>>();
     let (document, _) = Document::open_entities(initial_records, None).unwrap();
     let offset = source
         .windows(b"Bravo".len())
@@ -550,4 +551,54 @@ fn literal_prose_fast_path_rejects_markdown_syntax_and_noncanonical_layout() {
             "{name} must use the existing canonical-render fallback"
         );
     }
+}
+
+#[test]
+fn parser_uses_compact_transition_local_identities() {
+    fn collect_value_ids(value: &Value, output: &mut Vec<String>) {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::String(id)) = object.get("id") {
+                    output.push(id.clone());
+                }
+                for child in object.values() {
+                    collect_value_ids(child, output);
+                }
+            }
+            Value::Array(array) => {
+                for child in array {
+                    collect_value_ids(child, output);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_tree_ids(tree: &crate::model::NodeTree, output: &mut Vec<String>) {
+        if tree.node.kind != crate::model::NodeKind::Document {
+            output.push(tree.node.id.clone());
+        }
+        collect_value_ids(&tree.node.payload, output);
+        for child in &tree.children {
+            collect_tree_ids(child, output);
+        }
+    }
+
+    let parsed = parse_markdown_source(
+        "# Heading with *emphasis* and [a link](https://example.com)\n\n- list item\n",
+    )
+    .expect("syntax-rich Markdown should parse");
+    let mut ids = Vec::new();
+    collect_tree_ids(&parsed.root, &mut ids);
+
+    assert!(
+        ids.len() >= 5,
+        "fixture should allocate structural and inline ids"
+    );
+    assert!(ids.iter().all(|id| id.starts_with('~') && id.len() <= 9));
+    assert_eq!(
+        ids.iter().collect::<BTreeSet<_>>().len(),
+        ids.len(),
+        "parse-local identities must share one collision-free namespace"
+    );
 }

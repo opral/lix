@@ -162,9 +162,17 @@ impl MarkdownPlugin {
         namespace: IdNamespace,
     ) -> Result<Vec<DetectedChange>, PluginError> {
         let before = Projection::from_entity_state(state.into_iter())?;
+        let before_root = if before.nodes_by_id.is_empty() {
+            None
+        } else {
+            Some(before.to_tree()?)
+        };
+        let before_view = ProjectionView::from_projection(&before);
         let mut after = parse_file(&file)?;
         retain_noncanonical_source(&mut after, &file.data)?;
-        detect_changes_for_markdown(&before, after, namespace)
+        let (changes, _) =
+            detect_changes_for_markdown(&before_view, before_root.as_ref(), after, namespace)?;
+        Ok(changes)
     }
 
     pub fn render(state: Vec<EntityState>) -> Result<Vec<u8>, PluginError> {
@@ -226,18 +234,14 @@ fn render_tree_with_lexical_fallback(root: &NodeTree) -> Result<Vec<u8>, PluginE
 }
 
 fn detect_changes_for_markdown(
-    before: &Projection,
+    before: &ProjectionView<'_>,
+    before_root: Option<&NodeTree>,
     mut after: ParsedMarkdown,
     namespace: IdNamespace,
-) -> Result<Vec<DetectedChange>, PluginError> {
+) -> Result<(Vec<DetectedChange>, NodeTree), PluginError> {
     let generated_ids = collect_generated_ids(&after.root);
-    let before_root = if before.nodes_by_id.is_empty() {
-        None
-    } else {
-        Some(before.to_tree()?)
-    };
     let mut replacements = BTreeMap::new();
-    if let Some(before_root) = &before_root {
+    if let Some(before_root) = before_root {
         let old_hashes = SubtreeHashes::from_tree(before_root);
         let new_hashes = SubtreeHashes::from_tree(&after.root);
         let mut global_subtrees = HashMap::<SubtreeHash, Vec<&NodeTree>>::new();
@@ -288,8 +292,8 @@ fn detect_changes_for_markdown(
         }
         replace_column_ids(&mut node.payload, &replacements);
     });
-    let after_nodes = flatten_tree(&after.root);
-    diff_projections(before, &after_nodes)
+    let changes = diff_tree(before, &after.root)?;
+    Ok((changes, after.root))
 }
 
 fn collect_generated_ids(root: &NodeTree) -> BTreeSet<String> {
@@ -1244,33 +1248,34 @@ fn flatten_tree(root: &NodeTree) -> BTreeMap<String, NodeSnapshot> {
     output
 }
 
-fn diff_projections(
-    before: &Projection,
-    after: &BTreeMap<String, NodeSnapshot>,
+fn diff_tree(
+    before: &ProjectionView<'_>,
+    after: &NodeTree,
 ) -> Result<Vec<DetectedChange>, PluginError> {
+    let after = ProjectionView::from_tree(after);
     let mut changes = Vec::new();
-    for id in before.nodes_by_id.keys() {
-        if !after.contains_key(id) {
+    for id in before.nodes_by_id.keys().copied() {
+        if !after.nodes_by_id.contains_key(id) {
             changes.push(DetectedChange {
-                entity_pk: vec![id.clone()],
+                entity_pk: vec![id.to_owned()],
                 schema_key: NODE_SCHEMA_KEY.to_string(),
                 snapshot_content: None,
                 metadata: None,
             });
         }
     }
-    for (id, node) in after {
-        if before.nodes_by_id.get(id) == Some(node) {
+    for (id, node) in &after.nodes_by_id {
+        if before.nodes_by_id.get(id).copied() == Some(*node) {
             continue;
         }
         let snapshot_content = serde_json::to_string(node).map_err(|error| {
             PluginError::Internal(format!("failed to serialize Markdown node '{id}': {error}"))
         })?;
         changes.push(DetectedChange {
-            entity_pk: vec![id.clone()],
+            entity_pk: vec![(*id).to_owned()],
             schema_key: NODE_SCHEMA_KEY.to_string(),
             snapshot_content: Some(snapshot_content),
-            metadata: change_metadata(before.nodes_by_id.get(id), node),
+            metadata: change_metadata(before.nodes_by_id.get(id).copied(), node),
         });
     }
     Ok(changes)
@@ -1408,6 +1413,40 @@ impl Projection {
             )));
         }
         Ok(tree)
+    }
+}
+
+/// Read-only identity index over an existing tree or projection. Reconciliation
+/// needs keyed lookup and deletion detection, not another owned copy of every
+/// snapshot. The index owns only references and is discarded with the
+/// transition.
+#[derive(Default)]
+struct ProjectionView<'a> {
+    nodes_by_id: BTreeMap<&'a str, &'a NodeSnapshot>,
+}
+
+impl<'a> ProjectionView<'a> {
+    fn from_projection(projection: &'a Projection) -> Self {
+        Self {
+            nodes_by_id: projection
+                .nodes_by_id
+                .values()
+                .map(|node| (node.id.as_str(), node))
+                .collect(),
+        }
+    }
+
+    fn from_tree(root: &'a NodeTree) -> Self {
+        fn visit<'a>(tree: &'a NodeTree, output: &mut BTreeMap<&'a str, &'a NodeSnapshot>) {
+            output.insert(tree.node.id.as_str(), &tree.node);
+            for child in &tree.children {
+                visit(child, output);
+            }
+        }
+
+        let mut nodes_by_id = BTreeMap::new();
+        visit(root, &mut nodes_by_id);
+        Self { nodes_by_id }
     }
 }
 
@@ -1800,31 +1839,6 @@ fn detected_to_entity_change(change: DetectedChange) -> Result<EntityChange, Plu
     })
 }
 
-fn apply_detected_changes(state: &[EntityState], changes: &[DetectedChange]) -> Vec<EntityState> {
-    let mut rows = state
-        .iter()
-        .cloned()
-        .map(|row| ((row.schema_key.clone(), row.entity_pk.clone()), row))
-        .collect::<BTreeMap<_, _>>();
-    for change in changes {
-        let key = (change.schema_key.clone(), change.entity_pk.clone());
-        if let Some(snapshot_content) = &change.snapshot_content {
-            rows.insert(
-                key,
-                EntityState {
-                    entity_pk: change.entity_pk.clone(),
-                    schema_key: change.schema_key.clone(),
-                    snapshot_content: snapshot_content.clone(),
-                    metadata: change.metadata.clone(),
-                },
-            );
-        } else {
-            rows.remove(&key);
-        }
-    }
-    rows.into_values().collect()
-}
-
 fn entity_change_to_detected(change: EntityChange) -> Result<DetectedChange, PluginError> {
     if change.schema_key != NODE_SCHEMA_KEY {
         return Err(PluginError::InvalidInput(format!(
@@ -1976,9 +1990,8 @@ impl Document {
         let mut parsed = parse_file_with_literal_fast_path(&file, allow_literal_fast_path)?;
         retain_noncanonical_source(&mut parsed, &file.data)?;
         let top_level_ranges = parsed.top_level_ranges.clone();
-        let detected = detect_changes_for_markdown(&Projection::default(), parsed, namespace)?;
-        let state = apply_detected_changes(&[], &detected);
-        let root = Projection::from_entity_state(state.iter().cloned())?.to_tree()?;
+        let (detected, root) =
+            detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace)?;
         let changes = detected
             .into_iter()
             .map(detected_to_entity_change)
@@ -2062,14 +2075,12 @@ impl Document {
                 data: bytes,
             };
             let current_root = self.tree.materialize();
-            let before = Projection {
-                nodes_by_id: flatten_tree(&current_root),
-            };
+            let before = ProjectionView::from_tree(&current_root);
             let mut parsed = parse_file(&file)?;
             retain_noncanonical_source(&mut parsed, &file.data)?;
             let top_level_ranges = Arc::new(parsed.top_level_ranges.clone());
-            let detected = detect_changes_for_markdown(&before, parsed, namespace)?;
-            let root = projection_after_detected_changes(&current_root, &detected)?.to_tree()?;
+            let (detected, root) =
+                detect_changes_for_markdown(&before, Some(&current_root), parsed, namespace)?;
             (detected, top_level_ranges, PersistentTree::new(root))
         };
         let changes = detected
