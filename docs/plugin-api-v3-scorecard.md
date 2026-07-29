@@ -15,11 +15,15 @@ These use the production Wasmtime Component runtime and real format plugins.
 | CSV, 220,000 rows | 10,680,000 B | one-row warm edit after restore | included above | 61,997,056 B | one row |
 | JSON, 39,870 properties | 10,485,760 B | initial import | 1,688.546 ms | 26,673,152 B | full source |
 | JSON, one scalar | 10,485,760 B | verified warm edit | 5.500 ms engine | 26,673,152 B | 418 B |
+| JSON, one scalar | 10,485,760 B | ordinary public-SQL warm edit, 7 samples | 6.724 ms p50 / 8.602 ms p95 | 26,673,152 B control | full-byte request, sparse plugin update |
 | Markdown, `vscode-docs` `d5badf` | 3,276,550 changed B | one-commit replay | 8.95–9.22 s | 102,367,232 B | see format profile |
 
 The JSON hot path is the important control: v2 already crosses only 418 bytes
 and does not reparse or rerender the document. A v3 implementation must reduce
-total ownership while completing the same transition in at most 2.750 ms.
+total ownership while completing the verified-splice transition in at most
+2.750 ms. The independently sampled ordinary public-SQL path has an 8.602 ms
+p95, making its v3 target 4.301 ms. Its median hot transition allocated
+10,996,407 bytes and reached a 10,595,159-byte peak live allocation delta.
 Counting only the 10,485,760-byte accepted host blob plus the measured
 26,673,152-byte guest high water gives a conservative v2 total of 37,158,912
 bytes, so the v3 peak must be at most 12,386,304 bytes.
@@ -38,6 +42,10 @@ cargo test -p lix_sdk --lib \
 cargo test -p lix_sdk_tests --test e2e \
   v2_json_ten_mib_real_wasm_edit_stays_sparse_and_bounded \
   --release -- --ignored --nocapture
+
+cargo test -p lix_sdk_tests --test e2e \
+  v2_json_ten_mib_ordinary_sql_byte_edit_benchmark \
+  --release -- --ignored --nocapture
 ```
 
 ## v3 arena ownership model
@@ -55,20 +63,27 @@ The v3 number is the actual unique content-page storage after both roots.
 | JSON | 8,388,669 | 16,777,418 | 8,388,750 | 50.0% | 74 B |
 | Excalidraw | 8,388,673 | 16,777,438 | 8,388,766 | 50.0% | 86 B |
 
-The host rope operation itself does not introduce a latency concern:
+The host rope operation itself does not introduce a latency concern. This
+release run used 100 warmups and 5,000 measured edits per format, alternated the
+v2/v3 measurement order, and reports per-operation distributions:
 
-| format | whole-`Vec` successor mean | arena successor mean | ratio |
-| --- | ---: | ---: | ---: |
-| Markdown | 333.408 µs | 32.564 µs | 0.098 |
-| CSV | 392.008 µs | 40.465 µs | 0.103 |
-| JSON | 166.892 µs | 32.466 µs | 0.195 |
-| Excalidraw | 238.517 µs | 32.434 µs | 0.136 |
+| format | whole-`Vec` p50 / p95 | arena p50 / p95 | p95 speedup | retained reduction | gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Markdown | 162.550 / 181.749 µs | 32.470 / 40.460 µs | 4.492× | 2.000× | fail memory |
+| CSV | 235.589 / 275.049 µs | 41.500 / 53.599 µs | 5.132× | 2.000× | fail memory |
+| JSON | 160.260 / 177.839 µs | 32.779 / 40.240 µs | 4.419× | 2.000× | fail memory |
+| Excalidraw | 161.040 / 177.889 µs | 32.710 / 40.530 µs | 4.389× | 2.000× | fail memory |
 
 Reproduction:
 
 ```sh
 cargo test -p lix_plugin_arena --test scorecard -- --nocapture
 cargo test -p lix_plugin_arena --test scorecard --release \
+  four_format_warm_edit_latency_scorecard -- --ignored --nocapture
+
+# The same benchmark exits nonzero if any lane misses 2x latency or 3x memory.
+LIX_V3_ENFORCE_ACCEPTANCE=1 \
+  cargo test -p lix_plugin_arena --test scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 ```
 
@@ -78,7 +93,8 @@ Every row is an independent pass/fail gate. “Pending” is not a pass.
 
 | format | workload | v2 p95/control | required v3 p95 | conservative v2 total memory | required v3 total memory |
 | --- | --- | ---: | ---: | ---: | ---: |
-| JSON | 10 MiB warm scalar byte edit | 5.500 ms | ≤2.750 ms | 37,158,912 B | ≤12,386,304 B |
+| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms | 37,158,912 B | ≤12,386,304 B |
+| JSON | 10 MiB ordinary public-SQL warm scalar edit | 8.602 ms p95 | ≤4.301 ms | 37,158,912 B | ≤12,386,304 B |
 | Markdown | `vscode-docs` one-commit replay | 9.220 s | ≤4.610 s | ≥105,643,782 B | ≤35,214,594 B |
 | CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |
 | Excalidraw | large element/file edit | pending baseline | pending | pending baseline | pending |

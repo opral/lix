@@ -1,6 +1,6 @@
-use lix_plugin_arena::{ByteEdit, Root, Store};
+use lix_plugin_arena::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_v2};
 use std::hint::black_box;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[test]
 fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
@@ -190,25 +190,28 @@ fn four_format_sparse_scorecard_reports_prototype_ratios() {
 #[test]
 #[ignore = "manual release-mode latency scorecard"]
 fn four_format_warm_edit_latency_scorecard() {
-    const SAMPLES: usize = 50;
+    const WARMUPS: usize = 100;
+    const SAMPLES: usize = 5_000;
+    let enforce = std::env::var_os("LIX_V3_ENFORCE_ACCEPTANCE").is_some();
+    let mut failures = Vec::new();
     for format in Format::ALL {
         let bytes = format.fixture();
         let offset = bytes.len() / 2;
         let store = Store::default();
         let root = Root::import(
-            store,
+            store.clone(),
             "v3-generation",
             &bytes,
             std::iter::empty(),
             std::iter::empty(),
         );
 
-        let v2 = measure(SAMPLES, || {
+        let mut v2_operation = || {
             let mut successor = bytes.clone();
             successor[offset] = black_box(b'X');
             black_box(successor);
-        });
-        let v3 = measure(SAMPLES, || {
+        };
+        let mut v3_operation = || {
             let mut transaction = root.transaction();
             transaction.edit_bytes(ByteEdit {
                 offset: offset as u64,
@@ -216,26 +219,110 @@ fn four_format_warm_edit_latency_scorecard() {
                 insert: vec![black_box(b'X')],
             });
             black_box(transaction.commit().unwrap());
-        });
+        };
+
+        for _ in 0..WARMUPS {
+            v2_operation();
+            v3_operation();
+        }
+
+        let mut v2_samples = Vec::with_capacity(SAMPLES);
+        let mut v3_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            // Alternate order so frequency scaling and allocator state do not
+            // systematically favor either implementation.
+            if sample % 2 == 0 {
+                v2_samples.push(measure_once(&mut v2_operation));
+                v3_samples.push(measure_once(&mut v3_operation));
+            } else {
+                v3_samples.push(measure_once(&mut v3_operation));
+                v2_samples.push(measure_once(&mut v2_operation));
+            }
+        }
+
+        let v2 = Distribution::new(v2_samples);
+        let v3 = Distribution::new(v3_samples);
+        let v2_retained_bytes = bytes.len() * 2;
+        let v3_retained_bytes = store.unique_page_bytes();
+        let acceptance = compare_to_v2(
+            PerformanceMeasurement {
+                p95_nanoseconds: v2.p95_ns,
+                peak_total_bytes: v2_retained_bytes as u64,
+            },
+            PerformanceMeasurement {
+                p95_nanoseconds: v3.p95_ns,
+                peak_total_bytes: v3_retained_bytes as u64,
+            },
+        );
         eprintln!(
-            "plugin_v3_arena_latency format={} bytes={} samples={SAMPLES} v2_mean_us={:.3} v3_mean_us={:.3} ratio={:.3}",
+            "plugin_v3_arena_scorecard format={} bytes={} warmups={WARMUPS} samples={SAMPLES} \
+             v2_p50_us={:.3} v2_p95_us={:.3} v2_mean_us={:.3} \
+             v3_p50_us={:.3} v3_p95_us={:.3} v3_mean_us={:.3} \
+             p95_speedup={:.3} v2_retained_bytes={} v3_retained_bytes={} \
+             memory_reduction={:.3} latency_pass={} memory_pass={} accepted={}",
             format.name(),
             bytes.len(),
-            mean_micros(v2, SAMPLES),
-            mean_micros(v3, SAMPLES),
-            v3.as_secs_f64() / v2.as_secs_f64(),
+            ns_to_micros(v2.p50_ns),
+            ns_to_micros(v2.p95_ns),
+            ns_to_micros(v2.mean_ns),
+            ns_to_micros(v3.p50_ns),
+            ns_to_micros(v3.p95_ns),
+            ns_to_micros(v3.mean_ns),
+            v2.p95_ns as f64 / v3.p95_ns as f64,
+            v2_retained_bytes,
+            v3_retained_bytes,
+            v2_retained_bytes as f64 / v3_retained_bytes as f64,
+            acceptance.latency_passes,
+            acceptance.memory_passes,
+            acceptance.passes(),
+        );
+        if !acceptance.passes() {
+            failures.push(format.name());
+        }
+    }
+    if enforce {
+        assert!(
+            failures.is_empty(),
+            "Plugin API v3 failed the 2x latency / 3x memory gate for: {}",
+            failures.join(", ")
         );
     }
 }
 
-fn measure(samples: usize, mut operation: impl FnMut()) -> Duration {
+fn measure_once(operation: &mut impl FnMut()) -> u64 {
     let started = Instant::now();
-    for _ in 0..samples {
-        operation();
-    }
-    started.elapsed()
+    operation();
+    u64::try_from(started.elapsed().as_nanos()).expect("sample duration fits u64")
 }
 
-fn mean_micros(duration: Duration, samples: usize) -> f64 {
-    duration.as_secs_f64() * 1_000_000.0 / samples as f64
+#[derive(Debug)]
+struct Distribution {
+    p50_ns: u64,
+    p95_ns: u64,
+    mean_ns: u64,
+}
+
+impl Distribution {
+    fn new(mut samples: Vec<u64>) -> Self {
+        assert!(!samples.is_empty());
+        samples.sort_unstable();
+        let sum = samples
+            .iter()
+            .map(|sample| u128::from(*sample))
+            .sum::<u128>();
+        Self {
+            p50_ns: percentile(&samples, 50),
+            p95_ns: percentile(&samples, 95),
+            mean_ns: u64::try_from(sum / samples.len() as u128).expect("mean fits u64"),
+        }
+    }
+}
+
+fn percentile(samples: &[u64], percentile: usize) -> u64 {
+    let rank = (samples.len() * percentile).div_ceil(100);
+    samples[rank.saturating_sub(1)]
+}
+
+fn ns_to_micros(ns: u64) -> f64 {
+    ns as f64 / 1_000.0
 }
