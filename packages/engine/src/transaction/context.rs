@@ -5245,7 +5245,7 @@ where
             gc_state.add_collectible_interval(previous_recovery.interval_has_commits);
         }
 
-        if unselected.is_empty() {
+        let checkpoint_commit_id = if unselected.is_empty() {
             let mut marker_rows = RawWriteBatch::with_capacity(1);
             marker_rows.push(checkpoint_marker_stage_row(&branch_id));
             self.stage_write(TransactionWrite::Rows {
@@ -5260,7 +5260,7 @@ where
                 interval_has_commits,
                 gc_state,
                 selected,
-            )?;
+            )?
         } else {
             let checkpoint_commit_id = self.staged_writes.stage_intermediate_commit(
                 branch_id.clone(),
@@ -5286,13 +5286,11 @@ where
                     },
                     gc_state,
                 })?;
-        }
+            checkpoint_commit_id.to_string()
+        };
         Ok(crate::sql2::DiffCommandOutcome {
             rows_affected: diff_ids.len() as u64,
-            commit_id: self
-                .staged_writes
-                .commit_id_for_branch(&branch_id)?
-                .map(|commit_id| commit_id.to_string()),
+            commit_id: Some(checkpoint_commit_id),
         })
     }
 

@@ -150,6 +150,24 @@ simulation_test!(
         assert_eq!(checkpointed.rows_affected(), 1);
         assert_eq!(checkpointed.columns(), &["commit_id"]);
         assert_eq!(checkpointed.len(), 1);
+        let checkpoint_commit_id = match checkpointed.get(&checkpointed.rows()[0], "commit_id") {
+            Some(Value::Text(commit_id)) => commit_id.clone(),
+            value => panic!("checkpoint RETURNING should contain a commit ID, got {value:?}"),
+        };
+        let checkpoint_row = session
+            .execute(
+                "SELECT commit_id FROM lix_checkpoint WHERE commit_id = $1",
+                &[Value::Text(checkpoint_commit_id.clone())],
+            )
+            .await
+            .expect("returned checkpoint commit should be queryable");
+        assert_eq!(checkpoint_row.len(), 1);
+        let child_head = engine
+            .load_branch_head_commit_id(sim.main_branch_id())
+            .await
+            .expect("partial checkpoint child head should load")
+            .expect("partial checkpoint child head should exist");
+        assert_ne!(child_head.to_string(), checkpoint_commit_id);
 
         assert_eq!(
             select_rows(
