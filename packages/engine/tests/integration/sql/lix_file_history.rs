@@ -137,7 +137,7 @@ async fn lix_file_history_point_lookup_does_not_rescan_unrelated_observed_state(
         .expect("unrelated files should insert in one commit");
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {
-            format!("('01940001-0000-7000-8000-{index:012x}', '/unrelated-directory-{index:03}/')")
+            format!("('01940001-0000-7000-8000-{index:012x}', '/unrelated-directory-{index:03}')")
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -240,7 +240,7 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
 
     let unrelated_directories = (0..UNRELATED_DIRECTORY_COUNT)
         .map(|index| {
-            format!("('01940003-0000-7000-8000-{index:012x}', '/ancestor-noise-{index:03}/')")
+            format!("('01940003-0000-7000-8000-{index:012x}', '/ancestor-noise-{index:03}')")
         })
         .collect::<Vec<_>>()
         .join(",");
@@ -254,8 +254,8 @@ async fn lix_file_history_ancestor_point_lookup_keeps_parent_evidence_bounded() 
     session
         .execute(
             "INSERT INTO lix_directory (id, path) VALUES \
-             ('863f406b-3ce8-724d-8548-6dc1e41d451d', '/bounded/'), \
-             ('2b6a56e8-13dc-763d-8686-3f21011153ed', '/bounded/child/')",
+             ('863f406b-3ce8-724d-8548-6dc1e41d451d', '/bounded'), \
+             ('2b6a56e8-13dc-763d-8686-3f21011153ed', '/bounded/child')",
             &[],
         )
         .await
@@ -343,10 +343,10 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('7813628c-6493-7241-80fe-c63337c5d3f9', '/workspace/'), \
-                 ('e93d7695-7bde-7b9c-8fa1-e84cc0642112', '/workspace/docs/'), \
-                 ('f6105c07-3ce2-7baf-884d-30da343db297', '/workspace/docs/guides/'), \
-                 ('9ddb5236-2a85-74a2-8ae1-1d34ac01b82f', '/destination/')",
+                 ('7813628c-6493-7241-80fe-c63337c5d3f9', '/workspace'), \
+                 ('e93d7695-7bde-7b9c-8fa1-e84cc0642112', '/workspace/docs'), \
+                 ('f6105c07-3ce2-7baf-884d-30da343db297', '/workspace/docs/guides'), \
+                 ('9ddb5236-2a85-74a2-8ae1-1d34ac01b82f', '/destination')",
                 &[],
             )
             .await
@@ -417,13 +417,13 @@ simulation_test!(
         assert_eq!(renamed_directory.len(), 1);
         assert_eq!(
             renamed_directory.rows()[0].get::<Value>("path").unwrap(),
-            Value::Text("/archive/docs/guides/".to_string())
+            Value::Text("/archive/docs/guides".to_string())
         );
 
         session
             .execute(
                 "UPDATE lix_directory \
-                 SET path = '/destination/archive/' \
+                 SET path = '/destination/archive' \
                  WHERE id = '7813628c-6493-7241-80fe-c63337c5d3f9'",
                 &[],
             )
@@ -470,8 +470,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('945ddc79-6ca8-7a97-8ece-ecbde7f1358e', '/grouped/'), \
-                 ('46d97a70-d3ec-7d27-8b28-8c62f72869dd', '/grouped/child/')",
+                 ('945ddc79-6ca8-7a97-8ece-ecbde7f1358e', '/grouped'), \
+                 ('46d97a70-d3ec-7d27-8b28-8c62f72869dd', '/grouped/child')",
                 &[],
             )
             .await
@@ -594,8 +594,8 @@ simulation_test!(
         );
         main.execute(
             "INSERT INTO lix_directory (id, path) VALUES \
-             ('7afd096d-2680-7fd4-8467-c866b7474f8d', '/before/'), \
-             ('dd2d37ad-1bd0-7592-855e-9fcd50a55e1a', '/before/child/')",
+             ('7afd096d-2680-7fd4-8467-c866b7474f8d', '/before'), \
+             ('dd2d37ad-1bd0-7592-855e-9fcd50a55e1a', '/before/child')",
             &[],
         )
         .await
@@ -705,8 +705,8 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restore/'), \
-                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restore/child/')",
+                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restore'), \
+                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restore/child')",
                 &[],
             )
             .await
@@ -774,8 +774,8 @@ simulation_test!(
         transaction
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES \
-                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restored/'), \
-                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restored/child/')",
+                 ('e800ebc8-3b94-759f-8aa3-07fcaadc46a3', '/restored'), \
+                 ('262b5268-af6a-7225-8de7-5619a47c547a', '/restored/child')",
                 &[],
             )
             .await
@@ -1171,7 +1171,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('68697374-6f72-892d-8a6f-696e2d646900', '/joined/')",
+                 VALUES ('68697374-6f72-892d-8a6f-696e2d646900', '/joined')",
                 &[],
             )
             .await

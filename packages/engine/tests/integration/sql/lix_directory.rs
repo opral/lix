@@ -21,12 +21,12 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES ('6469722d-6c6f-8e67-8d73-65676d656e00', $1)",
-                &[Value::Text(format!("/{long_segment}/"))],
+                &[Value::Text(format!("/{long_segment}"))],
             )
             .await
             .expect("long opaque directory path segment should be accepted");
 
-        let long_path = format!("/{}/", ["abcd"; 820].join("/"));
+        let long_path = format!("/{}", ["abcd"; 820].join("/"));
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES ('6469722d-6c6f-8e67-8d70-617468000000', $1)",
@@ -53,7 +53,7 @@ simulation_test!(
                 ],
                 vec![
                     Value::Text("6469722d-6c6f-8e67-8d73-65676d656e00".to_string()),
-                    Value::Text(format!("/{long_segment}/")),
+                    Value::Text(format!("/{long_segment}")),
                 ],
             ],
         );
@@ -73,11 +73,11 @@ simulation_test!(
         );
 
         for (id, path) in [
-            ("6469722d-7065-8263-856e-742d61000000", "/docs/%61/"),
-            ("6469722d-7065-8263-856e-742d6e756c00", "/docs/%00evil/"),
+            ("6469722d-7065-8263-856e-742d61000000", "/docs/%61"),
+            ("6469722d-7065-8263-856e-742d6e756c00", "/docs/%00evil"),
             (
                 "6469722d-7065-8263-856e-742d62696400",
-                "/docs/%E2%80%AEevil/",
+                "/docs/%E2%80%AEevil",
             ),
         ] {
             session
@@ -103,17 +103,17 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("6469722d-7065-8263-856e-742d61000000".to_string()),
-                    Value::Text("/docs/%61/".to_string()),
+                    Value::Text("/docs/%61".to_string()),
                     Value::Text("%61".to_string()),
                 ],
                 vec![
                     Value::Text("6469722d-7065-8263-856e-742d62696400".to_string()),
-                    Value::Text("/docs/%E2%80%AEevil/".to_string()),
+                    Value::Text("/docs/%E2%80%AEevil".to_string()),
                     Value::Text("%E2%80%AEevil".to_string()),
                 ],
                 vec![
                     Value::Text("6469722d-7065-8263-856e-742d6e756c00".to_string()),
-                    Value::Text("/docs/%00evil/".to_string()),
+                    Value::Text("/docs/%00evil".to_string()),
                     Value::Text("%00evil".to_string()),
                 ],
             ],
@@ -144,7 +144,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
     let nested_insert_result = session
         .execute(
             "INSERT INTO lix_directory (id, path) \
-             VALUES ('6469722d-6e65-8374-8564-000000000000', '/docs/nested/')",
+             VALUES ('6469722d-6e65-8374-8564-000000000000', '/docs/nested')",
             &[],
         )
         .await
@@ -167,7 +167,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
         row_set.rows()[0].values(),
         &[
             Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-            Value::Text("/docs/".to_string()),
+            Value::Text("/docs".to_string()),
             Value::Null,
             Value::Text("docs".to_string()),
         ]
@@ -176,7 +176,7 @@ simulation_test!(lix_directory_insert_reads_nested_paths, |sim| async move {
         row_set.rows()[1].values(),
         &[
             Value::Text("6469722d-6e65-8374-8564-000000000000".to_string()),
-            Value::Text("/docs/nested/".to_string()),
+            Value::Text("/docs/nested".to_string()),
             Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
             Value::Text("nested".to_string()),
         ]
@@ -209,7 +209,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, parent_id, name \
              FROM lix_directory \
-             WHERE path = '/docs/'",
+             WHERE path = '/docs'",
                 &[],
             )
             .await
@@ -227,7 +227,7 @@ simulation_test!(
             panic!("expected generated directory row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");
-        assert_eq!(path, "/docs/");
+        assert_eq!(path, "/docs");
         assert_eq!(name, "docs");
     }
 );
@@ -245,7 +245,7 @@ simulation_test!(
         );
 
         let insert_result = session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
             .await
             .expect("directory path insert should apply defaulted id");
         assert_eq!(insert_result, ExecuteResult::from_rows_affected(1));
@@ -254,7 +254,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, parent_id, name \
              FROM lix_directory \
-             WHERE path = '/docs/'",
+             WHERE path = '/docs'",
                 &[],
             )
             .await
@@ -272,7 +272,7 @@ simulation_test!(
             panic!("expected generated directory path row, got {values:?}");
         };
         assert!(!id.is_empty(), "defaulted directory id should be non-empty");
-        assert_eq!(path, "/docs/");
+        assert_eq!(path, "/docs");
         assert_eq!(name, "docs");
     }
 );
@@ -290,11 +290,11 @@ simulation_test!(
         );
 
         session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
             .await
             .expect("first directory insert should succeed");
         let error = session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
             .await
             .expect_err("duplicate directory path insert should be rejected");
 
@@ -316,7 +316,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('73616d65-2d64-8972-8000-000000000000', '/a/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('73616d65-2d64-8972-8000-000000000000', '/a')",
                 &[],
             )
             .await
@@ -324,7 +324,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('73616d65-2d64-8972-8000-000000000000', '/b/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('73616d65-2d64-8972-8000-000000000000', '/b')",
                 &[],
             )
             .await
@@ -360,7 +360,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_directory_by_branch \
                      (id, path, lixcol_branch_id) \
-                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/a/', '{branch_id}')"
+                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/a', '{branch_id}')"
                 ),
                 &[],
             )
@@ -372,7 +372,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_directory_by_branch \
                      (id, path, lixcol_branch_id) \
-                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/b/', '{branch_id}')"
+                     VALUES ('73616d65-2d64-8972-8000-000000000000', '/b', '{branch_id}')"
                 ),
                 &[],
             )
@@ -410,7 +410,7 @@ simulation_test!(
             .expect("file insert should succeed");
 
         let error = session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/foo/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/foo')", &[])
             .await
             .expect_err("directory should conflict with file at same entry name");
 
@@ -499,7 +499,7 @@ simulation_test!(
             &engine,
         );
 
-        for path in ["/a/../b/", "/a/./b/"] {
+        for path in ["/a/../b", "/a/./b"] {
             let error = session
                 .execute(
                     "INSERT INTO lix_directory (path) VALUES ($1)",
@@ -512,10 +512,32 @@ simulation_test!(
         }
 
         let result = session
-            .execute("SELECT path FROM lix_directory WHERE path = '/b/'", &[])
+            .execute("SELECT path FROM lix_directory WHERE path = '/b'", &[])
             .await
             .expect("directory read should succeed");
         assert_eq!(result.len(), 0);
+    }
+);
+
+simulation_test!(
+    lix_directory_path_insert_rejects_trailing_slash,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let error = session
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .await
+            .expect_err("non-root directory path must reject a trailing slash");
+
+        assert_eq!(error.code, LixError::CODE_INVALID_PARAM);
+        assert_eq!(error.message, "non-root path must not end with '/'");
     }
 );
 
@@ -600,7 +622,7 @@ simulation_test!(
         );
 
         session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/Café/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/Café')", &[])
             .await
             .expect("directory insert should succeed");
 
@@ -636,12 +658,12 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("6469722d-6361-8665-8d64-65636f6d7000".to_string()),
-                    Value::Text("/Cafe\u{301}/".to_string()),
+                    Value::Text("/Cafe\u{301}".to_string()),
                     Value::Text("Cafe\u{301}".to_string()),
                 ],
                 vec![
                     Value::Text("6469722d-7a65-826f-8d77-696474680000".to_string()),
-                    Value::Text("/zero\u{200D}width/".to_string()),
+                    Value::Text("/zero\u{200D}width".to_string()),
                     Value::Text("zero\u{200D}width".to_string()),
                 ],
             ],
@@ -732,7 +754,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6272616e-6368-8d64-8972-2d666f6f0000', '/foo/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6272616e-6368-8d64-8972-2d666f6f0000', '/foo')",
                 &[],
             )
             .await
@@ -788,7 +810,7 @@ simulation_test!(
             .execute(
                 "SELECT id \
              FROM lix_directory \
-             WHERE path IN ('/docs/', '/docs/guides/') \
+             WHERE path IN ('/docs', '/docs/guides') \
              ORDER BY path",
                 &[],
             )
@@ -797,7 +819,7 @@ simulation_test!(
         let directory_id_rows = directory_ids_result;
         assert_eq!(directory_id_rows.len(), 2);
         let delete_result = session
-            .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
+            .execute("DELETE FROM lix_directory WHERE path = '/docs'", &[])
             .await
             .expect("recursive directory delete should succeed");
         assert_eq!(delete_result, ExecuteResult::from_rows_affected(3));
@@ -806,7 +828,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path \
              FROM lix_directory \
-             WHERE path IN ('/docs/', '/docs/guides/') \
+             WHERE path IN ('/docs', '/docs/guides') \
              ORDER BY path",
                 &[],
             )
@@ -852,7 +874,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_global, lixcol_untracked) \
-                 VALUES ('6469722d-676c-8f62-816c-2d6f76657200', '/shared/', true, false)",
+                 VALUES ('6469722d-676c-8f62-816c-2d6f76657200', '/shared', true, false)",
                 &[],
             )
             .await
@@ -873,14 +895,14 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("6469722d-676c-8f62-816c-2d6f76657200".to_string()),
-                    Value::Text("/shared/".to_string()),
+                    Value::Text("/shared".to_string()),
                     Value::Text(sim.main_branch_id().to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
                 ],
                 vec![
                     Value::Text("6469722d-676c-8f62-816c-2d6f76657200".to_string()),
-                    Value::Text("/shared/".to_string()),
+                    Value::Text("/shared".to_string()),
                     Value::Text("ffffffff-ffff-7fff-bfff-ffffffffffff".to_string()),
                     Value::Boolean(true),
                     Value::Boolean(false),
@@ -905,7 +927,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_global) \
-                 VALUES ('676c6f62-616c-8d73-8861-7265642d6401', '/shared/', true)",
+                 VALUES ('676c6f62-616c-8d73-8861-7265642d6401', '/shared', true)",
                 &[],
             )
             .await
@@ -914,7 +936,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_global) \
-                 VALUES ('676c6f62-616c-8d73-8861-7265642d6402', '/shared/child/', true)",
+                 VALUES ('676c6f62-616c-8d73-8861-7265642d6402', '/shared/child', true)",
                 &[],
             )
             .await
@@ -927,10 +949,7 @@ simulation_test!(
             )
             .await
             .expect("global directory should read through active overlay");
-        assert_rows_eq(
-            result,
-            vec![vec![Value::Text("/shared/child/".to_string())]],
-        );
+        assert_rows_eq(result, vec![vec![Value::Text("/shared/child".to_string())]]);
     }
 );
 
@@ -949,13 +968,13 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/', true)",
+                 VALUES ('6469722d-646f-8373-8000-000000000000', '/docs', true)",
                 &[],
             )
             .await
             .expect("untracked directory insert should succeed");
         let error = session
-            .execute("INSERT INTO lix_directory (path) VALUES ('/docs/')", &[])
+            .execute("INSERT INTO lix_directory (path) VALUES ('/docs')", &[])
             .await
             .expect_err("tracked directory insert must not replace an untracked directory");
         assert!(
@@ -969,7 +988,7 @@ simulation_test!(
             .execute(
                 "SELECT id, path, lixcol_untracked \
                  FROM lix_directory \
-                 WHERE path = '/docs/'",
+                 WHERE path = '/docs'",
                 &[],
             )
             .await
@@ -978,7 +997,7 @@ simulation_test!(
             result,
             vec![vec![
                 Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                Value::Text("/docs/".to_string()),
+                Value::Text("/docs".to_string()),
                 Value::Boolean(true),
             ]],
         );
@@ -999,7 +1018,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
                 &[],
             )
             .await
@@ -1007,7 +1026,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-6472-8166-8400-000000000000', '/docs/draft/', true)",
+                 VALUES ('6469722d-6472-8166-8400-000000000000', '/docs/draft', true)",
                 &[],
             )
             .await
@@ -1028,13 +1047,13 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                    Value::Text("/docs/".to_string()),
+                    Value::Text("/docs".to_string()),
                     Value::Null,
                     Value::Boolean(false),
                 ],
                 vec![
                     Value::Text("6469722d-6472-8166-8400-000000000000".to_string()),
-                    Value::Text("/docs/draft/".to_string()),
+                    Value::Text("/docs/draft".to_string()),
                     Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
                     Value::Boolean(true),
                 ],
@@ -1057,7 +1076,7 @@ simulation_test!(
 
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
                 &[],
             )
             .await
@@ -1065,7 +1084,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-646f-8373-8d73-6861646f7700', '/docs/', true)",
+                 VALUES ('6469722d-646f-8373-8d73-6861646f7700', '/docs', true)",
                 &[],
             )
             .await
@@ -1090,14 +1109,14 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_untracked) \
-                 VALUES ('6469722d-7061-8265-8e74-000000000000', '/archive/', true)",
+                 VALUES ('6469722d-7061-8265-8e74-000000000000', '/archive', true)",
                 &[],
             )
             .await
             .expect("untracked parent insert should succeed");
         session
             .execute(
-                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs/')",
+                "INSERT INTO lix_directory (id, path) VALUES ('6469722d-646f-8373-8000-000000000000', '/docs')",
                 &[],
             )
             .await
@@ -1105,7 +1124,7 @@ simulation_test!(
 
         let error = session
             .execute(
-                "UPDATE lix_directory SET path = '/archive/docs/' WHERE id = '6469722d-646f-8373-8000-000000000000'",
+                "UPDATE lix_directory SET path = '/archive/docs' WHERE id = '6469722d-646f-8373-8000-000000000000'",
                 &[],
             )
             .await
@@ -1127,13 +1146,13 @@ simulation_test!(
             vec![
                 vec![
                     Value::Text("6469722d-646f-8373-8000-000000000000".to_string()),
-                    Value::Text("/docs/".to_string()),
+                    Value::Text("/docs".to_string()),
                     Value::Null,
                     Value::Boolean(false),
                 ],
                 vec![
                     Value::Text("6469722d-7061-8265-8e74-000000000000".to_string()),
-                    Value::Text("/archive/".to_string()),
+                    Value::Text("/archive".to_string()),
                     Value::Null,
                     Value::Boolean(true),
                 ],
@@ -1186,7 +1205,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-7570-8365-8274-000000000000".to_string()),
-                Value::Text("/new/".to_string()),
+                Value::Text("/new".to_string()),
                 Value::Null,
                 Value::Text("new".to_string()),
             ]],
@@ -1238,7 +1257,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-6b65-8570-8000-000000000000".to_string()),
-                Value::Text("/keep/".to_string()),
+                Value::Text("/keep".to_string()),
                 Value::Null,
                 Value::Text("keep".to_string()),
             ]],
@@ -1281,7 +1300,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-6672-8573-8800-000000000000".to_string()),
-                Value::Text("/fresh/".to_string()),
+                Value::Text("/fresh".to_string()),
                 Value::Null,
                 Value::Text("fresh".to_string()),
             ]],
@@ -1304,7 +1323,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('6469722d-7061-8468-8d6b-656570000000', '/path-keep/')",
+                 VALUES ('6469722d-7061-8468-8d6b-656570000000', '/path-keep')",
                 &[],
             )
             .await
@@ -1313,7 +1332,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path) \
-                 VALUES ('/path-keep/') \
+                 VALUES ('/path-keep') \
                  ON CONFLICT (path) DO NOTHING",
                 &[],
             )
@@ -1323,7 +1342,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, path FROM lix_directory WHERE path = '/path-keep/'",
+                "SELECT id, path FROM lix_directory WHERE path = '/path-keep'",
                 &[],
             )
             .await
@@ -1332,7 +1351,7 @@ simulation_test!(
             read,
             vec![vec![
                 Value::Text("6469722d-7061-8468-8d6b-656570000000".to_string()),
-                Value::Text("/path-keep/".to_string()),
+                Value::Text("/path-keep".to_string()),
             ]],
         );
     }
@@ -1353,7 +1372,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata) \
-                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta/', lix_json('{\"version\":1}'))",
+                 VALUES ('6469722d-7061-8468-8d6d-657461000000', '/path-meta', lix_json('{\"version\":1}'))",
                 &[],
             )
             .await
@@ -1362,7 +1381,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/path-meta/', lix_json('{\"version\":2}')) \
+                 VALUES ('/path-meta', lix_json('{\"version\":2}')) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )
@@ -1372,7 +1391,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id, lixcol_metadata FROM lix_directory WHERE path = '/path-meta/'",
+                "SELECT id, lixcol_metadata FROM lix_directory WHERE path = '/path-meta'",
                 &[],
             )
             .await
@@ -1405,7 +1424,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_directory_by_branch \
                      (id, path, lixcol_branch_id) \
-                     VALUES ('6469722d-6272-816e-8368-2d7061746800', '/branch-dir/', '{branch_id}')"
+                     VALUES ('6469722d-6272-816e-8368-2d7061746800', '/branch-dir', '{branch_id}')"
                 ),
                 &[],
             )
@@ -1417,7 +1436,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_directory_by_branch \
                      (path, lixcol_branch_id) \
-                     VALUES ('/branch-dir/', '{branch_id}') \
+                     VALUES ('/branch-dir', '{branch_id}') \
                      ON CONFLICT (path, lixcol_branch_id) DO NOTHING"
                 ),
                 &[],
@@ -1428,7 +1447,7 @@ simulation_test!(
 
         let read = session
             .execute(
-                "SELECT id FROM lix_directory WHERE path = '/branch-dir/'",
+                "SELECT id FROM lix_directory WHERE path = '/branch-dir'",
                 &[],
             )
             .await
@@ -1460,7 +1479,7 @@ simulation_test!(
                 &format!(
                     "INSERT INTO lix_directory_by_branch \
                      (path, lixcol_branch_id) \
-                     VALUES ('/dir-reject/', '{branch_id}') \
+                     VALUES ('/dir-reject', '{branch_id}') \
                      ON CONFLICT (path) DO NOTHING"
                 ),
                 &[],
@@ -1515,7 +1534,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('6469722d-7472-8163-8b65-642d636f6c00', '/dir-collision/')",
+                 VALUES ('6469722d-7472-8163-8b65-642d636f6c00', '/dir-collision')",
                 &[],
             )
             .await
@@ -1524,7 +1543,7 @@ simulation_test!(
         let error = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_untracked) \
-                 VALUES ('/dir-collision/', true) \
+                 VALUES ('/dir-collision', true) \
                  ON CONFLICT (path) DO NOTHING",
                 &[],
             )
@@ -1550,7 +1569,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path, lixcol_metadata, lixcol_global) \
-                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir/', lix_json('{\"version\":1}'), true)",
+                 VALUES ('6469722d-676c-8f62-816c-2d7061746800', '/global-dir', lix_json('{\"version\":1}'), true)",
                 &[],
             )
             .await
@@ -1559,7 +1578,7 @@ simulation_test!(
         let result = session
             .execute(
                 "INSERT INTO lix_directory (path, lixcol_metadata) \
-                 VALUES ('/global-dir/', lix_json('{\"version\":2}')) \
+                 VALUES ('/global-dir', lix_json('{\"version\":2}')) \
                  ON CONFLICT (path) DO UPDATE SET lixcol_metadata = excluded.lixcol_metadata",
                 &[],
             )
@@ -1629,7 +1648,7 @@ simulation_test!(
 
         let moved = transaction
             .execute(
-                "UPDATE lix_directory SET path = '/new/' WHERE path = '/old/'",
+                "UPDATE lix_directory SET path = '/new' WHERE path = '/old'",
                 &[],
             )
             .await
@@ -1660,7 +1679,7 @@ simulation_test!(
         );
 
         let deleted = transaction
-            .execute("DELETE FROM lix_directory WHERE path = '/new/'", &[])
+            .execute("DELETE FROM lix_directory WHERE path = '/new'", &[])
             .await
             .expect("transactional recursive subtree delete should succeed");
         assert_eq!(deleted.rows_affected(), 3);

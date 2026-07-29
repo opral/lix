@@ -73,7 +73,7 @@ export class LocalFilesystem {
 			}
 			if (path.endsWith("/")) {
 				throw new TypeError(
-					"importPaths() paths must contain file paths, not directory paths",
+					"importPaths() paths must not end with a trailing slash",
 				);
 			}
 		}

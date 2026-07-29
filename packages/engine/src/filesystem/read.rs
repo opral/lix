@@ -300,26 +300,8 @@ fn insert_entry(
             entry_label(&entry)
         )));
     }
-    let namespace_conflict_path = namespace_conflict_path(&path, &entry);
-    if let Some(existing) = entries.get(&namespace_conflict_path) {
-        return Err(filesystem_conflict_error(format!(
-            "filesystem namespace conflict at {path:?}: {} conflicts with existing {} at {namespace_conflict_path:?}",
-            entry_label(&entry),
-            entry_label(existing)
-        )));
-    }
     entries.insert(path, entry);
     Ok(())
-}
-
-fn namespace_conflict_path(path: &str, entry: &FilesystemEntry) -> String {
-    match entry {
-        FilesystemEntry::Directory => path
-            .strip_suffix('/')
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| path.to_string()),
-        FilesystemEntry::File(_) => format!("{path}/"),
-    }
 }
 
 fn entry_label(entry: &FilesystemEntry) -> &'static str {
@@ -362,8 +344,8 @@ mod tests {
 
         assert_eq!(error.code, crate::LixError::CODE_CONSTRAINT_VIOLATION);
         assert!(
-            error.message.contains("filesystem namespace conflict"),
-            "expected namespace conflict error: {error}"
+            error.message.contains("claimed by both directory and file"),
+            "expected exact path conflict error: {error}"
         );
     }
 
@@ -376,20 +358,12 @@ mod tests {
             FilesystemEntry::File(file_entry("file-foo")),
         )
         .expect("initial file entry should insert");
-        insert_entry(
-            &mut entries,
-            "/foo/".to_string(),
-            FilesystemEntry::Directory,
-        )
-        .expect_err("directory should conflict with file namespace");
+        insert_entry(&mut entries, "/foo".to_string(), FilesystemEntry::Directory)
+            .expect_err("directory should conflict with file namespace");
 
         let mut entries = std::collections::BTreeMap::new();
-        insert_entry(
-            &mut entries,
-            "/foo/".to_string(),
-            FilesystemEntry::Directory,
-        )
-        .expect("initial directory entry should insert");
+        insert_entry(&mut entries, "/foo".to_string(), FilesystemEntry::Directory)
+            .expect("initial directory entry should insert");
         insert_entry(
             &mut entries,
             "/foo".to_string(),

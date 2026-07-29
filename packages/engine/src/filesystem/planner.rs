@@ -1422,7 +1422,7 @@ fn directory_path_from_segments(segments: &[String]) -> String {
     if segments.is_empty() {
         "/".to_string()
     } else {
-        format!("/{}/", segments.join("/"))
+        format!("/{}", segments.join("/"))
     }
 }
 
@@ -2041,14 +2041,14 @@ mod tests {
     #[test]
     fn directory_path_resolver_reuses_existing_ancestor() {
         let mut resolver = DirectoryPathResolver::from_existing([(
-            "/docs/".to_string(),
+            "/docs".to_string(),
             "01920000-0000-7000-8000-0000000000d3".to_string(),
         )])
         .expect("existing directories should parse");
 
         let rows = resolver
             .ensure_directory_path_batch(
-                "/docs/nested/",
+                "/docs/nested",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
@@ -2057,11 +2057,11 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(
-            resolver.directory_id("/docs/").unwrap(),
+            resolver.directory_id("/docs").unwrap(),
             Some("01920000-0000-7000-8000-0000000000d3")
         );
         assert_eq!(
-            resolver.directory_id("/docs/nested/").unwrap(),
+            resolver.directory_id("/docs/nested").unwrap(),
             Some("dir-generated-nested")
         );
 
@@ -2081,7 +2081,7 @@ mod tests {
 
         let docs_rows = resolver
             .ensure_directory_path_batch(
-                "/docs/",
+                "/docs",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
             )
@@ -2090,7 +2090,7 @@ mod tests {
 
         let nested_rows = resolver
             .ensure_directory_path_batch(
-                "/docs/nested/",
+                "/docs/nested",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["dir-generated-nested"]),
             )
@@ -2114,7 +2114,7 @@ mod tests {
 
         let rows = create_directory_path_with_leaf_id(
             &mut resolver,
-            "/docs/nested/",
+            "/docs/nested",
             Some("01920000-0000-7000-8000-000000000343".to_string()),
             FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&["01920000-0000-7000-8000-000000000353"]),
@@ -2123,11 +2123,11 @@ mod tests {
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
-            resolver.directory_id("/docs/").unwrap(),
+            resolver.directory_id("/docs").unwrap(),
             Some("01920000-0000-7000-8000-000000000353")
         );
         assert_eq!(
-            resolver.directory_id("/docs/nested/").unwrap(),
+            resolver.directory_id("/docs/nested").unwrap(),
             Some("01920000-0000-7000-8000-000000000343")
         );
 
@@ -2147,7 +2147,7 @@ mod tests {
 
         let rows = resolver
             .ensure_directory_path_batch(
-                "/docs/nested/",
+                "/docs/nested",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&[
                     "01920000-0000-7000-8000-000000000353",
@@ -2159,7 +2159,7 @@ mod tests {
 
         let rows = resolver
             .ensure_directory_path_batch(
-                "/docs/nested/",
+                "/docs/nested",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
             )
@@ -2262,11 +2262,11 @@ mod tests {
     fn file_path_write_reuses_existing_parent_directory() {
         let mut resolver = DirectoryPathResolver::from_existing([
             (
-                "/docs/".to_string(),
+                "/docs".to_string(),
                 "01920000-0000-7000-8000-0000000000d3".to_string(),
             ),
             (
-                "/docs/guides/".to_string(),
+                "/docs/guides".to_string(),
                 "01920000-0000-7000-8000-000000000313".to_string(),
             ),
         ])
@@ -2305,7 +2305,7 @@ mod tests {
     #[test]
     fn file_descriptor_write_renders_payload_path_from_parent_descriptor() {
         let mut resolver = DirectoryPathResolver::from_existing([(
-            "/docs/".to_string(),
+            "/docs".to_string(),
             "01920000-0000-7000-8000-0000000000d3".to_string(),
         )])
         .expect("resolver should build");
@@ -2351,20 +2351,20 @@ mod tests {
     #[test]
     fn file_path_planners_reject_representative_invalid_paths_before_staging() {
         let file_error = LixPath::try_from_file_path("/docs/")
-            .expect_err("directory-looking path should not parse as a file");
+            .expect_err("trailing slash should not parse as a file");
         assert!(!file_error.message.is_empty());
 
         let mut directory_resolver =
             DirectoryPathResolver::from_existing([]).expect("empty resolver should build");
         let directory_error = directory_resolver
             .ensure_directory_path_batch(
-                "/docs",
+                "/docs/",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["should-not-be-used"]),
             )
-            .expect_err("file-looking path should not plan as a directory");
+            .expect_err("trailing slash should not plan as a directory");
         assert!(!directory_error.message.is_empty());
-        assert_eq!(directory_resolver.directory_id("/docs/").unwrap(), None);
+        assert_eq!(directory_resolver.directory_id("/docs").unwrap(), None);
     }
 
     #[test]
@@ -2380,7 +2380,7 @@ mod tests {
         .expect("resolver should seed existing file");
         let error = existing_file_resolver
             .ensure_directory_path_batch(
-                "/docs/",
+                "/docs",
                 FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
                 &mut test_id_generator(&["01920000-0000-7000-8000-0000000000d3"]),
             )
@@ -2388,7 +2388,7 @@ mod tests {
         assert_eq!(error.code, crate::LixError::CODE_UNIQUE);
 
         let mut existing_directory_resolver = DirectoryPathResolver::from_existing([(
-            "/docs/".to_string(),
+            "/docs".to_string(),
             "01920000-0000-7000-8000-0000000000d3".to_string(),
         )])
         .expect("resolver should seed existing directory");
@@ -2433,7 +2433,7 @@ mod tests {
 
         create_directory_path_with_leaf_id(
             &mut resolver,
-            "/docs/",
+            "/docs",
             Some("01920000-0000-7000-8000-0000000000d3".to_string()),
             FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
@@ -2442,7 +2442,7 @@ mod tests {
 
         let error = create_directory_path_with_leaf_id(
             &mut resolver,
-            "/docs/",
+            "/docs",
             Some("01920000-0000-7000-8000-0000000000d3-again".to_string()),
             FilesystemRowContext::active_branch("01920000-0000-7000-8000-0000000000a1"),
             &mut test_id_generator(&[]),
@@ -2454,7 +2454,7 @@ mod tests {
     #[test]
     fn file_path_update_reuses_existing_parent_and_preserves_data() {
         let mut resolver = DirectoryPathResolver::from_existing([(
-            "/docs/".to_string(),
+            "/docs".to_string(),
             "01920000-0000-7000-8000-0000000000d3".to_string(),
         )])
         .expect("existing directories should seed");
@@ -2700,11 +2700,11 @@ mod tests {
             ))
             .expect("storage-scope resolver should exist");
         assert_eq!(
-            resolver.directory_id("/docs/").unwrap(),
+            resolver.directory_id("/docs").unwrap(),
             Some("01920000-0000-7000-8000-0000000000d3")
         );
         assert_eq!(
-            resolver.directory_id("/docs/guides/").unwrap(),
+            resolver.directory_id("/docs/guides").unwrap(),
             Some("01920000-0000-7000-8000-000000000313")
         );
     }
@@ -2821,7 +2821,7 @@ mod tests {
             resolvers
                 .get(&branch_a_key)
                 .unwrap()
-                .directory_id("/docs/")
+                .directory_id("/docs")
                 .unwrap(),
             Some("dir-01920000-0000-7000-8000-0000000000a1")
         );
@@ -2829,7 +2829,7 @@ mod tests {
             resolvers
                 .get(&branch_b_key)
                 .unwrap()
-                .directory_id("/docs/")
+                .directory_id("/docs")
                 .unwrap(),
             Some("dir-01920000-0000-7000-8000-0000000000b1")
         );
@@ -2837,7 +2837,7 @@ mod tests {
             resolvers
                 .get(&global_key)
                 .unwrap()
-                .directory_id("/docs/")
+                .directory_id("/docs")
                 .unwrap(),
             Some("01920000-0000-7000-8000-000000000363")
         );
@@ -2845,7 +2845,7 @@ mod tests {
             resolvers
                 .get(&untracked_key)
                 .unwrap()
-                .directory_id("/docs/")
+                .directory_id("/docs")
                 .unwrap(),
             Some("01920000-0000-7000-8000-000000000413")
         );
@@ -2853,7 +2853,7 @@ mod tests {
             resolvers
                 .get(&file_scoped_key)
                 .unwrap()
-                .directory_id("/docs/")
+                .directory_id("/docs")
                 .unwrap(),
             Some("dir-file-scoped")
         );

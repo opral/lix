@@ -29,7 +29,7 @@ simulation_test!(
                 })
                 .collect::<Vec<_>>();
             let directories = (0..3)
-                .map(|directory| format!("{root}/d{directory}/"))
+                .map(|directory| format!("{root}/d{directory}"))
                 .collect::<Vec<_>>();
             let mut expected = BTreeMap::<String, Vec<u8>>::new();
             let mut rng = TinyRng::new(seed);
@@ -126,7 +126,8 @@ simulation_test!(
                                 .unwrap_or_else(|error| {
                                     panic!("{label}: recursive directory delete failed: {error:?}")
                                 });
-                            expected.retain(|path, _| !path.starts_with(directory));
+                            let descendant_prefix = format!("{directory}/");
+                            expected.retain(|path, _| !path.starts_with(&descendant_prefix));
                         }
                     }
                     _ => {
@@ -209,7 +210,7 @@ async fn assert_files(
         .collect::<Vec<_>>();
     assert_eq!(actual, expected, "{label}: filesystem state diverged");
 
-    let rejected_directory = format!("{root}/rejected/");
+    let rejected_directory = format!("{root}/rejected");
     let directories = session
         .execute(
             "SELECT path FROM lix_directory WHERE path = $1",

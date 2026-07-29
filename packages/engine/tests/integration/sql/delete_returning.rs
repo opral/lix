@@ -42,7 +42,7 @@ simulation_test!(
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('72657475-726e-896e-872d-646972656300', '/72657475-726e-896e-872d-646972656300/')",
+                 VALUES ('72657475-726e-896e-872d-646972656300', '/72657475-726e-896e-872d-646972656300')",
                 &[],
             )
             .await
@@ -50,7 +50,7 @@ simulation_test!(
         let deleted_directory = session
             .execute(
                 "DELETE FROM lix_directory \
-                 WHERE path LIKE '/72657475-726e-896e-872d-646972656300/%' \
+                 WHERE path = '/72657475-726e-896e-872d-646972656300' \
                  RETURNING id, path",
                 &[],
             )
@@ -61,7 +61,7 @@ simulation_test!(
             deleted_directory,
             vec![vec![
                 Value::Text("72657475-726e-896e-872d-646972656300".to_string()),
-                Value::Text("/72657475-726e-896e-872d-646972656300/".to_string()),
+                Value::Text("/72657475-726e-896e-872d-646972656300".to_string()),
             ]],
         );
 

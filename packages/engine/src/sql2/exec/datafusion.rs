@@ -3607,7 +3607,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) \
-                 VALUES ('01920000-0000-7000-8000-0000000000d3', '/docs/')",
+                 VALUES ('01920000-0000-7000-8000-0000000000d3', '/docs')",
                 &[],
             )
             .await?;
@@ -3709,7 +3709,7 @@ mod tests {
         session
             .execute(
                 "INSERT INTO lix_directory (id, path) VALUES ('01920000-0000-7000-8000-000000000303', $1)",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
+                &[Value::Text("/Cafe\u{301}".to_string())],
             )
             .await
             .expect("decomposed directory path insert should preserve literal text");
@@ -3717,7 +3717,7 @@ mod tests {
         let result = session
             .execute(
                 "SELECT id FROM lix_directory WHERE path IN ($1)",
-                &[Value::Text("/Cafe\u{301}/".to_string())],
+                &[Value::Text("/Cafe\u{301}".to_string())],
             )
             .await
             .expect("directory path predicate should match literal text");
@@ -3731,7 +3731,7 @@ mod tests {
         let composed_alias_result = session
             .execute(
                 "SELECT id FROM lix_directory WHERE path IN ($1)",
-                &[Value::Text("/Café/".to_string())],
+                &[Value::Text("/Café".to_string())],
             )
             .await
             .expect("composed directory path predicate should execute");
@@ -3811,7 +3811,7 @@ mod tests {
         );
         assert_eq!(rows[0][1], Value::Null);
         assert_eq!(rows[0][2], Value::Text("docs".to_string()));
-        assert_eq!(rows[0][3], Value::Text("/docs/".to_string()));
+        assert_eq!(rows[0][3], Value::Text("/docs".to_string()));
         assert!(matches!(rows[0][4], Value::Integer(_)));
 
         let name_filtered_result = session
@@ -4601,7 +4601,7 @@ mod tests {
 
         let result = execute_write_sql(
             &mut ctx,
-            "UPDATE lix_directory SET path = '/renamed/' WHERE id = '01920000-0000-7000-8000-0000000000d3'",
+            "UPDATE lix_directory SET path = '/renamed' WHERE id = '01920000-0000-7000-8000-0000000000d3'",
             &[],
         )
         .await
@@ -6613,7 +6613,7 @@ mod tests {
 
                 assert_eq!(result.columns, vec!["path", "name", "lixcol_branch_id"]);
                 assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("/docs/".to_string()));
+                assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
                 assert_eq!(
                     result.rows[0][2],
@@ -6643,7 +6643,7 @@ mod tests {
 
                 assert_eq!(result.columns, vec!["path", "name"]);
                 assert_eq!(result.rows.len(), 1);
-                assert_eq!(result.rows[0][0], Value::Text("/docs/".to_string()));
+                assert_eq!(result.rows[0][0], Value::Text("/docs".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
             })
         });

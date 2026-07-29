@@ -9366,7 +9366,7 @@ mod tests {
         let paths = derive_directory_paths(records.iter().map(|row| (row.key.clone(), row)))
             .expect("path derivation should succeed");
 
-        assert_eq!(paths.get(&child_key), Some(&"/docs/guides/".to_string()));
+        assert_eq!(paths.get(&child_key), Some(&"/docs/guides".to_string()));
     }
 
     #[tokio::test]
@@ -10523,7 +10523,7 @@ mod tests {
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
-                "/docs/".to_string(),
+                "/docs".to_string(),
                 "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
@@ -10569,7 +10569,7 @@ mod tests {
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
-                "/docs/".to_string(),
+                "/docs".to_string(),
                 "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
@@ -10709,7 +10709,7 @@ mod tests {
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
-                "/docs/".to_string(),
+                "/docs".to_string(),
                 "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
@@ -10759,7 +10759,7 @@ mod tests {
                 None,
             ),
             super::DirectoryPathResolver::from_existing([(
-                "/docs/".to_string(),
+                "/docs".to_string(),
                 "01920000-0000-7000-8000-0000000000d3".to_string(),
             )])
             .expect("directory resolver should seed"),
@@ -11080,11 +11080,11 @@ mod tests {
             ),
             super::DirectoryPathResolver::from_existing([
                 (
-                    "/docs/".to_string(),
+                    "/docs".to_string(),
                     "01920000-0000-7000-8000-0000000000d3".to_string(),
                 ),
                 (
-                    "/docs/guides/".to_string(),
+                    "/docs/guides".to_string(),
                     "01920000-0000-7000-8000-000000000313".to_string(),
                 ),
             ])

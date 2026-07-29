@@ -1,7 +1,7 @@
 use crate::LixError;
 
-pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
 const PLUGIN_STORAGE_ROOT_PATH: &str = "/.lix/plugins";
+const PLUGIN_STORAGE_ROOT_PREFIX: &str = "/.lix/plugins/";
 pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
 const PLUGIN_ARCHIVE_ID_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0x6c69782d_706c_7567_696e_2d6172636869);
@@ -12,11 +12,11 @@ pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
 }
 
 pub fn plugin_storage_archive_path(plugin_key: &str) -> String {
-    format!("{PLUGIN_STORAGE_ROOT_DIRECTORY_PATH}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}")
+    format!("{PLUGIN_STORAGE_ROOT_PREFIX}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}")
 }
 
 pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
-    let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)?;
+    let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_PREFIX)?;
     let plugin_key = file_name.strip_suffix(PLUGIN_ARCHIVE_FILE_EXTENSION)?;
     if !is_valid_plugin_key(plugin_key) {
         return None;
@@ -61,7 +61,7 @@ pub(crate) fn reject_normal_plugin_storage_mutation(
 }
 
 pub(crate) fn is_plugin_storage_path(path: &str) -> bool {
-    path == PLUGIN_STORAGE_ROOT_PATH || path.starts_with(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)
+    path == PLUGIN_STORAGE_ROOT_PATH || path.starts_with(PLUGIN_STORAGE_ROOT_PREFIX)
 }
 
 #[cfg(test)]

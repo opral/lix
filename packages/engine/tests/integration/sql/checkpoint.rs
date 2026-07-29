@@ -474,7 +474,7 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Text("/docs/".to_string()),
+                Value::Text("/docs".to_string()),
                 Value::Null,
                 Value::Text("added".to_string()),
             ]]
@@ -491,7 +491,7 @@ simulation_test!(
 
         session
             .execute(
-                "UPDATE lix_directory SET path = '/writing/' WHERE path = '/docs/'",
+                "UPDATE lix_directory SET path = '/writing' WHERE path = '/docs'",
                 &[],
             )
             .await
@@ -518,8 +518,8 @@ simulation_test!(
             )
             .await,
             vec![vec![
-                Value::Text("/writing/".to_string()),
-                Value::Text("/docs/".to_string()),
+                Value::Text("/writing".to_string()),
+                Value::Text("/docs".to_string()),
             ]]
         );
     }
