@@ -10,7 +10,7 @@ use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::tracked_state::bench::seed_packed_history;
 use lix_engine::{Engine, SessionContext, Value};
 use lix_rocksdb_storage::RocksDB;
-use lix_slatedb_storage::SlateDB;
+use lix_slatedb_storage::{SlateDB, SlateDBIoCounters, SlateDBIoSnapshot};
 
 const DEFAULT_HISTORY: &[usize] = &[100_000, 1_000_000, 10_000_000];
 const DEFAULT_WIDTHS: &[usize] = &[1, 10, 100, 10_000];
@@ -111,16 +111,24 @@ async fn run() {
                             warmups,
                             samples,
                             seed,
+                            SlateDBIoSnapshot::default(),
+                            SlateDBIoSnapshot::default(),
                             directory.path(),
+                            None,
                             &mut fixture,
                         )
                         .await;
                     }
                     Backend::SlateDB => {
                         let directory = tempfile::tempdir().expect("create SlateDB directory");
-                        let storage = SlateDB::open(directory.path()).expect("open SlateDB");
+                        let io_counters = SlateDBIoCounters::default();
+                        let storage =
+                            SlateDB::open_with_io_counters(directory.path(), io_counters.clone())
+                                .expect("open SlateDB");
+                        let seed_io_before = io_counters.snapshot();
                         let (mut fixture, seed) =
                             Fixture::prepare(storage.clone(), live_rows, history, width).await;
+                        let seed_io_after = io_counters.snapshot();
                         if env_bool("LIX_FIXED_LIVE_MEMTABLE_FLUSH", false) {
                             storage
                                 .flush_memtable_for_diagnostics()
@@ -130,6 +138,7 @@ async fn run() {
                             storage.flush().await.expect("flush SlateDB WAL");
                         }
                         tokio::time::sleep(settle).await;
+                        let lifecycle_io_after = io_counters.snapshot();
                         run_case(
                             backend,
                             history,
@@ -137,7 +146,10 @@ async fn run() {
                             warmups,
                             samples,
                             seed,
+                            seed_io_after.saturating_sub(seed_io_before),
+                            lifecycle_io_after.saturating_sub(seed_io_after),
                             directory.path(),
+                            Some(&io_counters),
                             &mut fixture,
                         )
                         .await;
@@ -283,7 +295,10 @@ async fn run_case<S>(
     warmups: usize,
     samples: usize,
     seed: SeedStats,
+    seed_io: SlateDBIoSnapshot,
+    lifecycle_io: SlateDBIoSnapshot,
     storage_path: &Path,
+    io_counters: Option<&SlateDBIoCounters>,
     fixture: &mut Fixture<S>,
 ) where
     S: Storage + Clone + Send + Sync + 'static,
@@ -301,6 +316,7 @@ async fn run_case<S>(
         if matches!(operation, Operation::DeleteOne) {
             fixture.prepare_deletes(warmups + samples + 1).await;
         }
+        let io_before = io_counters.map_or_else(SlateDBIoSnapshot::default, |c| c.snapshot());
         let cold_started = Instant::now();
         fixture.execute(operation).await;
         let cold = cold_started.elapsed();
@@ -314,11 +330,19 @@ async fn run_case<S>(
             timings.push(started.elapsed());
         }
         timings.sort_unstable();
+        let io = io_counters
+            .map_or_else(SlateDBIoSnapshot::default, |c| c.snapshot())
+            .saturating_sub(io_before);
         println!(
             "fixed_live_history,backend={backend},operation={operation},history_changes={history},\
              commit_width={width},live_rows={},cold_us={},p50_us={},p95_us={},p99_us={},\
              seed_ms={},ingest_changes_per_second={:.1},staged_puts={},logical_written_bytes={},\
-             physical_bytes={},physical_objects={},runtime_threads={},memtable_flush={},settle_ms={}",
+             seed_object_reads={},seed_object_read_bytes={},seed_object_writes={},\
+             seed_object_write_bytes={},flush_object_reads={},flush_object_read_bytes={},\
+             flush_object_writes={},flush_object_write_bytes={},\
+             physical_bytes={},physical_objects={},object_reads={},object_read_bytes={},\
+             object_writes={},object_write_bytes={},list_operations={},listed_objects={},\
+             deleted_objects={},copied_objects={},runtime_threads={},memtable_flush={},settle_ms={}",
             fixture.live_rows,
             cold.as_micros(),
             percentile(&timings, 50).as_micros(),
@@ -328,8 +352,24 @@ async fn run_case<S>(
             history as f64 / seed.elapsed.as_secs_f64(),
             seed.staged_puts,
             seed.written_bytes,
+            seed_io.read_objects,
+            seed_io.read_bytes,
+            seed_io.write_objects,
+            seed_io.write_bytes,
+            lifecycle_io.read_objects,
+            lifecycle_io.read_bytes,
+            lifecycle_io.write_objects,
+            lifecycle_io.write_bytes,
             directory_bytes(storage_path),
             directory_objects(storage_path),
+            io.read_objects,
+            io.read_bytes,
+            io.write_objects,
+            io.write_bytes,
+            io.list_operations,
+            io.listed_objects,
+            io.deleted_objects,
+            io.copied_objects,
             env_usize("LIX_FIXED_LIVE_RUNTIME_THREADS", 1),
             env_bool("LIX_FIXED_LIVE_MEMTABLE_FLUSH", false),
             env_nonnegative_usize("LIX_FIXED_LIVE_SETTLE_MS", 0),

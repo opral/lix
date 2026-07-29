@@ -1,5 +1,8 @@
 use crate::changelog::{ChangeId, CommitId};
 use crate::entity_pk::EntityPk;
+use crate::json_store::{
+    JsonRef, JsonSlotRef, JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef,
+};
 use crate::storage_adapter::Storage;
 use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageReadOptions, StorageWriteOptions,
@@ -57,6 +60,39 @@ pub struct BenchPackedHistoryAccounting {
     pub written_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchPackedHistoryShape {
+    UniqueInserts,
+    RepeatedUpdates,
+    DeleteReinsert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchPackedHistoryPayload {
+    None,
+    SmallInline,
+    SharedLarge,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BenchPackedHistoryOptions<'a> {
+    pub shape: BenchPackedHistoryShape,
+    pub payload: BenchPackedHistoryPayload,
+    pub live_entities: usize,
+    pub shared_large_payload: Option<&'a str>,
+}
+
+impl Default for BenchPackedHistoryOptions<'_> {
+    fn default() -> Self {
+        Self {
+            shape: BenchPackedHistoryShape::UniqueInserts,
+            payload: BenchPackedHistoryPayload::None,
+            live_entities: 10_000,
+            shared_large_payload: None,
+        }
+    }
+}
+
 /// Seeds the authoritative packed-history plane without commit headers, roots,
 /// or live-state indexes.
 ///
@@ -69,6 +105,26 @@ pub async fn seed_packed_history<StorageImpl>(
     changes: usize,
     commit_width: usize,
     storage_batch_changes: usize,
+) -> BenchPackedHistoryAccounting
+where
+    StorageImpl: Storage,
+{
+    seed_packed_history_with_options(
+        storage,
+        changes,
+        commit_width,
+        storage_batch_changes,
+        BenchPackedHistoryOptions::default(),
+    )
+    .await
+}
+
+pub async fn seed_packed_history_with_options<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    changes: usize,
+    commit_width: usize,
+    storage_batch_changes: usize,
+    options: BenchPackedHistoryOptions<'_>,
 ) -> BenchPackedHistoryAccounting
 where
     StorageImpl: Storage,
@@ -86,17 +142,53 @@ where
         storage_batch_changes >= commit_width,
         "storage batch must hold at least one logical commit"
     );
+    validate_packed_history_shape(changes, commit_width, options.shape, options.live_entities);
+    assert_eq!(
+        matches!(options.payload, BenchPackedHistoryPayload::SharedLarge),
+        options.shared_large_payload.is_some(),
+        "shared-large payload mode requires exactly one payload"
+    );
 
     let commits = changes / commit_width;
     let commits_per_storage_batch = (storage_batch_changes / commit_width).max(1);
     let mut staged_puts = 0;
     let mut written_bytes = 0;
+    let shared_large_ref = if let Some(payload) = options.shared_large_payload {
+        let mut writes = storage.new_write_set();
+        let [json_ref] = JsonStoreContext::new()
+            .writer()
+            .stage_batch(
+                &mut writes,
+                JsonWritePlacementRef::OutOfBand,
+                [NormalizedJsonRef::new(payload)],
+            )
+            .expect("stage packed-history shared large payload")
+            .try_into()
+            .expect("one shared payload produces one JSON ref");
+        let (_commit, stats) = storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed-history shared large payload");
+        staged_puts += stats.staged_puts;
+        written_bytes += stats.written_bytes;
+        Some(json_ref)
+    } else {
+        None
+    };
     for commit_batch_start in (0..commits).step_by(commits_per_storage_batch) {
         let commit_batch_end = (commit_batch_start + commits_per_storage_batch).min(commits);
         let mut writes = storage.new_write_set();
         for commit_index in commit_batch_start..commit_batch_end {
             let owned = (0..commit_width)
-                .map(|row_index| PackedHistoryDelta::new(commit_index, row_index))
+                .map(|row_index| {
+                    PackedHistoryDelta::new(
+                        commit_index,
+                        row_index,
+                        commit_width,
+                        options,
+                        shared_large_ref,
+                    )
+                })
                 .collect::<Vec<_>>();
             let deltas = owned
                 .iter()
@@ -119,6 +211,31 @@ where
         staged_puts,
         written_bytes,
     }
+}
+
+fn validate_packed_history_shape(
+    changes: usize,
+    commit_width: usize,
+    shape: BenchPackedHistoryShape,
+    live_entities: usize,
+) {
+    let required_generations = match shape {
+        BenchPackedHistoryShape::UniqueInserts => return,
+        BenchPackedHistoryShape::RepeatedUpdates => 2,
+        BenchPackedHistoryShape::DeleteReinsert => 3,
+    };
+    assert!(
+        live_entities >= commit_width,
+        "repeated packed-history shapes require at least one live entity per commit row"
+    );
+    let required_changes = live_entities
+        .checked_mul(required_generations)
+        .expect("packed-history generation size should not overflow");
+    assert!(
+        changes >= required_changes,
+        "{shape:?} requires at least {required_generations} complete generations \
+         ({required_changes} changes for {live_entities} live entities)"
+    );
 }
 
 pub async fn scan_packed_history<StorageImpl>(storage: &StorageAdapter<StorageImpl>) -> usize
@@ -194,19 +311,46 @@ struct PackedHistoryDelta {
     commit_id: CommitId,
     entity_pk: EntityPk,
     schema_key: String,
+    deleted: bool,
+    payload: BenchPackedHistoryPayload,
+    shared_large_ref: Option<JsonRef>,
     created_at: crate::common::LixTimestamp,
     updated_at: crate::common::LixTimestamp,
 }
 
 impl PackedHistoryDelta {
-    fn new(commit_index: usize, row_index: usize) -> Self {
+    fn new(
+        commit_index: usize,
+        row_index: usize,
+        commit_width: usize,
+        options: BenchPackedHistoryOptions<'_>,
+        shared_large_ref: Option<JsonRef>,
+    ) -> Self {
+        let change_index = commit_index
+            .checked_mul(commit_width)
+            .and_then(|index| index.checked_add(row_index))
+            .expect("packed-history change index should not overflow");
+        let entity_pk = match options.shape {
+            BenchPackedHistoryShape::UniqueInserts => {
+                format!("packed-history-entity-{commit_index}-{row_index}")
+            }
+            BenchPackedHistoryShape::RepeatedUpdates | BenchPackedHistoryShape::DeleteReinsert => {
+                format!(
+                    "packed-history-entity-{}",
+                    change_index % options.live_entities
+                )
+            }
+        };
+        let deleted = matches!(options.shape, BenchPackedHistoryShape::DeleteReinsert)
+            && (change_index / options.live_entities) % 2 == 1;
         Self {
             change_id: packed_history_change_id(commit_index, row_index),
             commit_id: CommitId::new(packed_history_uuid(commit_index, 0, 0x43)),
-            entity_pk: EntityPk::single(format!(
-                "packed-history-entity-{commit_index}-{row_index}"
-            )),
+            entity_pk: EntityPk::single(entity_pk),
             schema_key: "packed_history".to_string(),
+            deleted,
+            payload: options.payload,
+            shared_large_ref,
             created_at: crate::common::LixTimestamp::expect_parse(
                 "created_at",
                 "2026-07-28T00:00:00.000Z",
@@ -219,6 +363,20 @@ impl PackedHistoryDelta {
     }
 
     fn as_commit_ref(&self) -> TrackedStateCommitDeltaRef<'_> {
+        const SMALL_PAYLOAD: &str = r#"{"value":"small"}"#;
+        let snapshot = if self.deleted {
+            JsonSlotRef::None
+        } else {
+            match self.payload {
+                BenchPackedHistoryPayload::None => JsonSlotRef::None,
+                BenchPackedHistoryPayload::SmallInline => JsonSlotRef::Inline(SMALL_PAYLOAD),
+                BenchPackedHistoryPayload::SharedLarge => JsonSlotRef::Ref(
+                    self.shared_large_ref
+                        .as_ref()
+                        .expect("shared-large packed history has a JSON ref"),
+                ),
+            }
+        };
         TrackedStateCommitDeltaRef {
             delta: TrackedStateDeltaRef {
                 schema_key: &self.schema_key,
@@ -226,12 +384,12 @@ impl PackedHistoryDelta {
                 entity_pk: &self.entity_pk,
                 change_id: self.change_id,
                 commit_id: self.commit_id,
-                deleted: false,
+                deleted: self.deleted,
                 created_at: self.created_at,
                 updated_at: self.updated_at,
             },
-            snapshot: crate::json_store::JsonSlotRef::None,
-            metadata: crate::json_store::JsonSlotRef::None,
+            snapshot,
+            metadata: JsonSlotRef::None,
             origin_key: None,
             authored: true,
         }
@@ -275,6 +433,107 @@ fn packed_history_uuid(commit_index: usize, ordinal: usize, discriminator: u8) -
     bytes[8..].copy_from_slice(&mixed.to_be_bytes());
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     uuid::Uuid::from_bytes(bytes)
+}
+
+#[cfg(test)]
+mod packed_history_tests {
+    use super::*;
+
+    fn options(
+        shape: BenchPackedHistoryShape,
+        payload: BenchPackedHistoryPayload,
+    ) -> BenchPackedHistoryOptions<'static> {
+        BenchPackedHistoryOptions {
+            shape,
+            payload,
+            live_entities: 10,
+            shared_large_payload: matches!(payload, BenchPackedHistoryPayload::SharedLarge)
+                .then_some(r#"{"payload":"large"}"#),
+        }
+    }
+
+    #[test]
+    fn repeated_updates_reuse_entity_identity() {
+        let first = PackedHistoryDelta::new(
+            0,
+            0,
+            10,
+            options(
+                BenchPackedHistoryShape::RepeatedUpdates,
+                BenchPackedHistoryPayload::None,
+            ),
+            None,
+        );
+        let second = PackedHistoryDelta::new(
+            1,
+            0,
+            10,
+            options(
+                BenchPackedHistoryShape::RepeatedUpdates,
+                BenchPackedHistoryPayload::None,
+            ),
+            None,
+        );
+
+        assert_eq!(first.entity_pk, second.entity_pk);
+        assert!(!first.deleted);
+        assert!(!second.deleted);
+    }
+
+    #[test]
+    fn delete_reinsert_alternates_generations() {
+        let options = options(
+            BenchPackedHistoryShape::DeleteReinsert,
+            BenchPackedHistoryPayload::SmallInline,
+        );
+        let insert = PackedHistoryDelta::new(0, 0, 10, options, None);
+        let delete = PackedHistoryDelta::new(1, 0, 10, options, None);
+        let reinsert = PackedHistoryDelta::new(2, 0, 10, options, None);
+
+        assert_eq!(insert.entity_pk, delete.entity_pk);
+        assert_eq!(delete.entity_pk, reinsert.entity_pk);
+        assert!(!insert.deleted);
+        assert!(delete.deleted);
+        assert!(!reinsert.deleted);
+        assert_eq!(
+            insert.as_commit_ref().snapshot,
+            JsonSlotRef::Inline(r#"{"value":"small"}"#)
+        );
+        assert_eq!(delete.as_commit_ref().snapshot, JsonSlotRef::None);
+        assert_eq!(
+            reinsert.as_commit_ref().snapshot,
+            JsonSlotRef::Inline(r#"{"value":"small"}"#)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "RepeatedUpdates requires at least 2 complete generations")]
+    fn repeated_updates_require_an_update_generation() {
+        validate_packed_history_shape(10, 10, BenchPackedHistoryShape::RepeatedUpdates, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "DeleteReinsert requires at least 3 complete generations")]
+    fn delete_reinsert_requires_a_reinsert_generation() {
+        validate_packed_history_shape(20, 10, BenchPackedHistoryShape::DeleteReinsert, 10);
+    }
+
+    #[test]
+    fn shared_large_payload_uses_one_json_reference() {
+        let json_ref = JsonRef::from_hash_bytes([7; 32]);
+        let delta = PackedHistoryDelta::new(
+            0,
+            0,
+            1,
+            options(
+                BenchPackedHistoryShape::UniqueInserts,
+                BenchPackedHistoryPayload::SharedLarge,
+            ),
+            Some(json_ref),
+        );
+
+        assert_eq!(delta.as_commit_ref().snapshot, JsonSlotRef::Ref(&json_ref));
+    }
 }
 
 struct BenchWriteOutcome {

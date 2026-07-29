@@ -3512,6 +3512,7 @@ dependencies = [
  "lix_engine",
  "object_store 0.14.0",
  "slatedb",
+ "slatedb-common",
  "tempfile",
  "tokio",
 ]

@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
-use std::ops::Bound;
+use std::ops::{Bound, Range};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -15,6 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures_util::FutureExt;
 use futures_util::stream::{self, BoxStream, StreamExt, TryStreamExt};
 use lix_engine::storage::{
     CommitResult, CoreProjection, GetManyRequest, GetManyResult, Key, KeyRange, Precondition,
@@ -39,6 +40,7 @@ use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
 use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
+use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
 use tempfile::TempDir;
 use tokio::runtime::{Builder, Handle, Runtime};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot};
@@ -57,13 +59,18 @@ const SNAPSHOT_POINT_CACHE_BYTES: usize = 16 * 1024 * 1024;
 const SNAPSHOT_POINT_CACHE_ENTRIES: usize = 4096;
 const SNAPSHOT_POINT_CACHE_MAX_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
-const DEFAULT_METADATA_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+// Keep indexes and Bloom filters resident across batched point validation.
+// A tiny metadata cache repeatedly fetched multi-megabyte filters once the
+// repository crossed the first large-SST boundary.
+const DEFAULT_METADATA_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
 const SCAN_MAX_FETCH_TASKS: usize = 16;
 const SCAN_CACHE_BLOCKS: bool = true;
 const OBJECT_STORE_CACHE_PART_SIZE_BYTES: usize = 2 * 1024 * 1024;
 const COMPACTOR_COMMIT_INTERVAL: Duration = Duration::from_secs(5);
+const WRITE_PIPELINE_MAX_PENDING_ENTRIES: usize = 1024 * 1024;
+const WRITE_PIPELINE_MAX_PENDING_BYTES: usize = 128 * 1024 * 1024;
 const LOCAL_SST_FILE_CACHE_ENTRIES: usize = 256;
 const LOCAL_SST_CONTENT_CACHE_BYTES: usize = 32 * 1024 * 1024;
 const LOCAL_SST_CONTENT_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -118,6 +125,211 @@ pub struct SlateDBCacheOptions {
     pub metadata_cache_bytes: u64,
 }
 
+#[derive(Clone)]
+pub struct SlateDBIoCounters {
+    inner: Arc<SlateDBIoCounterValues>,
+    metrics: Arc<DefaultMetricsRecorder>,
+}
+
+impl fmt::Debug for SlateDBIoCounters {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("SlateDBIoCounters").finish()
+    }
+}
+
+impl Default for SlateDBIoCounters {
+    fn default() -> Self {
+        Self {
+            inner: Arc::default(),
+            metrics: Arc::new(DefaultMetricsRecorder::new()),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SlateDBIoCounterValues {
+    read_objects: AtomicU64,
+    read_bytes: AtomicU64,
+    write_objects: AtomicU64,
+    write_bytes: AtomicU64,
+    list_operations: AtomicU64,
+    listed_objects: AtomicU64,
+    deleted_objects: AtomicU64,
+    copied_objects: AtomicU64,
+    wal: SlateDBIoCategoryCounters,
+    compacted: SlateDBIoCategoryCounters,
+    manifest: SlateDBIoCategoryCounters,
+    compactions: SlateDBIoCategoryCounters,
+    other: SlateDBIoCategoryCounters,
+}
+
+#[derive(Debug, Default)]
+struct SlateDBIoCategoryCounters {
+    read_objects: AtomicU64,
+    read_bytes: AtomicU64,
+    write_objects: AtomicU64,
+    write_bytes: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlateDBIoSnapshot {
+    pub read_objects: u64,
+    pub read_bytes: u64,
+    pub write_objects: u64,
+    pub write_bytes: u64,
+    pub list_operations: u64,
+    pub listed_objects: u64,
+    pub deleted_objects: u64,
+    pub copied_objects: u64,
+    pub wal: SlateDBIoCategorySnapshot,
+    pub compacted: SlateDBIoCategorySnapshot,
+    pub manifest: SlateDBIoCategorySnapshot,
+    pub compactions: SlateDBIoCategorySnapshot,
+    pub other: SlateDBIoCategorySnapshot,
+    pub main: SlateDBIoComponentSnapshot,
+    pub reader: SlateDBIoComponentSnapshot,
+    pub compactor: SlateDBIoComponentSnapshot,
+    pub gc: SlateDBIoComponentSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlateDBIoCategorySnapshot {
+    pub read_objects: u64,
+    pub read_bytes: u64,
+    pub write_objects: u64,
+    pub write_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlateDBIoComponentSnapshot {
+    pub read_requests: u64,
+    pub write_requests: u64,
+}
+
+impl SlateDBIoCounters {
+    pub fn snapshot(&self) -> SlateDBIoSnapshot {
+        let metrics = self.metrics.snapshot();
+        SlateDBIoSnapshot {
+            read_objects: self.inner.read_objects.load(Ordering::Relaxed),
+            read_bytes: self.inner.read_bytes.load(Ordering::Relaxed),
+            write_objects: self.inner.write_objects.load(Ordering::Relaxed),
+            write_bytes: self.inner.write_bytes.load(Ordering::Relaxed),
+            list_operations: self.inner.list_operations.load(Ordering::Relaxed),
+            listed_objects: self.inner.listed_objects.load(Ordering::Relaxed),
+            deleted_objects: self.inner.deleted_objects.load(Ordering::Relaxed),
+            copied_objects: self.inner.copied_objects.load(Ordering::Relaxed),
+            wal: self.inner.wal.snapshot(),
+            compacted: self.inner.compacted.snapshot(),
+            manifest: self.inner.manifest.snapshot(),
+            compactions: self.inner.compactions.snapshot(),
+            other: self.inner.other.snapshot(),
+            main: component_snapshot(&metrics, "db"),
+            reader: component_snapshot(&metrics, "reader"),
+            compactor: component_snapshot(&metrics, "compactor"),
+            gc: component_snapshot(&metrics, "gc"),
+        }
+    }
+}
+
+fn component_snapshot(
+    metrics: &slatedb_common::metrics::Metrics,
+    component: &str,
+) -> SlateDBIoComponentSnapshot {
+    let mut snapshot = SlateDBIoComponentSnapshot::default();
+    for metric in metrics.by_name("slatedb.object_store.request_count") {
+        let label = |name: &str| {
+            metric
+                .labels
+                .iter()
+                .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+        };
+        if label("component") != Some(component) {
+            continue;
+        }
+        let MetricValue::Counter(value) = metric.value else {
+            continue;
+        };
+        match label("op") {
+            Some("get") => snapshot.read_requests = snapshot.read_requests.saturating_add(value),
+            Some("put") => snapshot.write_requests = snapshot.write_requests.saturating_add(value),
+            _ => {}
+        }
+    }
+    snapshot
+}
+
+impl SlateDBIoCounterValues {
+    fn category(&self, location: &ObjectPath) -> &SlateDBIoCategoryCounters {
+        let path = location.as_ref();
+        if path.split('/').any(|part| part == "wal") {
+            &self.wal
+        } else if path.split('/').any(|part| part == "compacted") {
+            &self.compacted
+        } else if path.split('/').any(|part| part == "manifest") {
+            &self.manifest
+        } else if path.split('/').any(|part| part == "compactions") {
+            &self.compactions
+        } else {
+            &self.other
+        }
+    }
+}
+
+impl SlateDBIoCategoryCounters {
+    fn snapshot(&self) -> SlateDBIoCategorySnapshot {
+        SlateDBIoCategorySnapshot {
+            read_objects: self.read_objects.load(Ordering::Relaxed),
+            read_bytes: self.read_bytes.load(Ordering::Relaxed),
+            write_objects: self.write_objects.load(Ordering::Relaxed),
+            write_bytes: self.write_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+impl SlateDBIoSnapshot {
+    pub fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_objects: self.read_objects.saturating_sub(earlier.read_objects),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            write_objects: self.write_objects.saturating_sub(earlier.write_objects),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+            list_operations: self.list_operations.saturating_sub(earlier.list_operations),
+            listed_objects: self.listed_objects.saturating_sub(earlier.listed_objects),
+            deleted_objects: self.deleted_objects.saturating_sub(earlier.deleted_objects),
+            copied_objects: self.copied_objects.saturating_sub(earlier.copied_objects),
+            wal: self.wal.saturating_sub(earlier.wal),
+            compacted: self.compacted.saturating_sub(earlier.compacted),
+            manifest: self.manifest.saturating_sub(earlier.manifest),
+            compactions: self.compactions.saturating_sub(earlier.compactions),
+            other: self.other.saturating_sub(earlier.other),
+            main: self.main.saturating_sub(earlier.main),
+            reader: self.reader.saturating_sub(earlier.reader),
+            compactor: self.compactor.saturating_sub(earlier.compactor),
+            gc: self.gc.saturating_sub(earlier.gc),
+        }
+    }
+}
+
+impl SlateDBIoCategorySnapshot {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_objects: self.read_objects.saturating_sub(earlier.read_objects),
+            read_bytes: self.read_bytes.saturating_sub(earlier.read_bytes),
+            write_objects: self.write_objects.saturating_sub(earlier.write_objects),
+            write_bytes: self.write_bytes.saturating_sub(earlier.write_bytes),
+        }
+    }
+}
+
+impl SlateDBIoComponentSnapshot {
+    fn saturating_sub(self, earlier: Self) -> Self {
+        Self {
+            read_requests: self.read_requests.saturating_sub(earlier.read_requests),
+            write_requests: self.write_requests.saturating_sub(earlier.write_requests),
+        }
+    }
+}
+
 /// Reads local table ranges on the caller executor.
 ///
 /// `LocalFileSystem::get_opts` schedules file open and metadata work on the
@@ -130,6 +342,233 @@ pub struct SlateDBCacheOptions {
 struct DirectLocalReads {
     inner: LocalFileSystem,
     files: Mutex<DirectLocalFileCache>,
+}
+
+#[derive(Debug)]
+struct CountingObjectStore {
+    inner: Arc<dyn ObjectStore>,
+    counters: SlateDBIoCounters,
+}
+
+#[derive(Debug)]
+struct CountingMultipartUpload {
+    inner: Box<dyn MultipartUpload>,
+    counters: SlateDBIoCounters,
+    location: ObjectPath,
+    uploaded_bytes: Arc<AtomicU64>,
+}
+
+#[async_trait]
+impl MultipartUpload for CountingMultipartUpload {
+    fn put_part(&mut self, payload: PutPayload) -> object_store::UploadPart {
+        let bytes = payload.content_length() as u64;
+        let uploaded_bytes = Arc::clone(&self.uploaded_bytes);
+        self.inner
+            .put_part(payload)
+            .map(move |result| {
+                if result.is_ok() {
+                    uploaded_bytes.fetch_add(bytes, Ordering::Relaxed);
+                }
+                result
+            })
+            .boxed()
+    }
+
+    async fn complete(&mut self) -> object_store::Result<PutResult> {
+        let result = self.inner.complete().await?;
+        let bytes = self.uploaded_bytes.load(Ordering::Relaxed);
+        let category = self.counters.inner.category(&self.location);
+        self.counters
+            .inner
+            .write_objects
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inner
+            .write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        category.write_objects.fetch_add(1, Ordering::Relaxed);
+        category.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.inner.abort().await
+    }
+}
+
+impl fmt::Display for CountingObjectStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "counting {}", self.inner)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for CountingObjectStore {
+    async fn put_opts(
+        &self,
+        location: &ObjectPath,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        let bytes = payload.content_length() as u64;
+        let result = self.inner.put_opts(location, payload, options).await?;
+        let category = self.counters.inner.category(location);
+        self.counters
+            .inner
+            .write_objects
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inner
+            .write_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        category.write_objects.fetch_add(1, Ordering::Relaxed);
+        category.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &ObjectPath,
+        options: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        let inner = self.inner.put_multipart_opts(location, options).await?;
+        Ok(Box::new(CountingMultipartUpload {
+            inner,
+            counters: self.counters.clone(),
+            location: location.clone(),
+            uploaded_bytes: Arc::new(AtomicU64::new(0)),
+        }))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: ObjectStoreGetOptions,
+    ) -> object_store::Result<GetResult> {
+        let mut result = self.inner.get_opts(location, options).await?;
+        let category = self.counters.inner.category(location);
+        self.counters
+            .inner
+            .read_objects
+            .fetch_add(1, Ordering::Relaxed);
+        category.read_objects.fetch_add(1, Ordering::Relaxed);
+        if let GetResultPayload::Stream(payload) = result.payload {
+            let counters = self.counters.clone();
+            let location = location.clone();
+            result.payload = GetResultPayload::Stream(
+                payload
+                    .map(move |item| {
+                        if let Ok(bytes) = &item {
+                            counters
+                                .inner
+                                .read_bytes
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                            counters
+                                .inner
+                                .category(&location)
+                                .read_bytes
+                                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                        }
+                        item
+                    })
+                    .boxed(),
+            );
+        }
+        Ok(result)
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        let result = self.inner.get_ranges(location, ranges).await?;
+        let bytes = result.iter().map(|bytes| bytes.len() as u64).sum::<u64>();
+        let category = self.counters.inner.category(location);
+        self.counters
+            .inner
+            .read_objects
+            .fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .inner
+            .read_bytes
+            .fetch_add(bytes, Ordering::Relaxed);
+        category.read_objects.fetch_add(1, Ordering::Relaxed);
+        category.read_bytes.fetch_add(bytes, Ordering::Relaxed);
+        Ok(result)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> BoxStream<'static, object_store::Result<ObjectPath>> {
+        let counters = self.counters.clone();
+        self.inner
+            .delete_stream(locations)
+            .map(move |item| {
+                if item.is_ok() {
+                    counters
+                        .inner
+                        .deleted_objects
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                item
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.counters
+            .inner
+            .list_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let counters = self.counters.clone();
+        self.inner
+            .list(prefix)
+            .map(move |item| {
+                if item.is_ok() {
+                    counters
+                        .inner
+                        .listed_objects
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                item
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<ListResult> {
+        self.counters
+            .inner
+            .list_operations
+            .fetch_add(1, Ordering::Relaxed);
+        let result = self.inner.list_with_delimiter(prefix).await?;
+        self.counters.inner.listed_objects.fetch_add(
+            (result.objects.len() + result.common_prefixes.len()) as u64,
+            Ordering::Relaxed,
+        );
+        Ok(result)
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &ObjectPath,
+        to: &ObjectPath,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await?;
+        self.counters
+            .inner
+            .copied_objects
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 #[derive(Debug, Default)]
@@ -230,6 +669,22 @@ impl ObjectStore for DirectLocalReads {
             attributes: Attributes::default(),
             extensions: Extensions::default(),
         })
+    }
+
+    async fn get_ranges(
+        &self,
+        location: &ObjectPath,
+        ranges: &[Range<u64>],
+    ) -> object_store::Result<Vec<Bytes>> {
+        let mut result = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let options = ObjectStoreGetOptions {
+                range: Some(object_store::GetRange::Bounded(range.clone())),
+                ..ObjectStoreGetOptions::default()
+            };
+            result.push(self.get_opts(location, options).await?.bytes().await?);
+        }
+        Ok(result)
     }
 
     fn delete_stream(
@@ -460,8 +915,11 @@ struct WritePipelineState {
     draining: bool,
     visible: VecDeque<Arc<PublishedWrite>>,
     active_views: BTreeMap<(u64, u64), usize>,
+    snapshot_fetches: usize,
     newest_snapshot_sequence: u64,
     next_publication_id: u64,
+    pending_entries: usize,
+    pending_bytes: usize,
     terminal_error: Option<StorageError>,
     latest_snapshot: Option<Arc<DbSnapshot>>,
 }
@@ -471,6 +929,7 @@ struct QueuedWrite {
     published: Arc<PublishedWrite>,
     completion: Arc<WriteCompletion>,
     await_durable: bool,
+    weight_bytes: usize,
 }
 
 struct PublishedWrite {
@@ -484,6 +943,11 @@ struct PublicationView {
     worker: Option<SlateDBWorker>,
     snapshot_sequence: u64,
     publication_id: u64,
+}
+
+struct SnapshotFetch {
+    pipeline: WritePipeline,
+    worker: SlateDBWorker,
 }
 
 struct WriteCompletion {
@@ -556,17 +1020,28 @@ impl WritePipeline {
         error.map_or(Ok(()), Err)
     }
 
-    async fn snapshot(&self, worker: &SlateDBWorker) -> Result<Arc<DbSnapshot>, StorageError> {
+    async fn snapshot(
+        &self,
+        worker: &SlateDBWorker,
+    ) -> Result<(Arc<DbSnapshot>, Option<SnapshotFetch>), StorageError> {
         let publication_id = {
-            let state = self
+            let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(snapshot) = state.latest_snapshot.clone() {
                 worker.check_open_fast()?;
-                return Ok(snapshot);
+                return Ok((snapshot, None));
             }
+            state.snapshot_fetches = state
+                .snapshot_fetches
+                .checked_add(1)
+                .expect("SlateDB snapshot fetch overflow");
             state.next_publication_id
+        };
+        let fetch = SnapshotFetch {
+            pipeline: self.clone(),
+            worker: worker.clone(),
         };
         let snapshot = worker
             .call_read(|db| async move { db.snapshot().await.map_err(slatedb_error) })
@@ -588,7 +1063,7 @@ impl WritePipeline {
         } else {
             worker.check_open_fast()?;
         }
-        Ok(snapshot)
+        Ok((snapshot, Some(fetch)))
     }
 
     fn install_snapshot(&self, snapshot: Arc<DbSnapshot>) {
@@ -711,6 +1186,24 @@ impl Drop for PublicationView {
     }
 }
 
+impl Drop for SnapshotFetch {
+    fn drop(&mut self) {
+        let mut state = self
+            .pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.snapshot_fetches = state
+            .snapshot_fetches
+            .checked_sub(1)
+            .expect("SlateDB snapshot fetches should be balanced");
+        let newest_snapshot_sequence = state.newest_snapshot_sequence;
+        let retired = cleanup_publications(&mut state, newest_snapshot_sequence);
+        drop(state);
+        self.worker.defer_publication_drop(retired);
+    }
+}
+
 fn publication_visible_to_view(
     write: &PublishedWrite,
     snapshot_sequence: u64,
@@ -728,7 +1221,8 @@ fn cleanup_publications(
     let mut retired = Vec::new();
     while state.visible.front().is_some_and(|write| {
         let persisted = write.persisted_sequence.load(Ordering::Acquire);
-        persisted != PENDING_WRITE_SEQUENCE
+        state.snapshot_fetches == 0
+            && persisted != PENDING_WRITE_SEQUENCE
             && persisted <= newest_snapshot_sequence
             && !state
                 .active_views
@@ -755,6 +1249,11 @@ fn snapshot_covers_persisted_publications(
         let persisted = write.persisted_sequence.load(Ordering::Acquire);
         persisted != PENDING_WRITE_SEQUENCE && persisted <= snapshot_sequence
     })
+}
+
+fn write_pipeline_should_backpressure(pending_entries: usize, pending_bytes: usize) -> bool {
+    pending_entries >= WRITE_PIPELINE_MAX_PENDING_ENTRIES
+        || pending_bytes >= WRITE_PIPELINE_MAX_PENDING_BYTES
 }
 
 impl SnapshotPointCache {
@@ -972,22 +1471,46 @@ impl StorageFixture for SlateDBFixture {
 
 impl SlateDB {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StorageError> {
-        let path = path.into();
+        Self::open_local(path.into(), None)
+    }
+
+    #[doc(hidden)]
+    pub fn open_with_io_counters(
+        path: impl Into<PathBuf>,
+        counters: SlateDBIoCounters,
+    ) -> Result<Self, StorageError> {
+        Self::open_local(path.into(), Some(counters))
+    }
+
+    fn open_local(
+        path: PathBuf,
+        counters: Option<SlateDBIoCounters>,
+    ) -> Result<Self, StorageError> {
         std::fs::create_dir_all(&path).map_err(|error| {
             StorageError::Io(format!(
                 "create slatedb storage directory {}: {error}",
                 path.display()
             ))
         })?;
-        let object_store: Arc<dyn ObjectStore> = Arc::new(DirectLocalReads {
+        let mut object_store: Arc<dyn ObjectStore> = Arc::new(DirectLocalReads {
             inner: LocalFileSystem::new_with_prefix(&path).map_err(object_store_error)?,
             files: Mutex::new(DirectLocalFileCache::default()),
         });
+        let metrics = counters
+            .as_ref()
+            .map(|counters| Arc::clone(&counters.metrics));
+        if let Some(counters) = counters {
+            object_store = Arc::new(CountingObjectStore {
+                inner: object_store,
+                counters,
+            });
+        }
         Self::open_object_store_with_read_dispatch(
             DB_PATH,
             object_store,
             SlateDBObjectStoreOptions::default(),
             true,
+            metrics,
         )
         .map(|mut storage| {
             storage.path = path;
@@ -1000,7 +1523,7 @@ impl SlateDB {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
     ) -> Result<Self, StorageError> {
-        Self::open_object_store_with_read_dispatch(db_path, object_store, options, false)
+        Self::open_object_store_with_read_dispatch(db_path, object_store, options, false, None)
     }
 
     /// Opens SlateDB with a private current-thread read-dispatch choice.
@@ -1014,6 +1537,7 @@ impl SlateDB {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
         read_on_caller_current_thread: bool,
+        metrics: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Result<Self, StorageError> {
         validate_object_store_options(&options)?;
         let db_path = db_path.into();
@@ -1023,6 +1547,7 @@ impl SlateDB {
                 object_store,
                 options,
                 read_on_caller_current_thread,
+                metrics,
             )?,
             path: PathBuf::from(db_path),
             write_gate: WriteGate::new(),
@@ -1105,7 +1630,7 @@ impl Storage for SlateDB {
     ) -> impl Future<Output = Result<Self::Read<'_>, StorageError>> + Send {
         async move {
             self.write_pipeline.terminal_error()?;
-            let snapshot = self.write_pipeline.snapshot(&self.worker).await?;
+            let (snapshot, snapshot_fetch) = self.write_pipeline.snapshot(&self.worker).await?;
             self.point_cache.observe_snapshot(snapshot.seq());
             let publication_view = if opts.durability == ReadDurability::Visible {
                 Some(
@@ -1115,6 +1640,7 @@ impl Storage for SlateDB {
             } else {
                 None
             };
+            drop(snapshot_fetch);
             self.write_pipeline.terminal_error()?;
             Ok(SlateDBRead {
                 worker: self.worker.clone(),
@@ -1171,14 +1697,16 @@ async fn check_preconditions(
     let write_pipeline = write_pipeline.clone();
     let read_pipeline = write_pipeline.clone();
     let point_cache = point_cache.clone();
-    let capture_worker = worker.clone();
+    let (snapshot, snapshot_fetch) = write_pipeline.snapshot(worker).await?;
+    let snapshot_sequence = snapshot.seq();
+    point_cache.observe_snapshot(snapshot_sequence);
+    let publication_view = read_pipeline.capture_with_worker(worker.clone(), snapshot_sequence);
+    // Keep the fetch guard alive until the publication view is registered.
+    // Otherwise a concurrent drainer can retire an overlay between obtaining
+    // the snapshot and capturing the view that makes that overlay visible.
+    drop(snapshot_fetch);
     let matches = worker
-        .call_read(move |db| async move {
-            let snapshot = db.snapshot().await.map_err(slatedb_error)?;
-            let snapshot_sequence = snapshot.seq();
-            point_cache.observe_snapshot(snapshot_sequence);
-            let publication_view =
-                read_pipeline.capture_with_worker(capture_worker, snapshot_sequence);
+        .call_read(move |_db| async move {
             let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
             let mut index = 0;
@@ -1772,9 +2300,18 @@ impl StorageWrite for SlateDBWrite {
 
             worker.check_open()?;
             write_pipeline.terminal_error()?;
+            let overlay_entries = overlay.len();
+            let overlay_bytes = overlay
+                .iter()
+                .map(|(key, value)| {
+                    key.0
+                        .len()
+                        .saturating_add(value.as_ref().map_or(0, Bytes::len))
+                })
+                .sum::<usize>();
             let overlay = Arc::new(overlay);
             let completion = Arc::new(WriteCompletion::new());
-            let start_drainer = {
+            let (start_drainer, apply_backpressure) = {
                 let mut state = write_pipeline
                     .state
                     .lock()
@@ -1797,27 +2334,39 @@ impl StorageWrite for SlateDBWrite {
                 });
                 state.tail = Some(Arc::clone(&completion));
                 state.visible.push_back(Arc::clone(&published));
+                state.pending_entries = state.pending_entries.saturating_add(overlay_entries);
+                state.pending_bytes = state.pending_bytes.saturating_add(overlay_bytes);
                 state.queued.push_back(QueuedWrite {
                     overlay,
                     published,
                     completion: Arc::clone(&completion),
                     await_durable,
+                    weight_bytes: overlay_bytes,
                 });
                 let start_drainer = !state.draining;
                 state.draining = true;
-                start_drainer
+                let apply_backpressure =
+                    write_pipeline_should_backpressure(state.pending_entries, state.pending_bytes);
+                (start_drainer, apply_backpressure)
             };
 
-            drop(writer_permit);
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
-                worker.spawn(move |db| drain_write_queue(db, task_pipeline, point_cache));
+                let publication_reclaimer = worker.publication_reclaimer();
+                worker.spawn(move |db| {
+                    drain_write_queue(db, task_pipeline, point_cache, publication_reclaimer)
+                });
             }
 
             // The writer gate protects precondition evaluation plus publication
             // into the ordered adapter pipeline. Once published, later writers
-            // observe this overlay without waiting for SlateDB's task rendezvous.
-            if await_durable {
+            // observe this overlay without waiting for SlateDB's task rendezvous,
+            // except at the high-water mark where the gate bounds queued memory.
+            if apply_backpressure {
+                completion.wait().await?;
+            }
+            drop(writer_permit);
+            if await_durable && !apply_backpressure {
                 completion.wait().await?;
             }
             Ok(CommitResult {
@@ -1832,7 +2381,12 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
-async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: SnapshotPointCache) {
+async fn drain_write_queue(
+    db: Arc<Db>,
+    pipeline: WritePipeline,
+    point_cache: SnapshotPointCache,
+    publication_reclaimer: PublicationReclaimer,
+) {
     loop {
         let writes = {
             let mut state = pipeline
@@ -1893,6 +2447,35 @@ async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: Sn
                     .store(*sequence, Ordering::Release);
             }
         }
+        let completed_entries = writes
+            .iter()
+            .map(|write| write.overlay.len())
+            .sum::<usize>();
+        let completed_bytes = writes.iter().map(|write| write.weight_bytes).sum::<usize>();
+        let retired = {
+            let mut state = pipeline
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.pending_entries = state
+                .pending_entries
+                .checked_sub(completed_entries)
+                .expect("SlateDB pending write entries should be balanced");
+            state.pending_bytes = state
+                .pending_bytes
+                .checked_sub(completed_bytes)
+                .expect("SlateDB pending write bytes should be balanced");
+            if let Ok(sequence) = &result {
+                // A completed write is covered by every future SlateDB
+                // snapshot. Retain its publication only while an already
+                // active older view still needs the overlay.
+                state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(*sequence);
+                cleanup_publications(&mut state, *sequence)
+            } else {
+                Vec::new()
+            }
+        };
+        publication_reclaimer.defer(retired);
         for write in writes {
             if let Ok(sequence) = &result {
                 write.completion.complete(Ok(*sequence));
@@ -2000,6 +2583,7 @@ impl SlateDBWorker {
         object_store: Arc<dyn ObjectStore>,
         options: SlateDBObjectStoreOptions,
         read_on_caller_current_thread: bool,
+        metrics: Option<Arc<DefaultMetricsRecorder>>,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
         let reclamation = InFlightTracker::default();
@@ -2013,6 +2597,7 @@ impl SlateDBWorker {
                     db_path,
                     object_store,
                     options,
+                    metrics,
                     shutdown_rx,
                     opened_tx,
                     manager_in_flight,
@@ -2211,6 +2796,7 @@ fn run_slatedb_manager(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
+    metrics: Option<Arc<DefaultMetricsRecorder>>,
     shutdown: mpsc::Receiver<()>,
     opened: mpsc::Sender<Result<(Handle, Arc<Db>), StorageError>>,
     in_flight: InFlightTracker,
@@ -2229,7 +2815,7 @@ fn run_slatedb_manager(
         }
     };
 
-    let db = match open_slatedb(&runtime, db_path, object_store, options) {
+    let db = match open_slatedb(&runtime, db_path, object_store, options, metrics) {
         Ok(db) => db,
         Err(error) => {
             let _ = opened.send(Err(error));
@@ -2255,11 +2841,15 @@ fn open_slatedb(
     db_path: String,
     object_store: Arc<dyn ObjectStore>,
     options: SlateDBObjectStoreOptions,
+    metrics: Option<Arc<DefaultMetricsRecorder>>,
 ) -> Result<Db, StorageError> {
     runtime.block_on(async move {
         let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
         let mut builder = Db::builder(physical_db_path, object_store)
             .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor));
+        if let Some(metrics) = metrics {
+            builder = builder.with_metrics_recorder(metrics);
+        }
         let mut settings = slatedb_settings();
         if let Some(cache) = options.cache {
             settings.object_store_cache_options = ObjectStoreCacheOptions {
@@ -2911,8 +3501,8 @@ mod tests {
     use object_store::path::Path as ObjectPath;
     use object_store::{
         CopyOptions, Error as ObjectStoreError, GetOptions as ObjectStoreGetOptions, GetResult,
-        ListResult, MultipartUpload, ObjectMeta, PutMultipartOptions, PutOptions, PutPayload,
-        PutResult, RenameOptions, Result as ObjectStoreResult,
+        ListResult, MultipartUpload, ObjectMeta, ObjectStoreExt, PutMultipartOptions, PutOptions,
+        PutPayload, PutResult, RenameOptions, Result as ObjectStoreResult,
     };
     use slatedb::config::{FlushOptions, FlushType};
     use std::ops::Range;
@@ -2921,6 +3511,102 @@ mod tests {
 
     tokio::task_local! {
         static CALLER_READ_MARKER: ();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_object_store_counters_measure_completed_io() {
+        let counters = SlateDBIoCounters::default();
+        let store = CountingObjectStore {
+            inner: Arc::new(InMemory::new()),
+            counters: counters.clone(),
+        };
+        let path = ObjectPath::from("table.sst");
+        store
+            .put_opts(
+                &path,
+                PutPayload::from_static(b"payload"),
+                PutOptions::default(),
+            )
+            .await
+            .expect("write counted object");
+        let bytes = store
+            .get_opts(&path, ObjectStoreGetOptions::default())
+            .await
+            .expect("open counted object")
+            .bytes()
+            .await
+            .expect("read counted object");
+        assert_eq!(bytes, Bytes::from_static(b"payload"));
+        let ranges = store
+            .get_ranges(&path, &[0..2, 5..7])
+            .await
+            .expect("read counted object ranges");
+        assert_eq!(
+            ranges,
+            vec![Bytes::from_static(b"pa"), Bytes::from_static(b"ad")]
+        );
+        let multipart_path = ObjectPath::from("multipart.sst");
+        let mut multipart = store
+            .put_multipart_opts(&multipart_path, PutMultipartOptions::default())
+            .await
+            .expect("open counted multipart object");
+        multipart
+            .put_part(PutPayload::from_static(b"multi"))
+            .await
+            .expect("write counted multipart part");
+        multipart
+            .put_part(PutPayload::from_static(b"part"))
+            .await
+            .expect("write second counted multipart part");
+        multipart
+            .complete()
+            .await
+            .expect("complete counted multipart object");
+        let listed = store
+            .list(None)
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("list counted object");
+        assert_eq!(listed.len(), 2);
+        store.delete(&path).await.expect("delete counted object");
+
+        assert_eq!(
+            counters.snapshot(),
+            SlateDBIoSnapshot {
+                read_objects: 2,
+                read_bytes: 11,
+                write_objects: 2,
+                write_bytes: 16,
+                list_operations: 1,
+                listed_objects: 2,
+                deleted_objects: 1,
+                copied_objects: 0,
+                other: SlateDBIoCategorySnapshot {
+                    read_objects: 2,
+                    read_bytes: 11,
+                    write_objects: 2,
+                    write_bytes: 16,
+                },
+                ..SlateDBIoSnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn diagnostic_object_store_counters_classify_slatedb_paths() {
+        let counters = SlateDBIoCounterValues::default();
+        for (path, expected) in [
+            ("db/wal/1.sst", &counters.wal),
+            ("db/compacted/1.sst", &counters.compacted),
+            ("db/manifest/1.manifest", &counters.manifest),
+            ("db/compactions/1.compactions", &counters.compactions),
+            ("db/other/file", &counters.other),
+        ] {
+            assert!(std::ptr::eq(
+                counters.category(&ObjectPath::from(path)),
+                expected
+            ));
+        }
     }
 
     #[test]
@@ -2996,6 +3682,22 @@ mod tests {
     }
 
     #[test]
+    fn bulk_write_pipeline_applies_entry_and_byte_backpressure() {
+        assert!(!write_pipeline_should_backpressure(
+            WRITE_PIPELINE_MAX_PENDING_ENTRIES - 1,
+            WRITE_PIPELINE_MAX_PENDING_BYTES - 1,
+        ));
+        assert!(write_pipeline_should_backpressure(
+            WRITE_PIPELINE_MAX_PENDING_ENTRIES,
+            0,
+        ));
+        assert!(write_pipeline_should_backpressure(
+            0,
+            WRITE_PIPELINE_MAX_PENDING_BYTES,
+        ));
+    }
+
+    #[test]
     fn opens_fresh_local_versioned_storage() {
         let directory = tempfile::tempdir().expect("create fresh local storage directory");
         let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
@@ -3003,7 +3705,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_flush_reclaims_persisted_publications_before_the_next_read() {
+    fn completed_write_reclaims_publication_without_a_read_or_flush() {
         let storage = SlateDB::open_object_store_with_options(
             "test-flush-reclaims-publications",
             Arc::new(InMemory::new()),
@@ -3025,7 +3727,8 @@ mod tests {
         ))
         .expect("stage publication");
         block_on(write.commit()).expect("commit publication");
-        block_on(storage.flush()).expect("flush and reclaim publication");
+        block_on(storage.write_pipeline.wait_for_visible()).expect("wait for publication");
+        block_on(storage.worker.wait_for_reclamation()).expect("wait for publication reclamation");
 
         let state = storage
             .write_pipeline
@@ -4025,6 +4728,8 @@ mod tests {
         {
             let mut state = pipeline.state.lock().expect("lock publication state");
             state.next_publication_id = 1;
+            state.newest_snapshot_sequence = 2;
+            state.snapshot_fetches = 1;
             state.visible.push_back(published);
         }
 
@@ -4033,6 +4738,15 @@ mod tests {
         // must not discard the overlay before that fetch captures its view.
         drop(unrelated);
         let stale_fetch = pipeline.capture(1);
+        {
+            let mut state = pipeline.state.lock().expect("complete snapshot fetch");
+            state.snapshot_fetches = 0;
+            let retired = cleanup_publications(&mut state, 2);
+            assert!(
+                retired.is_empty(),
+                "the newly registered stale view still needs the publication"
+            );
+        }
 
         assert_eq!(
             pipeline.point_value(
