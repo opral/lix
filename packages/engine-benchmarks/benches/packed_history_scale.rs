@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use lix_engine::storage::Storage;
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::tracked_state::bench::{
-    BenchLayoutAccounting, packed_history_layout, scan_packed_history, seed_packed_history,
+    BenchLayoutAccounting, load_packed_change, packed_history_layout, scan_packed_history,
+    seed_packed_history,
 };
 use lix_rocksdb_storage::RocksDB;
 use lix_slatedb_storage::SlateDB;
@@ -15,6 +16,7 @@ const DEFAULT_COMMIT_WIDTHS: &[usize] = &[1, 10, 100, 10_000];
 const DEFAULT_STORAGE_BATCH_CHANGES: usize = 100_000;
 const DEFAULT_WARMUPS: usize = 1;
 const DEFAULT_SAMPLES: usize = 5;
+const DEFAULT_EXACT_SAMPLES: usize = 1_001;
 
 #[derive(Clone, Copy, Debug)]
 enum Backend {
@@ -48,6 +50,7 @@ async fn run() {
     );
     let warmups = env_nonnegative_usize("LIX_PACKED_HISTORY_WARMUPS", DEFAULT_WARMUPS);
     let samples = env_usize("LIX_PACKED_HISTORY_SAMPLES", DEFAULT_SAMPLES).max(1);
+    let exact_samples = env_usize("LIX_PACKED_HISTORY_EXACT_SAMPLES", DEFAULT_EXACT_SAMPLES).max(1);
     let flush = env_bool("LIX_PACKED_HISTORY_FLUSH", true);
     let memtable_flush = env_bool("LIX_PACKED_HISTORY_MEMTABLE_FLUSH", false);
     let account_layout = env_bool("LIX_PACKED_HISTORY_ACCOUNT_LAYOUT", true);
@@ -78,6 +81,7 @@ async fn run() {
                             storage_batch_changes,
                             warmups,
                             samples,
+                            exact_samples,
                             flush,
                             false,
                             account_layout,
@@ -100,6 +104,7 @@ async fn run() {
                             storage_batch_changes,
                             warmups,
                             samples,
+                            exact_samples,
                             flush,
                             memtable_flush,
                             account_layout,
@@ -132,6 +137,7 @@ async fn run_case<S, Flush, FlushFuture>(
     storage_batch_changes: usize,
     warmups: usize,
     samples: usize,
+    exact_samples: usize,
     flush: bool,
     memtable_flush: bool,
     account_layout: bool,
@@ -142,6 +148,8 @@ async fn run_case<S, Flush, FlushFuture>(
     FlushFuture: Future<Output = ()>,
 {
     let adapter = StorageAdapter::new(storage);
+    let id_shape =
+        std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").unwrap_or_else(|_| "deterministic".into());
     let seed_started = Instant::now();
     let writes = seed_packed_history(&adapter, changes, commit_width, storage_batch_changes).await;
     let seed_elapsed = seed_started.elapsed();
@@ -160,6 +168,18 @@ async fn run_case<S, Flush, FlushFuture>(
         timings.push(started.elapsed());
     }
     timings.sort_unstable();
+    let exact_commit_index = changes / commit_width / 2;
+    let exact_row_index = commit_width / 2;
+    for _ in 0..warmups {
+        assert!(load_packed_change(&adapter, exact_commit_index, exact_row_index).await);
+    }
+    let mut exact_timings = Vec::with_capacity(exact_samples);
+    for _ in 0..exact_samples {
+        let started = Instant::now();
+        assert!(load_packed_change(&adapter, exact_commit_index, exact_row_index).await);
+        exact_timings.push(started.elapsed());
+    }
+    exact_timings.sort_unstable();
     // Account after timing so a layout scan cannot pre-warm the measured
     // storage pages. `warmups=0,samples=1` is therefore the cold profile.
     let layout = if account_layout {
@@ -169,16 +189,19 @@ async fn run_case<S, Flush, FlushFuture>(
     };
     let manifest = find_layout(&layout, "tracked_state.commit_delta_manifest.v2");
     let segments = find_layout(&layout, "tracked_state.commit_delta_segment.v2");
+    let locators = find_layout(&layout, "tracked_state.change_locator.v1");
 
     println!(
-        "packed_history_scale,backend={backend},changes={changes},commits={},commit_width={commit_width},\
+        "packed_history_scale,backend={backend},id_shape={id_shape},changes={changes},commits={},commit_width={commit_width},\
          storage_batch_changes={storage_batch_changes},flushed={flush},warmups={warmups},samples={samples},\
          memtable_flushed={memtable_flush},\
          layout_accounted={account_layout},\
-         seed_ms={},ingest_changes_per_second={:.1},staged_puts={},logical_written_bytes={},\
+         exact_samples={exact_samples},seed_ms={},ingest_changes_per_second={:.1},staged_puts={},logical_written_bytes={},\
          scan_p50_ms={},scan_p95_ms={},scan_p99_ms={},\
+         exact_p50_ms={},exact_p95_ms={},exact_p99_ms={},\
          manifest_keys={},manifest_key_bytes={},manifest_value_bytes={},\
-         segment_keys={},segment_key_bytes={},segment_value_bytes={},backend_bytes={backend_bytes}",
+         segment_keys={},segment_key_bytes={},segment_value_bytes={},\
+         locator_keys={},locator_key_bytes={},locator_value_bytes={},backend_bytes={backend_bytes}",
         writes.commits,
         seed_elapsed.as_millis(),
         changes as f64 / seed_elapsed.as_secs_f64(),
@@ -187,12 +210,18 @@ async fn run_case<S, Flush, FlushFuture>(
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),
         millis(percentile(&timings, 99)),
+        millis(percentile(&exact_timings, 50)),
+        millis(percentile(&exact_timings, 95)),
+        millis(percentile(&exact_timings, 99)),
         manifest.rows,
         manifest.key_bytes,
         manifest.value_bytes,
         segments.rows,
         segments.key_bytes,
         segments.value_bytes,
+        locators.rows,
+        locators.key_bytes,
+        locators.value_bytes,
     );
 }
 

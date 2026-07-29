@@ -27,15 +27,18 @@ pub(crate) use row_materialization::{
 };
 #[cfg(test)]
 pub(crate) use storage::load_commit_delta_change_ids;
+pub(crate) use storage::{
+    CommitDeltaChangeLocator, load_change_record_by_id, load_commit_delta_change_records,
+    load_commit_delta_members_with_payloads, scan_change_records_from_commit_deltas,
+    scan_commit_delta_inventory, stage_change_locators, stage_commit_deltas,
+    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    stage_delete_commit_root,
+};
 #[cfg(feature = "storage-benches")]
 pub(crate) use storage::{
-    TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
-    TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE,
-};
-pub(crate) use storage::{
-    load_commit_delta_change_records, load_commit_delta_members_with_payloads,
-    scan_change_records_from_commit_deltas, scan_commit_delta_inventory, stage_commit_deltas,
-    stage_delete_commit_delta_inventory_entry, stage_delete_commit_root,
+    TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+    TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_SPACE,
+    TRACKED_STATE_TREE_CHUNK_SPACE,
 };
 pub(crate) use types::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateDeltaRef,

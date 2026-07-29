@@ -30,7 +30,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
-    load_commit_delta_change_records, stage_commit_deltas,
+    load_commit_delta_change_records, stage_change_locators, stage_commit_deltas,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
 #[cfg(test)]
@@ -922,7 +922,16 @@ fn stage_tracked_commit_delta_index(
                 record,
             )?);
         }
-        stage_commit_deltas(writes, &deltas)?;
+        let locators = stage_commit_deltas(writes, &deltas)?;
+        let authored_change_ids = state_row_indices
+            .iter()
+            .filter_map(|&row_index| state_rows.row(row_index).change_id)
+            .collect::<std::collections::HashSet<_>>();
+        let authored_locators = locators
+            .into_iter()
+            .filter(|locator| authored_change_ids.contains(&locator.change_id))
+            .collect::<Vec<_>>();
+        stage_change_locators(writes, &authored_locators);
     }
     Ok(())
 }

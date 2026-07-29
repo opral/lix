@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::logical_expr::{Expr, Operator, TableProviderFilterPushDown};
 
 use crate::LixError;
 use crate::changelog::{
-    ChangeId, ChangeRecord, ChangeScanRequest, ChangelogContext, ChangelogReader, CommitScanRequest,
+    COMMIT_CHANGE_ID_SPACE, ChangeId, ChangeLoadRequest, ChangeRecord, ChangeScanRequest,
+    ChangelogContext, ChangelogReader, CommitId, CommitLoadRequest, CommitScanRequest,
 };
 use crate::serialize_row_metadata;
 
@@ -20,7 +21,10 @@ use crate::sql2::change_materialization::{
 };
 use crate::sql2::error::lix_error_to_datafusion_error;
 use crate::sql2::result_metadata::json_field;
-use crate::storage_adapter::StorageAdapterRead;
+use crate::storage_adapter::{
+    PointReadPlan, StorageAdapterRead, StorageGetOptions, StorageKey, StorageProjectedValue,
+};
+use bytes::Bytes;
 
 use super::columns::{Col, ColumnTable, ColumnTableError};
 use super::spec::{PlannedScan, TableSpec, projected_schema, register_spec_table, row_source};
@@ -66,11 +70,11 @@ where
     }
 
     fn filter_pushdown(&self, filter: &Expr) -> TableProviderFilterPushDown {
-        let _ = filter;
-        // Packed changes are identity-ordered inside commit-owned segments.
-        // Until the layout has a measured change-id index, no `lix_change`
-        // predicate is a bounded point read.
-        TableProviderFilterPushDown::Unsupported
+        if exact_change_id_filter(filter).is_some() {
+            TableProviderFilterPushDown::Exact
+        } else {
+            TableProviderFilterPushDown::Unsupported
+        }
     }
 
     async fn plan_scan(
@@ -81,6 +85,7 @@ where
         _props: &ExecutionProps,
     ) -> Result<PlannedScan> {
         let pushed_limit = if filters.is_empty() { limit } else { None };
+        let route = change_scan_route(filters);
         let schema = projected_schema(&lix_change_schema(), projection);
         let payload_projection = change_payload_projection(schema.as_ref(), filters);
         Ok(PlannedScan {
@@ -91,7 +96,7 @@ where
                 move |(query_source, schema)| async move {
                     let mut json_reader = query_source.json_reader;
                     let canonical_changes =
-                        scan_changelog_changes(query_source.store, pushed_limit)
+                        scan_changelog_changes(query_source.store, pushed_limit, route)
                             .await
                             .map_err(lix_error_to_datafusion_error)?;
                     let mut changes = Vec::with_capacity(canonical_changes.len());
@@ -145,10 +150,20 @@ fn change_payload_projection(schema: &Schema, filters: &[Expr]) -> ChangePayload
 async fn scan_changelog_changes<S>(
     store: S,
     limit: Option<usize>,
+    route: ChangeScanRoute,
 ) -> Result<Vec<LixChangeRow>, LixError>
 where
     S: StorageAdapterRead + Clone + Send + Sync + 'static,
 {
+    match route {
+        ChangeScanRoute::Empty => return Ok(Vec::new()),
+        ChangeScanRoute::Exact(change_id) => {
+            return load_exact_change(store, change_id)
+                .await
+                .map(|change| change.into_iter().collect());
+        }
+        ChangeScanRoute::All => {}
+    }
     let packed_changes =
         crate::tracked_state::scan_change_records_from_commit_deltas(&store).await?;
     let mut reader = ChangelogContext::new().reader(store);
@@ -193,6 +208,120 @@ where
         changes.truncate(limit);
     }
     Ok(changes)
+}
+
+#[derive(Clone, Copy)]
+enum ChangeScanRoute {
+    All,
+    Exact(ChangeId),
+    Empty,
+}
+
+fn change_scan_route(filters: &[Expr]) -> ChangeScanRoute {
+    let mut exact = None;
+    for filter in filters {
+        let Some(candidate) = exact_change_id_filter(filter) else {
+            continue;
+        };
+        let Some(candidate) = candidate else {
+            return ChangeScanRoute::Empty;
+        };
+        if exact.is_some_and(|current| current != candidate) {
+            return ChangeScanRoute::Empty;
+        }
+        exact = Some(candidate);
+    }
+    exact.map_or(ChangeScanRoute::All, ChangeScanRoute::Exact)
+}
+
+fn exact_change_id_filter(filter: &Expr) -> Option<Option<ChangeId>> {
+    let Expr::BinaryExpr(binary) = filter else {
+        return None;
+    };
+    if binary.op != Operator::Eq {
+        return None;
+    }
+    let literal = match (binary.left.as_ref(), binary.right.as_ref()) {
+        (Expr::Column(column), literal) | (literal, Expr::Column(column))
+            if column.name == "id" =>
+        {
+            literal
+        }
+        _ => return None,
+    };
+    let Expr::Literal(
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)),
+        _,
+    ) = literal
+    else {
+        return None;
+    };
+    Some(ChangeId::parse(value).ok())
+}
+
+async fn load_exact_change<S>(
+    store: S,
+    change_id: ChangeId,
+) -> Result<Option<LixChangeRow>, LixError>
+where
+    S: StorageAdapterRead + Clone + Send + Sync + 'static,
+{
+    if let Some(change) = crate::tracked_state::load_change_record_by_id(&store, change_id).await? {
+        return Ok(Some(LixChangeRow::Direct(change)));
+    }
+
+    let mut reader = ChangelogContext::new().reader(store.clone());
+    if let Some(change) = reader
+        .load_changes(ChangeLoadRequest {
+            change_ids: std::slice::from_ref(&change_id),
+        })
+        .await?
+        .entries
+        .into_iter()
+        .next()
+        .flatten()
+    {
+        return Ok(Some(LixChangeRow::Direct(change)));
+    }
+
+    let index_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
+    let indexed_commit =
+        PointReadPlan::new(COMMIT_CHANGE_ID_SPACE, std::slice::from_ref(&index_key))
+            .materialize(&store, StorageGetOptions::default())
+            .await?
+            .value
+            .into_iter()
+            .next()
+            .flatten();
+    let Some(StorageProjectedValue::FullValue(commit_id)) = indexed_commit else {
+        return Ok(None);
+    };
+    let commit_id = CommitId::new(uuid::Uuid::from_slice(&commit_id).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("changelog commit change-id index has invalid commit id: {error}"),
+        )
+    })?);
+    let commit = reader
+        .load_commits(CommitLoadRequest {
+            commit_ids: std::slice::from_ref(&commit_id),
+        })
+        .await?
+        .entries
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("changelog commit change-id index references missing commit '{commit_id}'"),
+            )
+        })?;
+    Ok(Some(LixChangeRow::DerivedCommit(
+        commit_record_canonical_change(&commit),
+    )))
 }
 
 enum LixChangeRow {
@@ -284,9 +413,9 @@ fn change_batch_error(error: ColumnTableError) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use datafusion::arrow::datatypes::Schema;
-    use datafusion::logical_expr::{Expr, col};
+    use datafusion::logical_expr::{Expr, col, lit};
 
-    use super::{change_payload_projection, lix_change_schema};
+    use super::{ChangeScanRoute, change_payload_projection, change_scan_route, lix_change_schema};
 
     #[test]
     fn identity_projection_skips_json_payloads() {
@@ -315,5 +444,20 @@ mod tests {
 
         assert!(!projection.snapshot_content);
         assert!(projection.metadata);
+    }
+
+    #[test]
+    fn exact_change_id_route_accepts_uuid_and_rejects_impossible_literals() {
+        let id = crate::changelog::ChangeId::for_test_label("exact-change-route");
+        let route = change_scan_route(&[col("id").eq(lit(id.to_string()))]);
+        assert!(matches!(route, ChangeScanRoute::Exact(actual) if actual == id));
+        assert!(matches!(
+            change_scan_route(&[col("id").eq(lit("not-a-uuid"))]),
+            ChangeScanRoute::Empty
+        ));
+        assert!(matches!(
+            change_scan_route(&[col("schema_key").eq(lit("example"))]),
+            ChangeScanRoute::All
+        ));
     }
 }

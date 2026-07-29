@@ -650,6 +650,45 @@ where
         .map(JsonRef::from_hash_bytes)
         .collect::<Vec<_>>();
 
+    let dead_packed_change_ids = sweep_commits
+        .iter()
+        .filter_map(|commit_id| packed.commits.get(commit_id))
+        .flat_map(|entry| entry.members.iter().map(|member| member.value.change_id))
+        .collect::<BTreeSet<_>>();
+    crate::tracked_state::stage_delete_change_locators(
+        writes,
+        dead_packed_change_ids.difference(&live_change_ids).copied(),
+    );
+    let relocated_locators = live_commits
+        .iter()
+        .filter_map(|commit_id| {
+            packed
+                .commits
+                .get(commit_id)
+                .map(|entry| (*commit_id, entry))
+        })
+        .flat_map(|(commit_id, entry)| {
+            let dead_packed_change_ids = &dead_packed_change_ids;
+            entry.members.iter().filter_map(move |member| {
+                dead_packed_change_ids
+                    .contains(&member.value.change_id)
+                    .then_some(crate::tracked_state::CommitDeltaChangeLocator {
+                        change_id: member.value.change_id,
+                        commit_id,
+                        segment_index: member.segment_index,
+                        ordinal: u8::try_from(member.ordinal)
+                            .expect("commit-delta segment row count fits u8"),
+                    })
+            })
+        })
+        .fold(BTreeMap::new(), |mut locators, locator| {
+            locators.entry(locator.change_id).or_insert(locator);
+            locators
+        })
+        .into_values()
+        .collect::<Vec<_>>();
+    crate::tracked_state::stage_change_locators(writes, &relocated_locators);
+
     for commit_id in &sweep_commits {
         writes.delete(
             COMMIT_SPACE,
@@ -800,7 +839,8 @@ mod tests {
     };
     use crate::tracked_state::{
         TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef,
-        scan_commit_delta_inventory, stage_commit_deltas,
+        load_change_record_by_id, scan_commit_delta_inventory, stage_change_locators,
+        stage_commit_deltas,
     };
     use crate::{Engine, GLOBAL_BRANCH_ID, Value};
     use bytes::Bytes;
@@ -1135,11 +1175,7 @@ mod tests {
             "live-member",
             JsonSlot::Ref(shared_ref),
         );
-        let dead_shared_member = packed_change(
-            "authority-gc-dead-shared-member",
-            "dead-shared-member",
-            JsonSlot::Ref(shared_ref),
-        );
+        let dead_shared_member = live_member.clone();
         let dead_only_member = packed_change(
             "authority-gc-dead-only-member",
             "dead-only-member",
@@ -1205,7 +1241,11 @@ mod tests {
         stage_commit_deltas(&mut writes, &live_deltas).expect("live packed member should stage");
         let dead_members = vec![dead_shared_member.clone(), dead_only_member.clone()];
         let dead_deltas = commit_delta_refs(dead_commit, &dead_members);
-        stage_commit_deltas(&mut writes, &dead_deltas).expect("dead packed members should stage");
+        let dead_locators = stage_commit_deltas(&mut writes, &dead_deltas)
+            .expect("dead packed members should stage");
+        // Point the shared change at the owner about to be collected. GC must
+        // relocate it to the surviving physical copy, not delete the index.
+        stage_change_locators(&mut writes, &dead_locators);
         storage_adapter
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
@@ -1265,6 +1305,18 @@ mod tests {
             .expect("standalone facts should load");
         assert!(changes.entries[0].is_some());
         assert!(changes.entries[1].is_none());
+        assert!(
+            load_change_record_by_id(&read, live_member.change_id)
+                .await
+                .expect("relocated live locator should load")
+                .is_some()
+        );
+        assert!(
+            load_change_record_by_id(&read, dead_only_member.change_id)
+                .await
+                .expect("dead locator lookup should succeed")
+                .is_none()
+        );
         let inventory = scan_commit_delta_inventory(&read)
             .await
             .expect("post-GC packed inventory should scan");

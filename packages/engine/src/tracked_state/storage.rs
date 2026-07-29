@@ -34,6 +34,7 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_NAMESPACE: &str =
     "tracked_state.commit_delta_manifest.v2";
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE: &str =
     "tracked_state.commit_delta_segment.v2";
+pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE: &str = "tracked_state.change_locator.v1";
 pub(crate) const TRACKED_STATE_TREE_CHUNK_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_0001),
     TRACKED_STATE_TREE_CHUNK_NAMESPACE,
@@ -54,6 +55,10 @@ pub(crate) const TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE: StorageSpace = Stora
 pub(crate) const TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE: StorageSpace = StorageSpace::new(
     StorageSpaceId(0x0004_001a),
     TRACKED_STATE_COMMIT_DELTA_SEGMENT_NAMESPACE,
+);
+pub(crate) const TRACKED_STATE_CHANGE_LOCATOR_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0021),
+    TRACKED_STATE_CHANGE_LOCATOR_NAMESPACE,
 );
 
 const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
@@ -163,11 +168,21 @@ pub(crate) struct LoadedCommitDeltaEntry {
     pub(crate) change_record: crate::changelog::ChangeRecord,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CommitDeltaChangeLocator {
+    pub(crate) change_id: crate::changelog::ChangeId,
+    pub(crate) commit_id: CommitId,
+    pub(crate) segment_index: u32,
+    pub(crate) ordinal: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitDeltaMember {
     pub(crate) key: TrackedStateKey,
     pub(crate) value: TrackedStateIndexValue,
     pub(crate) change: crate::changelog::ChangeRecord,
+    pub(crate) segment_index: u32,
+    pub(crate) ordinal: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -546,9 +561,9 @@ pub(crate) fn stage_delete_commit_root(writes: &mut StorageWriteSet, commit_id: 
 pub(crate) fn stage_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
-) -> Result<(), LixError> {
+) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
     let Some(&commit_id) = deltas.first().map(|delta| &delta.delta.commit_id) else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
     let mut payloads = Vec::with_capacity(deltas.len());
@@ -640,13 +655,14 @@ pub(crate) fn stage_commit_deltas(
                 segments: Vec::new(),
             })?),
         );
-        return Ok(());
+        return commit_delta_change_locators(commit_id, 0, &entries);
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
     let mut manifest = CommitDeltaManifest {
         inline_segment: Vec::new(),
         segments: Vec::with_capacity(segment_count),
     };
+    let mut locators = Vec::with_capacity(entries.len());
     for (segment_index, (range, encoded)) in encoded_segments.into_iter().enumerate() {
         let segment_entries = &entries[range];
         let first_key = segment_entries
@@ -668,13 +684,314 @@ pub(crate) fn stage_commit_deltas(
             key(commit_delta_segment_key(commit_id, segment_index)?),
             value(encoded),
         );
+        locators.extend(commit_delta_change_locators(
+            commit_id,
+            segment_index,
+            segment_entries,
+        )?);
     }
     writes.put(
         TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         key(commit_delta_manifest_key(commit_id)),
         value(encode_commit_delta_manifest(&manifest)?),
     );
-    Ok(())
+    Ok(locators)
+}
+
+fn commit_delta_change_locators(
+    commit_id: CommitId,
+    segment_index: usize,
+    entries: &[EncodedLeafEntry],
+) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
+    let segment_index = u32::try_from(segment_index).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta locator segment index exceeds u32",
+        )
+    })?;
+    entries
+        .iter()
+        .enumerate()
+        .map(|(ordinal, entry)| {
+            let ordinal = u8::try_from(ordinal).expect("commit-delta segment row count fits u8");
+            let change_id = decode_value(&entry.value)?.change_id;
+            Ok(CommitDeltaChangeLocator {
+                change_id,
+                commit_id,
+                segment_index,
+                ordinal,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn stage_change_locators(
+    writes: &mut StorageWriteSet,
+    locators: &[CommitDeltaChangeLocator],
+) {
+    writes.reserve_space(TRACKED_STATE_CHANGE_LOCATOR_SPACE, locators.len(), 0);
+    for locator in locators {
+        let encoded = encode_change_locator(*locator);
+        writes.put(
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            key(locator.change_id.as_uuid().as_bytes().to_vec()),
+            value(encoded),
+        );
+    }
+}
+
+pub(crate) fn stage_delete_change_locators(
+    writes: &mut StorageWriteSet,
+    change_ids: impl IntoIterator<Item = crate::changelog::ChangeId>,
+) {
+    for change_id in change_ids {
+        writes.delete(
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+            key(change_id.as_uuid().as_bytes().to_vec()),
+        );
+    }
+}
+
+pub(crate) async fn load_change_record_by_id(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_id: crate::changelog::ChangeId,
+) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let locator_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
+    let locator = PointReadPlan::new(
+        TRACKED_STATE_CHANGE_LOCATOR_SPACE,
+        std::slice::from_ref(&locator_key),
+    )
+    .materialize(store, StorageGetOptions::default())
+    .await?
+    .value
+    .into_iter()
+    .next()
+    .flatten()
+    .and_then(full_value_bytes);
+    let Some(locator) = locator else {
+        return Ok(None);
+    };
+    let locator = decode_change_locator(change_id, &locator)?;
+    let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await? else {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state change locator for '{change_id}' references missing commit '{}'",
+                locator.commit_id
+            ),
+        ));
+    };
+    let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
+        if locator.segment_index != 0 {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state change locator for '{change_id}' references segment {} of an inline commit",
+                    locator.segment_index
+                ),
+            ));
+        }
+        (Bytes::copy_from_slice(inline), None)
+    } else {
+        let segment_index = usize::try_from(locator.segment_index).expect("u32 fits usize");
+        let bounds = manifest.segments.get(segment_index).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state change locator for '{change_id}' references missing segment {}",
+                    locator.segment_index
+                ),
+            )
+        })?;
+        let segment_key = StorageKey(Bytes::from(commit_delta_segment_key(
+            locator.commit_id,
+            segment_index,
+        )?));
+        let segment = PointReadPlan::new(
+            TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            std::slice::from_ref(&segment_key),
+        )
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value
+        .into_iter()
+        .next()
+        .flatten()
+        .and_then(full_value_bytes)
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!(
+                    "tracked_state change locator for '{change_id}' references absent segment {}",
+                    locator.segment_index
+                ),
+            )
+        })?;
+        (segment, Some(bounds))
+    };
+    let (leaf, payloads) = decode_commit_delta_with_payloads(&segment, bounds)?;
+    let ordinal = usize::from(locator.ordinal);
+    let entry = leaf.entry(ordinal)?.ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!(
+                "tracked_state change locator for '{change_id}' references absent ordinal {}",
+                locator.ordinal
+            ),
+        )
+    })?;
+    let value = decode_value(entry.value)?;
+    if value.change_id != change_id || value.commit_id != locator.commit_id {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state change locator for '{change_id}' points to the wrong row"),
+        ));
+    }
+    let key = decode_key(entry.key)?;
+    let payload = payloads.decode(ordinal)?;
+    Ok(Some(crate::changelog::ChangeRecord {
+        format_version: 2,
+        change_id,
+        schema_key: key.schema_key,
+        entity_pk: key.entity_pk,
+        file_id: key.file_id,
+        snapshot: payload.snapshot,
+        metadata: payload.metadata,
+        created_at: value.updated_at,
+        origin_key: payload.origin_key,
+    }))
+}
+
+fn decode_change_locator(
+    change_id: crate::changelog::ChangeId,
+    bytes: &[u8],
+) -> Result<CommitDeltaChangeLocator, LixError> {
+    let mut cursor = 0usize;
+    let encoding = *bytes.get(cursor).ok_or_else(|| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            format!("tracked_state change locator for '{change_id}' is truncated"),
+        )
+    })?;
+    cursor += 1;
+    let commit_id = match encoding {
+        0 => {
+            let encoded_delta = decode_locator_varint(bytes, &mut cursor)
+                .ok_or_else(|| invalid_change_locator(change_id, "has an invalid commit delta"))?;
+            let delta = ((encoded_delta >> 1) as i64) ^ -((encoded_delta & 1) as i64);
+            let change = change_id.as_uuid().as_u128();
+            let commit = if delta >= 0 {
+                change.checked_add(delta as u128)
+            } else {
+                change.checked_sub(u128::from(delta.unsigned_abs()))
+            }
+            .ok_or_else(|| invalid_change_locator(change_id, "commit delta overflows"))?;
+            uuid::Uuid::from_u128(commit)
+        }
+        1 => {
+            let common_prefix = usize::from(*bytes.get(cursor).ok_or_else(|| {
+                invalid_change_locator(change_id, "is missing its commit prefix length")
+            })?);
+            cursor += 1;
+            if common_prefix > 16 || bytes.len() - cursor < 16 - common_prefix {
+                return Err(invalid_change_locator(
+                    change_id,
+                    "has an invalid commit id",
+                ));
+            }
+            let suffix_end = cursor + 16 - common_prefix;
+            let mut commit_id = *change_id.as_uuid().as_bytes();
+            commit_id[common_prefix..].copy_from_slice(&bytes[cursor..suffix_end]);
+            cursor = suffix_end;
+            uuid::Uuid::from_bytes(commit_id)
+        }
+        _ => {
+            return Err(invalid_change_locator(
+                change_id,
+                "has an unsupported encoding",
+            ));
+        }
+    };
+    let packed_ordinal = decode_locator_varint(bytes, &mut cursor)
+        .filter(|_| cursor == bytes.len())
+        .ok_or_else(|| invalid_change_locator(change_id, "has an invalid ordinal"))?;
+    let segment_index = u32::try_from(packed_ordinal / COMMIT_DELTA_SEGMENT_MAX_ROWS as u64)
+        .map_err(|_| invalid_change_locator(change_id, "has an invalid segment"))?;
+    let ordinal = u8::try_from(packed_ordinal % COMMIT_DELTA_SEGMENT_MAX_ROWS as u64)
+        .expect("segment remainder fits u8");
+    Ok(CommitDeltaChangeLocator {
+        change_id,
+        commit_id: CommitId::new(commit_id),
+        segment_index,
+        ordinal,
+    })
+}
+
+fn encode_change_locator(locator: CommitDeltaChangeLocator) -> Vec<u8> {
+    let packed_ordinal = u64::from(locator.segment_index)
+        * u64::try_from(COMMIT_DELTA_SEGMENT_MAX_ROWS).expect("segment row limit fits u64")
+        + u64::from(locator.ordinal);
+    let change_uuid = locator.change_id.as_uuid();
+    let commit_uuid = locator.commit_id.as_uuid();
+    let numeric_delta = if commit_uuid.as_u128() >= change_uuid.as_u128() {
+        i128::try_from(commit_uuid.as_u128() - change_uuid.as_u128()).ok()
+    } else {
+        i128::try_from(change_uuid.as_u128() - commit_uuid.as_u128())
+            .ok()
+            .map(|delta| -delta)
+    };
+    if let Some(delta) = numeric_delta.and_then(|delta| i64::try_from(delta).ok()) {
+        let mut encoded = Vec::with_capacity(12);
+        encoded.push(0);
+        let zigzag = ((delta << 1) ^ (delta >> 63)) as u64;
+        encode_locator_varint(zigzag, &mut encoded);
+        encode_locator_varint(packed_ordinal, &mut encoded);
+        return encoded;
+    }
+    let change_id = change_uuid.as_bytes();
+    let commit_id = commit_uuid.as_bytes();
+    let common_prefix = change_id
+        .iter()
+        .zip(commit_id)
+        .position(|(change, commit)| change != commit)
+        .unwrap_or(16);
+    let mut encoded = Vec::with_capacity(19);
+    encoded.push(1);
+    encoded.push(u8::try_from(common_prefix).expect("UUID prefix length fits u8"));
+    encoded.extend_from_slice(&commit_id[common_prefix..]);
+    encode_locator_varint(packed_ordinal, &mut encoded);
+    encoded
+}
+
+fn invalid_change_locator(change_id: crate::changelog::ChangeId, reason: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_INTERNAL_ERROR,
+        format!("tracked_state change locator for '{change_id}' {reason}"),
+    )
+}
+
+fn encode_locator_varint(mut value: u64, encoded: &mut Vec<u8>) {
+    while value >= 0x80 {
+        encoded.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    encoded.push(value as u8);
+}
+
+fn decode_locator_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        if shift == 63 && byte > 1 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// Loads commit deltas by encoded key for first-parent batch replay.
@@ -800,7 +1117,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     };
     let mut members = Vec::new();
     if let Some(inline_segment) = manifest.inline_segment() {
-        collect_strict_commit_delta_members(inline_segment, None, commit_id, &mut members)?;
+        collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
     } else {
         let segment_keys = (0..manifest.segments.len())
             .map(|segment_index| {
@@ -824,6 +1141,7 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
                 &bytes,
                 Some(&manifest.segments[segment_index]),
                 commit_id,
+                u32::try_from(segment_index).expect("segment index fits u32"),
                 &mut members,
             )?;
         }
@@ -1142,7 +1460,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                     ),
                 ));
             }
-            collect_strict_commit_delta_members(inline_segment, None, commit_id, &mut members)?;
+            collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
         } else {
             validate_physical_commit_delta_segments(commit_id, &manifest, &physical_segments)?;
             for (segment_index, bounds) in manifest.segments.iter().enumerate() {
@@ -1150,6 +1468,7 @@ pub(crate) async fn scan_commit_delta_inventory(
                     &physical_segments[&segment_index],
                     Some(bounds),
                     commit_id,
+                    u32::try_from(segment_index).expect("segment index fits u32"),
                     &mut members,
                 )?;
             }
@@ -1361,6 +1680,7 @@ fn collect_strict_commit_delta_members(
     bytes: &[u8],
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
     expected_commit_id: CommitId,
+    segment_index: u32,
     members: &mut Vec<CommitDeltaMember>,
 ) -> Result<(), LixError> {
     let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
@@ -1395,7 +1715,13 @@ fn collect_strict_commit_delta_members(
             created_at: value.updated_at,
             origin_key: payload.origin_key,
         };
-        members.push(CommitDeltaMember { key, value, change });
+        members.push(CommitDeltaMember {
+            key,
+            value,
+            change,
+            segment_index,
+            ordinal: u32::try_from(entry_index).expect("segment ordinal fits u32"),
+        });
     }
     Ok(())
 }
@@ -2231,18 +2557,20 @@ mod tests {
     };
 
     use super::{
-        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaManifest,
-        CommitDeltaPayloadRef, DecodedCommitDeltaBatch, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        COMMIT_DELTA_FORMAT_MAGIC, COMMIT_DELTA_SEGMENT_MAX_ROWS, CommitDeltaChangeLocator,
+        CommitDeltaManifest, CommitDeltaPayloadRef, DecodedCommitDeltaBatch,
+        TRACKED_STATE_CHANGE_LOCATOR_SPACE, TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, TRACKED_STATE_COMMIT_ROOT_MAGIC,
         TRACKED_STATE_COMMIT_ROOT_SPACE, TRACKED_STATE_TREE_CHUNK_SPACE, TrackedStateChunkOverlay,
         commit_delta_manifest_key, decode_commit_delta_manifest, decode_commit_delta_with_payloads,
         decode_commit_root, encode_commit_delta_manifest, encode_commit_delta_segment,
         encode_commit_delta_segment_with_payloads, encode_commit_root, key,
-        load_commit_delta_change_ids, load_commit_delta_change_records,
+        load_change_record_by_id, load_commit_delta_change_ids, load_commit_delta_change_records,
         load_commit_delta_members_with_payloads, load_commit_delta_values_encoded,
         load_owned_commit_delta_entries, scan_change_records_from_commit_deltas,
         scan_commit_delta_inventory, scan_commit_delta_members, scan_commit_delta_values,
-        stage_commit_deltas, stage_delete_commit_delta_inventory_entry, value,
+        stage_change_locators, stage_commit_deltas, stage_delete_commit_delta_inventory_entry,
+        value,
     };
 
     #[derive(Clone)]
@@ -2350,6 +2678,87 @@ mod tests {
             metadata,
             origin_key,
         }
+    }
+
+    #[tokio::test]
+    async fn change_locator_loads_inline_and_segmented_records_by_id() {
+        for (label, fixtures) in [
+            (
+                "inline",
+                packed_commit_delta_fixtures()
+                    .into_iter()
+                    .take(3)
+                    .collect::<Vec<_>>(),
+            ),
+            ("segmented", packed_commit_delta_fixtures()),
+        ] {
+            let storage = StorageAdapter::new(Memory::new());
+            let commit_id = CommitId::for_test_label(&format!("{label}-locator-commit"));
+            let deltas = commit_delta_refs(commit_id, &fixtures);
+            let mut writes = storage.new_write_set();
+            let locators =
+                stage_commit_deltas(&mut writes, &deltas).expect("locator delta should stage");
+            stage_change_locators(&mut writes, &locators);
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("locator delta should commit");
+            let read = storage
+                .begin_read(StorageReadOptions::default())
+                .await
+                .expect("locator read should open");
+            let expected = &fixtures[fixtures.len() / 2];
+            let loaded = load_change_record_by_id(&read, expected.change_id)
+                .await
+                .expect("exact locator read should succeed")
+                .expect("exact locator should find the change");
+            assert_eq!(loaded.change_id, expected.change_id);
+            assert_eq!(loaded.schema_key, expected.schema_key);
+            assert_eq!(loaded.entity_pk, expected.entity_pk);
+            assert_eq!(loaded.file_id, expected.file_id);
+            assert_eq!(loaded.created_at, expected.updated_at);
+            assert!(
+                load_change_record_by_id(
+                    &read,
+                    ChangeId::for_test_label(&format!("{label}-missing-change"))
+                )
+                .await
+                .expect("missing exact locator read should succeed")
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn change_locator_codec_compacts_sequential_ids_and_round_trips_fallback_ids() {
+        let sequential = CommitDeltaChangeLocator {
+            change_id: ChangeId::new(uuid::Uuid::from_u128(
+                0x0192_0000_0000_7000_8000_0000_0000_0101,
+            )),
+            commit_id: CommitId::new(uuid::Uuid::from_u128(
+                0x0192_0000_0000_7000_8000_0000_0000_0100,
+            )),
+            segment_index: 2,
+            ordinal: 7,
+        };
+        let encoded = super::encode_change_locator(sequential);
+        assert_eq!(encoded.len(), 4);
+        assert_eq!(
+            super::decode_change_locator(sequential.change_id, &encoded).expect("decode locator"),
+            sequential
+        );
+
+        let fallback = CommitDeltaChangeLocator {
+            change_id: ChangeId::new(uuid::Uuid::from_u128(u128::MAX)),
+            commit_id: CommitId::new(uuid::Uuid::from_u128(1)),
+            segment_index: u32::MAX,
+            ordinal: 127,
+        };
+        let encoded = super::encode_change_locator(fallback);
+        assert_eq!(
+            super::decode_change_locator(fallback.change_id, &encoded).expect("decode locator"),
+            fallback
+        );
     }
 
     #[tokio::test]
@@ -3632,6 +4041,7 @@ mod tests {
             TRACKED_STATE_COMMIT_ROOT_SPACE,
             TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
             TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+            TRACKED_STATE_CHANGE_LOCATOR_SPACE,
             BINARY_CAS_MANIFEST_SPACE,
             BINARY_CAS_MANIFEST_CHUNK_SPACE,
             BINARY_CAS_CHUNK_PRESENCE_SPACE,
