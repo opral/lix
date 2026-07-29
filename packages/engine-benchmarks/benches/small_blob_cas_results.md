@@ -157,3 +157,25 @@ The exact-case binaries had SHA-256
 `3e2d86c24a18491b352bbcd77d8a0c6417ab0d9fd881efe8a209d52799500866`
 (candidate). The combined raw-result SHA-256 is
 `e78b2dcd263addb7cff669f43779c9c24a86828d4b407ce3e0ab82e2862bc174`.
+
+### Rejected 256 KiB extension
+
+The same seven-pair protocol tested extending inline manifests through
+256 KiB. This is rejected because it moves the larger value into the manifest
+space and materially regresses RocksDB:
+
+| Backend | Operation | 128 KiB limit p50 | 256 KiB limit p50 | Change |
+| ------- | --------- | ---------------: | ----------------: | -----: |
+| RocksDB | New-content write | 412,075 ns | 413,457 ns | 0.3% slower |
+| RocksDB | Repeat write | 39,174 ns | 48,827 ns | **24.6% slower** |
+| RocksDB | Hot read | 10,473 ns | 12,798 ns | **22.2% slower** |
+| SlateDB | New-content write | 204,020 ns | 203,700 ns | 0.2% faster |
+| SlateDB | Repeat write | 52,703 ns | 43,640 ns | **17.2% faster** |
+| SlateDB | Hot read | 8,581 ns | 8,151 ns | 5.0% faster |
+
+The exact-case binaries had SHA-256
+`1ead339d48e6f3e351e88376eebdfc58031c4fd6bbf673c4d0719d6c7e65b949`
+(baseline) and
+`7224531462d84fd4d87d0928719ca3bf5caab195c1ab36e3eaa8950117a9a3f1`
+(candidate). The combined raw-result SHA-256 is
+`add3c863a4e22fb4494a9eb4f327230939d388e2870ad1c9452c3ee542f0e39e`.
