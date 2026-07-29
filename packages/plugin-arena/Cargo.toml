@@ -1,14 +1,13 @@
 [package]
-name = "plugin_csv_v2"
+name = "lix_plugin_arena"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "Incremental CSV file plugin for the Lix Wasm Component v2 API"
+description = "Host-owned immutable copy-on-write arenas for Lix Component plugins"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 documentation.workspace = true
-readme = "README.md"
 keywords.workspace = true
 categories.workspace = true
 rust-version.workspace = true
@@ -16,12 +15,9 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
-base64 = "0.22"
-lix_plugin_arena = { workspace = true }
-lix_plugin_api_v2 = { workspace = true }
-serde_json = "1"
-uuid = { version = "1", features = ["std"] }
+blake3 = "1"
+parking_lot = "0.12"
+
+[dev-dependencies]
+wit-parser = "0.247"

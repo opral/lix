@@ -3315,6 +3315,7 @@ dependencies = [
  "globset",
  "jiff",
  "jsonschema",
+ "lix_plugin_arena",
  "lru",
  "memchr",
  "musli",
@@ -3400,6 +3401,15 @@ dependencies = [
  "serde_json",
  "uuid",
  "wit-bindgen 0.57.1",
+]
+
+[[package]]
+name = "lix_plugin_arena"
+version = "0.8.4"
+dependencies = [
+ "blake3",
+ "parking_lot",
+ "wit-parser 0.247.0",
 ]
 
 [[package]]
@@ -4271,6 +4281,7 @@ version = "0.8.4"
 dependencies = [
  "base64 0.22.1",
  "lix_plugin_api_v2",
+ "lix_plugin_arena",
  "serde_json",
  "uuid",
 ]
@@ -4282,6 +4293,7 @@ dependencies = [
  "base64 0.22.1",
  "lix_order_key",
  "lix_plugin_api_v2",
+ "lix_plugin_arena",
  "serde_json",
  "uuid",
 ]
@@ -4304,6 +4316,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "lix_plugin_api_v2",
+ "lix_plugin_arena",
  "serde_json",
  "uuid",
 ]
@@ -4317,6 +4330,7 @@ dependencies = [
  "encoding_rs",
  "lix_order_key",
  "lix_plugin_api_v2",
+ "lix_plugin_arena",
  "markdown",
  "markdown-syntax",
  "serde",
