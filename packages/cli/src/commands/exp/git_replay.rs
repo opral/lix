@@ -23,6 +23,7 @@ const DEFAULT_INSERT_BATCH_ROWS: usize = 100;
 // pipe capacity or deadlocking behind a large blob response.
 const CAT_FILE_REQUESTS_PER_BATCH: usize = 4;
 const GIT_TEXT_PLUGIN_KEY: &str = "plugin_git_text_v2";
+const CSV_PLUGIN_KEY: &str = "plugin_csv_v2";
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown_incremental_v2";
 const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw_v2";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
@@ -406,7 +407,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
     println!(
-        "[git-replay] text/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
+        "[git-replay] text/CSV/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
     );
     if let Some(parent) = &baseline_seed_parent {
         println!(
@@ -1976,6 +1977,23 @@ fn install_embedded_replay_plugins(lix: &RocksLix) -> Result<(), CliError> {
             )?,
         ),
         (
+            CSV_PLUGIN_KEY,
+            build_embedded_plugin_archive(
+                include_str!("../../../../../plugins/csv-v2/manifest.json"),
+                &[
+                    (
+                        "schema/csv_v2_table.json",
+                        include_bytes!("../../../../../plugins/csv-v2/schema/csv_v2_table.json"),
+                    ),
+                    (
+                        "schema/csv_v2_row.json",
+                        include_bytes!("../../../../../plugins/csv-v2/schema/csv_v2_row.json"),
+                    ),
+                ],
+                Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2")),
+            )?,
+        ),
+        (
             MARKDOWN_PLUGIN_KEY,
             build_embedded_plugin_archive(
                 include_str!("../../../../../plugins/markdown-v2/manifest.json"),
@@ -2712,7 +2730,7 @@ mod tests {
     }
 
     #[test]
-    fn rocksdb_replay_installs_git_text_and_keeps_nul_files_binary() {
+    fn rocksdb_replay_installs_format_plugins_and_keeps_nul_files_binary() {
         let fixture = unique_temp_dir();
         let repo = fixture.join("repo");
         let output = fixture.join("replay.rocksdb");
@@ -2724,8 +2742,10 @@ mod tests {
 
         fs::write(repo.join("notes.txt"), b"first line\nsecond line\n")
             .expect("text fixture should write");
+        fs::write(repo.join("table.csv"), b"name,value\nalpha,1\n")
+            .expect("CSV fixture should write");
         fs::write(repo.join("binary.bin"), b"raw\0bytes\n").expect("binary fixture should write");
-        git_ok(&repo, &["add", "notes.txt", "binary.bin"]);
+        git_ok(&repo, &["add", "notes.txt", "table.csv", "binary.bin"]);
         git_ok(&repo, &["commit", "-qm", "root"]);
         git_ok(&repo, &["commit", "--allow-empty", "-qm", "empty"]);
 
@@ -2787,6 +2807,16 @@ mod tests {
         assert!(
             !text_rows.rows().is_empty(),
             "renamed text file must derive Git-text semantic rows at its new path"
+        );
+        let csv_rows = db::block_on(lix.execute(
+            "SELECT lixcol_entity_pk FROM csv_v2_row WHERE lixcol_file_id = ?",
+            &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
+        ))
+        .expect("CSV rows should be queryable after replay");
+        assert_eq!(
+            csv_rows.rows().len(),
+            2,
+            "CSV replay must eagerly materialize both records"
         );
         let binary_rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
