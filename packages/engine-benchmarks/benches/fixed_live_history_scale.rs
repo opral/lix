@@ -137,8 +137,8 @@ async fn run() {
                         } else {
                             storage.flush().await.expect("flush SlateDB WAL");
                         }
-                        let lifecycle_io_after = io_counters.snapshot();
                         tokio::time::sleep(settle).await;
+                        let lifecycle_io_after = io_counters.snapshot();
                         run_case(
                             backend,
                             history,
