@@ -1,8 +1,11 @@
-use crate::cli::exp::ExpGitReplayArgs;
+use crate::cli::exp::{ExpGitReplayArgs, GitReplayPlugins, GitReplayStorage};
 use crate::db;
 use crate::error::CliError;
 use lix_rocksdb_storage::RocksDB;
-use lix_sdk::{ExecuteBatchStatement, Lix, Value, open_lix_with_storage};
+use lix_sdk::{
+    ExecuteBatchStatement, Lix, Storage, Value, WasmTransitionCounters, open_lix_with_storage,
+};
+use lix_slatedb_storage::SlateDB;
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -27,8 +30,6 @@ const CSV_PLUGIN_KEY: &str = "plugin_csv_v2";
 const MARKDOWN_PLUGIN_KEY: &str = "plugin_markdown_incremental_v2";
 const EXCALIDRAW_PLUGIN_KEY: &str = "plugin_excalidraw_v2";
 const GIT_REPLAY_MARKER_KEY: &str = "git_replay_marker_v1";
-
-type RocksLix = Lix<RocksDB>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Change {
@@ -126,6 +127,63 @@ struct ReplayProfilePhaseTotals {
     total_ms: f64,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct ReplayPluginCounters {
+    source_read_calls: u64,
+    source_bytes_read: u64,
+    packet_pages: u64,
+    packet_records: u64,
+    attachment_reads: u64,
+    attachment_bytes_read: u64,
+    component_import_calls: u64,
+    component_boundary_bytes: u64,
+    guest_linear_memory_high_water_bytes: u64,
+    host_full_diff_bytes_compared: u64,
+    host_content_classification_bytes: u64,
+    full_state_semantic_rows_materialized: u64,
+    change_payload_requests: u64,
+    returned_change_payloads: u64,
+    durable_semantic_changes: u64,
+    private_document_cache_hits: u64,
+    shared_renderer_cache_hits: u64,
+    full_document_reparses: u64,
+    full_renderer_invocations: u64,
+    filesystem_sync_full_renders: u64,
+    conflict_resolution_calls: u64,
+    conflict_resolution_records: u64,
+    conflict_resolution_takes: u64,
+}
+
+impl From<WasmTransitionCounters> for ReplayPluginCounters {
+    fn from(value: WasmTransitionCounters) -> Self {
+        Self {
+            source_read_calls: value.source_read_calls,
+            source_bytes_read: value.source_bytes_read,
+            packet_pages: value.packet_pages,
+            packet_records: value.packet_records,
+            attachment_reads: value.attachment_reads,
+            attachment_bytes_read: value.attachment_bytes_read,
+            component_import_calls: value.component_import_calls,
+            component_boundary_bytes: value.component_boundary_bytes,
+            guest_linear_memory_high_water_bytes: value.guest_linear_memory_high_water_bytes,
+            host_full_diff_bytes_compared: value.host_full_diff_bytes_compared,
+            host_content_classification_bytes: value.host_content_classification_bytes,
+            full_state_semantic_rows_materialized: value.full_state_semantic_rows_materialized,
+            change_payload_requests: value.change_payload_requests,
+            returned_change_payloads: value.returned_change_payloads,
+            durable_semantic_changes: value.durable_semantic_changes,
+            private_document_cache_hits: value.private_document_cache_hits,
+            shared_renderer_cache_hits: value.shared_renderer_cache_hits,
+            full_document_reparses: value.full_document_reparses,
+            full_renderer_invocations: value.full_renderer_invocations,
+            filesystem_sync_full_renders: value.filesystem_sync_full_renders,
+            conflict_resolution_calls: value.conflict_resolution_calls,
+            conflict_resolution_records: value.conflict_resolution_records,
+            conflict_resolution_takes: value.conflict_resolution_takes,
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct ReplayCommitProfile {
     commit_sha: String,
@@ -142,6 +200,7 @@ struct ReplayCommitProfile {
     prepare_ms: f64,
     build_sql_ms: f64,
     execute_ms: f64,
+    plugin_counters: ReplayPluginCounters,
     verify_ms: Option<f64>,
     total_ms: f64,
 }
@@ -149,7 +208,9 @@ struct ReplayCommitProfile {
 #[derive(Debug, Serialize)]
 struct ReplayProfileReport {
     repo_path: String,
-    output_rocksdb_path: String,
+    output_path: String,
+    storage: String,
+    plugins: String,
     branch: String,
     from_commit: Option<String>,
     num_commits_requested: Option<u32>,
@@ -160,7 +221,7 @@ struct ReplayProfileReport {
     baseline_seed_files: usize,
     final_tree_verify_ms: Option<f64>,
     replay_elapsed_ms: f64,
-    rocksdb_flush_ms: f64,
+    storage_flush_ms: f64,
     commits_replayed: usize,
     commits_applied: usize,
     commits_marker_only: usize,
@@ -173,8 +234,8 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     let repo_path = absolutize_from_cwd(&args.repo_path)?;
     validate_repo_dir(&repo_path)?;
     validate_git_repo(&repo_path)?;
-    let output_rocksdb_path = absolutize_from_cwd(&args.output_rocksdb_path)?;
-    validate_safe_rocksdb_output_path(&repo_path, &output_rocksdb_path)?;
+    let output_path = absolutize_from_cwd(&args.output_path)?;
+    validate_safe_storage_output_path(&repo_path, &output_path)?;
     let profile_json_path = args
         .profile_json
         .as_ref()
@@ -203,19 +264,71 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
 
     // Do not let `--force` delete a valid previous replay until every
     // non-destructive input check has succeeded.
-    prepare_rocksdb_output_path(&output_rocksdb_path, args.force)?;
+    prepare_storage_output_path(&output_path, args.force)?;
     if let Some(path) = &profile_json_path {
         prepare_regular_output_path(path, args.force)?;
     }
 
-    let storage = RocksDB::open(&output_rocksdb_path).map_err(|error| {
-        CliError::msg(format!(
-            "failed to open RocksDB at {}: {error}",
-            output_rocksdb_path.display()
-        ))
-    })?;
+    let storage_backend = args.storage;
+    match storage_backend {
+        GitReplayStorage::Rocksdb => {
+            let storage = RocksDB::open(&output_path).map_err(|error| {
+                CliError::msg(format!(
+                    "failed to open RocksDB at {}: {error}",
+                    output_path.display()
+                ))
+            })?;
+            run_with_storage(
+                args,
+                repo_path,
+                output_path,
+                profile_json_path,
+                commits,
+                storage,
+                |storage| {
+                    storage
+                        .flush()
+                        .map_err(|error| CliError::msg(format!("failed to flush RocksDB: {error}")))
+                },
+            )
+        }
+        GitReplayStorage::Slatedb => {
+            let storage = SlateDB::open(&output_path).map_err(|error| {
+                CliError::msg(format!(
+                    "failed to open SlateDB at {}: {error}",
+                    output_path.display()
+                ))
+            })?;
+            run_with_storage(
+                args,
+                repo_path,
+                output_path,
+                profile_json_path,
+                commits,
+                storage,
+                |storage| {
+                    db::block_on(storage.flush())
+                        .map_err(|error| CliError::msg(format!("failed to flush SlateDB: {error}")))
+                },
+            )
+        }
+    }
+}
+
+fn run_with_storage<StorageImpl>(
+    args: ExpGitReplayArgs,
+    repo_path: PathBuf,
+    output_path: PathBuf,
+    profile_json_path: Option<PathBuf>,
+    commits: Vec<ReplayCommit>,
+    storage: StorageImpl,
+    flush_storage: impl FnOnce(&StorageImpl) -> Result<(), CliError>,
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let lix = db::block_on(open_lix_with_storage(storage.clone()))
-        .map_err(|error| CliError::msg(format!("failed to open RocksDB Lix: {error}")))?;
+        .map_err(|error| CliError::msg(format!("failed to open replay Lix: {error}")))?;
     db::block_on(lix.execute(
         "INSERT INTO lix_key_value (key, value, lixcol_global, lixcol_untracked) \
          VALUES ('lix_deterministic_mode', lix_json('{\"enabled\":true}'), true, true)",
@@ -224,7 +337,9 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     .map_err(|error| CliError::msg(format!("failed to enable deterministic mode: {error}")))?;
 
     let plugin_install_started = Instant::now();
-    install_embedded_replay_plugins(&lix)?;
+    if args.plugins == GitReplayPlugins::All {
+        install_embedded_replay_plugins(&lix)?;
+    }
     let plugin_install_ms = duration_to_ms(plugin_install_started.elapsed());
 
     let mut state = ReplayState::default();
@@ -269,9 +384,10 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     let mut commit_profiles = Vec::<ReplayCommitProfile>::with_capacity(commits.len());
 
     println!(
-        "[git-replay] replaying {} commits from {} into RocksDB",
+        "[git-replay] replaying {} commits from {} into {}",
         commits.len(),
-        repo_path.display()
+        repo_path.display(),
+        args.storage.as_str()
     );
 
     for (index, commit) in commits.iter().enumerate() {
@@ -313,9 +429,11 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
         {
             marker_only += 1;
         }
+        lix.reset_plugin_v2_transition_counters();
         let execute_started = Instant::now();
         execute_statements_as_transaction(&lix, &statements, commit_sha)?;
         let execute_ms = duration_to_ms(execute_started.elapsed());
+        let plugin_counters = lix.plugin_v2_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
         applied += 1;
 
@@ -348,6 +466,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
             prepare_ms,
             build_sql_ms,
             execute_ms,
+            plugin_counters,
             verify_ms,
             total_ms,
         });
@@ -388,27 +507,26 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     db::block_on(lix.close())
         .map_err(|error| CliError::msg(format!("failed to close replay Lix: {error}")))?;
     let flush_started = Instant::now();
-    storage.flush().map_err(|error| {
-        CliError::msg(format!(
-            "failed to flush replay RocksDB at {}: {error}",
-            output_rocksdb_path.display()
-        ))
-    })?;
-    let rocksdb_flush_ms = duration_to_ms(flush_started.elapsed());
+    flush_storage(&storage)?;
+    let storage_flush_ms = duration_to_ms(flush_started.elapsed());
 
     println!("[git-replay] done");
     println!("[git-replay] ref: {}", args.branch);
     println!(
-        "[git-replay] output RocksDB: {}",
-        output_rocksdb_path.display()
+        "[git-replay] output {}: {}",
+        args.storage.as_str(),
+        output_path.display()
     );
     println!("[git-replay] commits replayed: {}", commits.len());
     println!("[git-replay] commits applied: {applied}");
     println!("[git-replay] commits with marker only: {marker_only}");
     println!("[git-replay] changed paths total: {changed_paths}");
-    println!(
-        "[git-replay] text/CSV/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
-    );
+    println!("[git-replay] plugins: {}", args.plugins.as_str());
+    if args.plugins == GitReplayPlugins::All {
+        println!(
+            "[git-replay] text/CSV/Markdown/Excalidraw plugin setup excluded from replay timing: {plugin_install_ms:.3}ms"
+        );
+    }
     if let Some(parent) = &baseline_seed_parent {
         println!(
             "[git-replay] parent-tree bootstrap excluded from replay timing: {baseline_seed_ms:.3}ms ({baseline_seed_files} files from {parent})"
@@ -430,7 +548,9 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
             profile_path,
             ReplayProfileReport {
                 repo_path: repo_path.display().to_string(),
-                output_rocksdb_path: output_rocksdb_path.display().to_string(),
+                output_path: output_path.display().to_string(),
+                storage: args.storage.as_str().to_string(),
+                plugins: args.plugins.as_str().to_string(),
                 branch: args.branch.clone(),
                 from_commit: args.from_commit.clone(),
                 num_commits_requested: args.num_commits,
@@ -441,7 +561,7 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
                 baseline_seed_files,
                 final_tree_verify_ms,
                 replay_elapsed_ms,
-                rocksdb_flush_ms,
+                storage_flush_ms,
                 commits_replayed: commits.len(),
                 commits_applied: applied,
                 commits_marker_only: marker_only,
@@ -456,11 +576,14 @@ pub fn run(args: ExpGitReplayArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-fn execute_statements_as_transaction(
-    lix: &RocksLix,
+fn execute_statements_as_transaction<StorageImpl>(
+    lix: &Lix<StorageImpl>,
     statements: &[SqlStatement],
     commit_sha: &str,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let batch = statements
         .iter()
         .map(|statement| ExecuteBatchStatement {
@@ -646,15 +769,18 @@ fn resolve_replay_ref_oid(repo_path: &Path, raw: &str) -> Result<String, CliErro
     Ok(oid.to_string())
 }
 
-fn seed_parent_tree(
+fn seed_parent_tree<StorageImpl>(
     repo_path: &Path,
     parent_commit: &str,
     blob_reader: &mut GitBlobReader,
     state: &mut ReplayState,
     expected_state_by_id: &mut HashMap<String, ExpectedFile>,
     verify_state: bool,
-    lix: &RocksLix,
-) -> Result<usize, CliError> {
+    lix: &Lix<StorageImpl>,
+) -> Result<usize, CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let changes = read_tree_snapshot_changes(repo_path, parent_commit)?;
     let wanted_blob_ids = collect_wanted_blob_ids(&changes);
     let blob_by_oid = blob_reader.read_blobs(&wanted_blob_ids)?;
@@ -1568,11 +1694,14 @@ fn apply_prepared_to_expected_state(
     }
 }
 
-fn verify_commit_state_hashes(
-    lix: &RocksLix,
+fn verify_commit_state_hashes<StorageImpl>(
+    lix: &Lix<StorageImpl>,
     expected_state_by_id: &HashMap<String, ExpectedFile>,
     commit_sha: &str,
-) -> Result<(), CliError> {
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let params: &[Value] = &[];
     let result = db::block_on(lix.execute(
         "SELECT id, path, data, lixcol_metadata FROM lix_file \
@@ -1670,12 +1799,15 @@ fn verify_commit_state_hashes(
     Ok(())
 }
 
-fn verify_final_git_tree(
+fn verify_final_git_tree<StorageImpl>(
     repo_path: &Path,
     commit_sha: &str,
     blob_reader: &mut GitBlobReader,
-    lix: &RocksLix,
-) -> Result<(), CliError> {
+    lix: &Lix<StorageImpl>,
+) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let tree_changes = read_tree_snapshot_changes(repo_path, commit_sha)?;
     let blob_by_oid = blob_reader.read_blobs(&collect_wanted_blob_ids(&tree_changes))?;
     let mut expected_by_path = HashMap::<String, ExpectedFile>::with_capacity(tree_changes.len());
@@ -1961,7 +2093,10 @@ fn run_git_bytes(
     )))
 }
 
-fn install_embedded_replay_plugins(lix: &RocksLix) -> Result<(), CliError> {
+fn install_embedded_replay_plugins<StorageImpl>(lix: &Lix<StorageImpl>) -> Result<(), CliError>
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
     let plugins = [
         (
             GIT_TEXT_PLUGIN_KEY,
@@ -2089,38 +2224,38 @@ fn build_embedded_plugin_archive(
         .map(Cursor::into_inner)
 }
 
-fn prepare_rocksdb_output_path(path: &Path, force: bool) -> Result<(), CliError> {
+fn prepare_storage_output_path(path: &Path, force: bool) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .map_err(|source| CliError::io("failed to create RocksDB output parent", source))?;
+            .map_err(|source| CliError::io("failed to create storage output parent", source))?;
     }
     if !path.exists() {
         return Ok(());
     }
     if !path.is_dir() {
         return Err(CliError::msg(format!(
-            "RocksDB output path points to a file, expected a directory: {}",
+            "storage output path points to a file, expected a directory: {}",
             path.display()
         )));
     }
     if !force {
         return Err(CliError::msg(format!(
-            "RocksDB output directory already exists: {} (pass --force to replace it)",
+            "storage output directory already exists: {} (pass --force to replace it)",
             path.display()
         )));
     }
     fs::remove_dir_all(path).map_err(|source| {
-        CliError::io("failed to remove existing RocksDB output directory", source)
+        CliError::io("failed to remove existing storage output directory", source)
     })
 }
 
-fn validate_safe_rocksdb_output_path(repo_path: &Path, output_path: &Path) -> Result<(), CliError> {
+fn validate_safe_storage_output_path(repo_path: &Path, output_path: &Path) -> Result<(), CliError> {
     if output_path
         .components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(CliError::msg(format!(
-            "RocksDB output path must not contain '.' or '..' components: {}",
+            "storage output path must not contain '.' or '..' components: {}",
             output_path.display()
         )));
     }
@@ -2141,13 +2276,13 @@ fn validate_safe_rocksdb_output_path(repo_path: &Path, output_path: &Path) -> Re
             .any(|protected_path| output == Path::new(protected_path))
     {
         return Err(CliError::msg(format!(
-            "refusing broad RocksDB output directory: {}",
+            "refusing broad storage output directory: {}",
             output.display()
         )));
     }
     if paths_overlap(&output, &repo) || paths_overlap(&output, &cwd) {
         return Err(CliError::msg(format!(
-            "RocksDB output directory must not overlap the repository or current directory: {}",
+            "storage output directory must not overlap the repository or current directory: {}",
             output.display()
         )));
     }
@@ -2174,7 +2309,7 @@ fn canonicalize_candidate_path(path: &Path) -> Result<PathBuf, CliError> {
     }
     let mut canonical = probe
         .canonicalize()
-        .map_err(|source| CliError::io("failed to canonicalize RocksDB output path", source))?;
+        .map_err(|source| CliError::io("failed to canonicalize storage output path", source))?;
     for segment in missing_suffix.iter().rev() {
         canonical.push(segment);
     }
@@ -2378,13 +2513,13 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rocksdb_output_path_rejects_existing_file() {
+    fn prepare_storage_output_path_rejects_existing_file() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let output_path = temp_dir.join("existing.rocksdb");
         fs::write(&output_path, b"existing").expect("seed file should be written");
 
-        let result = prepare_rocksdb_output_path(&output_path, false);
+        let result = prepare_storage_output_path(&output_path, false);
         assert!(result.is_err(), "expected error when output file exists");
         let message = format!("{}", result.expect_err("expected output path error"));
         assert!(
@@ -2397,12 +2532,12 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rocksdb_output_path_allows_absent_directory_and_creates_parent() {
+    fn prepare_storage_output_path_allows_absent_directory_and_creates_parent() {
         let temp_dir = unique_temp_dir();
         let nested_parent = temp_dir.join("nested").join("output");
         let output_path = nested_parent.join("new.rocksdb");
 
-        let result = prepare_rocksdb_output_path(&output_path, false);
+        let result = prepare_storage_output_path(&output_path, false);
         assert!(result.is_ok(), "expected success for absent output file");
         assert!(
             nested_parent.is_dir(),
@@ -2413,14 +2548,14 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rocksdb_output_path_force_removes_existing_directory() {
+    fn prepare_storage_output_path_force_removes_existing_directory() {
         let temp_dir = unique_temp_dir();
         fs::create_dir_all(&temp_dir).expect("temp dir should be created");
         let output_path = temp_dir.join("existing.rocksdb");
         fs::create_dir_all(&output_path).expect("seed directory should be created");
         fs::write(output_path.join("CURRENT"), b"rocksdb").expect("seed file should be written");
 
-        let result = prepare_rocksdb_output_path(&output_path, true);
+        let result = prepare_storage_output_path(&output_path, true);
         assert!(result.is_ok(), "expected success when force is enabled");
         assert!(
             !output_path.exists(),
@@ -2434,7 +2569,7 @@ mod tests {
     fn rocksdb_output_rejects_repository_overlap_before_force_can_remove_it() {
         let repo = unique_temp_dir();
         fs::create_dir_all(&repo).expect("fixture repository should be created");
-        let result = validate_safe_rocksdb_output_path(&repo, &repo.join("replay.rocksdb"));
+        let result = validate_safe_storage_output_path(&repo, &repo.join("replay.rocksdb"));
         assert!(result.is_err(), "repository child must be rejected");
         fs::remove_dir_all(&repo).expect("fixture repository should be removable");
     }
@@ -2450,7 +2585,7 @@ mod tests {
             .join("repo")
             .join("replay.rocksdb");
 
-        let result = validate_safe_rocksdb_output_path(&repo, &output);
+        let result = validate_safe_storage_output_path(&repo, &output);
 
         assert!(result.is_err(), "lexical parent traversal must be rejected");
         fs::remove_dir_all(&temp_dir).expect("fixture directory should be removable");
@@ -2469,7 +2604,9 @@ mod tests {
 
         let result = run(ExpGitReplayArgs {
             repo_path: repo,
-            output_rocksdb_path: output,
+            output_path: output,
+            storage: GitReplayStorage::Rocksdb,
+            plugins: GitReplayPlugins::All,
             branch: "missing-ref".to_string(),
             from_commit: None,
             num_commits: None,
@@ -2768,7 +2905,9 @@ mod tests {
 
         run(ExpGitReplayArgs {
             repo_path: repo,
-            output_rocksdb_path: output.clone(),
+            output_path: output.clone(),
+            storage: GitReplayStorage::Rocksdb,
+            plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
             num_commits: None,
@@ -2833,6 +2972,77 @@ mod tests {
     }
 
     #[test]
+    fn replay_profiles_plugin_controls_on_both_storage_adapters() {
+        let fixture = unique_temp_dir();
+        let repo = fixture.join("repo");
+        fs::create_dir_all(&repo).expect("fixture repository should be created");
+        git_ok(&repo, &["init", "-q", "-b", "main"]);
+        git_ok(&repo, &["config", "user.email", "replay@example.test"]);
+        git_ok(&repo, &["config", "user.name", "Replay Test"]);
+        fs::write(repo.join("table.csv"), b"name,value\nalpha,1\n")
+            .expect("CSV fixture should write");
+        git_ok(&repo, &["add", "table.csv"]);
+        git_ok(&repo, &["commit", "-qm", "root"]);
+
+        for storage in [GitReplayStorage::Rocksdb, GitReplayStorage::Slatedb] {
+            for plugins in [GitReplayPlugins::None, GitReplayPlugins::All] {
+                let label = format!("{}-{}", storage.as_str(), plugins.as_str());
+                let output = fixture.join(format!("{label}.storage"));
+                let profile = fixture.join(format!("{label}.json"));
+                run(ExpGitReplayArgs {
+                    repo_path: repo.clone(),
+                    output_path: output.clone(),
+                    storage,
+                    plugins,
+                    branch: "main".to_string(),
+                    from_commit: None,
+                    num_commits: Some(1),
+                    verify_state: true,
+                    force: false,
+                    profile_json: Some(profile.clone()),
+                })
+                .expect("storage/plugin replay matrix should complete");
+
+                let profile_json: serde_json::Value = serde_json::from_slice(
+                    &fs::read(&profile).expect("replay profile should be written"),
+                )
+                .expect("replay profile should be valid JSON");
+                assert_eq!(profile_json["storage"], storage.as_str());
+                assert_eq!(profile_json["plugins"], plugins.as_str());
+                assert_eq!(profile_json["commits_replayed"], 1);
+
+                if plugins == GitReplayPlugins::All {
+                    match storage {
+                        GitReplayStorage::Rocksdb => {
+                            assert_csv_semantics(RocksDB::open(&output).expect("reopen RocksDB"));
+                        }
+                        GitReplayStorage::Slatedb => {
+                            assert_csv_semantics(SlateDB::open(&output).expect("reopen SlateDB"));
+                        }
+                    }
+                }
+            }
+        }
+
+        fs::remove_dir_all(&fixture).expect("fixture directory should be removable");
+    }
+
+    fn assert_csv_semantics<StorageImpl>(storage: StorageImpl)
+    where
+        StorageImpl: Storage + Clone + Send + Sync + 'static,
+    {
+        let lix =
+            db::block_on(open_lix_with_storage(storage)).expect("replay Lix should reopen cleanly");
+        let rows = db::block_on(lix.execute(
+            "SELECT lixcol_entity_pk FROM csv_v2_row WHERE lixcol_file_id = ?",
+            &[Value::Text(stable_file_id(&git_path(b"table.csv")))],
+        ))
+        .expect("CSV rows should be queryable after replay");
+        assert_eq!(rows.rows().len(), 2);
+        db::block_on(lix.close()).expect("reopened Lix should close");
+    }
+
+    #[test]
     fn rocksdb_replay_bounds_text_actor_lifecycle_across_hundred_commits() {
         const TEXT_FILES: usize = 17;
 
@@ -2880,7 +3090,9 @@ mod tests {
 
         run(ExpGitReplayArgs {
             repo_path: repo,
-            output_rocksdb_path: output.clone(),
+            output_path: output.clone(),
+            storage: GitReplayStorage::Rocksdb,
+            plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
             num_commits: Some(100),
@@ -3024,7 +3236,9 @@ mod tests {
 
         run(ExpGitReplayArgs {
             repo_path: repo,
-            output_rocksdb_path: output.clone(),
+            output_path: output.clone(),
+            storage: GitReplayStorage::Rocksdb,
+            plugins: GitReplayPlugins::All,
             branch: "main".to_string(),
             from_commit: None,
             num_commits: Some(2),
