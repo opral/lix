@@ -260,10 +260,7 @@ impl CatalogSnapshot {
     }
 
     pub(crate) fn plan_for_key(&self, schema_key: &str) -> Option<(SchemaPlanId, &SchemaPlan)> {
-        let key = SchemaCatalogKey {
-            schema_key: schema_key.to_string(),
-        };
-        let plan_id = *self.by_key.get(&key)?;
+        let plan_id = *self.by_key.get(schema_key)?;
         let plan = self.plan(plan_id)?;
         Some((plan_id, plan))
     }
@@ -2290,6 +2287,12 @@ impl StateForeignKeyPlan {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct SchemaCatalogKey {
     pub(crate) schema_key: String,
+}
+
+impl std::borrow::Borrow<str> for SchemaCatalogKey {
+    fn borrow(&self) -> &str {
+        &self.schema_key
+    }
 }
 
 impl SchemaCatalogKey {
