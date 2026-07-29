@@ -463,6 +463,7 @@ struct PublishedWrite {
 
 struct PublicationView {
     pipeline: WritePipeline,
+    worker: Option<SlateDBWorker>,
     snapshot_sequence: u64,
     publication_id: u64,
 }
@@ -586,20 +587,42 @@ impl WritePipeline {
         }
     }
 
+    fn capture_with_worker(
+        &self,
+        worker: SlateDBWorker,
+        snapshot_sequence: u64,
+    ) -> PublicationView {
+        self.capture_inner(Some(worker), snapshot_sequence)
+    }
+
+    #[cfg(test)]
     fn capture(&self, snapshot_sequence: u64) -> PublicationView {
+        self.capture_inner(None, snapshot_sequence)
+    }
+
+    fn capture_inner(
+        &self,
+        worker: Option<SlateDBWorker>,
+        snapshot_sequence: u64,
+    ) -> PublicationView {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(snapshot_sequence);
-        cleanup_publications(&mut state, snapshot_sequence);
+        let retired = cleanup_publications(&mut state, snapshot_sequence);
         let publication_id = state.next_publication_id;
         *state
             .active_views
             .entry((snapshot_sequence, publication_id))
             .or_default() += 1;
+        drop(state);
+        if let Some(worker) = &worker {
+            worker.defer_publication_drop(retired);
+        }
         PublicationView {
             pipeline: self.clone(),
+            worker,
             snapshot_sequence,
             publication_id,
         }
@@ -662,7 +685,11 @@ impl Drop for PublicationView {
             state.active_views.remove(&key);
         }
         let newest_snapshot_sequence = state.newest_snapshot_sequence;
-        cleanup_publications(&mut state, newest_snapshot_sequence);
+        let retired = cleanup_publications(&mut state, newest_snapshot_sequence);
+        drop(state);
+        if let Some(worker) = &self.worker {
+            worker.defer_publication_drop(retired);
+        }
     }
 }
 
@@ -676,7 +703,11 @@ fn publication_visible_to_view(
         && (persisted == PENDING_WRITE_SEQUENCE || persisted > snapshot_sequence)
 }
 
-fn cleanup_publications(state: &mut WritePipelineState, newest_snapshot_sequence: u64) {
+fn cleanup_publications(
+    state: &mut WritePipelineState,
+    newest_snapshot_sequence: u64,
+) -> Vec<Arc<PublishedWrite>> {
+    let mut retired = Vec::new();
     while state.visible.front().is_some_and(|write| {
         let persisted = write.persisted_sequence.load(Ordering::Acquire);
         persisted != PENDING_WRITE_SEQUENCE
@@ -688,8 +719,14 @@ fn cleanup_publications(state: &mut WritePipelineState, newest_snapshot_sequence
                     publication_visible_to_view(write, *snapshot_sequence, *publication_id)
                 })
     }) {
-        state.visible.pop_front();
+        retired.push(
+            state
+                .visible
+                .pop_front()
+                .expect("front publication passed the retirement predicate"),
+        );
     }
+    retired
 }
 
 fn snapshot_covers_persisted_publications(
@@ -982,6 +1019,7 @@ impl SlateDB {
 
     pub async fn flush(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
+        self.worker.wait_for_reclamation().await?;
         self.worker
             .call(|db| async move { db.flush().await.map_err(slatedb_error) })
             .await
@@ -997,6 +1035,7 @@ impl SlateDB {
     #[doc(hidden)]
     pub async fn flush_memtable_for_diagnostics(&self) -> Result<(), StorageError> {
         self.write_pipeline.wait_for_visible().await?;
+        self.worker.wait_for_reclamation().await?;
         self.worker
             .call(|db| async move {
                 db.flush_with_options(FlushOptions {
@@ -1029,7 +1068,10 @@ impl Storage for SlateDB {
             let snapshot = self.write_pipeline.snapshot(&self.worker).await?;
             self.point_cache.observe_snapshot(snapshot.seq());
             let publication_view = if opts.durability == ReadDurability::Visible {
-                Some(self.write_pipeline.capture(snapshot.seq()))
+                Some(
+                    self.write_pipeline
+                        .capture_with_worker(self.worker.clone(), snapshot.seq()),
+                )
             } else {
                 None
             };
@@ -1089,12 +1131,14 @@ async fn check_preconditions(
     let write_pipeline = write_pipeline.clone();
     let read_pipeline = write_pipeline.clone();
     let point_cache = point_cache.clone();
+    let capture_worker = worker.clone();
     let matches = worker
         .call_read(move |db| async move {
             let snapshot = db.snapshot().await.map_err(slatedb_error)?;
             let snapshot_sequence = snapshot.seq();
             point_cache.observe_snapshot(snapshot_sequence);
-            let publication_view = read_pipeline.capture(snapshot_sequence);
+            let publication_view =
+                read_pipeline.capture_with_worker(capture_worker, snapshot_sequence);
             let publication_id = publication_view.publication_id;
             let mut matches = Vec::with_capacity(preconditions.len());
             let mut index = 0;
@@ -1727,7 +1771,9 @@ impl StorageWrite for SlateDBWrite {
             drop(writer_permit);
             if start_drainer {
                 let task_pipeline = write_pipeline.clone();
-                worker.spawn(move |db| drain_write_queue(db, task_pipeline, point_cache));
+                let reclaimer = worker.publication_reclaimer();
+                worker
+                    .spawn(move |db| drain_write_queue(db, task_pipeline, point_cache, reclaimer));
             }
 
             // The writer gate protects precondition evaluation plus publication
@@ -1748,7 +1794,12 @@ impl StorageWrite for SlateDBWrite {
     }
 }
 
-async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: SnapshotPointCache) {
+async fn drain_write_queue(
+    db: Arc<Db>,
+    pipeline: WritePipeline,
+    point_cache: SnapshotPointCache,
+    reclaimer: PublicationReclaimer,
+) {
     loop {
         let writes = {
             let mut state = pipeline
@@ -1802,13 +1853,29 @@ async fn drain_write_queue(db: Arc<Db>, pipeline: WritePipeline, point_cache: Sn
                 .map(|write| Arc::clone(&write.overlay))
                 .collect::<Vec<_>>();
             point_cache.advance_local_write(*sequence, &overlays);
-        }
-        for write in writes {
-            if let Ok(sequence) = &result {
+            for write in &writes {
                 write
                     .published
                     .persisted_sequence
                     .store(*sequence, Ordering::Release);
+            }
+        }
+        let retired = {
+            let mut state = pipeline
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            result.as_ref().map_or_else(
+                |_| Vec::new(),
+                |sequence| {
+                    state.newest_snapshot_sequence = state.newest_snapshot_sequence.max(*sequence);
+                    cleanup_publications(&mut state, *sequence)
+                },
+            )
+        };
+        reclaimer.defer(retired);
+        for write in writes {
+            if let Ok(sequence) = &result {
                 write.completion.complete(Ok(*sequence));
             } else {
                 write.completion.complete(result.clone());
@@ -1830,6 +1897,7 @@ struct SlateDBWorkerInner {
     status: tokio::sync::watch::Receiver<DbStatus>,
     read_on_caller_current_thread: bool,
     in_flight: InFlightTracker,
+    reclamation: InFlightTracker,
     shutdown: mpsc::Sender<()>,
     manager: Mutex<Option<JoinHandle<()>>>,
 }
@@ -1841,6 +1909,28 @@ struct InFlightTracker {
 
 struct InFlightGuard {
     state: Arc<(Mutex<usize>, Condvar)>,
+}
+
+#[derive(Clone)]
+struct PublicationReclaimer {
+    runtime: Handle,
+    shutdown_in_flight: InFlightTracker,
+    reclamation: InFlightTracker,
+}
+
+impl PublicationReclaimer {
+    fn defer(&self, retired: Vec<Arc<PublishedWrite>>) {
+        if retired.is_empty() {
+            return;
+        }
+        let shutdown_in_flight = self.shutdown_in_flight.enter();
+        let reclamation = self.reclamation.enter();
+        self.runtime.spawn_blocking(move || {
+            let _shutdown_in_flight = shutdown_in_flight;
+            let _reclamation = reclamation;
+            drop(retired);
+        });
+    }
 }
 
 impl InFlightTracker {
@@ -1893,6 +1983,7 @@ impl SlateDBWorker {
         read_on_caller_current_thread: bool,
     ) -> Result<Self, StorageError> {
         let in_flight = InFlightTracker::default();
+        let reclamation = InFlightTracker::default();
         let manager_in_flight = in_flight.clone();
         let (shutdown, shutdown_rx) = mpsc::channel();
         let (opened_tx, opened_rx) = mpsc::channel::<Result<(Handle, Arc<Db>), StorageError>>();
@@ -1923,6 +2014,7 @@ impl SlateDBWorker {
                         status,
                         read_on_caller_current_thread,
                         in_flight,
+                        reclamation,
                         shutdown,
                         manager: Mutex::new(Some(thread)),
                     }),
@@ -1946,6 +2038,27 @@ impl SlateDBWorker {
             let _in_flight = in_flight;
             operation(db).await;
         });
+    }
+
+    fn defer_publication_drop(&self, retired: Vec<Arc<PublishedWrite>>) {
+        self.publication_reclaimer().defer(retired);
+    }
+
+    fn publication_reclaimer(&self) -> PublicationReclaimer {
+        PublicationReclaimer {
+            runtime: self.inner.runtime.clone(),
+            shutdown_in_flight: self.inner.in_flight.clone(),
+            reclamation: self.inner.reclamation.clone(),
+        }
+    }
+
+    async fn wait_for_reclamation(&self) -> Result<(), StorageError> {
+        let reclamation = self.inner.reclamation.clone();
+        tokio::task::spawn_blocking(move || reclamation.wait_until_idle())
+            .await
+            .map_err(|error| {
+                StorageError::Io(format!("join SlateDB publication reclaimer: {error}"))
+            })
     }
 
     fn check_open(&self) -> Result<(), StorageError> {
@@ -2817,6 +2930,55 @@ mod tests {
         let directory = tempfile::tempdir().expect("create fresh local storage directory");
         let storage = SlateDB::open(directory.path()).expect("open fresh local LZ4 storage");
         assert_eq!(storage.path(), directory.path());
+    }
+
+    #[test]
+    fn explicit_flush_reclaims_persisted_publications_before_the_next_read() {
+        let storage = SlateDB::open_object_store_with_options(
+            "test-flush-reclaims-publications",
+            Arc::new(InMemory::new()),
+            SlateDBObjectStoreOptions::default(),
+        )
+        .expect("open publication reclamation storage");
+        let mut write =
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin publication");
+        block_on(write.put_many(
+            SpaceId(7),
+            PutBatch {
+                entries: vec![PutEntry {
+                    key: Key(Bytes::from_static(b"key")),
+                    value: StoredValue {
+                        bytes: Bytes::from_static(b"value"),
+                    },
+                }],
+            },
+        ))
+        .expect("stage publication");
+        block_on(write.commit()).expect("commit publication");
+        block_on(storage.flush()).expect("flush and reclaim publication");
+
+        let state = storage
+            .write_pipeline
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            state.visible.is_empty(),
+            "persisted overlays must not wait for the next foreground read to be reclaimed"
+        );
+        drop(state);
+        let active_reclaimers = storage
+            .worker
+            .inner
+            .reclamation
+            .state
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            *active_reclaimers, 0,
+            "an explicit flush is a publication-reclamation lifecycle barrier"
+        );
     }
 
     #[test]
