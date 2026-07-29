@@ -142,12 +142,7 @@ where
         storage_batch_changes >= commit_width,
         "storage batch must hold at least one logical commit"
     );
-    if !matches!(options.shape, BenchPackedHistoryShape::UniqueInserts) {
-        assert!(
-            options.live_entities >= commit_width,
-            "repeated packed-history shapes require at least one live entity per commit row"
-        );
-    }
+    validate_packed_history_shape(changes, commit_width, options.shape, options.live_entities);
     assert_eq!(
         matches!(options.payload, BenchPackedHistoryPayload::SharedLarge),
         options.shared_large_payload.is_some(),
@@ -216,6 +211,31 @@ where
         staged_puts,
         written_bytes,
     }
+}
+
+fn validate_packed_history_shape(
+    changes: usize,
+    commit_width: usize,
+    shape: BenchPackedHistoryShape,
+    live_entities: usize,
+) {
+    let required_generations = match shape {
+        BenchPackedHistoryShape::UniqueInserts => return,
+        BenchPackedHistoryShape::RepeatedUpdates => 2,
+        BenchPackedHistoryShape::DeleteReinsert => 3,
+    };
+    assert!(
+        live_entities >= commit_width,
+        "repeated packed-history shapes require at least one live entity per commit row"
+    );
+    let required_changes = live_entities
+        .checked_mul(required_generations)
+        .expect("packed-history generation size should not overflow");
+    assert!(
+        changes >= required_changes,
+        "{shape:?} requires at least {required_generations} complete generations \
+         ({required_changes} changes for {live_entities} live entities)"
+    );
 }
 
 pub async fn scan_packed_history<StorageImpl>(storage: &StorageAdapter<StorageImpl>) -> usize
@@ -484,6 +504,18 @@ mod packed_history_tests {
             reinsert.as_commit_ref().snapshot,
             JsonSlotRef::Inline(r#"{"value":"small"}"#)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "RepeatedUpdates requires at least 2 complete generations")]
+    fn repeated_updates_require_an_update_generation() {
+        validate_packed_history_shape(10, 10, BenchPackedHistoryShape::RepeatedUpdates, 10);
+    }
+
+    #[test]
+    #[should_panic(expected = "DeleteReinsert requires at least 3 complete generations")]
+    fn delete_reinsert_requires_a_reinsert_generation() {
+        validate_packed_history_shape(20, 10, BenchPackedHistoryShape::DeleteReinsert, 10);
     }
 
     #[test]
