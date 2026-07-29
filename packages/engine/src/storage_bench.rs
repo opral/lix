@@ -381,23 +381,58 @@ async fn scan_layout_space<R>(
 where
     R: StorageAdapterRead,
 {
-    let entries = scan_layout_entries(read, space).await;
-
-    StorageLayoutAccounting {
+    let plan = ScanPlan::prefix(
+        space,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut accounting = StorageLayoutAccounting {
         space_id: space.id.0,
         space: space.name,
-        rows: entries.len() as u64,
-        key_bytes: entries
-            .iter()
-            .map(|entry| entry.key.0.len() as u64 + 4)
-            .sum(),
-        value_bytes: entries
-            .iter()
-            .map(|entry| match &entry.value {
-                StorageProjectedValue::KeyOnly => 0,
-                StorageProjectedValue::FullValue(value) => value.len() as u64,
-            })
-            .sum(),
+        rows: 0,
+        key_bytes: 0,
+        value_bytes: 0,
+    };
+    let mut resume_after = None;
+    loop {
+        let result = plan
+            .collect(
+                read,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    resume_after,
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await
+            .expect("scan complete storage bench layout space");
+        let has_more = result.value.has_more;
+        resume_after = result.value.entries.last().map(|entry| entry.key.clone());
+        for entry in result.value.entries {
+            accounting.rows = accounting
+                .rows
+                .checked_add(1)
+                .expect("storage layout row count should not overflow");
+            accounting.key_bytes = accounting
+                .key_bytes
+                .checked_add(entry.key.0.len() as u64 + 4)
+                .expect("storage layout key bytes should not overflow");
+            accounting.value_bytes = accounting
+                .value_bytes
+                .checked_add(match entry.value {
+                    StorageProjectedValue::KeyOnly => 0,
+                    StorageProjectedValue::FullValue(value) => value.len() as u64,
+                })
+                .expect("storage layout value bytes should not overflow");
+        }
+        if !has_more {
+            return accounting;
+        }
+        assert!(
+            resume_after.is_some(),
+            "storage scan reported more rows without a resume key"
+        );
     }
 }
 
@@ -472,6 +507,43 @@ mod tests {
         assert_eq!(materialized.commits, 1_025);
         assert_eq!(materialized.pages, 2);
         assert_eq!(streamed, materialized);
+    }
+
+    #[tokio::test]
+    async fn streamed_layout_accounting_matches_full_space_inventory() {
+        let storage = Memory::new();
+        let append = append_ordered_commits(0, 1_025).expect("build commit fixture");
+        stage_append_once(storage.clone(), &append)
+            .await
+            .expect("stage commit fixture");
+        let adapter = StorageAdapter::new(storage);
+        let read = adapter
+            .begin_read(crate::ReadOptions::default())
+            .await
+            .expect("begin layout accounting read");
+
+        let inventory = super::space_inventory(&read, crate::changelog::COMMIT_SPACE.name).await;
+        let accounting = super::layout_accounting(&read)
+            .await
+            .into_iter()
+            .find(|space| space.space == crate::changelog::COMMIT_SPACE.name)
+            .expect("commit space is accounted");
+
+        assert_eq!(accounting.rows, inventory.len() as u64);
+        assert_eq!(
+            accounting.key_bytes,
+            inventory
+                .iter()
+                .map(|(key, _)| key.len() as u64 + 4)
+                .sum::<u64>()
+        );
+        assert_eq!(
+            accounting.value_bytes,
+            inventory
+                .iter()
+                .map(|(_, value)| value.len() as u64)
+                .sum::<u64>()
+        );
     }
 
     #[tokio::test]
