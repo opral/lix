@@ -1152,7 +1152,6 @@ async fn manifest_keys_exist(
     store: &(impl StorageAdapterRead + ?Sized),
     keys: Vec<StorageKey>,
 ) -> Result<Vec<bool>, LixError> {
-    let started = Instant::now();
     let result = PointReadPlan::from_unique_keys(BINARY_CAS_MANIFEST_SPACE, keys)
         .materialize(
             store,
@@ -1166,13 +1165,6 @@ async fn manifest_keys_exist(
         .into_iter()
         .map(|value| value.is_some())
         .collect::<Vec<_>>();
-    let hit_count = exists.iter().filter(|&&exists| exists).count() as u64;
-    let miss_count = exists.len() as u64 - hit_count;
-    crate::binary_cas::metrics::record_binary_cas_chunk_lookup_batch(
-        hit_count,
-        miss_count,
-        started.elapsed(),
-    );
     Ok(exists)
 }
 
