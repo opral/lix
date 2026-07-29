@@ -179,3 +179,32 @@ The exact-case binaries had SHA-256
 `7224531462d84fd4d87d0928719ca3bf5caab195c1ab36e3eaa8950117a9a3f1`
 (candidate). The combined raw-result SHA-256 is
 `add3c863a4e22fb4494a9eb4f327230939d388e2870ad1c9452c3ee542f0e39e`.
+
+### OpenClaw end-to-end check
+
+The storage-neutral Git replay profiler from PR #925 replayed OpenClaw commit
+`c5c50a2141f2cdd805ae9b70a14a2e66dabac9b6` with all text, CSV, and Markdown
+plugins enabled. This commit changes 3,423 paths and eagerly persists 559,701
+semantic changes. Three counterbalanced pairs compared #925 alone with #925
+plus the 64 KiB and 128 KiB layout changes:
+
+| Backend | Metric | Baseline median | Layout stack median | Change |
+| ------- | ------ | --------------: | ------------------: | -----: |
+| RocksDB | Timed replay | 17,830.306 ms | 17,919.724 ms | 0.5% slower |
+| RocksDB | Parent bootstrap | 1,488.259 ms | 1,416.860 ms | 4.8% faster |
+| RocksDB | Final flush | 1,720.548 ms | 1,729.472 ms | 0.5% slower |
+| SlateDB | Timed replay | 17,618.113 ms | 17,823.678 ms | 1.2% slower |
+| SlateDB | Parent bootstrap | 1,388.375 ms | 1,387.330 ms | 0.1% faster |
+| SlateDB | Final flush | 4,410.714 ms | 4,576.873 ms | 3.8% slower |
+
+Final physical size was effectively flat: RocksDB changed from 136,500,209 to
+136,503,305 bytes and SlateDB from 341,107,956 to 341,168,511 bytes. This
+confirms that plugin reconciliation and validation, rather than binary CAS
+layout, dominate this pathological commit.
+
+The exact replay binaries had SHA-256
+`9b99f9ac44bd4e3c06913fadc375d5bba1d6c65039d7d9f01ceb0635e210f19b`
+(baseline) and
+`eb4df3645df61d65213e706034efebe39db92b04f68df00f688f24910da2ffca`
+(layout stack). The ordered profile-hash manifest SHA-256 is
+`23f3b0551cc4b729895871e7b6c5976ee27402182614ab4222807ecb5145473c`.
