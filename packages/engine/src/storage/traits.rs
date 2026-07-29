@@ -97,6 +97,21 @@ pub trait StorageWrite: Send {
         entries: PutBatch,
     ) -> impl Future<Output = Result<(), StorageError>> + Send;
 
+    /// Applies a point batch that no later range deletion in this write
+    /// transaction needs to observe.
+    ///
+    /// The default preserves ordinary [`Self::put_many`] behavior. Backends
+    /// that retain point keys only to reconcile future range deletes may
+    /// override this lane and stream the entries directly into their atomic
+    /// write batch. Exact point deletes remain valid after this call.
+    fn put_many_final(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        self.put_many(space, entries)
+    }
+
     /// Deletes the given keys of one space. Batches hold at most one
     /// mutation per key; engine write-set lowering produces sorted keys.
     fn delete_many(

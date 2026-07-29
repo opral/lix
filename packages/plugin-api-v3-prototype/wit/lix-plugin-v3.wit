@@ -1,0 +1,126 @@
+package lix:plugin@3.0.0;
+
+interface host {
+  type bytes = list<u8>;
+
+  variant host-error {
+    invalid-range,
+    limit-exceeded(string),
+    rejected(string),
+  }
+
+  /// Immutable input bytes. Calls happen as imports while one exported guest
+  /// transition remains entered.
+  resource source {
+    len: func() -> u64;
+    read: func(offset: u64, length: u32) -> result<bytes, host-error>;
+  }
+
+  /// Packet-v1 change page. Prototype A intentionally retains the v2 payload
+  /// format so only control flow and scheduling change.
+  record change-page {
+    format-version: u16,
+    record-count: u32,
+    payload: bytes,
+  }
+
+  /// Prototype B: a bounded, row-oriented typed CSV batch. The payload keeps
+  /// decoded cells, row identity ordinals, order ranks, and lexical layout in
+  /// compact binary columns; it contains no JSON entity snapshots.
+  record csv-row-batch {
+    row-count: u32,
+    payload: bytes,
+  }
+
+  /// Transaction-local staging sink. Emission never commits durable state.
+  resource transition-sink {
+    emit-changes: func(page: change-page) -> result<_, host-error>;
+    emit-csv-rows: func(batch: csv-row-batch) -> result<_, host-error>;
+  }
+}
+
+interface api {
+  use host.{bytes, source, transition-sink};
+
+  variant plugin-error {
+    invalid-input(string),
+    limit-exceeded(string),
+    internal(string),
+  }
+
+  record file-descriptor {
+    path: option<string>,
+    media-type: option<string>,
+  }
+
+  record create-context {
+    high: u64,
+    low: u32,
+  }
+
+  record open-file-input {
+    descriptor: file-descriptor,
+    file: own<source>,
+    creates: create-context,
+    max-batch-bytes: u32,
+  }
+
+  record source-range {
+    offset: u64,
+    length: u64,
+  }
+
+  variant input-bytes {
+    inline(bytes),
+    after-range(source-range),
+  }
+
+  record input-splice {
+    offset: u64,
+    delete-len: u64,
+    insert: input-bytes,
+  }
+
+  record file-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<source>,
+    edits: list<input-splice>,
+    after: own<source>,
+    creates: create-context,
+    max-batch-bytes: u32,
+  }
+
+  record transition-summary {
+    entity-count: u64,
+    batch-count: u32,
+    payload-bytes: u64,
+  }
+
+  resource document {
+    fork: func() -> own<document>;
+    /// The guest stays entered while it pushes every bounded change page into
+    /// the host sink. No guest-owned change cursor crosses the boundary.
+    file-changed: func(
+      input: file-update,
+      sink: borrow<transition-sink>,
+    ) -> result<file-transition, plugin-error>;
+  }
+
+  record file-transition {
+    document: own<document>,
+    summary: transition-summary,
+  }
+
+  /// One host-to-guest entry. Source reads and sink writes are imports made
+  /// while this call remains active.
+  open-file: func(
+    input: open-file-input,
+    sink: borrow<transition-sink>,
+  ) -> result<file-transition, plugin-error>;
+}
+
+world plugin {
+  import host;
+  export api;
+}

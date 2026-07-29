@@ -718,6 +718,7 @@ fn decode_change_packet(
                 WasmEntityChange::Create {
                     schema_key: schema_key.to_string(),
                     local_ref,
+                    resolved_key: None,
                     snapshot_content,
                 }
             }
@@ -730,6 +731,25 @@ fn decode_change_packet(
     Ok(DecodedChangePacket {
         changes: WasmEntityChanges { changes },
         output_ranges,
+    })
+}
+
+pub(super) fn decode_inline_change_page(
+    record_count: u32,
+    payload: Vec<u8>,
+    max_bytes: u32,
+    limits: WasmTransitionLimits,
+) -> Result<WasmChangePage, LixError> {
+    let decoded = decode_change_packet(record_count, payload, max_bytes, limits)?;
+    if !decoded.output_ranges.is_empty() {
+        return Err(v2_invalid_plugin(
+            "v3 prototype packet-v1 pages cannot contain output attachments",
+        ));
+    }
+    Ok(WasmChangePage {
+        format_version: PACKET_FORMAT_V1,
+        changes: decoded.changes,
+        outputs: None,
     })
 }
 
@@ -2201,6 +2221,7 @@ mod tests {
                         schema_key,
                         local_ref,
                         snapshot_content,
+                        ..
                     } if schema_key == "csv_v2_row" => {
                         let snapshot_content = match snapshot_content {
                             WasmGuestBytes::Inline(bytes) => bytes,
@@ -3329,6 +3350,7 @@ mod tests {
                     WasmEntityChange::Create {
                         schema_key,
                         local_ref,
+                        resolved_key,
                         snapshot_content,
                     } => {
                         let snapshot_content = match snapshot_content {
@@ -3340,6 +3362,7 @@ mod tests {
                         WasmEntityChange::Create {
                             schema_key,
                             local_ref,
+                            resolved_key,
                             snapshot_content,
                         }
                     }
@@ -3660,6 +3683,13 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
             .ok_or_else(|| v2_invalid_plugin("unknown v2 document handle"))?;
         let (transition, _budget_resource) = self.begin_transition(limits, Some(document.0))?;
         let budget = self.transition_budget(transition)?;
+        {
+            let mut budget = budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            budget.counters.guest_export_calls =
+                budget.counters.guest_export_calls.saturating_add(1);
+        }
         let before = self.push_byte_source(update.before, &budget)?;
         let after = self.push_byte_source(update.after, &budget)?;
         let edits = update
@@ -3833,6 +3863,14 @@ impl WasmComponentV2Actor for WasmtimeV2Actor {
         }
         if eof {
             return Ok(None);
+        }
+        {
+            let budget = self.transition_budget(transition.0)?;
+            let mut budget = budget
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            budget.counters.guest_export_calls =
+                budget.counters.guest_export_calls.saturating_add(1);
         }
         let budget_rep = self.prepare_nested_call(transition.0)?;
         let guest = self.guest.clone();

@@ -7,14 +7,22 @@
 //! full row identity the physical mutation unit.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Range;
+use std::sync::Arc;
 
+use crate::wasm::WasmCreateContext;
+use base64::Engine as _;
 use bytes::Bytes;
 use smallvec::SmallVec;
 use tracing::Instrument as _;
 
-use crate::storage_adapter::{BufferRange, EncodedMutationBatch, EncodedPut};
+use crate::storage_adapter::{
+    BufferRange, DeferredFinalPutPage, DeferredFinalPutSource, EncodedMutationBatch, EncodedPut,
+    PutBatch, PutEntry,
+};
+use crate::tracked_state::TrackedStateReadColumns;
+use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
@@ -32,6 +40,1149 @@ pub(crate) const HOT_DIFF_SPACE: StorageSpace =
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
+const CERTIFIED_ENTITY_BATCH_MAGIC: &[u8; 4] = b"CEB1";
+pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_001f),
+    "live_state.certified_entity_batch.v1",
+);
+pub(crate) const CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0021),
+    "live_state.certified_entity_batch_manifest.v1",
+);
+const DEFERRED_FRESH_HOT_ROWS_PER_PAGE: usize = 4_096;
+const DEFERRED_FRESH_HOT_SPACES: [StorageSpace; 3] =
+    [HOT_ROW_SPACE, HOT_FILE_SPACE, HOT_DIFF_SPACE];
+
+pub(crate) struct DeferredFreshHotRowRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) delta: CurrentStateDeltaRef<'a>,
+}
+
+pub(crate) trait DeferredFreshHotRows: Send + Sync {
+    fn row(&self, index: usize) -> DeferredFreshHotRowRef<'_>;
+}
+
+pub(crate) struct CertifiedEntityBatchFileRef<'a> {
+    pub(crate) branch_id: &'a str,
+    pub(crate) file_id: &'a str,
+    pub(crate) batches: &'a [WasmCertifiedEntityBatch],
+}
+
+/// A certified fresh-file hot-state publication whose row owner is attached
+/// only after every other commit materializer has finished reading it.
+///
+/// Keeping this as row ordinals avoids manufacturing expanded keys and values
+/// while the prepared transaction batch is still live.
+pub(crate) struct DeferredFreshHotPlan {
+    branch_id: String,
+    generation: CommitId,
+    checkpoint_commit_id: Option<CommitId>,
+    row_indices: Vec<usize>,
+    put_count: u64,
+    written_bytes: u64,
+    backend_capacity_hint_bytes: usize,
+}
+
+impl DeferredFreshHotPlan {
+    pub(crate) fn new(
+        branch_id: &str,
+        generation: CommitId,
+        state_rows: &dyn DeferredFreshHotRows,
+        row_indices: &[usize],
+        certified_file_id: &str,
+        validated_absence_guards: &[TrackedStateKeyRef<'_>],
+        checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+    ) -> Result<Self, LixError> {
+        if row_indices.is_empty() {
+            return Err(head_value_error(
+                "deferred fresh hot publication has no rows",
+            ));
+        }
+        let scope = hot_scope_prefix(branch_id, generation);
+        let diff_scope = checkpoint_commit_id.map(|checkpoint_commit_id| {
+            encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation)
+        });
+        let mut next_coverage = *coverage;
+        let mut written_bytes = 0_u64;
+        let mut backend_capacity_hint_bytes = 0_usize;
+        let mut put_count = 0_u64;
+        let mut coverage_key = Vec::new();
+        for &row_index in row_indices {
+            let row = state_rows.row(row_index);
+            let delta =
+                deferred_fresh_delta(row, branch_id, certified_file_id, validated_absence_guards)?;
+            delta.validate()?;
+            if delta.deleted {
+                return Err(head_value_error(
+                    "deferred fresh hot publication requires live rows",
+                ));
+            }
+            let key_len = encoded_hot_identity_key_len(
+                scope.len(),
+                delta.schema_key,
+                delta.entity_pk,
+                delta.file_id,
+            )
+            .ok_or_else(|| head_value_error("deferred fresh hot key length overflowed"))?;
+            let value_len =
+                checked_add_hot_next_value_capacity(0, &delta, checkpoint_commit_id.is_some())
+                    .ok_or_else(|| {
+                        head_value_error("deferred fresh hot value length overflowed")
+                    })?;
+            let value_copies = 1_u64 + u64::from(delta.file_id.is_some());
+            written_bytes = written_bytes
+                .checked_add(
+                    u64::try_from(value_len)
+                        .unwrap_or(u64::MAX)
+                        .checked_mul(value_copies)
+                        .ok_or_else(|| {
+                            head_value_error("deferred fresh hot written bytes overflowed")
+                        })?,
+                )
+                .ok_or_else(|| head_value_error("deferred fresh hot written bytes overflowed"))?;
+            backend_capacity_hint_bytes = backend_capacity_hint_bytes
+                .checked_add(key_len)
+                .and_then(|capacity| match delta.file_id {
+                    Some(_) => capacity.checked_add(key_len),
+                    None => Some(capacity),
+                })
+                .and_then(|capacity| {
+                    capacity.checked_add(value_len.checked_mul(value_copies as usize)?)
+                })
+                .and_then(|capacity| {
+                    capacity.checked_add(16_usize.checked_mul(value_copies as usize)?)
+                })
+                .ok_or_else(|| {
+                    head_value_error("deferred fresh hot backend capacity overflowed")
+                })?;
+            put_count = put_count
+                .checked_add(value_copies)
+                .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
+            if let Some(diff_scope) = diff_scope.as_deref() {
+                coverage_key.clear();
+                let range = append_hot_diff_key_parts(
+                    &mut coverage_key,
+                    diff_scope,
+                    delta.schema_key,
+                    delta.entity_pk,
+                    delta.file_id,
+                );
+                next_coverage
+                    .add_encoded_group_key(&coverage_key[range])
+                    .ok_or_else(|| {
+                        head_value_error("deferred fresh hot working-diff count overflowed")
+                    })?;
+                backend_capacity_hint_bytes = backend_capacity_hint_bytes
+                    .checked_add(coverage_key.len())
+                    .and_then(|capacity| capacity.checked_add(16))
+                    .ok_or_else(|| {
+                        head_value_error("deferred fresh hot diff capacity overflowed")
+                    })?;
+                put_count = put_count
+                    .checked_add(1)
+                    .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
+            }
+        }
+        *coverage = next_coverage;
+        Ok(Self {
+            branch_id: branch_id.to_owned(),
+            generation,
+            checkpoint_commit_id,
+            row_indices: row_indices.to_vec(),
+            put_count,
+            written_bytes,
+            backend_capacity_hint_bytes,
+        })
+    }
+
+    pub(crate) fn into_source(
+        self,
+        state_rows: Arc<dyn DeferredFreshHotRows>,
+    ) -> Box<dyn DeferredFinalPutSource> {
+        Box::new(DeferredFreshHotSource {
+            plan: self,
+            state_rows,
+            cursor: 0,
+            pending_pages: VecDeque::new(),
+        })
+    }
+}
+
+struct DeferredFreshHotSource {
+    plan: DeferredFreshHotPlan,
+    state_rows: Arc<dyn DeferredFreshHotRows>,
+    cursor: usize,
+    pending_pages: VecDeque<DeferredFinalPutPage>,
+}
+
+impl DeferredFinalPutSource for DeferredFreshHotSource {
+    fn target_spaces(&self) -> &[StorageSpace] {
+        &DEFERRED_FRESH_HOT_SPACES
+    }
+
+    fn put_count(&self) -> u64 {
+        self.plan.put_count
+    }
+
+    fn written_bytes(&self) -> u64 {
+        self.plan.written_bytes
+    }
+
+    fn backend_capacity_hint_bytes(&self) -> usize {
+        self.plan.backend_capacity_hint_bytes
+    }
+
+    fn next_page(&mut self) -> Option<DeferredFinalPutPage> {
+        if let Some(page) = self.pending_pages.pop_front() {
+            return Some(page);
+        }
+        if self.cursor == self.plan.row_indices.len() {
+            return None;
+        }
+        let end = self
+            .cursor
+            .saturating_add(DEFERRED_FRESH_HOT_ROWS_PER_PAGE)
+            .min(self.plan.row_indices.len());
+        let indices = &self.plan.row_indices[self.cursor..end];
+        self.cursor = end;
+        let scope = hot_scope_prefix(&self.plan.branch_id, self.plan.generation);
+        let diff_scope = self.plan.checkpoint_commit_id.map(|checkpoint_commit_id| {
+            encode_working_diff_scope_prefix(
+                &self.plan.branch_id,
+                checkpoint_commit_id,
+                self.plan.generation,
+            )
+        });
+        let mut key_capacity = 0_usize;
+        let mut value_capacity = 0_usize;
+        for &row_index in indices {
+            let delta = self.state_rows.row(row_index).delta;
+            key_capacity = key_capacity.saturating_add(
+                encoded_hot_identity_key_len(
+                    scope.len(),
+                    delta.schema_key,
+                    delta.entity_pk,
+                    delta.file_id,
+                )
+                .unwrap_or(0)
+                .saturating_mul(1 + usize::from(delta.file_id.is_some())),
+            );
+            if let Some(diff_scope) = diff_scope.as_deref() {
+                key_capacity = key_capacity.saturating_add(
+                    encoded_hot_identity_key_len(
+                        diff_scope.len(),
+                        delta.schema_key,
+                        delta.entity_pk,
+                        delta.file_id,
+                    )
+                    .unwrap_or(0),
+                );
+            }
+            value_capacity = checked_add_hot_next_value_capacity(
+                value_capacity,
+                &delta,
+                self.plan.checkpoint_commit_id.is_some(),
+            )
+            .unwrap_or(0);
+        }
+        let mut key_bytes = Vec::with_capacity(key_capacity);
+        let mut value_bytes = Vec::with_capacity(value_capacity);
+        let mut key_ranges = Vec::with_capacity(indices.len());
+        let mut value_ranges = Vec::with_capacity(indices.len());
+        let mut diff_key_ranges =
+            Vec::with_capacity(diff_scope.as_ref().map_or(0, |_| indices.len()));
+        for &row_index in indices {
+            let delta = self.state_rows.row(row_index).delta;
+            key_ranges.push(append_hot_mutation_identity(&mut key_bytes, &scope, &delta));
+            value_ranges.push(
+                append_head_value(
+                    &mut value_bytes,
+                    &delta.value_ref(
+                        delta.created_at,
+                        if self.plan.checkpoint_commit_id.is_some() {
+                            WorkingDiffBaseline::BeforeAbsent
+                        } else {
+                            WorkingDiffBaseline::Disabled
+                        },
+                    ),
+                )
+                .expect("deferred fresh hot rows were validated before staging"),
+            );
+            if let Some(diff_scope) = diff_scope.as_deref() {
+                diff_key_ranges.push(append_hot_diff_key_parts(
+                    &mut key_bytes,
+                    diff_scope,
+                    delta.schema_key,
+                    delta.entity_pk,
+                    delta.file_id,
+                ));
+            }
+        }
+        let key_bytes = Bytes::from(key_bytes);
+        let value_bytes = Bytes::from(value_bytes);
+        let mut row_entries = Vec::with_capacity(indices.len());
+        let mut file_entries = Vec::with_capacity(indices.len());
+        for (identity, value) in key_ranges.into_iter().zip(value_ranges) {
+            let value = StorageValue {
+                bytes: value_bytes.slice(value.clone()),
+            };
+            row_entries.push(PutEntry {
+                key: StorageKey(key_bytes.slice(
+                    identity.row_key.offset()..identity.row_key.offset() + identity.row_key.len(),
+                )),
+                value: value.clone(),
+            });
+            if let Some(file_key) = identity.file_key {
+                file_entries.push(PutEntry {
+                    key: StorageKey(
+                        key_bytes.slice(file_key.offset()..file_key.offset() + file_key.len()),
+                    ),
+                    value,
+                });
+            }
+        }
+        if !file_entries.is_empty() {
+            self.pending_pages.push_back(DeferredFinalPutPage {
+                space: HOT_FILE_SPACE,
+                entries: PutBatch {
+                    entries: file_entries,
+                },
+            });
+        }
+        if !diff_key_ranges.is_empty() {
+            self.pending_pages.push_back(DeferredFinalPutPage {
+                space: HOT_DIFF_SPACE,
+                entries: PutBatch {
+                    entries: diff_key_ranges
+                        .into_iter()
+                        .map(|key| PutEntry {
+                            key: StorageKey(key_bytes.slice(key)),
+                            value: StorageValue {
+                                bytes: Bytes::new(),
+                            },
+                        })
+                        .collect(),
+                },
+            });
+        }
+        Some(DeferredFinalPutPage {
+            space: HOT_ROW_SPACE,
+            entries: PutBatch {
+                entries: row_entries,
+            },
+        })
+    }
+}
+
+fn deferred_fresh_delta<'a>(
+    row: DeferredFreshHotRowRef<'a>,
+    branch_id: &str,
+    certified_file_id: &str,
+    validated_absence_guards: &[TrackedStateKeyRef<'_>],
+) -> Result<CurrentStateDeltaRef<'a>, LixError> {
+    let delta = row.delta;
+    let file_is_certified = delta.file_id == Some(certified_file_id);
+    let identity_is_guarded = validated_absence_guards
+        .binary_search_by(|guard| {
+            guard
+                .schema_key
+                .cmp(delta.schema_key)
+                .then_with(|| guard.entity_pk.cmp(delta.entity_pk))
+                .then_with(|| guard.file_id.cmp(&delta.file_id))
+        })
+        .is_ok();
+    if row.branch_id != branch_id || (!file_is_certified && !identity_is_guarded) || delta.untracked
+    {
+        return Err(head_value_error(
+            "deferred fresh hot row escaped its certified or guarded identity scope",
+        ));
+    }
+    if delta.commit_id.is_none() || delta.change_id.is_none() {
+        return Err(head_value_error(
+            "deferred fresh hot tracked row is missing commit identity",
+        ));
+    }
+    Ok(delta)
+}
+
+/// Publishes one immutable semantic owner per certified file batch.
+///
+/// The storage value is the authority for the batch rows. Current-state and
+/// history readers decode rows lazily; later sparse mutations remain ordinary
+/// hot rows and therefore form overlays instead of rewriting this value.
+pub(crate) async fn stage_certified_entity_batches(
+    read: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    file_writes: &[CertifiedEntityBatchFileRef<'_>],
+    controls: &BTreeMap<String, BranchHeadControl>,
+    observations: &BTreeMap<String, crate::branch::BranchHeadControlObservation>,
+    commit_created_at: &BTreeMap<CommitId, LixTimestamp>,
+) -> Result<(), LixError> {
+    let mut complete_manifest_suffixes = BTreeMap::<String, Vec<Vec<u8>>>::new();
+    for file in file_writes {
+        for batch in file
+            .batches
+            .iter()
+            .filter(|batch| batch.complete_file_state)
+        {
+            let mut suffix = Vec::new();
+            append_batch_text(&mut suffix, file.file_id)?;
+            suffix.extend_from_slice(&batch.format.to_le_bytes());
+            complete_manifest_suffixes
+                .entry(file.branch_id.to_owned())
+                .or_default()
+                .push(suffix);
+        }
+    }
+
+    for (branch_id, control) in controls {
+        let Some(previous) = observations
+            .get(branch_id)
+            .and_then(|observation| observation.control)
+        else {
+            continue;
+        };
+        if previous.generation == control.generation {
+            continue;
+        }
+        let previous_prefix = previous.generation.as_uuid().as_bytes().to_vec();
+        let manifests = ScanPlan::prefix(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(previous_prefix.clone()),
+            },
+        )
+        .collect(read, StorageScanOptions::default())
+        .await?;
+        for entry in manifests.value.entries {
+            let suffix = entry
+                .key
+                .0
+                .get(previous_prefix.len()..)
+                .ok_or_else(|| head_value_error("truncated certified manifest key"))?;
+            if complete_manifest_suffixes
+                .get(branch_id)
+                .is_some_and(|prefixes| prefixes.iter().any(|prefix| suffix.starts_with(prefix)))
+            {
+                continue;
+            }
+            let mut key = control.generation.as_uuid().as_bytes().to_vec();
+            key.extend_from_slice(suffix);
+            writes.put(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                StorageKey(Bytes::from(key)),
+                StorageValue {
+                    bytes: full_value_bytes(entry.value)?,
+                },
+            );
+        }
+    }
+
+    for file in file_writes {
+        if file.batches.is_empty() {
+            continue;
+        }
+        let control = controls.get(file.branch_id).ok_or_else(|| {
+            head_value_error("certified entity batch has no published branch control")
+        })?;
+        let created_at = commit_created_at
+            .get(&control.head_commit_id)
+            .copied()
+            .ok_or_else(|| head_value_error("certified entity batch has no commit timestamp"))?;
+        for batch in file.batches {
+            if batch.complete_file_state {
+                let mut manifest_prefix = control.generation.as_uuid().as_bytes().to_vec();
+                append_batch_text(&mut manifest_prefix, file.file_id)?;
+                manifest_prefix.extend_from_slice(&batch.format.to_le_bytes());
+                let prior_manifests = ScanPlan::prefix(
+                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                    StoragePrefix {
+                        bytes: Bytes::from(manifest_prefix),
+                    },
+                )
+                .collect(read, StorageScanOptions::default())
+                .await?;
+                for entry in prior_manifests.value.entries {
+                    writes.delete(CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, entry.key);
+                }
+            }
+            let mut content_key = control.head_commit_id.as_uuid().as_bytes().to_vec();
+            append_batch_text(&mut content_key, file.file_id)?;
+            content_key.extend_from_slice(&batch.format.to_le_bytes());
+
+            let page_bytes = batch
+                .pages
+                .iter()
+                .try_fold(0usize, |total, page| total.checked_add(4 + page.len()))
+                .ok_or_else(|| head_value_error("certified entity batch size overflowed"))?;
+            let schema_bytes = batch
+                .schema_keys
+                .iter()
+                .try_fold(2usize, |total, schema| total.checked_add(2 + schema.len()))
+                .ok_or_else(|| head_value_error("certified schema list size overflowed"))?;
+            let mut value = Vec::with_capacity(
+                4 + schema_bytes
+                    + 2
+                    + file.file_id.len()
+                    + 16
+                    + 2
+                    + created_at.to_string().len()
+                    + 2
+                    + 8
+                    + 8
+                    + 4
+                    + 4
+                    + page_bytes,
+            );
+            value.extend_from_slice(CERTIFIED_ENTITY_BATCH_MAGIC);
+            value.extend_from_slice(
+                &u16::try_from(batch.schema_keys.len())
+                    .map_err(|_| head_value_error("certified batch has too many schemas"))?
+                    .to_le_bytes(),
+            );
+            for schema_key in &batch.schema_keys {
+                append_batch_text(&mut value, schema_key)?;
+            }
+            append_batch_text(&mut value, file.file_id)?;
+            value.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
+            append_batch_text(&mut value, &created_at.to_string())?;
+            value.extend_from_slice(&batch.format.to_le_bytes());
+            value.extend_from_slice(&batch.row_count.to_le_bytes());
+            value.extend_from_slice(&batch.creates.high.to_le_bytes());
+            value.extend_from_slice(&batch.creates.low.to_le_bytes());
+            value.extend_from_slice(
+                &u32::try_from(batch.pages.len())
+                    .map_err(|_| head_value_error("certified entity batch has too many pages"))?
+                    .to_le_bytes(),
+            );
+            for page in &batch.pages {
+                value.extend_from_slice(
+                    &u32::try_from(page.len())
+                        .map_err(|_| head_value_error("certified entity batch page exceeds 4GiB"))?
+                        .to_le_bytes(),
+                );
+                value.extend_from_slice(page);
+            }
+            writes.put(
+                CERTIFIED_ENTITY_BATCH_SPACE,
+                StorageKey(Bytes::from(content_key.clone())),
+                StorageValue {
+                    bytes: Bytes::from(value),
+                },
+            );
+            let mut manifest_key = control.generation.as_uuid().as_bytes().to_vec();
+            append_batch_text(&mut manifest_key, file.file_id)?;
+            manifest_key.extend_from_slice(&batch.format.to_le_bytes());
+            manifest_key.extend_from_slice(control.head_commit_id.as_uuid().as_bytes());
+            writes.put(
+                CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+                StorageKey(Bytes::from(manifest_key)),
+                StorageValue {
+                    bytes: Bytes::from(content_key),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn append_batch_text(output: &mut Vec<u8>, value: &str) -> Result<(), LixError> {
+    output.extend_from_slice(
+        &u16::try_from(value.len())
+            .map_err(|_| head_value_error("certified entity batch text exceeds 64KiB"))?
+            .to_le_bytes(),
+    );
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+async fn scan_certified_entity_batch_rows(
+    store: &impl StorageAdapterRead,
+    branch_id: &str,
+    generation: CommitId,
+    request: &TrackedStateScanRequest,
+    limit: Option<usize>,
+) -> Result<MaterializedLiveStateBatch, LixError> {
+    if matches!(limit, Some(0)) {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
+    let manifests = ScanPlan::prefix(
+        CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+        StoragePrefix {
+            bytes: Bytes::copy_from_slice(generation.as_uuid().as_bytes()),
+        },
+    )
+    .collect(store, StorageScanOptions::default())
+    .await?;
+    let content_keys = manifests
+        .value
+        .entries
+        .into_iter()
+        .map(|entry| full_value_bytes(entry.value).map(StorageKey))
+        .collect::<Result<Vec<_>, _>>()?;
+    let contents = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_SPACE, &content_keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value;
+    let content_count = contents.iter().flatten().count();
+    let decode_limit = (content_count <= 1).then_some(limit).flatten();
+    let needs_snapshot = request.read_columns.columns.is_empty()
+        || request
+            .read_columns
+            .columns
+            .iter()
+            .any(|column| column == "snapshot_content");
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(
+        limit.unwrap_or_else(|| contents.len().saturating_mul(1024)),
+    );
+    for value in contents.into_iter().flatten() {
+        let value = full_value_bytes(value)?;
+        decode_certified_entity_batch_rows(
+            &value,
+            branch_id,
+            request,
+            needs_snapshot,
+            decode_limit,
+            &mut builder,
+        )?;
+        if decode_limit.is_some_and(|limit| builder.len() >= limit) {
+            break;
+        }
+    }
+    let batch = builder.finish();
+    if content_count <= 1 {
+        return Ok(batch);
+    }
+    let mut winners = BTreeMap::new();
+    for row in batch.into_rows() {
+        let key = (
+            row.schema_key.clone(),
+            row.entity_pk.clone(),
+            row.file_id.clone(),
+        );
+        match winners.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry)
+                if entry.get().updated_at <= row.updated_at =>
+            {
+                entry.insert(row);
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {}
+        }
+    }
+    let mut rows = MaterializedLiveStateBatch::from_rows(winners.into_values().collect());
+    if let Some(limit) = limit {
+        rows = rows.filter(|_| true, Some(limit));
+    }
+    Ok(rows)
+}
+
+pub(crate) async fn scan_certified_history_rows(
+    store: &impl StorageAdapterRead,
+    commit_ids: &BTreeSet<CommitId>,
+    request: &TrackedStateScanRequest,
+) -> Result<Vec<MaterializedLiveStateRow>, LixError> {
+    if commit_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let page = ScanPlan::prefix(
+        CERTIFIED_ENTITY_BATCH_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    )
+    .collect(store, StorageScanOptions::default())
+    .await?;
+    let needs_snapshot = request
+        .read_columns
+        .columns
+        .iter()
+        .any(|column| column == "snapshot_content");
+    let mut builder =
+        MaterializedLiveStateBatchBuilder::with_capacity(page.value.entries.len() * 1024);
+    for entry in page.value.entries {
+        let value = full_value_bytes(entry.value)?;
+        if !commit_ids.contains(&certified_batch_commit_id(&value)?) {
+            continue;
+        }
+        decode_certified_entity_batch_rows(
+            &value,
+            "",
+            request,
+            needs_snapshot,
+            None,
+            &mut builder,
+        )?;
+    }
+    Ok(builder.finish().into_rows())
+}
+
+fn certified_batch_commit_id(bytes: &[u8]) -> Result<CommitId, LixError> {
+    let mut input = CertifiedBatchReader::new(bytes)?;
+    let schema_count = input.u16()? as usize;
+    for _ in 0..schema_count {
+        let _ = input.text()?;
+    }
+    let _ = input.text()?;
+    Ok(CommitId::new(
+        uuid::Uuid::from_slice(input.bytes(16)?)
+            .map_err(|error| head_value_error(format!("invalid certified commit id: {error}")))?,
+    ))
+}
+
+fn decode_certified_entity_batch_rows(
+    bytes: &[u8],
+    branch_id: &str,
+    request: &TrackedStateScanRequest,
+    needs_snapshot: bool,
+    limit: Option<usize>,
+    builder: &mut MaterializedLiveStateBatchBuilder,
+) -> Result<(), LixError> {
+    let mut input = CertifiedBatchReader::new(bytes)?;
+    let schema_count = input.u16()? as usize;
+    if schema_count == 0 {
+        return Err(head_value_error("certified entity batch has no schemas"));
+    }
+    let mut schema_keys = Vec::with_capacity(schema_count);
+    for _ in 0..schema_count {
+        schema_keys.push(input.text()?);
+    }
+    let file_id = input.text()?;
+    let commit_id = CommitId::new(
+        uuid::Uuid::from_slice(input.bytes(16)?)
+            .map_err(|error| head_value_error(format!("invalid certified commit id: {error}")))?,
+    );
+    let timestamp = LixTimestamp::parse(input.text()?).map_err(head_value_error)?;
+    let format = input.u16()?;
+    if format != 1 && format != 2 {
+        return Err(head_value_error(format!(
+            "unsupported certified entity batch format {format}"
+        )));
+    }
+    let declared_rows = input.u64()?;
+    let creates = WasmCreateContext {
+        high: input.u64()?,
+        low: input.u32()?,
+    };
+    let page_count = input.u32()?;
+    if !request.filter.schema_keys.is_empty()
+        && !request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|candidate| schema_keys.contains(&candidate.as_str()))
+    {
+        return Ok(());
+    }
+    if !request.filter.file_ids.is_empty()
+        && !request
+            .filter
+            .file_ids
+            .iter()
+            .any(|candidate| match candidate {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => false,
+                NullableKeyFilter::Value(candidate) => candidate == file_id,
+            })
+    {
+        return Ok(());
+    }
+
+    let mut decoded_rows = 0_u64;
+    for _ in 0..page_count {
+        let page_len = input.u32()? as usize;
+        let page = input.bytes(page_len)?;
+        if format == 2 {
+            decoded_rows = decoded_rows.saturating_add(decode_certified_packet_rows(
+                page,
+                &creates,
+                commit_id,
+                timestamp,
+                branch_id,
+                file_id,
+                request,
+                needs_snapshot,
+                limit,
+                decoded_rows,
+                builder,
+            )?);
+            if limit.is_some_and(|limit| builder.len() >= limit) {
+                return Ok(());
+            }
+            continue;
+        }
+        let mut rows = CertifiedCsvReader {
+            bytes: page,
+            offset: 0,
+        };
+        while rows.offset < rows.bytes.len() {
+            let local_ref = rows.u32()?;
+            let order_rank = rows.u64()?;
+            let ending = rows.u8()?;
+            let quote_layout_len = rows.u32()? as usize;
+            let quote_layout = rows.bytes(quote_layout_len)?;
+            let field_count = rows.u16()?;
+            let id = creates
+                .component_uuid_bytes(u64::from(local_ref))
+                .map_err(|error| head_value_error(error.to_string()))?;
+            let entity_pk = EntityPk::uuid_from_bytes(id);
+            let selected = request.filter.entity_pks.is_empty()
+                || request
+                    .filter
+                    .entity_pks
+                    .iter()
+                    .any(|candidate| candidate == &entity_pk);
+            let mut cells = needs_snapshot.then(|| Vec::with_capacity(field_count as usize));
+            for _ in 0..field_count {
+                let cell_len = rows.u32()? as usize;
+                let cell = std::str::from_utf8(rows.bytes(cell_len)?).map_err(|error| {
+                    head_value_error(format!("certified CSV cell is not UTF-8: {error}"))
+                })?;
+                if let Some(cells) = &mut cells {
+                    cells.push(cell);
+                }
+            }
+            decoded_rows = decoded_rows.saturating_add(1);
+            if !selected {
+                continue;
+            }
+            let snapshot = cells
+                .map(|cells| {
+                    let mut object = serde_json::Map::new();
+                    object.insert(
+                        "cells".to_owned(),
+                        serde_json::Value::Array(
+                            cells
+                                .into_iter()
+                                .map(|cell| serde_json::Value::String(cell.to_owned()))
+                                .collect(),
+                        ),
+                    );
+                    object.insert(
+                        "id".to_owned(),
+                        serde_json::Value::String(uuid::Uuid::from_bytes(id).to_string()),
+                    );
+                    if !quote_layout.is_empty() || ending != 0 {
+                        let mut layout = serde_json::Map::new();
+                        if !quote_layout.is_empty() {
+                            layout.insert(
+                                "force_quote".to_owned(),
+                                serde_json::Value::String(
+                                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                                        .encode(quote_layout),
+                                ),
+                            );
+                        }
+                        if ending != 0 {
+                            let terminator = match ending {
+                                1 => "",
+                                2 => "\n",
+                                3 => "\r\n",
+                                4 => "\r",
+                                _ => {
+                                    return Err(head_value_error(
+                                        "certified CSV row has invalid terminator",
+                                    ));
+                                }
+                            };
+                            layout.insert(
+                                "terminator".to_owned(),
+                                serde_json::Value::String(terminator.to_owned()),
+                            );
+                        }
+                        object.insert("layout".to_owned(), serde_json::Value::Object(layout));
+                    }
+                    object.insert(
+                        "order_key".to_owned(),
+                        serde_json::Value::String(format!("{order_rank:016x}")),
+                    );
+                    let json = serde_json::to_vec(&serde_json::Value::Object(object))
+                        .map_err(|error| head_value_error(error.to_string()))?;
+                    SharedStr::from_utf8(Bytes::from(json))
+                        .map_err(|error| head_value_error(error.to_string()))
+                })
+                .transpose()?;
+            builder.push_materialized(
+                entity_pk,
+                schema_keys[0].to_owned(),
+                Some(file_id.to_owned()),
+                snapshot,
+                None,
+                false,
+                timestamp,
+                timestamp,
+                false,
+                Some(ChangeId::new(uuid::Uuid::from_bytes(id))),
+                Some(commit_id),
+                false,
+                branch_id,
+            );
+            if limit.is_some_and(|limit| builder.len() >= limit) {
+                return Ok(());
+            }
+        }
+    }
+    if decoded_rows != declared_rows {
+        return Err(head_value_error(format!(
+            "certified entity batch declared {declared_rows} rows but decoded {decoded_rows}"
+        )));
+    }
+    if input.offset != input.bytes.len() {
+        return Err(head_value_error(
+            "certified entity batch has trailing storage bytes",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_certified_packet_rows(
+    page: &[u8],
+    creates: &WasmCreateContext,
+    commit_id: CommitId,
+    timestamp: LixTimestamp,
+    branch_id: &str,
+    file_id: &str,
+    request: &TrackedStateScanRequest,
+    needs_snapshot: bool,
+    limit: Option<usize>,
+    base_ordinal: u64,
+    builder: &mut MaterializedLiveStateBatchBuilder,
+) -> Result<u64, LixError> {
+    let mut input = CertifiedCsvReader {
+        bytes: page,
+        offset: 0,
+    };
+    let mut decoded = 0_u64;
+    while input.offset < input.bytes.len() {
+        let record_len = input.u32()? as usize;
+        let record_bytes = input.bytes(record_len)?;
+        let mut record = CertifiedCsvReader {
+            bytes: record_bytes,
+            offset: 0,
+        };
+        let tag = record.u8()?;
+        let schema_len = record.u32()? as usize;
+        let schema_key = std::str::from_utf8(record.bytes(schema_len)?)
+            .map_err(|error| head_value_error(format!("invalid packet schema: {error}")))?;
+        let (entity_pk, created_id) = match tag {
+            0 => {
+                let component_count = record.u32()? as usize;
+                let mut components = Vec::with_capacity(component_count);
+                for _ in 0..component_count {
+                    let component_len = record.u32()? as usize;
+                    let component =
+                        std::str::from_utf8(record.bytes(component_len)?).map_err(|error| {
+                            head_value_error(format!("invalid packet key: {error}"))
+                        })?;
+                    components.push(
+                        SharedStr::from_utf8(Bytes::copy_from_slice(component.as_bytes()))
+                            .map_err(|error| head_value_error(error.to_string()))?,
+                    );
+                }
+                if record.u8()? > 1 {
+                    return Err(head_value_error(
+                        "certified packet upsert has invalid effect",
+                    ));
+                }
+                (
+                    EntityPk::from_shared_parts(components)
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                    None,
+                )
+            }
+            2 => {
+                let local_ref = record.u64()?;
+                let id = creates
+                    .component_uuid_bytes(local_ref)
+                    .map_err(|error| head_value_error(error.to_string()))?;
+                (EntityPk::uuid_from_bytes(id), Some(id))
+            }
+            _ => {
+                return Err(head_value_error(
+                    "certified packet contains a non-snapshot record",
+                ));
+            }
+        };
+        if record.u8()? != 0 {
+            return Err(head_value_error(
+                "certified create packet snapshot is not inline",
+            ));
+        }
+        let snapshot_len = record.u32()? as usize;
+        let snapshot_bytes = record.bytes(snapshot_len)?;
+        if record.offset != record.bytes.len() {
+            return Err(head_value_error(
+                "certified create packet record has trailing bytes",
+            ));
+        }
+        decoded = decoded.saturating_add(1);
+        let selected = (request.filter.schema_keys.is_empty()
+            || request
+                .filter
+                .schema_keys
+                .iter()
+                .any(|candidate| candidate == schema_key))
+            && (request.filter.entity_pks.is_empty()
+                || request
+                    .filter
+                    .entity_pks
+                    .iter()
+                    .any(|candidate| candidate == &entity_pk));
+        if !selected {
+            continue;
+        }
+        let snapshot = if needs_snapshot {
+            if let Some(id) = &created_id {
+                let mut snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes)
+                    .map_err(|error| {
+                        head_value_error(format!("invalid certified JSON: {error}"))
+                    })?;
+                let object = snapshot.as_object_mut().ok_or_else(|| {
+                    head_value_error("certified create snapshot is not a JSON object")
+                })?;
+                object.insert(
+                    "id".to_owned(),
+                    serde_json::Value::String(uuid::Uuid::from_bytes(*id).to_string()),
+                );
+                let json = serde_json::to_vec(&snapshot)
+                    .map_err(|error| head_value_error(error.to_string()))?;
+                Some(
+                    SharedStr::from_utf8(Bytes::from(json))
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                )
+            } else {
+                Some(
+                    SharedStr::from_utf8(Bytes::copy_from_slice(snapshot_bytes))
+                        .map_err(|error| head_value_error(error.to_string()))?,
+                )
+            }
+        } else {
+            None
+        };
+        let change_id = if let Some(id) = &created_id {
+            ChangeId::new(uuid::Uuid::from_bytes(*id))
+        } else {
+            let mut bytes = *commit_id.as_uuid().as_bytes();
+            let ordinal = base_ordinal.saturating_add(decoded).to_be_bytes();
+            for (target, source) in bytes[8..].iter_mut().zip(ordinal) {
+                *target ^= source;
+            }
+            ChangeId::new(uuid::Uuid::from_bytes(bytes))
+        };
+        builder.push_materialized(
+            entity_pk,
+            schema_key.to_owned(),
+            Some(file_id.to_owned()),
+            snapshot,
+            None,
+            false,
+            timestamp,
+            timestamp,
+            false,
+            Some(change_id),
+            Some(commit_id),
+            false,
+            branch_id,
+        );
+        if limit.is_some_and(|limit| builder.len() >= limit) {
+            break;
+        }
+    }
+    Ok(decoded)
+}
+
+struct CertifiedBatchReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CertifiedBatchReader<'a> {
+    fn new(bytes: &'a [u8]) -> Result<Self, LixError> {
+        if !bytes.starts_with(CERTIFIED_ENTITY_BATCH_MAGIC) {
+            return Err(head_value_error("invalid certified entity batch magic"));
+        }
+        Ok(Self { bytes, offset: 4 })
+    }
+
+    fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| head_value_error("truncated certified entity batch"))?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn text(&mut self) -> Result<&'a str, LixError> {
+        let length = self.u16()? as usize;
+        std::str::from_utf8(self.bytes(length)?)
+            .map_err(|error| head_value_error(format!("invalid certified batch text: {error}")))
+    }
+
+    fn u16(&mut self) -> Result<u16, LixError> {
+        Ok(u16::from_le_bytes(
+            self.bytes(2)?.try_into().expect("fixed batch u16 width"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, LixError> {
+        Ok(u32::from_le_bytes(
+            self.bytes(4)?.try_into().expect("fixed batch u32 width"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, LixError> {
+        Ok(u64::from_le_bytes(
+            self.bytes(8)?.try_into().expect("fixed batch u64 width"),
+        ))
+    }
+}
+
+struct CertifiedCsvReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CertifiedCsvReader<'a> {
+    fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| head_value_error("truncated certified CSV page"))?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, LixError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, LixError> {
+        Ok(u16::from_le_bytes(
+            self.bytes(2)?.try_into().expect("fixed CSV u16 width"),
+        ))
+    }
+
+    fn u32(&mut self) -> Result<u32, LixError> {
+        Ok(u32::from_le_bytes(
+            self.bytes(4)?.try_into().expect("fixed CSV u32 width"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, LixError> {
+        Ok(u64::from_le_bytes(
+            self.bytes(8)?.try_into().expect("fixed CSV u64 width"),
+        ))
+    }
+}
 
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
@@ -99,7 +1250,32 @@ where
             },
         )
         .await?;
-        Ok(!page.value.entries.is_empty())
+        if !page.value.entries.is_empty() {
+            return Ok(true);
+        }
+        // Format plugins cannot publish engine-owned schemas. Avoid probing
+        // certified plugin segments when validation asks about a missing
+        // system schema; durable-function setup relies on this point-read-only
+        // path staying free of unrelated storage scans.
+        if schema_key.starts_with("lix_") {
+            return Ok(false);
+        }
+        let certified = scan_certified_entity_batch_rows(
+            &self.store,
+            branch_id,
+            control.generation,
+            &TrackedStateScanRequest {
+                filter: TrackedStateFilter {
+                    schema_keys: vec![schema_key.to_owned()],
+                    ..TrackedStateFilter::default()
+                },
+                read_columns: Default::default(),
+                limit: Some(1),
+            },
+            Some(1),
+        )
+        .await?;
+        Ok(!certified.is_empty())
     }
 
     pub(crate) async fn scan_entity_snapshots(
@@ -157,6 +1333,49 @@ where
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
         let rows =
             materialize_hot_scan_entries(&self.store, entries, projection, branch_id).await?;
+        let overlay_identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.schema_key().to_owned(),
+                    row.entity_pk().clone(),
+                    row.file_id().map(str::to_owned),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        let certified_rows = scan_certified_entity_batch_rows(
+            &self.store,
+            branch_id,
+            generation,
+            request,
+            if overlay_identities.is_empty() {
+                request.limit.map(|limit| limit.saturating_sub(rows.len()))
+            } else {
+                None
+            },
+        )
+        .await?
+        .filter(
+            |row| {
+                !overlay_identities
+                    .iter()
+                    .any(|(schema_key, entity_pk, file_id)| {
+                        schema_key == row.schema_key()
+                            && entity_pk == row.entity_pk()
+                            && file_id.as_deref() == row.file_id()
+                    })
+            },
+            None,
+        );
+        let rows = if certified_rows.is_empty() {
+            rows
+        } else if rows.is_empty() {
+            certified_rows
+        } else {
+            let mut combined = rows.into_rows();
+            combined.extend(certified_rows.into_rows());
+            MaterializedLiveStateBatch::from_rows(combined)
+        };
         if request.filter.include_tombstones && request.limit.is_none() {
             return Ok(rows);
         }
@@ -259,7 +1478,80 @@ where
             }));
         }
         let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
-        MaterializedLiveStateExactBatch::new(rows, slots)
+        if slots.iter().all(Option::is_some) {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+        if keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+
+        // Certified immutable segments deliberately do not manufacture one
+        // HOT_ROW entry per semantic row. Exact validation reads still need
+        // to observe those identities—for example, a sparse plugin successor
+        // proving that a keyed update or foreign-key target already exists.
+        // Decode the matching segment rows only when the ordinary point-read
+        // index misses, then preserve the original request alignment.
+        let certified_request = TrackedStateScanRequest {
+            filter: TrackedStateFilter {
+                schema_keys: keys.iter().map(|key| key.schema_key.to_owned()).collect(),
+                entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
+                file_ids: keys
+                    .iter()
+                    .map(|key| {
+                        key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
+                            NullableKeyFilter::Value(file_id.to_owned())
+                        })
+                    })
+                    .collect(),
+                include_tombstones: true,
+            },
+            read_columns: TrackedStateReadColumns {
+                columns: [
+                    projection.snapshot_content.then_some("snapshot_content"),
+                    projection.metadata.then_some("metadata"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(str::to_owned)
+                .collect(),
+            },
+            limit: None,
+        };
+        let certified = scan_certified_entity_batch_rows(
+            &self.store,
+            branch_id,
+            generation,
+            &certified_request,
+            None,
+        )
+        .await?;
+        if certified.is_empty() {
+            return MaterializedLiveStateExactBatch::new(rows, slots);
+        }
+
+        let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(keys.len());
+        let mut combined_slots = Vec::with_capacity(keys.len());
+        for (key, slot) in keys.iter().zip(slots) {
+            let row = slot.and_then(|slot| rows.get(slot as usize)).or_else(|| {
+                certified.iter().find(|row| {
+                    row.schema_key() == key.schema_key
+                        && row.entity_pk() == key.entity_pk
+                        && row.file_id() == key.file_id
+                })
+            });
+            combined_slots.push(
+                row.map(|row| {
+                    u32::try_from(builder.push_ref(row, None)).map_err(|_| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "certified exact live-state result exceeds u32 rows",
+                        )
+                    })
+                })
+                .transpose()?,
+            );
+        }
+        MaterializedLiveStateExactBatch::new(builder.finish(), combined_slots)
     }
 
     pub(crate) async fn working_diff_epoch(

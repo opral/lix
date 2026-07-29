@@ -403,6 +403,34 @@ impl StorageWrite for RocksDBWrite {
         }
     }
 
+    fn put_many_final(
+        &mut self,
+        space: SpaceId,
+        entries: PutBatch,
+    ) -> impl Future<Output = Result<(), StorageError>> + Send {
+        async move {
+            let max_key_bytes = entries
+                .entries
+                .iter()
+                .map(|entry| 4_usize.saturating_add(entry.key.0.len()))
+                .max()
+                .unwrap_or(0);
+            let mut physical_key = Vec::with_capacity(max_key_bytes);
+            let space_prefix = space.0.to_be_bytes();
+            for entry in entries.entries {
+                physical_key.clear();
+                physical_key.extend_from_slice(&space_prefix);
+                physical_key.extend_from_slice(&entry.key.0);
+                let value = stored_value_bytes(entry.value);
+                self.stats.put_entries += 1;
+                self.stats.written_bytes += value.len() as u64;
+                self.batch.put(physical_key.as_slice(), value.as_ref());
+            }
+            self.stats.storage_calls += 1;
+            Ok(())
+        }
+    }
+
     fn delete_many(
         &mut self,
         space: SpaceId,

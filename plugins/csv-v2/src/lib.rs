@@ -1,5 +1,6 @@
 //! Incremental CSV guest for the Lix Wasm Component plugin API v2.
 
+#[cfg(feature = "component-v2")]
 mod bindings;
 mod core;
 

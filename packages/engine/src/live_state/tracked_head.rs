@@ -8,7 +8,12 @@
 
 mod hot;
 
-pub(crate) use hot::{HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot};
+pub(crate) use hot::{
+    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_SPACE,
+    CertifiedEntityBatchFileRef, DeferredFreshHotPlan, DeferredFreshHotRowRef,
+    DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot,
+    scan_certified_history_rows, stage_certified_entity_batches,
+};
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
@@ -1747,7 +1752,7 @@ fn decode_slot<'a>(kind: u8, bytes: &'a [u8], field: &str) -> Result<HeadSlotVie
     }
 }
 
-fn head_value_error(message: &str) -> LixError {
+fn head_value_error(message: impl std::fmt::Display) -> LixError {
     LixError::new(
         LixError::CODE_INTERNAL_ERROR,
         format!("invalid hot live-state row: {message}"),

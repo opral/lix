@@ -84,9 +84,10 @@ use crate::session::{
     encode_receipt, load_workspace_branch_id_from_index,
 };
 use crate::sql2::{
-    ChangelogQuerySource, DiffCommand, HistoryQuerySource, SessionFileViewKey,
-    SessionFileViewMutation, SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource,
-    SqlExecutionContext, SqlHistoryQuerySource,
+    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
+    HistoryQuerySource, MaterializedChange, SessionFileViewKey, SessionFileViewMutation,
+    SessionFileViews, SessionPluginFileView, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource,
 };
 use crate::sql2::{SqlPlanningCache, SqlWriteExecutionContext};
 use crate::storage_adapter::Storage;
@@ -97,7 +98,8 @@ use crate::storage_adapter::{
     SharedStorageAdapterRead, StorageAdapter, StorageAdapterRead, StorageAdapterReadScope,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateStoreReader,
+    TrackedStateContext, TrackedStateDiffKind, TrackedStateDiffRequest, TrackedStateScanRequest,
+    TrackedStateStoreReader,
 };
 use crate::transaction::commit;
 use crate::transaction::normalization::{
@@ -115,6 +117,50 @@ use crate::transaction::types::{
     TransactionWriteOutcome, TransactionWriteRow, canonicalize_transaction_json_batch,
     stage_json_from_value,
 };
+
+pub(crate) struct CertifiedHistoryStoreReader<S> {
+    store: S,
+}
+
+impl<S> CertifiedHistoryStoreReader<S> {
+    pub(crate) const fn new(store: S) -> Self {
+        Self { store }
+    }
+}
+
+#[async_trait]
+impl<S> CertifiedHistoryReader for CertifiedHistoryStoreReader<S>
+where
+    S: StorageAdapterRead + Send + Sync,
+{
+    async fn scan(
+        &self,
+        commit_ids: &BTreeSet<CommitId>,
+        request: &TrackedStateScanRequest,
+    ) -> Result<Vec<CertifiedHistoryChange>, LixError> {
+        Ok(
+            crate::live_state::scan_certified_history_rows(&self.store, commit_ids, request)
+                .await?
+                .into_iter()
+                .filter_map(|row| {
+                    Some(CertifiedHistoryChange {
+                        commit_id: row.commit_id?,
+                        change: MaterializedChange {
+                            id: row.change_id?.to_string(),
+                            entity_pk: row.entity_pk,
+                            schema_key: row.schema_key,
+                            file_id: row.file_id,
+                            snapshot_content: row.snapshot_content,
+                            metadata: row.metadata,
+                            created_at: row.created_at.to_string(),
+                            origin_key: None,
+                        },
+                    })
+                })
+                .collect(),
+        )
+    }
+}
 use crate::transaction::validation::{
     TransactionValidationInput, fresh_plugin_file_import_certificate,
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
@@ -624,6 +670,9 @@ where
                 return Err(error);
             }
         };
+        transaction
+            .uncache_completed_plugin_actors_for_large_file_writes(&prepared_writes)
+            .await;
         let tracked_state_changed = prepared_writes.state_rows.iter().any(|row| !row.untracked)
             || !prepared_writes.commit_change_refs_by_branch.is_empty()
             || !prepared_writes.extra_commit_parents_by_branch.is_empty();
@@ -815,6 +864,47 @@ where
             std::mem::take(&mut transaction.pending_file_view_mutations).into_values(),
         );
         Ok(TransactionCommitOutcome { storage_stats })
+    }
+
+    /// Large import documents are more valuable as transient parser state than
+    /// as cache entries. Release their completed Stores before validation and
+    /// materialization so guest arenas do not overlap the atomic storage
+    /// batch. The durable semantic rows and exact materialized bytes remain
+    /// authoritative; a later semantic edit takes the ordinary cold path.
+    async fn uncache_completed_plugin_actors_for_large_file_writes(
+        &mut self,
+        prepared_writes: &PreparedWriteSet,
+    ) {
+        const MAX_RETAINED_IMPORT_BYTES: usize = 8 * 1024 * 1024;
+
+        let large_files = prepared_writes
+            .file_data_writes
+            .iter()
+            .filter(|write| write.len() > MAX_RETAINED_IMPORT_BYTES)
+            .map(|write| (write.branch_id.as_str(), write.file_id.as_str()))
+            .collect::<BTreeSet<_>>();
+        if large_files.is_empty() {
+            return;
+        }
+
+        for index in (0..self.pending_plugin_actor_publications.len()).rev() {
+            if self.pending_plugin_actor_publications[index].retains_large_import_actor() {
+                continue;
+            }
+            let session_key = self.pending_plugin_actor_publications[index].session_key();
+            if !large_files
+                .contains(&(session_key.branch_id.as_str(), session_key.file_id.as_str()))
+            {
+                continue;
+            }
+            let publication = self
+                .pending_plugin_actor_publications
+                .remove(index)
+                .into_uncached()
+                .await;
+            self.pending_plugin_actor_publications
+                .insert(index, publication);
+        }
     }
 
     pub(crate) fn attach_commit_boundary(&mut self, boundary: TransactionCommitBoundary) {
@@ -3139,6 +3229,8 @@ where
                     plugin_generation: selected.archive_blob_hash().to_string(),
                     owner_change_id,
                     semantic_chainable: false,
+                    retain_large_import_actor: selected.api_version()
+                        != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
                 };
                 if !prepared_session_keys.insert(view.session_key.clone())
                     || self
@@ -3332,6 +3424,13 @@ where
             }
 
             for (pending, actor, validated) in completed_opens {
+                let certified_row_count = validated
+                    .certified_batches
+                    .iter()
+                    .map(|batch| batch.row_count)
+                    .sum::<u64>();
+                file_data[pending.file_index]
+                    .set_certified_entity_batches(validated.certified_batches);
                 let mut changes = validated.changes;
                 let create_rows = self
                     .v2_create_rows(
@@ -3348,8 +3447,9 @@ where
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes =
-                    u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(certified_row_count);
                 self.plugin_host.record_v2_transition_counters(counters);
 
                 rows.push(pending.owner_row);
@@ -3518,6 +3618,8 @@ where
                 plugin_generation: selected.archive_blob_hash().to_string(),
                 owner_change_id,
                 semantic_chainable: false,
+                retain_large_import_actor: selected.api_version()
+                    != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
             };
             if self
                 .pending_plugin_actor_publications
@@ -3710,6 +3812,12 @@ where
                     return Err(lease.handle_guest_call_error(error));
                 }
 
+                let certified_row_count = detected_transition
+                    .certified_batches
+                    .iter()
+                    .map(|batch| batch.row_count)
+                    .sum::<u64>();
+                write.set_certified_entity_batches(detected_transition.certified_batches.clone());
                 let detection_document = detected_transition.document;
                 let mut counters = detected_transition.counters;
                 let mut changes = match self
@@ -3843,8 +3951,9 @@ where
                     .copied()
                     .unwrap_or(0);
                 counters.private_document_cache_hits = 1;
-                counters.durable_semantic_changes =
-                    u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(certified_row_count);
                 self.plugin_host.record_v2_transition_counters(counters);
                 lease.complete_guest_call(
                     successor_document,
@@ -3902,6 +4011,12 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
+                let certified_row_count = validated
+                    .certified_batches
+                    .iter()
+                    .map(|batch| batch.row_count)
+                    .sum::<u64>();
+                write.set_certified_entity_batches(validated.certified_batches);
                 let mut changes = validated.changes;
                 let create_rows = self
                     .v2_create_rows(
@@ -3922,8 +4037,9 @@ where
                     .copied()
                     .unwrap_or(0);
                 counters.full_document_reparses = 1;
-                counters.durable_semantic_changes =
-                    u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);
+                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(certified_row_count);
                 self.plugin_host.record_v2_transition_counters(counters);
                 (
                     changes,
@@ -4085,6 +4201,8 @@ where
                 plugin_generation: group.plugin.archive_blob_hash().to_string(),
                 owner_change_id: group.owner_change_id.clone(),
                 semantic_chainable: true,
+                retain_large_import_actor: group.plugin.api_version()
+                    != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
             };
 
             let prior_index = self
@@ -4491,7 +4609,13 @@ where
                     "prepared metadata",
                 )?;
             }
-            let mut prepared_rows = PreparedStateBatch::with_capacity(row_count);
+            let json_count = rows
+                .iter()
+                .map(|row| {
+                    usize::from(row.snapshot.is_some()) + usize::from(row.metadata.is_some())
+                })
+                .sum();
+            let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
             for index in 0..row_count {
                 push_prepared_state_row_from_planned_parts(
                     &mut prepared_rows,
@@ -4583,7 +4707,11 @@ where
             canonicalize_transaction_json_batch(rows.metadata_slots_mut(), "prepared metadata")?;
         }
 
-        let mut prepared_rows = PreparedStateBatch::with_capacity(row_count);
+        let json_count = rows
+            .iter()
+            .map(|row| usize::from(row.snapshot.is_some()) + usize::from(row.metadata.is_some()))
+            .sum();
+        let mut prepared_rows = PreparedStateBatch::with_dense_capacity(row_count, json_count);
         for (index, &scalar_ordinal) in scalar_ordinal_by_row.iter().enumerate() {
             debug_assert_ne!(scalar_ordinal, usize::MAX);
             push_prepared_state_row_from_planned_parts(
@@ -5456,6 +5584,9 @@ where
         HistoryQuerySource {
             store: self.read_store.clone(),
             json_reader: crate::json_store::JsonStoreContext::new().reader(self.read_store.clone()),
+            certified_history_reader: Some(Arc::new(CertifiedHistoryStoreReader::new(
+                self.read_store.clone(),
+            ))),
             default_as_of_commit_id,
         }
     }
@@ -6892,6 +7023,7 @@ struct PendingPluginActorView {
     plugin_generation: String,
     owner_change_id: String,
     semantic_chainable: bool,
+    retain_large_import_actor: bool,
 }
 
 enum PendingPluginActorPublication {
@@ -7020,6 +7152,14 @@ impl PendingPluginActorPublication {
             }
         }
     }
+
+    fn retains_large_import_actor(&self) -> bool {
+        match self {
+            Self::Existing { view, .. } | Self::New { view, .. } | Self::Uncached { view, .. } => {
+                view.retain_large_import_actor
+            }
+        }
+    }
 }
 
 /// Releases the oldest completed Store retained only for post-commit cache
@@ -7106,6 +7246,7 @@ async fn render_v2_semantic_changes_with_lease(
             plugin_generation: view.plugin_generation.clone(),
             owner_change_id: view.owner_change_id.clone(),
             semantic_chainable: view.semantic_chainable,
+            retain_large_import_actor: view.retain_large_import_actor,
         },
     };
     let change_count = u64::try_from(changes.entity_change_count()).unwrap_or(u64::MAX);

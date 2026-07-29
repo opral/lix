@@ -3403,6 +3403,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "lix_plugin_api_v3_prototype"
+version = "0.9.0"
+dependencies = [
+ "wit-bindgen 0.57.1",
+]
+
+[[package]]
 name = "lix_rocksdb_storage"
 version = "0.9.0"
 dependencies = [
@@ -3419,6 +3426,7 @@ name = "lix_sdk"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "blake3",
  "bytes",
  "codspeed-criterion-compat",
@@ -3454,10 +3462,14 @@ dependencies = [
  "lix_rocksdb_storage",
  "lix_sdk",
  "plugin_csv_v2",
+ "plugin_csv_v3_prototype",
  "plugin_excalidraw_v2",
+ "plugin_excalidraw_v3_prototype",
  "plugin_git_text_v2",
  "plugin_json_incremental_v2",
+ "plugin_json_v3_prototype",
  "plugin_markdown_incremental_v2",
+ "plugin_markdown_v3_prototype",
  "rand 0.9.2",
  "serde_json",
  "sha2",
@@ -4267,12 +4279,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_csv_v3_prototype"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "lix_plugin_api_v3_prototype",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "plugin_excalidraw_v2"
 version = "0.9.0"
 dependencies = [
  "base64 0.22.1",
  "lix_order_key",
  "lix_plugin_api_v2",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "plugin_excalidraw_v3_prototype"
+version = "0.9.0"
+dependencies = [
+ "lix_order_key",
+ "lix_plugin_api_v3_prototype",
  "serde_json",
  "uuid",
 ]
@@ -4300,6 +4332,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_json_v3_prototype"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "lix_plugin_api_v3_prototype",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "plugin_markdown_incremental_v2"
 version = "0.9.0"
 dependencies = [
@@ -4309,6 +4352,21 @@ dependencies = [
  "lix_order_key",
  "lix_plugin_api_v2",
  "markdown",
+ "markdown-syntax",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "plugin_markdown_v3_prototype"
+version = "0.9.0"
+dependencies = [
+ "base64 0.22.1",
+ "chardetng",
+ "encoding_rs",
+ "lix_order_key",
+ "lix_plugin_api_v3_prototype",
  "markdown-syntax",
  "serde",
  "serde_json",

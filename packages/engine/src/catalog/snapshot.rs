@@ -436,6 +436,44 @@ impl SchemaPlan {
         bytes: &[u8],
         key: &WasmEntityKey,
     ) -> Result<Option<CertifiedV2PluginRow>, LixError> {
+        let emitted = key
+            .entity_pk
+            .iter()
+            .map(|component| component.as_str())
+            .collect::<SmallVec<[_; 2]>>();
+        let Some(normalized) =
+            self.certify_or_normalize_v2_plugin_row_parts(bytes, &key.schema_key, &emitted)?
+        else {
+            return Ok(None);
+        };
+        let component_types = self
+            .primary_key_component_types
+            .as_deref()
+            .expect("certificate eligibility requires typed primary-key components");
+        EntityPk::from_shared_external_parts(key.entity_pk.iter().cloned(), component_types)
+            .map(|entity_pk| {
+                Some(CertifiedV2PluginRow {
+                    entity_pk,
+                    normalized,
+                })
+            })
+            .map_err(|error| {
+                LixError::new(
+                    LixError::CODE_SCHEMA_VALIDATION,
+                    format!(
+                        "plugin entity_pk is invalid for schema '{}': {error}",
+                        self.key.schema_key
+                    ),
+                )
+            })
+    }
+
+    pub(crate) fn certify_or_normalize_v2_plugin_row_parts(
+        &self,
+        bytes: &[u8],
+        schema_key: &str,
+        entity_pk: &[&str],
+    ) -> Result<Option<Option<Vec<u8>>>, LixError> {
         if !self.accepts_v2_canonical_certificate() {
             return Ok(None);
         }
@@ -451,21 +489,21 @@ impl SchemaPlan {
             .primary_key_component_types
             .as_deref()
             .expect("certificate eligibility requires typed primary-key components");
-        if key.entity_pk.len() != primary_key_paths.len() {
+        if entity_pk.len() != primary_key_paths.len() {
             return Ok(None);
         }
-        if key.schema_key != self.key.schema_key {
+        if schema_key != self.key.schema_key {
             return Err(LixError::new(
                 LixError::CODE_SCHEMA_VALIDATION,
                 format!(
                     "plugin snapshot schema '{}' does not match schema plan '{}'",
-                    key.schema_key, self.key.schema_key
+                    schema_key, self.key.schema_key
                 ),
             ));
         }
 
         let mut parser = CanonicalPluginRowParser::new(bytes)?;
-        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &key.entity_pk);
+        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, entity_pk);
         let normalized = match parser.parse_root_object(validation, &mut primary_key) {
             Ok(normalized) => normalized,
             Err(CanonicalPluginRowError::InvalidPlugin(message)) => {
@@ -482,13 +520,8 @@ impl SchemaPlan {
             }
         };
 
-        EntityPk::from_shared_external_parts(key.entity_pk.iter().cloned(), component_types)
-            .map(|entity_pk| {
-                Some(CertifiedV2PluginRow {
-                    entity_pk,
-                    normalized,
-                })
-            })
+        EntityPk::validate_external_parts(entity_pk, component_types)
+            .map(|()| Some(normalized))
             .map_err(|error| {
                 LixError::new(
                     LixError::CODE_SCHEMA_VALIDATION,
@@ -1356,12 +1389,12 @@ fn write_canonical_json_string_contents(value: &str, output: &mut Vec<u8>) {
 
 struct CanonicalPrimaryKeyMatcher<'a> {
     paths: &'a [Vec<String>],
-    emitted: &'a [crate::common::SharedStr],
+    emitted: &'a [&'a str],
     seen: u128,
 }
 
 impl<'a> CanonicalPrimaryKeyMatcher<'a> {
-    fn new(paths: &'a [Vec<String>], emitted: &'a [crate::common::SharedStr]) -> Self {
+    fn new(paths: &'a [Vec<String>], emitted: &'a [&'a str]) -> Self {
         Self {
             paths,
             emitted,
@@ -1381,7 +1414,7 @@ impl<'a> CanonicalPrimaryKeyMatcher<'a> {
                 self.paths[index][0]
             ));
         };
-        if actual.eq_str(self.emitted[index].as_str()) {
+        if actual.eq_str(self.emitted[index]) {
             None
         } else {
             Some(format!(
@@ -3074,7 +3107,12 @@ mod tests {
             br#"{"cells":["a","b"],"id":"019a0000-0000-7000-8000-000000000001","order_key":"01"}"#,
         )
         .expect("canonical parser");
-        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &key.entity_pk);
+        let emitted = key
+            .entity_pk
+            .iter()
+            .map(|component| component.as_str())
+            .collect::<SmallVec<[_; 2]>>();
+        let mut primary_key = CanonicalPrimaryKeyMatcher::new(primary_key_paths, &emitted);
         assert!(
             parser
                 .parse_root_object(validation, &mut primary_key)

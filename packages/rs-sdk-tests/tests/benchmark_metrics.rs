@@ -133,6 +133,15 @@ impl AllocatorSnapshot {
     }
 }
 
+/// Current Rust global-allocator live bytes.
+///
+/// Ignored profiling benchmarks use this only to annotate tracing phase
+/// boundaries. Reading the relaxed counter does not allocate and therefore
+/// does not perturb the measured scope.
+pub fn current_live_bytes() -> u64 {
+    LIVE_BYTES.load(Ordering::Relaxed)
+}
+
 /// One exclusive allocation-measurement window.
 ///
 /// Run ignored allocation benchmarks with an exact test filter. The lock

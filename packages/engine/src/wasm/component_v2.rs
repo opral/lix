@@ -20,6 +20,7 @@ use crate::{
 
 pub const PACKET_FORMAT_V1: u16 = 1;
 pub const WASM_COMPONENT_V2_API_VERSION: &str = "2.1.0";
+pub const WASM_COMPONENT_V3_PROTOTYPE_API_VERSION: &str = "3.0.0";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
@@ -126,6 +127,13 @@ pub struct WasmTransitionCounters {
     pub attachment_reads: u64,
     pub attachment_bytes_read: u64,
     pub component_import_calls: u64,
+    /// Exported guest entries. Prototype A requires exactly one for an initial
+    /// file transition, independent of page and source-read counts.
+    pub guest_export_calls: u64,
+    /// Persistent executor threads created for the actor while serving this
+    /// transition. This is one on the actor's first transition and zero for
+    /// subsequent transitions; it must never scale with source/sink calls.
+    pub actor_executor_threads_created: u64,
     pub component_boundary_bytes: u64,
     pub guest_linear_memory_high_water_bytes: u64,
     /// Bytes examined by the host-only full-blob diff fallback. Validated
@@ -178,6 +186,12 @@ impl WasmTransitionCounters {
         self.component_import_calls = self
             .component_import_calls
             .saturating_add(other.component_import_calls);
+        self.guest_export_calls = self
+            .guest_export_calls
+            .saturating_add(other.guest_export_calls);
+        self.actor_executor_threads_created = self
+            .actor_executor_threads_created
+            .saturating_add(other.actor_executor_threads_created);
         self.component_boundary_bytes = self
             .component_boundary_bytes
             .saturating_add(other.component_boundary_bytes);
@@ -788,6 +802,10 @@ pub enum WasmEntityChange<B> {
     Create {
         schema_key: String,
         local_ref: u64,
+        /// v3 may resolve the host-namespaced primary key before canonical
+        /// validation. v2 leaves this absent and retains keyless semantics
+        /// until create-context materialization.
+        resolved_key: Option<WasmEntityKey>,
         snapshot_content: B,
     },
     Upsert {
@@ -800,7 +818,7 @@ pub enum WasmEntityChange<B> {
 impl<B> WasmEntityChange<B> {
     pub fn entity_key(&self) -> Option<&WasmEntityKey> {
         match self {
-            Self::Create { .. } => None,
+            Self::Create { resolved_key, .. } => resolved_key.as_ref(),
             Self::Upsert { entity, .. } => Some(&entity.key),
             Self::Delete(key) => Some(key),
         }
@@ -1009,6 +1027,10 @@ impl WasmCreateContext {
     }
 
     pub fn component(self, local_ref: u64) -> Result<String, LixError> {
+        Ok(uuid::Uuid::from_bytes(self.component_uuid_bytes(local_ref)?).to_string())
+    }
+
+    pub(crate) fn component_uuid_bytes(self, local_ref: u64) -> Result<[u8; 16], LixError> {
         let local_ref = u32::try_from(local_ref).map_err(|_| {
             invalid_param("v2 create local references must fit in an unsigned 32-bit integer")
         })?;
@@ -1016,7 +1038,7 @@ impl WasmCreateContext {
         bytes[..8].copy_from_slice(&self.high.to_be_bytes());
         bytes[8..12].copy_from_slice(&self.low.to_be_bytes());
         bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
-        Ok(uuid::Uuid::from_bytes(bytes).to_string())
+        Ok(bytes)
     }
 }
 
@@ -1521,6 +1543,24 @@ pub struct WasmFileTransition {
     pub changes: WasmChangeCursorHandle,
 }
 
+/// One immutable, host-validated semantic batch which remains encoded until
+/// storage/query consumption.
+///
+/// This is deliberately format-neutral at the runtime boundary. The format
+/// id selects a registered engine codec; pages retain the guest's bounded
+/// framing and share their backing buffers through transaction commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmCertifiedEntityBatch {
+    pub format: u16,
+    pub schema_keys: Vec<String>,
+    pub row_count: u64,
+    pub creates: WasmCreateContext,
+    /// True when this batch replaces every prior segment for the file.
+    /// Incremental transitions emit sparse overlays instead.
+    pub complete_file_state: bool,
+    pub pages: Vec<Bytes>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmEntityTransition {
     pub transition: WasmTransitionHandle,
@@ -1597,6 +1637,17 @@ pub trait WasmComponentV2Actor: Send {
         cursor: WasmChangeCursorHandle,
         max_bytes: u32,
     ) -> Result<Option<WasmChangePage>, LixError>;
+
+    /// Takes encoded semantic batches accumulated while draining `transition`.
+    ///
+    /// Ordinary v2 actors never produce these. A v3 adapter may return a
+    /// batch only after every bounded page has passed its format validator.
+    fn take_certified_entity_batches(
+        &mut self,
+        _transition: WasmTransitionHandle,
+    ) -> Vec<WasmCertifiedEntityBatch> {
+        Vec::new()
+    }
 
     async fn next_resolution_page(
         &mut self,

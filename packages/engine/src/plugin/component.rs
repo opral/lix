@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
 use crate::common::LixError;
-use crate::wasm::{WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters};
+use crate::wasm::{
+    WASM_COMPONENT_V3_PROTOTYPE_API_VERSION, WasmComponentV2Factory, WasmLimits, WasmRuntime,
+    WasmTransitionCounters,
+};
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
@@ -213,10 +216,15 @@ impl PluginRuntimeHost {
         if let Some(factory) = self.cached_plugin_v2_factory(&plugin.key, plugin.wasm_hash)? {
             return Ok(factory);
         }
-        let compiled = self
-            .wasm_runtime
-            .compile_component_v2(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
-            .await?;
+        let compiled = if plugin.api_version == WASM_COMPONENT_V3_PROTOTYPE_API_VERSION {
+            self.wasm_runtime
+                .compile_component_v3_prototype(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
+                .await?
+        } else {
+            self.wasm_runtime
+                .compile_component_v2(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
+                .await?
+        };
         let mut cache = self
             .plugin_v2_factory_cache
             .lock()

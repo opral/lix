@@ -250,6 +250,12 @@ impl EntityPk {
         })
     }
 
+    pub(crate) const fn uuid_from_bytes(bytes: [u8; 16]) -> Self {
+        Self {
+            components: EntityPkComponents::Single(EntityPkComponent::Uuid(bytes)),
+        }
+    }
+
     pub(crate) fn from_external_parts(
         parts: Vec<String>,
         component_types: &[EntityPkComponentType],
@@ -286,6 +292,47 @@ impl EntityPk {
             return Err(error);
         }
         Self::from_components(components)
+    }
+
+    pub(crate) fn validate_external_parts(
+        parts: &[&str],
+        component_types: &[EntityPkComponentType],
+    ) -> Result<(), EntityPkError> {
+        if parts.is_empty() {
+            return Err(EntityPkError::EmptyPrimaryKey);
+        }
+        if parts.len() != component_types.len() {
+            return Err(EntityPkError::InvalidEncodedEntityPk);
+        }
+        for (index, (part, component_type)) in parts.iter().zip(component_types).enumerate() {
+            match component_type {
+                EntityPkComponentType::Uuid => {
+                    if crate::storage_codec::id_string::uuid_bytes_from_canonical(part).is_none() {
+                        return Err(EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "canonical UUID string",
+                        });
+                    }
+                }
+                EntityPkComponentType::Integer => {
+                    part.parse::<i64>()
+                        .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "integer",
+                        })?;
+                }
+                EntityPkComponentType::String => {}
+                EntityPkComponentType::Bytes => {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(part.as_bytes())
+                        .map_err(|_| EntityPkError::InvalidPrimaryKeyValue {
+                            index,
+                            expected: "base64 string",
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]

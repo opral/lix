@@ -24,6 +24,7 @@ lix_slatedb_storage = { workspace = true, optional = true }
 lix_sqlite_storage = { workspace = true, optional = true }
 
 async-trait = "0.1"
+base64 = "0.22"
 blake3 = { version = "1", optional = true }
 bytes = "1"
 lru = { version = "0.18", optional = true }

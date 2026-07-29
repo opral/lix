@@ -36,11 +36,12 @@ pub(crate) use bind::{
     statement_has_durable_runtime_function,
 };
 pub(crate) use catalog::PublicCatalog;
+pub(crate) use change_materialization::MaterializedChange;
 pub(crate) use context::{
-    ChangelogQuerySource, DiffCommand, DiffCommandOutcome, HistoryQuerySource,
-    SqlChangelogQuerySource, SqlExecutionContext, SqlHistoryQuerySource, SqlWriteContext,
-    SqlWriteExecutionContext, WriteAccess, WriteContextBranchRefReader,
-    WriteContextLiveStateReader,
+    CertifiedHistoryChange, CertifiedHistoryReader, ChangelogQuerySource, DiffCommand,
+    DiffCommandOutcome, HistoryQuerySource, SqlChangelogQuerySource, SqlExecutionContext,
+    SqlHistoryQuerySource, SqlWriteContext, SqlWriteExecutionContext, WriteAccess,
+    WriteContextBranchRefReader, WriteContextLiveStateReader,
 };
 pub(crate) use entity_batch::{CurrentEntitySnapshotReader, EntitySnapshotReader};
 pub(crate) use exec::{SessionReadSqlResult, SqlWriteResult};

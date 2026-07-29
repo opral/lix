@@ -50,6 +50,20 @@ pub trait WasmRuntime: Send + Sync {
         bytes: Vec<u8>,
         limits: WasmLimits,
     ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError>;
+
+    /// Compiles the deliberately incompatible fused Component v3 prototype.
+    /// The returned adapter implements the existing actor trait so transaction
+    /// validation and storage lowering remain unchanged for Prototype A.
+    async fn compile_component_v3_prototype(
+        &self,
+        _bytes: Vec<u8>,
+        _limits: WasmLimits,
+    ) -> Result<Arc<dyn WasmComponentV2Factory>, LixError> {
+        Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "configured WASM runtime does not support the Component v3 prototype",
+        ))
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]

@@ -20,15 +20,16 @@ use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmChangeDrainValidator, WasmChangePage,
-    WasmComponentV2Actor, WasmConflictResolution, WasmConflictResolutionDrainValidator,
-    WasmConflictResolutionPage, WasmConflictTransition, WasmDocumentHandle, WasmEditDrainValidator,
-    WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges,
-    WasmEntityConflict, WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityPage,
-    WasmEntitySource, WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
-    WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
-    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
+    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
+    WasmChangeDrainValidator, WasmChangePage, WasmComponentV2Actor, WasmConflictResolution,
+    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
+    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
+    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
+    WasmEntityConflictSource, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
+    WasmFileTransition, WasmGuestBytes, WasmHostBytes, WasmHostConflictResolution, WasmHostEntity,
+    WasmHostEntityChanges, WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmSourceRange,
+    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    validate_change_cursor_key_uniqueness,
 };
 use crate::{Blob, LixError};
 
@@ -1625,6 +1626,7 @@ fn change_attachment_refs(change: &WasmEntityChange<WasmHostBytes>) -> u32 {
 pub(crate) struct ValidatedFileTransition {
     pub(crate) document: WasmDocumentHandle,
     pub(crate) changes: WasmHostEntityChanges,
+    pub(crate) certified_batches: Vec<WasmCertifiedEntityBatch>,
     pub(crate) counters: WasmTransitionCounters,
 }
 
@@ -1669,6 +1671,264 @@ pub(crate) struct ValidatedEntityTransition {
     #[cfg(test)]
     pub(crate) edits: Vec<ResolvedOutputSplice>,
     pub(crate) counters: WasmTransitionCounters,
+}
+
+fn validate_certified_entity_batches(
+    batches: &[WasmCertifiedEntityBatch],
+    schemas: &V2SchemaAllowlist,
+) -> Result<(), LixError> {
+    for batch in batches {
+        for schema_key in &batch.schema_keys {
+            schemas.validate(schema_key)?;
+        }
+        match batch.format {
+            // Typed CSV is a schema codec: the runtime validates every scalar
+            // field and the engine decoder constructs the fixed row shape.
+            1 if batch.schema_keys.as_slice() == ["csv_v2_row"] => {}
+            2 => validate_certified_snapshot_packets(batch, schemas)?,
+            format => {
+                return Err(invalid_guest(format!(
+                    "unknown certified entity batch format {format}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_certified_snapshot_packets(
+    batch: &WasmCertifiedEntityBatch,
+    schemas: &V2SchemaAllowlist,
+) -> Result<(), LixError> {
+    let mut rows = 0_u64;
+    let mut encountered = BTreeSet::new();
+    let mut markdown_ids = BTreeSet::new();
+    let mut markdown_parent_ids = Vec::new();
+    for page in &batch.pages {
+        let mut page = CertifiedPacketReader::new(page);
+        while !page.finished() {
+            let record_len = page.u32()? as usize;
+            let mut record = CertifiedPacketReader::new(page.bytes(record_len)?);
+            let tag = record.u8()?;
+            let schema_key = record.text()?;
+            schemas.validate(schema_key)?;
+            encountered.insert(schema_key);
+            let normalized = match tag {
+                0 => {
+                    let component_count = record.u32()? as usize;
+                    if component_count == 0 {
+                        return Err(invalid_guest(
+                            "certified packet upsert key has no components",
+                        ));
+                    }
+                    let mut components = smallvec::SmallVec::<[&str; 2]>::new();
+                    for _ in 0..component_count {
+                        components.push(record.text()?);
+                    }
+                    if record.u8()? > 1 {
+                        return Err(invalid_guest("certified packet upsert has invalid effect"));
+                    }
+                    let snapshot = record.inline_blob()?;
+                    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
+                        invalid_guest(format!(
+                            "certified batch schema '{schema_key}' has no validation plan"
+                        ))
+                    })?;
+                    plan.certify_or_normalize_v2_plugin_row_parts(
+                        snapshot,
+                        schema_key,
+                        &components,
+                    )?
+                    .ok_or_else(|| {
+                        invalid_guest(format!(
+                            "certified batch schema '{schema_key}' has no streaming validator"
+                        ))
+                    })?
+                }
+                2 => {
+                    let local_ref = record.u64()?;
+                    let id = batch.creates.component(local_ref)?;
+                    let snapshot = record.inline_blob()?;
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(snapshot).map_err(|error| {
+                            invalid_guest(format!(
+                                "certified create snapshot is invalid JSON: {error}"
+                            ))
+                        })?;
+                    let object = value.as_object_mut().ok_or_else(|| {
+                        invalid_guest("certified create snapshot must be an object")
+                    })?;
+                    if object
+                        .insert("id".to_owned(), serde_json::Value::String(id.clone()))
+                        .is_some()
+                    {
+                        return Err(invalid_guest(
+                            "certified create snapshot already contains its generated id",
+                        ));
+                    }
+                    let markdown_parent_id = if schema_key == "markdown_node_v2" {
+                        if object
+                            .get("parent_id")
+                            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
+                        {
+                            return Err(invalid_guest(
+                                "certified Markdown parent_id must be a string or null",
+                            ));
+                        }
+                        object
+                            .get("parent_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_owned)
+                    } else {
+                        None
+                    };
+                    let snapshot = serde_json::to_vec(&value).map_err(|error| {
+                        invalid_guest(format!(
+                            "certified create snapshot normalization failed: {error}"
+                        ))
+                    })?;
+                    let plan = schemas.schema_plan(schema_key).ok_or_else(|| {
+                        invalid_guest(format!(
+                            "certified batch schema '{schema_key}' has no validation plan"
+                        ))
+                    })?;
+                    if schema_key == "markdown_node_v2" {
+                        if !batch.complete_file_state {
+                            return Err(invalid_guest(
+                                "sparse certified Markdown batches require a durable-base observation",
+                            ));
+                        }
+                        if let Err(errors) = plan.compiled_schema.validate(&value) {
+                            let details = errors
+                                .take(3)
+                                .map(|error| error.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(invalid_guest(format!(
+                                "certified Markdown snapshot failed schema validation: {details}"
+                            )));
+                        }
+                        markdown_ids.insert(id);
+                        markdown_parent_ids.extend(markdown_parent_id);
+                        None
+                    } else {
+                        let key =
+                            crate::wasm::WasmEntityKey::from_owned_parts(schema_key, vec![id]);
+                        plan.certify_or_normalize_v2_plugin_row(&snapshot, &key)?
+                            .ok_or_else(|| {
+                                invalid_guest(format!(
+                                    "certified batch schema '{schema_key}' has no streaming validator"
+                                ))
+                            })?
+                            .normalized
+                    }
+                }
+                _ => {
+                    return Err(invalid_guest(
+                        "certified snapshot packet contains a non-snapshot change",
+                    ));
+                }
+            };
+            record.finish()?;
+            if normalized.is_some() {
+                return Err(invalid_guest(
+                    "certified batch snapshot is not in canonical storage form",
+                ));
+            }
+            rows = rows
+                .checked_add(1)
+                .ok_or_else(|| invalid_guest("certified batch row count overflowed"))?;
+        }
+    }
+    if rows != batch.row_count {
+        return Err(invalid_guest(format!(
+            "certified batch declared {} rows but validated {rows}",
+            batch.row_count
+        )));
+    }
+    if encountered.len() != batch.schema_keys.len()
+        || !batch
+            .schema_keys
+            .iter()
+            .all(|schema_key| encountered.contains(schema_key.as_str()))
+    {
+        return Err(invalid_guest(
+            "certified batch schema header does not match its records",
+        ));
+    }
+    if let Some(parent_id) = markdown_parent_ids
+        .iter()
+        .find(|parent_id| !markdown_ids.contains(parent_id.as_str()))
+    {
+        return Err(invalid_guest(format!(
+            "certified Markdown parent_id '{parent_id}' is absent from the complete batch"
+        )));
+    }
+    Ok(())
+}
+
+struct CertifiedPacketReader<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CertifiedPacketReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn bytes(&mut self, length: usize) -> Result<&'a [u8], LixError> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| invalid_guest("certified packet ended early"))?;
+        let value = &self.bytes[self.offset..end];
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn u8(&mut self) -> Result<u8, LixError> {
+        Ok(self.bytes(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32, LixError> {
+        Ok(u32::from_le_bytes(
+            self.bytes(4)?.try_into().expect("fixed packet u32"),
+        ))
+    }
+
+    fn u64(&mut self) -> Result<u64, LixError> {
+        Ok(u64::from_le_bytes(
+            self.bytes(8)?.try_into().expect("fixed packet u64"),
+        ))
+    }
+
+    fn text(&mut self) -> Result<&'a str, LixError> {
+        let length = self.u32()? as usize;
+        std::str::from_utf8(self.bytes(length)?)
+            .map_err(|error| invalid_guest(format!("certified packet text is invalid: {error}")))
+    }
+
+    fn inline_blob(&mut self) -> Result<&'a [u8], LixError> {
+        if self.u8()? != 0 {
+            return Err(invalid_guest("certified packet snapshot is not inline"));
+        }
+        let length = self.u32()? as usize;
+        self.bytes(length)
+    }
+
+    fn finished(&self) -> bool {
+        self.offset == self.bytes.len()
+    }
+
+    fn finish(&self) -> Result<(), LixError> {
+        if self.finished() {
+            Ok(())
+        } else {
+            Err(invalid_guest("certified packet record has trailing bytes"))
+        }
+    }
 }
 
 /// Drains and validates every change before returning any proposed semantic
@@ -1749,6 +2009,7 @@ async fn drain_file_transition_changes_inner(
                     WasmEntityChange::Create {
                         schema_key,
                         local_ref,
+                        resolved_key,
                         snapshot_content,
                     } => {
                         let snapshot = resolve_guest_bytes(
@@ -1760,12 +2021,16 @@ async fn drain_file_transition_changes_inner(
                             &mut local_counters,
                         )
                         .await?;
-                        let snapshot_row = snapshots.push(&snapshot)?;
+                        let snapshot_row = match &resolved_key {
+                            Some(key) => snapshots.push_plugin(snapshot, key, schemas)?,
+                            None => snapshots.push(&snapshot)?,
+                        };
                         debug_assert_eq!(snapshot_row, page_snapshot_ordinal);
                         page_snapshot_ordinal += 1;
                         WasmEntityChange::Create {
                             schema_key,
                             local_ref,
+                            resolved_key,
                             // Patched with the page-owned canonical row after
                             // every snapshot validates.
                             snapshot_content: WasmHostBytes::Inline(Bytes::new()),
@@ -1837,6 +2102,8 @@ async fn drain_file_transition_changes_inner(
     validate_change_cursor_key_uniqueness(&changes).map_err(|error| {
         invalid_guest(format!("invalid v2 change cursor page: {}", error.message))
     })?;
+    let certified_batches = actor.take_certified_entity_batches(transition.transition);
+    validate_certified_entity_batches(&certified_batches, schemas)?;
     let runtime_counters = actor
         .finish_transition(transition.transition)
         .instrument(tracing::debug_span!(
@@ -1847,6 +2114,7 @@ async fn drain_file_transition_changes_inner(
     Ok(ValidatedFileTransition {
         document: transition.document,
         changes: WasmEntityChanges { changes },
+        certified_batches,
         counters: merge_counter_snapshots(local_counters, runtime_counters),
     })
 }
@@ -2649,6 +2917,10 @@ fn merge_counter_snapshots(
         component_import_calls: local
             .component_import_calls
             .max(runtime.component_import_calls),
+        guest_export_calls: local.guest_export_calls.max(runtime.guest_export_calls),
+        actor_executor_threads_created: local
+            .actor_executor_threads_created
+            .max(runtime.actor_executor_threads_created),
         component_boundary_bytes: local
             .component_boundary_bytes
             .max(runtime.component_boundary_bytes),

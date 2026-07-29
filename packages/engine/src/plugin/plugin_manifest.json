@@ -24,7 +24,7 @@
     },
     "api_version": {
       "type": "string",
-      "const": "2.1.0"
+      "enum": ["2.1.0", "3.0.0"]
     },
     "materialization": {
       "type": "string",
