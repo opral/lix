@@ -106,6 +106,16 @@ ORDER BY lixcol_depth;
 `lix_file_history` and `lix_directory_history` expose logical filesystem
 history. Their storage descriptors are not public SQL relations.
 
+Both follow the same active-head and explicit-anchor convention:
+
+```sql
+lix_file_history()
+lix_file_history($as_of)
+
+lix_directory_history()
+lix_directory_history($as_of)
+```
+
 Use a stable ID to follow an object across renames:
 
 ```sql
