@@ -2890,7 +2890,7 @@ fn join_db_path(db_path: &str, child: &str) -> String {
 
 fn slatedb_settings() -> Settings {
     let mut settings = Settings {
-        compression_codec: Some(CompressionCodec::Lz4),
+        compression_codec: Some(CompressionCodec::Zstd),
         ..Settings::default()
     };
     settings
@@ -3610,10 +3610,10 @@ mod tests {
     }
 
     #[test]
-    fn uses_lz4_compression_by_default() {
+    fn uses_zstd_compression_by_default() {
         assert_eq!(
             slatedb_settings().compression_codec,
-            Some(CompressionCodec::Lz4)
+            Some(CompressionCodec::Zstd)
         );
     }
 
@@ -3886,31 +3886,31 @@ mod tests {
     #[test]
     fn fresh_storage_uses_versioned_segmented_format() {
         let store = Arc::new(InMemory::new());
-        let db_path = "test-lz4-physical-format";
+        let db_path = "test-zstd-physical-format";
         let space = SpaceId(7);
         let storage = SlateDB::open_object_store_with_options(
             db_path,
             store.clone(),
             SlateDBObjectStoreOptions::default(),
         )
-        .expect("open fresh LZ4 storage");
+        .expect("open fresh Zstd storage");
 
         let mut write =
-            block_on(storage.begin_write(WriteOptions::default())).expect("begin LZ4 write");
+            block_on(storage.begin_write(WriteOptions::default())).expect("begin Zstd write");
         block_on(write.put_many(
             space,
             PutBatch {
                 entries: vec![PutEntry {
-                    key: Key(Bytes::from_static(b"lz4-key")),
+                    key: Key(Bytes::from_static(b"zstd-key")),
                     value: StoredValue {
-                        bytes: Bytes::from_static(b"lz4-value"),
+                        bytes: Bytes::from_static(b"zstd-value"),
                     },
                 }],
             },
         ))
-        .expect("stage LZ4 row");
-        block_on(write.commit()).expect("commit LZ4 row");
-        block_on(storage.flush()).expect("flush LZ4 row");
+        .expect("stage Zstd row");
+        block_on(write.commit()).expect("commit Zstd row");
+        block_on(storage.flush()).expect("flush Zstd row");
         block_on(storage.worker.call(move |db| async move {
             db.flush_with_options(FlushOptions {
                 flush_type: FlushType::MemTable,
@@ -3933,12 +3933,12 @@ mod tests {
                     .segments()
                     .iter()
                     .flat_map(|segment| segment.l0())
-                    .any(|view| view.sst.info.compression_codec == Some(CompressionCodec::Lz4)),
-                "new physical SST must record the LZ4 codec"
+                    .any(|view| view.sst.info.compression_codec == Some(CompressionCodec::Zstd)),
+                "new physical SST must record the Zstd codec"
             );
             Ok(())
         }))
-        .expect("flush and inspect LZ4 SST");
+        .expect("flush and inspect Zstd SST");
         drop(storage);
 
         let physical_prefix = format!("{db_path}/{SEGMENTED_FORMAT_PATH}/");
@@ -3948,7 +3948,7 @@ mod tests {
             while let Some(object) = objects.next().await {
                 paths.push(
                     object
-                        .expect("list fresh LZ4 storage object")
+                        .expect("list fresh Zstd storage object")
                         .location
                         .to_string(),
                 );
