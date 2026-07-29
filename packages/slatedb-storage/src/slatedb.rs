@@ -2391,17 +2391,18 @@ impl EncodedBounds {
     fn new(range: KeyRange, resume_after: Option<&Key>) -> Self {
         let range_lower = match range.lower {
             Bound::Included(key) => Bound::Included(key.0.to_vec()),
-            Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
+            Bound::Excluded(key) => Bound::Included(exclusive_successor(&key)),
             Bound::Unbounded => Bound::Unbounded,
         };
         let lower = match resume_after {
-            Some(resume_after) => {
-                max_lower_bound(range_lower, Bound::Excluded(resume_after.0.to_vec()))
-            }
+            Some(resume_after) => max_lower_bound(
+                range_lower,
+                Bound::Included(exclusive_successor(resume_after)),
+            ),
             None => range_lower,
         };
         let upper = match range.upper {
-            Bound::Included(key) => Bound::Included(key.0.to_vec()),
+            Bound::Included(key) => Bound::Excluded(exclusive_successor(&key)),
             Bound::Excluded(key) => Bound::Excluded(key.0.to_vec()),
             Bound::Unbounded => Bound::Unbounded,
         };
@@ -2430,6 +2431,16 @@ impl EncodedBounds {
         };
         above_lower && below_upper
     }
+}
+
+fn exclusive_successor(key: &Key) -> Vec<u8> {
+    // SlateDB scans are half-open. Appending the smallest byte produces the
+    // immediate lexicographic successor, so `> key` becomes `>= key || 0` and
+    // `<= key` becomes `< key || 0` without relying on non-half-open bounds.
+    let mut successor = Vec::with_capacity(key.0.len() + 1);
+    successor.extend_from_slice(&key.0);
+    successor.push(0);
+    successor
 }
 
 async fn get_snapshot_values(
@@ -2937,6 +2948,31 @@ mod tests {
     #[test]
     fn disk_cache_parts_match_scan_read_ahead() {
         assert_eq!(OBJECT_STORE_CACHE_PART_SIZE_BYTES, SCAN_READ_AHEAD_BYTES);
+    }
+
+    #[test]
+    fn encoded_bounds_normalize_to_half_open_ranges() {
+        let key = Key(Bytes::from_static(b"key"));
+        let bounds = EncodedBounds::new(
+            KeyRange {
+                lower: Bound::Excluded(key.clone()),
+                upper: Bound::Included(key.clone()),
+            },
+            None,
+        );
+        let successor = b"key\0".to_vec();
+        assert_eq!(bounds.lower, Bound::Included(successor.clone()));
+        assert_eq!(bounds.upper, Bound::Excluded(successor));
+
+        let bounds = EncodedBounds::new(
+            KeyRange {
+                lower: Bound::Unbounded,
+                upper: Bound::Unbounded,
+            },
+            Some(&key),
+        );
+        assert_eq!(bounds.lower, Bound::Included(b"key\0".to_vec()));
+        assert_eq!(bounds.upper, Bound::Unbounded);
     }
 
     #[test]
