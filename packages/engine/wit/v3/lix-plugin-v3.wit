@@ -1,0 +1,202 @@
+package lix:plugin@3.0.0;
+
+/// Host-owned immutable arenas. Resource handles are capabilities scoped to
+/// one plugin generation; they never expose storage addresses or host memory.
+interface arena {
+  type bytes = list<u8>;
+
+  variant arena-error {
+    invalid-range,
+    record-too-large(u64),
+    limit-exceeded(string),
+    deadline-exceeded,
+    unavailable(string),
+  }
+
+  record limits {
+    max-page-bytes: u32,
+    max-pages: u32,
+    max-total-bytes: u64,
+    deadline-nanoseconds: u64,
+  }
+
+  resource budget {
+    limits: func() -> limits;
+    remaining-nanoseconds: func() -> u64;
+  }
+
+  record page {
+    ordinal: u64,
+    bytes: bytes,
+  }
+
+  record keyed-page {
+    next-key: option<bytes>,
+    entries: list<tuple<bytes, bytes>>,
+  }
+
+  /// One accepted immutable version. The host may evict decoded pages while
+  /// retaining the content-addressed root in durable storage.
+  resource root {
+    generation: func() -> string;
+    file-len: func() -> u64;
+    read-file: func(
+      budget: borrow<budget>,
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, arena-error>;
+    get-entity: func(
+      budget: borrow<budget>,
+      key: bytes,
+    ) -> result<option<bytes>, arena-error>;
+    scan-entities: func(
+      budget: borrow<budget>,
+      after-key: option<bytes>,
+      max-bytes: u32,
+    ) -> result<keyed-page, arena-error>;
+    get-state: func(
+      budget: borrow<budget>,
+      key: bytes,
+    ) -> result<option<bytes>, arena-error>;
+    scan-state: func(
+      budget: borrow<budget>,
+      after-key: option<bytes>,
+      max-bytes: u32,
+    ) -> result<keyed-page, arena-error>;
+  }
+
+  /// Host-staged successor. It is initially a structural alias of `before`
+  /// with the already verified candidate file rope. Guest calls may replace
+  /// only opaque state keys. The host applies validated semantic output to the
+  /// entity arena and publishes all three arenas as one root after every
+  /// output cursor reaches valid EOF. Dropping this resource rolls back.
+  resource transaction {
+    put-state: func(
+      budget: borrow<budget>,
+      key: bytes,
+      value: bytes,
+    ) -> result<_, arena-error>;
+    delete-state: func(key: bytes) -> result<_, arena-error>;
+  }
+}
+
+interface api {
+  use arena.{budget, root, transaction};
+  type bytes = list<u8>;
+
+  variant plugin-error {
+    invalid-input(string),
+    record-too-large(u64),
+    limit-exceeded(string),
+    deadline-exceeded,
+    internal(string),
+  }
+
+  record file-descriptor {
+    path: option<string>,
+    media-type: option<string>,
+    plugin-key: string,
+    generation: string,
+  }
+
+  record source-range {
+    offset: u64,
+    length: u64,
+  }
+
+  variant input-bytes {
+    inline(bytes),
+    after-range(source-range),
+  }
+
+  record input-splice {
+    offset: u64,
+    delete-len: u64,
+    insert: input-bytes,
+  }
+
+  record byte-edit {
+    offset: u64,
+    delete-len: u64,
+    insert: bytes,
+  }
+
+  record entity-change {
+    schema-key: string,
+    entity-pk: list<string>,
+    snapshot: option<bytes>,
+    format-only: bool,
+  }
+
+  resource change-cursor {
+    /// Returns complete sparse changes. `some([])` is invalid; keys are unique
+    /// over the complete cursor and EOF is permanent.
+    next: func(
+      budget: borrow<budget>,
+      max-bytes: u32,
+    ) -> result<option<list<entity-change>>, plugin-error>;
+  }
+
+  resource edit-cursor {
+    /// All coordinates address the immutable accepted base in `root`.
+    next: func(
+      budget: borrow<budget>,
+      max-bytes: u32,
+    ) -> result<option<list<byte-edit>>, plugin-error>;
+  }
+
+  record file-transition {
+    successor: own<transaction>,
+    changes: own<change-cursor>,
+  }
+
+  record entity-transition {
+    successor: own<transaction>,
+    edits: own<edit-cursor>,
+  }
+
+  record open-file-input {
+    descriptor: file-descriptor,
+    accepted: own<root>,
+    successor: own<transaction>,
+  }
+
+  record file-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<root>,
+    edits: list<input-splice>,
+    successor: own<transaction>,
+  }
+
+  record open-entities-input {
+    descriptor: file-descriptor,
+    durable: own<root>,
+    successor: own<transaction>,
+  }
+
+  record entity-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<root>,
+    changed-entity-keys: list<bytes>,
+    successor: own<transaction>,
+  }
+
+  /// v3 has no guest-owned document resource. Every accepted version is a
+  /// host root; every operation returns a transaction that can publish exactly
+  /// one immutable successor after sparse output validation.
+  open-file: func(budget: borrow<budget>, input: open-file-input)
+    -> result<file-transition, plugin-error>;
+  file-changed: func(budget: borrow<budget>, input: file-update)
+    -> result<file-transition, plugin-error>;
+  open-entities: func(budget: borrow<budget>, input: open-entities-input)
+    -> result<entity-transition, plugin-error>;
+  entities-changed: func(budget: borrow<budget>, input: entity-update)
+    -> result<entity-transition, plugin-error>;
+}
+
+world plugin {
+  import arena;
+  export api;
+}

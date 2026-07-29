@@ -12,6 +12,26 @@ pub use core::{
 };
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");
+/// API v3 keeps the existing node schema and top-level semantic granularity.
+/// Only acceleration state moves into host-owned pages.
+pub const V3_ARENA_LAYOUT: lix_plugin_arena::FormatLayout = lix_plugin_arena::FormatLayout {
+    plugin_key: "plugin_markdown_incremental_v2",
+    schema_keys: &["markdown_node_v2"],
+    state_pages: &[
+        lix_plugin_arena::StatePageLayout {
+            kind: "top-level-source-range",
+            target_items: 256,
+        },
+        lix_plugin_arena::StatePageLayout {
+            kind: "top-level-node",
+            target_items: 256,
+        },
+        lix_plugin_arena::StatePageLayout {
+            kind: "identity-index",
+            target_items: 256,
+        },
+    ],
+};
 pub const SCHEMAS: [(&str, &str); 1] = [(
     "schema/markdown_node_v2.json",
     include_str!("../schema/markdown_node_v2.json"),
@@ -19,3 +39,15 @@ pub const SCHEMAS: [(&str, &str); 1] = [(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod arena_layout_tests {
+    #[test]
+    fn v3_layout_retains_the_markdown_schema_and_granularity() {
+        assert!(super::V3_ARENA_LAYOUT.is_valid());
+        assert_eq!(
+            super::V3_ARENA_LAYOUT.schema_keys,
+            &[super::NODE_SCHEMA_KEY]
+        );
+    }
+}

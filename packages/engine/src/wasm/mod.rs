@@ -15,6 +15,17 @@ pub mod v2 {
     pub use super::component_v2::*;
 }
 
+/// Host-owned immutable arena primitives for the Component v3 prototype.
+///
+/// Unlike v2 document handles, these values are independent of a Wasm Store
+/// and remain valid across branch switches, actor eviction, and cold reopen.
+pub mod v3 {
+    pub use lix_plugin_arena::{
+        Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics, Root,
+        StatePageLayout, Store, Transaction,
+    };
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmLimits {
     /// Maximum bytes available to each guest linear memory. With Wasmtime's
