@@ -3477,6 +3477,7 @@ dependencies = [
  "plugin_excalidraw_v2",
  "plugin_git_text_v2",
  "plugin_json_incremental_v2",
+ "plugin_json_incremental_v3",
  "plugin_markdown_incremental_v2",
  "rand 0.9.2",
  "serde_json",
@@ -4327,6 +4328,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "plugin_json_incremental_core"
+version = "0.8.4"
+dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "plugin_json_incremental_v2"
 version = "0.8.4"
 dependencies = [
@@ -4343,7 +4354,7 @@ name = "plugin_json_incremental_v3"
 version = "0.8.4"
 dependencies = [
  "lix_plugin_api_v3",
- "plugin_json_incremental_v2",
+ "plugin_json_incremental_core",
  "serde_json",
 ]
 

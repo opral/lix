@@ -120,12 +120,15 @@ Profile-driven changes were measured independently:
 | 1 MiB scalar locator window | 23.479 ms | 244,397 B | 403 B | 83,066,349 B before eviction accounting | fail |
 | 64 KiB locator + immutable Merkle map pages | 1.348 ms | 16,440 B | 403 B | 7,220,338 B | pass latency/memory |
 
-The accepted row has a 1.001 ms p50 and 1.348 ms p95. Against the stricter
-5.500 ms v2 engine control it is **4.080× faster**. Its resident owned payload
-is 6,040,690 host bytes plus 1,179,648 bytes of guest linear-memory high water,
-or 7,220,338 bytes total: **5.147× less** than the conservative 37,158,912-byte
-v2 total. Logical durable content is reported separately as 27,041,487 bytes;
-immutable backing is compressed while decoded pages are evictable.
+The 2,000-sample runtime row has a 1.001 ms p50 and 1.348 ms p95. Against the
+stricter 5.500 ms v2 engine control it is **4.080× faster**. A separate
+counting-allocator run (100 warmups, 200 measured samples) reported 1.022 ms
+p50 / 1.240 ms p95, 6,040,690 resident host bytes, 1,179,648 bytes of guest
+linear-memory high water, and an 82,267-byte p95 transient live-allocation
+delta. That is 7,302,605 peak owned bytes: **5.088× less** than the conservative
+37,158,912-byte v2 total. Logical durable content is reported separately as
+27,041,487 bytes; immutable backing is compressed while decoded pages are
+evictable.
 
 The hot JSON boundary is not yet an acceptance win: 16,440 bytes is larger than
 v2's already-sparse 418-byte retained-document transition. It is 977× smaller
@@ -144,6 +147,10 @@ Reproduction:
 ```sh
 cargo test -p lix_sdk --lib \
   json_v3_ten_mib_affected_page_benchmark \
+  --release -- --ignored --nocapture
+
+cargo test -p lix_sdk_tests --test e2e \
+  v3_json_ten_mib_affected_page_allocator_benchmark \
   --release -- --ignored --nocapture
 ```
 
@@ -166,7 +173,7 @@ Every row is an independent pass/fail gate. “Pending” is not a pass.
 
 | format | workload | v2 p95/control | required v3 p95 | conservative v2 total memory | required v3 total memory |
 | --- | --- | ---: | ---: | ---: | ---: |
-| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms; actual 1.348 ms | 37,158,912 B | ≤12,386,304 B; actual 7,220,338 B |
+| JSON | 10 MiB verified-splice warm scalar edit | 5.500 ms control | ≤2.750 ms; actual 1.348 ms | 37,158,912 B | ≤12,386,304 B; allocator-backed actual 7,302,605 B |
 | JSON | 10 MiB ordinary public-SQL warm scalar edit | 8.602 ms p95 | ≤4.301 ms | 37,158,912 B | ≤12,386,304 B |
 | Markdown | `vscode-docs` one-commit replay | 9.220 s | ≤4.610 s | ≥105,643,782 B | ≤35,214,594 B |
 | CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |

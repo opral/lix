@@ -19,6 +19,7 @@ plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib"
 plugin_markdown_incremental_v2 = { path = "../../plugins/markdown-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw_v2 = { path = "../../plugins/excalidraw-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_json_incremental_v2 = { path = "../../plugins/json-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
+plugin_json_incremental_v3 = { path = "../../plugins/json-v3", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_git_text_v2 = { path = "../../plugins/text-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 
 async-trait = "0.1"

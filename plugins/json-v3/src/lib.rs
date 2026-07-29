@@ -8,7 +8,7 @@
 #![cfg_attr(not(target_family = "wasm"), allow(dead_code))]
 
 use lix_plugin_api_v3 as sdk;
-use plugin_json_incremental_v2::{
+use plugin_json_incremental_core::{
     ByteEdit as CoreByteEdit, ChangeEffect as CoreChangeEffect, Document as CoreDocument,
     EntityChange as CoreEntityChange, EntityRecord as CoreEntityRecord, IdNamespace,
     InputSplice as CoreInputSplice, V3ScalarIndexRecord,

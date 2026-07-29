@@ -1,9 +1,9 @@
 [package]
-name = "plugin_json_incremental_v3"
+name = "plugin_json_incremental_core"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
-description = "JSON plugin for the host-owned Lix Wasm Component v3 arena API"
+description = "ABI-neutral recursive stable-identity JSON semantic core"
 license.workspace = true
 homepage.workspace = true
 repository.workspace = true
@@ -15,10 +15,8 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[lib]
-crate-type = ["cdylib", "rlib"]
-
 [dependencies]
-lix_plugin_api_v3 = { workspace = true }
-plugin_json_incremental_core = { path = "../json-core", version = "0.8.4" }
-serde_json = "1"
+base64 = "0.22"
+blake3 = "1"
+serde_json = { version = "1", features = ["raw_value"] }
+uuid = { version = "1", features = ["std"] }
