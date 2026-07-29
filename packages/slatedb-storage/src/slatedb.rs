@@ -31,8 +31,9 @@ use object_store::{
     PutOptions, PutPayload, PutResult,
 };
 use slatedb::config::{
-    CompressionCodec, DurabilityLevel, ObjectStoreCacheOptions, ReadOptions as SlateDBReadOptions,
-    ScanOptions as SlateDBScanOptions, Settings, WriteOptions as SlateDBWriteOptions,
+    CompressionCodec, DurabilityLevel, FlushOptions, FlushType, ObjectStoreCacheOptions,
+    ReadOptions as SlateDBReadOptions, ScanOptions as SlateDBScanOptions, Settings,
+    WriteOptions as SlateDBWriteOptions,
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
@@ -982,6 +983,27 @@ impl SlateDB {
         self.write_pipeline.wait_for_visible().await?;
         self.worker
             .call(|db| async move { db.flush().await.map_err(slatedb_error) })
+            .await
+    }
+
+    /// Forces the active and immutable memtables into SSTs for storage-layout
+    /// diagnostics.
+    ///
+    /// [`Self::flush`] intentionally follows upstream durability semantics and
+    /// flushes only the WAL while WAL is enabled. Benchmarks must opt into this
+    /// stronger lifecycle boundary when comparing memory-resident and SST
+    /// scan shapes.
+    #[doc(hidden)]
+    pub async fn flush_memtable_for_diagnostics(&self) -> Result<(), StorageError> {
+        self.write_pipeline.wait_for_visible().await?;
+        self.worker
+            .call(|db| async move {
+                db.flush_with_options(FlushOptions {
+                    flush_type: FlushType::MemTable,
+                })
+                .await
+                .map_err(slatedb_error)
+            })
             .await
     }
 }

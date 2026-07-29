@@ -6,8 +6,8 @@ use crate::storage_adapter::{
     StorageWriteSetStats,
 };
 use crate::tracked_state::{
-    TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey,
-    TrackedStateReadColumns, TrackedStateScanRequest,
+    TrackedStateCommitDeltaRef, TrackedStateContext, TrackedStateDeltaRef, TrackedStateFilter,
+    TrackedStateKey, TrackedStateReadColumns, TrackedStateScanRequest,
 };
 
 #[derive(Clone, Debug)]
@@ -47,6 +47,168 @@ pub struct BenchLayoutAccounting {
     pub rows: u64,
     pub key_bytes: u64,
     pub value_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BenchPackedHistoryAccounting {
+    pub changes: usize,
+    pub commits: usize,
+    pub staged_puts: u64,
+    pub written_bytes: u64,
+}
+
+/// Seeds the authoritative packed-history plane without commit headers, roots,
+/// or live-state indexes.
+///
+/// This deliberately isolates the physical packed scan from public commit
+/// facts and live-state work. `storage_batch_changes` controls only how many
+/// logical changes share one backend transaction; it does not change the
+/// commit-delta layout.
+pub async fn seed_packed_history<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+    changes: usize,
+    commit_width: usize,
+    storage_batch_changes: usize,
+) -> BenchPackedHistoryAccounting
+where
+    StorageImpl: Storage,
+{
+    assert!(changes > 0, "packed-history changes must be positive");
+    assert!(
+        commit_width > 0,
+        "packed-history commit width must be positive"
+    );
+    assert!(
+        changes.is_multiple_of(commit_width),
+        "packed-history changes must divide evenly by commit width"
+    );
+    assert!(
+        storage_batch_changes >= commit_width,
+        "storage batch must hold at least one logical commit"
+    );
+
+    let commits = changes / commit_width;
+    let commits_per_storage_batch = (storage_batch_changes / commit_width).max(1);
+    let mut staged_puts = 0;
+    let mut written_bytes = 0;
+    for commit_batch_start in (0..commits).step_by(commits_per_storage_batch) {
+        let commit_batch_end = (commit_batch_start + commits_per_storage_batch).min(commits);
+        let mut writes = storage.new_write_set();
+        for commit_index in commit_batch_start..commit_batch_end {
+            let owned = (0..commit_width)
+                .map(|row_index| PackedHistoryDelta::new(commit_index, row_index))
+                .collect::<Vec<_>>();
+            let deltas = owned
+                .iter()
+                .map(PackedHistoryDelta::as_commit_ref)
+                .collect::<Vec<_>>();
+            super::storage::stage_commit_deltas(&mut writes, &deltas)
+                .expect("stage packed-history commit delta");
+        }
+        let (_commit, stats) = storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit packed-history storage batch");
+        staged_puts += stats.staged_puts;
+        written_bytes += stats.written_bytes;
+    }
+    BenchPackedHistoryAccounting {
+        changes,
+        commits,
+        staged_puts,
+        written_bytes,
+    }
+}
+
+pub async fn scan_packed_history<StorageImpl>(storage: &StorageAdapter<StorageImpl>) -> usize
+where
+    StorageImpl: Storage,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin packed-history scan"),
+    );
+    super::storage::scan_change_records_from_commit_deltas(&read)
+        .await
+        .expect("scan packed history")
+        .len()
+}
+
+pub async fn packed_history_layout<StorageImpl>(
+    storage: &StorageAdapter<StorageImpl>,
+) -> Vec<BenchLayoutAccounting>
+where
+    StorageImpl: Storage,
+{
+    let read = SharedStorageAdapterRead::new(
+        storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("begin packed-history layout scan"),
+    );
+    crate::storage_bench::layout_accounting(&read)
+        .await
+        .into_iter()
+        .map(|space| BenchLayoutAccounting {
+            space_id: space.space_id,
+            space: space.space,
+            rows: space.rows,
+            key_bytes: space.key_bytes,
+            value_bytes: space.value_bytes,
+        })
+        .collect()
+}
+
+struct PackedHistoryDelta {
+    change_id: ChangeId,
+    commit_id: CommitId,
+    entity_pk: EntityPk,
+    schema_key: String,
+    created_at: crate::common::LixTimestamp,
+    updated_at: crate::common::LixTimestamp,
+}
+
+impl PackedHistoryDelta {
+    fn new(commit_index: usize, row_index: usize) -> Self {
+        Self {
+            change_id: ChangeId::for_test_label(&format!(
+                "packed-history-change-{commit_index}-{row_index}"
+            )),
+            commit_id: CommitId::for_test_label(&format!("packed-history-commit-{commit_index}")),
+            entity_pk: EntityPk::single(format!(
+                "packed-history-entity-{commit_index}-{row_index}"
+            )),
+            schema_key: "packed_history".to_string(),
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "created_at",
+                "2026-07-28T00:00:00.000Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "updated_at",
+                "2026-07-28T00:00:00.000Z",
+            ),
+        }
+    }
+
+    fn as_commit_ref(&self) -> TrackedStateCommitDeltaRef<'_> {
+        TrackedStateCommitDeltaRef {
+            delta: TrackedStateDeltaRef {
+                schema_key: &self.schema_key,
+                file_id: None,
+                entity_pk: &self.entity_pk,
+                change_id: self.change_id,
+                commit_id: self.commit_id,
+                deleted: false,
+                created_at: self.created_at,
+                updated_at: self.updated_at,
+            },
+            snapshot: crate::json_store::JsonSlotRef::None,
+            metadata: crate::json_store::JsonSlotRef::None,
+            origin_key: None,
+        }
+    }
 }
 
 struct BenchWriteOutcome {
