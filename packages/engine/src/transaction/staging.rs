@@ -84,12 +84,17 @@ struct StagedScanFileCandidates {
 /// candidate can legitimately have multiple such physical rows while staged.
 #[derive(Default)]
 struct StagedScanCandidateIndex {
+    slots_by_schema: HashMap<SharedStr, SmallVec<[RowSlot; 1]>>,
     slots_by_schema_and_entity: HashMap<SharedStr, HashMap<EntityPk, SmallVec<[RowSlot; 1]>>>,
     slots_by_schema_and_file: HashMap<SharedStr, StagedScanFileCandidates>,
 }
 
 impl StagedScanCandidateIndex {
     fn insert(&mut self, row: PreparedStateRowRef<'_>, slot: RowSlot) {
+        self.slots_by_schema
+            .entry(row.schema_key.clone())
+            .or_default()
+            .push(slot);
         self.slots_by_schema_and_entity
             .entry(row.schema_key.clone())
             .or_default()
@@ -160,7 +165,24 @@ impl StagedScanCandidateIndex {
                 .iter()
                 .any(|file_id| matches!(file_id, NullableKeyFilter::Any))
         {
-            return None;
+            if let [schema_key] = filter.schema_keys.as_slice() {
+                return Some(Cow::Borrowed(
+                    self.slots_by_schema
+                        .get(schema_key.as_str())
+                        .map(SmallVec::as_slice)
+                        .unwrap_or(&[]),
+                ));
+            }
+
+            let mut slots = Vec::new();
+            for schema_key in &filter.schema_keys {
+                if let Some(candidate_slots) = self.slots_by_schema.get(schema_key.as_str()) {
+                    slots.extend(candidate_slots.iter().copied());
+                }
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            return Some(Cow::Owned(slots));
         }
 
         if let ([schema_key], [file_id]) =
@@ -3634,7 +3656,7 @@ mod tests {
     }
 
     #[test]
-    fn file_staged_scan_indexes_null_and_declines_any_filter() {
+    fn file_staged_scan_indexes_null_and_uses_schema_candidates_for_any_filter() {
         let mut index = StagedScanCandidateIndex::default();
         index.insert(state_row("null", "one").borrowed(), RowSlot::State(4));
         index.insert(
@@ -3657,10 +3679,40 @@ mod tests {
             file_ids: vec![NullableKeyFilter::Any],
             ..LiveStateFilter::default()
         };
-        assert!(
-            index.slots_for_filter(&any_filter).is_none(),
-            "an Any file filter must retain the complete staged scan"
+        let Some(Cow::Borrowed(any_slots)) = index.slots_for_filter(&any_filter) else {
+            panic!("an Any file filter should use schema candidates");
+        };
+        assert_eq!(
+            any_slots,
+            &[RowSlot::State(4), RowSlot::State(9)],
+            "the established matcher still applies the Any file predicate"
         );
+    }
+
+    #[test]
+    fn schema_staged_scan_deduplicates_multi_schema_candidates_by_slot_order() {
+        let mut index = StagedScanCandidateIndex::default();
+        index.insert(state_row("first", "one").borrowed(), RowSlot::State(4));
+        index.insert(
+            state_row("second", "two")
+                .with_schema("other_schema")
+                .borrowed(),
+            RowSlot::State(9),
+        );
+
+        let filter = LiveStateFilter {
+            schema_keys: vec![
+                "other_schema".to_string(),
+                "lix_key_value".to_string(),
+                "lix_key_value".to_string(),
+            ],
+            ..LiveStateFilter::default()
+        };
+        let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
+            panic!("multi-schema filter should use the candidate index");
+        };
+
+        assert_eq!(slots, vec![RowSlot::State(4), RowSlot::State(9)]);
     }
 
     #[test]
