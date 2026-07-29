@@ -394,7 +394,6 @@ impl TinyRng {
         self.state
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn usize(&mut self, upper: usize) -> usize {
         // The low bits of an LCG have short, predictable cycles. Draw from the
         // upper half so consecutive power-of-two choices (notably range-bound
