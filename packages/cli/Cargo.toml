@@ -36,7 +36,7 @@ comfy-table = "7.1"
 base64 = "0.22"
 bytes = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread"] }
 zip = { version = "8", default-features = false }
 uuid = { version = "1", features = ["v5", "std"] }
 

@@ -72,13 +72,20 @@ pub(crate) enum RowSlot {
     State(usize),
 }
 
-/// Narrows exact entity scans over an indexed transaction overlay without
-/// changing the journal's identity/coalescing semantics. A file id, branch,
-/// and durability remain post-filter checks because one logical entity can
-/// legitimately have multiple such physical rows while it is staged.
+#[derive(Default)]
+struct StagedScanFileCandidates {
+    slots_by_value: HashMap<SharedStr, SmallVec<[RowSlot; 1]>>,
+    null_slots: SmallVec<[RowSlot; 1]>,
+}
+
+/// Narrows entity- or file-constrained scans over an indexed transaction
+/// overlay without changing the journal's identity/coalescing semantics.
+/// Branch and durability remain post-filter checks because one indexed
+/// candidate can legitimately have multiple such physical rows while staged.
 #[derive(Default)]
 struct StagedScanCandidateIndex {
     slots_by_schema_and_entity: HashMap<SharedStr, HashMap<EntityPk, SmallVec<[RowSlot; 1]>>>,
+    slots_by_schema_and_file: HashMap<SharedStr, StagedScanFileCandidates>,
 }
 
 impl StagedScanCandidateIndex {
@@ -89,39 +96,109 @@ impl StagedScanCandidateIndex {
             .entry(row.entity_pk.clone())
             .or_default()
             .push(slot);
+
+        let by_file = self
+            .slots_by_schema_and_file
+            .entry(row.schema_key.clone())
+            .or_default();
+        if let Some(file_id) = row.file_id {
+            by_file
+                .slots_by_value
+                .entry(file_id.clone())
+                .or_default()
+                .push(slot);
+        } else {
+            by_file.null_slots.push(slot);
+        }
     }
 
     /// Returns a strict superset of the staged rows a scan can observe when
-    /// both identity dimensions are constrained. The remaining scan filters
-    /// are deliberately applied by the established matcher afterwards.
+    /// schema plus either entity or file identity are constrained. The
+    /// remaining scan filters are deliberately applied by the established
+    /// matcher afterwards.
     fn slots_for_filter<'a>(
         &'a self,
         filter: &crate::live_state::LiveStateFilter,
     ) -> Option<Cow<'a, [RowSlot]>> {
-        if filter.schema_keys.is_empty() || filter.entity_pks.is_empty() {
+        if filter.schema_keys.is_empty() {
             return None;
         }
 
-        if let ([schema_key], [entity_pk]) =
-            (filter.schema_keys.as_slice(), filter.entity_pks.as_slice())
+        if !filter.entity_pks.is_empty() {
+            if let ([schema_key], [entity_pk]) =
+                (filter.schema_keys.as_slice(), filter.entity_pks.as_slice())
+            {
+                let slots = self
+                    .slots_by_schema_and_entity
+                    .get(schema_key.as_str())
+                    .and_then(|by_entity| by_entity.get(entity_pk))
+                    .map(SmallVec::as_slice)
+                    .unwrap_or(&[]);
+                return Some(Cow::Borrowed(slots));
+            }
+
+            let mut slots = Vec::new();
+            for schema_key in &filter.schema_keys {
+                let Some(by_entity) = self.slots_by_schema_and_entity.get(schema_key.as_str())
+                else {
+                    continue;
+                };
+                for entity_pk in &filter.entity_pks {
+                    if let Some(candidate_slots) = by_entity.get(entity_pk) {
+                        slots.extend(candidate_slots.iter().copied());
+                    }
+                }
+            }
+            slots.sort_unstable();
+            slots.dedup();
+            return Some(Cow::Owned(slots));
+        }
+
+        if filter.file_ids.is_empty()
+            || filter
+                .file_ids
+                .iter()
+                .any(|file_id| matches!(file_id, NullableKeyFilter::Any))
+        {
+            return None;
+        }
+
+        if let ([schema_key], [file_id]) =
+            (filter.schema_keys.as_slice(), filter.file_ids.as_slice())
         {
             let slots = self
-                .slots_by_schema_and_entity
+                .slots_by_schema_and_file
                 .get(schema_key.as_str())
-                .and_then(|by_entity| by_entity.get(entity_pk))
-                .map(SmallVec::as_slice)
+                .map(|by_file| match file_id {
+                    NullableKeyFilter::Null => by_file.null_slots.as_slice(),
+                    NullableKeyFilter::Value(file_id) => by_file
+                        .slots_by_value
+                        .get(file_id.as_str())
+                        .map(SmallVec::as_slice)
+                        .unwrap_or(&[]),
+                    NullableKeyFilter::Any => unreachable!("handled above"),
+                })
                 .unwrap_or(&[]);
             return Some(Cow::Borrowed(slots));
         }
 
         let mut slots = Vec::new();
         for schema_key in &filter.schema_keys {
-            let Some(by_entity) = self.slots_by_schema_and_entity.get(schema_key.as_str()) else {
+            let Some(by_file) = self.slots_by_schema_and_file.get(schema_key.as_str()) else {
                 continue;
             };
-            for entity_pk in &filter.entity_pks {
-                if let Some(candidate_slots) = by_entity.get(entity_pk) {
-                    slots.extend(candidate_slots.iter().copied());
+            for file_id in &filter.file_ids {
+                match file_id {
+                    NullableKeyFilter::Null => {
+                        slots.extend(by_file.null_slots.iter().copied());
+                    }
+                    NullableKeyFilter::Value(file_id) => {
+                        if let Some(candidate_slots) = by_file.slots_by_value.get(file_id.as_str())
+                        {
+                            slots.extend(candidate_slots.iter().copied());
+                        }
+                    }
+                    NullableKeyFilter::Any => unreachable!("handled above"),
                 }
             }
         }
@@ -3452,6 +3529,58 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn staging_overlay_file_scan_uses_file_candidates_before_final_matching() {
+        let staged_writes = test_staged_writes();
+        staged_writes
+            .stage_write(PreparedTransactionWrite::Rows {
+                mode: TransactionWriteMode::Replace,
+                rows: prepared_rows![
+                    state_row("global", "selected").with_file_id("selected-file"),
+                    state_row("active", "selected")
+                        .with_file_id("selected-file")
+                        .with_branch("01920000-0000-7000-8000-0000000000a1"),
+                    state_row("other-file", "ignored")
+                        .with_file_id("01920000-0000-7000-8000-0000000000a2"),
+                    state_row("other-schema", "ignored")
+                        .with_schema("other_schema")
+                        .with_file_id("selected-file"),
+                ],
+            })
+            .expect("rows should stage");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let rows = overlay
+            .scan_parts(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    branch_ids: vec!["01920000-0000-7000-8000-0000000000a1".to_string()],
+                    file_ids: vec![NullableKeyFilter::Value("selected-file".to_string())],
+                    include_tombstones: true,
+                    ..LiveStateFilter::default()
+                },
+                ..LiveStateScanRequest::default()
+            })
+            .expect("file scan should succeed")
+            .rows;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "active and global fallback both remain candidates"
+        );
+        assert!(rows.iter().all(|row| {
+            row.schema_key == "lix_key_value"
+                && row.file_id.as_deref() == Some("selected-file")
+                && matches!(
+                    row.branch_id.as_ref(),
+                    "01920000-0000-7000-8000-0000000000a1" | GLOBAL_BRANCH_ID
+                )
+        }));
+    }
+
     #[test]
     fn keyed_staged_scan_deduplicates_multi_key_candidates_by_slot_order() {
         let mut index = StagedScanCandidateIndex::default();
@@ -3475,6 +3604,66 @@ mod tests {
     }
 
     #[test]
+    fn file_staged_scan_deduplicates_multi_key_candidates_by_slot_order() {
+        let mut index = StagedScanCandidateIndex::default();
+        index.insert(
+            state_row("first", "one")
+                .with_file_id("selected")
+                .borrowed(),
+            RowSlot::State(4),
+        );
+        index.insert(
+            state_row("second", "two").with_file_id("other").borrowed(),
+            RowSlot::State(9),
+        );
+
+        let filter = LiveStateFilter {
+            schema_keys: vec!["lix_key_value".to_string(), "lix_key_value".to_string()],
+            file_ids: vec![
+                NullableKeyFilter::Value("other".to_string()),
+                NullableKeyFilter::Value("selected".to_string()),
+                NullableKeyFilter::Value("selected".to_string()),
+            ],
+            ..LiveStateFilter::default()
+        };
+        let Some(Cow::Owned(slots)) = index.slots_for_filter(&filter) else {
+            panic!("multi-key file filter should use the candidate index");
+        };
+
+        assert_eq!(slots, vec![RowSlot::State(4), RowSlot::State(9)]);
+    }
+
+    #[test]
+    fn file_staged_scan_indexes_null_and_declines_any_filter() {
+        let mut index = StagedScanCandidateIndex::default();
+        index.insert(state_row("null", "one").borrowed(), RowSlot::State(4));
+        index.insert(
+            state_row("file", "two").with_file_id("selected").borrowed(),
+            RowSlot::State(9),
+        );
+
+        let null_filter = LiveStateFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            file_ids: vec![NullableKeyFilter::Null],
+            ..LiveStateFilter::default()
+        };
+        let Some(Cow::Borrowed(null_slots)) = index.slots_for_filter(&null_filter) else {
+            panic!("single null file filter should borrow indexed candidates");
+        };
+        assert_eq!(null_slots, &[RowSlot::State(4)]);
+
+        let any_filter = LiveStateFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            file_ids: vec![NullableKeyFilter::Any],
+            ..LiveStateFilter::default()
+        };
+        assert!(
+            index.slots_for_filter(&any_filter).is_none(),
+            "an Any file filter must retain the complete staged scan"
+        );
+    }
+
+    #[test]
     fn keyed_staged_scan_keeps_the_common_single_slot_inline() {
         let row = state_row("single", "value");
         let mut index = StagedScanCandidateIndex::default();
@@ -3489,6 +3678,17 @@ mod tests {
         assert!(
             !slots.spilled(),
             "one exact-read candidate must not allocate a row-local slot buffer"
+        );
+
+        let file_slots = index
+            .slots_by_schema_and_file
+            .get(row.schema_key.as_str())
+            .and_then(|by_file| by_file.null_slots.first().map(|_| &by_file.null_slots))
+            .expect("indexed null file should retain its candidate slot");
+        assert_eq!(file_slots.as_slice(), &[RowSlot::State(7)]);
+        assert!(
+            !file_slots.spilled(),
+            "one file candidate must not allocate a row-local slot buffer"
         );
     }
 

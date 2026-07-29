@@ -177,6 +177,10 @@ impl PluginRuntimeHost {
         self.plugin_actor_cache.clone()
     }
 
+    pub(crate) fn max_live_plugin_stores(&self) -> usize {
+        self.plugin_actor_cache.capacity()
+    }
+
     /// Aggregates validated guest work and host-owned lifecycle facts.
     /// Poison recovery is deliberate: diagnostics must not fail a transaction.
     pub(crate) fn record_v2_transition_counters(&self, counters: WasmTransitionCounters) {
