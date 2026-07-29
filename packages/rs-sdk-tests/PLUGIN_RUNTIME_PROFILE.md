@@ -301,17 +301,28 @@ rows:
 | lane | p50 | p95 | host allocation | peak host allocation | exports / imports | guest high water |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Markdown v2 cursor | 883.3 ms | 947.1 ms | 32.2 MB | 11.2 MB | 3 / 0 | 102.4 MB |
-| Markdown v3 push | 900.2 ms | 918.4 ms | 174.7 MB | 21.0 MB | 1 / 1 | 102.4 MB |
+| Markdown v3 push, full parse | 912.0 ms | 951.1 ms | 136.2 MB | 21.0 MB | 1 / 1 | 102.4 MB |
+| Markdown v3 push, local subtree | 42.8 ms | 60.8 ms | 136.2 MB | 21.0 MB | 1 / 1 | 56.8 MB |
 
-The fused transition therefore fails Prototype A's acceptance gate for this
-workload. Guest re-entry falls from three exports to one, but guest high-water
-memory and boundary bytes are unchanged. The Markdown parser/reconciler owns
-the runtime, while validation of the immutable opening segment amplifies host
-bytes. A read-facade cache experiment made this worse—1,225.7 ms, 710.3 MB
-cumulative allocation, and 44.7 MB peak—because the cache owner was shorter
-lived than the validation sequence and repeatedly hydrated the full segment.
-It was removed. Reuse must be transaction-scoped, or queries/validation must
-consume the encoded segment directly.
+The fused transition alone therefore failed Prototype A's acceptance gate.
+The exact repository transition changes only `DateApproved` inside the first
+frontmatter block: four source bytes become three while 1,237,730 trailing
+bytes remain identical. The paragraph-only fast path rejected that edit and
+the document's exact-byte lexical fallback, forcing a full parse and stable
+render of the entire file.
+
+The persistent Markdown tree now stores sparse complete top-level subtree
+overrides rather than node-only overrides. A single edit fully contained in
+one block parses and reconciles only that block, retains the untouched base
+tree, shifts later source ranges, and updates the exact-byte fallback directly
+from the piece table. Edits crossing block or line boundaries still take the
+full parser. This makes the measured transition 21.3x faster and reduces guest
+high water by 45.6 MB without changing its two durable semantic changes.
+
+A read-facade cache experiment had made the old full-parse path worse—1,225.7
+ms, 710.3 MB cumulative allocation, and 44.7 MB peak—because the cache owner
+was shorter lived than the validation sequence and repeatedly hydrated the
+full segment. It remains removed.
 
 A generated 1.849 MB Excalidraw document with 20,000 elements changes one
 element:
@@ -319,7 +330,7 @@ element:
 | lane | p50 | host allocation | peak host allocation | exports / imports | guest high water |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Excalidraw v2 cursor | 229.7 ms | 5.0 MB | 3.0 MB | 3 / 0 | 42.1 MB |
-| Excalidraw v3 push | 237.5 ms | 73.4 MB | 7.7 MB | 1 / 1 | 41.8 MB |
+| Excalidraw v3 push | 217.5 ms | 38.8 MB | 7.7 MB | 1 / 1 | 41.8 MB |
 
 Heaptrack shows repeated certified-segment consumption on the semantic read
 path. Stable-primary-key packets now retain their already-certified canonical
@@ -329,15 +340,19 @@ the large v3 import actor is evicted, so its successor reconstructs the prior
 20,000-element document. This is a concrete cross-format acceptance case for
 `apply-cold-successor`, not for more cursor tuning.
 
-Current one-sample verification after the sparse-overlay policy:
+Current five-sample verification after the sparse-overlay and localized
+Markdown policies:
 
-| workload | v2 | v3 | v3 peak host allocation | result |
-| --- | ---: | ---: | ---: | --- |
-| CSV, 10.68 MiB / 220,001 changes | 5.227 s baseline | 168.2 ms | 36.2 MB | 31.1x |
-| JSON, 10 MiB / 39,871 changes | 738.6 ms | 244.9 ms | 45.6 MB | 3.02x |
+| workload | v3 p50 | v3 p95 | peak host allocation | guest high water |
+| --- | ---: | ---: | ---: | ---: |
+| CSV, 10.68 MiB / 220,001 entities | 127.7 ms | 164.2 ms | 36.1 MB | 41.2 MB |
+| JSON, 10 MiB / 39,871 entities | 237.8 ms | 250.7 ms | 45.5 MB | 29.8 MB |
+| Markdown, 1.24 MiB / 3,808 entities | 42.8 ms | 60.8 ms | 21.0 MB | 56.8 MB |
+| Excalidraw, 1.85 MiB / 20,000 entities | 217.5 ms | 226.1 ms | 7.7 MB | 41.8 MB |
 
-Both bulk lanes use one guest export, bounded pages, exact byte and semantic
-checks, history where applicable, and RocksDB reopen. CSV creates no per-row
+All four lanes remain Wasm components. They use one guest export and bounded
+push pages, preserve exact file bytes and semantic cardinality, and retain the
+format-specific history and RocksDB reopen checks. CSV creates no per-row
 history segments or locator records before hot publication.
 
 ## Reproduction
