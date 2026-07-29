@@ -17,6 +17,47 @@ use std::ops::Range;
 use std::sync::Arc;
 
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
+pub const REQUIRED_V3_SPEEDUP: u64 = 2;
+pub const REQUIRED_V3_MEMORY_REDUCTION: u64 = 3;
+
+/// One end-to-end benchmark lane. `peak_total_bytes` must include host live
+/// ownership, guest linear-memory high water, and transient materialization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PerformanceMeasurement {
+    pub p95_nanoseconds: u64,
+    pub peak_total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Acceptance {
+    pub latency_passes: bool,
+    pub memory_passes: bool,
+}
+
+impl Acceptance {
+    pub const fn passes(self) -> bool {
+        self.latency_passes && self.memory_passes
+    }
+}
+
+/// Applies the non-negotiable API v3 performance gate without floating-point
+/// rounding: v3 must be at least 2× faster and consume at least 3× less total
+/// peak memory than the matching v2 lane.
+pub const fn compare_to_v2(v2: PerformanceMeasurement, v3: PerformanceMeasurement) -> Acceptance {
+    Acceptance {
+        latency_passes: match v3.p95_nanoseconds.checked_mul(REQUIRED_V3_SPEEDUP) {
+            Some(scaled) => scaled <= v2.p95_nanoseconds,
+            None => false,
+        },
+        memory_passes: match v3
+            .peak_total_bytes
+            .checked_mul(REQUIRED_V3_MEMORY_REDUCTION)
+        {
+            Some(scaled) => scaled <= v2.peak_total_bytes,
+            None => false,
+        },
+    }
+}
 
 /// Format-owned paging policy. These declarations live with each plugin so a
 /// schema or semantic boundary cannot silently drift into host infrastructure.
@@ -967,6 +1008,50 @@ mod tests {
                 }],
             })
             .is_valid()
+        );
+    }
+
+    #[test]
+    fn hard_performance_gate_requires_both_two_x_speed_and_three_x_memory() {
+        let v2 = PerformanceMeasurement {
+            p95_nanoseconds: 6_000_000,
+            peak_total_bytes: 30_000_000,
+        };
+        assert!(
+            compare_to_v2(
+                v2,
+                PerformanceMeasurement {
+                    p95_nanoseconds: 3_000_000,
+                    peak_total_bytes: 10_000_000,
+                }
+            )
+            .passes()
+        );
+        assert_eq!(
+            compare_to_v2(
+                v2,
+                PerformanceMeasurement {
+                    p95_nanoseconds: 3_000_001,
+                    peak_total_bytes: 9_999_999,
+                }
+            ),
+            Acceptance {
+                latency_passes: false,
+                memory_passes: true,
+            }
+        );
+        assert_eq!(
+            compare_to_v2(
+                v2,
+                PerformanceMeasurement {
+                    p95_nanoseconds: 2_999_999,
+                    peak_total_bytes: 10_000_001,
+                }
+            ),
+            Acceptance {
+                latency_passes: true,
+                memory_passes: false,
+            }
         );
     }
 }

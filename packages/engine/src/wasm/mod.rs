@@ -21,8 +21,9 @@ pub mod v2 {
 /// and remain valid across branch switches, actor eviction, and cold reopen.
 pub mod v3 {
     pub use lix_plugin_arena::{
-        Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics, Root,
-        StatePageLayout, Store, Transaction,
+        Acceptance, Archive, ByteArena, ByteEdit, Digest, Error, FormatLayout, MapArena, Metrics,
+        PerformanceMeasurement, REQUIRED_V3_MEMORY_REDUCTION, REQUIRED_V3_SPEEDUP, Root,
+        StatePageLayout, Store, Transaction, compare_to_v2,
     };
 }
 

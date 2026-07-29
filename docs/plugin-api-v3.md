@@ -2,10 +2,11 @@
 
 ## Status
 
-Profile-driven prototype. API v3 is accepted only if the end-to-end scorecard
-shows materially lower total resident ownership and Component-boundary
-materialization on real large-file workloads, while warm p95 latency remains
-within 10% of v2 (or improves). The prototype does not retain a v2 adapter.
+Profile-driven prototype. API v3 is accepted only if every required real-file
+lane demonstrates at least 2× end-to-end throughput and at least 3× lower peak
+total memory than v2. Total memory includes host-owned live bytes, guest linear
+memory high water, and transition materialization. The prototype does not
+retain a v2 adapter.
 
 ## Evidence for the cut
 
@@ -78,6 +79,10 @@ Report all of the following for v2 and v3:
   restore, and merge p50/p95 latency;
 - exact output hashes and semantic row counts.
 
-The deterministic arena micro-scorecard is a design check, not the acceptance
-decision. The decision comes from the same RocksDB/public-SQL workloads used by
-the v2 Markdown and CSV profiles, expanded to JSON and Excalidraw.
+For each Markdown, CSV, JSON, and Excalidraw fixture, cold import, warm byte
+edit, warm entity edit, eviction restore, and merge must independently satisfy
+`v3 p95 <= v2 p95 / 2` and `v3 peak total bytes <= v2 peak total bytes / 3`.
+Medians are reported but cannot hide a failing p95. The deterministic arena
+micro-scorecard is a design check, not the acceptance decision. The decision
+comes from the same RocksDB/public-SQL workloads used by the v2 Markdown and
+CSV profiles, expanded to JSON and Excalidraw.

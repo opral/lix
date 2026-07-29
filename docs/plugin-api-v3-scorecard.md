@@ -19,7 +19,10 @@ These use the production Wasmtime Component runtime and real format plugins.
 
 The JSON hot path is the important control: v2 already crosses only 418 bytes
 and does not reparse or rerender the document. A v3 implementation must reduce
-total ownership without regressing that 5.5 ms transition.
+total ownership while completing the same transition in at most 2.750 ms.
+Counting only the 10,485,760-byte accepted host blob plus the measured
+26,673,152-byte guest high water gives a conservative v2 total of 37,158,912
+bytes, so the v3 peak must be at most 12,386,304 bytes.
 
 Reproduction:
 
@@ -69,13 +72,29 @@ cargo test -p lix_plugin_arena --test scorecard --release \
   four_format_warm_edit_latency_scorecard -- --ignored --nocapture
 ```
 
+## Hard acceptance gates
+
+Every row is an independent pass/fail gate. “Pending” is not a pass.
+
+| format | workload | v2 p95/control | required v3 p95 | conservative v2 total memory | required v3 total memory |
+| --- | --- | ---: | ---: | ---: | ---: |
+| JSON | 10 MiB warm scalar byte edit | 5.500 ms | ≤2.750 ms | 37,158,912 B | ≤12,386,304 B |
+| Markdown | `vscode-docs` one-commit replay | 9.220 s | ≤4.610 s | ≥105,643,782 B | ≤35,214,594 B |
+| CSV | 10.68 MiB warm row edit | pending isolated p95 | pending | ≥72,677,056 B | ≤24,225,685 B |
+| Excalidraw | large element/file edit | pending baseline | pending | pending baseline | pending |
+
+The final scorecard also requires cold import, warm entity edit, eviction
+restore, and merge lanes for all four formats. It measures process peak delta
+and separately reports host unique arena bytes and guest high water so a lower
+Wasm heap cannot hide host duplication.
+
 ## Decision
 
-The immutable host arena design passes its prototype ownership,
-materialization, determinism, rollback, branch, reopen, upgrade, and merge
-gates. It is **not yet accepted as the production v3 hard cut**: the scorecard
-does not include a Wasmtime v3 binding or format-specific page codecs, so it
-cannot prove the end-to-end warm p95 gate against the strong v2 JSON control.
+The immutable host arena design passes its prototype correctness gates. It is
+**not yet accepted as the production v3 hard cut**: its conservative retained
+byte model improves by only 2×, below the required 3×, and the scorecard does
+not include a Wasmtime v3 binding or format-specific page codecs. The rope-only
+latency result cannot prove the required 2× end-to-end p95.
 
 Accordingly this prototype keeps the production v2 runtime selected. The next
 implementation step is to bind the parsed WIT transaction/root resources in
