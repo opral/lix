@@ -75,6 +75,7 @@ struct CommitDeltaPayloadRef<'a> {
     metadata: crate::json_store::JsonSlotRef<'a>,
     #[musli(with = storage_codec::option)]
     origin_key: Option<&'a str>,
+    authored: bool,
 }
 
 #[derive(Debug, musli::Decode)]
@@ -86,6 +87,7 @@ struct CommitDeltaPayload {
     metadata: crate::json_store::JsonSlot,
     #[musli(with = storage_codec::option)]
     origin_key: Option<String>,
+    authored: bool,
 }
 
 /// Borrowed fixed-width directory over independently encoded payload records.
@@ -183,6 +185,7 @@ pub(crate) struct CommitDeltaMember {
     pub(crate) change: crate::changelog::ChangeRecord,
     pub(crate) segment_index: u32,
     pub(crate) ordinal: u32,
+    pub(crate) authored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,6 +595,7 @@ pub(crate) fn stage_commit_deltas(
             snapshot: delta.snapshot,
             metadata: delta.metadata,
             origin_key: delta.origin_key,
+            authored: delta.authored,
         });
     }
     let mutations = entries
@@ -756,6 +760,18 @@ pub(crate) async fn load_change_record_by_id(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let Some(locator) = load_change_locator_by_id(store, change_id).await? else {
+        return Ok(None);
+    };
+    load_change_record_at_locator(store, locator)
+        .await
+        .map(Some)
+}
+
+async fn load_change_locator_by_id(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_id: crate::changelog::ChangeId,
+) -> Result<Option<CommitDeltaChangeLocator>, LixError> {
     let locator_key = StorageKey(Bytes::copy_from_slice(change_id.as_uuid().as_bytes()));
     let locator = PointReadPlan::new(
         TRACKED_STATE_CHANGE_LOCATOR_SPACE,
@@ -771,7 +787,14 @@ pub(crate) async fn load_change_record_by_id(
     let Some(locator) = locator else {
         return Ok(None);
     };
-    let locator = decode_change_locator(change_id, &locator)?;
+    decode_change_locator(change_id, &locator).map(Some)
+}
+
+async fn load_change_record_at_locator(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    let change_id = locator.change_id;
     let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await? else {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -849,7 +872,7 @@ pub(crate) async fn load_change_record_by_id(
     }
     let key = decode_key(entry.key)?;
     let payload = payloads.decode(ordinal)?;
-    Ok(Some(crate::changelog::ChangeRecord {
+    Ok(crate::changelog::ChangeRecord {
         format_version: 2,
         change_id,
         schema_key: key.schema_key,
@@ -859,7 +882,7 @@ pub(crate) async fn load_change_record_by_id(
         metadata: payload.metadata,
         created_at: value.updated_at,
         origin_key: payload.origin_key,
-    }))
+    })
 }
 
 fn decode_change_locator(
@@ -1115,6 +1138,14 @@ pub(crate) async fn load_commit_delta_members_with_payloads(
     let Some(manifest) = load_commit_delta_manifest(store, commit_id).await? else {
         return Ok(Vec::new());
     };
+    load_commit_delta_members_from_manifest(store, commit_id, &manifest).await
+}
+
+async fn load_commit_delta_members_from_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    commit_id: CommitId,
+    manifest: &CommitDeltaManifest,
+) -> Result<Vec<CommitDeltaMember>, LixError> {
     let mut members = Vec::new();
     if let Some(inline_segment) = manifest.inline_segment() {
         collect_strict_commit_delta_members(inline_segment, None, commit_id, 0, &mut members)?;
@@ -1394,43 +1425,191 @@ pub(crate) async fn scan_commit_delta_values(
 pub(crate) async fn scan_change_records_from_commit_deltas(
     store: &(impl StorageAdapterRead + ?Sized),
 ) -> Result<Vec<crate::changelog::ChangeRecord>, LixError> {
-    let CommitDeltaPlane {
-        manifests,
-        mut segments,
-    } = scan_commit_delta_plane(store).await?;
-    let mut records =
-        BTreeMap::<crate::changelog::ChangeId, (CommitId, crate::changelog::ChangeRecord)>::new();
-    for (commit_id, manifest) in manifests {
-        let physical_segments = segments.remove(&commit_id).unwrap_or_default();
-        if let Some(inline_segment) = manifest.inline_segment() {
-            if !physical_segments.is_empty() {
+    let mut records = Vec::new();
+    visit_change_records_from_commit_deltas(store, |record| {
+        records.push(record);
+        Ok(())
+    })
+    .await?;
+    records.sort_unstable_by_key(|record| record.change_id);
+    Ok(records)
+}
+
+/// Visits canonical packed changes while retaining memory proportional to one
+/// storage page plus one logical commit, never total repository history.
+///
+/// Merge/checkpoint selections carry an explicit non-authored marker. Those
+/// uncommon duplicates validate against the immutable locator before being
+/// skipped; authored rows require no secondary read.
+pub(crate) async fn visit_change_records_from_commit_deltas(
+    store: &(impl StorageAdapterRead + ?Sized),
+    mut visit: impl FnMut(crate::changelog::ChangeRecord) -> Result<(), LixError>,
+) -> Result<usize, LixError> {
+    let plan = ScanPlan::range(
+        TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+        StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    );
+    let mut resume_after = None;
+    let mut emitted = 0usize;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::FullValue,
+                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
+                    resume_after,
+                },
+            )
+            .await?;
+        for entry in &page.value.entries {
+            if entry.key.0.len() != 16 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta manifest key is not a 16-byte commit id",
+                ));
+            }
+            let StorageProjectedValue::FullValue(bytes) = &entry.value else {
+                unreachable!("full commit-delta scan returned a key-only row");
+            };
+            let commit_id = commit_id_from_delta_key(&entry.key)?;
+            let manifest = decode_commit_delta_manifest(bytes)?;
+            let members =
+                load_commit_delta_members_from_manifest(store, commit_id, &manifest).await?;
+            for member in members {
+                if member.authored {
+                    visit(member.change)?;
+                    emitted += 1;
+                } else {
+                    let locator = load_change_locator_by_id(store, member.change.change_id)
+                        .await?
+                        .ok_or_else(|| {
+                            invalid_change_locator(
+                                member.change.change_id,
+                                "does not resolve to a canonical record",
+                            )
+                        })?;
+                    if locator.commit_id == member.value.commit_id
+                        && locator.segment_index == member.segment_index
+                        && u32::from(locator.ordinal) == member.ordinal
+                    {
+                        visit(member.change)?;
+                        emitted += 1;
+                        continue;
+                    }
+                    let canonical = load_change_record_at_locator(store, locator).await?;
+                    if canonical != member.change {
+                        return Err(LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "tracked_state change '{}' has conflicting authoritative packed payloads",
+                                member.change.change_id
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        if !page.value.has_more {
+            break;
+        }
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+    }
+    validate_no_orphan_commit_delta_segments(store).await?;
+    Ok(emitted)
+}
+
+async fn validate_no_orphan_commit_delta_segments(
+    store: &(impl StorageAdapterRead + ?Sized),
+) -> Result<(), LixError> {
+    let plan = ScanPlan::range(
+        TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE,
+        StorageKeyRange {
+            lower: Bound::Unbounded,
+            upper: Bound::Unbounded,
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    projection: StorageCoreProjection::KeyOnly,
+                    limit_rows: crate::storage_adapter::MAX_SCAN_PAGE_ROWS,
+                    resume_after,
+                },
+            )
+            .await?;
+        if page.value.entries.is_empty() {
+            break;
+        }
+        let mut commit_ids = Vec::new();
+        for entry in &page.value.entries {
+            if entry.key.0.len() != 20 {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "tracked_state commit_delta segment key is not commit-id plus u32 suffix",
+                ));
+            }
+            let commit_id = commit_id_from_delta_key(&entry.key)?;
+            if commit_ids.last() != Some(&commit_id) {
+                commit_ids.push(commit_id);
+            }
+        }
+        let manifest_keys = commit_ids
+            .iter()
+            .map(|commit_id| StorageKey(Bytes::from(commit_delta_manifest_key(*commit_id))))
+            .collect::<Vec<_>>();
+        let manifests =
+            PointReadPlan::new(TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE, &manifest_keys)
+                .materialize(store, StorageGetOptions::default())
+                .await?;
+        let manifests = commit_ids
+            .into_iter()
+            .zip(manifests.value)
+            .map(|(commit_id, value)| {
+                value
+                    .and_then(full_value_bytes)
+                    .map(|bytes| decode_commit_delta_manifest(&bytes))
+                    .transpose()
+                    .map(|manifest| (commit_id, manifest))
+            })
+            .collect::<Result<BTreeMap<_, _>, LixError>>()?;
+        for entry in &page.value.entries {
+            let commit_id = commit_id_from_delta_key(&entry.key)?;
+            let segment_index = usize::try_from(u32::from_be_bytes(
+                entry.key.0[16..20]
+                    .try_into()
+                    .expect("segment suffix length checked"),
+            ))
+            .expect("u32 fits usize");
+            let Some(Some(manifest)) = manifests.get(&commit_id) else {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "tracked_state inline commit_delta for commit '{commit_id}' has external segments"
+                        "tracked_state commit_delta inventory found orphan segments for commit '{commit_id}'"
+                    ),
+                ));
+            };
+            if manifest.inline_segment().is_some() || segment_index >= manifest.segments.len() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked_state commit_delta for commit '{commit_id}' has an undeclared segment {segment_index}"
                     ),
                 ));
             }
-            collect_validated_commit_delta_change_records(
-                inline_segment,
-                None,
-                commit_id,
-                &mut records,
-            )?;
-        } else {
-            validate_physical_commit_delta_segments(commit_id, &manifest, &physical_segments)?;
-            for (segment_index, bounds) in manifest.segments.iter().enumerate() {
-                collect_validated_commit_delta_change_records(
-                    &physical_segments[&segment_index],
-                    Some(bounds),
-                    commit_id,
-                    &mut records,
-                )?;
-            }
         }
+        if !page.value.has_more {
+            break;
+        }
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
     }
-    debug_assert!(segments.is_empty());
-    Ok(records.into_values().map(|(_, change)| change).collect())
+    Ok(())
 }
 
 /// Inventories the complete packed commit-delta plane in one manifest scan and
@@ -1721,64 +1900,10 @@ fn collect_strict_commit_delta_members(
             change,
             segment_index,
             ordinal: u32::try_from(entry_index).expect("segment ordinal fits u32"),
+            authored: payload.authored,
         });
     }
     Ok(())
-}
-
-fn collect_validated_commit_delta_change_records(
-    bytes: &[u8],
-    expected_bounds: Option<&CommitDeltaSegmentBounds>,
-    expected_commit_id: CommitId,
-    records: &mut BTreeMap<crate::changelog::ChangeId, (CommitId, crate::changelog::ChangeRecord)>,
-) -> Result<(), LixError> {
-    let (leaf, payloads) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
-    visit_commit_delta_leaf(
-        &leaf,
-        expected_commit_id,
-        |entry_index, encoded_key, value| {
-            let payload = payloads.decode(entry_index)?;
-            let key = decode_key(encoded_key)?;
-            let change = crate::changelog::ChangeRecord {
-                format_version: 2,
-                change_id: value.change_id,
-                schema_key: key.schema_key,
-                entity_pk: key.entity_pk,
-                file_id: key.file_id,
-                snapshot: payload.snapshot,
-                metadata: payload.metadata,
-                created_at: value.updated_at,
-                origin_key: payload.origin_key,
-            };
-            match records.entry(change.change_id) {
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    entry.insert((expected_commit_id, change));
-                }
-                std::collections::btree_map::Entry::Occupied(entry)
-                    if entry.get().0 == expected_commit_id =>
-                {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state commit_delta for commit '{expected_commit_id}' contains duplicate change id '{}'",
-                            change.change_id
-                        ),
-                    ));
-                }
-                std::collections::btree_map::Entry::Occupied(entry) if entry.get().1 != change => {
-                    return Err(LixError::new(
-                        LixError::CODE_INTERNAL_ERROR,
-                        format!(
-                            "tracked_state change '{}' has conflicting authoritative packed payloads",
-                            change.change_id
-                        ),
-                    ));
-                }
-                std::collections::btree_map::Entry::Occupied(_) => {}
-            }
-            Ok(())
-        },
-    )
 }
 
 fn validate_commit_delta_member_order_and_ids(
@@ -1967,6 +2092,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
             snapshot: crate::json_store::JsonSlotRef::None,
             metadata: crate::json_store::JsonSlotRef::None,
             origin_key: None,
+            authored: true,
         };
         entries.len()
     ];
@@ -2677,6 +2803,7 @@ mod tests {
             snapshot,
             metadata,
             origin_key,
+            authored: true,
         }
     }
 
@@ -2879,6 +3006,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                authored: true,
             }],
         );
         let mut writes = orphan_storage.new_write_set();
@@ -2973,15 +3101,18 @@ mod tests {
             crate::json_store::JsonSlotRef::None,
             None,
         );
-        let second = commit_delta_ref(
+        let mut second = commit_delta_ref(
             second_commit,
             &fixture,
             crate::json_store::JsonSlotRef::Inline(shared_snapshot),
             crate::json_store::JsonSlotRef::None,
             None,
         );
+        second.authored = false;
         let mut writes = storage.new_write_set();
-        stage_commit_deltas(&mut writes, &[first]).expect("first owner should stage");
+        let locators =
+            stage_commit_deltas(&mut writes, &[first]).expect("first owner should stage");
+        stage_change_locators(&mut writes, &locators);
         stage_commit_deltas(&mut writes, &[second]).expect("second owner should stage");
         storage
             .commit_write_set(writes, StorageWriteOptions::default())
@@ -3007,13 +3138,14 @@ mod tests {
         drop(read);
 
         let conflicting_commit = CommitId::for_test_label("shared-authority-conflict");
-        let conflicting = commit_delta_ref(
+        let mut conflicting = commit_delta_ref(
             conflicting_commit,
             &fixture,
             crate::json_store::JsonSlotRef::Inline(r#"{"shared":false}"#),
             crate::json_store::JsonSlotRef::None,
             None,
         );
+        conflicting.authored = false;
         let mut writes = storage.new_write_set();
         stage_commit_deltas(&mut writes, &[conflicting]).expect("conflicting owner should stage");
         storage
@@ -3289,16 +3421,19 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[0]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("first"),
+                authored: true,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[1]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                authored: true,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(snapshots[2]),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: Some("last"),
+                authored: true,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
@@ -3383,11 +3518,13 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::None,
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                authored: true,
             },
             CommitDeltaPayloadRef {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"second":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                authored: true,
             },
         ];
         let mut encoded = encode_commit_delta_segment_with_payloads(&entries, &payloads);
@@ -3533,6 +3670,7 @@ mod tests {
                 snapshot: crate::json_store::JsonSlotRef::Inline(r#"{"ok":true}"#),
                 metadata: crate::json_store::JsonSlotRef::None,
                 origin_key: None,
+                authored: true,
             }],
         );
 

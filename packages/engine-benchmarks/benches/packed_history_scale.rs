@@ -1,5 +1,5 @@
 use std::fmt::{self, Display, Formatter};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use lix_engine::storage::Storage;
@@ -54,6 +54,20 @@ async fn run() {
     let flush = env_bool("LIX_PACKED_HISTORY_FLUSH", true);
     let memtable_flush = env_bool("LIX_PACKED_HISTORY_MEMTABLE_FLUSH", false);
     let account_layout = env_bool("LIX_PACKED_HISTORY_ACCOUNT_LAYOUT", true);
+    let skip_seed = env_bool("LIX_PACKED_HISTORY_SKIP_SEED", false);
+    let persistent_root = std::env::var_os("LIX_PACKED_HISTORY_STORAGE_PATH").map(PathBuf::from);
+    if persistent_root.is_some() {
+        assert_eq!(
+            changes.len(),
+            1,
+            "persistent storage requires one history size"
+        );
+        assert_eq!(
+            commit_widths.len(),
+            1,
+            "persistent storage requires one commit width"
+        );
+    }
 
     for backend in [Backend::RocksDB, Backend::SlateDB] {
         if !selected("LIX_PACKED_HISTORY_BACKENDS", &backend.to_string()) {
@@ -70,7 +84,10 @@ async fn run() {
                 match backend {
                     Backend::RocksDB => {
                         let dir = tempfile::tempdir().expect("create RocksDB benchmark directory");
-                        let path = dir.path().join("rocksdb");
+                        let path = persistent_root.as_ref().map_or_else(
+                            || dir.path().join("rocksdb"),
+                            |root| root.join("rocksdb"),
+                        );
                         let storage = RocksDB::open(&path).expect("open benchmark RocksDB");
                         run_case(
                             backend,
@@ -85,6 +102,7 @@ async fn run() {
                             flush,
                             false,
                             account_layout,
+                            skip_seed,
                             || async {
                                 storage.flush().expect("flush benchmark RocksDB");
                             },
@@ -93,7 +111,10 @@ async fn run() {
                     }
                     Backend::SlateDB => {
                         let dir = tempfile::tempdir().expect("create SlateDB benchmark directory");
-                        let path = dir.path().join("slatedb");
+                        let path = persistent_root.as_ref().map_or_else(
+                            || dir.path().join("slatedb"),
+                            |root| root.join("slatedb"),
+                        );
                         let storage = SlateDB::open(&path).expect("open benchmark SlateDB");
                         run_case(
                             backend,
@@ -108,6 +129,7 @@ async fn run() {
                             flush,
                             memtable_flush,
                             account_layout,
+                            skip_seed,
                             || async {
                                 if memtable_flush {
                                     storage
@@ -141,6 +163,7 @@ async fn run_case<S, Flush, FlushFuture>(
     flush: bool,
     memtable_flush: bool,
     account_layout: bool,
+    skip_seed: bool,
     flush_storage: Flush,
 ) where
     S: Storage + Clone,
@@ -151,7 +174,11 @@ async fn run_case<S, Flush, FlushFuture>(
     let id_shape =
         std::env::var("LIX_PACKED_HISTORY_ID_SHAPE").unwrap_or_else(|_| "deterministic".into());
     let seed_started = Instant::now();
-    let writes = seed_packed_history(&adapter, changes, commit_width, storage_batch_changes).await;
+    let writes = if skip_seed {
+        None
+    } else {
+        Some(seed_packed_history(&adapter, changes, commit_width, storage_batch_changes).await)
+    };
     let seed_elapsed = seed_started.elapsed();
     if flush {
         flush_storage().await;
@@ -194,7 +221,7 @@ async fn run_case<S, Flush, FlushFuture>(
     println!(
         "packed_history_scale,backend={backend},id_shape={id_shape},changes={changes},commits={},commit_width={commit_width},\
          storage_batch_changes={storage_batch_changes},flushed={flush},warmups={warmups},samples={samples},\
-         memtable_flushed={memtable_flush},\
+         memtable_flushed={memtable_flush},skip_seed={skip_seed},\
          layout_accounted={account_layout},\
          exact_samples={exact_samples},seed_ms={},ingest_changes_per_second={:.1},staged_puts={},logical_written_bytes={},\
          scan_p50_ms={},scan_p95_ms={},scan_p99_ms={},\
@@ -202,11 +229,11 @@ async fn run_case<S, Flush, FlushFuture>(
          manifest_keys={},manifest_key_bytes={},manifest_value_bytes={},\
          segment_keys={},segment_key_bytes={},segment_value_bytes={},\
          locator_keys={},locator_key_bytes={},locator_value_bytes={},backend_bytes={backend_bytes}",
-        writes.commits,
+        writes.map_or_else(|| changes / commit_width, |writes| writes.commits),
         seed_elapsed.as_millis(),
         changes as f64 / seed_elapsed.as_secs_f64(),
-        writes.staged_puts,
-        writes.written_bytes,
+        writes.map_or(0, |writes| writes.staged_puts),
+        writes.map_or(0, |writes| writes.written_bytes),
         millis(percentile(&timings, 50)),
         millis(percentile(&timings, 95)),
         millis(percentile(&timings, 99)),

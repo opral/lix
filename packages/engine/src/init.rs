@@ -358,6 +358,7 @@ where
                 snapshot: change.snapshot.as_ref_slot(),
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
+                authored: true,
             })
             .collect::<Vec<_>>();
         let locators = crate::tracked_state::stage_commit_deltas(&mut writes, &commit_deltas)?;

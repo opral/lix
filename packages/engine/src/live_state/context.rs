@@ -2325,6 +2325,7 @@ mod tests {
                     snapshot: change.snapshot.as_ref_slot(),
                     metadata: change.metadata.as_ref_slot(),
                     origin_key: change.origin_key.as_deref(),
+                    authored: true,
                 })
                 .collect::<Vec<_>>();
             stage_commit_deltas(writes, &commit_deltas)?;
