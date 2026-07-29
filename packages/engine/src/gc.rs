@@ -13,8 +13,8 @@ use bytes::Bytes;
 use crate::branch::BranchHeadControlContext;
 use crate::changelog::{
     CHANGE_SPACE, COMMIT_CHANGE_ID_SPACE, COMMIT_SPACE, ChangeId, ChangeRecord, ChangeScanRequest,
-    ChangelogContext, ChangelogReader, CommitId, CommitRecord, CommitScanRequest, GcLiveSet,
-    GcPlan, GcRepairSet, GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
+    ChangelogContext, ChangelogReader, CommitId, CommitScanRequest, GcLiveSet, GcPlan, GcRepairSet,
+    GcRoot, GcSweepSet, change_key, commit_change_id_key, commit_key,
 };
 use crate::json_store::{
     JsonRef, JsonSlot, JsonStoreContext, JsonStoreWriter, UntrackedJsonReclaimCandidate,
@@ -422,9 +422,10 @@ where
     // content-addressed maintenance work, but delta rows have no shared
     // ownership and must be reclaimed in the same logical GC pass.
     let phase_started = Instant::now();
-    for commit_id in &sweep_tracked_commit_roots {
-        crate::tracked_state::stage_delete_commit_root(writes, *commit_id);
-    }
+    crate::tracked_state::stage_delete_commit_roots(
+        writes,
+        sweep_tracked_commit_roots.iter().copied(),
+    );
     // Old serving generations are derived data. Removing them in the same
     // atomic sweep as their untracked payload-root withdrawal prevents stale
     // branch generations from accumulating indefinitely.
@@ -520,7 +521,7 @@ where
     if let Some(commit_id) = packed
         .commits
         .keys()
-        .find(|commit_id| !commits.contains_key(commit_id))
+        .find(|commit_id| !commits.contains(commit_id))
     {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -557,13 +558,13 @@ where
         if !live_commits.insert(commit_id) {
             continue;
         }
-        let commit = commits.get(&commit_id).ok_or_else(|| {
+        let commit = commits.get(commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("garbage-collection root references missing commit '{commit_id}'"),
             )
         })?;
-        pending.extend(commit.parent_commit_ids.iter().copied());
+        pending.extend(commits.parent_commit_ids(commit).iter().copied());
     }
 
     let standalone_root_ids = roots
@@ -608,20 +609,11 @@ where
         }
     }
 
-    let sweep_commits = commits
-        .keys()
-        .filter(|commit_id| !live_commits.contains(commit_id))
-        .copied()
-        .collect::<Vec<_>>();
-    let sweep_commit_change_ids = sweep_commits
+    let (sweep_commits, sweep_commit_change_ids): (Vec<CommitId>, Vec<ChangeId>) = commits
         .iter()
-        .map(|commit_id| {
-            commits
-                .get(commit_id)
-                .expect("sweep commit came from commit inventory")
-                .change_id
-        })
-        .collect::<Vec<_>>();
+        .filter(|commit| !live_commits.contains(&commit.commit_id))
+        .map(|commit| (commit.commit_id, commit.change_id))
+        .unzip();
     let sweep_changes = standalone_changes
         .keys()
         .filter(|change_id| !standalone_root_ids.contains(change_id))
@@ -689,29 +681,27 @@ where
         .collect::<Vec<_>>();
     crate::tracked_state::stage_change_locators(writes, &relocated_locators);
 
+    writes.delete_batch(
+        COMMIT_SPACE,
+        sweep_commits.iter().map(|commit_id| commit_key(*commit_id)),
+    );
     for commit_id in &sweep_commits {
-        writes.delete(
-            COMMIT_SPACE,
-            StorageKey(Bytes::from(commit_key(*commit_id))),
-        );
         if let Some(entry) = packed.commits.get(commit_id) {
             crate::tracked_state::stage_delete_commit_delta_inventory_entry(
                 writes, *commit_id, entry,
             )?;
         }
     }
-    for change_id in &sweep_commit_change_ids {
-        writes.delete(
-            COMMIT_CHANGE_ID_SPACE,
-            StorageKey(Bytes::from(commit_change_id_key(*change_id))),
-        );
-    }
-    for change_id in &sweep_changes {
-        writes.delete(
-            CHANGE_SPACE,
-            StorageKey(Bytes::from(change_key(*change_id))),
-        );
-    }
+    writes.delete_batch(
+        COMMIT_CHANGE_ID_SPACE,
+        sweep_commit_change_ids
+            .iter()
+            .map(|change_id| commit_change_id_key(*change_id)),
+    );
+    writes.delete_batch(
+        CHANGE_SPACE,
+        sweep_changes.iter().map(|change_id| change_key(*change_id)),
+    );
     JsonStoreContext::new()
         .writer()
         .stage_delete_refs(writes, sweep_json_payloads.iter().copied());
@@ -737,12 +727,47 @@ where
     })
 }
 
-async fn scan_all_gc_commits<S>(store: S) -> Result<BTreeMap<CommitId, CommitRecord>, LixError>
+#[derive(Clone, Copy, Debug)]
+struct GcCommitInventoryEntry {
+    commit_id: CommitId,
+    change_id: ChangeId,
+    parent_start: usize,
+    parent_len: usize,
+}
+
+#[derive(Debug, Default)]
+struct GcCommitInventory {
+    entries: Vec<GcCommitInventoryEntry>,
+    parent_commit_ids: Vec<CommitId>,
+}
+
+impl GcCommitInventory {
+    fn contains(&self, commit_id: &CommitId) -> bool {
+        self.get(*commit_id).is_some()
+    }
+
+    fn get(&self, commit_id: CommitId) -> Option<&GcCommitInventoryEntry> {
+        self.entries
+            .binary_search_by_key(&commit_id, |entry| entry.commit_id)
+            .ok()
+            .map(|index| &self.entries[index])
+    }
+
+    fn parent_commit_ids(&self, entry: &GcCommitInventoryEntry) -> &[CommitId] {
+        &self.parent_commit_ids[entry.parent_start..entry.parent_start + entry.parent_len]
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &GcCommitInventoryEntry> {
+        self.entries.iter()
+    }
+}
+
+async fn scan_all_gc_commits<S>(store: S) -> Result<GcCommitInventory, LixError>
 where
     S: StorageAdapterRead,
 {
     let mut reader = ChangelogContext::new().reader(store);
-    let mut commits = BTreeMap::new();
+    let mut commits = GcCommitInventory::default();
     let mut start_after = None::<String>;
     loop {
         let batch = reader
@@ -752,15 +777,30 @@ where
             })
             .await?;
         for commit in batch.entries {
-            if commits.insert(commit.commit_id, commit.clone()).is_some() {
+            if commits
+                .entries
+                .last()
+                .is_some_and(|previous| previous.commit_id >= commit.commit_id)
+            {
                 return Err(LixError::new(
                     LixError::CODE_INTERNAL_ERROR,
                     format!(
-                        "garbage collection found duplicate commit '{}'",
+                        "garbage collection found duplicate or out-of-order commit '{}'",
                         commit.commit_id
                     ),
                 ));
             }
+            let parent_start = commits.parent_commit_ids.len();
+            let parent_len = commit.parent_commit_ids.len();
+            commits
+                .parent_commit_ids
+                .extend(commit.parent_commit_ids.into_iter());
+            commits.entries.push(GcCommitInventoryEntry {
+                commit_id: commit.commit_id,
+                change_id: commit.change_id,
+                parent_start,
+                parent_len,
+            });
         }
         let Some(next) = batch.next_start_after else {
             break;
