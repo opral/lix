@@ -17,6 +17,10 @@
 //!
 //! `setup` refuses to overwrite an existing directory. `measure` is read-only
 //! and can therefore be used for profiles against the same warmed fixture.
+//! Merge modes accept `LIX_WORKING_DIFF_UNRELATED_HISTORY`,
+//! `LIX_WORKING_DIFF_UNRELATED_HISTORY_WIDTH`, and
+//! `LIX_WORKING_DIFF_SETTLE_MS` to separate total-history scaling from
+//! relevant divergence and backend lifecycle state.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -28,6 +32,7 @@ static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::storage_bench::diff_tracked_commits_for_bench;
+use lix_engine::tracked_state::bench::seed_packed_history;
 use lix_engine::{
     CreateBranchOptions, Engine, ExecuteBatchStatement, MergeBranchOptions, MergeBranchOutcome,
     MergeBranchPreviewOptions, Storage, Value,
@@ -39,6 +44,8 @@ const DEFAULT_ROW_COUNT: usize = 10_000;
 const DEFAULT_COMMIT_COUNT: usize = 1_000;
 const DEFAULT_CHANGES_PER_COMMIT: usize = 10;
 const DEFAULT_MEASURE_REPETITIONS: usize = 11;
+const DEFAULT_UNRELATED_HISTORY_WIDTH: usize = 1;
+const UNRELATED_HISTORY_STORAGE_BATCH: usize = 100_000;
 const INSERT_BATCH_SIZE: usize = 500;
 const MERGE_PREVIEW_SOURCE_BRANCH_ID: &str = "01920000-0000-7000-8000-000000000901";
 const WORKING_DIFF_SQL: &str = "SELECT entity_pk, schema_key, change_kind, before_change_id, after_change_id \
@@ -599,9 +606,11 @@ async fn measure_merge_preview<StorageImpl>(
         row_count >= changes_per_side * 2,
         "merge preview needs disjoint target and source rows"
     );
+    let adapter = StorageAdapter::new(storage.clone());
     Engine::initialize(storage.clone())
         .await
         .expect("initialize merge-preview storage");
+    let (unrelated_history, settle_ms) = seed_unrelated_history(&adapter).await;
     let engine = Engine::new(storage)
         .await
         .expect("open merge-preview engine");
@@ -668,9 +677,12 @@ async fn measure_merge_preview<StorageImpl>(
     println!(
         "tracked_working_diff merge-preview backend={} rows={row_count} commits_per_side={commit_count} \
          changes_per_commit={changes_per_commit} source_changes={changes_per_side} repetitions={repetitions} \
-         p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+         unrelated_history_changes={unrelated_history} settle_ms={settle_ms} \
+         p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
         backend.name(),
-        millis(sorted[sorted.len() / 2]),
+        millis(percentile(&sorted, 50)),
+        millis(percentile(&sorted, 95)),
+        millis(percentile(&sorted, 99)),
         mean_millis(&latencies),
         millis(sorted[0]),
         millis(*sorted.last().expect("measurement samples are non-empty")),
@@ -686,9 +698,11 @@ async fn measure_merge_commit<StorageImpl>(
     StorageImpl: Storage + Clone + Send + Sync + 'static,
 {
     let row_count = repetitions * changes_per_side * 2;
+    let adapter = StorageAdapter::new(storage.clone());
     Engine::initialize(storage.clone())
         .await
         .expect("initialize merge-commit storage");
+    let (unrelated_history, settle_ms) = seed_unrelated_history(&adapter).await;
     let engine = Engine::new(storage)
         .await
         .expect("open merge-commit engine");
@@ -751,13 +765,51 @@ async fn measure_merge_commit<StorageImpl>(
     sorted.sort_unstable();
     println!(
         "tracked_working_diff merge-commit backend={} changes_per_side={changes_per_side} \
-         repetitions={repetitions} p50_ms={:.3} mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
+         unrelated_history_changes={unrelated_history} settle_ms={settle_ms} \
+         repetitions={repetitions} p50_ms={:.3} p95_ms={:.3} p99_ms={:.3} \
+         mean_ms={:.3} min_ms={:.3} max_ms={:.3}",
         backend.name(),
-        millis(sorted[sorted.len() / 2]),
+        millis(percentile(&sorted, 50)),
+        millis(percentile(&sorted, 95)),
+        millis(percentile(&sorted, 99)),
         mean_millis(&latencies),
         millis(sorted[0]),
         millis(*sorted.last().expect("measurement samples are non-empty")),
     );
+}
+
+async fn seed_unrelated_history<StorageImpl>(storage: &StorageAdapter<StorageImpl>) -> (usize, u64)
+where
+    StorageImpl: Storage,
+{
+    let changes = std::env::var("LIX_WORKING_DIFF_UNRELATED_HISTORY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    if changes == 0 {
+        return (0, 0);
+    }
+    let width = std::env::var("LIX_WORKING_DIFF_UNRELATED_HISTORY_WIDTH")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(DEFAULT_UNRELATED_HISTORY_WIDTH);
+    assert!(
+        changes.is_multiple_of(width),
+        "unrelated history must divide evenly by its commit width"
+    );
+    seed_packed_history(
+        storage,
+        changes,
+        width,
+        UNRELATED_HISTORY_STORAGE_BATCH.max(width),
+    )
+    .await;
+    let settle_ms = std::env::var("LIX_WORKING_DIFF_SETTLE_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
+    (changes, settle_ms)
 }
 
 async fn register_schema<StorageImpl>(session: &lix_engine::SessionContext<StorageImpl>)
@@ -929,6 +981,11 @@ fn mean_millis(durations: &[Duration]) -> f64 {
         .map(|duration| millis(*duration))
         .sum::<f64>()
         / f64::from(sample_count)
+}
+
+fn percentile(sorted: &[Duration], percentile: usize) -> Duration {
+    let rank = sorted.len().saturating_mul(percentile).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
 fn millis(duration: Duration) -> f64 {
