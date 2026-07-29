@@ -38,6 +38,7 @@ use slatedb::config::{
 };
 use slatedb::db_cache::moka::{MokaCache, MokaCacheOptions};
 use slatedb::db_cache::{DbCache, SplitCache};
+use slatedb::filter_policy::BloomFilterPolicy;
 use slatedb::prefix_extractor::{PrefixExtractor, PrefixTarget};
 use slatedb::{CloseReason, Db, DbIterator, DbSnapshot, DbStatus, KeyValue, WriteBatch};
 use slatedb_common::metrics::{DefaultMetricsRecorder, MetricValue};
@@ -64,6 +65,10 @@ const DEFAULT_BLOCK_CACHE_BYTES: u64 = 16 * 1024 * 1024;
 // these multi-megabyte filters and turned 1,001 five-key probes into 353 MiB
 // of repeated compacted-object reads.
 const DEFAULT_METADATA_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+// Large repositories probe several identity spaces for new absent IDs on
+// every append. Sixteen bits keeps aggregate false positives bounded across
+// the L0 and sorted-run fan-out without changing the filter encoding.
+const FILTER_BITS_PER_KEY: u32 = 16;
 const MAX_UNFLUSHED_BYTES: usize = 128 * 1024 * 1024;
 const SCAN_BATCH_ROWS: usize = 1024;
 const SCAN_READ_AHEAD_BYTES: usize = 2 * 1024 * 1024;
@@ -2848,7 +2853,8 @@ fn open_slatedb(
     runtime.block_on(async move {
         let physical_db_path = join_db_path(&db_path, SEGMENTED_FORMAT_PATH);
         let mut builder = Db::builder(physical_db_path, object_store)
-            .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor));
+            .with_segment_extractor(Arc::new(StorageSpacePrefixExtractor))
+            .with_filter_policies(vec![Arc::new(BloomFilterPolicy::new(FILTER_BITS_PER_KEY))]);
         if let Some(metrics) = metrics {
             builder = builder.with_metrics_recorder(metrics);
         }
@@ -3625,6 +3631,15 @@ mod tests {
         let settings = slatedb_settings();
         assert_eq!(settings.max_unflushed_bytes, MAX_UNFLUSHED_BYTES);
         assert_eq!(settings.max_unflushed_bytes, settings.l0_sst_size_bytes * 2);
+    }
+
+    #[test]
+    fn strengthens_point_filters_for_large_history() {
+        assert_eq!(FILTER_BITS_PER_KEY, 16);
+        assert_eq!(
+            BloomFilterPolicy::new(FILTER_BITS_PER_KEY).bits_per_key(),
+            FILTER_BITS_PER_KEY
+        );
     }
 
     #[test]
