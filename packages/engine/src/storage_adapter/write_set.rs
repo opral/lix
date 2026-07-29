@@ -98,8 +98,32 @@ struct MutationArena {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ArenaRange {
-    buffer_index: usize,
-    range: BufferRange,
+    buffer_index: u32,
+    offset: u32,
+    length: u32,
+}
+
+impl ArenaRange {
+    fn new(buffer_index: usize, range: BufferRange) -> Self {
+        Self {
+            buffer_index: u32::try_from(buffer_index)
+                .expect("mutation arena buffer count fits u32"),
+            offset: u32::try_from(range.offset()).expect("mutation arena offset fits u32"),
+            length: u32::try_from(range.len()).expect("mutation arena range length fits u32"),
+        }
+    }
+
+    fn buffer_index(self) -> usize {
+        self.buffer_index as usize
+    }
+
+    fn offset(self) -> usize {
+        self.offset as usize
+    }
+
+    fn len(self) -> usize {
+        self.length as usize
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -380,6 +404,37 @@ impl StorageWriteSet {
         self.stats.staged_deletes += 1;
         self.group_mut(space.into_storage_space())
             .stage_delete(key.0);
+    }
+
+    /// Stages delete keys in one contiguous retained buffer.
+    ///
+    /// Large maintenance sweeps should use this path instead of retaining one
+    /// separately allocated [`Bytes`] buffer per key.
+    pub fn delete_batch<S, I, K>(&mut self, space: S, keys: I)
+    where
+        S: IntoStorageSpace,
+        I: IntoIterator<Item = K>,
+        K: IntoStorageKey,
+    {
+        let mut key_bytes = Vec::new();
+        let mut deletes = Vec::new();
+        for key in keys {
+            let key = key.into_storage_key();
+            let start = key_bytes.len();
+            key_bytes.extend_from_slice(&key.0);
+            deletes.push(BufferRange::new(start, key_bytes.len() - start));
+        }
+        if deletes.is_empty() {
+            return;
+        }
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(key_bytes),
+            Bytes::new(),
+            Vec::new(),
+            deletes,
+        )
+        .expect("delete ranges originate in the supplied encoded key buffer");
+        self.stage_encoded_batch(space.into_storage_space(), batch);
     }
 
     /// Reserves capacity for a storage space's grouped puts and deletes.
@@ -754,21 +809,17 @@ impl StorageWriteGroup {
         let key_buffer_index = self.key_arena.import(key_bytes);
         let value_buffer_index = (!puts.is_empty()).then(|| self.value_arena.import(value_bytes));
         self.puts.extend(puts.into_iter().map(|put| StagedPut {
-            key: ArenaRange {
-                buffer_index: key_buffer_index,
-                range: put.key,
-            },
-            value: ArenaRange {
-                buffer_index:
-                    value_buffer_index.expect("an encoded put batch must retain its value buffer"),
-                range: put.value,
-            },
+            key: ArenaRange::new(key_buffer_index, put.key),
+            value: ArenaRange::new(
+                value_buffer_index.expect("an encoded put batch must retain its value buffer"),
+                put.value,
+            ),
         }));
-        self.deletes
-            .extend(deletes.into_iter().map(|range| ArenaRange {
-                buffer_index: key_buffer_index,
-                range,
-            }));
+        self.deletes.extend(
+            deletes
+                .into_iter()
+                .map(|range| ArenaRange::new(key_buffer_index, range)),
+        );
     }
 
     fn key_bytes(&self, range: ArenaRange) -> &[u8] {
@@ -871,10 +922,7 @@ impl MutationArena {
     fn stage_bytes(&mut self, bytes: Bytes) -> ArenaRange {
         let length = bytes.len();
         let buffer_index = self.import(bytes);
-        ArenaRange {
-            buffer_index,
-            range: BufferRange::new(0, length),
-        }
+        ArenaRange::new(buffer_index, BufferRange::new(0, length))
     }
 
     fn import(&mut self, bytes: Bytes) -> usize {
@@ -886,9 +934,9 @@ impl MutationArena {
     fn bytes(&self, range: ArenaRange) -> &[u8] {
         slice_bytes(
             self.shared
-                .get(range.buffer_index)
+                .get(range.buffer_index())
                 .expect("staged mutation references a retained shared buffer"),
-            range.range,
+            range,
         )
     }
 
@@ -907,10 +955,10 @@ impl MutationArena {
 
 impl ArenaRemap {
     fn remap(&self, range: ArenaRange) -> ArenaRange {
-        ArenaRange {
-            buffer_index: self.shared_buffer_base + range.buffer_index,
-            range: range.range,
-        }
+        ArenaRange::new(
+            self.shared_buffer_base + range.buffer_index(),
+            BufferRange::new(range.offset(), range.len()),
+        )
     }
 }
 
@@ -918,9 +966,8 @@ impl FrozenMutationArena {
     fn slice(&self, range: ArenaRange) -> Bytes {
         let bytes = self
             .shared
-            .get(range.buffer_index)
+            .get(range.buffer_index())
             .expect("lowered mutation references a retained shared buffer");
-        let range = range.range;
         if range.offset() == 0 && range.len() == bytes.len() {
             return bytes.clone();
         }
@@ -928,7 +975,7 @@ impl FrozenMutationArena {
     }
 }
 
-fn slice_bytes(bytes: &[u8], range: BufferRange) -> &[u8] {
+fn slice_bytes(bytes: &[u8], range: ArenaRange) -> &[u8] {
     &bytes[range.offset()..range.offset() + range.len()]
 }
 
@@ -1157,6 +1204,33 @@ mod tests {
                 .map(|key| key.0.as_ptr() as usize)
                 .collect::<Vec<_>>(),
             delete_key_pointers
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_batch_retains_one_contiguous_key_buffer() {
+        assert_eq!(size_of::<super::ArenaRange>(), 12);
+        let mut writes = StorageWriteSet::new();
+        writes.delete_batch(space(), [key("c"), key("a"), key("b")]);
+
+        let arenas = writes.arena_stats();
+        assert_eq!(arenas.delete_descriptors, 3);
+        assert_eq!(arenas.key_shared_buffers, 1);
+        assert_eq!(arenas.key_shared_bytes, 3);
+
+        let mut backend = CapturingStorageWrite::default();
+        writes
+            .lower_into(&mut backend)
+            .await
+            .expect("lower contiguous delete batch");
+        let (_, deletes) = backend.deletes.pop().expect("one delete batch");
+        assert_eq!(
+            deletes.into_iter().map(|key| key.0).collect::<Vec<_>>(),
+            [
+                Bytes::from_static(b"a"),
+                Bytes::from_static(b"b"),
+                Bytes::from_static(b"c")
+            ]
         );
     }
 
