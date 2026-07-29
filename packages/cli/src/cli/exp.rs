@@ -73,7 +73,7 @@ pub struct ExpGitReplayArgs {
     #[arg(long, value_parser = value_parser!(u32).range(1..))]
     pub num_commits: Option<u32>,
 
-    /// Verify file paths and payload hashes after each replayed commit.
+    /// Verify changed files after each commit and the complete final tree.
     #[arg(long, default_value_t = false)]
     pub verify_state: bool,
 
