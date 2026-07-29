@@ -1,4 +1,8 @@
-pub(super) const INLINE_BINARY_CAS_MAX_BYTES: usize = 32 * 1024;
+// Values through 32 KiB are a one-row write with no existence probe. The
+// 32–64 KiB band stays inline for one-phase reads, but probes the manifest key
+// before staging so repeat-content writes do not rewrite the large value.
+pub(super) const UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES: usize = 32 * 1024;
+pub(super) const INLINE_BINARY_CAS_MAX_BYTES: usize = 64 * 1024;
 pub(super) const SINGLE_CHUNK_FAST_PATH_MAX_BYTES: usize = 64 * 1024;
 pub(super) const MAX_BINARY_CAS_CHUNK_BYTES: usize = 4096 * 1024;
 const FASTCDC_WRITE_MAX_CHUNK_BYTES: usize = 1024 * 1024;

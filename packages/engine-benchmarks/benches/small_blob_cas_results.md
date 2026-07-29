@@ -85,3 +85,42 @@ rewrites the whole value. This change is justified only when new or changed
 file content plus reads represent the dominant path. If repeat writes of
 identical content are common, do not treat this optimization as a net win
 without a representative workload measurement.
+
+## Manifest-probed inline values through 64 KiB
+
+Date: 2026-07-29
+
+OpenClaw's complete `main` object set contains 455,883 unique blobs. Of those,
+43,444 blobs (9.5%, 1,991,214,838 logical bytes) fall above 32 KiB and at or
+below 64 KiB. The previous layout stored each of these as a manifest, an empty
+presence row, and a payload row.
+
+The extended layout stores that band as one inline manifest. Reads finish from
+the manifest point read, while repeat writes use a key-only manifest probe and
+stage no value. Payloads through 32 KiB retain the original unguarded one-row
+layout.
+
+Seven counterbalanced baseline/candidate process pairs used fresh temporary
+databases per exact case, 300 warmups, and 3,000 timed samples. The values are
+the median per-run p50:
+
+| Backend | Operation | Baseline p50 | Inline p50 | Change |
+| ------- | --------- | -----------: | ---------: | -----: |
+| RocksDB | New-content write | 139,402 ns | 135,556 ns | 2.8% faster |
+| RocksDB | Repeat write | 13,459 ns | 13,169 ns | 2.2% faster |
+| RocksDB | Hot read | 4,276 ns | 3,685 ns | **13.8% faster** |
+| SlateDB | New-content write | 72,400 ns | 66,161 ns | 8.6% faster |
+| SlateDB | Repeat write | 28,418 ns | 12,636 ns | **55.5% faster** |
+| SlateDB | Hot read | 5,208 ns | 4,636 ns | **11.0% faster** |
+
+The logical shape drops from three rows and 96 key bytes to one row and 32 key
+bytes per unique blob in the extended band, both 66.7% reductions. Encoded
+value bytes remain nearly flat (65,583 to 65,548 bytes for the measured
+high-entropy 64 KiB payload).
+
+The exact-case binaries had SHA-256
+`335b84b9ef6ae399b999613ef49f095684f313411f761b877a9a696f4422e815`
+(baseline) and
+`eb0cbbd5d2f1a6acf11589c73175fb8a326f0a0a6eb31353dc4e0bd2097da8e4`
+(candidate). The combined raw-result SHA-256 is
+`86f828358d38bff5f4a82d3a0bd956d079b2162efa9e7e2823db4d24e88594e3`.

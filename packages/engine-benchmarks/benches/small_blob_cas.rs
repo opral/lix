@@ -18,7 +18,7 @@ use lix_slatedb_storage::SlateDB;
 use tempfile::TempDir;
 
 const BACKENDS: &[Backend] = &[Backend::Rocks, Backend::Slate];
-const SIZES: &[usize] = &[4 << 10, 32 << 10];
+const SIZES: &[usize] = &[4 << 10, 32 << 10, 64 << 10];
 const OPERATIONS: &[Operation] = &[
     Operation::UniqueWrite,
     Operation::DedupeWrite,

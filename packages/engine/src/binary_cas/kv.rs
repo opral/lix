@@ -2,7 +2,8 @@
 
 use crate::LixError;
 use crate::binary_cas::chunking::{
-    INLINE_BINARY_CAS_MAX_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, fastcdc_chunk_ranges_with_chunking,
+    INLINE_BINARY_CAS_MAX_BYTES, MAX_BINARY_CAS_CHUNK_BYTES, UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES,
+    fastcdc_chunk_ranges_with_chunking,
 };
 use crate::binary_cas::codec::{
     BinaryCasManifest, BinaryChunkCodec, decode_binary_cas_chunk, decode_binary_cas_manifest,
@@ -975,6 +976,11 @@ fn stage_prepared_blob_write(
             );
         }
         BlobLayout::Inline => {
+            if bytes.len() > UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES
+                && !should_stage_chunk(plan.blob_hash)?
+            {
+                return Ok(());
+            }
             let encoded = encode_chunk_payload(plan.blob_hash, bytes)?;
             writes.put(
                 BINARY_CAS_MANIFEST_SPACE,
@@ -1040,7 +1046,17 @@ async fn missing_chunk_hashes(
 ) -> Result<HashSet<BlobHash>, LixError> {
     let mut candidates = Vec::<(BlobHash, StorageKey)>::new();
     match &plan.layout {
-        BlobLayout::Empty | BlobLayout::Inline => {}
+        BlobLayout::Empty => {}
+        BlobLayout::Inline
+            if plan.receipt.size_bytes
+                > u64::try_from(UNGUARDED_INLINE_BINARY_CAS_MAX_BYTES)
+                    .expect("inline CAS threshold fits u64") =>
+        {
+            let exists =
+                manifest_keys_exist(store, vec![key(manifest_key(plan.blob_hash))]).await?;
+            return Ok((!exists[0]).then_some(plan.blob_hash).into_iter().collect());
+        }
+        BlobLayout::Inline => {}
         BlobLayout::SingleChunk { chunk_hash } => {
             collect_chunk_lookup_candidate(*chunk_hash, transaction_chunk_keys, &mut candidates);
         }
@@ -1110,6 +1126,34 @@ async fn chunk_keys_exist(
 ) -> Result<Vec<bool>, LixError> {
     let started = Instant::now();
     let result = PointReadPlan::from_unique_keys(BINARY_CAS_CHUNK_PRESENCE_SPACE, keys)
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
+    let exists = result
+        .value
+        .into_iter()
+        .map(|value| value.is_some())
+        .collect::<Vec<_>>();
+    let hit_count = exists.iter().filter(|&&exists| exists).count() as u64;
+    let miss_count = exists.len() as u64 - hit_count;
+    crate::binary_cas::metrics::record_binary_cas_chunk_lookup_batch(
+        hit_count,
+        miss_count,
+        started.elapsed(),
+    );
+    Ok(exists)
+}
+
+async fn manifest_keys_exist(
+    store: &(impl StorageAdapterRead + ?Sized),
+    keys: Vec<StorageKey>,
+) -> Result<Vec<bool>, LixError> {
+    let started = Instant::now();
+    let result = PointReadPlan::from_unique_keys(BINARY_CAS_MANIFEST_SPACE, keys)
         .materialize(
             store,
             StorageGetOptions {
@@ -1255,6 +1299,7 @@ mod tests {
         active_manifest_scans: AtomicUsize,
         max_active_manifest_scans: AtomicUsize,
         manifest_scan_calls: AtomicUsize,
+        manifest_get_many_calls: AtomicUsize,
         chunk_get_many_calls: AtomicUsize,
         presence_get_many_calls: AtomicUsize,
         chunk_keys_requested: AtomicUsize,
@@ -1271,6 +1316,7 @@ mod tests {
                 active_manifest_scans: AtomicUsize::new(0),
                 max_active_manifest_scans: AtomicUsize::new(0),
                 manifest_scan_calls: AtomicUsize::new(0),
+                manifest_get_many_calls: AtomicUsize::new(0),
                 chunk_get_many_calls: AtomicUsize::new(0),
                 presence_get_many_calls: AtomicUsize::new(0),
                 chunk_keys_requested: AtomicUsize::new(0),
@@ -1297,6 +1343,9 @@ mod tests {
             requests: &[crate::storage_adapter::StorageGetManyRequest<'_>],
         ) -> Result<StorageGetManyResult, StorageError> {
             for request in requests {
+                if request.space == BINARY_CAS_MANIFEST_SPACE.id {
+                    self.manifest_get_many_calls.fetch_add(1, Ordering::Relaxed);
+                }
                 if request.space == BINARY_CAS_CHUNK_SPACE.id {
                     self.chunk_get_many_calls.fetch_add(1, Ordering::Relaxed);
                     self.chunk_keys_requested
@@ -1841,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_layout_stops_at_the_32kib_boundary() {
+    fn inline_layout_stops_at_the_64kib_boundary() {
         let at_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES];
         let above_boundary = vec![b'a'; INLINE_BINARY_CAS_MAX_BYTES + 1];
 
@@ -1972,7 +2021,7 @@ mod tests {
     #[tokio::test]
     async fn public_kv_api_keeps_high_entropy_inline_blob_raw() {
         let storage = StorageAdapter::new(Memory::new());
-        let data = deterministic_high_entropy_bytes(32 * 1024);
+        let data = deterministic_high_entropy_bytes(INLINE_BINARY_CAS_MAX_BYTES);
         let blob_hash = BlobHash::from_content(&data);
 
         {
@@ -2083,6 +2132,85 @@ mod tests {
             counted.chunk_get_many_calls.load(Ordering::Relaxed),
             0,
             "inline blob reads must finish from the manifest point read"
+        );
+    }
+
+    #[tokio::test]
+    async fn extended_inline_writer_uses_manifest_probe_to_skip_repeat_payload_writes() {
+        let storage = StorageAdapter::new(Memory::new());
+        let data = deterministic_high_entropy_bytes(INLINE_BINARY_CAS_MAX_BYTES);
+        let payload = BlobPayload::from_bytes(data.clone());
+        let blob_hash = payload.hash().expect("payload should have a hash");
+
+        {
+            let mut writes = storage.new_write_set();
+            stage_test_payload(&storage, &mut writes, &payload).await;
+            assert_eq!(
+                writes.stats().staged_puts,
+                1,
+                "extended inline content stores only its manifest"
+            );
+            storage
+                .commit_write_set(writes, StorageWriteOptions::default())
+                .await
+                .expect("extended inline blob write should commit");
+        }
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        assert_eq!(
+            get_one(
+                &store,
+                BINARY_CAS_CHUNK_PRESENCE_SPACE,
+                chunk_key(blob_hash),
+            )
+            .await
+            .expect("chunk presence lookup should succeed"),
+            None,
+            "inline content must not occupy the chunk presence namespace"
+        );
+
+        let store = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let counted = DelayedManifestScanRead::new(store, Duration::ZERO);
+        let mut writes = storage.new_write_set();
+        let mut writer =
+            BinaryCasContext::new().writer_skipping_existing_chunks(&counted, &mut writes);
+        writer
+            .stage_payload(&payload)
+            .await
+            .expect("repeat extended inline blob write should stage");
+
+        assert_eq!(
+            writes.stats().staged_puts,
+            0,
+            "an existing extended inline payload should not be rewritten"
+        );
+        assert_eq!(
+            counted.manifest_get_many_calls.load(Ordering::Relaxed),
+            1,
+            "extended inline dedupe should use one key-only manifest lookup"
+        );
+        assert_eq!(
+            counted.presence_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "extended inline content must not probe chunk presence"
+        );
+        assert_eq!(
+            load_bytes_many(&counted, &[blob_hash])
+                .await
+                .expect("extended inline blob should load")
+                .into_vec(),
+            vec![Some(data)]
+        );
+        assert_eq!(
+            counted.chunk_get_many_calls.load(Ordering::Relaxed),
+            0,
+            "extended inline reads must finish from the manifest point read"
         );
     }
 
