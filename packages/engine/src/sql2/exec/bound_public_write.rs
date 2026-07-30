@@ -169,6 +169,67 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         }
         write_rows.append_taken_row(&mut row, 0);
     }
+    let committed = scan_entity_conflict_candidates(ctx, &spec, &write_rows).await?;
+    if !committed.is_empty() {
+        let committed_identities = committed
+            .iter()
+            .map(|row| {
+                (
+                    (
+                        row.entity_pk().clone(),
+                        row.file_id().map(SharedStr::from),
+                        SharedStr::from(row.branch_id()),
+                        row.global(),
+                    ),
+                    row.untracked(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        for (row_index, row) in write_rows.iter().enumerate() {
+            let entity_pk = row
+                .entity_pk
+                .expect("certified parameter INSERT rows have explicit identities");
+            let identity = (
+                entity_pk.clone(),
+                row.file_id.cloned(),
+                row.branch_id.clone(),
+                row.global,
+            );
+            let Some(existing_untracked) = committed_identities.get(&identity).copied() else {
+                continue;
+            };
+            let error = if existing_untracked != row.untracked {
+                let requested = if row.untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                let existing = if existing_untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
+                        row.schema_key, entity_pk,
+                    ),
+                )
+            } else {
+                LixError::new(
+                    LixError::CODE_UNIQUE,
+                    crate::transaction::duplicate_insert_identity_message(
+                        row.schema_key,
+                        entity_pk,
+                        Some(row.branch_id),
+                        row.origin,
+                    ),
+                )
+            };
+            return Err(with_parameter_batch_statement_index(error, row_index));
+        }
+    }
     stage_rows(ctx, TransactionWriteMode::Insert, write_rows)
         .await
         .map(|_| {

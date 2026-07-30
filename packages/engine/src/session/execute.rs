@@ -3914,6 +3914,43 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-a");
         assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-b");
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("c".to_string()),
+                        Value::Text("value-c".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("duplicate-b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the second INSERT conflicts with committed row b");
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+        let rows = session
+            .execute(
+                "SELECT id FROM parameter_insert_batch_probe WHERE id = 'c'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "the fresh prefix must roll back with the conflicting batch"
+        );
     }
 
     #[tokio::test]
