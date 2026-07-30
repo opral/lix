@@ -115,6 +115,23 @@ console.log(bytes && new TextDecoder().decode(bytes));
 await lix.close();
 ```
 
+## Discover the SQL contract
+
+Lix extends the standard `information_schema.columns` relation with
+`lix_value_kind` and `lix_insert_policy`. Inspect it before generating writes:
+
+```sql
+SELECT table_name, column_name, data_type, is_nullable, column_default,
+       lix_value_kind, lix_insert_policy
+FROM information_schema.columns
+WHERE table_name = 'lix_file'
+ORDER BY ordinal_position;
+```
+
+`lix_insert_policy` distinguishes `REQUIRED`, `DEFAULT`, `CONDITIONAL`, and
+`READ_ONLY` columns. For the complete table and history-function map, see
+[SQL Surfaces](https://lix.dev/docs/surfaces).
+
 ## Branches
 
 ```ts
