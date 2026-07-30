@@ -86,6 +86,48 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         crate::transaction::validation::fresh_plugin_file_import_certificate(&prepared_writes)
             .is_some()
             .then(|| prepared_writes.file_data_writes[0].file_id.clone());
+    let mut host_certified_file_schemas =
+        BTreeMap::<String, BTreeMap<String, BTreeSet<String>>>::new();
+    let mut host_certified_live_increments =
+        BTreeMap::<String, BTreeMap<(String, Option<String>), u64>>::new();
+    for file in &prepared_writes.file_data_writes {
+        for batch in file.certified_entity_batches().iter().filter(|batch| {
+            batch.complete_file_state && batch.format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+        }) {
+            let [schema_key] = batch.schema_keys.as_slice() else {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "host-certified packet batch must own exactly one schema",
+                ));
+            };
+            host_certified_file_schemas
+                .entry(file.branch_id.clone())
+                .or_default()
+                .entry(file.file_id.clone())
+                .or_default()
+                .extend(batch.schema_keys.iter().cloned());
+            let increments = host_certified_live_increments
+                .entry(file.branch_id.clone())
+                .or_default();
+            for scope in [
+                (schema_key.clone(), None),
+                (schema_key.clone(), Some(file.file_id.clone())),
+            ] {
+                let next = increments
+                    .get(&scope)
+                    .copied()
+                    .unwrap_or_default()
+                    .checked_add(batch.row_count)
+                    .ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            "host-certified collection live count exceeds u64",
+                        )
+                    })?;
+                increments.insert(scope, next);
+            }
+        }
+    }
     let mut writes = StorageWriteSet::new();
     let mut preconditions = Vec::new();
     for publication in &prepared_writes.checkpoint_publications {
@@ -122,6 +164,10 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     if !prepared_writes.file_data_writes.is_empty() {
         let mut blob_writer = binary_cas.writer_skipping_existing_chunks(&*read, &mut writes);
         for write in &prepared_writes.file_data_writes {
+            if !write.stage_payload_at_commit() {
+                debug_assert!(write.auxiliary_payloads().is_empty());
+                continue;
+            }
             blob_writer
                 .stage_file_payload(write.payload(), write.same_length_blob_splice())
                 .instrument(tracing::debug_span!(
@@ -272,6 +318,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &selected_change_payloads,
         &insert_selection,
         certified_fresh_plugin_file_id.as_deref(),
+        &host_certified_file_schemas,
+        &host_certified_live_increments,
         &explicit_branch_targets,
         &branch_control_observations,
         &checkpoint_epochs,
@@ -852,6 +900,24 @@ fn current_state_delta_from_state_row(
             crate::transaction::types::StageJson::slot_ref,
         ),
     })
+}
+
+fn host_certified_batch_owns_live_row(
+    row: PreparedStateRowRef<'_>,
+    branch_id: &str,
+    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) -> bool {
+    // A complete certified batch replaces only the incoming live rows. An
+    // ownership transition may stage tombstones for the previous plugin under
+    // the same file/schema pair; those must remain HOT overlays so the old
+    // entity identities disappear and collection counts are decremented.
+    row.snapshot.is_some()
+        && row.file_id.is_some_and(|file_id| {
+            host_certified_file_schemas
+                .get(branch_id)
+                .and_then(|files| files.get(file_id.as_str()))
+                .is_some_and(|schemas| schemas.contains(row.schema_key.as_str()))
+        })
 }
 
 impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
@@ -1678,6 +1744,8 @@ async fn stage_tracked_head(
     >,
     insert_selection: &PreparedInsertSelection,
     certified_fresh_plugin_file_id: Option<&str>,
+    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    host_certified_live_increments: &BTreeMap<String, BTreeMap<(String, Option<String>), u64>>,
     explicit_branch_targets: &BTreeMap<String, ExplicitBranchHeadTarget>,
     observations: &BTreeMap<String, BranchHeadControlObservation>,
     checkpoint_epochs: &BTreeMap<String, CommitId>,
@@ -1901,6 +1969,7 @@ async fn stage_tracked_head(
             .map(|epoch| epoch.coverage)
             .unwrap_or_default();
         let can_defer_fresh_hot = certified_fresh_plugin_file_id.is_some()
+            && !host_certified_live_increments.contains_key(&root.branch_id)
             && tracked_roots.len() == 1
             && state_row_indices.len() == state_rows.len()
             && staged.selected_change_batches.is_empty()
@@ -1954,6 +2023,14 @@ async fn stage_tracked_head(
             .entered();
             state_row_indices
                 .iter()
+                .filter(|&&row_index| {
+                    let row = state_rows.row(row_index);
+                    !host_certified_batch_owns_live_row(
+                        row,
+                        &root.branch_id,
+                        host_certified_file_schemas,
+                    )
+                })
                 .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -2007,6 +2084,26 @@ async fn stage_tracked_head(
                 .instrument(tracing::debug_span!(
                     target: "lix_perf",
                     "lix.perf.materialization.tracked_head.stage_checkpoint"
+                ))
+                .await?
+        } else if let Some(certified_live_increments) =
+            host_certified_live_increments.get(&root.branch_id)
+        {
+            let owned_absence_guards = owned_absence_guards(&absence_guards);
+            writer
+                .stage_current_state_with_certified_counts(
+                    &root.branch_id,
+                    Some(parent_generation),
+                    root.commit_id,
+                    &deltas,
+                    &owned_absence_guards,
+                    working_diff_capture_checkpoint_commit_id,
+                    &mut coverage,
+                    certified_live_increments,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_current_state"
                 ))
                 .await?
         } else if has_validated_insert_deltas {
@@ -3371,6 +3468,47 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[test]
+    fn host_certified_ownership_change_preserves_old_plugin_tombstone() {
+        let mut old_plugin_tombstone = tracked_branch_row("main", "old-plugin-delete");
+        old_plugin_tombstone.entity_pk = EntityPk::single("old-plugin-line");
+        old_plugin_tombstone.schema_key = "git_text_line_v2".into();
+        old_plugin_tombstone.file_id = Some("file-a".into());
+        old_plugin_tombstone.snapshot = None;
+
+        let mut new_plugin_live = tracked_branch_row("main", "new-plugin-create");
+        new_plugin_live.entity_pk = EntityPk::single("new-plugin-line");
+        new_plugin_live.schema_key = "git_text_line_v2".into();
+        new_plugin_live.file_id = Some("file-a".into());
+
+        let certified = BTreeMap::from([(
+            "main".to_string(),
+            BTreeMap::from([(
+                "file-a".to_string(),
+                BTreeSet::from(["git_text_line_v2".to_string()]),
+            )]),
+        )]);
+
+        assert!(
+            !host_certified_batch_owns_live_row(
+                old_plugin_tombstone.borrowed(),
+                "main",
+                &certified,
+            ),
+            "the previous owner's tombstone must remain in HOT publication",
+        );
+        assert!(
+            current_state_delta_from_state_row(old_plugin_tombstone.borrowed())
+                .expect("ownership tombstone should lower")
+                .deleted,
+            "the retained row must decrement collection counts as a deletion",
+        );
+        assert!(
+            host_certified_batch_owns_live_row(new_plugin_live.borrowed(), "main", &certified),
+            "the certified batch owns the replacement live row",
+        );
     }
 
     #[test]

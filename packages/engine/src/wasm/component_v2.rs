@@ -1561,6 +1561,11 @@ pub struct WasmCertifiedEntityBatch {
     pub pages: Vec<Bytes>,
 }
 
+/// Dense snapshot packets synthesized only after ordinary v2 guest output has
+/// completed host validation. Guest-emitted certified batches intentionally
+/// cannot claim this format.
+pub(crate) const HOST_CERTIFIED_PACKET_FORMAT: u16 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmEntityTransition {
     pub transition: WasmTransitionHandle,

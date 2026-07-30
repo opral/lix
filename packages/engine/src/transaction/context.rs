@@ -2066,12 +2066,20 @@ where
                 }
                 let file_data = file_data
                     .into_iter()
-                    .filter(|write| {
-                        let key = PluginFileWriteKey::from(write);
-                        !reconciliation.file_keys.contains(&key)
+                    .filter_map(|mut write| {
+                        let key = PluginFileWriteKey::from(&write);
+                        let retain_payload = !reconciliation.file_keys.contains(&key)
                             && !reconciliation.derived_materializations.contains_key(&key)
                             && (!write.is_empty()
-                                || reconciliation.materialized_file_keys.contains(&key))
+                                || reconciliation.materialized_file_keys.contains(&key));
+                        if retain_payload {
+                            return Some(write);
+                        }
+                        if write.certified_entity_batches().is_empty() {
+                            return None;
+                        }
+                        write.retain_certified_batches_only();
+                        Some(write)
                     })
                     .collect();
                 Ok((
@@ -3412,7 +3420,7 @@ where
                                 "lix.perf.plugin_open_file"
                             ))
                             .await?;
-                        let validated = drain_file_transition_changes(
+                        let mut validated = drain_file_transition_changes(
                             actor.as_mut(),
                             transition,
                             &schemas,
@@ -3423,6 +3431,11 @@ where
                             "lix.perf.plugin_open_file_drain"
                         ))
                         .await?;
+                        crate::plugin::certify_dense_v2_fresh_file(
+                            &mut validated,
+                            creates,
+                            &schemas,
+                        )?;
                         Ok((actor, validated))
                     });
                     PendingFreshPluginOpen {
@@ -4054,7 +4067,7 @@ where
                         "lix.perf.plugin_open_file"
                     ))
                     .await?;
-                let validated = drain_file_transition_changes(
+                let mut validated = drain_file_transition_changes(
                     actor.as_mut(),
                     transition,
                     &schemas,
@@ -4065,6 +4078,7 @@ where
                     "lix.perf.plugin_open_file_drain"
                 ))
                 .await?;
+                crate::plugin::certify_dense_v2_fresh_file(&mut validated, creates, &schemas)?;
                 let certified_row_count = validated
                     .certified_batches
                     .iter()
