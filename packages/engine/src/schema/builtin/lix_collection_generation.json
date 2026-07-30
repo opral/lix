@@ -1,0 +1,39 @@
+{
+  "x-lix-key": "lix_collection_generation",
+  "description": "Internal tracked control row selecting the active physical generation for one schema/file collection. This schema is intentionally hidden from generated entity SQL surfaces.",
+  "x-lix-primary-key": [
+    "/scope_key"
+  ],
+  "type": "object",
+  "properties": {
+    "scope_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Canonical JSON tuple [schema_key, file_id] used as the internal row identity."
+    },
+    "schema_key": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Schema whose rows are controlled by this generation."
+    },
+    "file_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Optional file scope. Null selects the whole schema collection."
+    },
+    "live_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of live logical rows in the selected generation."
+    }
+  },
+  "required": [
+    "schema_key",
+    "scope_key",
+    "file_id",
+    "live_count"
+  ],
+  "additionalProperties": false
+}

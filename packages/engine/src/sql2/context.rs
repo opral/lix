@@ -188,6 +188,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
 
     async fn load_branch_head(&mut self, branch_id: &str) -> Result<Option<CommitId>, LixError>;
 
+    async fn load_collection_generation(
+        &mut self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        Ok(None)
+    }
+
     async fn stage_write(
         &mut self,
         write: TransactionWrite,

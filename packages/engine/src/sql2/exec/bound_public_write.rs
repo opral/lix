@@ -706,9 +706,52 @@ async fn execute_entity_write(
             if no_op {
                 return Ok(empty_entity_delete_returning_result(plan));
             }
+            if matches!(surface, EntityWriteSurface::Base { .. })
+                && matches!(plan.bound.predicate, BoundPredicate::True)
+                && plan.bound.returning.is_none()
+                && let Some(result) = entity_delete_collection(ctx, &spec).await?
+            {
+                return Ok(result);
+            }
             entity_delete(ctx, plan, &spec, params, active_branch_commit_id.as_ref()).await
         }
     }
+}
+
+async fn entity_delete_collection(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    spec: &EntitySurfaceSpec,
+) -> Result<Option<SqlWriteResult>, LixError> {
+    use crate::collection_generation::{CollectionScopeRef, collection_delete_stage_row};
+
+    let scope = CollectionScopeRef {
+        schema_key: &spec.schema_key,
+        file_id: None,
+    };
+    let active_branch_id = ctx.active_branch_id().to_string();
+    let global = ctx
+        .load_collection_generation(crate::GLOBAL_BRANCH_ID, scope)
+        .await?;
+    // A visible active-branch collection can shadow global rows with the same
+    // identity. Per-branch counts cannot recover that union cardinality
+    // exactly, so preserve the row-wise route until the projection itself has
+    // a certified count.
+    if global.is_some_and(|global| global.live_count != 0) {
+        return Ok(None);
+    }
+    let Some(previous) = ctx
+        .load_collection_generation(&active_branch_id, scope)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if previous.live_count == 0 {
+        return Ok(Some(SqlWriteResult::affected(0)));
+    }
+    let mut rows = RawWriteBatch::with_capacity(1);
+    rows.push(collection_delete_stage_row(&active_branch_id, scope));
+    stage_rows(ctx, TransactionWriteMode::Replace, rows).await?;
+    Ok(Some(SqlWriteResult::affected(previous.live_count)))
 }
 
 fn plan_references_active_branch_commit_id(plan: &LogicalWritePlan) -> bool {

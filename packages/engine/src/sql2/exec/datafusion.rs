@@ -2398,7 +2398,7 @@ mod tests {
     use crate::transaction::types::{
         TransactionWrite, TransactionWriteOutcome, TransactionWriteRow,
     };
-    use crate::{Engine, ExecuteResult, SessionContext};
+    use crate::{CreateBranchOptions, Engine, ExecuteResult, MergeBranchOptions, SessionContext};
     use crate::{LixError, NullableKeyFilter, Value};
     use bytes::Bytes;
     use datafusion::common::ScalarValue;
@@ -3702,6 +3702,345 @@ mod tests {
                 )
             })?;
         Ok((session, head_commit_id))
+    }
+
+    #[tokio::test]
+    async fn whole_entity_collection_delete_uses_one_generation_fact_and_allows_recreation() {
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let branch_id = init_receipt.main_branch_id.clone();
+        let session = engine
+            .open_session(init_receipt.main_branch_id)
+            .await
+            .expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"id\",\"value\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("test schema should register");
+        session
+            .execute(
+                "INSERT INTO test_state_schema (id, value) VALUES \
+                 ('a', 'A'), ('b', 'B'), ('c', 'C')",
+                &[],
+            )
+            .await
+            .expect("test rows should insert");
+        let before_delete = engine
+            .load_branch_head_commit_id(&branch_id)
+            .await
+            .expect("head before delete should load")
+            .expect("head before delete should exist");
+
+        let deleted = session
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("whole collection should delete");
+        assert_eq!(deleted.rows_affected(), 3);
+        let after_delete = engine
+            .load_branch_head_commit_id(&branch_id)
+            .await
+            .expect("head after delete should load")
+            .expect("head after delete should exist");
+        let diff = session
+            .execute(
+                &format!(
+                    "SELECT schema_key, diff_type FROM lix_diff('{before_delete}', '{after_delete}')"
+                ),
+                &[],
+            )
+            .await
+            .expect("collection delete diff should query");
+        assert_eq!(
+            rows_from_execute_result(diff).1,
+            vec![vec![
+                Value::Text("lix_collection_generation".to_string()),
+                Value::Text("added".to_string())
+            ]]
+        );
+        let marker_changes = session
+            .execute(
+                "SELECT COUNT(*) AS changes FROM lix_change \
+                 WHERE schema_key = 'lix_collection_generation'",
+                &[],
+            )
+            .await
+            .expect("collection marker changelog should query")
+            .rows()[0]
+            .get::<i64>("changes")
+            .expect("marker count should be numeric");
+        assert_eq!(marker_changes, 1);
+        let expanded_tombstones = session
+            .execute(
+                "SELECT COUNT(*) AS changes FROM lix_change \
+                 WHERE schema_key = 'test_state_schema' AND snapshot_content IS NULL",
+                &[],
+            )
+            .await
+            .expect("entity tombstone changelog should query")
+            .rows()[0]
+            .get::<i64>("changes")
+            .expect("tombstone count should be numeric");
+        assert_eq!(expanded_tombstones, 0);
+        let selected = session
+            .execute("SELECT id FROM test_state_schema ORDER BY id", &[])
+            .await
+            .expect("deleted collection should remain queryable");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+        session
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should preserve a collection generation delete");
+        let selected = session
+            .execute("SELECT id FROM test_state_schema ORDER BY id", &[])
+            .await
+            .expect("checkpointed deleted collection should query");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+        let checkout = session
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "after-generation-delete".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("branching from the deleted collection should succeed");
+        let checkout_session = engine
+            .open_session(checkout.id)
+            .await
+            .expect("checkout branch session should open");
+        let selected = checkout_session
+            .execute("SELECT id FROM test_state_schema ORDER BY id", &[])
+            .await
+            .expect("branch created from the deleted generation should query");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+
+        session
+            .execute(
+                "INSERT INTO test_state_schema (id, value) VALUES ('a', 'A2')",
+                &[],
+            )
+            .await
+            .expect("a retired-generation identity should be reusable");
+        let selected = session
+            .execute("SELECT id, value FROM test_state_schema", &[])
+            .await
+            .expect("recreated generation should be visible");
+        assert_eq!(
+            rows_from_execute_result(selected).1,
+            vec![vec![
+                Value::Text("a".to_string()),
+                Value::Text("A2".to_string())
+            ]]
+        );
+
+        let deleted = session
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("recreated collection should delete");
+        assert_eq!(deleted.rows_affected(), 1);
+    }
+
+    #[tokio::test]
+    async fn whole_entity_collection_delete_is_visible_inside_explicit_transaction() {
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_branch_id)
+            .await
+            .expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                 VALUES (\
+                 lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+                 false,\
+                 false\
+                 )",
+                &[],
+            )
+            .await
+            .expect("test schema should register");
+        session
+            .execute(
+                "INSERT INTO test_state_schema (id) VALUES ('a'), ('b')",
+                &[],
+            )
+            .await
+            .expect("test rows should insert");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("explicit transaction should open");
+        let deleted = transaction
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("collection delete should stage");
+        assert_eq!(deleted.rows_affected(), 2);
+        let selected = transaction
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("staged collection delete should be visible");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+        let deleted_again = transaction
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("repeated staged collection delete should be a no-op");
+        assert_eq!(deleted_again.rows_affected(), 0);
+        let recreate_error = transaction
+            .execute(
+                "INSERT INTO test_state_schema (id) VALUES ('next-generation')",
+                &[],
+            )
+            .await
+            .expect_err("recreation should require the deletion commit boundary");
+        assert_eq!(recreate_error.code, LixError::CODE_CONSTRAINT_VIOLATION);
+        assert_eq!(
+            recreate_error.hint.as_deref(),
+            Some("Commit the collection deletion before recreating rows in its next generation.")
+        );
+        transaction
+            .commit()
+            .await
+            .expect("collection delete should commit");
+    }
+
+    #[tokio::test]
+    async fn whole_entity_collection_delete_falls_back_for_global_members() {
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let session = engine
+            .open_session(init_receipt.main_branch_id)
+            .await
+            .expect("session should open");
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value, lixcol_global) VALUES \
+                 ('local-only', lix_json('1'), false), \
+                 ('global-only', lix_json('2'), true), \
+                 ('shadowed', lix_json('3'), true), \
+                 ('shadowed', lix_json('4'), false)",
+                &[],
+            )
+            .await
+            .expect("local, global, and shadowing rows should insert");
+        let visible_before = session
+            .execute("SELECT COUNT(*) AS count FROM lix_key_value", &[])
+            .await
+            .expect("visible collection count should query")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("visible collection count should be numeric");
+
+        let deleted = session
+            .execute("DELETE FROM lix_key_value", &[])
+            .await
+            .expect("mixed global collection should delete through row fallback");
+        assert_eq!(deleted.rows_affected(), visible_before as u64);
+        let marker_count = session
+            .execute(
+                "SELECT COUNT(*) AS count FROM lix_change \
+                 WHERE schema_key = 'lix_collection_generation'",
+                &[],
+            )
+            .await
+            .expect("marker count should query")
+            .rows()[0]
+            .get::<i64>("count")
+            .expect("marker count should be numeric");
+        assert_eq!(marker_count, 0);
+    }
+
+    #[tokio::test]
+    async fn merge_applies_collection_generation_delete_without_expanding_members() {
+        let storage = Memory::new();
+        let init_receipt = Engine::initialize(storage.clone())
+            .await
+            .expect("engine should initialize");
+        let engine = Engine::new(storage).await.expect("engine should open");
+        let main = engine
+            .open_session(init_receipt.main_branch_id)
+            .await
+            .expect("main session should open");
+        main.execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+             VALUES (\
+             lix_json('{\"x-lix-key\":\"test_state_schema\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false,\"x-lix-primary-key\":[\"/id\"]}'),\
+             false,\
+             false\
+             )",
+            &[],
+        )
+        .await
+        .expect("test schema should register");
+        main.execute(
+            "INSERT INTO test_state_schema (id) VALUES ('a'), ('b'), ('c')",
+            &[],
+        )
+        .await
+        .expect("test rows should insert");
+        let source = main
+            .create_branch(CreateBranchOptions {
+                id: None,
+                name: "delete-source".to_string(),
+                from_commit_id: None,
+            })
+            .await
+            .expect("source branch should create");
+        let source_session = engine
+            .open_session(source.id.clone())
+            .await
+            .expect("source session should open");
+        let deleted = source_session
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("source collection should delete");
+        assert_eq!(deleted.rows_affected(), 3);
+
+        let before_merge = main
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("target collection should query before merge");
+        assert_eq!(rows_from_execute_result(before_merge).1.len(), 3);
+        main.merge_branch(MergeBranchOptions {
+            source_branch_id: source.id,
+        })
+        .await
+        .expect("collection delete should merge");
+        let after_merge = main
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("target collection should query after merge");
+        assert!(rows_from_execute_result(after_merge).1.is_empty());
+
+        let expanded_tombstones = main
+            .execute(
+                "SELECT COUNT(*) AS changes FROM lix_change \
+                 WHERE schema_key = 'test_state_schema' AND snapshot_content IS NULL",
+                &[],
+            )
+            .await
+            .expect("merged entity tombstones should query")
+            .rows()[0]
+            .get::<i64>("changes")
+            .expect("tombstone count should be numeric");
+        assert_eq!(expanded_tombstones, 0);
     }
 
     #[tokio::test]

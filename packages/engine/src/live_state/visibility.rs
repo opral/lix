@@ -35,6 +35,19 @@ pub(crate) trait StagedLiveStateRows {
         &self,
         request: &LiveStateExactBatchRequest,
     ) -> Result<MaterializedLiveStateExactBatch, LixError>;
+
+    /// Whether this transaction has replaced the requested collection with a
+    /// generation marker. Collection replacement suppresses committed members
+    /// without expanding them into staged row tombstones.
+    fn collection_replaced(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        file_id: Option<&str>,
+    ) -> Result<bool, LixError> {
+        let _ = (branch_id, schema_key, file_id);
+        Ok(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,6 +101,20 @@ pub(crate) async fn overlay_scan_batch<S>(
 where
     S: StagedLiveStateRows + ?Sized,
 {
+    if let [schema_key] = request.filter.schema_keys.as_slice()
+        && request
+            .filter
+            .branch_ids
+            .iter()
+            .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
+            .try_fold(false, |replaced, branch_id| {
+                Ok::<_, LixError>(
+                    replaced || staged.collection_replaced(branch_id, schema_key, None)?,
+                )
+            })?
+    {
+        return Ok(MaterializedLiveStateBatch::default());
+    }
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
     candidate_request.filter.include_tombstones = true;
@@ -205,6 +232,16 @@ where
     for (slot, (requested, (global_index, branch_index))) in
         request.rows.iter().zip(staged_indices).enumerate()
     {
+        if requested.branch_id != GLOBAL_BRANCH_ID
+            && staged.collection_replaced(
+                &requested.branch_id,
+                &requested.schema_key,
+                requested.file_id.as_deref(),
+            )?
+        {
+            slots.push(None);
+            continue;
+        }
         let mut winner = base_rows.row(slot).map(|row| {
             let tier = if row.global() {
                 OverlayTier::BaseGlobal

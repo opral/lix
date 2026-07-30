@@ -30,6 +30,7 @@ use super::*;
 pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v17";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
+pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
 /// Conservative `(branch, generation, schema)` file-membership markers.
@@ -42,6 +43,10 @@ pub(crate) const HOT_FILE_SPACE: StorageSpace =
 /// Reserved for the row-level first-before working-diff index.
 pub(crate) const HOT_DIFF_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
+pub(crate) const HOT_COLLECTION_CONTROL_SPACE: StorageSpace = StorageSpace::new(
+    StorageSpaceId(0x0004_0023),
+    HOT_COLLECTION_CONTROL_NAMESPACE,
+);
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
 const HOT_DIFF_SEGMENT_VERSION: u8 = 1;
@@ -1573,6 +1578,359 @@ impl<'a> CertifiedCsvReader<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, musli::Encode, musli::Decode)]
+#[musli(packed)]
+struct HotCollectionControl {
+    active_generation: CommitId,
+    live_count: u64,
+}
+
+fn hot_collection_control_key(
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+) -> Vec<u8> {
+    let mut key = hot_scope_prefix(branch_id, branch_generation);
+    write_key_string(&mut key, scope.schema_key, KEY_PART_FINAL);
+    write_file_id(&mut key, scope.file_id);
+    key
+}
+
+async fn load_hot_collection_control(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+) -> Result<HotCollectionControl, LixError> {
+    let key = StorageKey(Bytes::from(hot_collection_control_key(
+        branch_id,
+        branch_generation,
+        scope,
+    )));
+    let value = PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &[key])
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value
+        .into_iter()
+        .next()
+        .flatten();
+    value.map_or(
+        Ok(HotCollectionControl {
+            active_generation: branch_generation,
+            live_count: 0,
+        }),
+        |value| {
+            let StorageProjectedValue::FullValue(bytes) = value else {
+                return Err(head_value_error(
+                    "hot collection-control read unexpectedly omitted its value",
+                ));
+            };
+            storage_codec::decode("hot collection control", &bytes)
+        },
+    )
+}
+
+async fn load_hot_collection_controls(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    scopes: &[crate::collection_generation::CollectionScopeRef<'_>],
+) -> Result<Vec<HotCollectionControl>, LixError> {
+    if scopes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let keys = scopes
+        .iter()
+        .copied()
+        .map(|scope| {
+            StorageKey(Bytes::from(hot_collection_control_key(
+                branch_id,
+                branch_generation,
+                scope,
+            )))
+        })
+        .collect::<Vec<_>>();
+    PointReadPlan::new(HOT_COLLECTION_CONTROL_SPACE, &keys)
+        .materialize(store, StorageGetOptions::default())
+        .await?
+        .value
+        .into_iter()
+        .map(|value| {
+            value.map_or(
+                Ok(HotCollectionControl {
+                    active_generation: branch_generation,
+                    live_count: 0,
+                }),
+                |value| {
+                    let StorageProjectedValue::FullValue(bytes) = value else {
+                        return Err(head_value_error(
+                            "hot collection-control batch read unexpectedly omitted its value",
+                        ));
+                    };
+                    storage_codec::decode("hot collection control", &bytes)
+                },
+            )
+        })
+        .collect()
+}
+
+fn stage_hot_collection_control(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    scope: crate::collection_generation::CollectionScopeRef<'_>,
+    control: HotCollectionControl,
+) -> Result<(), LixError> {
+    writes.put(
+        HOT_COLLECTION_CONTROL_SPACE,
+        StorageKey(Bytes::from(hot_collection_control_key(
+            branch_id,
+            branch_generation,
+            scope,
+        ))),
+        StorageValue {
+            bytes: Bytes::from(storage_codec::encode("hot collection control", &control)?),
+        },
+    );
+    Ok(())
+}
+
+async fn load_incremental_collection_controls(
+    store: &(impl StorageAdapterRead + ?Sized),
+    branch_id: &str,
+    branch_generation: CommitId,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+) -> Result<BTreeMap<(String, Option<String>), HotCollectionControl>, LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_entity_pk,
+    };
+
+    let mut owned_scopes = BTreeSet::<(String, Option<String>)>::new();
+    for delta in deltas {
+        if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+            owned_scopes.insert(collection_scope_from_entity_pk(delta.entity_pk)?);
+            continue;
+        }
+        owned_scopes.insert((delta.schema_key.to_string(), None));
+        if let Some(file_id) = delta.file_id {
+            owned_scopes.insert((delta.schema_key.to_string(), Some(file_id.to_string())));
+        }
+    }
+    if owned_scopes.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let scopes = owned_scopes
+        .iter()
+        .map(|(schema_key, file_id)| CollectionScopeRef {
+            schema_key,
+            file_id: file_id.as_deref(),
+        })
+        .collect::<Vec<_>>();
+    let controls =
+        load_hot_collection_controls(store, branch_id, branch_generation, &scopes).await?;
+    Ok(scopes
+        .iter()
+        .copied()
+        .zip(controls)
+        .map(|(scope, control)| {
+            (
+                (
+                    scope.schema_key.to_string(),
+                    scope.file_id.map(str::to_string),
+                ),
+                control,
+            )
+        })
+        .collect())
+}
+
+fn stage_incremental_collection_controls(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    deltas: &[&CurrentStateDeltaRef<'_>],
+    previous_values: &[Option<Bytes>],
+    mut controls: BTreeMap<(String, Option<String>), HotCollectionControl>,
+) -> Result<(), LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_entity_pk,
+    };
+    for (delta, previous) in deltas.iter().zip(previous_values) {
+        if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+            let scope = collection_scope_from_entity_pk(delta.entity_pk)?;
+            let control = controls
+                .get_mut(&scope)
+                .expect("collection marker target was loaded above");
+            if delta.deleted {
+                return Err(head_value_error(
+                    "collection-generation controls cannot be tombstoned",
+                ));
+            }
+            control.active_generation = delta.commit_id.ok_or_else(|| {
+                head_value_error("tracked collection-generation row lacks commit_id")
+            })?;
+            control.live_count = 0;
+            continue;
+        }
+
+        let previous_live = previous
+            .as_deref()
+            .map(decode_head_value)
+            .transpose()?
+            .is_some_and(|value| !value.deleted);
+        let schema_control = controls
+            .get(&(delta.schema_key.to_string(), None))
+            .expect("row schema collection scope was loaded above");
+        let belongs_to_active_generation = schema_control.active_generation == branch_generation
+            || delta
+                .commit_id
+                .is_some_and(|commit_id| commit_id > schema_control.active_generation);
+        let next_live = !delta.deleted && belongs_to_active_generation;
+        if previous_live == next_live {
+            continue;
+        }
+        for scope in [
+            Some((delta.schema_key.to_string(), None)),
+            delta
+                .file_id
+                .map(|file_id| (delta.schema_key.to_string(), Some(file_id.to_string()))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let control = controls
+                .get_mut(&scope)
+                .expect("row collection scope was loaded above");
+            control.live_count = if next_live {
+                control
+                    .live_count
+                    .checked_add(1)
+                    .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?
+            } else {
+                control
+                    .live_count
+                    .checked_sub(1)
+                    .ok_or_else(|| head_value_error("hot collection live count underflow"))?
+            };
+        }
+    }
+
+    for ((schema_key, file_id), control) in controls {
+        stage_hot_collection_control(
+            writes,
+            branch_id,
+            branch_generation,
+            CollectionScopeRef {
+                schema_key: &schema_key,
+                file_id: file_id.as_deref(),
+            },
+            control,
+        )?;
+    }
+    Ok(())
+}
+
+fn stage_complete_collection_controls(
+    writes: &mut StorageWriteSet,
+    branch_id: &str,
+    branch_generation: CommitId,
+    rows: &HotRowMap,
+) -> Result<(), LixError> {
+    use crate::collection_generation::{
+        COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_entity_pk,
+    };
+
+    let mut controls = BTreeMap::<(String, Option<String>), HotCollectionControl>::new();
+    for (identity, bytes) in rows {
+        if identity.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+            let target = collection_scope_from_entity_pk(&identity.entity_pk)?;
+            let marker = decode_head_value(bytes)?;
+            let active_generation = marker.commit_id.ok_or_else(|| {
+                head_value_error("tracked collection-generation row lacks commit_id")
+            })?;
+            controls.insert(
+                target,
+                HotCollectionControl {
+                    active_generation,
+                    live_count: 0,
+                },
+            );
+            continue;
+        }
+        controls
+            .entry((identity.schema_key.clone(), None))
+            .or_insert(HotCollectionControl {
+                active_generation: branch_generation,
+                live_count: 0,
+            });
+        if let Some(file_id) = &identity.file_id {
+            controls
+                .entry((identity.schema_key.clone(), Some(file_id.clone())))
+                .or_insert(HotCollectionControl {
+                    active_generation: branch_generation,
+                    live_count: 0,
+                });
+        }
+    }
+
+    for (identity, bytes) in rows {
+        if identity.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
+            continue;
+        }
+        let value = decode_head_value(bytes)?;
+        if value.deleted {
+            continue;
+        }
+        let schema_scope = (identity.schema_key.clone(), None);
+        let schema_control = controls
+            .get(&schema_scope)
+            .expect("complete row schema control was initialized above");
+        let visible_after_schema_generation = schema_control.active_generation == branch_generation
+            || value
+                .commit_id
+                .is_some_and(|commit_id| commit_id > schema_control.active_generation);
+        let file_scope = identity
+            .file_id
+            .as_ref()
+            .map(|file_id| (identity.schema_key.clone(), Some(file_id.clone())));
+        let visible_after_file_generation = file_scope
+            .as_ref()
+            .and_then(|scope| controls.get(scope))
+            .is_none_or(|control| {
+                control.active_generation == branch_generation
+                    || value
+                        .commit_id
+                        .is_some_and(|commit_id| commit_id > control.active_generation)
+            });
+        if !visible_after_schema_generation || !visible_after_file_generation {
+            continue;
+        }
+        for scope in [Some(schema_scope), file_scope].into_iter().flatten() {
+            let control = controls
+                .get_mut(&scope)
+                .expect("complete row collection control was initialized above");
+            control.live_count = control
+                .live_count
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+        }
+    }
+
+    for ((schema_key, file_id), control) in controls {
+        stage_hot_collection_control(
+            writes,
+            branch_id,
+            branch_generation,
+            CollectionScopeRef {
+                schema_key: &schema_key,
+                file_id: file_id.as_deref(),
+            },
+            control,
+        )?;
+    }
+    Ok(())
+}
+
 /// Direct reader for one published hot generation.
 pub(crate) struct HotStateStoreReader<S> {
     pub(super) store: S,
@@ -1582,6 +1940,22 @@ impl<S> HotStateStoreReader<S>
 where
     S: StorageAdapterRead,
 {
+    pub(crate) async fn collection_generation(
+        &self,
+        branch_id: &str,
+        branch_generation: CommitId,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<crate::collection_generation::CollectionGeneration, LixError> {
+        load_hot_collection_control(&self.store, branch_id, branch_generation, scope)
+            .await
+            .map(
+                |control| crate::collection_generation::CollectionGeneration {
+                    active_generation: control.active_generation,
+                    live_count: control.live_count,
+                },
+            )
+    }
+
     pub(crate) async fn scan_live_batch(
         &self,
         branch_id: &str,
@@ -1714,6 +2088,30 @@ where
         generation: CommitId,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
+        let collection_control = match request.filter.schema_keys.as_slice() {
+            [schema_key]
+                if schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY =>
+            {
+                Some(
+                    load_hot_collection_control(
+                        &self.store,
+                        branch_id,
+                        generation,
+                        crate::collection_generation::CollectionScopeRef {
+                            schema_key,
+                            file_id: None,
+                        },
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+        let replaced_generation =
+            collection_control.filter(|control| control.active_generation != generation);
+        if replaced_generation.is_some_and(|control| control.live_count == 0) {
+            return Ok(MaterializedLiveStateBatch::default());
+        }
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
         // would therefore let one tombstone hide a later live row.
@@ -1765,11 +2163,20 @@ where
             combined.extend(certified_rows.into_rows());
             MaterializedLiveStateBatch::from_rows(combined)
         };
-        if request.filter.include_tombstones && request.limit.is_none() {
+        if request.filter.include_tombstones
+            && request.limit.is_none()
+            && replaced_generation.is_none()
+        {
             return Ok(rows);
         }
         Ok(rows.filter(
-            |row| request.filter.include_tombstones || !row.deleted(),
+            |row| {
+                let in_active_generation = replaced_generation.is_none_or(|control| {
+                    row.commit_id()
+                        .is_some_and(|commit_id| commit_id > control.active_generation)
+                });
+                in_active_generation && (request.filter.include_tombstones || !row.deleted())
+            },
             request.limit,
         ))
     }
@@ -1855,7 +2262,52 @@ where
         if keys.is_empty() {
             return Ok(MaterializedLiveStateExactBatch::default());
         }
-        let values = hot_load_identity_ref_bytes(&self.store, branch_id, generation, keys).await?;
+        let replaced_generation = keys
+            .first()
+            .filter(|first| keys.iter().all(|key| key.schema_key == first.schema_key))
+            .filter(|first| {
+                first.schema_key != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            })
+            .map(|first| async {
+                load_hot_collection_control(
+                    &self.store,
+                    branch_id,
+                    generation,
+                    crate::collection_generation::CollectionScopeRef {
+                        schema_key: first.schema_key,
+                        file_id: None,
+                    },
+                )
+                .await
+            });
+        let replaced_generation = match replaced_generation {
+            Some(control) => {
+                let control = control.await?;
+                (control.active_generation != generation).then_some(control)
+            }
+            None => None,
+        };
+        if replaced_generation.is_some_and(|control| control.live_count == 0) {
+            return MaterializedLiveStateExactBatch::new(
+                MaterializedLiveStateBatch::default(),
+                vec![None; keys.len()],
+            );
+        }
+        let mut values =
+            hot_load_identity_ref_bytes(&self.store, branch_id, generation, keys).await?;
+        if let Some(control) = replaced_generation {
+            for value in &mut values {
+                let visible = value
+                    .as_deref()
+                    .map(decode_head_value)
+                    .transpose()?
+                    .and_then(|value| value.commit_id)
+                    .is_some_and(|commit_id| commit_id > control.active_generation);
+                if !visible {
+                    *value = None;
+                }
+            }
+        }
         let mut slots = Vec::with_capacity(values.len());
         let mut entries = Vec::with_capacity(values.iter().flatten().count());
         for (identity, value) in keys.iter().copied().zip(values) {
@@ -1870,7 +2322,9 @@ where
         if slots.iter().all(Option::is_some) {
             return MaterializedLiveStateExactBatch::new(rows, slots);
         }
-        if keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
+        if replaced_generation.is_some()
+            || keys.iter().all(|key| key.schema_key.starts_with("lix_"))
+        {
             return MaterializedLiveStateExactBatch::new(rows, slots);
         }
 
@@ -2032,6 +2486,21 @@ where
         if matches!(limit, Some(0)) {
             return Ok(Vec::new());
         }
+        let collection_control = load_hot_collection_control(
+            &self.store,
+            branch_id,
+            generation,
+            crate::collection_generation::CollectionScopeRef {
+                schema_key,
+                file_id: None,
+            },
+        )
+        .await?;
+        let replaced_generation =
+            (collection_control.active_generation != generation).then_some(collection_control);
+        if replaced_generation.is_some_and(|control| control.live_count == 0) {
+            return Ok(Vec::new());
+        }
         let use_finite_batch = !entity_pks.is_empty()
             && !hot_schema_has_file_member(&self.store, branch_id, generation, schema_key).await?;
         let fallback_filter = (!use_finite_batch).then(|| TrackedStateFilter {
@@ -2069,7 +2538,13 @@ where
         let mut deferred = Vec::new();
         for bytes in hot_scan_values_in_logical_order(entries) {
             let value = decode_head_value(&bytes)?;
-            if value.deleted {
+            if value.deleted
+                || replaced_generation.is_some_and(|control| {
+                    value
+                        .commit_id
+                        .is_none_or(|commit_id| commit_id <= control.active_generation)
+                })
+            {
                 continue;
             }
             let row_index = snapshots.len();
@@ -2448,7 +2923,7 @@ where
         ))
         .await?;
         let mut loaded_previous_values = loaded_previous_values.into_iter();
-        let previous_values = sorted
+        let mut previous_values = sorted
             .iter()
             .map(|delta| {
                 if hot_delta_is_guarded_by_absent_file(
@@ -2465,6 +2940,30 @@ where
             })
             .collect::<Vec<_>>();
         debug_assert_eq!(loaded_previous_values.len(), 0);
+        let collection_controls =
+            load_incremental_collection_controls(self.store, branch_id, generation, &sorted)
+                .await?;
+        for (delta, previous) in sorted.iter().zip(&mut previous_values) {
+            if delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
+                continue;
+            }
+            let Some(control) = collection_controls.get(&(delta.schema_key.to_string(), None))
+            else {
+                continue;
+            };
+            if control.active_generation == generation {
+                continue;
+            }
+            let belongs_to_retired_generation = previous
+                .as_deref()
+                .map(decode_head_value)
+                .transpose()?
+                .and_then(|value| value.commit_id)
+                .is_none_or(|commit_id| commit_id <= control.active_generation);
+            if belongs_to_retired_generation {
+                *previous = None;
+            }
+        }
         let mut created_ats = Vec::with_capacity(sorted.len());
         let mut retired_untracked_json_refs = BTreeSet::new();
         for (delta, previous) in sorted.iter().zip(&previous_values) {
@@ -2612,6 +3111,14 @@ where
             }
         }
         let next_value_bytes = Bytes::from(next_value_bytes);
+        stage_incremental_collection_controls(
+            self.writes,
+            branch_id,
+            generation,
+            &sorted,
+            &previous_values,
+            collection_controls,
+        )?;
 
         let _stage_span = tracing::debug_span!(
             target: "lix_perf",
@@ -2720,6 +3227,7 @@ where
             }
         }
 
+        stage_complete_collection_controls(self.writes, branch_id, generation, &rows)?;
         stage_complete_hot_rows(self.writes, branch_id, generation, rows);
         JsonStoreWriter::stage_untracked_reclaim_candidates(
             self.writes,
@@ -3919,6 +4427,7 @@ fn stage_hot_bootstrap(
             );
         }
     }
+    stage_complete_collection_controls(writes, branch_id, generation, &rows)?;
     stage_complete_hot_rows(writes, branch_id, generation, rows);
     JsonStoreWriter::stage_untracked_reclaim_candidates(
         writes,
@@ -5740,10 +6249,60 @@ where
         &mut stale_untracked_refs,
     )
     .await?;
+    stage_collect_stale_hot_collection_controls(store, writes, &active).await?;
     Ok(stale_untracked_refs
         .into_iter()
         .map(JsonRef::from_hash_bytes)
         .collect())
+}
+
+fn decode_hot_collection_control_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
+    let mut offset = 0;
+    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot collection-control branch id has an invalid terminator",
+        ));
+    }
+    let generation = read_generation(bytes, &mut offset)?;
+    Ok((branch_id, generation))
+}
+
+async fn stage_collect_stale_hot_collection_controls(
+    store: &(impl StorageAdapterRead + ?Sized),
+    writes: &mut StorageWriteSet,
+    active: &BTreeSet<(String, CommitId)>,
+) -> Result<(), LixError> {
+    let plan = ScanPlan::prefix(
+        HOT_COLLECTION_CONTROL_SPACE,
+        StoragePrefix {
+            bytes: Bytes::new(),
+        },
+    );
+    let mut resume_after = None;
+    loop {
+        let page = plan
+            .collect(
+                store,
+                StorageScanOptions {
+                    resume_after: resume_after.clone(),
+                    ..StorageScanOptions::default()
+                },
+            )
+            .await?;
+        resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+        for entry in page.value.entries {
+            let keep = decode_hot_collection_control_scope(entry.key.0.as_ref())
+                .is_ok_and(|scope| active.contains(&scope));
+            if !keep {
+                writes.delete(HOT_COLLECTION_CONTROL_SPACE, entry.key);
+            }
+        }
+        if !page.value.has_more || resume_after.is_none() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 async fn stage_collect_stale_hot_space(
