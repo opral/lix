@@ -1374,6 +1374,32 @@ pub(crate) async fn validate_certified_tracked_insert_identities(
     live_state: &dyn LiveStateReader,
     prepared_writes: &PreparedWriteSet,
 ) -> Result<(), LixError> {
+    let mut inserts = prepared_writes
+        .insert_selection
+        .iter(&prepared_writes.state_rows);
+    if let Some(first) = inserts.next()
+        && inserts.all(|insert| {
+            insert.row.branch_id == first.row.branch_id
+                && insert.row.schema_key == first.row.schema_key
+                && insert.row.file_id == first.row.file_id
+        })
+    {
+        let scope = crate::collection_generation::CollectionScopeRef {
+            schema_key: first.row.schema_key,
+            file_id: first.row.file_id.map(crate::common::SharedStr::as_str),
+        };
+        if live_state
+            .collection_generation(first.row.branch_id, scope)
+            .await?
+            .is_some_and(|generation| generation.live_count == 0)
+        {
+            // This proof comes from the exact coherent read used to resolve
+            // commit parents and branch-control preconditions. A concurrent
+            // insert before the read makes the count nonzero; one after the
+            // read invalidates the publication CAS.
+            return Ok(());
+        }
+    }
     validate_committed_insert_identity_entries(
         live_state,
         prepared_writes

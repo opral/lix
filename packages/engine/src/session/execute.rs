@@ -3973,6 +3973,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn certified_empty_batch_rechecks_concurrent_insert_at_commit_snapshot() {
+        let storage = Memory::default();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("initialized storage should create engine");
+        let setup = engine.open_workspace_session().await.unwrap();
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "concurrent_parameter_insert_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        setup
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let first = engine.open_workspace_session().await.unwrap();
+        let second = engine.open_workspace_session().await.unwrap();
+        let sql = "INSERT INTO concurrent_parameter_insert_probe (id, value) VALUES ($1, $2)";
+        let first_statements = [
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("first-only".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+            ExecuteBatchStatement {
+                sql: sql.to_string(),
+                params: vec![
+                    Value::Text("shared".to_string()),
+                    Value::Text("first".to_string()),
+                ],
+            },
+        ];
+        let parsed = TransactionBatchStatements::Shared {
+            statement: sql2::parse_statement(sql).unwrap(),
+            len: first_statements.len(),
+        };
+        let mut first_transaction = first.begin_transaction().await.unwrap();
+        let staged = try_execute_transaction_parameter_batch(
+            first_transaction.transaction_mut().unwrap(),
+            &first_statements,
+            &parsed,
+            &ExecuteOptions::default(),
+            &vec![ExecuteStatementMetadata::default(); first_statements.len()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            staged.is_some(),
+            "first batch should take the certified route"
+        );
+
+        second
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("second-only".to_string()),
+                        Value::Text("second".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("shared".to_string()),
+                        Value::Text("second".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect("concurrent batch should commit first");
+
+        let error = first_transaction
+            .commit()
+            .await
+            .expect_err("commit snapshot must observe the concurrent identity");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        let rows = second
+            .execute(
+                "SELECT value FROM concurrent_parameter_insert_probe WHERE id = 'shared'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "second");
+    }
+
+    #[tokio::test]
     async fn execute_batch_declines_uncertified_entity_insert_rows() {
         let session = open_session().await;
         let schema = serde_json::json!({

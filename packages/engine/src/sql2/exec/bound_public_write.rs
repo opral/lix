@@ -162,8 +162,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     }
     drop(unique_identities);
     drop(certification_span);
-    let collection_was_empty = collection_is_certifiably_empty(ctx, &spec.schema_key).await?;
-    let committed = if collection_was_empty {
+    let committed = if collection_is_certifiably_empty(ctx, &spec.schema_key).await? {
         MaterializedLiveStateBatch::default()
     } else {
         scan_entity_conflict_candidates(ctx, &spec, &write_rows)
@@ -245,17 +244,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     };
     drop(conflict_attribution_span);
     drop(committed);
-    // The empty-collection certificate proves both committed and staged
-    // absence for every row in this homogeneous batch. Staging it as a
-    // replacement preserves the resulting state and changelog while avoiding
-    // a second O(rows log rows) committed-identity proof at transaction commit.
-    // The transaction's branch-head guard still rejects a concurrent change.
-    let stage_mode = if collection_was_empty {
-        TransactionWriteMode::Replace
-    } else {
-        TransactionWriteMode::Insert
-    };
-    stage_rows(ctx, stage_mode, write_rows)
+    stage_rows(ctx, TransactionWriteMode::Insert, write_rows)
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.entity_insert_parameter_batch.stage_rows"
