@@ -42,6 +42,8 @@ std::thread_local! {
         const { std::cell::Cell::new(0) };
     static CERTIFIED_ENTITY_INSERT_BATCH_EXECUTIONS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -60,6 +62,11 @@ pub(crate) fn take_certified_entity_insert_batch_executions() -> usize {
 }
 
 #[cfg(test)]
+pub(crate) fn take_certified_entity_insert_parameter_batch_executions() -> usize {
+    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| executions.replace(0))
+}
+
+#[cfg(test)]
 pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
     match &plan.bound.target {
         BoundWriteTarget::Entity(_) => bound_public_write_shape_supported(plan),
@@ -74,6 +81,168 @@ pub(crate) fn supports_bound_public_write(plan: &LogicalWritePlan) -> bool {
 pub(crate) enum BoundPublicWriteExecution {
     Executed(SqlWriteResult),
     Unsupported,
+}
+
+/// Executes independent parameterized entity INSERT statements as one dense
+/// transaction write. The public batch still returns one affected-row result
+/// per logical statement, while parsing, binding, and transaction staging
+/// happen once for the homogeneous batch.
+pub(crate) async fn try_execute_entity_insert_parameter_batch(
+    ctx: &mut dyn SqlWriteExecutionContext,
+    plan: &LogicalWritePlan,
+    parameter_batch: &RecordBatch,
+) -> Result<Option<Vec<SqlWriteResult>>, LixError> {
+    let BoundWriteTarget::Entity(EntityWriteSurface::Base { schema_key }) = &plan.bound.target
+    else {
+        return Ok(None);
+    };
+    let BoundWriteInput::Values(values) = &plan.bound.input else {
+        return Ok(None);
+    };
+    if plan.bound.op != BoundWriteOp::Insert
+        || values.rows.len() != 1
+        || plan.bound.conflict.is_some()
+        || plan.bound.returning.is_some()
+        || !matches!(plan.bound.branch_scope, BranchScope::Active { .. })
+    {
+        return Ok(None);
+    }
+
+    let spec = entity_spec(ctx, schema_key)?;
+    if spec.has_inter_row_constraints {
+        return Ok(None);
+    }
+    validate_bound_write_supported(plan, &spec)?;
+    let active_branch_commit_id = if plan_references_active_branch_commit_id(plan) {
+        Some(load_active_branch_commit_id(ctx).await?)
+    } else {
+        None
+    };
+    let layout = InsertRowLayout::from_values(&spec, values)?;
+    if layout
+        .columns
+        .iter()
+        .any(|target| !matches!(target, InsertColumnTarget::Visible { .. }))
+    {
+        return Ok(None);
+    }
+    let mut write_rows = RawWriteBatch::with_capacity(parameter_batch.num_rows());
+    let mut unique_identities =
+        std::collections::HashSet::with_capacity(parameter_batch.num_rows());
+    for row_index in 0..parameter_batch.num_rows() {
+        let params = super::write::parameter_row(parameter_batch, row_index)
+            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
+        let Some(mut row) = certified_entity_insert_batch(
+            ctx,
+            plan,
+            &spec,
+            &layout,
+            values,
+            &params,
+            active_branch_commit_id.as_ref(),
+        )
+        .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
+        else {
+            return Ok(None);
+        };
+        if row.len() != 1 {
+            return Ok(None);
+        }
+        let candidate = row.row(0);
+        let Some(entity_pk) = candidate.entity_pk else {
+            return Ok(None);
+        };
+        if !unique_identities.insert((
+            candidate.schema_key.clone(),
+            entity_pk.clone(),
+            candidate.file_id.cloned(),
+            candidate.branch_id.clone(),
+        )) {
+            return Ok(None);
+        }
+        write_rows.append_taken_row(&mut row, 0);
+    }
+    let committed = scan_entity_conflict_candidates(ctx, &spec, &write_rows).await?;
+    let committed_conflict = if committed.is_empty() {
+        None
+    } else {
+        let committed_identities = committed
+            .iter()
+            .map(|row| {
+                (
+                    (
+                        row.entity_pk().clone(),
+                        row.file_id().map(SharedStr::from),
+                        SharedStr::from(row.branch_id()),
+                        row.global(),
+                    ),
+                    row.untracked(),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut conflict = None;
+        for (row_index, row) in write_rows.iter().enumerate() {
+            let entity_pk = row
+                .entity_pk
+                .expect("certified parameter INSERT rows have explicit identities");
+            let identity = (
+                entity_pk.clone(),
+                row.file_id.cloned(),
+                row.branch_id.clone(),
+                row.global,
+            );
+            let Some(existing_untracked) = committed_identities.get(&identity).copied() else {
+                continue;
+            };
+            let error = if existing_untracked != row.untracked {
+                let requested = if row.untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                let existing = if existing_untracked {
+                    "untracked"
+                } else {
+                    "tracked"
+                };
+                LixError::new(
+                    LixError::CODE_UNIQUE,
+                    format!(
+                        "cannot insert {requested} row for schema '{}' entity_pk {:?}: a canonical {existing} row already exists; delete it first",
+                        row.schema_key, entity_pk,
+                    ),
+                )
+            } else {
+                LixError::new(
+                    LixError::CODE_UNIQUE,
+                    crate::transaction::duplicate_insert_identity_message(
+                        row.schema_key,
+                        entity_pk,
+                        Some(row.branch_id),
+                        row.origin,
+                    ),
+                )
+            };
+            conflict = Some(with_parameter_batch_statement_index(error, row_index));
+            break;
+        }
+        conflict
+    };
+    stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await?;
+    if let Some(error) = committed_conflict {
+        return Err(error);
+    }
+    #[cfg(test)]
+    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+        executions.set(executions.get().saturating_add(1));
+    });
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
+    Ok(Some(
+        (0..parameter_batch.num_rows())
+            .map(|_| SqlWriteResult::affected(1))
+            .collect(),
+    ))
 }
 
 /// Executes a certified run of independent point updates as one physical

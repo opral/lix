@@ -60,6 +60,28 @@ async fn standalone_sqlite_public_results_match_every_lix_adapter() {
     }
 }
 
+#[tokio::test]
+async fn insert_benchmark_hits_certified_parameter_batch_on_every_adapter() {
+    let rows = [
+        WorkloadRow {
+            path: "/alpha".to_string(),
+            value_json: r#"{"enabled":true}"#.to_string(),
+            updated_value_json: r#"{"enabled":false}"#.to_string(),
+        },
+        WorkloadRow {
+            path: "/beta".to_string(),
+            value_json: r#"[1,2,3]"#.to_string(),
+            updated_value_json: r#"[4,5,6]"#.to_string(),
+        },
+    ];
+
+    for &profile in storage::STORAGE_PROFILES {
+        let fixture =
+            sql_session::empty_fixture_with_read_many_pk_count(profile, &rows, rows.len()).await;
+        assert_eq!(fixture.insert_all().await, rows.len());
+    }
+}
+
 #[test]
 fn scaling_fixture_extends_the_real_workload_in_physical_key_order() {
     let rows = workload::fixture_rows(20_000);

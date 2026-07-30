@@ -9,6 +9,7 @@ use crate::workload::{WorkloadRow, sql_string};
 
 const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
+const BOUND_INSERT_ALL_SQL: &str = "INSERT INTO tracked_crud_insert (path, value) VALUES ($1, $2)";
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
 
@@ -40,7 +41,8 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     visible_row_count: usize,
     untracked_fixture: UntrackedFixture,
     read_many_by_pk_count: usize,
-    insert_sql_chunks: Vec<String>,
+    bound_insert_all_batch: Vec<ExecuteBatchStatement>,
+    seed_sql_chunks: Vec<String>,
     select_all_sql: String,
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
@@ -107,7 +109,7 @@ pub(crate) async fn seeded_fixture_with_read_many_pk_count(
     read_many_by_pk_count: usize,
 ) -> SqlFixture {
     let fixture = empty_fixture_with_read_many_pk_count(profile, rows, read_many_by_pk_count).await;
-    fixture.insert_all().await;
+    fixture.seed_json_rows().await;
     fixture.insert_untracked_probe().await;
     fixture
 }
@@ -119,6 +121,15 @@ impl SqlFixture {
             Self::RocksDB(fixture) => fixture.insert_all().await,
             #[cfg(feature = "slatedb")]
             Self::SlateDB(fixture) => fixture.insert_all().await,
+        }
+    }
+
+    async fn seed_json_rows(&self) {
+        match self {
+            Self::SQLite(fixture) => fixture.seed_json_rows().await,
+            Self::RocksDB(fixture) => fixture.seed_json_rows().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.seed_json_rows().await,
         }
     }
 
@@ -264,13 +275,32 @@ where
 {
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
+        let _ =
+            lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions();
+        let affected = self
+            .session
+            .execute_batch(&self.bound_insert_all_batch)
+            .await
+            .expect("execute tracked-state CRUD bound insert batch")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
+        assert_eq!(affected as usize, self.row_count);
+        assert_eq!(
+            lix_engine::storage_bench::take_certified_entity_insert_parameter_batch_executions(),
+            1,
+            "tracked-state CRUD insert benchmark must execute one certified parameter batch"
+        );
+        affected as usize
+    }
+
+    async fn seed_json_rows(&self) {
         let affected = Box::pin(execute_many_in_transaction(
             &self.session,
-            &self.insert_sql_chunks,
+            &self.seed_sql_chunks,
         ))
         .await;
         assert_eq!(affected as usize, self.row_count);
-        affected as usize
     }
 
     async fn read_all(&self) -> usize {
@@ -429,9 +459,19 @@ where
         visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
         untracked_fixture,
         read_many_by_pk_count,
-        insert_sql_chunks: tracked_rows
+        bound_insert_all_batch: tracked_rows
+            .iter()
+            .map(|row| ExecuteBatchStatement {
+                sql: BOUND_INSERT_ALL_SQL.to_string(),
+                params: vec![
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ],
+            })
+            .collect(),
+        seed_sql_chunks: tracked_rows
             .chunks(SQL_CHUNK_SIZE)
-            .map(insert_rows_sql)
+            .map(insert_json_rows_sql)
             .collect(),
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
         select_many_by_pk_sql: select_many_by_pk_sql(
@@ -492,6 +532,7 @@ where
         .await
         .expect("open tracked-state crud session");
     register_json_pointer_schema(&session).await;
+    register_bulk_insert_schema(&session).await;
     session
 }
 
@@ -519,6 +560,32 @@ where
         )
         .await
         .expect("register json_pointer schema")
+        .rows_affected();
+    assert_eq!(affected, 1);
+}
+
+async fn register_bulk_insert_schema<StorageImpl>(session: &SessionContext<StorageImpl>)
+where
+    StorageImpl: Storage + Clone + Send + Sync + 'static,
+{
+    let schema = serde_json::json!({
+        "x-lix-key": "tracked_crud_insert",
+        "x-lix-primary-key": ["/path"],
+        "type": "object",
+        "required": ["path", "value"],
+        "properties": {
+            "path": { "type": "string" },
+            "value": { "type": "string" }
+        },
+        "additionalProperties": false
+    });
+    let affected = session
+        .execute(
+            "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) VALUES (lix_json($1), false, false)",
+            &[Value::Text(schema.to_string())],
+        )
+        .await
+        .expect("register tracked_crud_insert schema")
         .rows_affected();
     assert_eq!(affected, 1);
 }
@@ -559,7 +626,7 @@ where
     affected
 }
 
-fn insert_rows_sql(rows: &[WorkloadRow]) -> String {
+fn insert_json_rows_sql(rows: &[WorkloadRow]) -> String {
     let mut sql = String::from("INSERT INTO json_pointer (path, value) VALUES ");
     for (index, row) in rows.iter().enumerate() {
         if index > 0 {
