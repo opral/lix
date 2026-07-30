@@ -42,10 +42,10 @@ use datafusion::logical_expr::TableSource;
 pub(crate) use directory::execute_exact_lix_directory_root_listing;
 pub(crate) use file::{
     ExactLixFileReadColumn, ExactLixFileReadSelector, FastLixFilePathWriteConflict,
-    execute_exact_lix_file_batch_read, execute_exact_lix_file_read,
-    execute_exact_lix_file_root_listing, execute_fast_lix_file_data_update_by_id,
-    execute_fast_lix_file_data_update_by_id_with_metadata, execute_fast_lix_file_id_path_writes,
-    execute_fast_lix_file_path_writes,
+    execute_exact_lix_file_batch_read, execute_exact_lix_file_id_manifest_batch_read,
+    execute_exact_lix_file_read, execute_exact_lix_file_root_listing,
+    execute_fast_lix_file_data_update_by_id, execute_fast_lix_file_data_update_by_id_with_metadata,
+    execute_fast_lix_file_id_path_writes, execute_fast_lix_file_path_writes,
 };
 #[cfg(test)]
 pub(crate) use filesystem_working_change::filesystem_working_change_schema;
