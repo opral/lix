@@ -2340,6 +2340,7 @@ impl WasmComponentFactory for V3Factory {
             edit_cursors: HashMap::new(),
             outputs: HashMap::new(),
             transitions: HashMap::new(),
+            transition_permits: HashMap::new(),
             prospective_documents: ProspectiveDocuments::default(),
             retired: false,
             next_document: 1,
@@ -3310,6 +3311,7 @@ struct V3Actor {
     edit_cursors: HashMap<u64, V3EditCursorState>,
     outputs: HashMap<u64, OutputState>,
     transitions: HashMap<u64, WasmTransitionCounters>,
+    transition_permits: HashMap<u64, tokio::sync::OwnedSemaphorePermit>,
     prospective_documents: ProspectiveDocuments,
     retired: bool,
     next_document: u64,
@@ -3421,7 +3423,6 @@ impl WasmComponentActor for V3Actor {
         )
         .await?;
         let output = self.worker.open_file(document, limits, input);
-        drop(permit);
         let output = match output {
             Ok(output) => output,
             Err(error) => {
@@ -3447,6 +3448,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
+        self.transition_permits.insert(transition.0, permit);
         self.prospective_documents.track(transition, document);
         Ok(WasmFileTransition {
             transition,
@@ -3470,7 +3472,6 @@ impl WasmComponentActor for V3Actor {
         )
         .await?;
         let resolved = self.worker.hydrate_file(document, limits, input);
-        drop(permit);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -3499,6 +3500,7 @@ impl WasmComponentActor for V3Actor {
         self.prospective_documents.track(transition, document);
         self.edit_cursors
             .insert(edits.0, V3EditCursorState { transition, page });
+        self.transition_permits.insert(transition.0, permit);
         Ok(WasmEntityTransition {
             transition,
             document: WasmDocumentHandle(document),
@@ -3525,7 +3527,6 @@ impl WasmComponentActor for V3Actor {
         let output = self
             .worker
             .file_changed(document.0, next_document, limits, update);
-        drop(permit);
         let output = match output {
             Ok(output) => output,
             Err(error) => {
@@ -3551,6 +3552,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
+        self.transition_permits.insert(transition.0, permit);
         self.prospective_documents.track(transition, next_document);
         Ok(WasmFileTransition {
             transition,
@@ -3575,7 +3577,6 @@ impl WasmComponentActor for V3Actor {
         )
         .await?;
         let output = self.worker.cold_file_changed(document, limits, update);
-        drop(permit);
         let output = match output {
             Ok(output) => output,
             Err(error) => {
@@ -3601,6 +3602,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
+        self.transition_permits.insert(transition.0, permit);
         self.prospective_documents.track(transition, document);
         Ok(WasmFileTransition {
             transition,
@@ -3626,7 +3628,6 @@ impl WasmComponentActor for V3Actor {
         let resolved = self
             .worker
             .entities_changed(document.0, next_document, limits, update);
-        drop(permit);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -3665,6 +3666,7 @@ impl WasmComponentActor for V3Actor {
                 }),
             },
         );
+        self.transition_permits.insert(transition.0, permit);
         Ok(WasmEntityTransition {
             transition,
             document: WasmDocumentHandle(next_document),
@@ -3684,7 +3686,6 @@ impl WasmComponentActor for V3Actor {
         )
         .await?;
         let resolved = self.worker.resolve_conflicts(limits, update);
-        drop(permit);
         let resolved = match resolved {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -3755,6 +3756,7 @@ impl WasmComponentActor for V3Actor {
         self.transitions.insert(transition.0, resolved.counters);
         self.resolution_cursors
             .insert(cursor.0, ResolutionCursorState { transition, pages });
+        self.transition_permits.insert(transition.0, permit);
         Ok(WasmConflictTransition {
             transition,
             resolutions: cursor,
@@ -4019,6 +4021,9 @@ impl WasmComponentActor for V3Actor {
         &mut self,
         transition: WasmTransitionHandle,
     ) -> Result<WasmTransitionCounters, LixError> {
+        // Keep component admission until every guest-pushed page and output
+        // owned by this transition has been drained and reclaimed.
+        let _permit = self.transition_permits.remove(&transition.0);
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
         self.resolution_cursors
@@ -4037,6 +4042,9 @@ impl WasmComponentActor for V3Actor {
         &mut self,
         transition: WasmTransitionHandle,
     ) -> Result<(), LixError> {
+        // Hold the removed permit locally through cleanup, including the
+        // prospective guest document drop on validation rejection.
+        let _permit = self.transition_permits.remove(&transition.0);
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
         self.resolution_cursors
