@@ -28,7 +28,7 @@ use super::*;
 
 pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v16";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v16";
-pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v16";
+pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
 /// File-id-first projection. The primary hot row remains authoritative.
@@ -39,6 +39,13 @@ pub(crate) const HOT_DIFF_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001d), HOT_DIFF_NAMESPACE);
 const HOT_DENSE_SCAN_MIN_IDENTITIES: usize = 64;
 const HOT_DENSE_SCAN_MAX_OVERREAD: usize = 2;
+const HOT_DIFF_SEGMENT_VERSION: u8 = 1;
+const HOT_DIFF_SEGMENT_HEADER_BYTES: usize = 5;
+const HOT_DIFF_SEGMENT_MAX_BYTES: usize = 256 * 1024;
+const HOT_DIFF_SEGMENT_MAX_IDENTITIES: u32 = 4_096;
+// Real-repository profiling showed that smaller batches contribute negligible
+// storage amplification, so retain their allocation-free direct-key path.
+const HOT_DIFF_PACK_MIN_IDENTITIES: usize = 64;
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const CERTIFIED_ENTITY_BATCH_MAGIC: &[u8; 4] = b"CEB1";
 pub(crate) const CERTIFIED_ENTITY_BATCH_SPACE: StorageSpace = StorageSpace::new(
@@ -2181,7 +2188,12 @@ where
             "lix.perf.materialization.hot.stage"
         )
         .entered();
-        stage_hot_diff_batch(self.writes, diff_key_bytes, diff_puts);
+        stage_hot_diff_batch(
+            self.writes,
+            diff_scope.as_deref().unwrap_or_default(),
+            diff_key_bytes,
+            diff_puts,
+        )?;
         stage_hot_mutation_batch(self.writes, identities, next_value_bytes, next_value_ranges);
         stage_incremental_file_delete_cascades(
             self.store,
@@ -2460,7 +2472,12 @@ async fn stage_incremental_file_delete_cascades(
             value,
         });
     }
-    stage_hot_diff_batch(writes, diff_key_bytes, diff_puts);
+    stage_hot_diff_batch(
+        writes,
+        diff_scope.as_deref().unwrap_or_default(),
+        diff_key_bytes,
+        diff_puts,
+    )?;
     if !mutations.row_puts.is_empty() || !mutations.row_deletes.is_empty() {
         stage_hot_encoded_mutation_ranges(
             writes,
@@ -3081,14 +3098,113 @@ fn stage_hot_encoded_mutation_ranges(
     }
 }
 
-fn stage_hot_diff_batch(writes: &mut StorageWriteSet, key_bytes: Vec<u8>, puts: Vec<EncodedPut>) {
-    if puts.is_empty() {
-        return;
+fn stage_hot_diff_batch(
+    writes: &mut StorageWriteSet,
+    scope: &[u8],
+    identity_key_bytes: Vec<u8>,
+    identity_puts: Vec<EncodedPut>,
+) -> Result<(), LixError> {
+    if identity_puts.is_empty() {
+        return Ok(());
     }
-    let batch =
-        EncodedMutationBatch::try_new(Bytes::from(key_bytes), Bytes::new(), puts, Vec::new())
-            .expect("hot diff ranges originate in the supplied encoded buffer");
+    if scope.is_empty() {
+        return Err(head_value_error(
+            "hot diff identities require a checkpoint scope",
+        ));
+    }
+    if identity_puts.len() < HOT_DIFF_PACK_MIN_IDENTITIES {
+        let batch = EncodedMutationBatch::try_new(
+            Bytes::from(identity_key_bytes),
+            Bytes::new(),
+            identity_puts,
+            Vec::new(),
+        )
+        .expect("direct hot diff ranges originate in the supplied encoded buffer");
+        writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
+        return Ok(());
+    }
+
+    // HOT_DIFF is a set of eagerly persisted identities. Store bounded
+    // segments instead of repeating the checkpoint scope in one LSM entry per
+    // identity. The content digest makes each segment key deterministic while
+    // the value retains every identity suffix in the same atomic write set.
+    let value_capacity = identity_key_bytes
+        .len()
+        .saturating_sub(scope.len().saturating_mul(identity_puts.len()))
+        .saturating_add(identity_puts.len().saturating_mul(4))
+        .saturating_add(
+            identity_puts
+                .len()
+                .div_ceil(HOT_DIFF_SEGMENT_MAX_IDENTITIES as usize)
+                .saturating_mul(HOT_DIFF_SEGMENT_HEADER_BYTES),
+        );
+    let mut value_bytes = Vec::with_capacity(value_capacity);
+    let mut value_ranges = Vec::<Range<usize>>::new();
+    let mut segment_start = value_bytes.len();
+    value_bytes.push(HOT_DIFF_SEGMENT_VERSION);
+    value_bytes.extend_from_slice(&0_u32.to_le_bytes());
+    let mut segment_count = 0_u32;
+
+    for put in identity_puts {
+        let key_start = put.key.offset();
+        let key_end = key_start
+            .checked_add(put.key.len())
+            .ok_or_else(|| head_value_error("hot diff key range overflow"))?;
+        let full_key = identity_key_bytes
+            .get(key_start..key_end)
+            .ok_or_else(|| head_value_error("hot diff key range escapes its arena"))?;
+        let suffix = full_key
+            .strip_prefix(scope)
+            .ok_or_else(|| head_value_error("hot diff identity key is outside its scope"))?;
+        let suffix_len = u32::try_from(suffix.len())
+            .map_err(|_| head_value_error("hot diff identity suffix exceeds u32"))?;
+        let encoded_len = 4_usize.saturating_add(suffix.len());
+        if HOT_DIFF_SEGMENT_HEADER_BYTES.saturating_add(encoded_len) > HOT_DIFF_SEGMENT_MAX_BYTES {
+            return Err(head_value_error(
+                "hot diff identity exceeds the segment size limit",
+            ));
+        }
+        let current_len = value_bytes.len() - segment_start;
+        if segment_count > 0
+            && (segment_count == HOT_DIFF_SEGMENT_MAX_IDENTITIES
+                || current_len.saturating_add(encoded_len) > HOT_DIFF_SEGMENT_MAX_BYTES)
+        {
+            value_bytes[segment_start + 1..segment_start + HOT_DIFF_SEGMENT_HEADER_BYTES]
+                .copy_from_slice(&segment_count.to_le_bytes());
+            value_ranges.push(segment_start..value_bytes.len());
+            segment_start = value_bytes.len();
+            value_bytes.push(HOT_DIFF_SEGMENT_VERSION);
+            value_bytes.extend_from_slice(&0_u32.to_le_bytes());
+            segment_count = 0;
+        }
+        value_bytes.extend_from_slice(&suffix_len.to_le_bytes());
+        value_bytes.extend_from_slice(suffix);
+        segment_count += 1;
+    }
+    value_bytes[segment_start + 1..segment_start + HOT_DIFF_SEGMENT_HEADER_BYTES]
+        .copy_from_slice(&segment_count.to_le_bytes());
+    value_ranges.push(segment_start..value_bytes.len());
+
+    let mut key_bytes = Vec::with_capacity(value_ranges.len().saturating_mul(scope.len() + 32));
+    let mut puts = Vec::with_capacity(value_ranges.len());
+    for value in value_ranges {
+        let key_start = key_bytes.len();
+        key_bytes.extend_from_slice(scope);
+        key_bytes.extend_from_slice(blake3::hash(&value_bytes[value.clone()]).as_bytes());
+        puts.push(EncodedPut {
+            key: BufferRange::new(key_start, key_bytes.len() - key_start),
+            value: buffer_range(&value),
+        });
+    }
+    let batch = EncodedMutationBatch::try_new(
+        Bytes::from(key_bytes),
+        Bytes::from(value_bytes),
+        puts,
+        Vec::new(),
+    )
+    .expect("hot diff segment ranges originate in the supplied encoded buffers");
     writes.stage_encoded_batch(HOT_DIFF_SPACE, batch);
+    Ok(())
 }
 
 fn buffer_range(range: &Range<usize>) -> BufferRange {
@@ -4060,26 +4176,48 @@ async fn hot_working_diff_entries(
             let Ok(bytes) = full_value_bytes(entry.value) else {
                 return Ok(None);
             };
-            if !bytes.is_empty() {
-                return Ok(None);
+            if bytes.is_empty() {
+                if actual_coverage
+                    .add_encoded_group_key(entry.key.0.as_ref())
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                let Ok(identity) = decode_hot_diff_key_in_scope(entry.key.0.as_ref(), &scope)
+                else {
+                    return Ok(None);
+                };
+                if matches_filter(&identity, filter) {
+                    selected.push(HeadIdentity {
+                        branch_id: branch_id.to_string(),
+                        generation,
+                        schema_key: identity.schema_key,
+                        entity_pk: identity.entity_pk,
+                        file_id: identity.file_id,
+                    });
+                }
+                continue;
             }
-            if actual_coverage
-                .add_encoded_group_key(entry.key.0.as_ref())
-                .is_none()
-            {
-                return Ok(None);
-            }
-            let Ok(identity) = decode_hot_diff_key_in_scope(entry.key.0.as_ref(), &scope) else {
+            let Ok(segment_scope) = decode_hot_diff_segment_key(entry.key.0.as_ref()) else {
                 return Ok(None);
             };
-            if matches_filter(&identity, filter) {
-                selected.push(HeadIdentity {
-                    branch_id: branch_id.to_string(),
-                    generation,
-                    schema_key: identity.schema_key,
-                    entity_pk: identity.entity_pk,
-                    file_id: identity.file_id,
+            if segment_scope.digest != *blake3::hash(&bytes).as_bytes() {
+                return Ok(None);
+            }
+            let decoded =
+                visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |identity| {
+                    if matches_filter(&identity, filter) {
+                        selected.push(HeadIdentity {
+                            branch_id: branch_id.to_string(),
+                            generation,
+                            schema_key: identity.schema_key,
+                            entity_pk: identity.entity_pk,
+                            file_id: identity.file_id,
+                        });
+                    }
                 });
+            if decoded.is_err() {
+                return Ok(None);
             }
         }
         if !page.value.has_more || resume_after.is_none() {
@@ -5044,8 +5182,98 @@ fn decode_hot_file_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     })
 }
 
+struct HotDiffSegmentScope {
+    branch_id: String,
+    checkpoint_commit_id: CommitId,
+    generation: CommitId,
+    digest: [u8; 32],
+}
+
 fn decode_hot_diff_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
     decode_hot_row_key_in_scope(bytes, scope)
+}
+
+fn decode_hot_diff_segment_key(bytes: &[u8]) -> Result<HotDiffSegmentScope, LixError> {
+    let mut offset = 0;
+    let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
+    if branch_terminator != KEY_PART_FINAL {
+        return Err(key_codec_error(
+            "hot diff branch id has an invalid terminator",
+        ));
+    }
+    let checkpoint_commit_id = read_generation(bytes, &mut offset)?;
+    let generation = read_generation(bytes, &mut offset)?;
+    let digest_bytes = bytes
+        .get(offset..)
+        .ok_or_else(|| key_codec_error("hot diff segment key is truncated before its digest"))?;
+    let digest = <[u8; 32]>::try_from(digest_bytes)
+        .map_err(|_| key_codec_error("hot diff segment key has an invalid digest length"))?;
+    Ok(HotDiffSegmentScope {
+        branch_id,
+        checkpoint_commit_id,
+        generation,
+        digest,
+    })
+}
+
+fn visit_hot_diff_segment(
+    bytes: &[u8],
+    scope: &[u8],
+    coverage: &mut WorkingDiffIndexCoverage,
+    mut visit: impl FnMut(HeadRowIdentity),
+) -> Result<(), LixError> {
+    if bytes.len() < HOT_DIFF_SEGMENT_HEADER_BYTES {
+        return Err(key_codec_error("hot diff segment is truncated"));
+    }
+    if bytes[0] != HOT_DIFF_SEGMENT_VERSION {
+        return Err(key_codec_error("hot diff segment has an unknown version"));
+    }
+    let count = u32::from_le_bytes(
+        bytes[1..HOT_DIFF_SEGMENT_HEADER_BYTES]
+            .try_into()
+            .expect("hot diff segment header has a fixed count width"),
+    );
+    if count == 0 || count > HOT_DIFF_SEGMENT_MAX_IDENTITIES {
+        return Err(key_codec_error(
+            "hot diff segment has an invalid identity count",
+        ));
+    }
+    let mut offset = HOT_DIFF_SEGMENT_HEADER_BYTES;
+    let mut full_key = Vec::with_capacity(scope.len() + 128);
+    full_key.extend_from_slice(scope);
+    for _ in 0..count {
+        let length_end = offset
+            .checked_add(4)
+            .ok_or_else(|| key_codec_error("hot diff segment length offset overflow"))?;
+        let encoded_length = bytes.get(offset..length_end).ok_or_else(|| {
+            key_codec_error("hot diff segment is truncated before identity length")
+        })?;
+        let suffix_len = u32::from_le_bytes(
+            encoded_length
+                .try_into()
+                .expect("hot diff identity length has a fixed width"),
+        ) as usize;
+        if suffix_len == 0 {
+            return Err(key_codec_error("hot diff segment has an empty identity"));
+        }
+        let suffix_end = length_end
+            .checked_add(suffix_len)
+            .ok_or_else(|| key_codec_error("hot diff segment identity offset overflow"))?;
+        let suffix = bytes
+            .get(length_end..suffix_end)
+            .ok_or_else(|| key_codec_error("hot diff segment is truncated in an identity"))?;
+        full_key.truncate(scope.len());
+        full_key.extend_from_slice(suffix);
+        coverage
+            .add_encoded_group_key(&full_key)
+            .ok_or_else(|| head_value_error("hot working-diff index count exceeds u64"))?;
+        visit(decode_hot_row_key_in_scope(&full_key, scope)?);
+        offset = suffix_end;
+    }
+    if offset != bytes.len() {
+        return Err(key_codec_error("hot diff segment has trailing bytes"));
+    }
+    Ok(())
 }
 
 fn decode_hot_diff_key(bytes: &[u8]) -> Result<(CommitId, HeadIdentity), LixError> {
@@ -5202,17 +5430,31 @@ where
             .await?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
-            let keep = match (
-                decode_hot_diff_key(entry.key.0.as_ref()),
-                full_value_bytes(entry.value),
-            ) {
-                (Ok((checkpoint_commit_id, identity)), Ok(bytes))
-                    if active.get(&identity.branch_id).is_some_and(|scope| {
-                        scope.checkpoint_commit_id == checkpoint_commit_id
-                            && scope.generation == identity.generation
-                    }) =>
-                {
-                    bytes.is_empty()
+            let keep = match full_value_bytes(entry.value) {
+                Ok(bytes) if bytes.is_empty() => decode_hot_diff_key(entry.key.0.as_ref())
+                    .is_ok_and(|(checkpoint_commit_id, identity)| {
+                        active.get(&identity.branch_id).is_some_and(|scope| {
+                            scope.checkpoint_commit_id == checkpoint_commit_id
+                                && scope.generation == identity.generation
+                        })
+                    }),
+                Ok(bytes) => {
+                    decode_hot_diff_segment_key(entry.key.0.as_ref()).is_ok_and(|segment_scope| {
+                        if !active.get(&segment_scope.branch_id).is_some_and(|scope| {
+                            scope.checkpoint_commit_id == segment_scope.checkpoint_commit_id
+                                && scope.generation == segment_scope.generation
+                        }) {
+                            return false;
+                        }
+                        let scope = encode_working_diff_scope_prefix(
+                            &segment_scope.branch_id,
+                            segment_scope.checkpoint_commit_id,
+                            segment_scope.generation,
+                        );
+                        let mut coverage = WorkingDiffIndexCoverage::default();
+                        segment_scope.digest == *blake3::hash(&bytes).as_bytes()
+                            && visit_hot_diff_segment(&bytes, &scope, &mut coverage, |_| {}).is_ok()
+                    })
                 }
                 _ => false,
             };
@@ -5265,6 +5507,33 @@ mod tests {
                 hash: [0; JSON_REF_BYTES],
             },
         }
+    }
+
+    fn single_hot_diff_segment(
+        checkpoint_commit_id: CommitId,
+        identity: &HeadIdentity,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let scope = encode_working_diff_scope_prefix(
+            &identity.branch_id,
+            checkpoint_commit_id,
+            identity.generation,
+        );
+        let full_key = encode_hot_diff_key(checkpoint_commit_id, identity);
+        let suffix = full_key
+            .strip_prefix(scope.as_slice())
+            .expect("encoded hot diff identity starts with its scope");
+        let mut value = Vec::with_capacity(HOT_DIFF_SEGMENT_HEADER_BYTES + 4 + suffix.len());
+        value.push(HOT_DIFF_SEGMENT_VERSION);
+        value.extend_from_slice(&1_u32.to_le_bytes());
+        value.extend_from_slice(
+            &u32::try_from(suffix.len())
+                .expect("test identity suffix fits u32")
+                .to_le_bytes(),
+        );
+        value.extend_from_slice(suffix);
+        let mut key = scope;
+        key.extend_from_slice(blake3::hash(&value).as_bytes());
+        (key, value)
     }
 
     #[test]
@@ -5533,6 +5802,76 @@ mod tests {
             assert_eq!(decoded_identity.entity_pk, expected.entity_pk);
             assert_eq!(decoded_identity.file_id, expected.file_id);
         }
+    }
+
+    #[tokio::test]
+    async fn hot_diff_segments_preserve_identity_coverage_with_bounded_puts() {
+        const IDENTITY_COUNT: usize = 10_000;
+
+        let checkpoint = CommitId::for_test_label("segmented-hot-diff-checkpoint");
+        let generation = CommitId::for_test_label("segmented-hot-diff-generation");
+        let scope = encode_working_diff_scope_prefix("branch", checkpoint, generation);
+        let mut identity_key_bytes = Vec::new();
+        let mut identity_puts = Vec::with_capacity(IDENTITY_COUNT);
+        let mut expected_coverage = WorkingDiffIndexCoverage::default();
+        for index in 0..IDENTITY_COUNT {
+            let entity_pk = EntityPk::single(format!("entity-{index:05}"));
+            let key = append_hot_diff_key_parts(
+                &mut identity_key_bytes,
+                &scope,
+                "schema",
+                &entity_pk,
+                Some("file.md"),
+            );
+            expected_coverage
+                .add_encoded_group_key(&identity_key_bytes[key.clone()])
+                .expect("test coverage count fits u64");
+            identity_puts.push(EncodedPut {
+                key: buffer_range(&key),
+                value: BufferRange::default(),
+            });
+        }
+
+        let mut writes = StorageWriteSet::new();
+        stage_hot_diff_batch(&mut writes, &scope, identity_key_bytes, identity_puts)
+            .expect("stage segmented hot diff");
+        assert!(
+            writes.stats().staged_puts <= 3,
+            "ten thousand short identities should require at most three bounded segments"
+        );
+
+        let storage = StorageAdapter::new(Memory::new());
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("commit segmented hot diff");
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open segmented hot diff read");
+        let page = ScanPlan::prefix(
+            HOT_DIFF_SPACE,
+            StoragePrefix {
+                bytes: Bytes::from(scope.clone()),
+            },
+        )
+        .collect(&read, StorageScanOptions::default())
+        .await
+        .expect("scan segmented hot diff");
+        assert!(!page.value.has_more);
+
+        let mut actual_coverage = WorkingDiffIndexCoverage::default();
+        let mut decoded = 0_usize;
+        for entry in page.value.entries {
+            let bytes = full_value_bytes(entry.value).expect("full segment value");
+            let segment_scope =
+                decode_hot_diff_segment_key(entry.key.0.as_ref()).expect("segment key");
+            assert_eq!(segment_scope.digest, *blake3::hash(&bytes).as_bytes());
+            visit_hot_diff_segment(&bytes, &scope, &mut actual_coverage, |_| decoded += 1)
+                .expect("decode hot diff segment");
+        }
+        assert_eq!(decoded, IDENTITY_COUNT);
+        assert_eq!(actual_coverage, expected_coverage);
     }
 
     #[test]
@@ -6102,9 +6441,11 @@ mod tests {
         let active_identity = diff_identity("active", active_generation, "active-row");
         let stale_identity = diff_identity("stale", stale_generation, "stale-row");
         let orphan_identity = diff_identity("deleted", orphan_generation, "orphan-row");
-        let active_key = encode_hot_diff_key(active_checkpoint, &active_identity);
-        let stale_key = encode_hot_diff_key(stale_checkpoint, &stale_identity);
-        let orphan_key = encode_hot_diff_key(orphan_checkpoint, &orphan_identity);
+        let (active_key, active_value) =
+            single_hot_diff_segment(active_checkpoint, &active_identity);
+        let (stale_key, stale_value) = single_hot_diff_segment(stale_checkpoint, &stale_identity);
+        let (orphan_key, orphan_value) =
+            single_hot_diff_segment(orphan_checkpoint, &orphan_identity);
 
         let mut writes = StorageWriteSet::new();
         stage_tracked_working_diff_epoch(
@@ -6170,12 +6511,16 @@ mod tests {
         )
         .expect("stage orphan epoch");
 
-        for key in [&active_key, &stale_key, &orphan_key] {
+        for (key, value) in [
+            (&active_key, active_value),
+            (&stale_key, stale_value),
+            (&orphan_key, orphan_value),
+        ] {
             writes.put(
                 HOT_DIFF_SPACE,
                 StorageKey(Bytes::copy_from_slice(key)),
                 StorageValue {
-                    bytes: Bytes::new(),
+                    bytes: Bytes::from(value),
                 },
             );
         }
