@@ -910,56 +910,58 @@ pub(crate) async fn scan_certified_history_rows(
     if commit_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let page = ScanPlan::prefix(
-        CERTIFIED_ENTITY_BATCH_SPACE,
-        StoragePrefix {
-            bytes: Bytes::new(),
-        },
-    )
-    .collect(store, StorageScanOptions::default())
-    .await?;
     let needs_snapshot = request
         .read_columns
         .columns
         .iter()
         .any(|column| column == "snapshot_content");
-    let mut builder =
-        MaterializedLiveStateBatchBuilder::with_capacity(page.value.entries.len() * 1024);
-    for entry in page.value.entries {
-        let value = full_value_bytes(entry.value)?;
-        if !commit_ids.contains(&certified_batch_commit_id(&value)?) {
-            continue;
+    let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
+    for commit_id in commit_ids {
+        let page = ScanPlan::prefix(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            StoragePrefix {
+                bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
+            },
+        )
+        .collect(store, StorageScanOptions::default())
+        .await?;
+        for entry in page.value.entries {
+            let value = full_value_bytes(entry.value)?;
+            if certified_batch_commit_id(&value)? != *commit_id {
+                continue;
+            }
+            let external_plan =
+                certified_external_page_plan(&value, entry.key.0.as_ref(), request)?;
+            let external_pages = if let Some(plan) = &external_plan {
+                let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+                let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
+                    .materialize(store, StorageGetOptions::default())
+                    .await?
+                    .value;
+                Some(
+                    plan.iter()
+                        .zip(values)
+                        .map(|((page_index, _), value)| {
+                            let value = value.ok_or_else(|| {
+                                head_value_error("certified history batch page is missing")
+                            })?;
+                            Ok((*page_index, full_value_bytes(value)?))
+                        })
+                        .collect::<Result<Vec<_>, LixError>>()?,
+                )
+            } else {
+                None
+            };
+            decode_certified_entity_batch_rows(
+                &value,
+                external_pages.as_deref(),
+                "",
+                request,
+                needs_snapshot,
+                None,
+                &mut builder,
+            )?;
         }
-        let external_plan = certified_external_page_plan(&value, entry.key.0.as_ref(), request)?;
-        let external_pages = if let Some(plan) = &external_plan {
-            let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-            let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
-                .materialize(store, StorageGetOptions::default())
-                .await?
-                .value;
-            Some(
-                plan.iter()
-                    .zip(values)
-                    .map(|((page_index, _), value)| {
-                        let value = value.ok_or_else(|| {
-                            head_value_error("certified history batch page is missing")
-                        })?;
-                        Ok((*page_index, full_value_bytes(value)?))
-                    })
-                    .collect::<Result<Vec<_>, LixError>>()?,
-            )
-        } else {
-            None
-        };
-        decode_certified_entity_batch_rows(
-            &value,
-            external_pages.as_deref(),
-            "",
-            request,
-            needs_snapshot,
-            None,
-            &mut builder,
-        )?;
     }
     Ok(builder.finish().into_rows())
 }
@@ -6427,6 +6429,41 @@ mod tests {
 
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
+    }
+
+    #[tokio::test]
+    async fn certified_history_scan_ignores_malformed_unrequested_commit() {
+        let storage = StorageAdapter::new(Memory::new());
+        let requested_commit = CommitId::for_test_label("requested-certified-history");
+        let unrelated_commit = CommitId::for_test_label("malformed-certified-history");
+        let mut writes = storage.new_write_set();
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            StorageKey(Bytes::copy_from_slice(
+                unrelated_commit.as_uuid().as_bytes(),
+            )),
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("malformed unrelated certified batch should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified history read should open");
+        let rows = scan_certified_history_rows(
+            &read,
+            &BTreeSet::from([requested_commit]),
+            &TrackedStateScanRequest::default(),
+        )
+        .await
+        .expect("unrelated malformed batch must not affect the requested commit");
+
+        assert!(rows.is_empty());
     }
 
     #[test]
