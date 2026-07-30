@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::size_of;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -37,6 +37,10 @@ use super::{
 };
 
 const V3_MAX_BATCH_BYTES: u32 = 2 * 1024 * 1024;
+// Admit one fused export per compiled plugin component before allocating its
+// Wasmtime Store. This bounds both actor and pushed-page residency without
+// creating an executor thread or serializing different plugin types.
+const V3_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT: usize = 1;
 const CERTIFIED_TYPED_CSV_V1: u16 = 1;
 const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
 
@@ -96,7 +100,7 @@ struct TransitionState {
     creates: WasmCreateContext,
     started: Instant,
     total_bytes: SharedByteBudget,
-    events: Option<tokio::sync::mpsc::Sender<WorkerTransitionEvent>>,
+    pages: VecDeque<PendingChangePage>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
     file_replacement: Option<PendingFileReplacement>,
@@ -169,11 +173,6 @@ enum PendingChangePage {
         payload: Vec<u8>,
         creates: WasmCreateContext,
     },
-}
-
-enum WorkerTransitionEvent {
-    Page(PendingChangePage),
-    Finished(Result<WasmTransitionCounters, LixError>),
 }
 
 impl PendingChangePage {
@@ -404,8 +403,6 @@ impl TransitionState {
     fn new(
         limits: WasmTransitionLimits,
         creates: WasmCreateContext,
-        events: Option<tokio::sync::mpsc::Sender<WorkerTransitionEvent>>,
-        executor_thread_created: bool,
         allow_file_replacement: bool,
         total_bytes: Option<SharedByteBudget>,
     ) -> Result<Self, LixError> {
@@ -414,10 +411,9 @@ impl TransitionState {
             creates,
             started: Instant::now(),
             total_bytes: total_bytes.unwrap_or_default(),
-            events,
+            pages: VecDeque::new(),
             counters: WasmTransitionCounters {
                 guest_export_calls: 1,
-                actor_executor_threads_created: u64::from(executor_thread_created),
                 ..WasmTransitionCounters::default()
             },
             allow_file_replacement,
@@ -479,7 +475,6 @@ impl ResolutionState {
     fn new(
         limits: WasmTransitionLimits,
         conflicts: Vec<WasmHostEntityConflict>,
-        executor_thread_created: bool,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
@@ -491,7 +486,6 @@ impl ResolutionState {
             counters: WasmTransitionCounters {
                 guest_export_calls: 1,
                 conflict_resolution_calls: 1,
-                actor_executor_threads_created: u64::from(executor_thread_created),
                 ..WasmTransitionCounters::default()
             },
         })
@@ -986,15 +980,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             limits,
             creates,
         };
-        if let Some(events) = &state.events {
-            events
-                .blocking_send(WorkerTransitionEvent::Page(page))
-                .map_err(|_| {
-                    bindings::lix::plugin::host::HostError::Rejected(
-                        "v3 transition consumer stopped".to_owned(),
-                    )
-                })?;
-        }
+        state.pages.push_back(page);
         Ok(())
     }
 
@@ -1043,15 +1029,7 @@ impl bindings::lix::plugin::host::HostTransition for WasiHostState {
             payload: batch.payload,
             creates,
         };
-        if let Some(events) = &state.events {
-            events
-                .blocking_send(WorkerTransitionEvent::Page(page))
-                .map_err(|_| {
-                    bindings::lix::plugin::host::HostError::Rejected(
-                        "v3 transition consumer stopped".to_owned(),
-                    )
-                })?;
-        }
+        state.pages.push_back(page);
         Ok(())
     }
 
@@ -2280,6 +2258,7 @@ struct V3Factory {
     runtime: Arc<super::WasmtimeSharedRuntime>,
     limits: WasmLimits,
     profile: CompileProfile,
+    execution_permit: Arc<tokio::sync::Semaphore>,
 }
 
 pub(super) async fn compile_component(
@@ -2318,12 +2297,21 @@ pub(super) async fn compile_component(
         runtime: runtime.shared.clone(),
         limits,
         profile,
+        execution_permit: Arc::new(tokio::sync::Semaphore::new(
+            V3_MAX_CONCURRENT_EXECUTIONS_PER_COMPONENT,
+        )),
     }))
 }
 
 #[async_trait]
 impl WasmComponentFactory for V3Factory {
     async fn instantiate_actor(&self) -> Result<Box<dyn WasmComponentActor>, LixError> {
+        let initial_execution_permit = self
+            .execution_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| v3_error("v3 component execution scheduler stopped"))?;
         let engine = self.runtime.engine(self.profile);
         let timeout_ticker = self
             .runtime
@@ -2334,22 +2322,17 @@ impl WasmComponentFactory for V3Factory {
         let bindings = bindings::Plugin::instantiate(&mut store, &self.component, &self.linker)
             .map_err(|error| wasm_runtime_error("failed to instantiate plugin actor", error))?;
         let guest = bindings.lix_plugin_api().clone();
-        let (sender, receiver) = mpsc::channel();
         let worker = V3Worker {
             store,
             guest,
             limits: self.limits,
             documents: HashMap::new(),
             next_document: 1,
-            first_transition: true,
         };
-        let thread = std::thread::Builder::new()
-            .name("lix-plugin-v3-actor".to_owned())
-            .spawn(move || worker.run(receiver))
-            .map_err(|error| v3_error(format!("failed to create v3 actor executor: {error}")))?;
         Ok(Box::new(V3Actor {
-            sender,
-            thread: Some(thread),
+            worker,
+            execution_permit: self.execution_permit.clone(),
+            initial_execution_permit: Some(initial_execution_permit),
             _timeout_ticker: timeout_ticker,
             next_handle: 1,
             cursors: HashMap::new(),
@@ -2364,62 +2347,12 @@ impl WasmComponentFactory for V3Factory {
     }
 }
 
-enum WorkerCommand {
-    OpenFile {
-        document: u64,
-        limits: WasmTransitionLimits,
-        input: WasmOpenFileInput,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    },
-    FileChanged {
-        document: u64,
-        next_document: u64,
-        limits: WasmTransitionLimits,
-        update: WasmFileUpdate,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    },
-    ColdFileChanged {
-        document: u64,
-        limits: WasmTransitionLimits,
-        update: WasmColdFileUpdate,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    },
-    HydrateFile {
-        document: u64,
-        limits: WasmTransitionLimits,
-        input: WasmOpenEntitiesInput,
-        response: tokio::sync::oneshot::Sender<Result<HydrateWorkerOutput, LixError>>,
-    },
-    EntitiesChanged {
-        document: u64,
-        next_document: u64,
-        limits: WasmTransitionLimits,
-        update: WasmEntityUpdate,
-        response: tokio::sync::oneshot::Sender<Result<EntityWorkerOutput, LixError>>,
-    },
-    ResolveConflicts {
-        limits: WasmTransitionLimits,
-        update: WasmConflictUpdate,
-        response: tokio::sync::oneshot::Sender<Result<ResolutionWorkerOutput, LixError>>,
-    },
-    Fork {
-        document: u64,
-        response: tokio::sync::oneshot::Sender<Result<u64, LixError>>,
-    },
-    DropDocument {
-        document: u64,
-        response: tokio::sync::oneshot::Sender<Result<(), LixError>>,
-    },
-    Shutdown,
-}
-
 struct V3Worker {
     store: Store<WasiHostState>,
     guest: bindings::exports::lix::plugin::api::Guest,
     limits: WasmLimits,
     documents: HashMap<u64, V3Document>,
     next_document: u64,
-    first_transition: bool,
 }
 
 #[derive(Clone)]
@@ -2443,6 +2376,11 @@ struct HydrateWorkerOutput {
     counters: WasmTransitionCounters,
 }
 
+struct FileWorkerOutput {
+    pages: VecDeque<PendingChangePage>,
+    counters: WasmTransitionCounters,
+}
+
 fn hydration_replacement_edit(replacement_len: u64, accepted_len: u64) -> WasmOutputSplice {
     WasmOutputSplice {
         offset: 0,
@@ -2456,85 +2394,12 @@ fn hydration_replacement_edit(replacement_len: u64, accepted_len: u64) -> WasmOu
 }
 
 impl V3Worker {
-    fn run(mut self, receiver: mpsc::Receiver<WorkerCommand>) {
-        while let Ok(command) = receiver.recv() {
-            match command {
-                WorkerCommand::OpenFile {
-                    document,
-                    limits,
-                    input,
-                    events,
-                } => {
-                    let result = self.open_file(document, limits, input, events.clone());
-                    let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
-                }
-                WorkerCommand::FileChanged {
-                    document,
-                    next_document,
-                    limits,
-                    update,
-                    events,
-                } => {
-                    let result =
-                        self.file_changed(document, next_document, limits, update, events.clone());
-                    let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
-                }
-                WorkerCommand::ColdFileChanged {
-                    document,
-                    limits,
-                    update,
-                    events,
-                } => {
-                    let result = self.cold_file_changed(document, limits, update, events.clone());
-                    let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
-                }
-                WorkerCommand::HydrateFile {
-                    document,
-                    limits,
-                    input,
-                    response,
-                } => {
-                    let _ = response.send(self.hydrate_file(document, limits, input));
-                }
-                WorkerCommand::EntitiesChanged {
-                    document,
-                    next_document,
-                    limits,
-                    update,
-                    response,
-                } => {
-                    let _ = response.send(self.entities_changed(
-                        document,
-                        next_document,
-                        limits,
-                        update,
-                    ));
-                }
-                WorkerCommand::ResolveConflicts {
-                    limits,
-                    update,
-                    response,
-                } => {
-                    let _ = response.send(self.resolve_conflicts(limits, update));
-                }
-                WorkerCommand::Fork { document, response } => {
-                    let _ = response.send(self.fork(document));
-                }
-                WorkerCommand::DropDocument { document, response } => {
-                    let _ = response.send(self.drop_document(document));
-                }
-                WorkerCommand::Shutdown => break,
-            }
-        }
-    }
-
     fn open_file(
         &mut self,
         document: u64,
         limits: WasmTransitionLimits,
         input: WasmOpenFileInput,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    ) -> Result<WasmTransitionCounters, LixError> {
+    ) -> Result<FileWorkerOutput, LixError> {
         let limits = v3_transition_limits(limits)?;
         validate_source_admission(input.file.len(), limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
@@ -2543,8 +2408,6 @@ impl V3Worker {
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             input.creates,
-            Some(events),
-            std::mem::take(&mut self.first_transition),
             false,
             None,
         )?));
@@ -2626,7 +2489,10 @@ impl V3Worker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
-        Ok(state.counters)
+        Ok(FileWorkerOutput {
+            pages: state.pages,
+            counters: state.counters,
+        })
     }
 
     fn file_changed(
@@ -2635,8 +2501,7 @@ impl V3Worker {
         next_document: u64,
         limits: WasmTransitionLimits,
         update: WasmFileUpdate,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    ) -> Result<WasmTransitionCounters, LixError> {
+    ) -> Result<FileWorkerOutput, LixError> {
         let limits = v3_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
@@ -2654,8 +2519,6 @@ impl V3Worker {
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             update.creates,
-            Some(events),
-            false,
             false,
             None,
         )?));
@@ -2769,7 +2632,10 @@ impl V3Worker {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
-        Ok(state.counters)
+        Ok(FileWorkerOutput {
+            pages: state.pages,
+            counters: state.counters,
+        })
     }
 
     fn cold_file_changed(
@@ -2777,8 +2643,7 @@ impl V3Worker {
         document: u64,
         limits: WasmTransitionLimits,
         cold: WasmColdFileUpdate,
-        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-    ) -> Result<WasmTransitionCounters, LixError> {
+    ) -> Result<FileWorkerOutput, LixError> {
         let limits = v3_transition_limits(limits)?;
         cold.validate(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
@@ -2800,8 +2665,6 @@ impl V3Worker {
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             cold.creates,
-            Some(events),
-            std::mem::take(&mut self.first_transition),
             false,
             Some(total_bytes.clone()),
         )?));
@@ -2974,7 +2837,10 @@ impl V3Worker {
             .saturating_add(entity_state.counters.source_bytes_read);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
-        Ok(state.counters)
+        Ok(FileWorkerOutput {
+            pages: state.pages,
+            counters: state.counters,
+        })
     }
 
     fn resolve_conflicts(
@@ -3004,11 +2870,7 @@ impl V3Worker {
             }
         }
         let expected_count = conflicts.len();
-        let state = Arc::new(Mutex::new(ResolutionState::new(
-            limits,
-            conflicts,
-            std::mem::take(&mut self.first_transition),
-        )?));
+        let state = Arc::new(Mutex::new(ResolutionState::new(limits, conflicts)?));
         let source = self
             .store
             .data_mut()
@@ -3099,8 +2961,6 @@ impl V3Worker {
         let transition_state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             WasmCreateContext { high: 0, low: 0 },
-            None,
-            false,
             true,
             Some(total_bytes),
         )?));
@@ -3267,8 +3127,6 @@ impl V3Worker {
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             WasmCreateContext { high: 0, low: 0 },
-            None,
-            std::mem::take(&mut self.first_transition),
             true,
             Some(total_bytes),
         )?));
@@ -3413,7 +3271,7 @@ impl V3Worker {
 
 struct CursorState {
     transition: WasmTransitionHandle,
-    events: tokio::sync::mpsc::Receiver<WorkerTransitionEvent>,
+    pages: VecDeque<PendingChangePage>,
     complete_file_state: bool,
     certified_csv_pages: Vec<Bytes>,
     certified_csv_rows: u64,
@@ -3442,8 +3300,9 @@ struct V3EditCursorState {
 }
 
 struct V3Actor {
-    sender: mpsc::Sender<WorkerCommand>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    worker: V3Worker,
+    execution_permit: Arc<tokio::sync::Semaphore>,
+    initial_execution_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     _timeout_ticker: TimeoutTickerLease,
     next_handle: u64,
     cursors: HashMap<u64, CursorState>,
@@ -3496,30 +3355,33 @@ impl V3Actor {
         Ok(document)
     }
 
-    async fn request<T>(
-        &mut self,
-        build: impl FnOnce(tokio::sync::oneshot::Sender<Result<T, LixError>>) -> WorkerCommand,
-    ) -> Result<T, LixError> {
+    fn ensure_active(&self) -> Result<(), LixError> {
         if self.retired {
             return Err(v3_error("v3 actor is retired"));
         }
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.sender
-            .send(build(sender))
-            .map_err(|_| v3_error("v3 actor executor stopped"))?;
-        let result = receiver
-            .await
-            .map_err(|_| v3_error("v3 actor executor dropped its response"))?;
-        if let Err(error) = &result {
-            self.retire_after_trap(error);
+        Ok(())
+    }
+
+    fn execution_scheduler(&self) -> Arc<tokio::sync::Semaphore> {
+        Arc::clone(&self.execution_permit)
+    }
+
+    async fn acquire_execution_permit(
+        initial: Option<tokio::sync::OwnedSemaphorePermit>,
+        scheduler: Arc<tokio::sync::Semaphore>,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, LixError> {
+        match initial {
+            Some(permit) => Ok(permit),
+            None => scheduler
+                .acquire_owned()
+                .await
+                .map_err(|_| v3_error("v3 component execution scheduler stopped")),
         }
-        result
     }
 
     fn retire_after_trap(&mut self, error: &LixError) {
         if is_guest_trap(error) {
             self.retired = true;
-            let _ = self.sender.send(WorkerCommand::Shutdown);
         }
     }
 }
@@ -3538,12 +3400,8 @@ impl WasmComponentActor for V3Actor {
         &mut self,
         document: WasmDocumentHandle,
     ) -> Result<WasmDocumentHandle, LixError> {
-        let fork = self
-            .request(|response| WorkerCommand::Fork {
-                document: document.0,
-                response,
-            })
-            .await?;
+        self.ensure_active()?;
+        let fork = self.worker.fork(document.0)?;
         self.next_document = self.next_document.max(fork.saturating_add(1));
         Ok(WasmDocumentHandle(fork))
     }
@@ -3556,20 +3414,27 @@ impl WasmComponentActor for V3Actor {
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
-        let (events, receiver) = tokio::sync::mpsc::channel(2);
-        self.sender
-            .send(WorkerCommand::OpenFile {
-                document,
-                limits,
-                input,
-                events,
-            })
-            .map_err(|_| v3_error("v3 actor executor stopped"))?;
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
+        let output = self.worker.open_file(document, limits, input);
+        drop(permit);
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
+        self.transitions.insert(transition.0, output.counters);
         self.cursors.insert(
             cursor.0,
             CursorState {
                 transition,
-                events: receiver,
+                pages: output.pages,
                 complete_file_state: true,
                 certified_csv_pages: Vec::new(),
                 certified_csv_rows: 0,
@@ -3598,14 +3463,21 @@ impl WasmComponentActor for V3Actor {
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let edits = WasmEditCursorHandle(self.allocate_handle()?);
-        let resolved = self
-            .request(|response| WorkerCommand::HydrateFile {
-                document,
-                limits,
-                input,
-                response,
-            })
-            .await?;
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
+        let resolved = self.worker.hydrate_file(document, limits, input);
+        drop(permit);
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
         let page = if let Some(replacement) = resolved.replacement {
             let outputs = WasmByteOutputsHandle(self.allocate_handle()?);
             let length = replacement.len() as u64;
@@ -3644,21 +3516,29 @@ impl WasmComponentActor for V3Actor {
         let next_document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
-        let (events, receiver) = tokio::sync::mpsc::channel(2);
-        self.sender
-            .send(WorkerCommand::FileChanged {
-                document: document.0,
-                next_document,
-                limits,
-                update,
-                events,
-            })
-            .map_err(|_| v3_error("v3 actor executor stopped"))?;
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
+        let output = self
+            .worker
+            .file_changed(document.0, next_document, limits, update);
+        drop(permit);
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
+        self.transitions.insert(transition.0, output.counters);
         self.cursors.insert(
             cursor.0,
             CursorState {
                 transition,
-                events: receiver,
+                pages: output.pages,
                 complete_file_state: false,
                 certified_csv_pages: Vec::new(),
                 certified_csv_rows: 0,
@@ -3688,20 +3568,27 @@ impl WasmComponentActor for V3Actor {
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
-        let (events, receiver) = tokio::sync::mpsc::channel(2);
-        self.sender
-            .send(WorkerCommand::ColdFileChanged {
-                document,
-                limits,
-                update,
-                events,
-            })
-            .map_err(|_| v3_error("v3 actor executor stopped"))?;
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
+        let output = self.worker.cold_file_changed(document, limits, update);
+        drop(permit);
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
+        self.transitions.insert(transition.0, output.counters);
         self.cursors.insert(
             cursor.0,
             CursorState {
                 transition,
-                events: receiver,
+                pages: output.pages,
                 complete_file_state: false,
                 certified_csv_pages: Vec::new(),
                 certified_csv_rows: 0,
@@ -3730,15 +3617,23 @@ impl WasmComponentActor for V3Actor {
     ) -> Result<WasmEntityTransition, LixError> {
         let next_document = self.allocate_document()?;
         let before_len = update.before.len();
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
         let resolved = self
-            .request(|response| WorkerCommand::EntitiesChanged {
-                document: document.0,
-                next_document,
-                limits,
-                update,
-                response,
-            })
-            .await?;
+            .worker
+            .entities_changed(document.0, next_document, limits, update);
+        drop(permit);
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let edits = WasmEditCursorHandle(self.allocate_handle()?);
         let outputs = WasmByteOutputsHandle(self.allocate_handle()?);
@@ -3782,13 +3677,21 @@ impl WasmComponentActor for V3Actor {
         limits: WasmTransitionLimits,
         update: WasmConflictUpdate,
     ) -> Result<WasmConflictTransition, LixError> {
-        let resolved = self
-            .request(|response| WorkerCommand::ResolveConflicts {
-                limits,
-                update,
-                response,
-            })
-            .await?;
+        self.ensure_active()?;
+        let permit = Self::acquire_execution_permit(
+            self.initial_execution_permit.take(),
+            self.execution_scheduler(),
+        )
+        .await?;
+        let resolved = self.worker.resolve_conflicts(limits, update);
+        drop(permit);
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.retire_after_trap(&error);
+                return Err(error);
+            }
+        };
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmResolutionCursorHandle(self.allocate_handle()?);
         let records_per_page = (limits.max_page_bytes as usize / 64).max(1);
@@ -3872,12 +3775,12 @@ impl WasmComponentActor for V3Actor {
             return Err(v3_error("v3 change cursor belongs to another transition"));
         }
         loop {
-            match cursor.events.recv().await {
-                Some(WorkerTransitionEvent::Page(PendingChangePage::TypedCsv {
+            match cursor.pages.pop_front() {
+                Some(PendingChangePage::TypedCsv {
                     row_count,
                     payload,
                     creates,
-                })) => {
+                }) => {
                     let (first_local_ref, last_local_ref) =
                         validate_typed_csv_rows(row_count, &payload).map_err(v3_error)?;
                     if cursor
@@ -3912,7 +3815,7 @@ impl WasmComponentActor for V3Actor {
                     cursor.certified_csv_pages.push(Bytes::from(payload));
                     cursor.certified_packet_entity_keys.extend(page_keys);
                 }
-                Some(WorkerTransitionEvent::Page(page @ PendingChangePage::Packet { .. })) => {
+                Some(page @ PendingChangePage::Packet { .. }) => {
                     let PendingChangePage::Packet {
                         record_count,
                         payload,
@@ -3987,18 +3890,7 @@ impl WasmComponentActor for V3Actor {
                         return Ok(Some(decoded));
                     }
                 }
-                Some(WorkerTransitionEvent::Finished(result)) => {
-                    let counters = match result {
-                        Ok(counters) => counters,
-                        Err(error) => {
-                            self.retire_after_trap(&error);
-                            return Err(error);
-                        }
-                    };
-                    self.transitions.insert(transition.0, counters);
-                    return Ok(None);
-                }
-                None => return Err(v3_error("v3 transition producer stopped")),
+                None => return Ok(None),
             }
         }
     }
@@ -4157,8 +4049,7 @@ impl WasmComponentActor for V3Actor {
         if let Some(document) = self.prospective_documents.reject(transition)
             && !self.retired
         {
-            self.request(|response| WorkerCommand::DropDocument { document, response })
-                .await?;
+            self.worker.drop_document(document)?;
         }
         Ok(())
     }
@@ -4168,30 +4059,19 @@ impl WasmComponentActor for V3Actor {
     }
 
     async fn drop_document(&mut self, document: WasmDocumentHandle) -> Result<(), LixError> {
-        self.request(|response| WorkerCommand::DropDocument {
-            document: document.0,
-            response,
-        })
-        .await
+        self.ensure_active()?;
+        self.worker.drop_document(document.0)
     }
 
     async fn retire(&mut self) -> Result<(), LixError> {
-        if !self.retired {
-            self.retired = true;
-            let _ = self.sender.send(WorkerCommand::Shutdown);
-        }
-        if let Some(thread) = self.thread.take() {
-            thread
-                .join()
-                .map_err(|_| v3_error("v3 actor executor panicked"))?;
-        }
+        self.retired = true;
         Ok(())
     }
 }
 
 impl Drop for V3Actor {
     fn drop(&mut self) {
-        let _ = self.sender.send(WorkerCommand::Shutdown);
+        self.retired = true;
     }
 }
 
@@ -4496,8 +4376,6 @@ mod tests {
         let mut sink = TransitionState::new(
             limits,
             WasmCreateContext { high: 0, low: 0 },
-            None,
-            false,
             true,
             Some(budget),
         )
