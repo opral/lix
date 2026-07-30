@@ -2352,7 +2352,9 @@ fn push_prepared_materialized(
         row.created_at,
         row.updated_at,
         row.global,
-        row.change_id,
+        (!row.addressable_change_id || row.untracked)
+            .then_some(row.change_id)
+            .flatten(),
         row.commit_id,
         row.untracked,
         row.branch_id.as_str(),

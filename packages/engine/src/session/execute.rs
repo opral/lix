@@ -5824,4 +5824,125 @@ mod tests {
             .await
             .expect("transaction should roll back");
     }
+
+    #[tokio::test]
+    async fn explicit_transaction_origin_key_survives_addressable_change_assignment() {
+        let session = open_session().await;
+        session
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('origin-key-address', 'seed')",
+                &[],
+            )
+            .await
+            .expect("seed row should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute_with_options(
+                "UPDATE lix_key_value SET value = 'updated' \
+                 WHERE key = 'origin-key-address'",
+                &[],
+                ExecuteOptions {
+                    origin_key: Some("tx-origin".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stamped update should stage");
+        transaction
+            .commit()
+            .await
+            .expect("stamped update should commit");
+
+        let result = session
+            .execute(
+                "SELECT change.origin_key \
+                 FROM lix_key_value AS value \
+                 JOIN lix_change AS change ON change.id = value.lixcol_change_id \
+                 WHERE value.key = 'origin-key-address'",
+                &[],
+            )
+            .await
+            .expect("current change should be readable");
+        assert_eq!(
+            result.rows()[0]
+                .get::<String>("origin_key")
+                .expect("origin key should be text"),
+            "tx-origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_file_transaction_origin_key_survives_addressable_change_assignment() {
+        const FILE_ID: &str = "01920000-0000-7000-8000-000000000411";
+        let session = open_session().await;
+        session
+            .execute_with_options(
+                "INSERT INTO lix_file (id, path, data) VALUES ($1, $2, $3)",
+                &[
+                    Value::Text(FILE_ID.to_string()),
+                    Value::Text("/origin-key.md".to_string()),
+                    Value::Blob(b"one\n".to_vec().into()),
+                ],
+                ExecuteOptions {
+                    origin_key: Some("first-origin".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed file should commit");
+        session
+            .execute(
+                "UPDATE lix_file SET data = $1 WHERE id = $2",
+                &[
+                    Value::Blob(b"two\n".to_vec().into()),
+                    Value::Text(FILE_ID.to_string()),
+                ],
+            )
+            .await
+            .expect("unstamped file update should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        transaction
+            .execute_with_options(
+                "UPDATE lix_file SET data = $1 WHERE id = $2",
+                &[
+                    Value::Blob(b"three\n".to_vec().into()),
+                    Value::Text(FILE_ID.to_string()),
+                ],
+                ExecuteOptions {
+                    origin_key: Some("tx-origin".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("stamped file update should stage");
+        transaction
+            .commit()
+            .await
+            .expect("stamped file update should commit");
+
+        let result = session
+            .execute(
+                "SELECT change.origin_key \
+                 FROM lix_file AS file \
+                 JOIN lix_change AS change ON change.id = file.lixcol_change_id \
+                 WHERE file.id = $1",
+                &[Value::Text(FILE_ID.to_string())],
+            )
+            .await
+            .expect("current file change should be readable");
+        assert_eq!(
+            result.rows()[0]
+                .get::<String>("origin_key")
+                .expect("origin key should be text"),
+            "tx-origin"
+        );
+    }
 }

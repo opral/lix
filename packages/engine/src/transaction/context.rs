@@ -6418,20 +6418,23 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes
-        .state_rows
-        .iter()
-        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        || prepared_writes
-            .commit_change_refs_by_branch
-            .values()
-            .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
-            .any(|change_ref| {
-                matches!(
-                    change_ref.schema_key(),
+    prepared_writes.state_rows.iter().any(|row| {
+        row.schema_key == BRANCH_REF_SCHEMA_KEY
+            || (row.addressable_change_id
+                && matches!(
+                    row.schema_key.as_str(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                )
-            })
+                ))
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .any(|change_ref| {
+            matches!(
+                change_ref.schema_key(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+            )
+        })
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
@@ -9503,6 +9506,45 @@ mod tests {
     }
 
     #[test]
+    fn addressable_filesystem_row_requires_index_rebuild() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("file-a"),
+            BLOB_REF_SCHEMA_KEY.into(),
+            Some("file-a".into()),
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            false,
+            Some(ChangeId::for_test_label("provisional")),
+            true,
+            Some(CommitId::for_test_label("commit")),
+            false,
+            "main".into(),
+        );
+        let prepared_writes = PreparedWriteSet {
+            state_rows,
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_data_writes: Vec::new(),
+        };
+
+        assert!(prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
+
+    #[test]
     fn visible_materialization_requires_a_matching_blob_ref_identity() {
         let blob_hash = BlobHash::from_content(b"base");
         let row = |snapshot_id: &str| MaterializedLiveStateRow {
@@ -10262,6 +10304,28 @@ mod tests {
             ]))
             .await
             .expect("programmatic rows should stage");
+        let staged = transaction
+            .scan_live_state_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    entity_pks: vec![EntityPk::single("tracked-programmatic")],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("staged tracked row should scan");
+        assert_eq!(staged.len(), 1, "staged tracked row should be visible");
+        let staged = staged.row(0);
+        assert_eq!(
+            staged.change_id(),
+            None,
+            "provisional engine-generated change IDs must not escape before commit"
+        );
         transaction
             .commit(&runtime_functions)
             .await
