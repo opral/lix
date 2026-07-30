@@ -917,6 +917,7 @@ impl TableSpec for LixFileSpec {
         .map_err(lix_error_to_datafusion_error)?;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
         let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
+        let needs_file_timestamps = scan_needs_file_timestamps(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let target_directory_ids =
             exact_string_column_constraint_from_filters(&filters, "directory_id")?;
@@ -935,6 +936,7 @@ impl TableSpec for LixFileSpec {
         // A path predicate or exact file/directory ids can narrow those loads
         // to matching cached descriptors instead of scanning complete state.
         let use_path_index = should_use_path_index(&indexed_path_predicate, needs_blob_rows)
+            || needs_file_timestamps
             || matches!(&target_file_ids, FileIdConstraint::Ids(_))
             || matches!(&target_directory_ids, FileIdConstraint::Ids(_))
             || root_directory_filter;
@@ -4810,6 +4812,14 @@ async fn lix_file_record_batch_from_prepared(
             })
             .or_else(|| live_rows.row(file.live).change_id());
         let live = live_rows.row(file.live);
+        let content_live = blob_rows
+            .get(&blob_key)
+            .map(|blob_ref| live_rows.row(blob_ref.live))
+            .or_else(|| {
+                derived_rows
+                    .get(&blob_key)
+                    .map(|derived| live_rows.row(derived.live))
+            });
         let FileDescriptorRecord {
             id,
             directory_id,
@@ -4827,7 +4837,7 @@ async fn lix_file_record_batch_from_prepared(
             global: live.global(),
             change_id: projected_change_id.map(|id| id.to_string()),
             created_at: live.created_at().to_string(),
-            updated_at: live.updated_at().to_string(),
+            updated_at: content_live.unwrap_or(live).updated_at().to_string(),
             commit_id: live.commit_id().map(|id| id.to_string()),
             untracked: live.untracked(),
             metadata: live.metadata().map(|value| serialize_row_metadata(value)),
@@ -5662,19 +5672,42 @@ fn scan_needs_blob_rows(
         Some(indices) => indices.iter().any(|index| {
             matches!(
                 base_schema.field(*index).name().as_str(),
-                "data" | "lixcol_change_id"
+                "data" | "lixcol_change_id" | "lixcol_updated_at"
             )
         }),
         None => true,
     };
     projects_blob_column
         || filters.iter().any(|filter| {
-            contains_column(filter, "data") || contains_column(filter, "lixcol_change_id")
+            contains_column(filter, "data")
+                || contains_column(filter, "lixcol_change_id")
+                || contains_column(filter, "lixcol_updated_at")
         })
 }
 
 fn should_use_path_index(path_predicate: &FilePathPredicate, needs_blob_rows: bool) -> bool {
     path_predicate != &FilePathPredicate::All || !needs_blob_rows
+}
+
+fn scan_needs_file_timestamps(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projects_timestamp = match projection {
+        Some(indices) => indices.iter().any(|index| {
+            matches!(
+                base_schema.field(*index).name().as_str(),
+                "lixcol_created_at" | "lixcol_updated_at"
+            )
+        }),
+        None => true,
+    };
+    projects_timestamp
+        || filters.iter().any(|filter| {
+            contains_column(filter, "lixcol_created_at")
+                || contains_column(filter, "lixcol_updated_at")
+        })
 }
 
 fn lix_file_scan_request(

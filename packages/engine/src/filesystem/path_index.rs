@@ -142,8 +142,14 @@ impl FilesystemPathEntry {
         &self.created_at
     }
 
-    pub(crate) fn updated_at(&self) -> &str {
-        &self.updated_at
+    pub(crate) fn updated_at(&self) -> String {
+        self.blob_ref
+            .as_ref()
+            .filter(|_| self.kind == FilesystemPathKind::File)
+            .map_or_else(
+                || self.updated_at.clone(),
+                |blob_ref| blob_ref.updated_at.to_string(),
+            )
     }
 
     pub(crate) fn change_id(&self) -> Option<ChangeId> {
@@ -790,6 +796,12 @@ impl FilesystemPathIndex {
         }
 
         let mut entry = self.entry_from_row(row, key, kind)?;
+        if let Some(prior) = prior.as_ref() {
+            // Descriptor writes in the transaction overlay carry the current
+            // change timestamp. Replacing the same identity must retain the
+            // entity's first visible timestamp.
+            entry.created_at.clone_from(&prior.created_at);
+        }
         entry.blob_ref = prior_blob_ref;
         entry.cached_blob_data = prior_cached_blob_data;
         self.insert_entry(Arc::new(entry));
