@@ -236,6 +236,8 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
         executions.set(executions.get().saturating_add(1));
     });
+    #[cfg(feature = "storage-benches")]
+    crate::storage_bench::record_certified_entity_insert_parameter_batch_execution();
     Ok(Some(
         (0..parameter_batch.num_rows())
             .map(|_| SqlWriteResult::affected(1))
