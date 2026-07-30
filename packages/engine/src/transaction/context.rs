@@ -6234,6 +6234,31 @@ where
         Ok(Some(generation))
     }
 
+    fn has_staged_collection_rows(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let file_ids = scope
+            .file_id
+            .map(|file_id| vec![NullableKeyFilter::Value(file_id.to_string())])
+            .unwrap_or_default();
+        Ok(!staged
+            .staged_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![scope.schema_key.to_string()],
+                    branch_ids: vec![branch_id.to_string()],
+                    file_ids,
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })?
+            .is_empty())
+    }
+
     async fn stage_write(
         &mut self,
         write: TransactionWrite,

@@ -3916,6 +3916,70 @@ mod tests {
             .commit()
             .await
             .expect("collection delete should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("explicit transaction on the empty collection should open");
+        transaction
+            .execute(
+                "INSERT INTO test_state_schema (id) VALUES ('only-staged')",
+                &[],
+            )
+            .await
+            .expect("member should stage against an empty committed collection");
+        let deleted = transaction
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("staged-only collection should delete");
+        assert_eq!(deleted.rows_affected(), 1);
+        let selected = transaction
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("staged-only collection delete should be visible");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+        transaction
+            .commit()
+            .await
+            .expect("staged-only collection delete should commit");
+        let selected = session
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("committed staged-only collection delete should query");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+
+        session
+            .execute(
+                "INSERT INTO test_state_schema (id) VALUES ('committed-a'), ('committed-b')",
+                &[],
+            )
+            .await
+            .expect("committed members should recreate the collection");
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("explicit transaction on the nonempty collection should open");
+        transaction
+            .execute(
+                "INSERT INTO test_state_schema (id) VALUES ('staged-c')",
+                &[],
+            )
+            .await
+            .expect("additional member should stage");
+        let deleted = transaction
+            .execute("DELETE FROM test_state_schema", &[])
+            .await
+            .expect("committed and staged members should delete together");
+        assert_eq!(deleted.rows_affected(), 3);
+        let selected = transaction
+            .execute("SELECT id FROM test_state_schema", &[])
+            .await
+            .expect("mixed committed and staged collection delete should be visible");
+        assert!(rows_from_execute_result(selected).1.is_empty());
+        transaction
+            .commit()
+            .await
+            .expect("mixed committed and staged collection delete should commit");
     }
 
     #[tokio::test]

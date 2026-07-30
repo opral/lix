@@ -196,6 +196,14 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         Ok(None)
     }
 
+    fn has_staged_collection_rows(
+        &self,
+        _branch_id: &str,
+        _scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        Ok(false)
+    }
+
     async fn stage_write(
         &mut self,
         write: TransactionWrite,

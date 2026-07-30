@@ -739,6 +739,13 @@ async fn entity_delete_collection(
     if global.is_some_and(|global| global.live_count != 0) {
         return Ok(None);
     }
+    // A generation control only counts committed HOT members. Ordinary staged
+    // rows can add, replace, or remove members from that count, so let the
+    // row-wise executor resolve the exact transaction overlay whenever any are
+    // present.
+    if ctx.has_staged_collection_rows(&active_branch_id, scope)? {
+        return Ok(None);
+    }
     let Some(previous) = ctx
         .load_collection_generation(&active_branch_id, scope)
         .await?

@@ -101,24 +101,25 @@ pub(crate) async fn overlay_scan_batch<S>(
 where
     S: StagedLiveStateRows + ?Sized,
 {
-    if let [schema_key] = request.filter.schema_keys.as_slice()
-        && request
-            .filter
-            .branch_ids
-            .iter()
-            .filter(|branch_id| branch_id.as_str() != GLOBAL_BRANCH_ID)
-            .try_fold(false, |replaced, branch_id| {
-                Ok::<_, LixError>(
-                    replaced || staged.collection_replaced(branch_id, schema_key, None)?,
-                )
-            })?
-    {
+    let mut visible_branch_ids = request.filter.branch_ids.clone();
+    if let [schema_key] = request.filter.schema_keys.as_slice() {
+        let mut retained = Vec::with_capacity(visible_branch_ids.len());
+        for branch_id in visible_branch_ids {
+            if branch_id == GLOBAL_BRANCH_ID
+                || !staged.collection_replaced(&branch_id, schema_key, None)?
+            {
+                retained.push(branch_id);
+            }
+        }
+        visible_branch_ids = retained;
+    }
+    if !request.filter.branch_ids.is_empty() && visible_branch_ids.is_empty() {
         return Ok(MaterializedLiveStateBatch::default());
     }
     let mut candidate_request = request.clone();
     candidate_request.limit = None;
     candidate_request.filter.include_tombstones = true;
-    candidate_request.filter.branch_ids = expanded_branch_ids(&request.filter.branch_ids);
+    candidate_request.filter.branch_ids = expanded_branch_ids(&visible_branch_ids);
     let staged_rows = staged.staged_batch(&candidate_request)?;
     let rows = base.scan_batch(&candidate_request).await?;
     Ok(resolve_visible_batch(
@@ -126,7 +127,7 @@ where
         staged_rows,
         &VisibilityRequest {
             branch_scope: VisibilityBranchScope::BranchIds {
-                branch_ids: request.filter.branch_ids.clone(),
+                branch_ids: visible_branch_ids,
             },
             include_tombstones: request.filter.include_tombstones,
             limit: request.limit,
@@ -1007,6 +1008,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn overlay_scan_replacement_hides_only_its_branch() {
+        let replaced_branch = "01920000-0000-7000-8000-0000000000a1";
+        let unaffected_branch = "01920000-0000-7000-8000-0000000000a2";
+        let base = FilteringReader {
+            rows: vec![
+                row_at(
+                    replaced_branch,
+                    "replaced",
+                    "replaced-value",
+                    false,
+                    Some("change-replaced"),
+                ),
+                row_at(
+                    unaffected_branch,
+                    "unaffected",
+                    "unaffected-value",
+                    false,
+                    Some("change-unaffected"),
+                ),
+            ],
+        };
+        let staged = ReplacedBranchStagedRows {
+            replaced_branch,
+            schema_key: "schema",
+        };
+
+        let rows = overlay_scan_batch(
+            &base,
+            &staged,
+            &LiveStateScanRequest {
+                filter: crate::live_state::LiveStateFilter {
+                    branch_ids: vec![replaced_branch.to_string(), unaffected_branch.to_string()],
+                    schema_keys: vec!["schema".to_string()],
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("multi-branch replacement overlay should resolve")
+        .into_rows();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].branch_id.as_ref(), unaffected_branch);
+        assert_eq!(rows[0].entity_pk, EntityPk::single("unaffected"));
+    }
+
+    #[tokio::test]
     async fn exact_overlay_preserves_branch_global_precedence_and_tombstones() {
         let base = FilteringReader {
             rows: vec![
@@ -1241,6 +1290,41 @@ mod tests {
                 MaterializedLiveStateBatch::default(),
                 vec![None; request.rows.len()],
             )
+        }
+    }
+
+    struct ReplacedBranchStagedRows<'a> {
+        replaced_branch: &'a str,
+        schema_key: &'a str,
+    }
+
+    impl StagedLiveStateRows for ReplacedBranchStagedRows<'_> {
+        fn staged_batch(
+            &self,
+            _request: &LiveStateScanRequest,
+        ) -> Result<MaterializedLiveStateBatch, LixError> {
+            Ok(MaterializedLiveStateBatch::default())
+        }
+
+        fn load_exact_batch(
+            &self,
+            request: &LiveStateExactBatchRequest,
+        ) -> Result<MaterializedLiveStateExactBatch, LixError> {
+            MaterializedLiveStateExactBatch::new(
+                MaterializedLiveStateBatch::default(),
+                vec![None; request.rows.len()],
+            )
+        }
+
+        fn collection_replaced(
+            &self,
+            branch_id: &str,
+            schema_key: &str,
+            file_id: Option<&str>,
+        ) -> Result<bool, LixError> {
+            Ok(branch_id == self.replaced_branch
+                && schema_key == self.schema_key
+                && file_id.is_none())
         }
     }
 
