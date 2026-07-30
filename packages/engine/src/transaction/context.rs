@@ -6260,6 +6260,7 @@ struct PreparedScalarRow {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     change_id: Option<ChangeId>,
+    addressable_change_id: bool,
     commit_id: Option<CommitId>,
 }
 
@@ -6274,6 +6275,7 @@ struct PreparedScalarBatch {
     created_at: Vec<LixTimestamp>,
     updated_at: Vec<LixTimestamp>,
     change_ids: Vec<Option<ChangeId>>,
+    addressable_change_ids: Vec<bool>,
     commit_ids: Vec<Option<CommitId>>,
 }
 
@@ -6285,6 +6287,7 @@ impl PreparedScalarBatch {
             created_at: Vec::with_capacity(capacity),
             updated_at: Vec::with_capacity(capacity),
             change_ids: Vec::with_capacity(capacity),
+            addressable_change_ids: Vec::with_capacity(capacity),
             commit_ids: Vec::with_capacity(capacity),
         }
     }
@@ -6295,6 +6298,7 @@ impl PreparedScalarBatch {
         self.created_at.push(row.created_at);
         self.updated_at.push(row.updated_at);
         self.change_ids.push(row.change_id);
+        self.addressable_change_ids.push(row.addressable_change_id);
         self.commit_ids.push(row.commit_id);
     }
 
@@ -6305,6 +6309,7 @@ impl PreparedScalarBatch {
             created_at: self.created_at[index],
             updated_at: self.updated_at[index],
             change_id: self.change_ids[index],
+            addressable_change_id: self.addressable_change_ids[index],
             commit_id: self.commit_ids[index],
         }
     }
@@ -6333,6 +6338,7 @@ fn plan_prepared_row_scalars(
             "normalized transaction write row is missing entity_pk",
         ));
     }
+    let addressable_change_id = row.change_id.is_none();
     let change_id = Some(match row.change_id {
         Some(change_id) => ChangeId::parse_lix(change_id, "prepared row change_id")?,
         None => ChangeId::from(functions.call_uuid_v7()),
@@ -6347,6 +6353,7 @@ fn plan_prepared_row_scalars(
         created_at,
         updated_at,
         change_id,
+        addressable_change_id,
         commit_id,
     })
 }
@@ -6379,7 +6386,7 @@ fn push_prepared_state_row_from_planned_parts(
             "normalized transaction write row is missing entity_pk",
         )
     })?;
-    prepared.push_parts(
+    prepared.push_parts_with_change_addressability(
         scalar.schema_plan_id,
         scalar.facts,
         entity_pk,
@@ -6393,6 +6400,7 @@ fn push_prepared_state_row_from_planned_parts(
         scalar.updated_at,
         global,
         scalar.change_id,
+        scalar.addressable_change_id,
         scalar.commit_id,
         untracked,
         branch_id,
@@ -6443,20 +6451,23 @@ fn prepared_writes_change_catalog(prepared_writes: &PreparedWriteSet) -> bool {
 }
 
 fn prepared_writes_require_filesystem_index_rebuild(prepared_writes: &PreparedWriteSet) -> bool {
-    prepared_writes
-        .state_rows
-        .iter()
-        .any(|row| row.schema_key == BRANCH_REF_SCHEMA_KEY)
-        || prepared_writes
-            .commit_change_refs_by_branch
-            .values()
-            .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
-            .any(|change_ref| {
-                matches!(
-                    change_ref.schema_key(),
+    prepared_writes.state_rows.iter().any(|row| {
+        row.schema_key == BRANCH_REF_SCHEMA_KEY
+            || (row.addressable_change_id
+                && matches!(
+                    row.schema_key.as_str(),
                     "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
-                )
-            })
+                ))
+    }) || prepared_writes
+        .commit_change_refs_by_branch
+        .values()
+        .flat_map(crate::transaction::types::StagedCommitChangeRefs::selected_changes)
+        .any(|change_ref| {
+            matches!(
+                change_ref.schema_key(),
+                "lix_file_descriptor" | "lix_directory_descriptor" | BLOB_REF_SCHEMA_KEY
+            )
+        })
 }
 
 pub(crate) struct OpenTransaction<StorageImpl: Storage = Memory> {
@@ -9550,6 +9561,45 @@ mod tests {
     }
 
     #[test]
+    fn addressable_filesystem_row_requires_index_rebuild() {
+        let timestamp = LixTimestamp::from_unix_millis_utc_lossy(0);
+        let mut state_rows = PreparedStateBatch::with_capacity(1);
+        state_rows.push_parts_with_change_addressability(
+            SchemaPlanId::for_test(0),
+            PreparedRowFacts::default(),
+            EntityPk::single("file-a"),
+            BLOB_REF_SCHEMA_KEY.into(),
+            Some("file-a".into()),
+            None,
+            None,
+            None,
+            None,
+            timestamp,
+            timestamp,
+            false,
+            Some(ChangeId::for_test_label("provisional")),
+            true,
+            Some(CommitId::for_test_label("commit")),
+            false,
+            "main".into(),
+        );
+        let prepared_writes = PreparedWriteSet {
+            state_rows,
+            insert_selection: crate::transaction::staging::PreparedInsertSelection::new(),
+            commit_change_refs_by_branch: BTreeMap::new(),
+            first_commit_parent_override_by_branch: BTreeMap::new(),
+            checkpoint_publications: Vec::new(),
+            extra_commit_parents_by_branch: BTreeMap::new(),
+            intermediate_commits: Vec::new(),
+            file_data_writes: Vec::new(),
+        };
+
+        assert!(prepared_writes_require_filesystem_index_rebuild(
+            &prepared_writes
+        ));
+    }
+
+    #[test]
     fn visible_materialization_requires_a_matching_blob_ref_identity() {
         let blob_hash = BlobHash::from_content(b"base");
         let row = |snapshot_id: &str| MaterializedLiveStateRow {
@@ -10386,6 +10436,28 @@ mod tests {
             ]))
             .await
             .expect("programmatic rows should stage");
+        let staged = transaction
+            .scan_live_state_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec!["lix_key_value".to_string()],
+                    entity_pks: vec![EntityPk::single("tracked-programmatic")],
+                    branch_ids: vec![GLOBAL_BRANCH_ID.to_string()],
+                    file_ids: vec![NullableKeyFilter::Null],
+                    untracked: Some(false),
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+            .expect("staged tracked row should scan");
+        assert_eq!(staged.len(), 1, "staged tracked row should be visible");
+        let staged = staged.row(0);
+        assert_eq!(
+            staged.change_id(),
+            None,
+            "provisional engine-generated change IDs must not escape before commit"
+        );
         transaction
             .commit(&runtime_functions)
             .await
@@ -10443,6 +10515,28 @@ mod tests {
             .await
             .expect("branch ref should load")
             .expect("tracked commit should advance the global branch ref");
+        assert_eq!(
+            &tracked_change_id.as_uuid().as_bytes()[..12],
+            &head_commit_id.as_uuid().as_bytes()[..12],
+            "fresh tracked changes should carry their commit-delta address"
+        );
+        assert_eq!(
+            &head_commit_id.as_uuid().as_bytes()[12..],
+            &[0; 4],
+            "fresh commit ids should reserve the packed change address suffix"
+        );
+        let addressed_change =
+            crate::tracked_state::load_change_record_by_id(&packed_read, tracked_change_id)
+                .await
+                .expect("direct change address should load")
+                .expect("direct change address should exist");
+        assert_eq!(
+            addressed_change
+                .entity_pk
+                .as_single_string_owned()
+                .as_deref(),
+            Ok("tracked-programmatic")
+        );
 
         let tracked_row = TrackedStateContext::new()
             .reader(

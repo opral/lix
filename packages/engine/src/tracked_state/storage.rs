@@ -19,7 +19,7 @@ use crate::storage_adapter::{
 use crate::tracked_state::codec::{
     DecodedLeafNodeRef, DecodedNodeRef, EncodedLeafEntry, PendingChunkBatch,
     TrackedStateMutationBatchBuilder, decode_key, decode_key_shared, decode_node_ref, decode_value,
-    encode_key_ref, encode_leaf_node, encode_schema_key_prefix,
+    encode_key_ref, encode_leaf_node, encode_schema_key_prefix, encode_value_ref,
 };
 use crate::tracked_state::types::{
     TRACKED_STATE_HASH_BYTES, TrackedStateCommitDeltaRef, TrackedStateCommitRoot,
@@ -210,6 +210,13 @@ pub(crate) struct CommitDeltaChangeLocator {
     pub(crate) commit_id: CommitId,
     pub(crate) segment_index: u32,
     pub(crate) ordinal: u8,
+}
+
+pub(crate) struct AddressableCommitDeltaStage {
+    pub(crate) locators: Vec<CommitDeltaChangeLocator>,
+    /// Final ids by input delta ordinal. Non-addressable entries retain the
+    /// nil sentinel and never require a second per-row index.
+    pub(crate) assigned_change_ids: Vec<crate::changelog::ChangeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -602,8 +609,33 @@ pub(crate) fn stage_commit_deltas(
     writes: &mut StorageWriteSet,
     deltas: &[TrackedStateCommitDeltaRef<'_>],
 ) -> Result<Vec<CommitDeltaChangeLocator>, LixError> {
+    Ok(stage_commit_deltas_inner(writes, deltas, None)?.locators)
+}
+
+pub(crate) fn stage_addressable_commit_deltas(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+    addressable: &[bool],
+) -> Result<AddressableCommitDeltaStage, LixError> {
+    if addressable.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state addressability column does not match commit deltas",
+        ));
+    }
+    stage_commit_deltas_inner(writes, deltas, Some(addressable))
+}
+
+fn stage_commit_deltas_inner(
+    writes: &mut StorageWriteSet,
+    deltas: &[TrackedStateCommitDeltaRef<'_>],
+    addressable: Option<&[bool]>,
+) -> Result<AddressableCommitDeltaStage, LixError> {
     let Some(&commit_id) = deltas.first().map(|delta| &delta.delta.commit_id) else {
-        return Ok(Vec::new());
+        return Ok(AddressableCommitDeltaStage {
+            locators: Vec::new(),
+            assigned_change_ids: Vec::new(),
+        });
     };
     let mut entries = TrackedStateMutationBatchBuilder::with_row_capacity(deltas.len());
     let mut payloads = Vec::with_capacity(deltas.len());
@@ -643,18 +675,30 @@ pub(crate) fn stage_commit_deltas(
     let mut pending = mutations
         .into_iter()
         .zip(payloads)
-        .map(|(mutation, payload)| {
+        .enumerate()
+        .map(|(index, (mutation, payload))| {
             (
                 EncodedLeafEntry {
                     key: mutation.encoded_key,
                     value: mutation.encoded_value,
                 },
                 payload,
+                addressable.is_some_and(|column| column[index]),
+                index,
             )
         })
         .collect::<Vec<_>>();
     pending.sort_unstable_by(|left, right| left.0.key.cmp(&right.0.key));
-    let (entries, payloads): (Vec<_>, Vec<_>) = pending.into_iter().unzip();
+    let mut entries = Vec::with_capacity(pending.len());
+    let mut payloads = Vec::with_capacity(pending.len());
+    let mut addressable = Vec::with_capacity(pending.len());
+    let mut source_indices = Vec::with_capacity(pending.len());
+    for (entry, payload, direct, source_index) in pending {
+        entries.push(entry);
+        payloads.push(payload);
+        addressable.push(direct);
+        source_indices.push(source_index);
+    }
     if entries.windows(2).any(|pair| pair[0].key == pair[1].key) {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
@@ -665,19 +709,39 @@ pub(crate) fn stage_commit_deltas(
     }
 
     let mut encoded_segments = Vec::new();
+    let mut assigned_change_ids = vec![crate::changelog::ChangeId::default(); deltas.len()];
     let mut segment_start = 0usize;
     while segment_start < entries.len() {
         let mut segment_end = (segment_start + COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
-        let encoded = loop {
+        let segment_index = encoded_segments.len();
+        let (encoded, assigned_entries, segment_assignments) = loop {
+            let mut candidate = entries[segment_start..segment_end].to_vec();
+            let mut candidate_assignments = Vec::new();
+            for (ordinal, entry) in candidate.iter_mut().enumerate() {
+                let source_index = segment_start + ordinal;
+                if !addressable[source_index] {
+                    continue;
+                }
+                let value = decode_value(&entry.value)?;
+                let change_id = addressable_change_id(commit_id, segment_index, ordinal)?;
+                entry.value = Bytes::from(encode_value_ref(TrackedStateIndexValueRef {
+                    change_id,
+                    commit_id: value.commit_id,
+                    deleted: value.deleted,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                }));
+                candidate_assignments.push((source_indices[source_index], change_id));
+            }
             match try_encode_commit_delta_segment_with_payloads(
-                &entries[segment_start..segment_end],
+                &candidate,
                 &payloads[segment_start..segment_end],
             ) {
                 Ok(encoded)
                     if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES
                         || segment_end - segment_start == 1 =>
                 {
-                    break encoded;
+                    break (encoded, candidate, candidate_assignments);
                 }
                 Ok(_) | Err(CommitDeltaSegmentEncodeError::SidecarTooLarge)
                     if segment_end - segment_start > 1 =>
@@ -688,6 +752,10 @@ pub(crate) fn stage_commit_deltas(
                 Ok(_) => unreachable!("single-row segment exits through the guarded success arm"),
             }
         };
+        entries[segment_start..segment_end].clone_from_slice(&assigned_entries);
+        for (source_index, change_id) in segment_assignments {
+            assigned_change_ids[source_index] = change_id;
+        }
         encoded_segments.push((segment_start..segment_end, encoded));
         segment_start = segment_end;
     }
@@ -705,7 +773,15 @@ pub(crate) fn stage_commit_deltas(
                 segments: Vec::new(),
             })?),
         );
-        return commit_delta_change_locators(commit_id, 0, &entries);
+        let locators = commit_delta_change_locators(commit_id, 0, &entries)?
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, locator)| (!addressable[index]).then_some(locator))
+            .collect();
+        return Ok(AddressableCommitDeltaStage {
+            locators,
+            assigned_change_ids,
+        });
     }
     writes.reserve_space(TRACKED_STATE_COMMIT_DELTA_SEGMENT_SPACE, segment_count, 0);
     let mut manifest = CommitDeltaManifest {
@@ -714,6 +790,7 @@ pub(crate) fn stage_commit_deltas(
     };
     let mut locators = Vec::with_capacity(entries.len());
     for (segment_index, (range, encoded)) in encoded_segments.into_iter().enumerate() {
+        let segment_start = range.start;
         let segment_entries = &entries[range];
         let first_key = segment_entries
             .first()
@@ -734,18 +811,59 @@ pub(crate) fn stage_commit_deltas(
             key(commit_delta_segment_key(commit_id, segment_index)?),
             value(encoded),
         );
-        locators.extend(commit_delta_change_locators(
-            commit_id,
-            segment_index,
-            segment_entries,
-        )?);
+        locators.extend(
+            commit_delta_change_locators(commit_id, segment_index, segment_entries)?
+                .into_iter()
+                .enumerate()
+                .filter_map(|(ordinal, locator)| {
+                    (!addressable[segment_start + ordinal]).then_some(locator)
+                }),
+        );
     }
     writes.put(
         TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
         key(commit_delta_manifest_key(commit_id)),
         value(encode_commit_delta_manifest(&manifest)?),
     );
-    Ok(locators)
+    Ok(AddressableCommitDeltaStage {
+        locators,
+        assigned_change_ids,
+    })
+}
+
+fn addressable_change_id(
+    commit_id: CommitId,
+    segment_index: usize,
+    ordinal: usize,
+) -> Result<crate::changelog::ChangeId, LixError> {
+    if commit_id.as_uuid().as_bytes()[12..] != [0; 4] {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state addressable commit id has no reserved change address space",
+        ));
+    }
+    let segment = u32::try_from(segment_index).map_err(|_| {
+        LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "tracked_state commit_delta segment index exceeds direct address space",
+        )
+    })?;
+    let ordinal = u8::try_from(ordinal).expect("commit-delta segment row count fits u8");
+    let packed = segment
+        .checked_mul(256)
+        .and_then(|value| value.checked_add(u32::from(ordinal)))
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta address exceeds u32",
+            )
+        })?;
+    let mut bytes = *commit_id.as_uuid().as_bytes();
+    bytes[12..].copy_from_slice(&packed.to_be_bytes());
+    Ok(crate::changelog::ChangeId::new(uuid::Uuid::from_bytes(
+        bytes,
+    )))
 }
 
 fn commit_delta_change_locators(
@@ -806,12 +924,61 @@ pub(crate) async fn load_change_record_by_id(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
-    let Some(locator) = load_change_locator_by_id(store, change_id).await? else {
-        return Ok(None);
-    };
-    load_change_record_at_locator(store, locator)
-        .await
-        .map(Some)
+    let mut direct_error = None;
+    if let Some(locator) = direct_change_locator(change_id)
+        && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
+    {
+        match try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await {
+            Ok(Some(record)) => return Ok(Some(record)),
+            Ok(None) => {}
+            Err(error) => direct_error = Some(error),
+        }
+    }
+    if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
+        return load_change_record_at_locator(store, locator)
+            .await
+            .map(Some);
+    }
+    direct_error.map_or(Ok(None), Err)
+}
+
+async fn load_canonical_change_locator(
+    store: &(impl StorageAdapterRead + ?Sized),
+    change_id: crate::changelog::ChangeId,
+) -> Result<Option<CommitDeltaChangeLocator>, LixError> {
+    let mut direct_error = None;
+    if let Some(locator) = direct_change_locator(change_id)
+        && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
+    {
+        match try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await {
+            Ok(Some(_)) => return Ok(Some(locator)),
+            Ok(None) => {}
+            Err(error) => direct_error = Some(error),
+        }
+    }
+    if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
+        return Ok(Some(locator));
+    }
+    direct_error.map_or(Ok(None), Err)
+}
+
+fn direct_change_locator(
+    change_id: crate::changelog::ChangeId,
+) -> Option<CommitDeltaChangeLocator> {
+    let mut commit_bytes = *change_id.as_uuid().as_bytes();
+    let packed = u32::from_be_bytes(commit_bytes[12..].try_into().expect("four address bytes"));
+    let packed = packed.checked_sub(1)?;
+    let ordinal = u8::try_from(packed % 256).ok()?;
+    if usize::from(ordinal) >= COMMIT_DELTA_SEGMENT_MAX_ROWS {
+        return None;
+    }
+    commit_bytes[12..].fill(0);
+    Some(CommitDeltaChangeLocator {
+        change_id,
+        commit_id: CommitId::new(uuid::Uuid::from_bytes(commit_bytes)),
+        segment_index: packed / 256,
+        ordinal,
+    })
 }
 
 async fn load_change_locator_by_id(
@@ -850,6 +1017,31 @@ async fn load_change_record_at_locator(
             ),
         ));
     };
+    load_change_record_at_locator_in_manifest(store, locator, &manifest).await
+}
+
+async fn load_change_record_at_locator_in_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+    manifest: &CommitDeltaManifest,
+) -> Result<crate::changelog::ChangeRecord, LixError> {
+    let change_id = locator.change_id;
+    try_load_change_record_at_locator_in_manifest(store, locator, manifest)
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("tracked_state change locator for '{change_id}' points to the wrong row"),
+            )
+        })
+}
+
+async fn try_load_change_record_at_locator_in_manifest(
+    store: &(impl StorageAdapterRead + ?Sized),
+    locator: CommitDeltaChangeLocator,
+    manifest: &CommitDeltaManifest,
+) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let change_id = locator.change_id;
     let (segment, bounds) = if let Some(inline) = manifest.inline_segment() {
         if locator.segment_index != 0 {
             return Err(LixError::new(
@@ -910,15 +1102,18 @@ async fn load_change_record_at_locator(
         )
     })?;
     let value = decode_value(entry.value)?;
-    if value.change_id != change_id || value.commit_id != locator.commit_id {
+    if value.commit_id != locator.commit_id {
         return Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("tracked_state change locator for '{change_id}' points to the wrong row"),
         ));
     }
+    if value.change_id != change_id {
+        return Ok(None);
+    }
     let key = decode_key(entry.key)?;
     let payload = payloads.decode(ordinal)?;
-    Ok(crate::changelog::ChangeRecord {
+    Ok(Some(crate::changelog::ChangeRecord {
         format_version: 2,
         change_id,
         schema_key: key.schema_key,
@@ -928,7 +1123,7 @@ async fn load_change_record_at_locator(
         metadata: payload.metadata,
         created_at: value.updated_at,
         origin_key: payload.origin_key,
-    })
+    }))
 }
 
 fn decode_change_locator(
@@ -1525,7 +1720,7 @@ pub(crate) async fn visit_change_records_from_commit_deltas(
                     // introduce another public changelog fact.
                     continue;
                 } else {
-                    let locator = load_change_locator_by_id(store, member.change.change_id)
+                    let locator = load_canonical_change_locator(store, member.change.change_id)
                         .await?
                         .ok_or_else(|| {
                             invalid_change_locator(
@@ -3037,6 +3232,164 @@ mod tests {
                 .is_none()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn addressable_change_loads_without_a_per_change_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_5678_9abc,
+        ));
+        let fixtures = packed_commit_delta_fixtures();
+        let deltas = commit_delta_refs(commit_id, &fixtures);
+        let mut writes = storage.new_write_set();
+        let staged =
+            super::stage_addressable_commit_deltas(&mut writes, &deltas, &vec![true; deltas.len()])
+                .expect("addressable deltas should stage");
+        assert!(staged.locators.is_empty());
+        assert!(
+            staged
+                .assigned_change_ids
+                .iter()
+                .all(|change_id| *change_id != ChangeId::default())
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("addressable deltas should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("addressable read should open");
+        let source_index = fixtures.len() / 2;
+        let change_id = staged.assigned_change_ids[source_index];
+        assert!(
+            super::load_change_locator_by_id(&read, change_id)
+                .await
+                .expect("locator absence should read")
+                .is_none()
+        );
+        let loaded = load_change_record_by_id(&read, change_id)
+            .await
+            .expect("direct address should read")
+            .expect("direct address should resolve");
+        assert_eq!(loaded.change_id, change_id);
+        assert_eq!(loaded.schema_key, fixtures[source_index].schema_key);
+        assert_eq!(loaded.entity_pk, fixtures[source_index].entity_pk);
+    }
+
+    #[tokio::test]
+    async fn address_shaped_explicit_change_id_falls_back_to_its_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let addressable_commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_1234_0000_0000,
+        ));
+        let address_target = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let mut writes = storage.new_write_set();
+        let target_deltas =
+            commit_delta_refs(addressable_commit_id, std::slice::from_ref(&address_target));
+        let target_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &target_deltas, &[false])
+                .expect("non-addressable target should stage");
+        stage_change_locators(&mut writes, &target_staged.locators);
+
+        let explicit_change_id =
+            super::addressable_change_id(addressable_commit_id, 0, 0).expect("valid direct shape");
+        let explicit_commit_id = CommitId::for_test_label("address-shaped-explicit-commit");
+        let mut explicit = packed_commit_delta_fixtures()
+            .into_iter()
+            .nth(1)
+            .expect("second fixture should exist");
+        explicit.change_id = explicit_change_id;
+        let explicit_deltas =
+            commit_delta_refs(explicit_commit_id, std::slice::from_ref(&explicit));
+        let explicit_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false])
+                .expect("explicit change should stage with a locator");
+        assert_eq!(explicit_staged.locators.len(), 1);
+        stage_change_locators(&mut writes, &explicit_staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("collision fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("collision read should open");
+        let loaded = load_change_record_by_id(&read, explicit_change_id)
+            .await
+            .expect("explicit collision read should succeed")
+            .expect("explicit collision should resolve through its locator");
+        assert_eq!(loaded.change_id, explicit_change_id);
+        assert_eq!(loaded.schema_key, explicit.schema_key);
+        assert_eq!(loaded.entity_pk, explicit.entity_pk);
+        assert_ne!(loaded.entity_pk, address_target.entity_pk);
+        let canonical = super::load_canonical_change_locator(&read, explicit_change_id)
+            .await
+            .expect("canonical locator read should succeed")
+            .expect("explicit collision should retain a canonical locator");
+        assert_eq!(canonical.commit_id, explicit_commit_id);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_address_shaped_explicit_id_falls_back_to_its_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let addressable_commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5678_0000_0000,
+        ));
+        let address_target = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let mut writes = storage.new_write_set();
+        let target_deltas =
+            commit_delta_refs(addressable_commit_id, std::slice::from_ref(&address_target));
+        let target_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &target_deltas, &[false])
+                .expect("inline target should stage");
+        stage_change_locators(&mut writes, &target_staged.locators);
+
+        let explicit_change_id = super::addressable_change_id(addressable_commit_id, 1, 0)
+            .expect("out-of-range segment should retain a valid direct shape");
+        let explicit_commit_id = CommitId::for_test_label("out-of-range-explicit-commit");
+        let mut explicit = packed_commit_delta_fixtures()
+            .into_iter()
+            .nth(1)
+            .expect("second fixture should exist");
+        explicit.change_id = explicit_change_id;
+        let explicit_deltas =
+            commit_delta_refs(explicit_commit_id, std::slice::from_ref(&explicit));
+        let explicit_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false])
+                .expect("out-of-range explicit change should stage");
+        assert_eq!(explicit_staged.locators.len(), 1);
+        stage_change_locators(&mut writes, &explicit_staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("out-of-range collision fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("collision read should open");
+        let loaded = load_change_record_by_id(&read, explicit_change_id)
+            .await
+            .expect("out-of-range explicit read should succeed")
+            .expect("out-of-range explicit id should resolve through its locator");
+        assert_eq!(loaded.change_id, explicit_change_id);
+        assert_eq!(loaded.schema_key, explicit.schema_key);
+        assert_eq!(loaded.entity_pk, explicit.entity_pk);
+        let canonical = super::load_canonical_change_locator(&read, explicit_change_id)
+            .await
+            .expect("canonical locator read should succeed")
+            .expect("out-of-range explicit id should retain a canonical locator");
+        assert_eq!(canonical.commit_id, explicit_commit_id);
     }
 
     #[test]

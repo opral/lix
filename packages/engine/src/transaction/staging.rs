@@ -849,7 +849,7 @@ impl TransactionWriteBuffer {
                 commit_change_refs.insert(first_row.branch_id.to_string(), {
                     let timestamp = self.functions.call_timestamp();
                     StagedCommitChangeRefs::new(
-                        CommitId::from(self.functions.call_uuid_v7()),
+                        CommitId::with_change_address_space(self.functions.call_uuid_v7()),
                         ChangeId::from(self.functions.call_uuid_v7()),
                         ChangeId::from(self.functions.call_uuid_v7()),
                         timestamp,
@@ -972,7 +972,7 @@ impl TransactionWriteBuffer {
             commit_change_refs.insert(branch_id.to_string(), {
                 let timestamp = self.functions.call_timestamp();
                 StagedCommitChangeRefs::new(
-                    CommitId::from(self.functions.call_uuid_v7()),
+                    CommitId::with_change_address_space(self.functions.call_uuid_v7()),
                     ChangeId::from(self.functions.call_uuid_v7()),
                     ChangeId::from(self.functions.call_uuid_v7()),
                     timestamp,
@@ -1170,7 +1170,7 @@ impl TransactionWriteBuffer {
         let change_refs = guard.entry(branch_id).or_insert_with(|| {
             let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::from(functions.call_uuid_v7()),
+                CommitId::with_change_address_space(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
@@ -1189,7 +1189,7 @@ impl TransactionWriteBuffer {
     ) -> Result<CommitId, LixError> {
         let timestamp = self.functions.call_timestamp();
         let mut change_refs = StagedCommitChangeRefs::new(
-            CommitId::from(self.functions.call_uuid_v7()),
+            CommitId::with_change_address_space(self.functions.call_uuid_v7()),
             ChangeId::from(self.functions.call_uuid_v7()),
             ChangeId::from(self.functions.call_uuid_v7()),
             timestamp,
@@ -2288,7 +2288,7 @@ fn add_row_to_commit_change_refs(
         change_refs_by_branch.insert(row.branch_id.to_string(), {
             let timestamp = functions.call_timestamp();
             StagedCommitChangeRefs::new(
-                CommitId::from(functions.call_uuid_v7()),
+                CommitId::with_change_address_space(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 ChangeId::from(functions.call_uuid_v7()),
                 timestamp,
@@ -2352,7 +2352,9 @@ fn push_prepared_materialized(
         row.created_at,
         row.updated_at,
         row.global,
-        row.change_id,
+        (!row.addressable_change_id || row.untracked)
+            .then_some(row.change_id)
+            .flatten(),
         row.commit_id,
         row.untracked,
         row.branch_id.as_str(),
@@ -4020,7 +4022,7 @@ mod tests {
     }
 
     fn test_commit_id(index: usize) -> CommitId {
-        CommitId::parse(&test_uuid(index)).expect("test uuid should parse as commit id")
+        CommitId::with_change_address_space(test_uuid_value(index))
     }
 
     fn test_change_id(index: usize) -> ChangeId {

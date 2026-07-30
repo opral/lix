@@ -30,7 +30,7 @@ use crate::tracked_state::{
     MaterializedTrackedStateRow, TrackedStateCommitDeltaRef, TrackedStateContext,
     TrackedStateDeltaRef, TrackedStateFilter, TrackedStateKey, TrackedStateKeyRef,
     TrackedStateReadColumns, TrackedStateRootMutationRef, TrackedStateScanRequest, encode_key_ref,
-    load_commit_delta_change_records, stage_change_locators, stage_commit_deltas,
+    load_commit_delta_change_records, stage_addressable_commit_deltas, stage_change_locators,
 };
 use crate::transaction::staging::{PreparedInsertSelection, PreparedWriteSet};
 #[cfg(test)]
@@ -250,6 +250,17 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         return Ok((writes, preconditions));
     }
 
+    let selected_change_records = load_selected_change_records(read, &commit_rows).await?;
+
+    stage_tracked_commit_delta_index(
+        &mut writes,
+        &mut state_rows,
+        &row_index.tracked_row_indices_by_commit,
+        &tracked_roots,
+        &commit_rows,
+        &selected_change_records,
+    )?;
+
     let staged_commits = stage_changelog_commits(
         read,
         &mut writes,
@@ -270,18 +281,8 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
     ensure_explicit_branch_ref_targets_exist(read, &explicit_branch_targets, &staged_commits)
         .await?;
 
-    let selected_change_records = load_selected_change_records(read, &staged_commits).await?;
     let selected_change_payloads =
         materialize_selected_change_payloads(read, &selected_change_records).await?;
-
-    stage_tracked_commit_delta_index(
-        &mut writes,
-        &state_rows,
-        &row_index.tracked_row_indices_by_commit,
-        &tracked_roots,
-        &staged_commits,
-        &selected_change_records,
-    )?;
 
     stage_state_json_payloads(&mut json_writer, &mut writes, &state_rows)?;
 
@@ -977,12 +978,12 @@ fn current_state_delta_from_engine_row(
 /// first-parent history.
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
-    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    commit_rows: &[FinalizedCommitRow],
 ) -> Result<HashMap<SelectedChangeKey, ChangeRecord>, LixError> {
     let mut by_source_commit = BTreeMap::<CommitId, Vec<StagedCommitChangeRef<'_>>>::new();
-    for change_ref in staged_commits
-        .values()
-        .flat_map(|staged| selected_changes(&staged.selected_change_batches))
+    for change_ref in commit_rows
+        .iter()
+        .flat_map(|commit| selected_changes(&commit.selected_change_batches))
     {
         // Identity and timestamps fully describe a selected tombstone.
         // Historical rows may be absent or retain metadata, while checkpoint
@@ -1084,18 +1085,22 @@ async fn materialize_selected_change_payloads(
 
 fn stage_tracked_commit_delta_index(
     writes: &mut StorageWriteSet,
-    state_rows: &PreparedStateBatch,
+    state_rows: &mut PreparedStateBatch,
     tracked_row_indices_by_commit: &BTreeMap<CommitId, Vec<RowIndex>>,
     tracked_roots: &[PendingTrackedRoot],
-    staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
+    commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
 ) -> Result<(), LixError> {
+    let commit_rows = commit_rows
+        .iter()
+        .map(|commit| (commit.commit_id, commit))
+        .collect::<BTreeMap<_, _>>();
     for root in tracked_roots {
         let state_row_indices = tracked_row_indices_by_commit
             .get(&root.commit_id)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let staged = staged_commits.get(&root.commit_id).ok_or_else(|| {
+        let staged = commit_rows.get(&root.commit_id).ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!(
@@ -1107,10 +1112,11 @@ fn stage_tracked_commit_delta_index(
         let mut deltas = Vec::with_capacity(
             state_row_indices.len() + selected_change_count(&staged.selected_change_batches),
         );
+        let mut addressable = Vec::with_capacity(deltas.capacity());
         for &row_index in state_row_indices {
-            deltas.push(tracked_commit_delta_from_state_row(
-                state_rows.row(row_index),
-            )?);
+            let row = state_rows.row(row_index);
+            addressable.push(row.addressable_change_id);
+            deltas.push(tracked_commit_delta_from_state_row(row)?);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
             let key = selected_change_key(change_ref);
@@ -1120,13 +1126,34 @@ fn stage_tracked_commit_delta_index(
                 root.commit_id,
                 record,
             )?);
+            addressable.push(false);
         }
-        let locators = stage_commit_deltas(writes, &deltas)?;
         let authored_change_ids = state_row_indices
             .iter()
-            .filter_map(|&row_index| state_rows.row(row_index).change_id)
+            .filter_map(|&row_index| {
+                let row = state_rows.row(row_index);
+                (!row.addressable_change_id)
+                    .then_some(row.change_id)
+                    .flatten()
+            })
             .collect::<std::collections::HashSet<_>>();
-        let authored_locators = locators
+        let staged = stage_addressable_commit_deltas(writes, &deltas, &addressable)?;
+        drop(deltas);
+        for (source_index, &row_index) in state_row_indices.iter().enumerate() {
+            if !state_rows.row(row_index).addressable_change_id {
+                continue;
+            }
+            let change_id = staged.assigned_change_ids[source_index];
+            if change_id == ChangeId::default() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "addressable tracked row received no commit-delta address",
+                ));
+            }
+            state_rows.set_change_id(row_index, Some(change_id));
+        }
+        let authored_locators = staged
+            .locators
             .into_iter()
             .filter(|locator| authored_change_ids.contains(&locator.change_id))
             .collect::<Vec<_>>();

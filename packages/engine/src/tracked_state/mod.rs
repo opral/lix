@@ -32,8 +32,8 @@ pub(crate) use storage::load_commit_delta_change_ids;
 pub(crate) use storage::{
     CommitDeltaChangeLocator, load_change_record_by_id, load_commit_delta_change_records,
     load_commit_delta_members_with_payloads, scan_change_records_from_commit_deltas,
-    scan_commit_delta_inventory, stage_change_locators, stage_commit_deltas,
-    stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
+    scan_commit_delta_inventory, stage_addressable_commit_deltas, stage_change_locators,
+    stage_commit_deltas, stage_delete_change_locators, stage_delete_commit_delta_inventory_entry,
     stage_delete_commit_roots,
 };
 #[cfg(feature = "storage-benches")]
