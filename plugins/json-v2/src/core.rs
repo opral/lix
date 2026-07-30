@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::mem::size_of;
 use std::sync::Arc;
@@ -2077,16 +2077,19 @@ fn snapshot_node(
 }
 
 fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8>, String> {
-    let value = match &node.relation {
+    let mut output = Vec::with_capacity(192 + scalar.as_ref().map_or(0, String::len));
+    output.push(b'{');
+    let mut first = true;
+    match &node.relation {
         NodeRelation::Root => {
-            let mut value = Map::new();
-            value.insert("id".to_owned(), json!(ROOT_ID));
-            value.insert("kind".to_owned(), json!(node.kind.as_str()));
-            if let Some(scalar) = scalar {
-                value.insert("scalar_json".to_owned(), Value::String(scalar));
+            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"id\":", ROOT_ID)?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
+            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
+            if let Some(scalar) = scalar.as_deref() {
+                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
             }
-            append_layout_fields(&mut value, node.layout.as_deref());
-            Value::Object(value)
+            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
         }
         NodeRelation::Object {
             parent_id,
@@ -2094,57 +2097,93 @@ fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8
             order_key,
             container_id,
         } => {
-            let mut value = Map::new();
-            value.insert("parent_id".to_owned(), json!(parent_id.as_ref()));
-            value.insert("key".to_owned(), json!(key.as_ref()));
-            value.insert("order_key".to_owned(), json!(order_key.as_ref()));
-            value.insert("kind".to_owned(), json!(node.kind.as_str()));
-            if let Some(scalar) = scalar {
-                value.insert("scalar_json".to_owned(), Value::String(scalar));
-            }
             if let Some(container_id) = container_id {
-                value.insert(
-                    "container_id".to_owned(),
-                    Value::String(container_id.to_string()),
-                );
+                push_snapshot_string_field(
+                    &mut output,
+                    &mut first,
+                    b"\"container_id\":",
+                    container_id,
+                )?;
             }
-            append_layout_fields(&mut value, node.layout.as_deref());
-            Value::Object(value)
+            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"key\":", key)?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"order_key\":", order_key)?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"parent_id\":", parent_id)?;
+            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
+            if let Some(scalar) = scalar.as_deref() {
+                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
+            }
+            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
         }
         NodeRelation::Array {
             id,
             parent_id,
             order_key,
         } => {
-            let mut value = Map::new();
-            value.insert("id".to_owned(), json!(id.as_ref()));
-            value.insert("parent_id".to_owned(), json!(parent_id.as_ref()));
-            value.insert("order_key".to_owned(), json!(order_key.as_ref()));
-            value.insert("kind".to_owned(), json!(node.kind.as_str()));
-            if let Some(scalar) = scalar {
-                value.insert("scalar_json".to_owned(), Value::String(scalar));
+            push_layout_empty_field(&mut output, &mut first, node.layout.as_deref())?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"id\":", id)?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"kind\":", node.kind.as_str())?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"order_key\":", order_key)?;
+            push_snapshot_string_field(&mut output, &mut first, b"\"parent_id\":", parent_id)?;
+            push_layout_prefix_field(&mut output, &mut first, node.layout.as_deref())?;
+            if let Some(scalar) = scalar.as_deref() {
+                push_snapshot_string_field(&mut output, &mut first, b"\"scalar_json\":", scalar)?;
             }
-            append_layout_fields(&mut value, node.layout.as_deref());
-            Value::Object(value)
+            push_layout_suffix_field(&mut output, &mut first, node.layout.as_deref())?;
         }
-    };
-    serde_json::to_vec(&value)
+    }
+    output.push(b'}');
+    Ok(output)
+}
+
+fn push_snapshot_string_field(
+    output: &mut Vec<u8>,
+    first: &mut bool,
+    encoded_key: &[u8],
+    value: &str,
+) -> Result<(), String> {
+    if *first {
+        *first = false;
+    } else {
+        output.push(b',');
+    }
+    output.extend_from_slice(encoded_key);
+    serde_json::to_writer(output, value)
         .map_err(|error| format!("failed to serialize JSON entity snapshot: {error}"))
 }
 
-fn append_layout_fields(value: &mut Map<String, Value>, layout: Option<&NodeLayout>) {
-    let Some(layout) = layout else {
-        return;
-    };
-    if let Some(prefix) = &layout.prefix_json {
-        value.insert("prefix_json".to_owned(), Value::String(prefix.to_string()));
+fn push_layout_empty_field(
+    output: &mut Vec<u8>,
+    first: &mut bool,
+    layout: Option<&NodeLayout>,
+) -> Result<(), String> {
+    if let Some(value) = layout.and_then(|layout| layout.empty_json.as_deref()) {
+        push_snapshot_string_field(output, first, b"\"empty_json\":", value)?;
     }
-    if let Some(suffix) = &layout.suffix_json {
-        value.insert("suffix_json".to_owned(), Value::String(suffix.to_string()));
+    Ok(())
+}
+
+fn push_layout_prefix_field(
+    output: &mut Vec<u8>,
+    first: &mut bool,
+    layout: Option<&NodeLayout>,
+) -> Result<(), String> {
+    if let Some(value) = layout.and_then(|layout| layout.prefix_json.as_deref()) {
+        push_snapshot_string_field(output, first, b"\"prefix_json\":", value)?;
     }
-    if let Some(empty) = &layout.empty_json {
-        value.insert("empty_json".to_owned(), Value::String(empty.to_string()));
+    Ok(())
+}
+
+fn push_layout_suffix_field(
+    output: &mut Vec<u8>,
+    first: &mut bool,
+    layout: Option<&NodeLayout>,
+) -> Result<(), String> {
+    if let Some(value) = layout.and_then(|layout| layout.suffix_json.as_deref()) {
+        push_snapshot_string_field(output, first, b"\"suffix_json\":", value)?;
     }
+    Ok(())
 }
 
 fn snapshots_equal_without_layout(before: &[u8], after: &[u8]) -> Result<bool, String> {

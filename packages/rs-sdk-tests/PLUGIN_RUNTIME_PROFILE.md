@@ -356,8 +356,15 @@ the sparse arena index generated a complete scalar snapshot, parsed that JSON
 back into a value tree to remove `scalar_json`, and serialized it again.
 Encoding directly into the bounded sink page and serializing arena metadata
 directly reduced the five-sample v3 p50 from 459.9 ms to 380.5 ms (17.3%).
-The paired v2 p50 was 696.2 ms, so v3 is 1.83x faster with 115.0 MB cumulative
-and 63.2 MB peak host allocation versus v2's 336.4 MB and 85.6 MB.
+The next profile showed that every node still constructed a temporary
+`serde_json::Map` and `Value` tree solely to produce its canonical semantic
+snapshot. Writing those already-known fields directly in canonical key order
+reduced v3 again from 380.5 ms to 320.7 ms (15.7%). The paired v2 p50 was
+590.8 ms, so v3 is 1.84x faster with 115.0 MB cumulative and 63.2 MB peak host
+allocation versus v2's 336.3 MB and 85.7 MB. The direct encoder preserves
+serde_json string escaping and the existing snapshot bytes; all 23 JSON
+correctness tests and the benchmark's exact-byte, semantic, history, and
+RocksDB-reopen checks pass.
 
 The same 10 MiB JSON fixture changes one scalar in 6.779 ms warm versus
 8.222 ms for v2 (1.21x). A process-cold reopen plus successor is 216.1 ms
@@ -370,7 +377,7 @@ non-duplicated-source policies:
 | workload | v3 p50 | v3 p95 | peak host allocation | guest high water |
 | --- | ---: | ---: | ---: | ---: |
 | CSV, 10.68 MiB / 220,001 entities | 137.8 ms | 418.2 ms | 34.8 MB | 41.2 MB |
-| JSON, 10 MiB / 39,871 entities | 380.5 ms | 733.2 ms | 63.2 MB | 41.7 MB |
+| JSON, 10 MiB / 39,871 entities | 320.7 ms | 635.5 ms | 63.2 MB | 44.2 MB |
 | Markdown, 1.24 MiB / 3,808 entities | 5.702 ms | 5.789 ms | 3.756 MB | 53.477 MB |
 | Excalidraw, 1.85 MiB / 20,000 entities | 3.482 ms | 3.659 ms | 2.959 MB | 25.166 MB |
 
