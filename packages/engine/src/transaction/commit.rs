@@ -2476,6 +2476,16 @@ async fn stage_branch_head_control_publications(
         .map(|(branch_id, control)| (branch_id.clone(), Some(*control)))
         .collect::<BTreeMap<String, Option<BranchHeadControl>>>();
     let tracked_head = TrackedHeadContext::new();
+    let needs_branch_creation_donor = explicit_branch_targets.keys().any(|branch_id| {
+        observations
+            .get(branch_id)
+            .is_some_and(|observation| observation.control.is_none())
+    });
+    let durable_controls = if needs_branch_creation_donor {
+        BranchHeadControlContext::new().reader(read).scan().await?
+    } else {
+        Vec::new()
+    };
 
     for (branch_id, target) in explicit_branch_targets {
         if publications.contains_key(branch_id) {
@@ -2559,6 +2569,19 @@ async fn stage_branch_head_control_publications(
                         &mut coverage,
                     )
                     .await?;
+                let mut inherited_schema_presence_bloom = [0_u64; 4];
+                if existing.is_none() {
+                    for (_, donor) in &durable_controls {
+                        if donor.head_commit_id == head_commit_id {
+                            for (target, source) in inherited_schema_presence_bloom
+                                .iter_mut()
+                                .zip(donor.schema_presence_bloom)
+                            {
+                                *target |= source;
+                            }
+                        }
+                    }
+                }
                 let mut control = BranchHeadControl {
                     head_commit_id,
                     generation,
@@ -2580,7 +2603,10 @@ async fn stage_branch_head_control_publications(
                     created_at: existing.map_or(target.created_at, |control| control.created_at),
                     updated_at: target.updated_at,
                     ref_change_id: target.ref_change_id,
-                    schema_presence_bloom: [0; 4],
+                    schema_presence_bloom: existing
+                        .map_or(inherited_schema_presence_bloom, |control| {
+                            control.schema_presence_bloom
+                        }),
                 };
                 control.note_schemas(schema_keys.iter().map(String::as_str));
                 Some(control)
@@ -4086,6 +4112,58 @@ mod tests {
             .await
             .expect("same-write branch head should load");
         assert_eq!(head, Some(commit_id(target_commit)));
+    }
+
+    #[tokio::test]
+    async fn branch_creation_inherits_same_head_schema_presence() {
+        let storage = StorageAdapter::new(Memory::new());
+        let binary_cas = BinaryCasContext::new();
+        let branch_ctx = BranchContext::new();
+        let donor_branch = "01960000-0000-7000-8000-0000000000d1";
+        let created_branch = "01960000-0000-7000-8000-0000000000d2";
+        let head = "branch-schema-presence-head";
+        crate::test_support::seed_branch_head(storage.clone(), donor_branch, head).await;
+
+        let mut read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("branch creation read should open");
+        let (writes, preconditions) = commit_prepared_writes(
+            &binary_cas,
+            &branch_ctx,
+            None,
+            &mut read,
+            prepared_direct_branch_ref_update(created_branch, head, "inherited-schema-branch-ref"),
+        )
+        .await
+        .expect("same-head branch creation should stage");
+        storage
+            .commit_write_set(
+                writes,
+                StorageWriteOptions {
+                    preconditions,
+                    ..StorageWriteOptions::default()
+                },
+            )
+            .await
+            .expect("same-head branch creation should commit");
+
+        let control = BranchHeadControlContext::new()
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("created branch control read should open"),
+            )
+            .load(created_branch)
+            .await
+            .expect("created branch control should load")
+            .expect("created branch control must exist");
+        assert_eq!(
+            control.schema_presence_bloom,
+            [u64::MAX; 4],
+            "a new generation must preserve the donor head's conservative schema visibility"
+        );
     }
 
     #[tokio::test]
