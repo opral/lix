@@ -1420,7 +1420,6 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
 }
 
 #[tokio::test]
-#[ignore = "blocked by missing common-ancestor snapshots for certified v3 segments"]
 async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
