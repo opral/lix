@@ -1,4 +1,4 @@
-//! Authoring layer for the host-owned arena Component API v3 experiment.
+//! Authoring layer for Lix's fused, host-owned Component API v3.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -11,15 +11,17 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin::api::{
-    FileTransition, FileUpdate as WitFileUpdate, Guest, InputBytes, OpenFileInput, PluginError,
-    TransitionSummary as WitTransitionSummary,
+    ConflictUpdate as WitConflictUpdate, Guest, PluginError, TransitionRequest,
 };
 use lix::plugin::host::{
-    ChangePage, CsvRowBatch, Root as WitRoot, Transaction as WitTransaction, TransitionSink,
+    ChangePage, ConflictSide as WitConflictSide, ConflictSource, HostError, MapSpace, PackedPage,
+    ResolutionEffect, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
 };
 use std::marker::PhantomData;
 
 pub const PACKET_FORMAT_V1: u16 = 1;
+pub const PACKED_CSV_ROWS_CODEC: &str = "lix.csv.rows";
+pub const PACKED_CSV_ROWS_VERSION: u16 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
@@ -52,6 +54,14 @@ fn plugin_error(error: Error) -> PluginError {
     }
 }
 
+fn host_error(context: &str, error: HostError) -> Error {
+    match error {
+        HostError::InvalidRange => Error::invalid_input(format!("{context}: invalid range")),
+        HostError::LimitExceeded(message) => Error::limit_exceeded(format!("{context}: {message}")),
+        HostError::Rejected(message) => Error::invalid_input(format!("{context}: {message}")),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CreateContext {
     pub high: u64,
@@ -81,26 +91,25 @@ pub struct FileInfo {
 }
 
 pub struct Root<'a> {
-    inner: &'a WitRoot,
+    inner: &'a WitSnapshot,
 }
 
 impl std::fmt::Debug for Root<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Root")
-            .field("generation", &self.generation())
             .field("file_len", &self.len())
             .finish()
     }
 }
 
 impl Root<'_> {
-    pub fn generation(&self) -> String {
-        self.inner.generation()
-    }
-
     pub fn len(&self) -> u64 {
         self.inner.file_len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     pub fn read_all(&self) -> Result<Vec<u8>> {
@@ -111,22 +120,23 @@ impl Root<'_> {
         const READ_BYTES: u32 = 1024 * 1024;
         let end = offset
             .checked_add(length)
-            .ok_or_else(|| Error::invalid_input("root byte range overflowed"))?;
+            .ok_or_else(|| Error::invalid_input("snapshot byte range overflowed"))?;
         if end > self.len() {
-            return Err(Error::invalid_input("root byte range exceeds the file"));
+            return Err(Error::invalid_input("snapshot byte range exceeds the file"));
         }
         let capacity = usize::try_from(length)
-            .map_err(|_| Error::limit_exceeded("root range exceeds guest address space"))?;
+            .map_err(|_| Error::limit_exceeded("snapshot range exceeds guest address space"))?;
         let mut output = Vec::with_capacity(capacity);
         let mut cursor = offset;
         while cursor < end {
             let chunk = u32::try_from((end - cursor).min(u64::from(READ_BYTES)))
-                .expect("bounded root read fits u32");
-            let bytes = self.inner.read_file(cursor, chunk).map_err(|error| {
-                Error::invalid_input(format!("host root read failed: {error:?}"))
-            })?;
+                .expect("bounded snapshot read fits u32");
+            let bytes = self
+                .inner
+                .read_file(cursor, chunk)
+                .map_err(|error| host_error("host snapshot read failed", error))?;
             if bytes.len() != chunk as usize {
-                return Err(Error::invalid_input("host root returned a short read"));
+                return Err(Error::invalid_input("host snapshot returned a short read"));
             }
             output.extend_from_slice(&bytes);
             cursor += u64::from(chunk);
@@ -135,19 +145,18 @@ impl Root<'_> {
     }
 
     pub fn get_entity(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner
-            .get_entity(key)
-            .map_err(|error| Error::invalid_input(format!("host entity read failed: {error:?}")))
+        self.read_record_all(MapSpace::Entity, key)
     }
 
     pub fn get_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.inner
-            .get_state(key)
-            .map_err(|error| Error::invalid_input(format!("host state read failed: {error:?}")))
+        self.read_record_all(MapSpace::State, key)
     }
 
-    pub fn state_len(&self, key: &[u8]) -> Option<u64> {
-        self.inner.state_len(key)
+    pub fn state_len(&self, key: &[u8]) -> Result<Option<u64>> {
+        self.inner
+            .read_record(MapSpace::State, key, 0, 0)
+            .map(|chunk| chunk.map(|chunk| chunk.total_len))
+            .map_err(|error| host_error("host state length read failed", error))
     }
 
     pub fn read_state_range(
@@ -156,17 +165,51 @@ impl Root<'_> {
         offset: u64,
         length: u32,
     ) -> Result<Option<Vec<u8>>> {
-        self.inner.read_state(key, offset, length).map_err(|error| {
-            Error::invalid_input(format!("host state range read failed: {error:?}"))
-        })
+        self.inner
+            .read_record(MapSpace::State, key, offset, length)
+            .map(|chunk| chunk.map(|chunk| chunk.bytes))
+            .map_err(|error| host_error("host state range read failed", error))
+    }
+
+    fn read_record_all(&self, space: MapSpace, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        const READ_BYTES: u32 = 1024 * 1024;
+        let Some(first) = self
+            .inner
+            .read_record(space, key, 0, READ_BYTES)
+            .map_err(|error| host_error("host record read failed", error))?
+        else {
+            return Ok(None);
+        };
+        let capacity = usize::try_from(first.total_len)
+            .map_err(|_| Error::limit_exceeded("host record exceeds guest address space"))?;
+        let mut output = Vec::with_capacity(capacity);
+        output.extend_from_slice(&first.bytes);
+        while output.len() < capacity {
+            let offset = output.len() as u64;
+            let remaining = capacity - output.len();
+            let chunk_len = u32::try_from(remaining.min(READ_BYTES as usize))
+                .expect("bounded record read fits u32");
+            let chunk = self
+                .inner
+                .read_record(space, key, offset, chunk_len)
+                .map_err(|error| host_error("host record read failed", error))?
+                .ok_or_else(|| Error::invalid_input("host record disappeared during read"))?;
+            if chunk.total_len != first.total_len || chunk.bytes.is_empty() {
+                return Err(Error::invalid_input(
+                    "host record changed or returned a short read",
+                ));
+            }
+            output.extend_from_slice(&chunk.bytes);
+        }
+        Ok(Some(output))
     }
 }
 
-pub struct Transaction {
-    inner: WitTransaction,
+pub struct Transaction<'a> {
+    inner: &'a WitTransition,
 }
 
-impl std::fmt::Debug for Transaction {
+impl std::fmt::Debug for Transaction<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Transaction")
@@ -174,26 +217,23 @@ impl std::fmt::Debug for Transaction {
     }
 }
 
-impl Transaction {
+impl Transaction<'_> {
     pub fn put_state(&self, key: &[u8], value: &[u8]) -> Result<()> {
         self.inner
             .put_state(key, value)
-            .map_err(|error| Error::invalid_input(format!("host rejected state page: {error:?}")))
+            .map_err(|error| host_error("host rejected state page", error))
     }
 
     pub fn delete_state(&self, key: &[u8]) -> Result<()> {
-        self.inner.delete_state(key).map_err(|error| {
-            Error::invalid_input(format!("host rejected state deletion: {error:?}"))
-        })
+        self.inner
+            .delete_state(key)
+            .map_err(|error| host_error("host rejected state deletion", error))
     }
 }
 
 pub struct Sink<'a> {
-    inner: &'a TransitionSink,
+    inner: &'a WitTransition,
     max_batch_bytes: u32,
-    entity_count: u64,
-    batch_count: u32,
-    payload_bytes: u64,
 }
 
 impl std::fmt::Debug for Sink<'_> {
@@ -201,9 +241,6 @@ impl std::fmt::Debug for Sink<'_> {
         formatter
             .debug_struct("Sink")
             .field("max_batch_bytes", &self.max_batch_bytes)
-            .field("entity_count", &self.entity_count)
-            .field("batch_count", &self.batch_count)
-            .field("payload_bytes", &self.payload_bytes)
             .finish_non_exhaustive()
     }
 }
@@ -214,84 +251,70 @@ impl Sink<'_> {
     }
 
     pub fn emit_changes(&mut self, record_count: u32, payload: Vec<u8>) -> Result<()> {
-        if record_count == 0 {
-            return Err(Error::invalid_input("v3 change pages cannot be empty"));
-        }
-        if payload.len() > self.max_batch_bytes as usize {
-            return Err(Error::limit_exceeded(
-                "v3 change page exceeds max-batch-bytes",
-            ));
-        }
-        let payload_len = payload.len() as u64;
+        self.validate_page(record_count, payload.len(), "change")?;
         self.inner
             .emit_changes(&ChangePage {
-                format_version: PACKET_FORMAT_V1,
                 record_count,
                 payload,
             })
-            .map_err(|error| {
-                Error::invalid_input(format!("host rejected entity batch: {error:?}"))
-            })?;
-        self.entity_count = self.entity_count.saturating_add(u64::from(record_count));
-        self.batch_count = self.batch_count.saturating_add(1);
-        self.payload_bytes = self.payload_bytes.saturating_add(payload_len);
-        Ok(())
+            .map_err(|error| host_error("host rejected entity batch", error))
     }
 
     pub fn emit_csv_rows(&mut self, row_count: u32, payload: Vec<u8>) -> Result<()> {
-        if row_count == 0 {
-            return Err(Error::invalid_input("v3 CSV batches cannot be empty"));
-        }
-        if payload.len() > self.max_batch_bytes as usize {
-            return Err(Error::limit_exceeded(
-                "v3 CSV batch exceeds max-batch-bytes",
-            ));
-        }
-        let payload_len = payload.len() as u64;
+        self.emit_packed(
+            PACKED_CSV_ROWS_CODEC,
+            PACKED_CSV_ROWS_VERSION,
+            row_count,
+            payload,
+        )
+    }
+
+    pub fn emit_packed(
+        &mut self,
+        codec: &str,
+        format_version: u16,
+        record_count: u32,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        self.validate_page(record_count, payload.len(), "packed")?;
         self.inner
-            .emit_csv_rows(&CsvRowBatch { row_count, payload })
-            .map_err(|error| Error::invalid_input(format!("host rejected CSV batch: {error:?}")))?;
-        self.entity_count = self.entity_count.saturating_add(u64::from(row_count));
-        self.batch_count = self.batch_count.saturating_add(1);
-        self.payload_bytes = self.payload_bytes.saturating_add(payload_len);
+            .emit_packed(&PackedPage {
+                codec: codec.to_owned(),
+                format_version,
+                record_count,
+                payload,
+            })
+            .map_err(|error| host_error("host rejected packed batch", error))
+    }
+
+    fn validate_page(&self, record_count: u32, payload_len: usize, kind: &str) -> Result<()> {
+        if record_count == 0 {
+            return Err(Error::invalid_input(format!(
+                "v3 {kind} pages cannot be empty"
+            )));
+        }
+        if payload_len > self.max_batch_bytes as usize {
+            return Err(Error::limit_exceeded(format!(
+                "v3 {kind} page exceeds max-batch-bytes"
+            )));
+        }
         Ok(())
     }
-
-    fn summary(&self) -> TransitionSummary {
-        TransitionSummary {
-            entity_count: self.entity_count,
-            batch_count: self.batch_count,
-            payload_bytes: self.payload_bytes,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TransitionSummary {
-    pub entity_count: u64,
-    pub batch_count: u32,
-    pub payload_bytes: u64,
 }
 
 #[derive(Debug)]
 pub struct OpenFile<'a> {
     pub file: FileInfo,
     pub accepted: Root<'a>,
-    pub successor: Transaction,
+    pub successor: Transaction<'a>,
     pub creates: CreateContext,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SpliceInsert {
-    Inline(Vec<u8>),
-    AfterRange { offset: u64, length: u64 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InputSplice {
     pub offset: u64,
     pub delete_len: u64,
-    pub insert: SpliceInsert,
+    pub insert: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -300,14 +323,114 @@ pub struct FileUpdate<'a> {
     pub after_file: FileInfo,
     pub before: Root<'a>,
     pub edits: Vec<InputSplice>,
-    pub successor: Transaction,
+    pub successor: Transaction<'a>,
     pub creates: CreateContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConflictSide {
+    Base,
+    A,
+    B,
+}
+
+impl ConflictSide {
+    fn wit(self) -> WitConflictSide {
+        match self {
+            Self::Base => WitConflictSide::Base,
+            Self::A => WitConflictSide::A,
+            Self::B => WitConflictSide::B,
+        }
+    }
+}
+
+pub struct ConflictValue<'a> {
+    source: &'a ConflictSource,
+    index: u32,
+    side: ConflictSide,
+    len: u64,
+}
+
+impl std::fmt::Debug for ConflictValue<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ConflictValue")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ConflictValue<'_> {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn read(&self) -> Result<Vec<u8>> {
+        const READ_BYTES: u32 = 1024 * 1024;
+        let capacity = usize::try_from(self.len)
+            .map_err(|_| Error::limit_exceeded("conflict value exceeds guest address space"))?;
+        let mut output = Vec::with_capacity(capacity);
+        while output.len() < capacity {
+            let offset = output.len() as u64;
+            let length = u32::try_from((capacity - output.len()).min(READ_BYTES as usize))
+                .expect("bounded conflict read fits u32");
+            let bytes = self
+                .source
+                .read_value(self.index, self.side.wit(), offset, length)
+                .map_err(|error| host_error("host conflict read failed", error))?
+                .ok_or_else(|| Error::invalid_input("host conflict value disappeared"))?;
+            if bytes.is_empty() {
+                return Err(Error::invalid_input(
+                    "host conflict value returned a short read",
+                ));
+            }
+            output.extend_from_slice(&bytes);
+        }
+        Ok(output)
+    }
+}
+
+#[derive(Debug)]
+pub struct EntityConflict<'a> {
+    pub schema_key: String,
+    pub entity_pk: Vec<String>,
+    pub base: Option<ConflictValue<'a>>,
+    pub a: Option<ConflictValue<'a>>,
+    pub b: Option<ConflictValue<'a>>,
+}
+
+impl EntityConflict<'_> {
+    pub fn take_b_or_delete(&self) -> ConflictResolution {
+        if self.b.is_some() {
+            ConflictResolution::TakeB
+        } else {
+            ConflictResolution::Delete
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConflictResolution {
+    TakeBase,
+    TakeA,
+    TakeB,
+    Replace(Vec<u8>),
+    ReplaceFormatOnly(Vec<u8>),
+    Delete,
 }
 
 pub trait FormatPlugin: 'static {
     fn open_file(input: &OpenFile<'_>, sink: &mut Sink<'_>) -> Result<()>;
 
     fn file_changed(update: &FileUpdate<'_>, sink: &mut Sink<'_>) -> Result<()>;
+
+    fn resolve_conflict(conflict: EntityConflict<'_>) -> Result<ConflictResolution> {
+        Ok(conflict.take_b_or_delete())
+    }
 }
 
 #[doc(hidden)]
@@ -315,119 +438,162 @@ pub trait FormatPlugin: 'static {
 pub struct Component<P>(PhantomData<P>);
 
 impl<P: FormatPlugin> Guest for Component<P> {
-    fn open_file(
-        input: OpenFileInput,
-        sink: &TransitionSink,
-    ) -> std::result::Result<FileTransition, PluginError> {
-        let OpenFileInput {
-            descriptor,
-            accepted,
-            successor,
-            creates,
-            max_batch_bytes,
-        } = input;
+    fn apply(
+        request: TransitionRequest,
+        output: &WitTransition,
+    ) -> std::result::Result<(), PluginError> {
+        let max_batch_bytes = output.max_batch_bytes();
         if max_batch_bytes == 0 {
             return Err(PluginError::LimitExceeded(
                 "max-batch-bytes must be positive".to_owned(),
             ));
         }
-        let input = OpenFile {
-            file: FileInfo {
-                path: descriptor.path,
-                media_type: descriptor.media_type,
-            },
-            accepted: Root { inner: &accepted },
-            successor: Transaction { inner: successor },
-            creates: CreateContext {
-                high: creates.high,
-                low: creates.low,
-            },
-        };
         let mut sink = Sink {
-            inner: sink,
+            inner: output,
             max_batch_bytes,
-            entity_count: 0,
-            batch_count: 0,
-            payload_bytes: 0,
         };
-        P::open_file(&input, &mut sink).map_err(plugin_error)?;
-        let summary = sink.summary();
-        Ok(FileTransition {
-            successor: input.successor.inner,
-            summary: WitTransitionSummary {
-                entity_count: summary.entity_count,
-                batch_count: summary.batch_count,
-                payload_bytes: summary.payload_bytes,
-            },
-        })
+        match request {
+            TransitionRequest::Open(request) => {
+                let input = OpenFile {
+                    file: FileInfo {
+                        path: request.descriptor.path,
+                        media_type: request.descriptor.media_type,
+                    },
+                    accepted: Root {
+                        inner: &request.accepted,
+                    },
+                    successor: Transaction { inner: output },
+                    creates: CreateContext {
+                        high: request.creates.high,
+                        low: request.creates.low,
+                    },
+                };
+                P::open_file(&input, &mut sink).map_err(plugin_error)
+            }
+            TransitionRequest::Update(request) => {
+                let input = FileUpdate {
+                    before_file: FileInfo {
+                        path: request.before_descriptor.path,
+                        media_type: request.before_descriptor.media_type,
+                    },
+                    after_file: FileInfo {
+                        path: request.after_descriptor.path,
+                        media_type: request.after_descriptor.media_type,
+                    },
+                    before: Root {
+                        inner: &request.before,
+                    },
+                    edits: request
+                        .edits
+                        .into_iter()
+                        .map(|edit| InputSplice {
+                            offset: edit.offset,
+                            delete_len: edit.delete_len,
+                            insert: edit.insert,
+                        })
+                        .collect(),
+                    successor: Transaction { inner: output },
+                    creates: CreateContext {
+                        high: request.creates.high,
+                        low: request.creates.low,
+                    },
+                };
+                P::file_changed(&input, &mut sink).map_err(plugin_error)
+            }
+        }
     }
 
-    fn file_changed(
-        input: WitFileUpdate,
-        sink: &TransitionSink,
-    ) -> std::result::Result<FileTransition, PluginError> {
-        let WitFileUpdate {
-            before_descriptor,
-            after_descriptor,
-            before,
-            edits,
-            successor,
-            creates,
-            max_batch_bytes,
-        } = input;
+    fn resolve_conflicts(
+        input: WitConflictUpdate,
+        output: &ResolutionSink,
+    ) -> std::result::Result<(), PluginError> {
+        let count = input.conflicts.len();
+        let max_batch_bytes = output.max_batch_bytes();
         if max_batch_bytes == 0 {
             return Err(PluginError::LimitExceeded(
                 "max-batch-bytes must be positive".to_owned(),
             ));
         }
-        let edits = edits
-            .into_iter()
-            .map(|edit| InputSplice {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert: match edit.insert {
-                    InputBytes::Inline(bytes) => SpliceInsert::Inline(bytes),
-                    InputBytes::AfterRange(range) => SpliceInsert::AfterRange {
-                        offset: range.offset,
-                        length: range.length,
-                    },
-                },
-            })
-            .collect();
-        let input = FileUpdate {
-            before_file: FileInfo {
-                path: before_descriptor.path,
-                media_type: before_descriptor.media_type,
-            },
-            after_file: FileInfo {
-                path: after_descriptor.path,
-                media_type: after_descriptor.media_type,
-            },
-            before: Root { inner: &before },
-            edits,
-            successor: Transaction { inner: successor },
-            creates: CreateContext {
-                high: creates.high,
-                low: creates.low,
-            },
-        };
-        let mut sink = Sink {
-            inner: sink,
-            max_batch_bytes,
-            entity_count: 0,
-            batch_count: 0,
-            payload_bytes: 0,
-        };
-        P::file_changed(&input, &mut sink).map_err(plugin_error)?;
-        let summary = sink.summary();
-        Ok(FileTransition {
-            successor: input.successor.inner,
-            summary: WitTransitionSummary {
-                entity_count: summary.entity_count,
-                batch_count: summary.batch_count,
-                payload_bytes: summary.payload_bytes,
-            },
-        })
+        for index in 0..count {
+            let meta = input.conflicts.get(index).map_err(|error| {
+                plugin_error(host_error("host conflict metadata read failed", error))
+            })?;
+            let value = |side, len: Option<u64>| {
+                len.map(|len| ConflictValue {
+                    source: &input.conflicts,
+                    index,
+                    side,
+                    len,
+                })
+            };
+            let conflict = EntityConflict {
+                schema_key: meta.schema_key,
+                entity_pk: meta.entity_pk,
+                base: value(ConflictSide::Base, meta.base_len),
+                a: value(ConflictSide::A, meta.a_len),
+                b: value(ConflictSide::B, meta.b_len),
+            };
+            let resolution = P::resolve_conflict(conflict).map_err(plugin_error)?;
+            match resolution {
+                ConflictResolution::TakeBase => output
+                    .take(meta.ordinal, WitConflictSide::Base)
+                    .map_err(|error| {
+                        plugin_error(host_error("host rejected conflict take", error))
+                    })?,
+                ConflictResolution::TakeA => output
+                    .take(meta.ordinal, WitConflictSide::A)
+                    .map_err(|error| {
+                        plugin_error(host_error("host rejected conflict take", error))
+                    })?,
+                ConflictResolution::TakeB => output
+                    .take(meta.ordinal, WitConflictSide::B)
+                    .map_err(|error| {
+                        plugin_error(host_error("host rejected conflict take", error))
+                    })?,
+                ConflictResolution::Delete => output.delete(meta.ordinal).map_err(|error| {
+                    plugin_error(host_error("host rejected conflict delete", error))
+                })?,
+                ConflictResolution::Replace(snapshot) => {
+                    output
+                        .begin_replace(
+                            meta.ordinal,
+                            ResolutionEffect::Content,
+                            snapshot.len() as u64,
+                        )
+                        .map_err(|error| {
+                            plugin_error(host_error("host rejected conflict replacement", error))
+                        })?;
+                    for chunk in snapshot.chunks(max_batch_bytes as usize) {
+                        output.write_replacement(chunk).map_err(|error| {
+                            plugin_error(host_error("host rejected replacement chunk", error))
+                        })?;
+                    }
+                    output.finish_replace().map_err(|error| {
+                        plugin_error(host_error("host rejected replacement finish", error))
+                    })?;
+                }
+                ConflictResolution::ReplaceFormatOnly(snapshot) => {
+                    output
+                        .begin_replace(
+                            meta.ordinal,
+                            ResolutionEffect::FormatOnly,
+                            snapshot.len() as u64,
+                        )
+                        .map_err(|error| {
+                            plugin_error(host_error("host rejected conflict replacement", error))
+                        })?;
+                    for chunk in snapshot.chunks(max_batch_bytes as usize) {
+                        output.write_replacement(chunk).map_err(|error| {
+                            plugin_error(host_error("host rejected replacement chunk", error))
+                        })?;
+                    }
+                    output.finish_replace().map_err(|error| {
+                        plugin_error(host_error("host rejected replacement finish", error))
+                    })?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

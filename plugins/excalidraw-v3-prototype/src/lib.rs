@@ -38,13 +38,8 @@ impl sdk::FormatPlugin for ExcalidrawV3Prototype {
         let inserts = update
             .edits
             .iter()
-            .map(|edit| match &edit.insert {
-                sdk::SpliceInsert::Inline(bytes) => Ok(bytes.clone()),
-                sdk::SpliceInsert::AfterRange { .. } => Err(sdk::Error::invalid_input(
-                    "arena host must lower after-range edits to inline bytes",
-                )),
-            })
-            .collect::<sdk::Result<Vec<_>>>()?;
+            .map(|edit| edit.insert.clone())
+            .collect::<Vec<_>>();
         let splices = update
             .edits
             .iter()
@@ -90,7 +85,7 @@ fn sparse_element_change(
     edit: &sdk::InputSplice,
     insert: &[u8],
 ) -> sdk::Result<Option<(EntityChange, Vec<u8>)>> {
-    let state_len = match update.before.state_len(ELEMENT_INDEX_KEY) {
+    let state_len = match update.before.state_len(ELEMENT_INDEX_KEY)? {
         Some(length) => length,
         None => return Ok(None),
     };

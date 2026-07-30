@@ -5,7 +5,8 @@
 mod core;
 
 use core::{
-    ArenaRowIndex, ChangeEffect, ColdInitialImport, EntityChange, ROW_SCHEMA_KEY, TABLE_SCHEMA_KEY,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, EntityChange, ROW_SCHEMA_KEY,
+    RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
 };
 use lix_plugin_api_v3_prototype as sdk;
 use serde_json::Value;
@@ -17,6 +18,31 @@ const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 
 impl sdk::FormatPlugin for CsvV3Prototype {
+    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+        if conflict.schema_key != ROW_SCHEMA_KEY {
+            return Ok(conflict.take_b_or_delete());
+        }
+        let (Some(base), Some(a), Some(b)) = (&conflict.base, &conflict.a, &conflict.b) else {
+            return Ok(conflict.take_b_or_delete());
+        };
+        if base.len() > 64 * 1024 || a.len() > 64 * 1024 || b.len() > 64 * 1024 {
+            return Ok(sdk::ConflictResolution::TakeB);
+        }
+        let base = base.read()?;
+        let a = a.read()?;
+        let b = b.read()?;
+        Ok(
+            match resolve_row_conflict(Some(&base), Some(&a), Some(&b)) {
+                RowConflictResolution::TakeA => sdk::ConflictResolution::TakeA,
+                RowConflictResolution::TakeB => sdk::ConflictResolution::TakeB,
+                RowConflictResolution::Replace(snapshot) => {
+                    sdk::ConflictResolution::Replace(snapshot)
+                }
+                RowConflictResolution::Delete => sdk::ConflictResolution::Delete,
+            },
+        )
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
@@ -47,20 +73,13 @@ impl sdk::FormatPlugin for CsvV3Prototype {
                 "arena CSV prototype requires one sparse byte edit",
             ));
         };
-        let insert = match &edit.insert {
-            sdk::SpliceInsert::Inline(bytes) => bytes,
-            sdk::SpliceInsert::AfterRange { .. } => {
-                return Err(sdk::Error::invalid_input(
-                    "arena CSV prototype requires an inline sparse edit",
-                ));
-            }
-        };
+        let insert = &edit.insert;
         if u64::try_from(insert.len()).expect("usize fits u64") != edit.delete_len {
             return Err(sdk::Error::invalid_input(
                 "arena CSV prototype currently requires a length-preserving edit",
             ));
         }
-        let (index, range) = if let Some(state_len) = update.before.state_len(CSV_INDEX_KEY) {
+        let (index, range) = if let Some(state_len) = update.before.state_len(CSV_INDEX_KEY)? {
             let header = update
                 .before
                 .read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)?

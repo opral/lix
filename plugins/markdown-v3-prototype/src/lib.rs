@@ -11,7 +11,8 @@ mod model;
 mod schemas;
 
 use core::{
-    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice, PluginError,
+    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice,
+    NODE_SCHEMA_KEY, PluginError,
 };
 use lix_plugin_api_v3_prototype as sdk;
 use serde_json::Value;
@@ -30,6 +31,33 @@ const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for MarkdownV3Prototype {
+    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+        let Some(b) = conflict.b.as_ref() else {
+            return Ok(sdk::ConflictResolution::Delete);
+        };
+        if conflict.schema_key != NODE_SCHEMA_KEY {
+            return Ok(sdk::ConflictResolution::TakeB);
+        }
+        let (Some(base), Some(a)) = (&conflict.base, &conflict.a) else {
+            return Ok(sdk::ConflictResolution::TakeB);
+        };
+        if base.len() > 64 * 1024 || a.len() > 64 * 1024 || b.len() > 64 * 1024 {
+            return Ok(sdk::ConflictResolution::TakeB);
+        }
+        let base = base.read()?;
+        let a = a.read()?;
+        let b = b.read()?;
+        let resolved =
+            Document::resolve_entity_conflict(Some(base.clone()), Some(a.clone()), Some(b.clone()));
+        Ok(match resolved {
+            None => sdk::ConflictResolution::Delete,
+            Some(resolved) if resolved == b => sdk::ConflictResolution::TakeB,
+            Some(resolved) if resolved == a => sdk::ConflictResolution::TakeA,
+            Some(resolved) if resolved == base => sdk::ConflictResolution::TakeBase,
+            Some(resolved) => sdk::ConflictResolution::Replace(resolved),
+        })
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, input.creates.low);
@@ -68,13 +96,8 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
         let inserts = update
             .edits
             .iter()
-            .map(|edit| match &edit.insert {
-                sdk::SpliceInsert::Inline(bytes) => Ok(bytes.clone()),
-                sdk::SpliceInsert::AfterRange { .. } => Err(sdk::Error::invalid_input(
-                    "arena host must lower after-range edits to inline bytes",
-                )),
-            })
-            .collect::<sdk::Result<Vec<_>>>()?;
+            .map(|edit| edit.insert.clone())
+            .collect::<Vec<_>>();
         let splices = update
             .edits
             .iter()
@@ -179,7 +202,7 @@ fn sparse_block_change(
     insert: &[u8],
     namespace: IdNamespace,
 ) -> sdk::Result<Option<SparseBlockResult>> {
-    let state_len = match update.before.state_len(BLOCKS_STATE) {
+    let state_len = match update.before.state_len(BLOCKS_STATE)? {
         Some(length) => length,
         None => return Ok(None),
     };

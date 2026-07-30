@@ -9,48 +9,100 @@ interface host {
     rejected(string),
   }
 
-  /// One immutable host-owned file/entity/state version. The guest owns only
-  /// a capability and reads the ranges or state pages needed by a transition.
-  resource root {
-    generation: func() -> string;
-    file-len: func() -> u64;
-    read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
-    get-entity: func(key: bytes) -> result<option<bytes>, host-error>;
-    get-state: func(key: bytes) -> result<option<bytes>, host-error>;
-    state-len: func(key: bytes) -> option<u64>;
-    read-state: func(key: bytes, offset: u64, length: u32) -> result<option<bytes>, host-error>;
+  enum map-space {
+    entity,
+    state,
   }
 
-  /// A host-staged copy-on-write successor. File splices are installed before
-  /// guest entry; the guest may replace only opaque state pages. Publication
-  /// remains atomic and happens only after every emitted semantic page passes
-  /// host validation.
-  resource transaction {
-    put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
-    delete-state: func(key: bytes) -> result<_, host-error>;
+  record record-chunk {
+    total-len: u64,
+    bytes: bytes,
+  }
+
+  /// One immutable host-owned file/entity/checkpoint version.
+  resource snapshot {
+    file-len: func() -> u64;
+    read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
+    read-record: func(
+      space: map-space,
+      key: bytes,
+      offset: u64,
+      max-bytes: u32,
+    ) -> result<option<record-chunk>, host-error>;
   }
 
   record change-page {
+    record-count: u32,
+    payload: bytes,
+  }
+
+  record packed-page {
+    codec: string,
     format-version: u16,
     record-count: u32,
     payload: bytes,
   }
 
-  record csv-row-batch {
-    row-count: u32,
-    payload: bytes,
+  /// The sole host-owned atomic output capability. Checkpoints and semantic
+  /// pages remain staged until the enclosing guest export succeeds.
+  resource transition {
+    max-batch-bytes: func() -> u32;
+    put-state: func(key: bytes, value: bytes) -> result<_, host-error>;
+    delete-state: func(key: bytes) -> result<_, host-error>;
+    emit-changes: func(page: change-page) -> result<_, host-error>;
+    emit-packed: func(page: packed-page) -> result<_, host-error>;
   }
 
-  /// Host-imported push sink: one top-level export remains entered while the
-  /// guest emits bounded pages directly into transaction/storage lowering.
-  resource transition-sink {
-    emit-changes: func(page: change-page) -> result<_, host-error>;
-    emit-csv-rows: func(batch: csv-row-batch) -> result<_, host-error>;
+  enum conflict-side {
+    base,
+    a,
+    b,
+  }
+
+  record conflict-meta {
+    ordinal: u32,
+    schema-key: string,
+    entity-pk: list<string>,
+    base-len: option<u64>,
+    a-len: option<u64>,
+    b-len: option<u64>,
+  }
+
+  /// A bounded lazy view of canonically ordered semantic conflicts.
+  resource conflict-source {
+    len: func() -> u32;
+    get: func(index: u32) -> result<conflict-meta, host-error>;
+    read-value: func(
+      index: u32,
+      side: conflict-side,
+      offset: u64,
+      length: u32,
+    ) -> result<option<bytes>, host-error>;
+  }
+
+  enum resolution-effect {
+    content,
+    format-only,
+  }
+
+  /// Ordered, host-staged conflict results. Replacement snapshots stream in
+  /// bounded chunks; a trap or validation failure publishes nothing.
+  resource resolution-sink {
+    max-batch-bytes: func() -> u32;
+    take: func(ordinal: u32, side: conflict-side) -> result<_, host-error>;
+    delete: func(ordinal: u32) -> result<_, host-error>;
+    begin-replace: func(
+      ordinal: u32,
+      effect: resolution-effect,
+      total-length: u64,
+    ) -> result<_, host-error>;
+    write-replacement: func(chunk: bytes) -> result<_, host-error>;
+    finish-replace: func() -> result<_, host-error>;
   }
 }
 
 interface api {
-  use host.{bytes, root, transaction, transition-sink};
+  use host.{bytes, conflict-source, resolution-sink, snapshot, transition};
 
   variant plugin-error {
     invalid-input(string),
@@ -68,60 +120,48 @@ interface api {
     low: u32,
   }
 
-  record source-range {
-    offset: u64,
-    length: u64,
-  }
-
-  variant input-bytes {
-    inline(bytes),
-    after-range(source-range),
-  }
-
   record input-splice {
     offset: u64,
     delete-len: u64,
-    insert: input-bytes,
+    insert: bytes,
   }
 
-  record open-file-input {
+  record open-request {
     descriptor: file-descriptor,
-    accepted: own<root>,
-    successor: own<transaction>,
+    accepted: own<snapshot>,
     creates: create-context,
-    max-batch-bytes: u32,
   }
 
-  record file-update {
+  record update-request {
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
-    before: own<root>,
+    before: own<snapshot>,
     edits: list<input-splice>,
-    successor: own<transaction>,
     creates: create-context,
-    max-batch-bytes: u32,
   }
 
-  record transition-summary {
-    entity-count: u64,
-    batch-count: u32,
-    payload-bytes: u64,
+  variant transition-request {
+    open(open-request),
+    update(update-request),
   }
 
-  record file-transition {
-    successor: own<transaction>,
-    summary: transition-summary,
+  record conflict-update {
+    descriptor: file-descriptor,
+    conflicts: own<conflict-source>,
   }
 
-  open-file: func(
-    input: open-file-input,
-    sink: borrow<transition-sink>,
-  ) -> result<file-transition, plugin-error>;
+  /// All file transitions use one fused guest entry and one borrowed,
+  /// host-owned atomic output capability.
+  apply: func(
+    request: transition-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
 
-  file-changed: func(
-    input: file-update,
-    sink: borrow<transition-sink>,
-  ) -> result<file-transition, plugin-error>;
+  /// Stateless merge resolution: no document hydration and no returned cursor.
+  resolve-conflicts: func(
+    input: conflict-update,
+    output: borrow<resolution-sink>,
+  ) -> result<_, plugin-error>;
 }
 
 world plugin {
