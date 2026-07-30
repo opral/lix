@@ -2990,7 +2990,7 @@ mod tests {
     fn plugin_registry(plugin_key: &str, schema_keys: &[&str]) -> PluginRegistry {
         let wasm = b"test wasm";
         let manifest_json = serde_json::json!({
-            "api_version":"3.0.0",
+            "api_version":"4.0.0",
             "entry": "plugin.wasm",
             "key": plugin_key,
             "match": { "path_glob": "*.plugin-test" },
@@ -3002,7 +3002,7 @@ mod tests {
         let entry = PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: plugin_key.to_string(),
             runtime: PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: "*.plugin-test".to_string(),
             content_type: None,
             entry: "plugin.wasm".to_string(),

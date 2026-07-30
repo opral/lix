@@ -221,6 +221,23 @@ impl PersistentBlob {
         output
     }
 
+    fn bytes_equal(&self, other: &[u8]) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut offset = 0usize;
+        for piece in self.pieces.iter() {
+            let start = usize::try_from(piece.start).expect("u32 fits usize");
+            let len = usize::try_from(piece.len).expect("u32 fits usize");
+            let end = start + len;
+            if piece.bytes[start..end] != other[offset..offset + len] {
+                return false;
+            }
+            offset += len;
+        }
+        true
+    }
+
     fn range(&self, start: usize, end: usize) -> Result<Vec<u8>, String> {
         let start = u32::try_from(start).map_err(|_| "CSV range exceeds 4GiB".to_owned())?;
         let end = u32::try_from(end).map_err(|_| "CSV range exceeds 4GiB".to_owned())?;
@@ -593,6 +610,35 @@ impl IdentityStore {
         }
         let namespace_index = usize::from(self.base_namespace_indices[index]);
         IdNamespace(self.namespaces[namespace_index]).encode(self.base_ordinals[index])
+    }
+
+    fn generated_parts(&self, slot: u32) -> Option<([u8; 12], u64)> {
+        let index = usize::try_from(slot).ok()?;
+        let (namespace, ordinal) = if index < self.base_len() {
+            if self.base_noncompact_ranges[index].len != 0 {
+                return None;
+            }
+            (
+                self.namespaces
+                    .get(usize::from(self.base_namespace_indices[index]))?,
+                *self.base_ordinals.get(index)?,
+            )
+        } else {
+            match self.appended_identity(slot) {
+                StoredIdentity::Generated {
+                    namespace_index,
+                    ordinal,
+                } => (
+                    self.namespaces.get(usize::from(*namespace_index))?,
+                    *ordinal,
+                ),
+                StoredIdentity::NonCompact(_) => return None,
+            }
+        };
+        Some((
+            namespace[..12].try_into().expect("twelve-byte namespace"),
+            ordinal,
+        ))
     }
 
     fn slot_for_id(&self, id: &str) -> Option<u32> {
@@ -1986,6 +2032,69 @@ impl Document {
 
     pub fn bytes(&self) -> Vec<u8> {
         self.0.blob.materialize()
+    }
+
+    pub fn bytes_equal(&self, bytes: &[u8]) -> bool {
+        self.0.blob.bytes_equal(bytes)
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.0.blob.len()
+    }
+
+    /// Returns the compact row-offset arena when every durable identity and
+    /// order key still has the initial dense form. Structural edits fall back
+    /// to the paged identity checkpoint; ordinary large-file successors avoid
+    /// materializing and serializing every row snapshot a second time.
+    pub fn canonical_arena_state(&self) -> Option<([u8; 12], Vec<u8>)> {
+        let row_count = self.0.index.row_count;
+        if row_count == 0 {
+            return None;
+        }
+        let mut namespace = None;
+        let mut starts = Vec::with_capacity(usize::try_from(row_count).ok()?);
+        let denominator = u128::from(row_count) + 1;
+        for (ordinal, location) in self.0.index.locations().enumerate() {
+            let ordinal_u32 = u32::try_from(ordinal).ok()?;
+            let (chunk, row) = self.0.index.row(location);
+            if row.id_slot != ordinal_u32 || self.0.order_overrides.get(row.id_slot).is_some() {
+                return None;
+            }
+            let (row_namespace, identity_ordinal) =
+                self.0.identities.generated_parts(row.id_slot)?;
+            if identity_ordinal != u64::from(ordinal_u32)
+                || namespace.is_some_and(|expected| expected != row_namespace)
+            {
+                return None;
+            }
+            namespace.get_or_insert(row_namespace);
+            let expected_rank =
+                u64::try_from((u128::from(ordinal_u32) + 1) * u128::from(u64::MAX) / denominator)
+                    .ok()?
+                    | 1;
+            if row.order_rank != expected_rank {
+                return None;
+            }
+            starts.push(chunk.byte_start.checked_add(row.relative_start)?);
+        }
+        let namespace = namespace?;
+        let mut output = Vec::with_capacity(36 + starts.len() * size_of::<u32>());
+        output.extend_from_slice(b"LIXCSV3\0");
+        output.extend_from_slice(&namespace);
+        output.extend_from_slice(&u64::try_from(self.0.blob.len()).ok()?.to_le_bytes());
+        output.push(self.0.dialect.delimiter);
+        output.push(self.0.dialect.quote.unwrap_or(0));
+        output.push(match self.0.dialect.terminator {
+            Terminator::Lf => 1,
+            Terminator::CrLf => 2,
+            Terminator::Cr => 3,
+        });
+        output.push(0);
+        output.extend_from_slice(&row_count.to_le_bytes());
+        for start in starts {
+            output.extend_from_slice(&start.to_le_bytes());
+        }
+        Some((namespace, output))
     }
 
     pub fn row_count(&self) -> usize {

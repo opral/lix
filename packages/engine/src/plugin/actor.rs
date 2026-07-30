@@ -167,6 +167,15 @@ impl Default for PluginActorCache {
 }
 
 impl PluginActorCache {
+    pub(crate) fn contains_observation(&self, observation: &PluginObservation) -> bool {
+        let state = self.lock();
+        state.actors.get(observation.key()).is_some_and(|slot| {
+            !slot.retired.load(Ordering::Acquire)
+                && slot.nonce == observation.actor_nonce
+                && slot.revision.load(Ordering::Acquire) == observation.revision
+        })
+    }
+
     pub(crate) fn new(capacity: usize) -> Result<Self, LixError> {
         let capacity = NonZeroUsize::new(capacity).ok_or_else(|| {
             LixError::new(

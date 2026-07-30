@@ -33,7 +33,7 @@ const MAX_PLUGIN_TABLES: usize = 8;
 const MAX_PLUGIN_TABLE_ELEMENTS: usize = 1_000_000;
 const LIX_WASMTIME_CACHE_DIR_ENV: &str = "LIX_WASMTIME_CACHE_DIR";
 
-pub(crate) fn runtime() -> Result<Arc<dyn WasmRuntime>, LixError> {
+pub fn runtime() -> Result<Arc<dyn WasmRuntime>, LixError> {
     Ok(Arc::new(WasmtimePluginRuntime::new()?))
 }
 

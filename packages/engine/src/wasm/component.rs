@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub const PACKET_FORMAT_V1: u16 = 1;
-pub const WASM_COMPONENT_API_VERSION: &str = "3.0.0";
+pub const WASM_COMPONENT_API_VERSION: &str = "4.0.0";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
@@ -173,7 +173,7 @@ impl WasmTransitionCounters {
     ///
     /// Counters saturate instead of wrapping so diagnostic instrumentation can
     /// never report a deceptively small value after a long-running process.
-    pub(crate) fn accumulate(&mut self, other: Self) {
+    pub fn accumulate(&mut self, other: Self) {
         self.source_read_calls = self
             .source_read_calls
             .saturating_add(other.source_read_calls);
@@ -1218,6 +1218,65 @@ pub struct WasmFileUpdate {
     pub creates: WasmCreateContext,
 }
 
+pub struct WasmColdFileUpdate {
+    pub before_descriptor: WasmFileDescriptor,
+    pub after_descriptor: WasmFileDescriptor,
+    pub before: Option<Arc<dyn WasmByteSource>>,
+    pub edits: Vec<WasmInputSplice>,
+    pub after: Arc<dyn WasmByteSource>,
+    pub creates: WasmCreateContext,
+    pub entities: Box<dyn WasmEntitySource>,
+}
+
+impl fmt::Debug for WasmColdFileUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WasmColdFileUpdate")
+            .field("before_descriptor", &self.before_descriptor)
+            .field("after_descriptor", &self.after_descriptor)
+            .field(
+                "before_len",
+                &self.before.as_ref().map(|source| source.len()),
+            )
+            .field("edits", &self.edits)
+            .field("after_len", &self.after.len())
+            .field("creates", &self.creates)
+            .finish()
+    }
+}
+
+impl WasmColdFileUpdate {
+    pub fn validate(&self, limits: WasmTransitionLimits) -> Result<(), LixError> {
+        match &self.before {
+            Some(before) => WasmFileUpdate {
+                before_descriptor: self.before_descriptor.clone(),
+                after_descriptor: self.after_descriptor.clone(),
+                before: Arc::clone(before),
+                edits: self.edits.clone(),
+                after: Arc::clone(&self.after),
+                creates: self.creates,
+            }
+            .validate(limits),
+            None => {
+                self.before_descriptor
+                    .validate_warm_successor(&self.after_descriptor)?;
+                limits.validate()?;
+                if !self.edits.is_empty() {
+                    return Err(invalid_param(
+                        "a derived cold successor must not carry host byte splices",
+                    ));
+                }
+                if self.after.len() > limits.max_total_bytes {
+                    return Err(invalid_param(
+                        "a derived cold successor source exceeds max_total_bytes",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl fmt::Debug for WasmFileUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1784,6 +1843,17 @@ pub trait WasmComponentActor: Send {
         update: WasmFileUpdate,
     ) -> Result<WasmFileTransition, LixError>;
 
+    async fn cold_file_changed(
+        &mut self,
+        limits: WasmTransitionLimits,
+        update: WasmColdFileUpdate,
+    ) -> Result<WasmFileTransition, LixError> {
+        let _ = (limits, update);
+        Err(invalid_param(
+            "this component actor does not implement cold successor reconciliation",
+        ))
+    }
+
     async fn entities_changed(
         &mut self,
         document: WasmDocumentHandle,
@@ -2318,7 +2388,7 @@ mod tests {
     #[test]
     fn production_wit_is_versioned_and_fused() {
         let wit = include_str!("../../../plugin-api/wit/lix-plugin.wit");
-        assert!(wit.starts_with("package lix:plugin@3.0.0;"));
+        assert!(wit.starts_with("package lix:plugin@4.0.0;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("apply:"));
         assert!(wit.contains("entities-changed:"));

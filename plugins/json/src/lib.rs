@@ -4,8 +4,8 @@
 mod core;
 
 use core::{
-    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, EntityRecord,
-    IdNamespace, InputSplice,
+    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, EntityImportBuilder,
+    EntityRecord, IdNamespace, InputSplice,
 };
 use lix_plugin_api as sdk;
 use serde_json::Value;
@@ -24,6 +24,91 @@ const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for JsonPlugin {
+    fn cold_file_changed(
+        update: &mut sdk::ColdFileUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let accepted = update
+            .before
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
+        if accepted.is_some() == submitted.is_some() {
+            return Err(sdk::Error::invalid_input(
+                "JSON cold successor requires exactly one byte source",
+            ));
+        }
+        let mut builder = EntityImportBuilder::new();
+        while let Some(entity) = update.entities.next()? {
+            let snapshot = entity.snapshot.ok_or_else(|| {
+                sdk::Error::invalid_input("JSON cold successor received a tombstone")
+            })?;
+            builder
+                .push(EntityRecord {
+                    schema_key: entity.schema_key,
+                    entity_pk: entity.entity_pk,
+                    snapshot,
+                })
+                .map_err(sdk::Error::invalid_input)?;
+        }
+        let create_namespace =
+            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+        if let Some(accepted) = accepted
+            && !document.bytes_equal(&accepted)
+        {
+            let reconcile = [InputSplice {
+                offset: 0,
+                delete_len: document.byte_len() as u64,
+                insert: &accepted,
+            }];
+            document = document
+                .file_changed(&reconcile, create_namespace)
+                .map_err(sdk::Error::invalid_input)?
+                .0;
+        }
+        let inserts;
+        let splices = if let Some(submitted) = submitted.as_ref() {
+            vec![InputSplice {
+                offset: 0,
+                delete_len: document.byte_len() as u64,
+                insert: submitted,
+            }]
+        } else {
+            inserts = update
+                .edits
+                .iter()
+                .map(|edit| edit.insert.clone())
+                .collect::<Vec<_>>();
+            update
+                .edits
+                .iter()
+                .zip(&inserts)
+                .map(|(edit, insert)| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (document, changes) = document
+            .file_changed(&splices, create_namespace)
+            .map_err(sdk::Error::invalid_input)?;
+        update
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+        store_fallback_entities_fresh(
+            &update.successor,
+            &document
+                .entity_records()
+                .map_err(sdk::Error::invalid_input)?,
+        )?;
+        store_scalar_state(&update.successor, &document)?;
+        emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
+        Ok(())
+    }
+
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
@@ -59,19 +144,23 @@ impl sdk::FormatPlugin for JsonPlugin {
     }
 
     fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut builder = EntityImportBuilder::new();
         let mut records = Vec::new();
         while let Some(entity) = input.entities.next()? {
             let snapshot = entity
                 .snapshot
                 .ok_or_else(|| sdk::Error::invalid_input("JSON hydration received a tombstone"))?;
-            records.push(EntityRecord {
+            let record = EntityRecord {
                 schema_key: entity.schema_key,
                 entity_pk: entity.entity_pk,
                 snapshot,
-            });
+            };
+            builder
+                .push(record.clone())
+                .map_err(sdk::Error::invalid_input)?;
+            records.push(record);
         }
-        let (document, _) =
-            Document::open_entities(records.clone()).map_err(sdk::Error::invalid_input)?;
+        let (document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
         store_fallback_entities_fresh(&input.successor, &records)?;
         if input.accepted.is_none() {
             sink.replace_file(&document.bytes())?;

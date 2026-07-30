@@ -1,5 +1,6 @@
 mod benchmark_metrics;
 
+use bytes::Bytes;
 use lix_rocksdb_storage::RocksDB;
 use lix_sdk::{
     CreateBranchOptions, ExecuteOptions, ExecuteStatementMetadata, Lix, LixError,
@@ -9,6 +10,12 @@ use lix_sdk::{
 };
 use lix_sdk::{LocalFilesystem, open_lix_with_storage};
 use lix_sdk::{OpenLixOptions, Value, open_lix};
+use lix_sdk::{
+    WasmByteSource, WasmColdFileUpdate, WasmCreateContext, WasmEntity, WasmEntityChange,
+    WasmEntityKey, WasmEntityPage, WasmEntitySource, WasmFileDescriptor, WasmFileUpdate,
+    WasmHostBytes, WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput,
+    WasmPluginSelection, WasmTransitionLimits,
+};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -4450,8 +4457,12 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
     let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
-        ("v2_actor", "plugin_json", build_json_plugin_archive()),
-        ("v3_arena", "plugin_json", build_json_plugin_archive()),
+        (
+            "hydrate_then_update",
+            "plugin_json",
+            build_json_plugin_archive(),
+        ),
+        ("cold_successor", "plugin_json", build_json_plugin_archive()),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -4478,10 +4489,12 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
             reopened.reset_plugin_transition_counters();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
-            assert_eq!(
-                read_file(&reopened, PATH).await.unwrap(),
-                Some(before.clone())
-            );
+            if label == "hydrate_then_update" {
+                assert_eq!(
+                    read_file(&reopened, PATH).await.unwrap(),
+                    Some(before.clone())
+                );
+            }
             write_file(&reopened, PATH, after.clone()).await.unwrap();
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
@@ -4542,8 +4555,399 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
         );
         lane_medians.insert(label, benchmark_medians(&measurements));
     }
-    if let (Some(v2), Some(v3)) = (lane_medians.get("v2_actor"), lane_medians.get("v3_arena")) {
-        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *v2, *v3);
+    if let (Some(hydrate), Some(cold)) = (
+        lane_medians.get("hydrate_then_update"),
+        lane_medians.get("cold_successor"),
+    ) {
+        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *hydrate, *cold);
+    }
+}
+
+#[tokio::test]
+async fn v3_json_reopen_uses_one_export_for_cold_successor() {
+    const PATH: &str = "/v3-json-cold-successor-regression.json";
+    let before = br#"{"keep":1,"edit":2}"#.to_vec();
+    let after = br#"{"keep":1,"edit":3}"#.to_vec();
+    let root = tempfile::tempdir().expect("create cold JSON regression directory");
+    let storage =
+        RocksDB::open(root.path().join(".lix")).expect("open cold JSON regression RocksDB");
+    let lix = open_lix_with_storage(storage.clone()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    write_file(&lix, PATH, before).await.unwrap();
+    storage.flush().expect("flush cold JSON regression import");
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    reopened.reset_plugin_transition_counters();
+    write_file(&reopened, PATH, after.clone()).await.unwrap();
+    let counters = reopened.plugin_transition_counters();
+    assert_eq!(counters.guest_export_calls, 1);
+    assert_eq!(counters.full_document_reparses, 1);
+    assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(after));
+    let rows = reopened
+        .execute(
+            "SELECT scalar_json FROM json_object_member WHERE key = 'edit'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows()[0].get::<String>("scalar_json").unwrap(), "3");
+    reopened.close().await.unwrap();
+}
+
+#[derive(Debug)]
+struct BenchmarkByteSource(Vec<u8>);
+
+impl WasmByteSource for BenchmarkByteSource {
+    fn len(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read(&self, offset: u64, length: u32) -> Result<Vec<u8>, LixError> {
+        let start = usize::try_from(offset)
+            .map_err(|_| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source offset"))?;
+        let end = start
+            .checked_add(length as usize)
+            .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source range"))?;
+        self.0
+            .get(start..end)
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| LixError::new(LixError::CODE_INVALID_PARAM, "benchmark source range"))
+    }
+}
+
+struct BenchmarkEntitySource {
+    entities: Vec<WasmHostEntity>,
+    next: usize,
+}
+
+impl WasmEntitySource for BenchmarkEntitySource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+        if self.next == self.entities.len() {
+            return Ok(None);
+        }
+        let start = self.next;
+        let mut bytes = 0usize;
+        while self.next < self.entities.len() {
+            let entity = &self.entities[self.next];
+            let size = entity.key.schema_key.len()
+                + entity
+                    .key
+                    .entity_pk
+                    .iter()
+                    .map(|part| part.len())
+                    .sum::<usize>()
+                + entity.snapshot_content.len() as usize
+                + 64;
+            if self.next > start && bytes.saturating_add(size) > max_bytes as usize {
+                break;
+            }
+            bytes = bytes.saturating_add(size);
+            self.next += 1;
+        }
+        Ok(Some(WasmEntityPage {
+            entities: self.entities[start..self.next].to_vec(),
+        }))
+    }
+}
+
+#[tokio::test]
+async fn v3_json_direct_cold_successor_preserves_durable_identity() {
+    let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")))
+        .expect("read JSON component");
+    let runtime = lix_sdk::default_wasm_runtime().expect("default Wasm runtime");
+    let factory = runtime
+        .compile_component(wasm, WasmLimits::default())
+        .await
+        .expect("compile JSON component");
+    let descriptor = WasmFileDescriptor {
+        path: Some("/direct-cold.json".to_owned()),
+        media_type: Some("application/json".to_owned()),
+        plugin: WasmPluginSelection {
+            plugin_key: "plugin_json".to_owned(),
+            generation: "direct".to_owned(),
+        },
+    };
+    let before = br#"{"a":"one","b":"two"}"#.to_vec();
+    let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+    let entities = vec![
+        WasmEntity {
+            key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                br#"{"id":"root","kind":"object"}"#,
+            )),
+        },
+        WasmEntity {
+            key: WasmEntityKey::from_owned_parts(
+                "json_object_member",
+                vec!["root".to_owned(), "a".to_owned()],
+            ),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                br#"{"parent_id":"root","key":"a","order_key":"40","kind":"string","scalar_json":"\"one\""}"#,
+            )),
+        },
+        WasmEntity {
+            key: WasmEntityKey::from_owned_parts(
+                "json_object_member",
+                vec!["root".to_owned(), "b".to_owned()],
+            ),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+                br#"{"parent_id":"root","key":"b","order_key":"80","kind":"string","scalar_json":"\"two\""}"#,
+            )),
+        },
+    ];
+    let original_keys = entities
+        .iter()
+        .map(|entity| entity.key.clone())
+        .collect::<Vec<_>>();
+
+    let limits = WasmTransitionLimits {
+        max_page_bytes: 64 * 1024,
+        max_record_bytes: 64 * 1024,
+        max_total_bytes: 64 * 1024,
+        max_inline_input_bytes: 64 * 1024,
+        ..WasmTransitionLimits::default()
+    };
+    let mut actor = factory.instantiate_actor().await.unwrap();
+    let cold = actor
+        .cold_file_changed(
+            limits,
+            WasmColdFileUpdate {
+                before_descriptor: descriptor.clone(),
+                after_descriptor: descriptor,
+                before: Some(Arc::new(BenchmarkByteSource(before))),
+                edits: vec![WasmInputSplice {
+                    offset: 6,
+                    delete_len: 3,
+                    insert: WasmInputBytes::Inline(b"ONE".to_vec()),
+                }],
+                after: Arc::new(BenchmarkByteSource(after)),
+                creates: WasmCreateContext { high: 13, low: 17 },
+                entities: Box::new(BenchmarkEntitySource { entities, next: 0 }),
+            },
+        )
+        .await
+        .unwrap();
+    let mut changed_keys = Vec::new();
+    while let Some(page) = actor
+        .next_change_page(cold.transition, cold.changes, 2 * 1024 * 1024)
+        .await
+        .unwrap()
+    {
+        changed_keys.extend(
+            page.changes
+                .changes
+                .iter()
+                .filter_map(WasmEntityChange::entity_key)
+                .cloned(),
+        );
+    }
+    actor.finish_transition(cold.transition).await.unwrap();
+    assert_eq!(changed_keys.len(), 1);
+    assert!(original_keys.contains(&changed_keys[0]));
+    actor.retire().await.unwrap();
+}
+
+fn json_ten_mib_durable_entities() -> Vec<WasmHostEntity> {
+    let mut entities = Vec::with_capacity(JSON_TEN_MIB_PROPERTY_COUNT + 1);
+    entities.push(WasmEntity {
+        key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
+        snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
+            br#"{"id":"root","kind":"object"}"#,
+        )),
+    });
+    let mut state = 0x6a73_6f6e_2d31_306du64;
+    let base_bytes = 2 + JSON_TEN_MIB_PROPERTY_COUNT * 44 + JSON_TEN_MIB_PROPERTY_COUNT - 1;
+    let padding = JSON_TEN_MIB_BYTES - base_bytes;
+    let padding_per_property = padding / JSON_TEN_MIB_PROPERTY_COUNT;
+    let extra_padding_properties = padding % JSON_TEN_MIB_PROPERTY_COUNT;
+    for index in 0..JSON_TEN_MIB_PROPERTY_COUNT {
+        state = splitmix64(state);
+        let first = state;
+        state = splitmix64(state);
+        let second = state as u32;
+        let padding = padding_per_property + usize::from(index < extra_padding_properties);
+        let key = format!("property_{index:06}");
+        let value = format!("{first:016x}{second:08x}{}", "f".repeat(padding));
+        let order_key = format!("{:016x}", (index as u64).saturating_mul(2) + 1);
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "parent_id": "root",
+            "key": key,
+            "order_key": order_key,
+            "kind": "string",
+            "scalar_json": serde_json::to_string(&value).unwrap(),
+        }))
+        .unwrap();
+        entities.push(WasmEntity {
+            key: WasmEntityKey::from_owned_parts(
+                "json_object_member",
+                vec!["root".to_owned(), key],
+            ),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from(snapshot)),
+        });
+    }
+    entities
+}
+
+async fn drain_direct_file_transition(
+    actor: &mut dyn lix_sdk::WasmComponentActor,
+    transition: lix_sdk::WasmFileTransition,
+) -> WasmTransitionCounters {
+    while actor
+        .next_change_page(transition.transition, transition.changes, 2 * 1024 * 1024)
+        .await
+        .unwrap()
+        .is_some()
+    {}
+    let _ = actor.take_certified_entity_batches(transition.transition);
+    actor
+        .finish_transition(transition.transition)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "10 MiB direct Wasm hydrate+update versus cold-successor A/B"]
+async fn v3_json_direct_cold_successor_benchmark() {
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3);
+    let wasm = std::fs::read(Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json")))
+        .expect("read JSON component");
+    let factory = lix_sdk::default_wasm_runtime()
+        .unwrap()
+        .compile_component(
+            wasm,
+            WasmLimits {
+                max_memory_bytes: 128 * 1024 * 1024,
+                ..WasmLimits::default()
+            },
+        )
+        .await
+        .unwrap();
+    let descriptor = WasmFileDescriptor {
+        path: Some("/direct-cold-large.json".to_owned()),
+        media_type: Some("application/json".to_owned()),
+        plugin: WasmPluginSelection {
+            plugin_key: "plugin_json".to_owned(),
+            generation: "direct".to_owned(),
+        },
+    };
+    let creates = WasmCreateContext { high: 13, low: 17 };
+    let (before, edit_offset, _) = json_ten_mib_flat_fixture();
+    let mut after = before.clone();
+    after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
+    let entities = json_ten_mib_durable_entities();
+    for lane in ["hydrate_then_update", "cold_successor"] {
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|selected| selected != lane) {
+            continue;
+        }
+        let mut elapsed = Vec::new();
+        for sample in 0..samples {
+            let source_entities = entities.clone();
+            let before_source = Arc::new(BenchmarkByteSource(before.clone()));
+            let after_source = Arc::new(BenchmarkByteSource(after.clone()));
+            let mut actor = factory.instantiate_actor().await.unwrap();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            let counters = if lane == "hydrate_then_update" {
+                let hydrated = actor
+                    .open_entities(
+                        WasmTransitionLimits::default(),
+                        WasmOpenEntitiesInput {
+                            descriptor: descriptor.clone(),
+                            entities: Box::new(BenchmarkEntitySource {
+                                entities: source_entities,
+                                next: 0,
+                            }),
+                            accepted: Some(before_source.clone()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    actor
+                        .next_edit_page(hydrated.transition, hydrated.edits, 1024, 2 * 1024 * 1024,)
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+                let mut counters = actor.finish_transition(hydrated.transition).await.unwrap();
+                let transition = actor
+                    .file_changed(
+                        hydrated.document,
+                        WasmTransitionLimits::default(),
+                        WasmFileUpdate {
+                            before_descriptor: descriptor.clone(),
+                            after_descriptor: descriptor.clone(),
+                            before: before_source,
+                            edits: vec![WasmInputSplice {
+                                offset: edit_offset as u64,
+                                delete_len: 1,
+                                insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
+                            }],
+                            after: after_source,
+                            creates,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                counters.accumulate(drain_direct_file_transition(actor.as_mut(), transition).await);
+                counters
+            } else {
+                let transition = actor
+                    .cold_file_changed(
+                        WasmTransitionLimits::default(),
+                        WasmColdFileUpdate {
+                            before_descriptor: descriptor.clone(),
+                            after_descriptor: descriptor.clone(),
+                            before: Some(before_source),
+                            edits: vec![WasmInputSplice {
+                                offset: edit_offset as u64,
+                                delete_len: 1,
+                                insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
+                            }],
+                            after: after_source,
+                            creates,
+                            entities: Box::new(BenchmarkEntitySource {
+                                entities: source_entities,
+                                next: 0,
+                            }),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                drain_direct_file_transition(actor.as_mut(), transition).await
+            };
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            eprintln!(
+                "json_direct_cold lane={lane} sample={sample} elapsed_ms={:.3} peak_live_mb={:.3} \
+                 allocated_mb={:.3} exports={} imports={} boundary_mb={:.3} guest_hwm_mb={:.3}",
+                measurement.elapsed_ms,
+                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
+                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes as f64 / 1_000_000.0,
+                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+            );
+            elapsed.push(measurement.elapsed_ms);
+            actor.retire().await.unwrap();
+        }
+        elapsed.sort_by(f64::total_cmp);
+        eprintln!(
+            "json_direct_cold lane={lane} raw_ms={elapsed:?} p50_ms={:.3} p95_ms={:.3}",
+            p50_ms(&elapsed),
+            p95_ms(&elapsed),
+        );
     }
 }
 
@@ -4720,7 +5124,12 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     lix.reset_plugin_transition_counters();
     let after_eviction = b"alpha,ONE\nbeta,two\n".to_vec();
     write_file(&lix, path, after_eviction).await.unwrap();
-    assert_eq!(lix.plugin_transition_counters().durable_semantic_changes, 1);
+    let eviction_counters = lix.plugin_transition_counters();
+    assert_eq!(
+        eviction_counters.guest_export_calls, 1,
+        "an acknowledged but evicted CSV actor must use cold successor directly"
+    );
+    assert_eq!(eviction_counters.durable_semantic_changes, 1);
     assert_eq!(
         lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
             .await
@@ -4738,6 +5147,11 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     write_file(&reopened, path, after_reopen.clone())
         .await
         .unwrap();
+    assert_eq!(
+        reopened.plugin_transition_counters().guest_export_calls,
+        1,
+        "cold CSV reconciliation must not hydrate and re-enter the guest"
+    );
     assert_eq!(
         reopened
             .plugin_transition_counters()
@@ -5176,14 +5590,21 @@ async fn v2_json_ten_mib_rocksdb_read_benchmark() {
 
 #[derive(Debug)]
 struct ColdMaterializedOpenSample {
-    elapsed: Duration,
+    measurement: BenchmarkMeasurement,
     counters: WasmTransitionCounters,
 }
 
 #[tokio::test]
-#[ignore = "large cold-open materialized-base benchmark"]
-async fn v2_cold_open_materialized_csv_and_json_benchmark() {
-    const SAMPLES: usize = 5;
+#[ignore = "large v3 cold-successor CSV and JSON benchmark"]
+async fn v3_cold_successor_csv_and_json_benchmark() {
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
 
     let storage = lix_sdk::Memory::new();
     let seed = open_lix(OpenLixOptions::new(storage.clone()))
@@ -5235,20 +5656,28 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
             nested_prefix.len() + json_edit_offset,
         ),
     ] {
-        let mut samples = Vec::with_capacity(SAMPLES);
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|selected| selected != label) {
+            continue;
+        }
+        let mut lane_samples = Vec::with_capacity(samples);
         let mut accepted = initial.to_vec();
-        for _ in 0..SAMPLES {
+        for sample in 0..samples {
             let lix = open_lix(OpenLixOptions::new(storage.clone()))
                 .await
                 .expect("cold benchmark workspace should reopen");
             lix.reset_plugin_transition_counters();
+            collector.clear();
             let mut after = accepted.clone();
             after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
+            let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(&lix, path, after.clone())
                 .await
                 .unwrap_or_else(|error| panic!("cold write for {path} should succeed: {error:?}"));
-            let elapsed = started.elapsed();
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let phases_ms = collector.take_aggregate_millis();
+            let phase_close_live_bytes = collector.take_close_live_bytes();
             let actual = read_file(&lix, path)
                 .await
                 .unwrap_or_else(|error| {
@@ -5256,8 +5685,12 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
                 })
                 .unwrap_or_else(|| panic!("cold write result for {path} should exist"));
             assert_eq!(actual, after, "cold write must remain byte-exact");
-            samples.push(ColdMaterializedOpenSample {
-                elapsed,
+            eprintln!(
+                "v3_cold_successor_phases label={label} sample={sample} phases_ms={:?} phase_close_live_bytes={:?}",
+                phases_ms, phase_close_live_bytes,
+            );
+            lane_samples.push(ColdMaterializedOpenSample {
+                measurement,
                 counters: lix.plugin_transition_counters(),
             });
             lix.close()
@@ -5265,7 +5698,7 @@ async fn v2_cold_open_materialized_csv_and_json_benchmark() {
                 .expect("cold benchmark workspace should close");
             accepted = after;
         }
-        report_cold_materialized_open(label, accepted.len(), &samples);
+        report_cold_materialized_open(label, accepted.len(), &lane_samples);
     }
 }
 
@@ -5276,7 +5709,7 @@ fn report_cold_materialized_open(
 ) {
     let mut elapsed_ms = samples
         .iter()
-        .map(|sample| sample.elapsed.as_secs_f64() * 1_000.0)
+        .map(|sample| sample.measurement.elapsed_ms)
         .collect::<Vec<_>>();
     elapsed_ms.sort_by(f64::total_cmp);
     let p50_ms = elapsed_ms[elapsed_ms.len() / 2];
@@ -5286,25 +5719,36 @@ fn report_cold_materialized_open(
     for sample in samples {
         let counters = sample.counters;
         assert_eq!(
-            counters.full_renderer_invocations, 0,
-            "{label} cold materialized read must not render through a plugin"
+            counters.guest_export_calls, 1,
+            "{label} cold successor must not hydrate and re-enter the guest"
         );
-        assert_eq!(
-            counters.full_state_semantic_rows_materialized, 0,
-            "{label} cold materialized read must not hydrate semantic entities"
+        assert!(
+            counters.full_state_semantic_rows_materialized > 0,
+            "{label} cold successor must consume durable identities"
         );
-        assert_eq!(
-            counters.component_boundary_bytes, 0,
-            "{label} cold materialized read must not cross the Component boundary"
+        assert!(
+            counters.component_boundary_bytes > 0,
+            "{label} cold successor must account for its bounded entity pages"
         );
     }
 
     let representative = samples[elapsed_ms.len() / 2].counters;
+    let mut peak_live = samples
+        .iter()
+        .map(|sample| sample.measurement.allocations.peak_live_bytes_delta)
+        .collect::<Vec<_>>();
+    peak_live.sort_unstable();
+    let mut allocated = samples
+        .iter()
+        .map(|sample| sample.measurement.allocations.allocated_bytes)
+        .collect::<Vec<_>>();
+    allocated.sort_unstable();
     eprintln!(
-        "v2_cold_materialized_open label={label} bytes={expected_bytes} samples={} \
+        "v3_cold_successor label={label} bytes={expected_bytes} samples={} \
          p50_ms={p50_ms:.3} p95_ms={p95_ms:.3} source_read_calls={} source_bytes_read={} \
          packet_pages={} packet_records={} attachment_reads={} attachment_bytes_read={} \
-         boundary_bytes={} guest_high_water_bytes={} full_renderer_invocations={}",
+         boundary_bytes={} guest_high_water_bytes={} full_renderer_invocations={} \
+         host_peak_live_mb={:.3} host_allocated_mb={:.3}",
         samples.len(),
         representative.source_read_calls,
         representative.source_bytes_read,
@@ -5315,6 +5759,8 @@ fn report_cold_materialized_open(
         representative.component_boundary_bytes,
         representative.guest_linear_memory_high_water_bytes,
         representative.full_renderer_invocations,
+        peak_live[peak_live.len() / 2] as f64 / 1_000_000.0,
+        allocated[allocated.len() / 2] as f64 / 1_000_000.0,
     );
 }
 
@@ -5632,6 +6078,50 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(renamed));
 
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_excalidraw_cold_successor_after_reopen_rebuilds_span_state() {
+    let root = tempfile::tempdir().expect("create v3 Excalidraw reopen directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    let path = "/v3-excalidraw-cold.excalidraw";
+    let before = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    write_file(&lix, path, before).await.unwrap();
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    reopened.reset_plugin_transition_counters();
+    let cold = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":10,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    write_file(&reopened, path, cold.clone()).await.unwrap();
+    let counters = reopened.plugin_transition_counters();
+    assert_eq!(
+        counters.guest_export_calls, 1,
+        "cold Excalidraw reconciliation must not hydrate and re-enter the guest"
+    );
+    assert_eq!(counters.durable_semantic_changes, 1);
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(cold));
+
+    // The cold successor must publish spans for its own bytes. A following
+    // localized edit would address the wrong range if it inherited the
+    // predecessor's index.
+    let warm = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":100,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    reopened.reset_plugin_transition_counters();
+    write_file(&reopened, path, warm.clone()).await.unwrap();
+    assert_eq!(
+        reopened
+            .plugin_transition_counters()
+            .durable_semantic_changes,
+        1
+    );
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(warm));
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -6640,6 +7130,52 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
         "a rejected merge must retain the target generation"
     );
 
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v4_csv_dialect_rename_after_eviction_uses_predecessor_descriptor() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_plugin(&lix, "plugin_csv", &build_csv_plugin_archive())
+        .await
+        .unwrap();
+    let before_path = "/dialect-before.csv";
+    let after_path = "/dialect-after.tsv";
+    let source = b"first,one\n".to_vec();
+    write_file(&lix, before_path, source.clone()).await.unwrap();
+    let file_id = file_id_at_path(&lix, before_path).await;
+    assert_eq!(
+        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        ["first", "one"]
+    );
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/dialect-evict-{index}.csv"),
+            format!("eviction,{index}\n").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    lix.execute(
+        "UPDATE lix_file SET path = $1 WHERE path = $2",
+        &[
+            Value::Text(after_path.to_owned()),
+            Value::Text(before_path.to_owned()),
+        ],
+    )
+    .await
+    .expect("an evicted CSV actor must observe the CSV to TSV descriptor transition");
+
+    assert_eq!(read_file(&lix, before_path).await.unwrap(), None);
+    assert_eq!(read_file(&lix, after_path).await.unwrap(), Some(source));
+    assert_eq!(
+        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        ["first,one"],
+        "the successor must be reparsed with TSV delimiter semantics"
+    );
     lix.close().await.unwrap();
 }
 

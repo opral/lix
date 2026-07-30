@@ -11,13 +11,14 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin::api::{
-    ConflictUpdate as WitConflictUpdate, EntityUpdate as WitEntityUpdate, Guest,
-    HydrateRequest as WitHydrateRequest, PluginError, TransitionRequest,
+    ColdSuccessorRequest as WitColdSuccessorRequest, ConflictUpdate as WitConflictUpdate,
+    EntityUpdate as WitEntityUpdate, Guest, HydrateRequest as WitHydrateRequest, PluginError,
+    TransitionRequest,
 };
 use lix::plugin::host::{
     ChangeEffect as WitChangeEffect, ChangePage, ConflictSide as WitConflictSide, ConflictSource,
-    EntityChangeSource, HostError, MapSpace, PackedPage, ResolutionEffect, ResolutionSink,
-    Snapshot as WitSnapshot, Transition as WitTransition,
+    EntityChangeInput as WitEntityChangeInput, EntityChangeSource, HostError, MapSpace, PackedPage,
+    ResolutionEffect, ResolutionSink, Snapshot as WitSnapshot, Transition as WitTransition,
 };
 use std::marker::PhantomData;
 
@@ -467,8 +468,10 @@ pub struct EntityChange {
 
 pub struct EntityChangeReader<'a> {
     source: &'a EntityChangeSource,
+    page: std::vec::IntoIter<WitEntityChangeInput>,
+    max_page_bytes: u32,
     next: u32,
-    len: u32,
+    eof: bool,
 }
 
 impl std::fmt::Debug for EntityChangeReader<'_> {
@@ -476,37 +479,78 @@ impl std::fmt::Debug for EntityChangeReader<'_> {
         formatter
             .debug_struct("EntityChangeReader")
             .field("next", &self.next)
-            .field("len", &self.len)
+            .field("buffered", &self.page.len())
+            .field("max_page_bytes", &self.max_page_bytes)
+            .field("eof", &self.eof)
             .finish_non_exhaustive()
     }
 }
 
 impl EntityChangeReader<'_> {
+    fn new(source: &EntityChangeSource, max_page_bytes: u32) -> EntityChangeReader<'_> {
+        EntityChangeReader {
+            source,
+            page: Vec::new().into_iter(),
+            max_page_bytes,
+            next: 0,
+            eof: false,
+        }
+    }
+
     pub fn next(&mut self) -> Result<Option<EntityChange>> {
-        if self.next == self.len {
-            return Ok(None);
+        if self.page.len() == 0 {
+            if self.eof {
+                return Ok(None);
+            }
+            let Some(page) = self
+                .source
+                .next_page(self.max_page_bytes)
+                .map_err(|error| host_error("host entity-change page read failed", error))?
+            else {
+                self.eof = true;
+                return Ok(None);
+            };
+            if page.changes.is_empty() {
+                return Err(Error::invalid_input(
+                    "host entity-change source returned an empty page",
+                ));
+            }
+            self.page = page.changes.into_iter();
         }
         let index = self.next;
         self.next += 1;
-        let meta = self
-            .source
-            .get(index)
-            .map_err(|error| host_error("host entity-change metadata read failed", error))?;
-        if meta.ordinal != index {
+        let input = self
+            .page
+            .next()
+            .expect("a non-empty entity-change page has a first record");
+        if input.ordinal != index {
             return Err(Error::invalid_input(format!(
                 "entity-change ordinal {}, expected {index}",
-                meta.ordinal
+                input.ordinal
             )));
         }
-        let snapshot = meta
-            .snapshot_len
-            .map(|length| read_entity_snapshot(self.source, index, length))
-            .transpose()?;
+        let snapshot = match (input.snapshot_len, input.snapshot) {
+            (None, None) => None,
+            (Some(length), Some(snapshot)) => {
+                if snapshot.len() as u64 != length {
+                    return Err(Error::invalid_input(
+                        "inline entity snapshot length does not match its metadata",
+                    ));
+                }
+                Some(snapshot)
+            }
+            (Some(length), None) => Some(read_entity_snapshot(self.source, index, length)?),
+            (None, Some(_)) => {
+                return Err(Error::invalid_input(
+                    "inline entity snapshot is missing its length metadata",
+                ));
+            }
+        };
         Ok(Some(EntityChange {
-            schema_key: meta.schema_key,
-            entity_pk: meta.entity_pk,
+            schema_key: input.schema_key,
+            entity_pk: input.entity_pk,
             snapshot,
-            effect: match meta.effect {
+            effect: match input.effect {
                 WitChangeEffect::Content => ChangeEffect::Content,
                 WitChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
             },
@@ -514,7 +558,7 @@ impl EntityChangeReader<'_> {
     }
 }
 
-fn read_entity_snapshot(source: &EntityChangeSource, index: u32, length: u64) -> Result<Vec<u8>> {
+fn read_entity_snapshot(source: &EntityChangeSource, ordinal: u32, length: u64) -> Result<Vec<u8>> {
     const READ_BYTES: u32 = 1024 * 1024;
     let capacity = usize::try_from(length)
         .map_err(|_| Error::limit_exceeded("entity snapshot exceeds guest address space"))?;
@@ -524,7 +568,7 @@ fn read_entity_snapshot(source: &EntityChangeSource, index: u32, length: u64) ->
         let chunk = u32::try_from((capacity - output.len()).min(READ_BYTES as usize))
             .expect("bounded entity snapshot read fits u32");
         let bytes = source
-            .read_snapshot(index, offset, chunk)
+            .read_snapshot(ordinal, offset, chunk)
             .map_err(|error| host_error("host entity snapshot read failed", error))?
             .ok_or_else(|| Error::invalid_input("host entity snapshot disappeared"))?;
         if bytes.is_empty() {
@@ -553,6 +597,18 @@ pub struct HydrateFile<'a> {
     pub successor: Transaction<'a>,
 }
 
+#[derive(Debug)]
+pub struct ColdFileUpdate<'a> {
+    pub before_file: FileInfo,
+    pub after_file: FileInfo,
+    pub before: Option<Root<'a>>,
+    pub after: Option<Root<'a>>,
+    pub edits: Vec<InputSplice>,
+    pub entities: EntityChangeReader<'a>,
+    pub successor: Transaction<'a>,
+    pub creates: CreateContext,
+}
+
 pub trait FormatPlugin: 'static {
     fn open_file(input: &OpenFile<'_>, sink: &mut Sink<'_>) -> Result<()>;
 
@@ -573,6 +629,15 @@ pub trait FormatPlugin: 'static {
             "this format does not implement durable entity hydration",
         ))
     }
+
+    /// Reconciles a successor directly from durable entities and accepted
+    /// bytes when no warm guest document is available.
+    ///
+    /// This is mandatory: the host may choose the cold route after eviction,
+    /// process restart, or cache pressure. A format must therefore preserve
+    /// durable identities without requiring hydrate followed by a second
+    /// guest transition.
+    fn cold_file_changed(update: &mut ColdFileUpdate<'_>, sink: &mut Sink<'_>) -> Result<()>;
 }
 
 #[doc(hidden)]
@@ -760,11 +825,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
             before: Root {
                 inner: &input.before,
             },
-            changes: EntityChangeReader {
-                len: input.changes.len(),
-                source: &input.changes,
-                next: 0,
-            },
+            changes: EntityChangeReader::new(&input.changes, max_batch_bytes),
         };
         let mut sink = Sink {
             inner: output,
@@ -793,11 +854,7 @@ impl<P: FormatPlugin> Guest for Component<P> {
                 media_type: input.descriptor.media_type,
             },
             accepted,
-            entities: EntityChangeReader {
-                len: input.entities.len(),
-                source: &input.entities,
-                next: 0,
-            },
+            entities: EntityChangeReader::new(&input.entities, max_batch_bytes),
             successor: Transaction { inner: output },
         };
         let mut sink = Sink {
@@ -805,6 +862,50 @@ impl<P: FormatPlugin> Guest for Component<P> {
             max_batch_bytes,
         };
         P::hydrate(&mut input, &mut sink).map_err(plugin_error)
+    }
+
+    fn cold_successor(
+        input: WitColdSuccessorRequest,
+        output: &WitTransition,
+    ) -> std::result::Result<(), PluginError> {
+        let max_batch_bytes = output.max_batch_bytes();
+        if max_batch_bytes == 0 {
+            return Err(PluginError::LimitExceeded(
+                "max-batch-bytes must be positive".to_owned(),
+            ));
+        }
+        let mut input = ColdFileUpdate {
+            before_file: FileInfo {
+                path: input.before_descriptor.path,
+                media_type: input.before_descriptor.media_type,
+            },
+            after_file: FileInfo {
+                path: input.after_descriptor.path,
+                media_type: input.after_descriptor.media_type,
+            },
+            before: input.before.as_ref().map(|before| Root { inner: before }),
+            after: input.after.as_ref().map(|after| Root { inner: after }),
+            edits: input
+                .edits
+                .into_iter()
+                .map(|edit| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: edit.insert,
+                })
+                .collect(),
+            entities: EntityChangeReader::new(&input.entities, max_batch_bytes),
+            successor: Transaction { inner: output },
+            creates: CreateContext {
+                high: input.creates.high,
+                low: input.creates.low,
+            },
+        };
+        let mut sink = Sink {
+            inner: output,
+            max_batch_bytes,
+        };
+        P::cold_file_changed(&mut input, &mut sink).map_err(plugin_error)
     }
 }
 
