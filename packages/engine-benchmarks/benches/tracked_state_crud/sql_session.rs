@@ -1,5 +1,3 @@
-use std::fmt::Write as _;
-
 use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
 
 #[cfg(feature = "slatedb")]
@@ -7,8 +5,9 @@ use crate::storage::SlateDB;
 use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, sql_string};
 
-const SQL_CHUNK_SIZE: usize = 500;
 const READ_MANY_PK_COUNT: usize = crate::READ_MANY_PK_COUNT;
+const BOUND_INSERT_ALL_SQL: &str =
+    "INSERT INTO json_pointer (path, value) VALUES ($1, lix_json($2))";
 const BOUND_UPDATE_ALL_SQL: &str = "UPDATE json_pointer SET value = lix_json($1) WHERE path = $2";
 const UNTRACKED_PROBE_PATH: &str = "/__lix_untracked_probe";
 
@@ -40,7 +39,7 @@ pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
     visible_row_count: usize,
     untracked_fixture: UntrackedFixture,
     read_many_by_pk_count: usize,
-    insert_sql_chunks: Vec<String>,
+    bound_insert_all_batch: Vec<ExecuteBatchStatement>,
     select_all_sql: String,
     select_many_by_pk_sql: String,
     select_one_by_pk_sql: String,
@@ -264,11 +263,14 @@ where
 {
     #[expect(clippy::cast_possible_truncation)]
     async fn insert_all(&self) -> usize {
-        let affected = Box::pin(execute_many_in_transaction(
-            &self.session,
-            &self.insert_sql_chunks,
-        ))
-        .await;
+        let affected = self
+            .session
+            .execute_batch(&self.bound_insert_all_batch)
+            .await
+            .expect("execute tracked-state CRUD bound insert batch")
+            .iter()
+            .map(ExecuteResult::rows_affected)
+            .sum::<u64>();
         assert_eq!(affected as usize, self.row_count);
         affected as usize
     }
@@ -429,9 +431,15 @@ where
         visible_row_count: tracked_rows.len() + usize::from(untracked_fixture.has_untracked_row()),
         untracked_fixture,
         read_many_by_pk_count,
-        insert_sql_chunks: tracked_rows
-            .chunks(SQL_CHUNK_SIZE)
-            .map(insert_rows_sql)
+        bound_insert_all_batch: tracked_rows
+            .iter()
+            .map(|row| ExecuteBatchStatement {
+                sql: BOUND_INSERT_ALL_SQL.to_string(),
+                params: vec![
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.value_json.clone()),
+                ],
+            })
             .collect(),
         select_all_sql: "SELECT path, value FROM json_pointer ORDER BY path".to_string(),
         select_many_by_pk_sql: select_many_by_pk_sql(
@@ -557,22 +565,6 @@ where
         .await
         .expect("commit tracked-state CRUD transaction");
     affected
-}
-
-fn insert_rows_sql(rows: &[WorkloadRow]) -> String {
-    let mut sql = String::from("INSERT INTO json_pointer (path, value) VALUES ");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            sql.push(',');
-        }
-        let _ = write!(
-            sql,
-            "('{}', lix_json('{}'))",
-            sql_string(row.path.as_str()),
-            sql_string(row.value_json.as_str())
-        );
-    }
-    sql
 }
 
 fn select_by_pk_sql(rows: &[WorkloadRow]) -> String {

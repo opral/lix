@@ -314,7 +314,7 @@ fn scalar_parameter_value(scalar: ScalarValue, is_json: bool) -> Result<Value, L
     }
 }
 
-/// Attempts the one currently certified physical parameter-batch route.
+/// Attempts a certified physical parameter-batch route.
 ///
 /// `None` means the logical statements are not independent and must retain
 /// public `executeBatch`'s sequential execution semantics.
@@ -327,6 +327,16 @@ pub(crate) async fn execute_write_logical_plan_parameter_batch(
         return Ok(None);
     };
     validate_write_parameter_count(&write_plan.plan, parameter_batch.num_columns())?;
+    if let Some(results) = super::bound_public_write::try_execute_entity_insert_parameter_batch(
+        ctx,
+        &write_plan.plan,
+        parameter_batch,
+    )
+    .await
+    .map_err(normalize_bound_public_write_error)?
+    {
+        return Ok(Some(results));
+    }
     super::bound_public_write::try_execute_entity_update_parameter_batch(
         ctx,
         &write_plan.plan,

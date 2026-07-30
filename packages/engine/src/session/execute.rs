@@ -3850,6 +3850,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_lowers_distinct_bound_entity_inserts_once() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_batch_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql = "INSERT INTO parameter_insert_batch_probe (id, value) VALUES ($1, $2)";
+        let results = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("value-a".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("value-b".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .map(ExecuteResult::rows_affected)
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        let rows = session
+            .execute(
+                "SELECT id, value FROM parameter_insert_batch_probe ORDER BY id",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows()[0].get::<String>("value").unwrap(), "value-a");
+        assert_eq!(rows.rows()[1].get::<String>("value").unwrap(), "value-b");
+    }
+
+    #[tokio::test]
     async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({
@@ -4166,6 +4233,32 @@ mod tests {
             )
             .await
             .unwrap();
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let insert_sql = "INSERT INTO parameter_batch_repeat_probe (id, value) VALUES ($1, $2)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: insert_sql.to_string(),
+                    params: vec![
+                        Value::Text("duplicate".to_string()),
+                        Value::Text("first".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: insert_sql.to_string(),
+                    params: vec![
+                        Value::Text("duplicate".to_string()),
+                        Value::Text("second".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the second INSERT repeats the first identity");
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
         session
             .execute(
                 "INSERT INTO parameter_batch_repeat_probe (id, value) VALUES ('a', 'old')",
@@ -4303,6 +4396,32 @@ mod tests {
             )
             .await
             .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let insert_sql = "INSERT INTO parameter_batch_constraint_probe (id, value) VALUES ($1, $2)";
+        session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: insert_sql.to_string(),
+                    params: vec![
+                        Value::Text("c".to_string()),
+                        Value::Text("old-c".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: insert_sql.to_string(),
+                    params: vec![
+                        Value::Text("d".to_string()),
+                        Value::Text("old-d".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
 
         sql2::take_entity_update_parameter_batch_executions();
         let sql = "UPDATE parameter_batch_constraint_probe SET value = $1 WHERE id = $2";
