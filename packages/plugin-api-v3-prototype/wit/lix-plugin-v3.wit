@@ -43,6 +43,29 @@ interface host {
     payload: bytes,
   }
 
+  enum change-effect {
+    content,
+    format-only,
+  }
+
+  record entity-change-meta {
+    ordinal: u32,
+    schema-key: string,
+    entity-pk: list<string>,
+    snapshot-len: option<u64>,
+    effect: change-effect,
+  }
+
+  resource entity-change-source {
+    len: func() -> u32;
+    get: func(index: u32) -> result<entity-change-meta, host-error>;
+    read-snapshot: func(
+      index: u32,
+      offset: u64,
+      length: u32,
+    ) -> result<option<bytes>, host-error>;
+  }
+
   /// The sole host-owned atomic output capability. Checkpoints and semantic
   /// pages remain staged until the enclosing guest export succeeds.
   resource transition {
@@ -51,6 +74,9 @@ interface host {
     delete-state: func(key: bytes) -> result<_, host-error>;
     emit-changes: func(page: change-page) -> result<_, host-error>;
     emit-packed: func(page: packed-page) -> result<_, host-error>;
+    begin-file-replacement: func(total-length: u64) -> result<_, host-error>;
+    write-file-replacement: func(chunk: bytes) -> result<_, host-error>;
+    finish-file-replacement: func() -> result<_, host-error>;
   }
 
   enum conflict-side {
@@ -102,7 +128,7 @@ interface host {
 }
 
 interface api {
-  use host.{bytes, conflict-source, resolution-sink, snapshot, transition};
+  use host.{bytes, conflict-source, entity-change-source, resolution-sink, snapshot, transition};
 
   variant plugin-error {
     invalid-input(string),
@@ -150,6 +176,13 @@ interface api {
     conflicts: own<conflict-source>,
   }
 
+  record entity-update {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<snapshot>,
+    changes: own<entity-change-source>,
+  }
+
   /// All file transitions use one fused guest entry and one borrowed,
   /// host-owned atomic output capability.
   apply: func(
@@ -161,6 +194,11 @@ interface api {
   resolve-conflicts: func(
     input: conflict-update,
     output: borrow<resolution-sink>,
+  ) -> result<_, plugin-error>;
+
+  entities-changed: func(
+    input: entity-update,
+    output: borrow<transition>,
   ) -> result<_, plugin-error>;
 }
 

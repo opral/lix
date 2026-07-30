@@ -5,8 +5,8 @@
 mod core;
 
 use core::{
-    ArenaRowIndex, ChangeEffect, ColdInitialImport, EntityChange, ROW_SCHEMA_KEY,
-    RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, Document, EntityChange, IdNamespace,
+    ROW_SCHEMA_KEY, RowConflictResolution, TABLE_SCHEMA_KEY, resolve_row_conflict,
 };
 use lix_plugin_api_v3_prototype as sdk;
 use serde_json::Value;
@@ -15,9 +15,43 @@ struct CsvV3Prototype;
 
 const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
 const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
+const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 
 impl sdk::FormatPlugin for CsvV3Prototype {
+    fn entities_changed(
+        update: &mut sdk::EntityUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let before = update.before.read_all()?;
+        let mut changes = Vec::new();
+        while let Some(change) = update.changes.next()? {
+            changes.push(EntityChange {
+                schema_key: change.schema_key,
+                entity_pk: change.entity_pk,
+                snapshot: change.snapshot,
+                effect: match change.effect {
+                    sdk::ChangeEffect::Content => ChangeEffect::Content,
+                    sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
+                },
+            });
+        }
+        let namespace = read_namespace(&update.before)?
+            .or_else(|| namespace_from_changes(&changes))
+            .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+        let (document, _) = Document::open_file(
+            before.clone(),
+            update.before_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
+        let (_, edits) = document
+            .entities_changed(&changes)
+            .map_err(sdk::Error::invalid_input)?;
+        sink.replace_file(&apply_edits(before, &edits)?)?;
+        Ok(())
+    }
+
     fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
         if conflict.schema_key != ROW_SCHEMA_KEY {
             return Ok(conflict.take_b_or_delete());
@@ -48,6 +82,9 @@ impl sdk::FormatPlugin for CsvV3Prototype {
         let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
             .map_err(sdk::Error::invalid_input)?;
         let state = import.arena_state(input.creates.namespace_bytes());
+        input
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         input.successor.put_state(CSV_INDEX_KEY, &state)?;
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         encoder.push(import.table_change(), input.creates, sink)?;
@@ -136,6 +173,55 @@ impl sdk::FormatPlugin for CsvV3Prototype {
         encoder.flush(sink)?;
         Ok(())
     }
+}
+
+fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
+    let Some(bytes) = root.get_state(ID_NAMESPACE_STATE)? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 12] = bytes
+        .try_into()
+        .map_err(|_| sdk::Error::invalid_input("CSV ID namespace has invalid length"))?;
+    Ok(Some(IdNamespace::from_halves(
+        u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+        u64::from(u32::from_be_bytes(
+            bytes[8..].try_into().expect("four bytes"),
+        )),
+    )))
+}
+
+fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+    changes
+        .iter()
+        .flat_map(|change| &change.entity_pk)
+        .find_map(|component| uuid::Uuid::parse_str(component).ok())
+        .map(|id| {
+            let bytes = id.into_bytes();
+            IdNamespace::from_halves(
+                u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+                u64::from(u32::from_be_bytes(
+                    bytes[8..12].try_into().expect("four bytes"),
+                )),
+            )
+        })
+}
+
+fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
+    for edit in edits.iter().rev() {
+        let start = usize::try_from(edit.offset)
+            .map_err(|_| sdk::Error::invalid_input("CSV edit offset exceeds guest memory"))?;
+        let end =
+            start
+                .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
+                    sdk::Error::invalid_input("CSV edit deletion exceeds guest memory")
+                })?)
+                .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
+        if end > bytes.len() {
+            return Err(sdk::Error::invalid_input("CSV edit exceeds accepted bytes"));
+        }
+        bytes.splice(start..end, edit.insert.iter().copied());
+    }
+    Ok(bytes)
 }
 
 struct BatchEncoder {

@@ -15,17 +15,54 @@ struct JsonV3Prototype;
 
 const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index-v1";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts-v1";
+const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace-v1";
 const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS1";
 const SCALAR_INDEX_HEADER_BYTES: u32 = 12;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for JsonV3Prototype {
+    fn entities_changed(
+        update: &mut sdk::EntityUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let before = update.before.read_all()?;
+        let mut changes = Vec::new();
+        while let Some(change) = update.changes.next()? {
+            changes.push(EntityChange {
+                schema_key: change.schema_key,
+                entity_pk: change.entity_pk,
+                snapshot: change.snapshot,
+                effect: match change.effect {
+                    sdk::ChangeEffect::Content => ChangeEffect::Content,
+                    sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
+                },
+            });
+        }
+        let namespace = read_namespace(&update.before, ID_NAMESPACE_STATE)?
+            .or_else(|| namespace_from_changes(&changes))
+            .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+        let (document, _) = Document::open_file(
+            before.clone(),
+            update.before_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
+        let (_, edits) = document
+            .entities_changed(&changes)
+            .map_err(sdk::Error::invalid_input)?;
+        sink.replace_file(&apply_edits(before, &edits)?)?;
+        Ok(())
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
         let (document, changes) = Document::open_file(bytes, input.file.path.as_deref(), namespace)
             .map_err(sdk::Error::invalid_input)?;
+        input
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         store_scalar_state(&input.successor, &document)?;
         emit_changes(changes, input.creates, sink)?;
         Ok(())
@@ -86,6 +123,56 @@ impl sdk::FormatPlugin for JsonV3Prototype {
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
     }
+}
+
+fn read_namespace(root: &sdk::Root<'_>, key: &[u8]) -> sdk::Result<Option<IdNamespace>> {
+    let Some(bytes) = root.get_state(key)? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 12] = bytes
+        .try_into()
+        .map_err(|_| sdk::Error::invalid_input("JSON ID namespace has invalid length"))?;
+    Ok(Some(IdNamespace::from_halves(
+        u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+        u64::from(u32::from_be_bytes(
+            bytes[8..].try_into().expect("four bytes"),
+        )),
+    )))
+}
+
+fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+    changes
+        .iter()
+        .flat_map(|change| &change.entity_pk)
+        .find_map(|component| uuid::Uuid::parse_str(component).ok())
+        .map(|id| {
+            let bytes = id.into_bytes();
+            IdNamespace::from_halves(
+                u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+                u64::from(u32::from_be_bytes(
+                    bytes[8..12].try_into().expect("four bytes"),
+                )),
+            )
+        })
+}
+
+fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
+    for edit in edits.iter().rev() {
+        let start = usize::try_from(edit.offset)
+            .map_err(|_| sdk::Error::invalid_input("JSON edit offset exceeds guest memory"))?;
+        let end = start
+            .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
+                sdk::Error::invalid_input("JSON edit deletion exceeds guest memory")
+            })?)
+            .ok_or_else(|| sdk::Error::invalid_input("JSON edit range overflowed"))?;
+        if end > bytes.len() {
+            return Err(sdk::Error::invalid_input(
+                "JSON edit exceeds accepted bytes",
+            ));
+        }
+        bytes.splice(start..end, edit.insert.iter().copied());
+    }
+    Ok(bytes)
 }
 
 fn apply_file_splices(mut bytes: Vec<u8>, splices: &[InputSplice<'_>]) -> sdk::Result<Vec<u8>> {

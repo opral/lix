@@ -1274,6 +1274,75 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
 }
 
 #[tokio::test]
+#[ignore = "blocked by inherited certified-row FK validation on non-active branches"]
+async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown_v3_prototype",
+        &build_markdown_v3_prototype_archive(),
+        &["markdown_node_v2"],
+    )
+    .await;
+
+    let path = "/v3-paragraph-conflict.md";
+    write_file(&lix, path, b"wonder\n".to_vec())
+        .await
+        .expect("base paragraph should import");
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-000000000608".to_owned()),
+            name: "Markdown v3 paragraph conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    write_file(&lix, path, b"prewonder\n".to_vec())
+        .await
+        .expect("target prefix insertion should commit");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, b"wonderful\n".to_vec())
+        .await
+        .expect("source suffix insertion should commit");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("v3 plugin-owned paragraph conflict should preview");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("v3 disjoint paragraph inserts should merge");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap().as_deref(),
+        Some(b"prewonderful\n".as_slice())
+    );
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.conflict_resolution_takes, 0);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
     let archive = build_csv_v2_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -1510,6 +1579,89 @@ async fn v2_json_same_entity_branch_merge_runs_static_resolver_on_certified_snap
     assert_eq!(
         merged.rows()[0].get::<String>("scalar_json").unwrap(),
         r#""source""#
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_json_same_entity_branch_merge_uses_fused_conflict_and_renderer_sinks() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_v3_prototype",
+        &build_json_v3_prototype_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/v3-certified-conflict-merge.json";
+    write_file(&lix, path, br#"{"pick":"base"}"#.to_vec())
+        .await
+        .expect("base JSON should import");
+    let file_id = file_id_at_path(&lix, path).await;
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000060b".to_owned()),
+            name: "JSON v3 conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"target\"' \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    lix.execute(
+        "UPDATE json_object_member SET scalar_json = '\"source\"' \
+         WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+        &[Value::Text(file_id.clone())],
+    )
+    .await
+    .unwrap();
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("the v3 JSON resolver and renderer should complete atomically");
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.conflict_resolution_takes, 1);
+
+    let merged = lix
+        .execute(
+            "SELECT scalar_json FROM json_object_member \
+             WHERE parent_id = 'root' AND key = 'pick' AND lixcol_file_id = $1",
+            &[Value::Text(file_id)],
+        )
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 1);
+    assert_eq!(
+        merged.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""source""#
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap().as_deref(),
+        Some(br#"{"pick":"source"}"#.as_slice())
     );
 
     lix.close().await.unwrap();

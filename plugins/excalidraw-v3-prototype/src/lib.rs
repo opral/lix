@@ -11,11 +11,45 @@ struct ExcalidrawV3Prototype;
 
 const ELEMENT_INDEX_KEY: &[u8] = b"excalidraw/element-spans-v1";
 const ELEMENT_SHIFTS_KEY: &[u8] = b"excalidraw/element-shifts-v1";
+const ID_NAMESPACE_STATE: &[u8] = b"excalidraw/id-namespace-v1";
 const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS1";
 const ELEMENT_INDEX_HEADER_BYTES: u32 = 8;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
 
 impl sdk::FormatPlugin for ExcalidrawV3Prototype {
+    fn entities_changed(
+        update: &mut sdk::EntityUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let before = update.before.read_all()?;
+        let mut changes = Vec::new();
+        while let Some(change) = update.changes.next()? {
+            changes.push(EntityChange {
+                schema_key: change.schema_key,
+                entity_pk: change.entity_pk,
+                snapshot: change.snapshot,
+                effect: match change.effect {
+                    sdk::ChangeEffect::Content => ChangeEffect::Content,
+                    sdk::ChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
+                },
+            });
+        }
+        let namespace = read_namespace(&update.before)?
+            .or_else(|| namespace_from_changes(&changes))
+            .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+        let (document, _) = Document::open_file(
+            before.clone(),
+            update.before_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
+        let (_, edits) = document
+            .entities_changed(&changes)
+            .map_err(sdk::Error::invalid_input)?;
+        sink.replace_file(&apply_edits(before, &edits)?)?;
+        Ok(())
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
         let (document, changes) = Document::open_file(
@@ -24,6 +58,9 @@ impl sdk::FormatPlugin for ExcalidrawV3Prototype {
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
+        input
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
         input.successor.put_state(
             ELEMENT_INDEX_KEY,
             &encode_element_index(&document.arena_element_spans())?,
@@ -78,6 +115,57 @@ impl sdk::FormatPlugin for ExcalidrawV3Prototype {
         emit_changes(changes.into_iter().map(Ok), sink)?;
         Ok(())
     }
+}
+
+fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
+    let Some(bytes) = root.get_state(ID_NAMESPACE_STATE)? else {
+        return Ok(None);
+    };
+    let bytes: [u8; 12] = bytes
+        .try_into()
+        .map_err(|_| sdk::Error::invalid_input("Excalidraw ID namespace has invalid length"))?;
+    Ok(Some(IdNamespace::from_halves(
+        u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+        u64::from(u32::from_be_bytes(
+            bytes[8..].try_into().expect("four bytes"),
+        )),
+    )))
+}
+
+fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
+    changes
+        .iter()
+        .flat_map(|change| &change.entity_pk)
+        .find_map(|component| uuid::Uuid::parse_str(component).ok())
+        .map(|id| {
+            let bytes = id.into_bytes();
+            IdNamespace::from_halves(
+                u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+                u64::from(u32::from_be_bytes(
+                    bytes[8..12].try_into().expect("four bytes"),
+                )),
+            )
+        })
+}
+
+fn apply_edits(mut bytes: Vec<u8>, edits: &[core::ByteEdit]) -> sdk::Result<Vec<u8>> {
+    for edit in edits.iter().rev() {
+        let start = usize::try_from(edit.offset).map_err(|_| {
+            sdk::Error::invalid_input("Excalidraw edit offset exceeds guest memory")
+        })?;
+        let end = start
+            .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
+                sdk::Error::invalid_input("Excalidraw edit deletion exceeds guest memory")
+            })?)
+            .ok_or_else(|| sdk::Error::invalid_input("Excalidraw edit range overflowed"))?;
+        if end > bytes.len() {
+            return Err(sdk::Error::invalid_input(
+                "Excalidraw edit exceeds accepted bytes",
+            ));
+        }
+        bytes.splice(start..end, edit.insert.iter().copied());
+    }
+    Ok(bytes)
 }
 
 fn sparse_element_change(

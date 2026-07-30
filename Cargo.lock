@@ -3456,6 +3456,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "wasm-encoder 0.248.0",
  "wasmtime",
  "wasmtime-wasi",
