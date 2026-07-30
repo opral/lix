@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    io::{self, Write as _},
     ops::Deref,
     sync::{Arc, OnceLock},
 };
@@ -1572,7 +1573,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     }
 
     let mut offsets = Vec::with_capacity(values.len());
-    let mut normalized = Vec::with_capacity(decoded_capacity_hint.min(u32::MAX as usize));
+    let mut normalized = CanonicalJsonArena::new(decoded_capacity_hint, context)?;
     let mut serialize_count = 0usize;
     for (value, cached) in values.iter().zip(&cached_normalized) {
         let start = u32::try_from(normalized.len()).map_err(|_| {
@@ -1582,12 +1583,19 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             )
         })?;
         if let Some(cached) = cached {
-            normalized.extend_from_slice(cached.as_bytes());
+            normalized
+                .append(cached.as_bytes())
+                .map_err(|failure| canonical_json_arena_error(context, failure))?;
         } else {
             serde_json::to_writer(&mut normalized, value).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("{context} failed to serialize normalized JSON: {error}"),
+                normalized.failure().map_or_else(
+                    || {
+                        LixError::new(
+                            LixError::CODE_UNKNOWN,
+                            format!("{context} failed to serialize normalized JSON: {error}"),
+                        )
+                    },
+                    |failure| canonical_json_arena_error(context, failure),
                 )
             })?;
             serialize_count += 1;
@@ -1602,7 +1610,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     }
     let rows = WasmCanonicalJson::from_batch_parts(
         values,
-        normalized,
+        normalized.into_bytes(),
         offsets,
         positions.len(),
         serialize_count,
@@ -1612,6 +1620,105 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         *slots[position] = Some(TransactionJson::from_canonical_batch(row));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalJsonArenaFailure {
+    ExceedsU32,
+    Allocation,
+}
+
+struct CanonicalJsonArena {
+    bytes: Vec<u8>,
+    limit: usize,
+    failure: Option<CanonicalJsonArenaFailure>,
+}
+
+impl CanonicalJsonArena {
+    fn new(capacity_hint: usize, context: &str) -> Result<Self, LixError> {
+        Self::with_limit(capacity_hint, u32::MAX as usize)
+            .map_err(|failure| canonical_json_arena_error(context, failure))
+    }
+
+    fn with_limit(capacity_hint: usize, limit: usize) -> Result<Self, CanonicalJsonArenaFailure> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity_hint.min(limit))
+            .map_err(|_| CanonicalJsonArenaFailure::Allocation)?;
+        Ok(Self {
+            bytes,
+            limit,
+            failure: None,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn failure(&self) -> Option<CanonicalJsonArenaFailure> {
+        self.failure
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), CanonicalJsonArenaFailure> {
+        self.write_all(bytes).map_err(|_| {
+            self.failure
+                .unwrap_or(CanonicalJsonArenaFailure::Allocation)
+        })
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for CanonicalJsonArena {
+    fn write(&mut self, source: &[u8]) -> io::Result<usize> {
+        let required = self
+            .bytes
+            .len()
+            .checked_add(source.len())
+            .filter(|&required| required <= self.limit)
+            .ok_or_else(|| {
+                self.failure = Some(CanonicalJsonArenaFailure::ExceedsU32);
+                io::Error::other("canonical JSON arena exceeds its wire-format limit")
+            })?;
+        if required > self.bytes.capacity() {
+            let doubled = self
+                .bytes
+                .capacity()
+                .max(1)
+                .saturating_mul(2)
+                .min(self.limit);
+            let target = required.max(doubled);
+            if self
+                .bytes
+                .try_reserve_exact(target - self.bytes.len())
+                .is_err()
+            {
+                self.failure = Some(CanonicalJsonArenaFailure::Allocation);
+                return Err(io::Error::other("canonical JSON arena allocation failed"));
+            }
+        }
+        self.bytes.extend_from_slice(source);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_json_arena_error(context: &str, failure: CanonicalJsonArenaFailure) -> LixError {
+    let message = match failure {
+        CanonicalJsonArenaFailure::ExceedsU32 => {
+            format!("{context} canonical JSON batch exceeds u32")
+        }
+        CanonicalJsonArenaFailure::Allocation => {
+            format!("{context} canonical JSON batch allocation failed")
+        }
+    };
+    LixError::new(LixError::CODE_UNKNOWN, message)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3639,6 +3746,24 @@ mod tests {
             first.validation_counts(),
             (2, 1),
             "only the uncached row should invoke canonical serialization"
+        );
+    }
+
+    #[test]
+    fn canonical_json_arena_rejects_uncached_bytes_before_exceeding_its_limit() {
+        let mut arena =
+            CanonicalJsonArena::with_limit(0, 8).expect("create bounded canonical JSON arena");
+        let error = serde_json::to_writer(
+            &mut arena,
+            &serde_json::json!("payload larger than the test wire limit"),
+        )
+        .expect_err("oversized uncached JSON must fail through the bounded writer");
+
+        assert!(error.is_io());
+        assert_eq!(arena.failure(), Some(CanonicalJsonArenaFailure::ExceedsU32));
+        assert!(
+            arena.len() <= 8,
+            "the arena must reject a write before growing beyond its wire limit"
         );
     }
 
