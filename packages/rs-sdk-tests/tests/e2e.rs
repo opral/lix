@@ -14,7 +14,7 @@ use lix_sdk::{
     WasmByteSource, WasmColdFileUpdate, WasmCreateContext, WasmEntity, WasmEntityChange,
     WasmEntityKey, WasmEntityPage, WasmEntitySource, WasmFileDescriptor, WasmFileUpdate,
     WasmHostBytes, WasmHostEntity, WasmInputBytes, WasmInputSplice, WasmOpenEntitiesInput,
-    WasmPluginSelection, WasmTransitionLimits,
+    WasmPluginSelection, WasmSourceRange, WasmSourceSlice, WasmTransitionLimits,
 };
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -4674,8 +4674,18 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
             generation: "direct".to_owned(),
         },
     };
-    let before = br#"{"a":"one","b":"two"}"#.to_vec();
-    let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+    let large_value = "x".repeat(96 * 1024);
+    let before = format!(r#"{{"a":"one","b":"{large_value}"}}"#).into_bytes();
+    let after = format!(r#"{{"a":"ONE","b":"{large_value}"}}"#).into_bytes();
+    let oversized_snapshot = serde_json::to_vec(&serde_json::json!({
+        "parent_id": "root",
+        "key": "b",
+        "order_key": "80",
+        "kind": "string",
+        "scalar_json": serde_json::to_string(&large_value).unwrap(),
+    }))
+    .unwrap();
+    let oversized_snapshot_len = oversized_snapshot.len() as u64;
     let entities = vec![
         WasmEntity {
             key: WasmEntityKey::from_owned_parts("json_root", vec!["root".to_owned()]),
@@ -4697,9 +4707,13 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
                 "json_object_member",
                 vec!["root".to_owned(), "b".to_owned()],
             ),
-            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(
-                br#"{"parent_id":"root","key":"b","order_key":"80","kind":"string","scalar_json":"\"two\""}"#,
-            )),
+            snapshot_content: WasmHostBytes::Source(WasmSourceSlice {
+                source: Arc::new(BenchmarkByteSource(oversized_snapshot)),
+                range: WasmSourceRange {
+                    offset: 0,
+                    length: oversized_snapshot_len,
+                },
+            }),
         },
     ];
     let original_keys = entities
@@ -4708,10 +4722,10 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
         .collect::<Vec<_>>();
 
     let limits = WasmTransitionLimits {
-        max_page_bytes: 64 * 1024,
-        max_record_bytes: 64 * 1024,
-        max_total_bytes: 64 * 1024,
-        max_inline_input_bytes: 64 * 1024,
+        max_page_bytes: 32 * 1024,
+        max_record_bytes: 32 * 1024,
+        max_total_bytes: 1024 * 1024,
+        max_inline_input_bytes: 32 * 1024,
         ..WasmTransitionLimits::default()
     };
     let mut actor = factory.instantiate_actor().await.unwrap();

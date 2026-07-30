@@ -539,7 +539,12 @@ impl EntityChangeReader<'_> {
                 }
                 Some(snapshot)
             }
-            (Some(length), None) => Some(read_entity_snapshot(self.source, index, length)?),
+            (Some(length), None) => Some(read_entity_snapshot(
+                self.source,
+                index,
+                length,
+                self.max_page_bytes,
+            )?),
             (None, Some(_)) => {
                 return Err(Error::invalid_input(
                     "inline entity snapshot is missing its length metadata",
@@ -558,15 +563,21 @@ impl EntityChangeReader<'_> {
     }
 }
 
-fn read_entity_snapshot(source: &EntityChangeSource, ordinal: u32, length: u64) -> Result<Vec<u8>> {
+fn read_entity_snapshot(
+    source: &EntityChangeSource,
+    ordinal: u32,
+    length: u64,
+    max_page_bytes: u32,
+) -> Result<Vec<u8>> {
     const READ_BYTES: u32 = 1024 * 1024;
     let capacity = usize::try_from(length)
         .map_err(|_| Error::limit_exceeded("entity snapshot exceeds guest address space"))?;
     let mut output = Vec::with_capacity(capacity);
     while output.len() < capacity {
         let offset = output.len() as u64;
-        let chunk = u32::try_from((capacity - output.len()).min(READ_BYTES as usize))
-            .expect("bounded entity snapshot read fits u32");
+        let chunk =
+            u32::try_from((capacity - output.len()).min(READ_BYTES.min(max_page_bytes) as usize))
+                .expect("bounded entity snapshot read fits u32");
         let bytes = source
             .read_snapshot(ordinal, offset, chunk)
             .map_err(|error| host_error("host entity snapshot read failed", error))?
