@@ -1170,7 +1170,46 @@ where
             .collect();
         let batch =
             materialize_batch_from_index_entry_refs(&self.store, entries, projection).await?;
-        MaterializedTrackedStateExactBatch::new(batch, slots)
+        let batch = MaterializedTrackedStateExactBatch::new(batch, slots)?;
+        if !batch.has_missing() || keys.iter().all(|key| key.schema_key.starts_with("lix_")) {
+            return Ok(batch);
+        }
+        let commit_id = CommitId::parse_lix(commit_id, "certified historical exact read")?;
+        let certified = crate::live_state::scan_certified_history_rows(
+            &self.store,
+            &BTreeSet::from([commit_id]),
+            &TrackedStateScanRequest {
+                filter: crate::tracked_state::TrackedStateFilter {
+                    schema_keys: keys.iter().map(|key| key.schema_key.to_owned()).collect(),
+                    entity_pks: keys.iter().map(|key| key.entity_pk.clone()).collect(),
+                    file_ids: keys
+                        .iter()
+                        .map(|key| {
+                            key.file_id.map_or(NullableKeyFilter::Null, |file_id| {
+                                NullableKeyFilter::Value(file_id.to_owned())
+                            })
+                        })
+                        .collect(),
+                    include_tombstones: true,
+                },
+                read_columns: crate::tracked_state::TrackedStateReadColumns {
+                    columns: [
+                        projection.snapshot_content.then_some("snapshot_content"),
+                        projection.metadata.then_some("metadata"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(str::to_owned)
+                    .collect(),
+                },
+                limit: None,
+            },
+        )
+        .await?;
+        if certified.is_empty() {
+            return Ok(batch);
+        }
+        batch.fill_missing_from_certified(keys, certified)
     }
 
     #[cfg(any(test, feature = "storage-benches"))]
@@ -3913,9 +3952,12 @@ fn nullable_key_filter_allows(filters: &[NullableKeyFilter<String>], value: Opti
 mod tests {
     use super::*;
     use crate::NullableKeyFilter;
+    use crate::branch::BranchHeadControl;
     use crate::changelog::CommitRecord;
+    use crate::live_state::CertifiedEntityBatchFileRef;
     use crate::storage_adapter::StorageAdapter;
     use crate::storage_adapter::{Memory, StorageReadOptions, StorageWriteOptions};
+    use crate::wasm::{WasmCertifiedEntityBatch, WasmCreateContext};
 
     fn commit_root_key(label: &str) -> crate::storage_adapter::StorageKey {
         crate::storage_adapter::StorageKey(Bytes::copy_from_slice(
@@ -6713,6 +6755,123 @@ mod tests {
                 .expect("root probe should succeed")
                 .is_none(),
             "the batch must resolve from rootless deltas, not a rebuilt durable tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_exact_read_fills_missing_root_row_from_certified_batch() {
+        const COMMIT_LABEL: &str = "certified-historical-exact";
+        const BRANCH_ID: &str = "certified-branch";
+        const FILE_ID: &str = "certified.csv";
+        const SCHEMA_KEY: &str = "certified_row";
+
+        let storage = StorageAdapter::new(Memory::new());
+        let tracked_state = TrackedStateContext::new();
+        write_root_for_test(&storage, &tracked_state, COMMIT_LABEL, None, &[])
+            .await
+            .expect("empty tracked root should write");
+
+        let commit_id = CommitId::for_test_label(COMMIT_LABEL);
+        let creates = WasmCreateContext {
+            high: 0x0192_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let local_ref = 7_u32;
+        let mut page = Vec::new();
+        page.extend_from_slice(&local_ref.to_le_bytes());
+        page.extend_from_slice(&1_u64.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(&0_u32.to_le_bytes());
+        page.extend_from_slice(&1_u16.to_le_bytes());
+        page.extend_from_slice(&5_u32.to_le_bytes());
+        page.extend_from_slice(b"value");
+        let batches = [WasmCertifiedEntityBatch {
+            format: 1,
+            schema_keys: vec![SCHEMA_KEY.to_owned()],
+            row_count: 1,
+            creates,
+            complete_file_state: true,
+            pages: vec![Bytes::from(page)],
+        }];
+        let files = [CertifiedEntityBatchFileRef {
+            branch_id: BRANCH_ID,
+            file_id: FILE_ID,
+            batches: &batches,
+        }];
+        let control = BranchHeadControl {
+            head_commit_id: commit_id,
+            generation: commit_id,
+            current_state_revision: 0,
+            schema_presence_bloom: [u64::MAX; 4],
+            working_diff_checkpoint_commit_id: None,
+            created_at: crate::common::LixTimestamp::expect_parse(
+                "certified test timestamp",
+                "2026-01-01T00:00:00Z",
+            ),
+            updated_at: crate::common::LixTimestamp::expect_parse(
+                "certified test timestamp",
+                "2026-01-01T00:00:00Z",
+            ),
+            ref_change_id: ChangeId::for_test_label("certified-branch-ref"),
+        };
+        let controls = BTreeMap::from([(BRANCH_ID.to_owned(), control)]);
+        let commit_created_at = BTreeMap::from([(commit_id, control.created_at)]);
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified batch read should open");
+        let mut writes = storage.new_write_set();
+        crate::live_state::stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &files,
+            &controls,
+            &BTreeMap::new(),
+            &commit_created_at,
+        )
+        .await
+        .expect("certified batch should stage");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("certified batch should commit");
+
+        let id = creates
+            .component_uuid_bytes(u64::from(local_ref))
+            .expect("certified local reference should form an id");
+        let key = TrackedStateKey {
+            schema_key: SCHEMA_KEY.to_owned(),
+            file_id: Some(FILE_ID.to_owned()),
+            entity_pk: EntityPk::uuid_from_bytes(id),
+        };
+        let exact = tracked_state
+            .reader(
+                storage
+                    .begin_read(StorageReadOptions::default())
+                    .await
+                    .expect("historical exact read should open"),
+            )
+            .load_projected_batch_at_commit(
+                &commit_id.to_string(),
+                &[key],
+                &ChangeRecordProjection::full(),
+            )
+            .await
+            .expect("certified historical exact row should load");
+        let row = exact
+            .row(0)
+            .expect("certified row must fill the missing slot");
+        assert_eq!(row.schema_key(), SCHEMA_KEY);
+        assert_eq!(row.file_id(), Some(FILE_ID));
+        assert_eq!(row.commit_id(), commit_id);
+        let expected_snapshot = format!(
+            r#"{{"cells":["value"],"id":"{}","order_key":"0000000000000001"}}"#,
+            uuid::Uuid::from_bytes(id)
+        );
+        assert_eq!(
+            row.snapshot_content().map(SharedStr::as_str),
+            Some(expected_snapshot.as_str())
         );
     }
 

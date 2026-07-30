@@ -1323,6 +1323,11 @@ fn verify_historical_conflict_row_ref(
     match (row, expected) {
         (None, None) => Ok(()),
         (Some(row), Some(expected)) if row.change_id() == expected.change_id => Ok(()),
+        // Certified fresh-import rows intentionally have no expanded
+        // tracked-root entry. Merge analysis can therefore represent their
+        // common ancestor as absent even though the authoritative certified
+        // segment at the base commit contains the row.
+        (Some(_), None) if side == "base" => Ok(()),
         _ => Err(LixError::new(
             LixError::CODE_INTERNAL_ERROR,
             format!("historical {side} row did not match merge analysis"),
@@ -1910,6 +1915,32 @@ mod tests {
             change_id: ChangeId::for_test_label(incarnation),
             commit_id: CommitId::for_test_label("owner-commit"),
         }
+    }
+
+    #[test]
+    fn certified_base_row_may_fill_merge_analysis_absence() {
+        let batch = crate::tracked_state::MaterializedTrackedStateBatch::from_rows(vec![
+            MaterializedTrackedStateRow {
+                entity_pk: EntityPk::single("certified-row"),
+                schema_key: "certified_schema".to_owned(),
+                file_id: Some("certified-file".to_owned()),
+                snapshot_content: Some(r#"{"value":"base"}"#.into()),
+                metadata: None,
+                deleted: false,
+                created_at: "2026-01-01T00:00:00Z".to_owned(),
+                updated_at: "2026-01-01T00:00:00Z".to_owned(),
+                change_id: ChangeId::for_test_label("certified-base-change"),
+                commit_id: CommitId::for_test_label("certified-base-commit"),
+            },
+        ])
+        .expect("certified base fixture should materialize");
+
+        verify_historical_conflict_row_ref(Some(batch.row(0)), None, "base")
+            .expect("certified base may be absent from expanded tracked roots");
+        assert!(
+            verify_historical_conflict_row_ref(Some(batch.row(0)), None, "target").is_err(),
+            "target/source variants must still match merge analysis"
+        );
     }
 
     fn derived_file_ref_conflict(file_id: &str) -> TrackedStateMergeConflict {
