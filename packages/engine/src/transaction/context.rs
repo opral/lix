@@ -1062,7 +1062,7 @@ where
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
         }
-        let (affects_filesystem_path_index, filesystem_delta_rows) =
+        let (affects_filesystem_path_index, mut filesystem_delta_rows) =
             prepared_transaction_write_filesystem_index_impact(&write);
         let stage_result = tracing::debug_span!(
             target: "lix_perf",
@@ -1082,6 +1082,25 @@ where
             }
         };
         if affects_filesystem_path_index {
+            let tracked_branch_ids = filesystem_delta_rows
+                .iter()
+                .filter(|row| !row.untracked)
+                .map(|row| row.branch_id.to_string())
+                .collect::<BTreeSet<_>>();
+            let mut commit_ids = BTreeMap::new();
+            for branch_id in tracked_branch_ids {
+                commit_ids.insert(
+                    branch_id.clone(),
+                    self.staged_writes.commit_id_for_branch(&branch_id)?,
+                );
+            }
+            for row in &mut filesystem_delta_rows {
+                row.commit_id = if row.untracked {
+                    None
+                } else {
+                    commit_ids.get(row.branch_id.as_ref()).copied().flatten()
+                };
+            }
             let previous_epoch = self
                 .filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
@@ -10115,12 +10134,24 @@ mod tests {
                 )
                 .await
                 .expect("path lookup after the staged descriptor should succeed");
+            let rows = transaction
+                .execute(
+                    &format!(
+                        "SELECT lixcol_commit_id FROM lix_file WHERE path = '/staged-{index}.md'"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("the advanced path-index row should remain queryable");
+            rows.rows()[0]
+                .get::<String>("lixcol_commit_id")
+                .expect("the advanced descriptor must retain its staged commit id");
         }
 
         let stats = transaction_path_index_build_stats();
         assert_eq!(
-            stats.builds, 1,
-            "the first staged revision may build once; later revisions must advance by delta"
+            stats.builds, 2,
+            "the data and metadata projections may each build once; later revisions must advance by delta"
         );
         assert!(
             stats.descriptor_rows > 0,
