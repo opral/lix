@@ -1,6 +1,6 @@
 //! Unified, materialized live state for one branch head.
 //!
-//! The V16 hot index has one row per full identity. Each row is tagged
+//! The V17 hot index has one file-first row per full identity. Each row is tagged
 //! `tracked` or `untracked`: tracked mutations also enter history, while
 //! untracked mutations exist only in this serving plane. Normal reads consult
 //! this single index rather than merging a tracked snapshot with an untracked
@@ -383,7 +383,7 @@ impl TrackedHeadContext {
 
     /// Reclaims derived current-state generations that no durable branch
     /// control can select and returns their history-free payload refs. Both
-    /// the authoritative hot rows and their explicit file-id projections are
+    /// the authoritative hot rows and their key-only file membership index are
     /// generation-scoped, so the control is the one ownership root for both
     /// spaces. The caller compares the returned refs with its complete live
     /// payload set before staging physical JSON deletion.
@@ -596,27 +596,6 @@ async fn materialize_entity_snapshot_refs(
             Some(bytes);
     }
     Ok(snapshots)
-}
-
-fn scan_prefixes(scope: &[u8], filter: &TrackedStateFilter) -> Vec<Vec<u8>> {
-    if filter.schema_keys.is_empty() {
-        return vec![scope.to_vec()];
-    }
-    let mut prefixes = Vec::new();
-    for schema_key in &filter.schema_keys {
-        let mut schema_prefix = scope.to_vec();
-        write_key_string(&mut schema_prefix, schema_key, KEY_PART_FINAL);
-        if filter.entity_pks.is_empty() {
-            prefixes.push(schema_prefix);
-            continue;
-        }
-        for entity_pk in &filter.entity_pks {
-            let mut entity_prefix = schema_prefix.clone();
-            write_entity_pk(&mut entity_prefix, entity_pk);
-            prefixes.push(entity_prefix);
-        }
-    }
-    prefixes
 }
 
 fn matches_filter(identity: &HeadRowIdentity, filter: &TrackedStateFilter) -> bool {
@@ -3333,7 +3312,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_id_reads_use_file_first_hot_projection() {
+    async fn file_id_reads_use_file_first_primary_values() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let head = CommitId::for_test_label("head");
@@ -3491,36 +3470,6 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].file_id, None);
 
-        // Remove every authoritative primary row to prove that file-id reads
-        // are served by the complete file-first projection. This intentionally
-        // creates an impossible committed state; it validates the physical
-        // read route without depending on sibling-row decoding.
-        let primary_read = storage
-            .begin_read(StorageReadOptions::default())
-            .await
-            .expect("open primary hot-row verification read");
-        let primary_rows = ScanPlan::prefix(
-            HOT_ROW_SPACE,
-            StoragePrefix {
-                bytes: Bytes::new(),
-            },
-        )
-        .collect(&primary_read, StorageScanOptions::default())
-        .await
-        .expect("primary hot rows should scan")
-        .value
-        .entries;
-        assert_eq!(primary_rows.len(), 4);
-        drop(primary_read);
-        let mut writes = StorageWriteSet::new();
-        for row in primary_rows {
-            writes.delete(HOT_ROW_SPACE, row.key);
-        }
-        storage
-            .commit_write_set(writes, StorageWriteOptions::default())
-            .await
-            .expect("remove primary rows for route proof");
-
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3551,9 +3500,10 @@ mod tests {
             Some("01920000-0000-7000-8000-0000000000b2")
         );
 
-        // A schema-scoped `file_id = ?` query also stays on the file-first
-        // projection. This is the access pattern used by filesystem-backed
-        // entity scans, where the entity PK is not known before the query.
+        // A schema-scoped `file_id = ?` query reads the hydrated file-first
+        // primary range directly. This is the access pattern used by
+        // filesystem-backed entity scans, where the entity PK is not known
+        // before the query.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -3590,8 +3540,8 @@ mod tests {
         );
 
         // The branch control validates the published hot generation. Exact
-        // file identity and schema-scoped file-id reads still route to the
-        // V16 file projection even when every primary row is absent.
+        // file identity and schema-scoped file-id reads route through the V17
+        // file-first primary index.
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
@@ -4046,22 +3996,12 @@ mod tests {
         .value
         .entries;
         assert_eq!(projections.len(), 2);
-        let projection_changes = projections
-            .into_iter()
-            .map(|projection| {
-                let bytes = full_value_bytes(projection.value).expect("projection has full bytes");
-                decode_head_value(&bytes)
-                    .expect("projection decodes")
-                    .change_id
-                    .expect("tracked projection has a change id")
-            })
-            .collect::<Vec<_>>();
-        assert!(projection_changes.contains(&ChangeId::for_test_label(
-            "01920000-0000-7000-8000-0000000000a2-second"
-        )));
-        assert!(projection_changes.contains(&ChangeId::for_test_label(
-            "01920000-0000-7000-8000-0000000000b2-first"
-        )));
+        assert!(
+            projections.into_iter().all(|projection| {
+                full_value_bytes(projection.value).is_ok_and(|bytes| bytes.is_empty())
+            }),
+            "file-first projections retain only identity keys"
+        );
     }
 
     #[tokio::test]
@@ -4763,7 +4703,7 @@ mod tests {
             .expect("open current-state GC verification read");
         for (label, space) in [
             ("primary hot row", HOT_ROW_SPACE),
-            ("file-first hot projection", HOT_FILE_SPACE),
+            ("file-first hot index", HOT_FILE_SPACE),
         ] {
             let entries = ScanPlan::prefix(
                 space,
@@ -4780,6 +4720,10 @@ mod tests {
             let encoded =
                 full_value_bytes(entries.into_iter().next().expect("one hot value").value)
                     .expect("hot value is present");
+            if space == HOT_FILE_SPACE {
+                assert!(encoded.is_empty(), "file-first index remains key-only");
+                continue;
+            }
             let value = decode_head_value(&encoded).expect("active hot value decodes");
             assert!(value.untracked, "active hot value remains untracked");
             match value.snapshot {
