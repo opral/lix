@@ -4100,6 +4100,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_preserves_later_durability_domain_error_index() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_durability_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema \
+                 (value, lixcol_global, lixcol_untracked) \
+                 VALUES (lix_json($1), false, true)",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        let sql = "INSERT INTO parameter_insert_durability_probe \
+                   (id, value, lixcol_untracked) VALUES ($1, $2, $3)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("value-a".to_string()),
+                        Value::Boolean(true),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("value-b".to_string()),
+                        Value::Boolean(false),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the second row's tracked-catalog failure must retain its statement index");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+
+        let rows = session
+            .execute(
+                "SELECT id FROM parameter_insert_durability_probe WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "the untracked prefix must roll back with the mixed-durability batch"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({

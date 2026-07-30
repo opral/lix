@@ -122,7 +122,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     if layout
         .columns
         .iter()
-        .any(|target| matches!(target, InsertColumnTarget::BranchId))
+        .any(|target| !matches!(target, InsertColumnTarget::Visible { .. }))
     {
         return Ok(None);
     }
