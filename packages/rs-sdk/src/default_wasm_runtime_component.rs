@@ -1690,6 +1690,7 @@ struct CertifiedPacketSchemaKeys {
     create_refs: std::collections::BTreeSet<u64>,
     explicit_keys: std::collections::BTreeSet<Vec<String>>,
     explicit_create_refs: std::collections::BTreeSet<u64>,
+    create_ref_ranges: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Default)]
@@ -1698,6 +1699,14 @@ struct CertifiedPacketEntityKeys {
 }
 
 impl CertifiedPacketEntityKeys {
+    fn contains_create_ref(keys: &CertifiedPacketSchemaKeys, local_ref: u64) -> bool {
+        keys.create_refs.contains(&local_ref)
+            || keys
+                .create_ref_ranges
+                .iter()
+                .any(|(first, last)| *first <= local_ref && local_ref <= *last)
+    }
+
     fn generated_local_ref(components: &[String], creates: WasmCreateContext) -> Option<u64> {
         let [component] = components else {
             return None;
@@ -1745,8 +1754,8 @@ impl CertifiedPacketEntityKeys {
                 if existing.is_some_and(|keys| keys.explicit_keys.contains(&key))
                     || !page.explicit_keys.insert(key)
                     || create_ref.is_some_and(|local_ref| {
-                        existing.is_some_and(|keys| keys.create_refs.contains(&local_ref))
-                            || page.create_refs.contains(&local_ref)
+                        existing.is_some_and(|keys| Self::contains_create_ref(keys, local_ref))
+                            || Self::contains_create_ref(page, local_ref)
                     })
                 {
                     return Err(duplicate_certified_packet_key());
@@ -1758,9 +1767,13 @@ impl CertifiedPacketEntityKeys {
             None => {
                 let local_ref = create_ref.expect("create identity has a local reference");
                 if existing.is_some_and(|keys| {
-                    keys.create_refs.contains(&local_ref)
+                    Self::contains_create_ref(keys, local_ref)
                         || keys.explicit_create_refs.contains(&local_ref)
                 }) || page.explicit_create_refs.contains(&local_ref)
+                    || page
+                        .create_ref_ranges
+                        .iter()
+                        .any(|(first, last)| *first <= local_ref && local_ref <= *last)
                     || !page.create_refs.insert(local_ref)
                 {
                     return Err(duplicate_certified_packet_key());
@@ -1770,12 +1783,43 @@ impl CertifiedPacketEntityKeys {
         Ok(())
     }
 
+    fn insert_create_ref_range(
+        &mut self,
+        schema_key: &str,
+        first: u64,
+        last: u64,
+        existing: &Self,
+    ) -> Result<(), LixError> {
+        let collides = |keys: &CertifiedPacketSchemaKeys| {
+            keys.create_refs.range(first..=last).next().is_some()
+                || keys
+                    .explicit_create_refs
+                    .range(first..=last)
+                    .next()
+                    .is_some()
+                || keys
+                    .create_ref_ranges
+                    .iter()
+                    .any(|(range_first, range_last)| *range_first <= last && first <= *range_last)
+        };
+        if existing.schemas.get(schema_key).is_some_and(collides) {
+            return Err(duplicate_certified_packet_key());
+        }
+        let page = self.schemas.entry(schema_key.to_owned()).or_default();
+        if collides(page) {
+            return Err(duplicate_certified_packet_key());
+        }
+        page.create_ref_ranges.push((first, last));
+        Ok(())
+    }
+
     fn extend(&mut self, page: Self) {
         for (schema_key, page) in page.schemas {
             let keys = self.schemas.entry(schema_key).or_default();
             keys.create_refs.extend(page.create_refs);
             keys.explicit_keys.extend(page.explicit_keys);
             keys.explicit_create_refs.extend(page.explicit_create_refs);
+            keys.create_ref_ranges.extend(page.create_ref_ranges);
         }
     }
 }
@@ -3371,6 +3415,13 @@ impl WasmComponentActor for V3Actor {
                             "one certified CSV transition used multiple create contexts",
                         ));
                     }
+                    let mut page_keys = CertifiedPacketEntityKeys::default();
+                    page_keys.insert_create_ref_range(
+                        "csv_v2_row",
+                        u64::from(first_local_ref),
+                        u64::from(last_local_ref),
+                        &cursor.certified_packet_entity_keys,
+                    )?;
                     cursor.certified_csv_creates = Some(creates);
                     cursor.certified_csv_rows = cursor
                         .certified_csv_rows
@@ -3378,6 +3429,7 @@ impl WasmComponentActor for V3Actor {
                         .ok_or_else(|| v3_error("certified CSV row count overflowed"))?;
                     cursor.certified_csv_last_local_ref = Some(last_local_ref);
                     cursor.certified_csv_pages.push(Bytes::from(payload));
+                    cursor.certified_packet_entity_keys.extend(page_keys);
                 }
                 Some(WorkerTransitionEvent::Page(page @ PendingChangePage::Packet { .. })) => {
                     let PendingChangePage::Packet {
@@ -3814,6 +3866,41 @@ mod tests {
         .expect_err("certified write must not repeat an ordinary identity");
         assert_eq!(
             duplicate_certified.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+    }
+
+    #[test]
+    fn typed_csv_ranges_share_packet_identity_validation() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let mut csv_first = CertifiedPacketEntityKeys::default();
+        csv_first
+            .insert_create_ref_range(
+                "csv_v2_row",
+                0,
+                219_999,
+                &CertifiedPacketEntityKeys::default(),
+            )
+            .expect("typed CSV range is initially unique");
+        let duplicate_packet = accept_page(&create_page("csv_v2_row", 17), creates, &mut csv_first)
+            .expect_err("packet create must not repeat a typed CSV identity");
+        assert_eq!(
+            duplicate_packet.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+
+        let mut packet_first = CertifiedPacketEntityKeys::default();
+        accept_page(&create_page("csv_v2_row", 17), creates, &mut packet_first)
+            .expect("packet create is initially unique");
+        let mut csv_range = CertifiedPacketEntityKeys::default();
+        let duplicate_csv = csv_range
+            .insert_create_ref_range("csv_v2_row", 0, 219_999, &packet_first)
+            .expect_err("typed CSV range must not repeat a packet identity");
+        assert_eq!(
+            duplicate_csv.message,
             "a component entity key may occur only once across certified packet pages"
         );
     }

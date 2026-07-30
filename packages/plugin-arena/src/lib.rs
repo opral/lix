@@ -396,6 +396,7 @@ impl ByteArena {
         }
         self.append_segments(cursor, self.len, &mut successor)?;
         coalesce_segments(&mut successor);
+        repack_fragmented_segments(&self.store, &mut successor);
         Ok(Self::from_segments(
             self.store.clone(),
             successor_len,
@@ -434,6 +435,53 @@ impl ByteArena {
             logical = segment_end;
         }
         Ok(())
+    }
+}
+
+fn repack_fragmented_segments(store: &Store, segments: &mut Vec<Segment>) {
+    let page_bytes = store.page_bytes();
+    let mut output = Vec::with_capacity(segments.len());
+    let mut fragments = Vec::new();
+    for segment in segments.drain(..) {
+        let is_full_page = segment.offset == 0
+            && segment.len as usize == page_bytes
+            && segment.page.bytes.len() == page_bytes;
+        if is_full_page {
+            flush_fragmented_segments(store, &mut fragments, &mut output);
+            output.push(segment);
+        } else {
+            fragments.push(segment);
+        }
+    }
+    flush_fragmented_segments(store, &mut fragments, &mut output);
+    *segments = output;
+}
+
+fn flush_fragmented_segments(
+    store: &Store,
+    fragments: &mut Vec<Segment>,
+    output: &mut Vec<Segment>,
+) {
+    if fragments.len() <= 1 {
+        output.append(fragments);
+        return;
+    }
+    let total = fragments
+        .iter()
+        .map(|segment| segment.len as usize)
+        .sum::<usize>();
+    let mut bytes = Vec::with_capacity(total);
+    for segment in fragments.drain(..) {
+        let start = segment.offset as usize;
+        let end = start + segment.len as usize;
+        bytes.extend_from_slice(&segment.page.bytes[start..end]);
+    }
+    for chunk in bytes.chunks(store.page_bytes()) {
+        output.push(Segment {
+            page: store.intern(chunk),
+            offset: 0,
+            len: u32::try_from(chunk.len()).expect("page size must fit u32"),
+        });
     }
 }
 
@@ -973,6 +1021,30 @@ mod tests {
         assert_eq!(root.bytes.read(0, root.bytes.len()).unwrap().len(), 8);
         assert_eq!(store.unique_page_count(), root.bytes.segment_count());
         assert!(store.unique_page_bytes() <= 8 + store.page_bytes());
+    }
+
+    #[test]
+    fn repeated_small_insertions_keep_byte_segments_page_bounded() {
+        let store = Store::new(64);
+        let mut root = Root::empty(store.clone(), "generation-a");
+        for _ in 0..10_000 {
+            let mut transaction = root.transaction();
+            transaction.edit_bytes(ByteEdit {
+                offset: root.bytes.len(),
+                delete_len: 0,
+                insert: vec![b'x'],
+            });
+            root = transaction.commit().unwrap();
+        }
+
+        assert_eq!(
+            root.bytes.read(0, root.bytes.len()).unwrap(),
+            vec![b'x'; 10_000]
+        );
+        assert!(
+            root.bytes.segment_count() <= 10_000_usize.div_ceil(store.page_bytes()),
+            "incremental inserts must not retain one segment per edit"
+        );
     }
 
     #[test]
