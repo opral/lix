@@ -152,7 +152,7 @@ simulation_test!(
 
         let timestamps_before_rebuild = select_rows(
             &session,
-            "SELECT lixcol_created_at, lixcol_updated_at \
+            "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
              FROM lix_key_value WHERE key = 'checkpoint-key'",
         )
         .await;
@@ -160,6 +160,11 @@ simulation_test!(
         assert_eq!(
             timestamps_before_rebuild[0][0], timestamps_before_rebuild[0][1],
             "a newly added row must use the changelog's canonical timestamp"
+        );
+        assert_eq!(
+            timestamps_before_rebuild[0][2],
+            Value::Text(receipt.commit_id.clone()),
+            "retained HOT rows must project the checkpoint as their live commit owner"
         );
 
         engine
@@ -169,7 +174,7 @@ simulation_test!(
         assert_eq!(
             select_rows(
                 &session,
-                "SELECT lixcol_created_at, lixcol_updated_at \
+                "SELECT lixcol_created_at, lixcol_updated_at, lixcol_commit_id \
                  FROM lix_key_value WHERE key = 'checkpoint-key'",
             )
             .await,

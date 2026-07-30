@@ -1350,6 +1350,33 @@ impl HeadValueView<'_> {
     }
 }
 
+fn working_diff_checkpoint_owner(baseline: WorkingDiffBaseline) -> Option<CommitId> {
+    match baseline {
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id,
+        }
+        | WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id,
+            ..
+        } => Some(checkpoint_commit_id),
+        WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => None,
+    }
+}
+
+fn effective_hot_commit_id(
+    value: HeadValueView<'_>,
+    active_checkpoint_commit_id: Option<CommitId>,
+) -> Option<CommitId> {
+    let commit_id = value.commit_id?;
+    match (
+        active_checkpoint_commit_id,
+        working_diff_checkpoint_owner(value.working_diff_baseline),
+    ) {
+        (Some(active), Some(owner)) if owner != active => Some(active),
+        _ => Some(commit_id),
+    }
+}
+
 impl WorkingDiffVersion {
     fn payload_eq(self, other: Self) -> bool {
         // Keep the accelerator's net-change classification identical to the
@@ -1936,6 +1963,7 @@ async fn materialize_live_entries<I>(
     entries: Vec<(I, Bytes)>,
     projection: ChangeRecordProjection,
     branch_id: &str,
+    active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedLiveStateBatch, LixError>
 where
     I: LiveMaterializationIdentity,
@@ -1974,7 +2002,7 @@ where
             value.updated_at,
             global,
             value.change_id,
-            value.commit_id,
+            effective_hot_commit_id(value, active_checkpoint_commit_id),
             value.untracked,
             branch_id,
         );
@@ -3094,6 +3122,31 @@ mod tests {
             .expect("no-op checkpoint direct diff should read")
             .expect("no-op checkpoint direct diff should be known empty");
         assert!(empty_diff.diff.entries.is_empty());
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("open exact no-op checkpoint read");
+        let exact_empty_diff = TrackedHeadContext::new()
+            .reader(read)
+            .working_diff_for_control(
+                branch_id,
+                control(no_op_checkpoint, checkpoint, no_op_checkpoint),
+                &TrackedStateDiffRequest {
+                    filter: TrackedStateFilter {
+                        schema_keys: vec!["schema".to_owned()],
+                        entity_pks: vec![entity_pk.clone()],
+                        ..TrackedStateFilter::default()
+                    },
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect("exact no-op checkpoint diff should read")
+            .expect("exact no-op checkpoint diff should be current");
+        assert!(
+            exact_empty_diff.diff.entries.is_empty(),
+            "finite diff reads must ignore a baseline owned by the prior checkpoint"
+        );
 
         let read = storage
             .begin_read(StorageReadOptions::default())

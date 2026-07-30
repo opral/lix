@@ -2205,8 +2205,13 @@ where
         control: BranchHeadControl,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
-        self.scan_live_batch_for_generation(branch_id, control.generation, request)
-            .await
+        self.scan_live_batch_for_generation(
+            branch_id,
+            control.generation,
+            control.working_diff_checkpoint_commit_id,
+            request,
+        )
+        .await
     }
 
     pub(crate) async fn scan_live_rows(
@@ -2319,9 +2324,14 @@ where
             return Ok(None);
         };
         Ok(Some(
-            self.scan_live_batch_for_generation(branch_id, control.generation, request)
-                .await?
-                .into_rows(),
+            self.scan_live_batch_for_generation(
+                branch_id,
+                control.generation,
+                control.working_diff_checkpoint_commit_id,
+                request,
+            )
+            .await?
+            .into_rows(),
         ))
     }
 
@@ -2329,6 +2339,7 @@ where
         &self,
         branch_id: &str,
         generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
         request: &TrackedStateScanRequest,
     ) -> Result<MaterializedLiveStateBatch, LixError> {
         let collection_control = match request.filter.schema_keys.as_slice() {
@@ -2358,11 +2369,20 @@ where
         // A storage prefix is ordered by identity, but tombstones are filtered
         // only after decoding the value. Applying SQL LIMIT to the raw scan
         // would therefore let one tombstone hide a later live row.
-        let entries =
+        let mut entries =
             hot_scan_entries(&self.store, branch_id, generation, &request.filter, None).await?;
+        if let Some(control) = replaced_generation {
+            filter_hot_scan_entries_by_collection_generation(&mut entries, control)?;
+        }
         let projection = ChangeRecordProjection::from_columns(&request.read_columns.columns);
-        let rows =
-            materialize_hot_scan_entries(&self.store, entries, projection, branch_id).await?;
+        let rows = materialize_hot_scan_entries(
+            &self.store,
+            entries,
+            projection,
+            branch_id,
+            active_checkpoint_commit_id,
+        )
+        .await?;
         let overlay_identities = rows
             .iter()
             .map(|row| {
@@ -2426,13 +2446,7 @@ where
             return Ok(rows);
         }
         Ok(rows.filter(
-            |row| {
-                let in_active_generation = replaced_generation.is_none_or(|control| {
-                    row.commit_id()
-                        .is_some_and(|commit_id| commit_id > control.active_generation)
-                });
-                in_active_generation && (request.filter.include_tombstones || !row.deleted())
-            },
+            |row| request.filter.include_tombstones || !row.deleted(),
             request.limit,
         ))
     }
@@ -2502,6 +2516,7 @@ where
         self.load_projected_live_batch_for_generation_refs(
             branch_id,
             control.generation,
+            control.working_diff_checkpoint_commit_id,
             keys,
             projection,
         )
@@ -2512,6 +2527,7 @@ where
         &self,
         branch_id: &str,
         generation: CommitId,
+        active_checkpoint_commit_id: Option<CommitId>,
         keys: &[TrackedStateKeyRef<'_>],
         projection: &ChangeRecordProjection,
     ) -> Result<MaterializedLiveStateExactBatch, LixError> {
@@ -2574,7 +2590,14 @@ where
                 ordinal
             }));
         }
-        let rows = materialize_live_entries(&self.store, entries, *projection, branch_id).await?;
+        let rows = materialize_live_entries(
+            &self.store,
+            entries,
+            *projection,
+            branch_id,
+            active_checkpoint_commit_id,
+        )
+        .await?;
         if slots.iter().all(Option::is_some) {
             return MaterializedLiveStateExactBatch::new(rows, slots);
         }
@@ -3859,9 +3882,10 @@ fn next_cascade_working_diff_baseline(
             false,
         )),
         WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
-            let before = previous
+            let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
+            before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
                     checkpoint_commit_id: active_checkpoint_commit_id,
@@ -3937,9 +3961,10 @@ fn next_hot_working_diff_baseline(
             false,
         )),
         WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
-            let before = previous
+            let mut before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
+            before.commit_id = active_checkpoint_commit_id;
             Ok((
                 WorkingDiffBaseline::BeforePresent {
                     checkpoint_commit_id: active_checkpoint_commit_id,
@@ -5242,6 +5267,43 @@ enum HotScanEntries<'a> {
     Decoded(Vec<(HotScanIdentity, Bytes)>),
 }
 
+fn filter_hot_scan_entries_by_collection_generation(
+    entries: &mut HotScanEntries<'_>,
+    control: HotCollectionControl,
+) -> Result<(), LixError> {
+    let visible = |bytes: &Bytes| -> Result<bool, LixError> {
+        Ok(decode_head_value(bytes)?
+            .commit_id
+            .is_some_and(|commit_id| commit_id > control.active_generation))
+    };
+    match entries {
+        HotScanEntries::Decoded(rows) => {
+            let mut retained = Vec::with_capacity(rows.len());
+            for (identity, bytes) in rows.drain(..) {
+                if visible(&bytes)? {
+                    retained.push((identity, bytes));
+                }
+            }
+            *rows = retained;
+        }
+        HotScanEntries::Finite(batches) => {
+            for batch in batches {
+                for value in &mut batch.values {
+                    if value
+                        .as_ref()
+                        .map(&visible)
+                        .transpose()?
+                        .is_some_and(|visible| !visible)
+                    {
+                        *value = None;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn hot_exact_identity_batches<'a>(
     branch_id: &'a str,
     generation: CommitId,
@@ -5346,10 +5408,18 @@ async fn materialize_hot_scan_entries(
     entries: HotScanEntries<'_>,
     projection: ChangeRecordProjection,
     branch_id: &str,
+    active_checkpoint_commit_id: Option<CommitId>,
 ) -> Result<MaterializedLiveStateBatch, LixError> {
     match entries {
         HotScanEntries::Decoded(entries) => {
-            materialize_live_entries(store, entries, projection, branch_id).await
+            materialize_live_entries(
+                store,
+                entries,
+                projection,
+                branch_id,
+                active_checkpoint_commit_id,
+            )
+            .await
         }
         HotScanEntries::Finite(batches) => {
             let row_count = batches
@@ -5366,7 +5436,14 @@ async fn materialize_hot_scan_entries(
                     entries.push((batch.identities.key_ref(index), value));
                 }
             }
-            materialize_live_entries(store, entries, projection, branch_id).await
+            materialize_live_entries(
+                store,
+                entries,
+                projection,
+                branch_id,
+                active_checkpoint_commit_id,
+            )
+            .await
         }
     }
 }
@@ -5492,10 +5569,19 @@ async fn hot_load_file_scope_identities(
 
 fn working_diff_baseline_before(
     baseline: WorkingDiffBaseline,
+    checkpoint_commit_id: CommitId,
 ) -> Option<Option<WorkingDiffVersion>> {
     match baseline {
-        WorkingDiffBaseline::BeforeAbsent { .. } => Some(None),
-        WorkingDiffBaseline::BeforePresent { version, .. } => Some(Some(version)),
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id: owner,
+        } if owner == checkpoint_commit_id => Some(None),
+        WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id: owner,
+            version,
+        } if owner == checkpoint_commit_id => Some(Some(version)),
+        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
+            None
+        }
         WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => None,
     }
 }
@@ -5512,8 +5598,14 @@ async fn hot_working_diff_entries(
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
     if !filter.schema_keys.is_empty() && !filter.entity_pks.is_empty() {
-        return hot_working_diff_entries_for_finite_filter(store, branch_id, generation, filter)
-            .await;
+        return hot_working_diff_entries_for_finite_filter(
+            store,
+            branch_id,
+            checkpoint_commit_id,
+            generation,
+            filter,
+        )
+        .await;
     }
 
     let scope = encode_working_diff_scope_prefix(branch_id, checkpoint_commit_id, generation);
@@ -5604,7 +5696,9 @@ async fn hot_working_diff_entries(
         if after.untracked {
             return Ok(None);
         }
-        let Some(before) = working_diff_baseline_before(after.working_diff_baseline) else {
+        let Some(before) =
+            working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)
+        else {
             return Ok(None);
         };
         let Some(after) = after.working_diff_version() else {
@@ -5627,6 +5721,7 @@ async fn hot_working_diff_entries(
 async fn hot_working_diff_entries_for_finite_filter(
     store: &(impl StorageAdapterRead + ?Sized),
     branch_id: &str,
+    checkpoint_commit_id: CommitId,
     generation: CommitId,
     filter: &TrackedStateFilter,
 ) -> Result<Option<Vec<TrackedStateDiffEntry>>, LixError> {
@@ -5635,7 +5730,8 @@ async fn hot_working_diff_entries_for_finite_filter(
         HotScanEntries::Decoded(rows) => {
             let mut candidates = Vec::with_capacity(rows.len());
             for (identity, bytes) in rows {
-                let Some(versions) = finite_working_diff_versions(&bytes) else {
+                let Some(versions) = finite_working_diff_versions(&bytes, checkpoint_commit_id)
+                else {
                     return Ok(None);
                 };
                 let Some((before, after)) = versions else {
@@ -5656,7 +5752,8 @@ async fn hot_working_diff_entries_for_finite_filter(
                     let Some(bytes) = bytes else {
                         continue;
                     };
-                    let Some(versions) = finite_working_diff_versions(&bytes) else {
+                    let Some(versions) = finite_working_diff_versions(&bytes, checkpoint_commit_id)
+                    else {
                         return Ok(None);
                     };
                     let Some((before, after)) = versions else {
@@ -5672,12 +5769,18 @@ async fn hot_working_diff_entries_for_finite_filter(
 
 fn finite_working_diff_versions(
     bytes: &Bytes,
+    checkpoint_commit_id: CommitId,
 ) -> Option<Option<(Option<WorkingDiffVersion>, WorkingDiffVersion)>> {
     let after = decode_head_value(bytes).ok()?;
     if after.untracked || after.working_diff_baseline == WorkingDiffBaseline::Clean {
         return Some(None);
     }
-    let before = working_diff_baseline_before(after.working_diff_baseline)?;
+    if working_diff_checkpoint_owner(after.working_diff_baseline)
+        .is_some_and(|owner| owner != checkpoint_commit_id)
+    {
+        return Some(None);
+    }
+    let before = working_diff_baseline_before(after.working_diff_baseline, checkpoint_commit_id)?;
     let after = after.working_diff_version()?;
     Some(Some((before, after)))
 }
