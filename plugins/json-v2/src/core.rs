@@ -1058,6 +1058,15 @@ fn node_layout_mut(nodes: &mut [Node], node: u32) -> &mut NodeLayout {
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaJsonScalar {
+    pub start: u32,
+    pub length: u32,
+    pub schema_key: String,
+    pub entity_pk: Vec<String>,
+    pub snapshot: Vec<u8>,
+}
+
 #[derive(Debug)]
 struct DocumentInner {
     blob: PersistentBlob,
@@ -1153,6 +1162,71 @@ impl Document {
 
     pub fn sparse_properties_touched(&self) -> usize {
         self.0.sparse_nodes_touched
+    }
+
+    pub fn arena_scalars(&self) -> Result<Vec<ArenaJsonScalar>, String> {
+        let mut scalars = self
+            .0
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| !node.kind.is_container())
+            .map(|(ordinal, node)| {
+                let (start, length) = self
+                    .0
+                    .spans
+                    .span(ordinal)
+                    .ok_or_else(|| "JSON scalar span is missing".to_owned())?;
+                let identity = node.identity();
+                let mut snapshot: Value = serde_json::from_slice(&self.node_snapshot(ordinal)?)
+                    .map_err(|error| format!("parse JSON arena scalar snapshot: {error}"))?;
+                snapshot
+                    .as_object_mut()
+                    .ok_or_else(|| "JSON arena scalar snapshot must be an object".to_owned())?
+                    .remove("scalar_json");
+                Ok(ArenaJsonScalar {
+                    start,
+                    length,
+                    schema_key: identity.schema_key().to_owned(),
+                    entity_pk: identity.entity_pk(),
+                    snapshot: serde_json::to_vec(&snapshot).map_err(|error| {
+                        format!("serialize JSON arena scalar snapshot: {error}")
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        scalars.sort_unstable_by_key(|scalar| scalar.start);
+        Ok(scalars)
+    }
+
+    pub fn scalar_change_from_arena(
+        schema_key: String,
+        entity_pk: Vec<String>,
+        snapshot: &[u8],
+        scalar: &[u8],
+    ) -> Result<EntityChange, String> {
+        let kind = parse_complete_scalar(scalar)?;
+        if kind.is_container() {
+            return Err("JSON arena scalar edit produced a container".to_owned());
+        }
+        let scalar = std::str::from_utf8(scalar)
+            .map_err(|error| format!("JSON scalar must be UTF-8: {error}"))?;
+        let mut snapshot: Value = serde_json::from_slice(snapshot)
+            .map_err(|error| format!("invalid JSON arena scalar snapshot: {error}"))?;
+        let object = snapshot
+            .as_object_mut()
+            .ok_or_else(|| "JSON arena scalar snapshot must be an object".to_owned())?;
+        object.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
+        object.insert("scalar_json".to_owned(), Value::String(scalar.to_owned()));
+        Ok(EntityChange {
+            schema_key,
+            entity_pk,
+            snapshot: Some(
+                serde_json::to_vec(&snapshot)
+                    .map_err(|error| format!("serialize JSON arena scalar: {error}"))?,
+            ),
+            effect: ChangeEffect::Content,
+        })
     }
 
     pub fn file_changed(

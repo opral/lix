@@ -104,6 +104,15 @@ struct Span {
     length: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArenaElementSpan {
+    pub id: String,
+    pub order_key: String,
+    pub leading_json: String,
+    pub offset: u64,
+    pub length: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
@@ -492,6 +501,43 @@ impl Document {
             ));
         }
         InitialChanges { changes }
+    }
+
+    pub fn arena_element_spans(&self) -> Vec<ArenaElementSpan> {
+        let mut spans = self
+            .0
+            .elements
+            .iter()
+            .map(|element| {
+                let span = self
+                    .0
+                    .element_spans
+                    .get(&element.id)
+                    .expect("parsed Excalidraw elements have source spans");
+                ArenaElementSpan {
+                    id: element.id.clone(),
+                    order_key: element.order_key.clone(),
+                    leading_json: element.leading_json.clone(),
+                    offset: span.offset,
+                    length: span.length,
+                }
+            })
+            .collect::<Vec<_>>();
+        spans.sort_unstable_by_key(|span| span.offset);
+        spans
+    }
+
+    pub fn element_change_from_source(
+        id: &str,
+        order_key: String,
+        leading_json: String,
+        element_json: String,
+    ) -> Result<EntityChange, String> {
+        let element = ElementEntity::from_source(order_key, leading_json, element_json)?;
+        if element.id != id {
+            return Err("sparse Excalidraw edit changed the element id".to_owned());
+        }
+        Ok(EntityChange::upsert(element.record()?))
     }
 
     pub fn file_changed(

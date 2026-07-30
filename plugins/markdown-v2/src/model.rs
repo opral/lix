@@ -51,7 +51,7 @@ impl NodeSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct NodeTree {
     pub(crate) node: NodeSnapshot,
     pub(crate) children: Vec<Self>,

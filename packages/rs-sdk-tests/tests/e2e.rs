@@ -3482,6 +3482,118 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
 }
 
 #[tokio::test]
+#[ignore = "10 MiB JSON sparse successor v2 actor versus v3 arena benchmark"]
+async fn v3_json_ten_mib_sparse_successor_benchmark() {
+    const PATH: &str = "/v3-json-sparse.json";
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(5);
+    let (before, edit_offset, edited_key) = json_ten_mib_flat_fixture();
+    let mut after = before.clone();
+    after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+
+    for (label, plugin_key, archive) in [
+        (
+            "v2_actor",
+            "plugin_json_incremental_v2",
+            build_json_v2_plugin_archive(),
+        ),
+        (
+            "v3_arena",
+            "plugin_json_v3_prototype",
+            build_json_v3_prototype_archive(),
+        ),
+    ] {
+        let mut elapsed_ms = Vec::with_capacity(samples);
+        let mut measurements = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let root = tempfile::tempdir().expect("create sparse JSON benchmark directory");
+            let lix = open_lix_with_rocksdb(root.path()).await;
+            install_reference_plugin_in_blank_registry(
+                &lix,
+                plugin_key,
+                &archive,
+                &["json_root", "json_object_member", "json_array_item"],
+            )
+            .await;
+            write_file(&lix, PATH, before.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{label} opening import failed: {error}"));
+
+            lix.reset_plugin_v2_transition_counters();
+            collector.clear();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            write_file(&lix, PATH, after.clone())
+                .await
+                .unwrap_or_else(|error| panic!("{label} successor failed: {error}"));
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let counters = lix.plugin_v2_transition_counters();
+            assert_eq!(read_file(&lix, PATH).await.unwrap(), Some(after.clone()));
+            assert_eq!(counters.durable_semantic_changes, 1);
+            let row = lix
+                .execute(
+                    "SELECT scalar_json FROM json_object_member WHERE key = $1",
+                    &[Value::Text(edited_key.clone())],
+                )
+                .await
+                .unwrap();
+            assert_eq!(row.rows().len(), 1);
+            assert!(
+                row.rows()[0]
+                    .get::<String>("scalar_json")
+                    .unwrap()
+                    .contains(char::from(after[edit_offset]))
+            );
+            eprintln!(
+                "json_sparse lane={label} sample={sample} elapsed_ms={:.3} \
+                 allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
+                 guest_exports={} imports={} boundary_bytes={} guest_high_water_mb={:.3}",
+                measurement.elapsed_ms,
+                measurement.allocations.allocation_count,
+                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
+                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes,
+                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+            );
+            eprintln!(
+                "json_sparse_phases lane={label} sample={sample} phases_ms={:?} \
+                 phase_close_live_bytes={:?}",
+                collector.take_aggregate_millis(),
+                collector.take_close_live_bytes(),
+            );
+            elapsed_ms.push(measurement.elapsed_ms);
+            measurements.push(measurement);
+            lix.close().await.unwrap();
+        }
+        elapsed_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "json_sparse lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3} p95_ms={:.3}",
+            p50_ms(&elapsed_ms),
+            p95_ms(&elapsed_ms),
+        );
+        emit_summary(
+            "v3_json_ten_mib_sparse_successor_benchmark",
+            label,
+            BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: 1,
+            },
+            BenchmarkGate::ElapsedRegression,
+            &measurements,
+        );
+    }
+}
+
+#[tokio::test]
 async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
     let root = tempfile::tempdir().expect("create v3 JSON successor directory");
     let lix = open_lix_with_rocksdb(root.path()).await;

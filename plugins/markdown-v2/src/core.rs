@@ -1518,6 +1518,13 @@ pub struct Document {
     top_level_ranges: Arc<Vec<Range<usize>>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaMarkdownBlock {
+    pub start: u64,
+    pub end: u64,
+    pub tree_json: Vec<u8>,
+}
+
 /// Persistent top-level Markdown tree. The common paragraph-edit path changes
 /// one top-level node, so retaining the parsed base avoids cloning thousands
 /// of unrelated `NodeSnapshot` JSON values on every keystroke.
@@ -2083,6 +2090,119 @@ impl Document {
 
     pub fn fork(&self) -> Self {
         self.clone()
+    }
+
+    pub fn arena_state(&self) -> Result<(Vec<u8>, Vec<ArenaMarkdownBlock>), PluginError> {
+        let mut root = self.tree.root_node().clone();
+        let format = root.format.as_object_mut().ok_or_else(|| {
+            PluginError::Internal("Markdown document format must be an object".to_owned())
+        })?;
+        let had_lexical_fallback = format.remove(LEXICAL_FALLBACK_FIELD).is_some();
+        let mut root_json = vec![u8::from(had_lexical_fallback)];
+        root_json.extend(serde_json::to_vec(&root).map_err(|error| {
+            PluginError::Internal(format!("serialize Markdown arena root: {error}"))
+        })?);
+        let mut blocks = Vec::with_capacity(self.top_level_ranges.len());
+        for (index, range) in self.top_level_ranges.iter().enumerate() {
+            let tree = self.tree.top_level_tree(index).ok_or_else(|| {
+                PluginError::Internal("Markdown arena range has no matching block".to_owned())
+            })?;
+            blocks.push(ArenaMarkdownBlock {
+                start: u64::try_from(range.start)
+                    .map_err(|_| PluginError::Internal("Markdown range exceeds u64".to_owned()))?,
+                end: u64::try_from(range.end)
+                    .map_err(|_| PluginError::Internal("Markdown range exceeds u64".to_owned()))?,
+                tree_json: serde_json::to_vec(tree).map_err(|error| {
+                    PluginError::Internal(format!("serialize Markdown arena block: {error}"))
+                })?,
+            });
+        }
+        Ok((root_json, blocks))
+    }
+
+    pub fn file_changed_from_arena_block(
+        before: Vec<u8>,
+        root_json: &[u8],
+        block_json: &[u8],
+        block_start: u64,
+        block_end: u64,
+        splice: InputSplice<'_>,
+        namespace: IdNamespace,
+    ) -> Result<Option<(Vec<EntityChange>, Vec<u8>, Vec<u8>)>, PluginError> {
+        let (&fallback_flag, root_json) = root_json
+            .split_first()
+            .ok_or_else(|| PluginError::InvalidInput("Markdown arena root is empty".to_owned()))?;
+        let root: NodeSnapshot = serde_json::from_slice(root_json).map_err(|error| {
+            PluginError::InvalidInput(format!("invalid Markdown arena root: {error}"))
+        })?;
+        let block = serde_json::from_slice(block_json).map_err(|error| {
+            PluginError::InvalidInput(format!("invalid Markdown arena block: {error}"))
+        })?;
+        let start = usize::try_from(block_start).map_err(|_| {
+            PluginError::InvalidInput("Markdown arena block start exceeds usize".to_owned())
+        })?;
+        let end = usize::try_from(block_end).map_err(|_| {
+            PluginError::InvalidInput("Markdown arena block end exceeds usize".to_owned())
+        })?;
+        let document = Self {
+            bytes: PersistentBytes::from_vec(before),
+            tree: PersistentTree::new(NodeTree {
+                node: root,
+                children: vec![block],
+            }),
+            top_level_ranges: Arc::new(vec![start..end]),
+        };
+        let successor_bytes = document.bytes.splice(&[splice])?;
+        let Some((detected, top_level_ranges, tree)) =
+            document.try_top_level_replacement(&[splice], &successor_bytes, namespace)?
+        else {
+            return Ok(None);
+        };
+        let mut changes = detected
+            .into_iter()
+            .map(detected_to_entity_change)
+            .collect::<Result<Vec<_>, _>>()?;
+        let successor = Self {
+            bytes: successor_bytes,
+            tree,
+            top_level_ranges,
+        };
+        if fallback_flag != 0 {
+            let mut successor_root = successor.tree.root_node().clone();
+            let format = successor_root.format.as_object_mut().ok_or_else(|| {
+                PluginError::Internal("Markdown document format must be an object".to_owned())
+            })?;
+            format.insert(
+                LEXICAL_FALLBACK_FIELD.to_owned(),
+                serde_json::Value::String(
+                    base64::engine::general_purpose::STANDARD.encode(successor.bytes.materialize()),
+                ),
+            );
+            changes.push(detected_to_entity_change(DetectedChange {
+                entity_pk: vec![successor_root.id.clone()],
+                schema_key: NODE_SCHEMA_KEY.to_owned(),
+                snapshot_content: Some(serde_json::to_string(&successor_root).map_err(
+                    |error| {
+                        PluginError::Internal(format!(
+                            "serialize successor Markdown arena root change: {error}"
+                        ))
+                    },
+                )?),
+                metadata: Some(r#"{"impact":"format"}"#.to_owned()),
+            })?);
+        }
+        let root_json = {
+            let mut bytes = vec![fallback_flag];
+            bytes.extend_from_slice(root_json);
+            bytes
+        };
+        let block_json = serde_json::to_vec(successor.tree.top_level_tree(0).ok_or_else(|| {
+            PluginError::Internal("Markdown arena successor lost its changed block".to_owned())
+        })?)
+        .map_err(|error| {
+            PluginError::Internal(format!("serialize successor Markdown arena block: {error}"))
+        })?;
+        Ok(Some((changes, root_json, block_json)))
     }
 
     pub fn file_changed(
