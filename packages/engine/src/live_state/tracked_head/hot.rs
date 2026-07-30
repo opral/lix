@@ -822,10 +822,33 @@ fn certified_external_page_plan(
         return Ok(None);
     }
     let schema_count = input.u16()? as usize;
+    let mut schema_keys = Vec::with_capacity(schema_count);
     for _ in 0..schema_count {
-        let _schema = input.text()?;
+        schema_keys.push(input.text()?);
     }
-    let _file_id = input.text()?;
+    let file_id = input.text()?;
+    if !request.filter.schema_keys.is_empty()
+        && !request
+            .filter
+            .schema_keys
+            .iter()
+            .any(|candidate| schema_keys.contains(&candidate.as_str()))
+    {
+        return Ok(Some(Vec::new()));
+    }
+    if !request.filter.file_ids.is_empty()
+        && !request
+            .filter
+            .file_ids
+            .iter()
+            .any(|candidate| match candidate {
+                NullableKeyFilter::Any => true,
+                NullableKeyFilter::Null => false,
+                NullableKeyFilter::Value(candidate) => candidate == file_id,
+            })
+    {
+        return Ok(Some(Vec::new()));
+    }
     let _commit_id = input.bytes(16)?;
     let _timestamp = input.text()?;
     let format = input.u16()?;
@@ -2321,30 +2344,43 @@ where
                 )
             })
             .collect::<BTreeSet<_>>();
-        let certified_rows = scan_certified_entity_batch_rows(
-            &self.store,
-            branch_id,
-            generation,
-            request,
-            if overlay_identities.is_empty() {
-                request.limit.map(|limit| limit.saturating_sub(rows.len()))
-            } else {
-                None
-            },
-        )
-        .await?
-        .filter(
-            |row| {
-                !overlay_identities
-                    .iter()
-                    .any(|(schema_key, entity_pk, file_id)| {
-                        schema_key == row.schema_key()
-                            && entity_pk == row.entity_pk()
-                            && file_id.as_deref() == row.file_id()
-                    })
-            },
-            None,
-        );
+        // Format plugins cannot publish engine-owned schemas. Do not even
+        // inspect certified semantic manifests for a scan that can only match
+        // engine rows such as file descriptors or blob materializations.
+        let certified_rows = if !request.filter.schema_keys.is_empty()
+            && request
+                .filter
+                .schema_keys
+                .iter()
+                .all(|schema_key| schema_key.starts_with("lix_"))
+        {
+            MaterializedLiveStateBatch::default()
+        } else {
+            scan_certified_entity_batch_rows(
+                &self.store,
+                branch_id,
+                generation,
+                request,
+                if overlay_identities.is_empty() {
+                    request.limit.map(|limit| limit.saturating_sub(rows.len()))
+                } else {
+                    None
+                },
+            )
+            .await?
+            .filter(
+                |row| {
+                    !overlay_identities
+                        .iter()
+                        .any(|(schema_key, entity_pk, file_id)| {
+                            schema_key == row.schema_key()
+                                && entity_pk == row.entity_pk()
+                                && file_id.as_deref() == row.file_id()
+                        })
+                },
+                None,
+            )
+        };
         let rows = if certified_rows.is_empty() {
             rows
         } else if rows.is_empty() {
