@@ -190,12 +190,14 @@ interface api {
   }
 
   /// Rebuild an evicted actor directly as the successor of a byte transition.
-  /// Durable entities provide identity; `before` preserves exact formatting;
-  /// the output transaction already contains `edits`.
+  /// Durable entities provide identity. Blob materializations provide
+  /// `before` plus sparse edits; derived materializations provide `after`
+  /// because their predecessor bytes must be rendered from the entities.
   record cold-successor-request {
     before-descriptor: file-descriptor,
     after-descriptor: file-descriptor,
-    before: own<snapshot>,
+    before: option<own<snapshot>>,
+    after: option<own<snapshot>>,
     edits: list<input-splice>,
     entities: own<entity-change-source>,
     creates: create-context,

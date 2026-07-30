@@ -23,6 +23,97 @@ const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const CSV_STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for CsvPlugin {
+    fn cold_file_changed(
+        update: &mut sdk::ColdFileUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let accepted = update
+            .before
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
+        if accepted.is_some() == submitted.is_some() {
+            return Err(sdk::Error::invalid_input(
+                "CSV cold successor requires exactly one byte source",
+            ));
+        }
+        let mut builder = core::EntityImportBuilder::new();
+        while let Some(entity) = update.entities.next()? {
+            builder
+                .push(EntityRecord {
+                    schema_key: entity.schema_key,
+                    entity_pk: entity.entity_pk,
+                    snapshot: entity.snapshot.ok_or_else(|| {
+                        sdk::Error::invalid_input("CSV cold successor received a tombstone")
+                    })?,
+                })
+                .map_err(sdk::Error::invalid_input)?;
+        }
+        let namespace =
+            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+        if let Some(accepted) = accepted {
+            let rendered = document.bytes();
+            if rendered != accepted {
+                let reconcile = [InputSplice {
+                    offset: 0,
+                    delete_len: rendered.len() as u64,
+                    insert: &accepted,
+                }];
+                document = document
+                    .file_changed_with_paths(
+                        &reconcile,
+                        update.before_file.path.as_deref(),
+                        update.before_file.path.as_deref(),
+                        namespace,
+                    )
+                    .map_err(sdk::Error::invalid_input)?
+                    .0;
+            }
+        }
+        let splices = if let Some(submitted) = submitted.as_ref() {
+            let reconcile = [InputSplice {
+                offset: 0,
+                delete_len: document.bytes().len() as u64,
+                insert: submitted,
+            }];
+            reconcile.to_vec()
+        } else {
+            update
+                .edits
+                .iter()
+                .map(|edit| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: &edit.insert,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (successor, changes) = document
+            .file_changed_with_paths(
+                &splices,
+                update.before_file.path.as_deref(),
+                update.after_file.path.as_deref(),
+                namespace,
+            )
+            .map_err(sdk::Error::invalid_input)?;
+        update
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+        store_fallback_entities_fresh(
+            &update.successor,
+            &successor
+                .entity_records()
+                .map_err(sdk::Error::invalid_input)?,
+        )?;
+        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
+        for change in changes {
+            encoder.push(change, update.creates, sink)?;
+        }
+        encoder.flush(sink)
+    }
+
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,

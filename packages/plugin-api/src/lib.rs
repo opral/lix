@@ -558,7 +558,8 @@ pub struct HydrateFile<'a> {
 pub struct ColdFileUpdate<'a> {
     pub before_file: FileInfo,
     pub after_file: FileInfo,
-    pub before: Root<'a>,
+    pub before: Option<Root<'a>>,
+    pub after: Option<Root<'a>>,
     pub edits: Vec<InputSplice>,
     pub entities: EntityChangeReader<'a>,
     pub successor: Transaction<'a>,
@@ -586,11 +587,14 @@ pub trait FormatPlugin: 'static {
         ))
     }
 
-    fn cold_file_changed(_update: &mut ColdFileUpdate<'_>, _sink: &mut Sink<'_>) -> Result<()> {
-        Err(Error::internal(
-            "this format does not implement cold successor reconciliation",
-        ))
-    }
+    /// Reconciles a successor directly from durable entities and accepted
+    /// bytes when no warm guest document is available.
+    ///
+    /// This is mandatory: the host may choose the cold route after eviction,
+    /// process restart, or cache pressure. A format must therefore preserve
+    /// durable identities without requiring hydrate followed by a second
+    /// guest transition.
+    fn cold_file_changed(update: &mut ColdFileUpdate<'_>, sink: &mut Sink<'_>) -> Result<()>;
 }
 
 #[doc(hidden)]
@@ -844,9 +848,8 @@ impl<P: FormatPlugin> Guest for Component<P> {
                 path: input.after_descriptor.path,
                 media_type: input.after_descriptor.media_type,
             },
-            before: Root {
-                inner: &input.before,
-            },
+            before: input.before.as_ref().map(|before| Root { inner: before }),
+            after: input.after.as_ref().map(|after| Root { inner: after }),
             edits: input
                 .edits
                 .into_iter()

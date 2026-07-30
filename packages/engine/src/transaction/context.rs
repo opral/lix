@@ -3756,15 +3756,23 @@ where
                             .as_deref()
                             .expect("same-owner component file should have an owner incarnation"),
                     );
-                    if acknowledged_view.is_none()
-                        && !self
-                            .pending_file_view_mutations
-                            .contains_key(&view.session_key)
-                        && !self
-                            .session_file_views
-                            .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
-                    {
-                        let cache = self.plugin_host.actor_cache().clone();
+                    let cache = self.plugin_host.actor_cache().clone();
+                    let acknowledged_observation = acknowledged_view
+                        .as_ref()
+                        .and_then(|view| view.observation.as_ref());
+                    let cold_successor_candidate = match acknowledged_view.as_ref() {
+                        Some(_) => acknowledged_observation
+                            .is_none_or(|observation| !cache.contains_observation(observation)),
+                        None => {
+                            !self
+                                .pending_file_view_mutations
+                                .contains_key(&view.session_key)
+                                && !self
+                                    .session_file_views
+                                    .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                        }
+                    };
+                    if cold_successor_candidate {
                         let cold_open_guard = cache.cold_open_guard().await;
                         let visible_materialization = self
                         .visible_materialization(&file_key)
@@ -3775,12 +3783,15 @@ where
                                 "the component file no longer has a visible materialization root",
                             )
                         })?;
+                        let observation_matches_visible_root =
+                            acknowledged_observation.is_none_or(|observation| {
+                                observation.semantic_root() == visible_materialization.semantic_root
+                            });
                         let cold_open = cache
                             .prepare_cold_open(&actor_key, &visible_materialization.semantic_root)
                             .await?;
                         if let PluginActorColdOpen::Build(mut cold_install) = cold_open
-                            && let VisibleMaterializationBytes::Blob { hash } =
-                                visible_materialization.bytes
+                            && observation_matches_visible_root
                         {
                             let staged = self.staged_writes.staging_overlay()?;
                             let read = SharedStorageAdapterRead::new(
@@ -3789,27 +3800,91 @@ where
                                     .await?,
                             );
                             let base = self.live_state.reader(read.clone());
-                            let before_bytes: crate::Blob = load_transaction_blob_bytes(
-                            &self.binary_cas.reader(read),
-                            &self.staged_writes,
-                            &[hash],
-                        )
-                        .await?
-                        .into_vec()
-                        .into_iter()
-                        .next()
-                        .flatten()
-                        .ok_or_else(|| {
-                            LixError::new(
-                                LixError::CODE_INVALID_PLUGIN,
-                                format!(
-                                    "owned component plugin file '{}' references missing materialized blob '{}'",
-                                    actor_key.file_id,
-                                    hash.to_hex()
-                                ),
-                            )
-                        })?
-                        .into();
+                            let (
+                                cold_before,
+                                cold_edits,
+                                host_full_diff_bytes_compared,
+                                same_length_blob_splice,
+                            ) = match (selected.materialization(), visible_materialization.bytes) {
+                                (
+                                    PluginMaterialization::Blob,
+                                    VisibleMaterializationBytes::Blob { hash },
+                                ) => {
+                                    let before_bytes: crate::Blob =
+                                        load_transaction_blob_bytes(
+                                            &self.binary_cas.reader(read.clone()),
+                                            &self.staged_writes,
+                                            &[hash],
+                                        )
+                                        .await?
+                                        .into_vec()
+                                        .into_iter()
+                                        .next()
+                                        .flatten()
+                                        .ok_or_else(|| {
+                                            LixError::new(
+                                                LixError::CODE_INVALID_PLUGIN,
+                                                format!(
+                                                    "owned component plugin file '{}' references missing materialized blob '{}'",
+                                                    actor_key.file_id,
+                                                    hash.to_hex()
+                                                ),
+                                            )
+                                        })?
+                                        .into();
+                                    let built_splices = tracing::debug_span!(
+                                        target: "lix_perf",
+                                        "lix.perf.plugin_splice_discovery"
+                                    )
+                                    .in_scope(|| {
+                                        build_file_update_splices(
+                                            &before_bytes,
+                                            Some(FileBytesSha256::compute(&before_bytes)),
+                                            write.data(),
+                                            write.splice_provenance(),
+                                            limits,
+                                        )
+                                    })?;
+                                    let same_length_blob_splice = built_splices
+                                        .same_length_replacement()
+                                        .map(|(offset, length)| (hash, offset, length));
+                                    let before_source: Arc<dyn crate::wasm::WasmByteSource> =
+                                        Arc::new(ArcByteSource::new(before_bytes));
+                                    (
+                                        Some(before_source),
+                                        built_splices.edits,
+                                        built_splices.full_diff_bytes_compared,
+                                        same_length_blob_splice,
+                                    )
+                                }
+                                (
+                                    PluginMaterialization::Derived,
+                                    VisibleMaterializationBytes::Derived { path, .. },
+                                ) => {
+                                    if path != actor_key.path
+                                        || descriptor.path.as_deref() != Some(path.as_str())
+                                    {
+                                        return Err(LixError::new(
+                                            LixError::CODE_INVALID_PLUGIN,
+                                            format!(
+                                                "owned component plugin file '{}' derived materialization cannot move from '{}'",
+                                                actor_key.file_id, path
+                                            ),
+                                        ));
+                                    }
+                                    (None, Vec::new(), 0, None)
+                                }
+                                _ => {
+                                    return Err(LixError::new(
+                                        LixError::CODE_INVALID_PLUGIN,
+                                        format!(
+                                            "owned component plugin file '{}' materialization does not match plugin '{}' contract",
+                                            actor_key.file_id,
+                                            selected.key()
+                                        ),
+                                    ));
+                                }
+                            };
                             let entity_rows = overlay_scan_batch(
                                 &base,
                                 &staged,
@@ -3837,24 +3912,7 @@ where
                             let entity_source =
                                 LiveBatchEntitySource::new(entity_rows, entity_ordinals, limits)?;
                             drop(base);
-                            let built_splices = tracing::debug_span!(
-                                target: "lix_perf",
-                                "lix.perf.plugin_splice_discovery"
-                            )
-                            .in_scope(|| {
-                                build_file_update_splices(
-                                    &before_bytes,
-                                    Some(FileBytesSha256::compute(&before_bytes)),
-                                    write.data(),
-                                    write.splice_provenance(),
-                                    limits,
-                                )
-                            })?;
-                            let host_full_diff_bytes_compared =
-                                built_splices.full_diff_bytes_compared;
-                            let same_length_blob_splice = built_splices
-                                .same_length_replacement()
-                                .map(|(offset, length)| (hash, offset, length));
+                            drop(read);
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -3888,18 +3946,16 @@ where
                                 .cold_file_changed(
                                     limits,
                                     WasmColdFileUpdate {
-                                        update: WasmFileUpdate {
-                                            before_descriptor: v2_file_descriptor_from_actor_key(
-                                                &actor_key,
-                                            ),
-                                            after_descriptor: descriptor.clone(),
-                                            before: Arc::new(ArcByteSource::new(before_bytes)),
-                                            edits: built_splices.edits,
-                                            after: Arc::new(ArcByteSource::new(
-                                                submitted_bytes.clone(),
-                                            )),
-                                            creates,
-                                        },
+                                        before_descriptor: v2_file_descriptor_from_actor_key(
+                                            &actor_key,
+                                        ),
+                                        after_descriptor: descriptor.clone(),
+                                        before: cold_before,
+                                        edits: cold_edits,
+                                        after: Arc::new(ArcByteSource::new(
+                                            submitted_bytes.clone(),
+                                        )),
+                                        creates,
                                         entities: Box::new(entity_source),
                                     },
                                 )

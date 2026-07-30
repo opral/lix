@@ -2657,38 +2657,55 @@ impl V3Worker {
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
     ) -> Result<WasmTransitionCounters, LixError> {
         let limits = v3_transition_limits(limits)?;
-        cold.update.validate(limits)?;
+        cold.validate(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
-        let before_bytes = read_source_all(&cold.update.before)?;
+        let derived_successor = cold.before.is_none();
+        let root_bytes = match cold.before.as_ref() {
+            Some(before) => read_source_all(before)?,
+            None => read_source_all(&cold.after)?,
+        };
         let root = ArenaRoot::import(
             ArenaStore::default(),
             "v3-cold-successor",
-            &before_bytes,
+            &root_bytes,
             std::iter::empty(),
             std::iter::empty(),
         );
         let total_bytes = SharedByteBudget::default();
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
-            cold.update.creates,
+            cold.creates,
             Some(events),
             std::mem::take(&mut self.first_transition),
             false,
             Some(total_bytes.clone()),
         )?));
-        let before = self
-            .store
-            .data_mut()
-            .table
-            .push(SnapshotResource {
-                root: root.clone(),
-                state: state.clone(),
+        let before = (!derived_successor)
+            .then(|| {
+                self.store.data_mut().table.push(SnapshotResource {
+                    root: root.clone(),
+                    state: state.clone(),
+                })
             })
+            .transpose()
             .map_err(|error| {
                 v3_error(format!(
                     "failed to register v3 cold-successor snapshot: {error}"
+                ))
+            })?;
+        let after = derived_successor
+            .then(|| {
+                self.store.data_mut().table.push(SnapshotResource {
+                    root: root.clone(),
+                    state: state.clone(),
+                })
+            })
+            .transpose()
+            .map_err(|error| {
+                v3_error(format!(
+                    "failed to register v3 cold-successor submitted snapshot: {error}"
                 ))
             })?;
         let mut entities = Vec::new();
@@ -2718,12 +2735,11 @@ impl V3Worker {
                 ))
             })?;
         let mut transaction = root.transaction();
-        let mut binding_edits = Vec::with_capacity(cold.update.edits.len());
-        for edit in cold.update.edits {
+        let mut binding_edits = Vec::with_capacity(cold.edits.len());
+        for edit in cold.edits {
             let insert = match edit.insert {
                 WasmInputBytes::Inline(bytes) => bytes,
                 WasmInputBytes::AfterRange(range) => cold
-                    .update
                     .after
                     .read(
                         range.offset,
@@ -2761,19 +2777,20 @@ impl V3Worker {
         let transition_rep = transition.rep();
         let binding_input = bindings::exports::lix::plugin::api::ColdSuccessorRequest {
             before_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: cold.update.before_descriptor.path,
-                media_type: cold.update.before_descriptor.media_type,
+                path: cold.before_descriptor.path,
+                media_type: cold.before_descriptor.media_type,
             },
             after_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                path: cold.update.after_descriptor.path,
-                media_type: cold.update.after_descriptor.media_type,
+                path: cold.after_descriptor.path,
+                media_type: cold.after_descriptor.media_type,
             },
             before,
+            after,
             edits: binding_edits,
             entities: source,
             creates: bindings::exports::lix::plugin::api::CreateContext {
-                high: cold.update.creates.high,
-                low: cold.update.creates.low,
+                high: cold.creates.high,
+                low: cold.creates.low,
             },
         };
         let result = tracing::debug_span!(
@@ -3569,7 +3586,7 @@ impl WasmComponentActor for V3Actor {
         limits: WasmTransitionLimits,
         update: WasmColdFileUpdate,
     ) -> Result<WasmFileTransition, LixError> {
-        update.update.validate(limits)?;
+        update.validate(limits)?;
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);

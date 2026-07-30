@@ -20,6 +20,74 @@ const LINE_IDENTITIES_MAGIC: &[u8; 4] = b"GTI1";
 const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for GitTextPlugin {
+    fn cold_file_changed(
+        update: &mut sdk::ColdFileUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let accepted = update
+            .before
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
+        if accepted.is_some() == submitted.is_some() {
+            return Err(sdk::Error::invalid_input(
+                "Git text cold successor requires exactly one byte source",
+            ));
+        }
+        let mut records = Vec::new();
+        while let Some(entity) = update.entities.next()? {
+            records.push(Ok(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot: entity.snapshot.ok_or_else(|| {
+                    sdk::Error::invalid_input("Git text cold successor received a tombstone")
+                })?,
+            }));
+        }
+        let creates = update.creates;
+        let mut document =
+            Document::open_entities_fallible(records).map_err(sdk::Error::invalid_input)?;
+        if let Some(accepted) = accepted {
+            if document.bytes() != accepted {
+                let reconcile = [InputSplice {
+                    offset: 0,
+                    delete_len: document.bytes().len() as u64,
+                    insert: accepted,
+                }];
+                document = document
+                    .file_changed(&reconcile, |ordinal| creates.id(local_ref(ordinal)))
+                    .map_err(sdk::Error::invalid_input)?
+                    .0;
+            }
+        }
+        let splices = if let Some(submitted) = submitted {
+            vec![InputSplice {
+                offset: 0,
+                delete_len: document.bytes().len() as u64,
+                insert: submitted,
+            }]
+        } else {
+            update
+                .edits
+                .iter()
+                .map(|edit| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: edit.insert.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let (successor, changes) = document
+            .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
+            .map_err(sdk::Error::invalid_input)?;
+        update
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
+        store_identities_in_transaction(&update.successor, &successor)?;
+        emit_changes(changes.into_iter().map(Ok), creates, sink)
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let namespace = input.creates;
         let (document, changes) = Document::open_file(input.accepted.read_all()?, |ordinal| {

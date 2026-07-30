@@ -4,7 +4,8 @@
 mod core;
 
 use core::{
-    ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace, InputSplice,
+    ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityImportBuilder, EntityRecord,
+    IdNamespace, InputSplice,
 };
 use lix_plugin_api as sdk;
 
@@ -20,6 +21,87 @@ const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_ELEMENT_SHIFT_RECORDS: usize = 4096;
 
 impl sdk::FormatPlugin for ExcalidrawPlugin {
+    fn cold_file_changed(
+        update: &mut sdk::ColdFileUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let accepted = update
+            .before
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
+        if accepted.is_some() == submitted.is_some() {
+            return Err(sdk::Error::invalid_input(
+                "Excalidraw cold successor requires exactly one byte source",
+            ));
+        }
+        let mut builder = EntityImportBuilder::new();
+        while let Some(entity) = update.entities.next()? {
+            builder
+                .push(EntityRecord {
+                    schema_key: entity.schema_key,
+                    entity_pk: entity.entity_pk,
+                    snapshot: entity.snapshot.ok_or_else(|| {
+                        sdk::Error::invalid_input("Excalidraw cold successor received a tombstone")
+                    })?,
+                })
+                .map_err(sdk::Error::invalid_input)?;
+        }
+        let namespace =
+            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
+        if let Some(accepted) = accepted {
+            let rendered = document.bytes();
+            if rendered != accepted {
+                let reconcile = [InputSplice {
+                    offset: 0,
+                    delete_len: rendered.len() as u64,
+                    insert: &accepted,
+                }];
+                document = document
+                    .file_changed(&reconcile, namespace)
+                    .map_err(sdk::Error::invalid_input)?
+                    .0;
+            }
+        }
+        let inserts;
+        let splices = if let Some(submitted) = submitted.as_ref() {
+            vec![InputSplice {
+                offset: 0,
+                delete_len: document.bytes().len() as u64,
+                insert: submitted,
+            }]
+        } else {
+            inserts = update
+                .edits
+                .iter()
+                .map(|edit| edit.insert.clone())
+                .collect::<Vec<_>>();
+            update
+                .edits
+                .iter()
+                .zip(&inserts)
+                .map(|(edit, insert)| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert,
+                })
+                .collect::<Vec<_>>()
+        };
+        let (successor, changes) = document
+            .file_changed(&splices, namespace)
+            .map_err(sdk::Error::invalid_input)?;
+        update
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &update.creates.namespace_bytes())?;
+        store_element_index(
+            &update.successor,
+            &encode_element_index(&successor.arena_element_spans())?,
+        )?;
+        emit_changes(changes.into_iter().map(Ok), sink)
+    }
+
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,

@@ -1093,7 +1093,12 @@ pub struct WasmFileUpdate {
 }
 
 pub struct WasmColdFileUpdate {
-    pub update: WasmFileUpdate,
+    pub before_descriptor: WasmFileDescriptor,
+    pub after_descriptor: WasmFileDescriptor,
+    pub before: Option<Arc<dyn WasmByteSource>>,
+    pub edits: Vec<WasmInputSplice>,
+    pub after: Arc<dyn WasmByteSource>,
+    pub creates: WasmCreateContext,
     pub entities: Box<dyn WasmEntitySource>,
 }
 
@@ -1101,8 +1106,48 @@ impl fmt::Debug for WasmColdFileUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WasmColdFileUpdate")
-            .field("update", &self.update)
-            .finish_non_exhaustive()
+            .field("before_descriptor", &self.before_descriptor)
+            .field("after_descriptor", &self.after_descriptor)
+            .field(
+                "before_len",
+                &self.before.as_ref().map(|source| source.len()),
+            )
+            .field("edits", &self.edits)
+            .field("after_len", &self.after.len())
+            .field("creates", &self.creates)
+            .finish()
+    }
+}
+
+impl WasmColdFileUpdate {
+    pub fn validate(&self, limits: WasmTransitionLimits) -> Result<(), LixError> {
+        match &self.before {
+            Some(before) => WasmFileUpdate {
+                before_descriptor: self.before_descriptor.clone(),
+                after_descriptor: self.after_descriptor.clone(),
+                before: Arc::clone(before),
+                edits: self.edits.clone(),
+                after: Arc::clone(&self.after),
+                creates: self.creates,
+            }
+            .validate(limits),
+            None => {
+                self.before_descriptor
+                    .validate_warm_successor(&self.after_descriptor)?;
+                limits.validate()?;
+                if !self.edits.is_empty() {
+                    return Err(invalid_param(
+                        "a derived cold successor must not carry host byte splices",
+                    ));
+                }
+                if self.after.len() > limits.max_total_bytes {
+                    return Err(invalid_param(
+                        "a derived cold successor source exceeds max_total_bytes",
+                    ));
+                }
+                Ok(())
+            }
+        }
     }
 }
 

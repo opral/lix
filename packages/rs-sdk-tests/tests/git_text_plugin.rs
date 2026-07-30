@@ -98,11 +98,18 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
         [0xff, b'\n', 0xfe, b'\n']
     );
     // This write forces a cold actor to rebuild its document from durable
-    // rows after reopen, then proves the resulting semantic update is exact.
+    // rows after reopen and apply the successor in the same guest export.
     let reopened_successor = [0xff, b'\n', b'X', b'\n'].to_vec();
+    reopened.reset_plugin_transition_counters();
     write_file(&reopened, text_path, &reopened_successor)
         .await
         .expect("cold row reconstruction should accept a later line edit");
+    let cold_counters = reopened.plugin_transition_counters();
+    assert_eq!(
+        cold_counters.guest_export_calls, 1,
+        "cold Git-text reconciliation must not hydrate and re-enter the guest"
+    );
+    assert_eq!(cold_counters.full_state_semantic_rows_materialized, 2);
     let reopened_rows = git_text_rows(&reopened, &text_file_id).await;
     assert_eq!(reopened_rows[0].id, text_rows[0].id);
     assert_eq!(reopened_rows[1].id, text_rows[1].id);

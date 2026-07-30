@@ -28,7 +28,17 @@ impl sdk::FormatPlugin for JsonPlugin {
         update: &mut sdk::ColdFileUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
     ) -> sdk::Result<()> {
-        let accepted = update.before.read_all()?;
+        let accepted = update
+            .before
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let submitted = update.after.as_ref().map(sdk::Root::read_all).transpose()?;
+        if accepted.is_some() == submitted.is_some() {
+            return Err(sdk::Error::invalid_input(
+                "JSON cold successor requires exactly one byte source",
+            ));
+        }
         let mut builder = EntityImportBuilder::new();
         while let Some(entity) = update.entities.next()? {
             let snapshot = entity.snapshot.ok_or_else(|| {
@@ -45,7 +55,9 @@ impl sdk::FormatPlugin for JsonPlugin {
         let create_namespace =
             IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
         let (mut document, _) = builder.finish().map_err(sdk::Error::invalid_input)?;
-        if !document.bytes_equal(&accepted) {
+        if let Some(accepted) = accepted
+            && !document.bytes_equal(&accepted)
+        {
             let reconcile = [InputSplice {
                 offset: 0,
                 delete_len: document.byte_len() as u64,
@@ -56,21 +68,30 @@ impl sdk::FormatPlugin for JsonPlugin {
                 .map_err(sdk::Error::invalid_input)?
                 .0;
         }
-        let inserts = update
-            .edits
-            .iter()
-            .map(|edit| edit.insert.clone())
-            .collect::<Vec<_>>();
-        let splices = update
-            .edits
-            .iter()
-            .zip(&inserts)
-            .map(|(edit, insert)| InputSplice {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert,
-            })
-            .collect::<Vec<_>>();
+        let inserts;
+        let splices = if let Some(submitted) = submitted.as_ref() {
+            vec![InputSplice {
+                offset: 0,
+                delete_len: document.byte_len() as u64,
+                insert: submitted,
+            }]
+        } else {
+            inserts = update
+                .edits
+                .iter()
+                .map(|edit| edit.insert.clone())
+                .collect::<Vec<_>>();
+            update
+                .edits
+                .iter()
+                .zip(&inserts)
+                .map(|(edit, insert)| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert,
+                })
+                .collect::<Vec<_>>()
+        };
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;

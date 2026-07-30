@@ -4712,18 +4712,16 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
         .cold_file_changed(
             WasmTransitionLimits::default(),
             WasmColdFileUpdate {
-                update: WasmFileUpdate {
-                    before_descriptor: descriptor.clone(),
-                    after_descriptor: descriptor,
-                    before: Arc::new(BenchmarkByteSource(before)),
-                    edits: vec![WasmInputSplice {
-                        offset: 6,
-                        delete_len: 3,
-                        insert: WasmInputBytes::Inline(b"ONE".to_vec()),
-                    }],
-                    after: Arc::new(BenchmarkByteSource(after)),
-                    creates: WasmCreateContext { high: 13, low: 17 },
-                },
+                before_descriptor: descriptor.clone(),
+                after_descriptor: descriptor,
+                before: Some(Arc::new(BenchmarkByteSource(before))),
+                edits: vec![WasmInputSplice {
+                    offset: 6,
+                    delete_len: 3,
+                    insert: WasmInputBytes::Inline(b"ONE".to_vec()),
+                }],
+                after: Arc::new(BenchmarkByteSource(after)),
+                creates: WasmCreateContext { high: 13, low: 17 },
                 entities: Box::new(BenchmarkEntitySource { entities, next: 0 }),
             },
         )
@@ -4901,18 +4899,16 @@ async fn v3_json_direct_cold_successor_benchmark() {
                     .cold_file_changed(
                         WasmTransitionLimits::default(),
                         WasmColdFileUpdate {
-                            update: WasmFileUpdate {
-                                before_descriptor: descriptor.clone(),
-                                after_descriptor: descriptor.clone(),
-                                before: before_source,
-                                edits: vec![WasmInputSplice {
-                                    offset: edit_offset as u64,
-                                    delete_len: 1,
-                                    insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
-                                }],
-                                after: after_source,
-                                creates,
-                            },
+                            before_descriptor: descriptor.clone(),
+                            after_descriptor: descriptor.clone(),
+                            before: Some(before_source),
+                            edits: vec![WasmInputSplice {
+                                offset: edit_offset as u64,
+                                delete_len: 1,
+                                insert: WasmInputBytes::Inline(vec![after[edit_offset]]),
+                            }],
+                            after: after_source,
+                            creates,
                             entities: Box::new(BenchmarkEntitySource {
                                 entities: source_entities,
                                 next: 0,
@@ -5121,7 +5117,12 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     lix.reset_plugin_transition_counters();
     let after_eviction = b"alpha,ONE\nbeta,two\n".to_vec();
     write_file(&lix, path, after_eviction).await.unwrap();
-    assert_eq!(lix.plugin_transition_counters().durable_semantic_changes, 1);
+    let eviction_counters = lix.plugin_transition_counters();
+    assert_eq!(
+        eviction_counters.guest_export_calls, 1,
+        "an acknowledged but evicted CSV actor must use cold successor directly"
+    );
+    assert_eq!(eviction_counters.durable_semantic_changes, 1);
     assert_eq!(
         lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
             .await
@@ -5139,6 +5140,11 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     write_file(&reopened, path, after_reopen.clone())
         .await
         .unwrap();
+    assert_eq!(
+        reopened.plugin_transition_counters().guest_export_calls,
+        1,
+        "cold CSV reconciliation must not hydrate and re-enter the guest"
+    );
     assert_eq!(
         reopened
             .plugin_transition_counters()
@@ -6033,6 +6039,50 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(renamed));
 
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_excalidraw_cold_successor_after_reopen_rebuilds_span_state() {
+    let root = tempfile::tempdir().expect("create v3 Excalidraw reopen directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+    let path = "/v3-excalidraw-cold.excalidraw";
+    let before = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    write_file(&lix, path, before).await.unwrap();
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    reopened.reset_plugin_transition_counters();
+    let cold = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":10,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    write_file(&reopened, path, cold.clone()).await.unwrap();
+    let counters = reopened.plugin_transition_counters();
+    assert_eq!(
+        counters.guest_export_calls, 1,
+        "cold Excalidraw reconciliation must not hydrate and re-enter the guest"
+    );
+    assert_eq!(counters.durable_semantic_changes, 1);
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(cold));
+
+    // The cold successor must publish spans for its own bytes. A following
+    // localized edit would address the wrong range if it inherited the
+    // predecessor's index.
+    let warm = br#"{"type":"excalidraw","version":2,"source":"test","elements":[{"id":"a","type":"rectangle","x":100,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec();
+    reopened.reset_plugin_transition_counters();
+    write_file(&reopened, path, warm.clone()).await.unwrap();
+    assert_eq!(
+        reopened
+            .plugin_transition_counters()
+            .durable_semantic_changes,
+        1
+    );
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(warm));
+    reopened.close().await.unwrap();
 }
 
 #[tokio::test]
