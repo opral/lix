@@ -74,3 +74,21 @@ fn scaling_fixture_extends_the_real_workload_in_physical_key_order() {
         "rows beyond the embedded real workload must use deterministic synthetic identities"
     );
 }
+
+#[test]
+fn slatedb_is_not_routed_through_the_unsupported_kv_layer() {
+    assert_eq!(
+        storage::KV_STORAGE_PROFILES
+            .iter()
+            .map(|profile| profile.name())
+            .collect::<Vec<_>>(),
+        vec!["lix_sqlite", "lix_rocksdb"]
+    );
+    #[cfg(feature = "slatedb")]
+    assert!(
+        storage::STORAGE_PROFILES
+            .iter()
+            .any(|profile| profile.name() == "lix_slatedb"),
+        "SlateDB must remain covered by transaction and SQL-session profiles"
+    );
+}

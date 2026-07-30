@@ -18,7 +18,7 @@ mod storage;
 mod transaction_api;
 mod workload;
 
-use storage::{STORAGE_PROFILES, StorageProfile};
+use storage::{KV_STORAGE_PROFILES, STORAGE_PROFILES, StorageProfile};
 use workload::{REAL_WORKLOAD_ROWS, SMOKE_ROWS, WorkloadRow, fixture_rows, row_label};
 
 const READ_MANY_PK_COUNT: usize = 10;
@@ -39,8 +39,10 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
         bench_raw_sqlite(c, &rows[..row_count], label);
-        for &profile in STORAGE_PROFILES {
+        for &profile in KV_STORAGE_PROFILES {
             bench_kv_layout(c, &runtime, profile, &rows[..row_count], label);
+        }
+        for &profile in STORAGE_PROFILES {
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }

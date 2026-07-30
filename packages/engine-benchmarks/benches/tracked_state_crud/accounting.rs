@@ -1,5 +1,5 @@
 use crate::kv_layout::{self, KvLayoutAccounting, KvWriteAccounting};
-use crate::storage::{STORAGE_PROFILES, StorageProfile};
+use crate::storage::{KV_STORAGE_PROFILES, STORAGE_PROFILES, StorageProfile};
 use crate::transaction_api::{self, TransactionLayoutAccounting, TransactionWriteAccounting};
 use crate::workload::{WorkloadRow, row_label};
 
@@ -33,7 +33,7 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
         "| ----- | ------- | --------- | -----------: | ---: | ------------: | ------------: | -------------: | ------------: | ----------: | -------------: | ------------: | ------: | ---------: |"
     );
 
-    for &profile in STORAGE_PROFILES {
+    for &profile in KV_STORAGE_PROFILES {
         let mut kv_insert = runtime.block_on(kv_layout::empty_fixture(profile, rows));
         print_kv_write(
             profile,
@@ -73,7 +73,9 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
             "delete_one_by_pk",
             runtime.block_on(kv_delete_one.delete_one_by_pk_accounting()),
         );
+    }
 
+    for &profile in STORAGE_PROFILES {
         let mut transaction_insert =
             runtime.block_on(transaction_api::empty_fixture(profile, rows));
         print_transaction_write(
@@ -127,12 +129,14 @@ fn print_layout_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRo
     println!("| Layer | Storage | Space id | Space | Rows | Key bytes | Value bytes |");
     println!("| ----- | ------- | -------: | ----- | ---: | --------: | ----------: |");
 
-    for &profile in STORAGE_PROFILES {
+    for &profile in KV_STORAGE_PROFILES {
         let kv = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         for row in runtime.block_on(kv.layout_accounting()) {
             print_kv_layout(profile, "kv_layout", row);
         }
+    }
 
+    for &profile in STORAGE_PROFILES {
         let transaction = runtime.block_on(transaction_api::seeded_fixture(profile, rows));
         for row in runtime.block_on(transaction.layout_accounting()) {
             print_transaction_layout(profile, "transaction", row);

@@ -12,6 +12,9 @@ pub(crate) enum StorageProfile {
     SlateDB,
 }
 
+pub(crate) const KV_STORAGE_PROFILES: &[StorageProfile] =
+    &[StorageProfile::SQLite, StorageProfile::RocksDB];
+
 #[cfg(not(feature = "slatedb"))]
 pub(crate) const STORAGE_PROFILES: &[StorageProfile] =
     &[StorageProfile::SQLite, StorageProfile::RocksDB];
