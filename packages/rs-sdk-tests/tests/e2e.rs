@@ -4457,8 +4457,12 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
     let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
-        ("v2_actor", "plugin_json", build_json_plugin_archive()),
-        ("v3_arena", "plugin_json", build_json_plugin_archive()),
+        (
+            "hydrate_then_update",
+            "plugin_json",
+            build_json_plugin_archive(),
+        ),
+        ("cold_successor", "plugin_json", build_json_plugin_archive()),
     ] {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -4485,10 +4489,12 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
             reopened.reset_plugin_transition_counters();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
-            assert_eq!(
-                read_file(&reopened, PATH).await.unwrap(),
-                Some(before.clone())
-            );
+            if label == "hydrate_then_update" {
+                assert_eq!(
+                    read_file(&reopened, PATH).await.unwrap(),
+                    Some(before.clone())
+                );
+            }
             write_file(&reopened, PATH, after.clone()).await.unwrap();
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
@@ -4549,9 +4555,50 @@ async fn v3_json_ten_mib_cold_successor_benchmark() {
         );
         lane_medians.insert(label, benchmark_medians(&measurements));
     }
-    if let (Some(v2), Some(v3)) = (lane_medians.get("v2_actor"), lane_medians.get("v3_arena")) {
-        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *v2, *v3);
+    if let (Some(hydrate), Some(cold)) = (
+        lane_medians.get("hydrate_then_update"),
+        lane_medians.get("cold_successor"),
+    ) {
+        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *hydrate, *cold);
     }
+}
+
+#[tokio::test]
+async fn v3_json_reopen_uses_one_export_for_cold_successor() {
+    const PATH: &str = "/v3-json-cold-successor-regression.json";
+    let before = br#"{"keep":1,"edit":2}"#.to_vec();
+    let after = br#"{"keep":1,"edit":3}"#.to_vec();
+    let root = tempfile::tempdir().expect("create cold JSON regression directory");
+    let storage =
+        RocksDB::open(root.path().join(".lix")).expect("open cold JSON regression RocksDB");
+    let lix = open_lix_with_storage(storage.clone()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    write_file(&lix, PATH, before).await.unwrap();
+    storage.flush().expect("flush cold JSON regression import");
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    reopened.reset_plugin_transition_counters();
+    write_file(&reopened, PATH, after.clone()).await.unwrap();
+    let counters = reopened.plugin_transition_counters();
+    assert_eq!(counters.guest_export_calls, 1);
+    assert_eq!(counters.full_document_reparses, 1);
+    assert_eq!(read_file(&reopened, PATH).await.unwrap(), Some(after));
+    let rows = reopened
+        .execute(
+            "SELECT scalar_json FROM json_object_member WHERE key = 'edit'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(rows.rows()[0].get::<String>("scalar_json").unwrap(), "3");
+    reopened.close().await.unwrap();
 }
 
 #[derive(Debug)]

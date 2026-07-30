@@ -26,6 +26,47 @@ const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 const MAX_BLOCK_SHIFT_RECORDS: usize = 4096;
 
 impl sdk::FormatPlugin for MarkdownPlugin {
+    fn cold_file_changed(
+        update: &mut sdk::ColdFileUpdate<'_>,
+        sink: &mut sdk::Sink<'_>,
+    ) -> sdk::Result<()> {
+        let accepted = update.before.read_all()?;
+        let mut records = Vec::new();
+        while let Some(entity) = update.entities.next()? {
+            records.push(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot: entity.snapshot.ok_or_else(|| {
+                    sdk::Error::invalid_input("Markdown cold successor received a tombstone")
+                })?,
+            });
+        }
+        let (document, _) = Document::open_entities(records, Some(accepted)).map_err(core_error)?;
+        let namespace = IdNamespace::from_halves(update.creates.high, update.creates.low);
+        let inserts = update
+            .edits
+            .iter()
+            .map(|edit| edit.insert.clone())
+            .collect::<Vec<_>>();
+        let splices = update
+            .edits
+            .iter()
+            .zip(&inserts)
+            .map(|(edit, insert)| InputSplice {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert,
+            })
+            .collect::<Vec<_>>();
+        let (document, mut changes) = document
+            .file_changed(&splices, namespace)
+            .map_err(core_error)?;
+        strip_duplicated_lexical_fallback(&mut changes)?;
+        store_markdown_state(&update.successor, &document)?;
+        emit_changes(changes, update.creates, Some(0), sink)?;
+        Ok(())
+    }
+
     fn entities_changed(
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,

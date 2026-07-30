@@ -167,10 +167,11 @@ use crate::transaction::validation::{
     validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
 use crate::wasm::{
-    WasmChangeEffect, WasmComponentActor, WasmComponentFactory, WasmConflictUpdate,
-    WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate,
-    WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
+    WasmChangeEffect, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
+    WasmConflictUpdate, WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey,
+    WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity,
+    WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection,
+    WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -3747,16 +3748,274 @@ where
             let mut verified_same_length_blob_splice = None;
 
             let (changes, publication, materialized_bytes, create_rows) = if same_plugin_owner {
-                let acknowledged_view = self.acknowledged_session_plugin_view(
-                    &view.session_key,
-                    selected,
-                    current_owner_change_id
-                        .as_deref()
-                        .expect("same-owner component file should have an owner incarnation"),
-                );
-                let observation = match acknowledged_view {
-                    Some(view) => match view.observation {
-                        Some(observation) => observation,
+                'same_owner: {
+                    let acknowledged_view = self.acknowledged_session_plugin_view(
+                        &view.session_key,
+                        selected,
+                        current_owner_change_id
+                            .as_deref()
+                            .expect("same-owner component file should have an owner incarnation"),
+                    );
+                    if acknowledged_view.is_none()
+                        && !self
+                            .pending_file_view_mutations
+                            .contains_key(&view.session_key)
+                        && !self
+                            .session_file_views
+                            .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path)
+                    {
+                        let cache = self.plugin_host.actor_cache().clone();
+                        let cold_open_guard = cache.cold_open_guard().await;
+                        let visible_materialization = self
+                        .visible_materialization(&file_key)
+                        .await?
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                                "the component file no longer has a visible materialization root",
+                            )
+                        })?;
+                        let cold_open = cache
+                            .prepare_cold_open(&actor_key, &visible_materialization.semantic_root)
+                            .await?;
+                        if let PluginActorColdOpen::Build(mut cold_install) = cold_open
+                            && let VisibleMaterializationBytes::Blob { hash } =
+                                visible_materialization.bytes
+                        {
+                            let staged = self.staged_writes.staging_overlay()?;
+                            let read = SharedStorageAdapterRead::new(
+                                self.storage
+                                    .begin_read(StorageReadOptions::default())
+                                    .await?,
+                            );
+                            let base = self.live_state.reader(read.clone());
+                            let before_bytes: crate::Blob = load_transaction_blob_bytes(
+                            &self.binary_cas.reader(read),
+                            &self.staged_writes,
+                            &[hash],
+                        )
+                        .await?
+                        .into_vec()
+                        .into_iter()
+                        .next()
+                        .flatten()
+                        .ok_or_else(|| {
+                            LixError::new(
+                                LixError::CODE_INVALID_PLUGIN,
+                                format!(
+                                    "owned component plugin file '{}' references missing materialized blob '{}'",
+                                    actor_key.file_id,
+                                    hash.to_hex()
+                                ),
+                            )
+                        })?
+                        .into();
+                            let entity_rows = overlay_scan_batch(
+                                &base,
+                                &staged,
+                                &LiveStateScanRequest {
+                                    filter: LiveStateFilter {
+                                        schema_keys: selected.schema_keys().to_vec(),
+                                        branch_ids: vec![actor_key.branch_id.clone()],
+                                        file_ids: vec![NullableKeyFilter::Value(
+                                            actor_key.file_id.clone(),
+                                        )],
+                                        untracked: Some(false),
+                                        ..Default::default()
+                                    },
+                                    projection: plugin_state_live_state_projection(),
+                                    ..Default::default()
+                                },
+                            )
+                            .await?;
+                            let entity_ordinals = v2_host_entity_ordinals_from_live_batch(
+                                &entity_rows,
+                                &file_key,
+                                selected.schema_keys(),
+                            )?;
+                            let entity_count = entity_ordinals.len();
+                            let entity_source =
+                                LiveBatchEntitySource::new(entity_rows, entity_ordinals, limits)?;
+                            drop(base);
+                            let built_splices = tracing::debug_span!(
+                                target: "lix_perf",
+                                "lix.perf.plugin_splice_discovery"
+                            )
+                            .in_scope(|| {
+                                build_file_update_splices(
+                                    &before_bytes,
+                                    Some(FileBytesSha256::compute(&before_bytes)),
+                                    write.data(),
+                                    write.splice_provenance(),
+                                    limits,
+                                )
+                            })?;
+                            let host_full_diff_bytes_compared =
+                                built_splices.full_diff_bytes_compared;
+                            let same_length_blob_splice = built_splices
+                                .same_length_replacement()
+                                .map(|(offset, length)| (hash, offset, length));
+                            let store_permit = loop {
+                                match cache.admit_cold_store(&mut cold_install) {
+                                    Ok(permit) => break permit,
+                                    Err(error)
+                                        if error.code == LixError::CODE_PLUGIN_RESOURCE_LIMIT =>
+                                    {
+                                        if retire_oldest_completed_actor(
+                                            &mut reconciliation.actor_publications,
+                                        )
+                                        .await
+                                            || retire_oldest_completed_actor(
+                                                &mut self.pending_plugin_actor_publications,
+                                            )
+                                            .await
+                                        {
+                                            continue;
+                                        }
+                                        return Err(error);
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            };
+                            let mut actor = factory
+                                .instantiate_actor()
+                                .instrument(tracing::debug_span!(
+                                    target: "lix_perf",
+                                    "lix.perf.plugin_actor_instantiate"
+                                ))
+                                .await?;
+                            let transition = match actor
+                                .cold_file_changed(
+                                    limits,
+                                    WasmColdFileUpdate {
+                                        update: WasmFileUpdate {
+                                            before_descriptor: v2_file_descriptor_from_actor_key(
+                                                &actor_key,
+                                            ),
+                                            after_descriptor: descriptor.clone(),
+                                            before: Arc::new(ArcByteSource::new(before_bytes)),
+                                            edits: built_splices.edits,
+                                            after: Arc::new(ArcByteSource::new(
+                                                submitted_bytes.clone(),
+                                            )),
+                                            creates,
+                                        },
+                                        entities: Box::new(entity_source),
+                                    },
+                                )
+                                .instrument(tracing::debug_span!(
+                                    target: "lix_perf",
+                                    "lix.perf.plugin_cold_file_changed"
+                                ))
+                                .await
+                            {
+                                Ok(transition) => transition,
+                                Err(error) => {
+                                    let _ = actor.retire().await;
+                                    return Err(error);
+                                }
+                            };
+                            let validated = match drain_file_transition_changes(
+                                actor.as_mut(),
+                                transition,
+                                &schemas,
+                                limits,
+                            )
+                            .instrument(tracing::debug_span!(
+                                target: "lix_perf",
+                                "lix.perf.plugin_cold_drain_changes"
+                            ))
+                            .await
+                            {
+                                Ok(validated) => validated,
+                                Err(error) => {
+                                    let _ = actor.retire().await;
+                                    return Err(error);
+                                }
+                            };
+                            let certified_row_count = validated
+                                .certified_batches
+                                .iter()
+                                .map(|batch| batch.row_count)
+                                .sum::<u64>();
+                            write.set_certified_entity_batches(validated.certified_batches);
+                            let mut changes = validated.changes;
+                            let (filtered, observed_existing_authorities) = self
+                                .suppress_format_only_noops(selected, changes, &file_key)
+                                .await?;
+                            changes = filtered;
+                            let create_rows = self
+                                .v2_create_rows(
+                                    selected,
+                                    &mut changes,
+                                    create_context,
+                                    &file_key,
+                                    existing_create_reservation.as_ref(),
+                                    Some(&observed_existing_authorities),
+                                )
+                                .await?;
+                            let mut counters = validated.counters;
+                            counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
+                            counters.host_content_classification_bytes =
+                                content_classification_bytes
+                                    .get(&file_key)
+                                    .copied()
+                                    .unwrap_or(0);
+                            counters.full_state_semantic_rows_materialized =
+                                u64::try_from(entity_count).unwrap_or(u64::MAX);
+                            counters.full_document_reparses = 1;
+                            counters.full_renderer_invocations = 1;
+                            counters.durable_semantic_changes =
+                                u64::try_from(changes.entity_change_count())
+                                    .unwrap_or(u64::MAX)
+                                    .saturating_add(certified_row_count);
+                            self.plugin_host.record_transition_counters(counters);
+                            verified_same_length_blob_splice = same_length_blob_splice;
+                            drop(cold_open_guard);
+                            break 'same_owner (
+                                changes,
+                                PendingPluginActorPublication::New {
+                                    cache,
+                                    key: actor_key,
+                                    store: PluginActorStore::new(actor, store_permit),
+                                    document: validated.document,
+                                    bytes: submitted_bytes.clone(),
+                                    semantic_root: Arc::from(materialization_version.clone()),
+                                    view,
+                                },
+                                submitted_bytes.clone(),
+                                create_rows,
+                            );
+                        }
+                        drop(cold_open_guard);
+                    }
+                    let observation = match acknowledged_view {
+                        Some(view) => match view.observation {
+                            Some(observation) => observation,
+                            None => {
+                                self.cold_open_semantic_actor(
+                                    &actor_key,
+                                    selected,
+                                    descriptor.clone(),
+                                    Arc::clone(&factory),
+                                    &mut reconciliation.actor_publications,
+                                )
+                                .await?
+                            }
+                        },
+                        None if self
+                            .pending_file_view_mutations
+                            .contains_key(&view.session_key)
+                            || self
+                                .session_file_views
+                                .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
+                        {
+                            return Err(LixError::new(
+                            LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                            "the acknowledged component file identity no longer matches this write",
+                        )
+                        .with_hint("read the exact file bytes again before retrying the edit"));
+                        }
                         None => {
                             self.cold_open_semantic_actor(
                                 &actor_key,
@@ -3767,55 +4026,31 @@ where
                             )
                             .await?
                         }
-                    },
-                    None if self
-                        .pending_file_view_mutations
-                        .contains_key(&view.session_key)
-                        || self
-                            .session_file_views
-                            .has_plugin_file_at_path(&actor_key.branch_id, &actor_key.path) =>
-                    {
+                    };
+                    if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
                         return Err(LixError::new(
                             LixError::CODE_PLUGIN_OBSERVATION_STALE,
                             "the acknowledged component file identity no longer matches this write",
                         )
                         .with_hint("read the exact file bytes again before retrying the edit"));
                     }
-                    None => {
-                        self.cold_open_semantic_actor(
+                    let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
+                    let after_descriptor = descriptor.clone();
+                    // Acquire serialization first, reopening a benignly evicted
+                    // observation only while its exact durable root is unchanged.
+                    // Then read the root again: a second local session may have
+                    // committed while this request waited for the actor.
+                    let mut lease = self
+                        .lease_or_reopen_observed_actor(
+                            &observation,
                             &actor_key,
                             selected,
                             descriptor.clone(),
                             Arc::clone(&factory),
                             &mut reconciliation.actor_publications,
                         )
-                        .await?
-                    }
-                };
-                if !v2_actor_key_is_descriptor_successor(observation.key(), &actor_key) {
-                    return Err(LixError::new(
-                        LixError::CODE_PLUGIN_OBSERVATION_STALE,
-                        "the acknowledged component file identity no longer matches this write",
-                    )
-                    .with_hint("read the exact file bytes again before retrying the edit"));
-                }
-                let before_descriptor = v2_file_descriptor_from_actor_key(observation.key());
-                let after_descriptor = descriptor.clone();
-                // Acquire serialization first, reopening a benignly evicted
-                // observation only while its exact durable root is unchanged.
-                // Then read the root again: a second local session may have
-                // committed while this request waited for the actor.
-                let mut lease = self
-                    .lease_or_reopen_observed_actor(
-                        &observation,
-                        &actor_key,
-                        selected,
-                        descriptor.clone(),
-                        Arc::clone(&factory),
-                        &mut reconciliation.actor_publications,
-                    )
-                    .await?;
-                let visible_materialization = self
+                        .await?;
+                    let visible_materialization = self
                     .visible_materialization(&file_key)
                     .await?
                     .ok_or_else(|| {
@@ -3825,237 +4060,249 @@ where
                         )
                         .with_hint("read the exact file bytes again before retrying the edit")
                     })?;
-                lease.require_accepted_semantic_root(&visible_materialization.semantic_root)?;
-                let observation_is_current =
-                    observation.semantic_root() == visible_materialization.semantic_root;
-                let observed_bytes = lease.observed_bytes();
-                let built_splices = tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.plugin_splice_discovery"
-                )
-                .in_scope(|| {
-                    build_file_update_splices(
-                        &observed_bytes,
-                        lease.observed_bytes_sha256(),
-                        write.data(),
-                        write.splice_provenance(),
-                        limits,
-                    )
-                })?;
-                let submitted_bytes_sha256 = built_splices.after_sha256;
-                let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
-                let same_length_blob_splice = built_splices.same_length_replacement();
-                let observed_source = ArcByteSource::new(observed_bytes.clone());
-                let submitted_source = ArcByteSource::new(submitted_bytes.clone());
-                let observed_document = lease.observed_document();
-                lease.begin_guest_call()?;
-                let detection_input = match lease.actor_mut().fork_document(observed_document).await
-                {
-                    Ok(document) => document,
-                    Err(error) => return Err(lease.handle_guest_call_error(error)),
-                };
-                let detection_transition = match lease
-                    .actor_mut()
-                    .file_changed(
-                        detection_input,
-                        limits,
-                        WasmFileUpdate {
-                            before_descriptor: before_descriptor.clone(),
-                            after_descriptor: after_descriptor.clone(),
-                            before: Arc::new(observed_source),
-                            edits: built_splices.edits,
-                            after: Arc::new(submitted_source),
-                            creates,
-                        },
-                    )
-                    .instrument(tracing::debug_span!(
+                    lease.require_accepted_semantic_root(&visible_materialization.semantic_root)?;
+                    let observation_is_current =
+                        observation.semantic_root() == visible_materialization.semantic_root;
+                    let observed_bytes = lease.observed_bytes();
+                    let built_splices = tracing::debug_span!(
                         target: "lix_perf",
-                        "lix.perf.plugin_file_changed"
-                    ))
-                    .await
-                {
-                    Ok(transition) => transition,
-                    Err(error) => return Err(lease.handle_guest_call_error(error)),
-                };
-                let detected_transition = match drain_file_transition_changes(
-                    lease.actor_mut(),
-                    detection_transition,
-                    &schemas,
-                    limits,
-                )
-                .instrument(tracing::debug_span!(
-                    target: "lix_perf",
-                    "lix.perf.plugin_drain_changes"
-                ))
-                .await
-                {
-                    Ok(transition) => transition,
-                    Err(error) => return Err(lease.handle_guest_call_error(error)),
-                };
-                if let Err(error) = lease.actor_mut().drop_document(detection_input).await {
-                    return Err(lease.handle_guest_call_error(error));
-                }
-
-                let certified_row_count = detected_transition
-                    .certified_batches
-                    .iter()
-                    .map(|batch| batch.row_count)
-                    .sum::<u64>();
-                write.set_certified_entity_batches(detected_transition.certified_batches.clone());
-                let detection_document = detected_transition.document;
-                let mut counters = detected_transition.counters;
-                let (mut changes, observed_existing_authorities) = match self
-                    .suppress_format_only_noops(selected, detected_transition.changes, &file_key)
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_suppress_noops"
-                    ))
-                    .await
-                {
-                    Ok(changes) => changes,
-                    Err(error) => {
-                        if let Err(cleanup_error) =
-                            lease.actor_mut().drop_document(detection_document).await
-                        {
-                            return Err(lease.handle_guest_call_error(cleanup_error));
-                        }
-                        return Err(lease.handle_guest_call_error(error));
-                    }
-                };
-                let create_rows = match self
-                    .v2_create_rows(
-                        selected,
-                        &mut changes,
-                        create_context,
-                        &file_key,
-                        existing_create_reservation.as_ref(),
-                        Some(&observed_existing_authorities),
+                        "lix.perf.plugin_splice_discovery"
                     )
-                    .instrument(tracing::debug_span!(
-                        target: "lix_perf",
-                        "lix.perf.plugin_create_rows"
-                    ))
-                    .await
-                {
-                    Ok(rows) => rows,
-                    Err(error) => {
-                        if let Err(cleanup_error) =
-                            lease.actor_mut().drop_document(detection_document).await
-                        {
-                            return Err(lease.handle_guest_call_error(cleanup_error));
-                        }
-                        return Err(lease.handle_guest_call_error(error));
-                    }
-                };
-                let (successor_document, materialized_bytes, materialized_bytes_sha256) =
-                    if observation_is_current {
-                        // The actor lease serializes this file and the durable
-                        // root still equals the acknowledged observation. The
-                        // validated file successor is therefore already the
-                        // exact merge result; rendering the same sparse change
-                        // onto the same base would only repeat guest work.
-                        verified_same_length_blob_splice = match visible_materialization.bytes {
-                            VisibleMaterializationBytes::Blob { hash } => same_length_blob_splice
-                                .map(|(offset, length)| (hash, offset, length)),
-                            VisibleMaterializationBytes::Derived { .. } => None,
-                        };
-                        (
-                            detection_document,
-                            submitted_bytes.clone(),
-                            submitted_bytes_sha256,
-                        )
-                    } else {
-                        // Detection happened against a historical session
-                        // document. Apply its sparse merge-resolved delta to
-                        // the actor's current accepted document so concurrent
-                        // different-entity edits compose and same-entity edits
-                        // obey transaction commit order.
-                        if let Err(error) =
-                            lease.actor_mut().drop_document(detection_document).await
-                        {
-                            return Err(lease.handle_guest_call_error(error));
-                        }
-                        let current_document = lease.accepted_document();
-                        let current_bytes = lease.accepted_bytes();
-                        let change_source =
-                            match VecEntityChangeSource::new(changes.clone(), limits) {
-                                Ok(source) => source,
-                                Err(error) => {
-                                    return Err(lease.handle_guest_call_error(error));
-                                }
-                            };
-                        let renderer_input =
-                            match lease.actor_mut().fork_document(current_document).await {
-                                Ok(document) => document,
-                                Err(error) => return Err(lease.handle_guest_call_error(error)),
-                            };
-                        let renderer_transition = match lease
-                            .actor_mut()
-                            .entities_changed(
-                                renderer_input,
-                                limits,
-                                WasmEntityUpdate {
-                                    before_descriptor,
-                                    after_descriptor,
-                                    before: Arc::new(ArcByteSource::new(current_bytes.clone())),
-                                    changes: Box::new(change_source),
-                                },
-                            )
-                            .await
-                        {
-                            Ok(transition) => transition,
-                            Err(error) => return Err(lease.handle_guest_call_error(error)),
-                        };
-                        let rendered_transition = match drain_entity_transition_edits(
-                            lease.actor_mut(),
-                            renderer_transition,
-                            &current_bytes,
-                            None,
-                            None,
+                    .in_scope(|| {
+                        build_file_update_splices(
+                            &observed_bytes,
+                            lease.observed_bytes_sha256(),
+                            write.data(),
+                            write.splice_provenance(),
                             limits,
                         )
-                        .await
-                        {
-                            Ok(transition) => transition,
+                    })?;
+                    let submitted_bytes_sha256 = built_splices.after_sha256;
+                    let host_full_diff_bytes_compared = built_splices.full_diff_bytes_compared;
+                    let same_length_blob_splice = built_splices.same_length_replacement();
+                    let observed_source = ArcByteSource::new(observed_bytes.clone());
+                    let submitted_source = ArcByteSource::new(submitted_bytes.clone());
+                    let observed_document = lease.observed_document();
+                    lease.begin_guest_call()?;
+                    let detection_input =
+                        match lease.actor_mut().fork_document(observed_document).await {
+                            Ok(document) => document,
                             Err(error) => return Err(lease.handle_guest_call_error(error)),
                         };
-                        if let Err(error) = lease.actor_mut().drop_document(renderer_input).await {
+                    let detection_transition = match lease
+                        .actor_mut()
+                        .file_changed(
+                            detection_input,
+                            limits,
+                            WasmFileUpdate {
+                                before_descriptor: before_descriptor.clone(),
+                                after_descriptor: after_descriptor.clone(),
+                                before: Arc::new(observed_source),
+                                edits: built_splices.edits,
+                                after: Arc::new(submitted_source),
+                                creates,
+                            },
+                        )
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_file_changed"
+                        ))
+                        .await
+                    {
+                        Ok(transition) => transition,
+                        Err(error) => return Err(lease.handle_guest_call_error(error)),
+                    };
+                    let detected_transition = match drain_file_transition_changes(
+                        lease.actor_mut(),
+                        detection_transition,
+                        &schemas,
+                        limits,
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_drain_changes"
+                    ))
+                    .await
+                    {
+                        Ok(transition) => transition,
+                        Err(error) => return Err(lease.handle_guest_call_error(error)),
+                    };
+                    if let Err(error) = lease.actor_mut().drop_document(detection_input).await {
+                        return Err(lease.handle_guest_call_error(error));
+                    }
+
+                    let certified_row_count = detected_transition
+                        .certified_batches
+                        .iter()
+                        .map(|batch| batch.row_count)
+                        .sum::<u64>();
+                    write.set_certified_entity_batches(
+                        detected_transition.certified_batches.clone(),
+                    );
+                    let detection_document = detected_transition.document;
+                    let mut counters = detected_transition.counters;
+                    let (mut changes, observed_existing_authorities) = match self
+                        .suppress_format_only_noops(
+                            selected,
+                            detected_transition.changes,
+                            &file_key,
+                        )
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_suppress_noops"
+                        ))
+                        .await
+                    {
+                        Ok(changes) => changes,
+                        Err(error) => {
+                            if let Err(cleanup_error) =
+                                lease.actor_mut().drop_document(detection_document).await
+                            {
+                                return Err(lease.handle_guest_call_error(cleanup_error));
+                            }
                             return Err(lease.handle_guest_call_error(error));
                         }
-                        counters.accumulate(rendered_transition.counters);
-                        counters.shared_renderer_cache_hits = 1;
-                        (
-                            rendered_transition.document,
-                            rendered_transition.bytes.clone(),
-                            rendered_transition.bytes_sha256,
-                        )
                     };
-                counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
-                counters.host_content_classification_bytes = content_classification_bytes
-                    .get(&file_key)
-                    .copied()
-                    .unwrap_or(0);
-                counters.private_document_cache_hits = 1;
-                counters.durable_semantic_changes = u64::try_from(changes.entity_change_count())
-                    .unwrap_or(u64::MAX)
-                    .saturating_add(certified_row_count);
-                self.plugin_host.record_transition_counters(counters);
-                lease.complete_guest_call(
-                    successor_document,
-                    materialized_bytes.clone(),
-                    materialized_bytes_sha256,
-                    materialization_version.clone(),
-                )?;
-                (
-                    changes,
-                    PendingPluginActorPublication::Existing {
-                        lease,
-                        successor_key: actor_key,
-                        view,
-                    },
-                    materialized_bytes,
-                    create_rows,
-                )
+                    let create_rows = match self
+                        .v2_create_rows(
+                            selected,
+                            &mut changes,
+                            create_context,
+                            &file_key,
+                            existing_create_reservation.as_ref(),
+                            Some(&observed_existing_authorities),
+                        )
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_create_rows"
+                        ))
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        Err(error) => {
+                            if let Err(cleanup_error) =
+                                lease.actor_mut().drop_document(detection_document).await
+                            {
+                                return Err(lease.handle_guest_call_error(cleanup_error));
+                            }
+                            return Err(lease.handle_guest_call_error(error));
+                        }
+                    };
+                    let (successor_document, materialized_bytes, materialized_bytes_sha256) =
+                        if observation_is_current {
+                            // The actor lease serializes this file and the durable
+                            // root still equals the acknowledged observation. The
+                            // validated file successor is therefore already the
+                            // exact merge result; rendering the same sparse change
+                            // onto the same base would only repeat guest work.
+                            verified_same_length_blob_splice = match visible_materialization.bytes {
+                                VisibleMaterializationBytes::Blob { hash } => {
+                                    same_length_blob_splice
+                                        .map(|(offset, length)| (hash, offset, length))
+                                }
+                                VisibleMaterializationBytes::Derived { .. } => None,
+                            };
+                            (
+                                detection_document,
+                                submitted_bytes.clone(),
+                                submitted_bytes_sha256,
+                            )
+                        } else {
+                            // Detection happened against a historical session
+                            // document. Apply its sparse merge-resolved delta to
+                            // the actor's current accepted document so concurrent
+                            // different-entity edits compose and same-entity edits
+                            // obey transaction commit order.
+                            if let Err(error) =
+                                lease.actor_mut().drop_document(detection_document).await
+                            {
+                                return Err(lease.handle_guest_call_error(error));
+                            }
+                            let current_document = lease.accepted_document();
+                            let current_bytes = lease.accepted_bytes();
+                            let change_source =
+                                match VecEntityChangeSource::new(changes.clone(), limits) {
+                                    Ok(source) => source,
+                                    Err(error) => {
+                                        return Err(lease.handle_guest_call_error(error));
+                                    }
+                                };
+                            let renderer_input =
+                                match lease.actor_mut().fork_document(current_document).await {
+                                    Ok(document) => document,
+                                    Err(error) => return Err(lease.handle_guest_call_error(error)),
+                                };
+                            let renderer_transition = match lease
+                                .actor_mut()
+                                .entities_changed(
+                                    renderer_input,
+                                    limits,
+                                    WasmEntityUpdate {
+                                        before_descriptor,
+                                        after_descriptor,
+                                        before: Arc::new(ArcByteSource::new(current_bytes.clone())),
+                                        changes: Box::new(change_source),
+                                    },
+                                )
+                                .await
+                            {
+                                Ok(transition) => transition,
+                                Err(error) => return Err(lease.handle_guest_call_error(error)),
+                            };
+                            let rendered_transition = match drain_entity_transition_edits(
+                                lease.actor_mut(),
+                                renderer_transition,
+                                &current_bytes,
+                                None,
+                                None,
+                                limits,
+                            )
+                            .await
+                            {
+                                Ok(transition) => transition,
+                                Err(error) => return Err(lease.handle_guest_call_error(error)),
+                            };
+                            if let Err(error) =
+                                lease.actor_mut().drop_document(renderer_input).await
+                            {
+                                return Err(lease.handle_guest_call_error(error));
+                            }
+                            counters.accumulate(rendered_transition.counters);
+                            counters.shared_renderer_cache_hits = 1;
+                            (
+                                rendered_transition.document,
+                                rendered_transition.bytes.clone(),
+                                rendered_transition.bytes_sha256,
+                            )
+                        };
+                    counters.host_full_diff_bytes_compared = host_full_diff_bytes_compared;
+                    counters.host_content_classification_bytes = content_classification_bytes
+                        .get(&file_key)
+                        .copied()
+                        .unwrap_or(0);
+                    counters.private_document_cache_hits = 1;
+                    counters.durable_semantic_changes =
+                        u64::try_from(changes.entity_change_count())
+                            .unwrap_or(u64::MAX)
+                            .saturating_add(certified_row_count);
+                    self.plugin_host.record_transition_counters(counters);
+                    lease.complete_guest_call(
+                        successor_document,
+                        materialized_bytes.clone(),
+                        materialized_bytes_sha256,
+                        materialization_version.clone(),
+                    )?;
+                    (
+                        changes,
+                        PendingPluginActorPublication::Existing {
+                            lease,
+                            successor_key: actor_key,
+                            view,
+                        },
+                        materialized_bytes,
+                        create_rows,
+                    )
+                }
             } else {
                 let store_permit = self
                     .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
@@ -4323,7 +4570,7 @@ where
                     .with_hint("commit the byte transition before editing semantic entities"));
                 }
                 None => {
-                    let cache = self.plugin_host.actor_cache();
+                    let cache = self.plugin_host.actor_cache().clone();
                     let visible_materialization = self
                         .visible_materialization(&file_key)
                         .await?
