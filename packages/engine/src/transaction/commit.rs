@@ -902,6 +902,24 @@ fn current_state_delta_from_state_row(
     })
 }
 
+fn host_certified_batch_owns_live_row(
+    row: PreparedStateRowRef<'_>,
+    branch_id: &str,
+    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+) -> bool {
+    // A complete certified batch replaces only the incoming live rows. An
+    // ownership transition may stage tombstones for the previous plugin under
+    // the same file/schema pair; those must remain HOT overlays so the old
+    // entity identities disappear and collection counts are decremented.
+    row.snapshot.is_some()
+        && row.file_id.is_some_and(|file_id| {
+            host_certified_file_schemas
+                .get(branch_id)
+                .and_then(|files| files.get(file_id.as_str()))
+                .is_some_and(|schemas| schemas.contains(row.schema_key.as_str()))
+        })
+}
+
 impl crate::live_state::DeferredFreshHotRows for PreparedStateBatch {
     fn row(&self, index: usize) -> crate::live_state::DeferredFreshHotRowRef<'_> {
         let row = PreparedStateBatch::row(self, index);
@@ -2007,12 +2025,11 @@ async fn stage_tracked_head(
                 .iter()
                 .filter(|&&row_index| {
                     let row = state_rows.row(row_index);
-                    !row.file_id.is_some_and(|file_id| {
-                        host_certified_file_schemas
-                            .get(&root.branch_id)
-                            .and_then(|files| files.get(file_id.as_str()))
-                            .is_some_and(|schemas| schemas.contains(row.schema_key.as_str()))
-                    })
+                    !host_certified_batch_owns_live_row(
+                        row,
+                        &root.branch_id,
+                        host_certified_file_schemas,
+                    )
                 })
                 .map(|&row_index| current_state_delta_from_state_row(state_rows.row(row_index)))
                 .collect::<Result<Vec<_>, _>>()?
@@ -3451,6 +3468,47 @@ mod tests {
 
     fn ts(value: &str) -> LixTimestamp {
         LixTimestamp::expect_parse("timestamp", value)
+    }
+
+    #[test]
+    fn host_certified_ownership_change_preserves_old_plugin_tombstone() {
+        let mut old_plugin_tombstone = tracked_branch_row("main", "old-plugin-delete");
+        old_plugin_tombstone.entity_pk = EntityPk::single("old-plugin-line");
+        old_plugin_tombstone.schema_key = "git_text_line_v2".into();
+        old_plugin_tombstone.file_id = Some("file-a".into());
+        old_plugin_tombstone.snapshot = None;
+
+        let mut new_plugin_live = tracked_branch_row("main", "new-plugin-create");
+        new_plugin_live.entity_pk = EntityPk::single("new-plugin-line");
+        new_plugin_live.schema_key = "git_text_line_v2".into();
+        new_plugin_live.file_id = Some("file-a".into());
+
+        let certified = BTreeMap::from([(
+            "main".to_string(),
+            BTreeMap::from([(
+                "file-a".to_string(),
+                BTreeSet::from(["git_text_line_v2".to_string()]),
+            )]),
+        )]);
+
+        assert!(
+            !host_certified_batch_owns_live_row(
+                old_plugin_tombstone.borrowed(),
+                "main",
+                &certified,
+            ),
+            "the previous owner's tombstone must remain in HOT publication",
+        );
+        assert!(
+            current_state_delta_from_state_row(old_plugin_tombstone.borrowed())
+                .expect("ownership tombstone should lower")
+                .deleted,
+            "the retained row must decrement collection counts as a deletion",
+        );
+        assert!(
+            host_certified_batch_owns_live_row(new_plugin_live.borrowed(), "main", &certified),
+            "the certified batch owns the replacement live row",
+        );
     }
 
     #[test]
