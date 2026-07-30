@@ -205,7 +205,7 @@ pub(crate) enum JsonSlot {
 
 /// Inline threshold in bytes. Payloads at or under this length skip the
 /// json_store entirely.
-pub(crate) const JSON_INLINE_MAX_BYTES: usize = 256;
+pub(crate) const JSON_INLINE_MAX_BYTES: usize = 1024;
 
 impl JsonSlot {
     pub(crate) fn from_json(json: &str) -> Self {

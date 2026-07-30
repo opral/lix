@@ -1280,6 +1280,104 @@ where
         )
     }
 
+    pub(crate) async fn load_tree_diff_comparison_payloads(
+        &mut self,
+        batch: &TrackedStateTreeDiffBatch,
+    ) -> Result<TrackedStatePayloadBatch, LixError> {
+        self.validate_tree_diff_batch_against_delta_index(batch)
+            .await?;
+        let changes = self
+            .load_routed_tree_diff_changes(&batch.comparison_rows())
+            .await?;
+        TrackedStatePayloadBatch::from_payloads(
+            changes
+                .into_iter()
+                .map(|(change_id, change)| (change_id, change.snapshot, change.metadata)),
+        )
+    }
+
+    async fn validate_tree_diff_batch_against_delta_index(
+        &self,
+        batch: &TrackedStateTreeDiffBatch,
+    ) -> Result<(), LixError> {
+        let rows = batch.side_rows().collect::<Vec<_>>();
+        let mut by_commit = BTreeMap::<CommitId, Vec<TrackedStateTreeDiffRowRef<'_>>>::new();
+        for row in rows {
+            by_commit.entry(row.commit_id()).or_default().push(row);
+        }
+        for (commit_id, commit_rows) in by_commit {
+            let mut encoded_keys =
+                TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
+            for row in &commit_rows {
+                encoded_keys.push(TrackedStateKeyRef {
+                    schema_key: row.schema_key(),
+                    file_id: row.file_id(),
+                    entity_pk: row.entity_pk(),
+                });
+            }
+            let loaded = storage::load_commit_delta_values_encoded(
+                &self.store,
+                commit_id,
+                &encoded_keys.finish(),
+            )
+            .await?;
+            let mut fallback_rows = Vec::new();
+            let mut fallback_keys =
+                TrackedStateKeyBatchBuilder::with_row_capacity(commit_rows.len());
+            for (index, (row, value)) in commit_rows.iter().zip(&loaded).enumerate() {
+                if value.is_none()
+                    && row.deleted()
+                    && let Some(file_id) = row.file_id()
+                {
+                    let key = cascade_payload_key(file_id);
+                    fallback_keys.push(TrackedStateKeyRef {
+                        schema_key: &key.schema_key,
+                        file_id: key.file_id.as_deref(),
+                        entity_pk: &key.entity_pk,
+                    });
+                    fallback_rows.push(index);
+                }
+            }
+            let fallback_values = storage::load_commit_delta_values_encoded(
+                &self.store,
+                commit_id,
+                &fallback_keys.finish(),
+            )
+            .await?;
+            let mut fallbacks = vec![None; commit_rows.len()];
+            for (index, value) in fallback_rows.into_iter().zip(fallback_values) {
+                fallbacks[index] = value;
+            }
+            for ((row, value), fallback) in commit_rows.iter().zip(loaded).zip(fallbacks) {
+                if value.as_ref().is_some_and(|value| {
+                    value.change_id == row.change_id()
+                        && value.commit_id == row.commit_id()
+                        && value.deleted == row.deleted()
+                        && value.updated_at() == row.updated_at()
+                }) {
+                    continue;
+                }
+                if let Some(cascade) = fallback
+                    && cascade.deleted
+                    && cascade.change_id == row.change_id()
+                    && cascade.commit_id == row.commit_id()
+                    && cascade.updated_at() == row.updated_at()
+                {
+                    continue;
+                }
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    format!(
+                        "tracked-state diff row '{}' does not match commit '{}' delta index",
+                        row.change_id(),
+                        commit_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn load_and_validate_diff_row_changes(
         &mut self,
         rows: &[&TrackedStateDiffRow],
@@ -6324,36 +6422,64 @@ mod tests {
 
     #[tokio::test]
     async fn inline_threshold_boundary_routes_payloads_deterministically() {
-        // 256 bytes inlines into the change record; 257 takes the
-        // json_store ref path. Both must read back identically.
+        // The exact threshold inlines into the change record; one byte over
+        // takes the json_store ref path. Both must read back identically.
         let storage = StorageAdapter::new(Memory::new());
         let tracked_state = TrackedStateContext::new();
         // row_with_value wraps values as {"value":"<v>"} (12 framing bytes);
         // size the inner strings so the stored payloads land exactly at the
         // threshold and one byte over.
+        let at_len = crate::json_store::JSON_INLINE_MAX_BYTES;
+        let over_len = at_len + 1;
         let rows = [
-            row_with_value("entity-at", "change-at", "commit-1", &"a".repeat(256 - 12)),
+            row_with_value(
+                "entity-at",
+                "change-at",
+                "commit-1",
+                &"a".repeat(at_len - 12),
+            ),
             row_with_value(
                 "entity-over",
                 "change-over",
                 "commit-1",
-                &"b".repeat(257 - 12),
+                &"b".repeat(over_len - 12),
             ),
         ];
         let at_threshold = rows[0].snapshot_content.clone().expect("payload");
         let over_threshold = rows[1].snapshot_content.clone().expect("payload");
-        assert_eq!(at_threshold.len(), 256);
-        assert_eq!(over_threshold.len(), 257);
+        assert_eq!(at_threshold.len(), at_len);
+        assert_eq!(over_threshold.len(), over_len);
         write_root_for_test(&storage, &tracked_state, "commit-1", None, &rows)
             .await
             .expect("root should write");
 
-        let mut reader = tracked_state.reader(
-            storage
-                .begin_read(StorageReadOptions::default())
-                .await
-                .expect("read should open"),
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let json_refs = [
+            crate::json_store::JsonRef::for_content(at_threshold.as_bytes()),
+            crate::json_store::JsonRef::for_content(over_threshold.as_bytes()),
+        ];
+        let stored = crate::json_store::JsonStoreContext::new()
+            .load_bytes_many(
+                &read,
+                crate::json_store::JsonLoadRequestRef {
+                    refs: &json_refs,
+                    scope: crate::json_store::JsonReadScopeRef::OutOfBand,
+                },
+            )
+            .await
+            .expect("json_store boundary rows should load")
+            .into_values();
+        assert_eq!(stored[0], None, "threshold payload must stay inline");
+        assert_eq!(
+            stored[1].as_deref(),
+            Some(over_threshold.as_bytes()),
+            "over-threshold payload must use the json_store"
         );
+
+        let mut reader = tracked_state.reader(read);
         let scanned = reader
             .scan_batch_at_commit("commit-1", &test_schema_scan_request())
             .await
@@ -6987,6 +7113,7 @@ mod tests {
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             )
             .await
@@ -7098,6 +7225,7 @@ mod tests {
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             )
             .await
@@ -7143,6 +7271,7 @@ mod tests {
                         file_ids: vec![NullableKeyFilter::Value(FILE_ID.to_string())],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             )
             .await
@@ -7268,6 +7397,7 @@ mod tests {
                         entity_pks: vec![EntityPk::single("line-1")],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             )
             .await
@@ -7426,6 +7556,7 @@ mod tests {
                 schema_keys: vec!["test_schema".to_string()],
                 ..Default::default()
             },
+            ..Default::default()
         }
     }
 

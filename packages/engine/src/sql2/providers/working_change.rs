@@ -278,6 +278,7 @@ impl WorkingChangeRoute {
                         .collect(),
                     include_tombstones: true,
                 },
+                retain_payloads: false,
             },
             contradictory,
         })
