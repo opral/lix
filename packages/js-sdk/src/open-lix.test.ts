@@ -1745,6 +1745,25 @@ test("execute accepts explicit Value parameters", async () => {
 	await lix.close();
 });
 
+test("information_schema.columns SELECT * exposes the Lix column contract", async () => {
+	const lix = await openLix();
+
+	const result = await lix.execute(
+		"SELECT * FROM information_schema.columns WHERE table_name = 'lix_file'",
+	);
+
+	expect(result.rows.length).toBeGreaterThan(0);
+	expect(result.columns).toContain("lix_value_kind");
+	expect(result.columns).toContain("lix_insert_policy");
+	expect(
+		result.rows.find((row) => row.get("column_name") === "data")?.get(
+			"character_octet_length",
+		),
+	).toBeNull();
+
+	await lix.close();
+});
+
 test("execute rejects invalid explicit Value parameters", async () => {
 	const lix = await openLix();
 

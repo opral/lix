@@ -296,6 +296,26 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_file_unknown_metadata_column_suggests_public_name,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+        let error = session
+            .execute("SELECT metadata FROM lix_file", &[])
+            .await
+            .expect_err("metadata should not be a public column");
+        assert_eq!(error.code, LixError::CODE_COLUMN_NOT_FOUND);
+        assert_eq!(error.hint.as_deref(), Some("Did you mean lixcol_metadata?"));
+    }
+);
+
+simulation_test!(
     lix_file_lower_path_like_keeps_the_blob_revision_for_guarded_updates,
     |sim| async move {
         let engine = sim.boot_engine().await;

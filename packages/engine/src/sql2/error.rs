@@ -95,7 +95,11 @@ fn classify_datafusion_error(error: &DataFusionError) -> LixError {
             || lower.contains("does not exist")
             || lower.contains("no field named"))
     {
-        return LixError::new(LixError::CODE_COLUMN_NOT_FOUND, message);
+        let error = LixError::new(LixError::CODE_COLUMN_NOT_FOUND, message);
+        if lower.contains("no field named metadata.") && lower.contains("lixcol_metadata") {
+            return error.with_hint("Did you mean lixcol_metadata?");
+        }
+        return error;
     }
 
     if lower.contains("schema validation") {
