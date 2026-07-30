@@ -23,7 +23,7 @@ const CHECKPOINT_GC_MIN_AGE: u64 = 64;
 // Once history is mature, each successful sweep grows the next interval in
 // proportion to retained checkpoint history. Full-sweep positions therefore
 // grow geometrically instead of producing fixed-cadence quadratic work.
-const CHECKPOINT_GC_HISTORY_FRACTION: u64 = 8;
+const CHECKPOINT_GC_HISTORY_FRACTION: u64 = 1;
 
 struct CreateCheckpointOutcome {
     receipt: CreateCheckpointReceipt,
@@ -249,7 +249,7 @@ mod tests {
         assert!(checkpoint_gc_due(early).expect("initial GC state should be due"));
 
         let last_gc_sequence = 8_000;
-        let scaled_age = last_gc_sequence / 8;
+        let scaled_age = last_gc_sequence;
         let mut mature = state(last_gc_sequence + scaled_age - 1, last_gc_sequence);
         assert!(!checkpoint_gc_due(mature).expect("mature GC state should be valid"));
         mature.checkpoint_sequence += 1;
@@ -269,7 +269,7 @@ mod tests {
             }
         }
         assert!(
-            sweep_count < 50,
+            sweep_count < 10,
             "geometric cadence unexpectedly scheduled {sweep_count} sweeps"
         );
     }

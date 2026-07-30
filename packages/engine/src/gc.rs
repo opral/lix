@@ -112,8 +112,8 @@ struct StoredCheckpointGcState {
 /// Stages one branch's recovery-root rotation.
 ///
 /// The caller owns the surrounding transaction. Replacing the key drops the
-/// prior interval from the next GC root set without ever exposing an
-/// intermediate root-less checkpoint.
+/// prior interval from the next GC root set without ever exposing a
+/// checkpoint that lacks durable commit-delta reconstruction authority.
 pub(crate) fn stage_recovery_ref_rotation(
     writes: &mut StorageWriteSet,
     recovery: &CheckpointRecoveryRef,

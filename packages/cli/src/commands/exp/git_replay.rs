@@ -123,6 +123,7 @@ struct ReplayProfilePhaseTotals {
     prepare_ms: f64,
     build_sql_ms: f64,
     execute_ms: f64,
+    checkpoint_ms: f64,
     verify_ms: f64,
     total_ms: f64,
 }
@@ -200,6 +201,7 @@ struct ReplayCommitProfile {
     prepare_ms: f64,
     build_sql_ms: f64,
     execute_ms: f64,
+    checkpoint_ms: Option<f64>,
     plugin_counters: ReplayPluginCounters,
     verify_ms: Option<f64>,
     total_ms: f64,
@@ -214,6 +216,7 @@ struct ReplayProfileReport {
     branch: String,
     from_commit: Option<String>,
     num_commits_requested: Option<u32>,
+    checkpoint_every: Option<u32>,
     verify_state: bool,
     plugin_install_ms: f64,
     baseline_seed_parent: Option<String>,
@@ -382,6 +385,7 @@ where
     let mut verified = 0usize;
     let mut phase_totals = ReplayProfilePhaseTotals::default();
     let mut commit_profiles = Vec::<ReplayCommitProfile>::with_capacity(commits.len());
+    let checkpoint_every = args.checkpoint_every.map(|interval| interval as usize);
 
     println!(
         "[git-replay] replaying {} commits from {} into {}",
@@ -436,6 +440,20 @@ where
         let plugin_counters = lix.plugin_v2_transition_counters().into();
         phase_totals.execute_ms += execute_ms;
         applied += 1;
+        let checkpoint_ms = if checkpoint_every.is_some_and(|interval| (index + 1) % interval == 0)
+        {
+            let checkpoint_started = Instant::now();
+            db::block_on(lix.create_checkpoint()).map_err(|error| {
+                CliError::msg(format!(
+                    "failed to checkpoint after replay commit {commit_sha}: {error}"
+                ))
+            })?;
+            let elapsed_ms = duration_to_ms(checkpoint_started.elapsed());
+            phase_totals.checkpoint_ms += elapsed_ms;
+            Some(elapsed_ms)
+        } else {
+            None
+        };
 
         if args.verify_state {
             let verify_started = Instant::now();
@@ -466,6 +484,7 @@ where
             prepare_ms,
             build_sql_ms,
             execute_ms,
+            checkpoint_ms,
             plugin_counters,
             verify_ms,
             total_ms,
@@ -554,6 +573,7 @@ where
                 branch: args.branch.clone(),
                 from_commit: args.from_commit.clone(),
                 num_commits_requested: args.num_commits,
+                checkpoint_every: args.checkpoint_every,
                 verify_state: args.verify_state,
                 plugin_install_ms,
                 baseline_seed_parent,
@@ -2595,6 +2615,7 @@ mod tests {
             branch: "missing-ref".to_string(),
             from_commit: None,
             num_commits: None,
+            checkpoint_every: None,
             verify_state: false,
             force: true,
             profile_json: None,
@@ -2896,6 +2917,7 @@ mod tests {
             branch: "main".to_string(),
             from_commit: None,
             num_commits: None,
+            checkpoint_every: Some(1),
             verify_state: true,
             force: false,
             profile_json: Some(profile.clone()),
@@ -2919,10 +2941,29 @@ mod tests {
             Some(1),
             "the empty Git commit must remain a Lix revision"
         );
+        assert_eq!(profile_json["checkpoint_every"], 1);
+        assert!(
+            profile_json["commits"]
+                .as_array()
+                .expect("profile commits should be an array")
+                .iter()
+                .all(|commit| commit["checkpoint_ms"].is_number()),
+            "checkpoint-every replay must profile every checkpoint"
+        );
 
         let storage = RocksDB::open(&output).expect("replay RocksDB should reopen");
         let lix = db::block_on(open_lix_with_storage(storage))
             .expect("replay Lix should reopen with installed plugin");
+        let checkpoint_rows =
+            db::block_on(lix.execute("SELECT count(*) AS count FROM lix_checkpoint", &[]))
+                .expect("checkpoint history should be queryable");
+        assert_eq!(
+            checkpoint_rows.rows()[0]
+                .get::<i64>("count")
+                .expect("checkpoint count should decode"),
+            5,
+            "initialization plus four replayed commits should publish five checkpoints"
+        );
         let text_rows = db::block_on(lix.execute(
             "SELECT lixcol_entity_pk FROM git_text_line_v2 WHERE lixcol_file_id = ?",
             &[Value::Text(stable_file_id(&git_path(b"docs/renamed.txt")))],
@@ -2982,6 +3023,7 @@ mod tests {
                     branch: "main".to_string(),
                     from_commit: None,
                     num_commits: Some(1),
+                    checkpoint_every: None,
                     verify_state: true,
                     force: false,
                     profile_json: Some(profile.clone()),
@@ -3081,6 +3123,7 @@ mod tests {
             branch: "main".to_string(),
             from_commit: None,
             num_commits: Some(100),
+            checkpoint_every: None,
             verify_state: true,
             force: false,
             profile_json: Some(profile.clone()),
@@ -3227,6 +3270,7 @@ mod tests {
             branch: "main".to_string(),
             from_commit: None,
             num_commits: Some(2),
+            checkpoint_every: None,
             verify_state: true,
             force: false,
             profile_json: Some(profile.clone()),

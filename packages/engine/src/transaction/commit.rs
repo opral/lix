@@ -159,7 +159,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .filter(|root| root.publish_head)
         .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
-    let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
+    // Checkpoints are logical compaction boundaries, not full immutable-tree
+    // snapshots. Their absolute commit-delta segments plus the previous
+    // checkpoint parent already form the persistent history representation;
+    // forcing a second full-state root made N checkpoints rewrite
+    // 1 + 2 + ... + N rows. Rootless history readers reconstruct from the
+    // nearest available ancestor root when a historical scan actually needs
+    // one, while eager HOT state remains complete at publication time.
+    let force_root_fence = false;
     // The current-state protocol publishes automatic tracked heads through
     // one direct control record.
     // Do not also synthesize a mutable `lix_branch_ref` current row for every
@@ -201,7 +208,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &[],
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
-        has_checkpoint_publication,
+        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -247,7 +254,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_selection,
-        has_checkpoint_publication,
+        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -894,9 +901,9 @@ fn current_state_delta_from_engine_row(
 }
 
 /// Stages a compact, identity-addressable change record for every tracked
-/// commit. Sparse immutable roots remain the scan/checkpoint structure; this
-/// index is the missing point-read structure for rootless first-parent
-/// history.
+/// commit. Immutable roots are optional cold accelerators; this index is the
+/// authoritative point-read and reconstruction structure for rootless
+/// first-parent history.
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
@@ -3023,10 +3030,11 @@ async fn stage_tracked_roots(
     Ok(())
 }
 
-/// Immutable roots are a cold-path history structure. Keep them at topology
-/// and checkpoint fences, plus any staged first-parent ancestors necessary to
-/// build that fence in one atomic write set. Ordinary serial commits are
-/// represented only by the changelog and the durable current-state projection.
+/// Immutable roots are an optional cold-path history accelerator. A caller
+/// that explicitly requests a fence also stages any missing first-parent
+/// ancestors in the same atomic write set. Normal serial and checkpoint
+/// commits use compact absolute deltas plus the durable current-state
+/// projection.
 fn tracked_root_fence_ids(
     tracked_roots: &[PendingTrackedRoot],
     force_all: bool,
