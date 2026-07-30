@@ -17,9 +17,19 @@ use crate::tracked_state::types::{
 use crate::tracked_state::{TrackedStateFilter, TrackedStateStoreReader};
 
 /// Filter for comparing two tracked-state commit roots.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStateDiffRequest {
     pub(crate) filter: TrackedStateFilter,
+    pub(crate) retain_payloads: bool,
+}
+
+impl Default for TrackedStateDiffRequest {
+    fn default() -> Self {
+        Self {
+            filter: TrackedStateFilter::default(),
+            retain_payloads: true,
+        }
+    }
 }
 
 /// Changed tracked-state rows between two commit roots.
@@ -39,10 +49,10 @@ impl Eq for TrackedStateDiff {}
 
 /// Change payload columns retained by a tracked-state diff.
 ///
-/// Diff validation already loads every changed row's immutable changelog
-/// record. Keeping those payload slots behind one `Arc` lets subsequent merge
-/// analysis compare cross-branch change ids without reading or cloning the
-/// same records again. Logical rows are resolved through the change-id
+/// Merge/checkpoint diff validation loads every changed row's immutable
+/// payload. Identity-only SQL diffs retain only the live/live comparison
+/// subset. Keeping either set behind one `Arc` lets downstream analysis reuse
+/// it without cloning records. Logical rows resolve through the change-id
 /// ordinal index and borrow the snapshot/metadata columns in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrackedStatePayloadBatch {
@@ -329,11 +339,13 @@ impl TrackedStateDiff {
 
 /// Diffs two tracked-state commit roots with hash-guided subtree skipping.
 ///
-/// Commit-root first-parent metadata is bound to the changelog. Every emitted
-/// row point-loads its change record and validates identity, deletion, and
-/// update time. Winner reachability, inherited creation time, and absence of
-/// omitted unchanged rows belong to the explicit full-root integrity audit;
-/// proving those here would make sparse diff O(total rows).
+/// Commit-root first-parent metadata is bound to the changelog. Payload-
+/// retaining consumers validate every emitted row against its immutable
+/// change record. Identity-only SQL consumers validate the packed delta leaf
+/// and hydrate payloads only for live/live equality classification. Winner
+/// reachability, inherited creation time, and absence of omitted unchanged
+/// rows belong to the explicit full-root integrity audit; proving those here
+/// would make sparse diff O(total rows).
 pub(crate) async fn diff_commits<S>(
     reader: &mut TrackedStateStoreReader<S>,
     left_commit_id: &str,
@@ -353,13 +365,18 @@ where
     // turn every sparse diff back into an O(total rows) scan.
     //
     // Rootless rows still come from an independently stored packed-delta
-    // index. Validate its identity, deletion flag, and timestamp against the
-    // referenced immutable ChangeRecord exactly as we do for durable tree
-    // rows. This also makes a missing ChangeRecord an error instead of letting
-    // an added/removed diff proceed without its authoritative payload.
-    let payloads = reader
-        .validate_tree_diff_batch_and_load_payloads(&tree_diff)
-        .await?;
+    // index. Merge/checkpoint consumers retain full payload authority; SQL
+    // consumers validate the allocation-free leaf index and avoid decoding
+    // payload sidecars for added/removed rows.
+    let payloads = if request.retain_payloads {
+        reader
+            .validate_tree_diff_batch_and_load_payloads(&tree_diff)
+            .await?
+    } else {
+        reader
+            .load_tree_diff_comparison_payloads(&tree_diff)
+            .await?
+    };
 
     // Rows are identity-only; payload equality needs the change records when
     // a live/live pair carries different change ids (cross-branch writes can
@@ -563,6 +580,34 @@ impl TrackedStateTreeDiffBatch {
                     })
             },
         )
+    }
+
+    pub(crate) fn comparison_rows(&self) -> Vec<TrackedStateTreeDiffRowRef<'_>> {
+        let Some(identities) = self.identities.as_deref() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for (ordinal, (before, after)) in self.before.iter().zip(&self.after).enumerate() {
+            let (Some(before), Some(after)) = (before.as_ref(), after.as_ref()) else {
+                continue;
+            };
+            if before.deleted || after.deleted || before.change_id == after.change_id {
+                continue;
+            }
+            let ordinal =
+                u32::try_from(ordinal).expect("tree diff batch row count is bounded to u32");
+            rows.push(TrackedStateTreeDiffRowRef {
+                identities,
+                ordinal,
+                value: before,
+            });
+            rows.push(TrackedStateTreeDiffRowRef {
+                identities,
+                ordinal,
+                value: after,
+            });
+        }
+        rows
     }
 
     fn into_columns(
@@ -1637,6 +1682,7 @@ mod tests {
                         )],
                         ..Default::default()
                     },
+                    ..Default::default()
                 },
             )
             .await
@@ -1947,6 +1993,27 @@ mod tests {
                 .contains("does not match changelog change identity")
                 || error.message.contains("changelog commit"),
             "unexpected error: {error}"
+        );
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("read should open");
+        let error = tracked_state
+            .reader(read)
+            .diff_commits(
+                "left",
+                "right-corrupt",
+                &TrackedStateDiffRequest {
+                    retain_payloads: false,
+                    ..TrackedStateDiffRequest::default()
+                },
+            )
+            .await
+            .expect_err("identity-only diff must validate the packed delta leaf");
+        assert!(
+            error.message.contains("delta index") || error.message.contains("changelog commit"),
+            "unexpected identity-only validation error: {error}"
         );
     }
 

@@ -1,4 +1,4 @@
-//! V18 row-addressable current state with schema-level file membership.
+//! V19 row-addressable current state with dirty-inline fingerprints.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
@@ -27,7 +27,7 @@ use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v17";
+pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v19";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
@@ -2777,7 +2777,8 @@ where
             let row_index = snapshots.len();
             match value.snapshot {
                 HeadSlotView::None => snapshots.push(None),
-                HeadSlotView::Inline(snapshot) => {
+                HeadSlotView::Inline(snapshot)
+                | HeadSlotView::InlineFingerprinted { json: snapshot, .. } => {
                     snapshots.push(Some(bytes.slice_ref(snapshot.as_bytes())));
                 }
                 HeadSlotView::Ref(json_ref) => {
@@ -4234,8 +4235,8 @@ fn checked_add_hot_next_value_capacity(
         (0, 0)
     } else {
         (
-            encoded_hot_slot_len(delta.snapshot),
-            encoded_hot_slot_len(delta.metadata),
+            encoded_hot_slot_len(delta.snapshot, active_checkpoint),
+            encoded_hot_slot_len(delta.metadata, active_checkpoint),
         )
     };
     // Keep the plan bounded by the same on-disk u32 fields the encoder checks.
@@ -4253,10 +4254,13 @@ fn checked_add_hot_next_value_capacity(
     total.checked_add(encoded_len)
 }
 
-fn encoded_hot_slot_len(slot: JsonSlotRef<'_>) -> usize {
+fn encoded_hot_slot_len(slot: JsonSlotRef<'_>, fingerprint_inline: bool) -> usize {
     match slot {
         JsonSlotRef::None => 0,
         JsonSlotRef::Ref(_) => JSON_REF_BYTES,
+        JsonSlotRef::Inline(json) if fingerprint_inline => {
+            JSON_REF_BYTES.saturating_add(json.len())
+        }
         JsonSlotRef::Inline(json) => json.len(),
     }
 }
