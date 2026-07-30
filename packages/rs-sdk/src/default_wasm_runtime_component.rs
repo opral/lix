@@ -2226,7 +2226,20 @@ struct EntityWorkerOutput {
 
 struct HydrateWorkerOutput {
     replacement: Option<Bytes>,
+    accepted_len: u64,
     counters: WasmTransitionCounters,
+}
+
+fn hydration_replacement_edit(replacement_len: u64, accepted_len: u64) -> WasmOutputSplice {
+    WasmOutputSplice {
+        offset: 0,
+        delete_len: accepted_len,
+        insert: WasmGuestBytes::Output(WasmOutputRange {
+            index: 0,
+            offset: 0,
+            length: replacement_len,
+        }),
+    }
 }
 
 impl V3Worker {
@@ -2797,6 +2810,11 @@ impl V3Worker {
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
+        let accepted_len = input
+            .accepted
+            .as_ref()
+            .map(|accepted| accepted.len())
+            .unwrap_or(0);
         let bytes = input
             .accepted
             .as_ref()
@@ -2940,6 +2958,7 @@ impl V3Worker {
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(HydrateWorkerOutput {
             replacement: rendered,
+            accepted_len,
             counters,
         })
     }
@@ -3171,15 +3190,7 @@ impl WasmComponentActor for V3Actor {
                 },
             );
             Some(WasmEditPage {
-                edits: vec![WasmOutputSplice {
-                    offset: 0,
-                    delete_len: 0,
-                    insert: WasmGuestBytes::Output(WasmOutputRange {
-                        index: 0,
-                        offset: 0,
-                        length,
-                    }),
-                }],
+                edits: vec![hydration_replacement_edit(length, resolved.accepted_len)],
                 outputs: Some(outputs),
             })
         } else {
@@ -3902,6 +3913,27 @@ mod tests {
         assert_eq!(
             duplicate_csv.message,
             "a component entity key may occur only once across certified packet pages"
+        );
+    }
+
+    #[test]
+    fn hydration_replacement_deletes_the_complete_accepted_blob() {
+        assert_eq!(
+            hydration_replacement_edit(17, 41),
+            WasmOutputSplice {
+                offset: 0,
+                delete_len: 41,
+                insert: WasmGuestBytes::Output(WasmOutputRange {
+                    index: 0,
+                    offset: 0,
+                    length: 17,
+                }),
+            }
+        );
+        assert_eq!(
+            hydration_replacement_edit(17, 0).delete_len,
+            0,
+            "derived hydration still replaces an empty accepted source"
         );
     }
 
