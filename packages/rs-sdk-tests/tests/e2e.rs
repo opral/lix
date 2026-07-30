@@ -4707,11 +4707,13 @@ async fn v3_json_direct_cold_successor_preserves_durable_identity() {
         .map(|entity| entity.key.clone())
         .collect::<Vec<_>>();
 
-    let mut limits = WasmTransitionLimits::default();
-    limits.max_page_bytes = 64 * 1024;
-    limits.max_record_bytes = 64 * 1024;
-    limits.max_total_bytes = 64 * 1024;
-    limits.max_inline_input_bytes = 64 * 1024;
+    let limits = WasmTransitionLimits {
+        max_page_bytes: 64 * 1024,
+        max_record_bytes: 64 * 1024,
+        max_total_bytes: 64 * 1024,
+        max_inline_input_bytes: 64 * 1024,
+        ..WasmTransitionLimits::default()
+    };
     let mut actor = factory.instantiate_actor().await.unwrap();
     let cold = actor
         .cold_file_changed(
