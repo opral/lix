@@ -1657,18 +1657,146 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
     ))
 }
 
-/// Returns the schemas when every framed record is an inline snapshot write.
+struct ValidatedCreatedPacketPage {
+    schemas: std::collections::BTreeSet<String>,
+    identities: Vec<CreatedPacketIdentity>,
+}
+
+enum CreatedPacketIdentity {
+    Explicit(WasmEntityKey),
+    Create { schema_key: String, local_ref: u64 },
+}
+
+#[derive(Default)]
+struct CertifiedPacketSchemaKeys {
+    create_refs: std::collections::BTreeSet<u64>,
+    explicit_keys: std::collections::BTreeSet<Vec<String>>,
+    explicit_create_refs: std::collections::BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct CertifiedPacketEntityKeys {
+    schemas: std::collections::BTreeMap<String, CertifiedPacketSchemaKeys>,
+}
+
+impl CertifiedPacketEntityKeys {
+    fn generated_local_ref(components: &[String], creates: WasmCreateContext) -> Option<u64> {
+        let [component] = components else {
+            return None;
+        };
+        let id = uuid::Uuid::parse_str(component).ok()?;
+        if id.to_string() != *component {
+            return None;
+        }
+        let bytes = id.into_bytes();
+        if bytes[..8] != creates.high.to_be_bytes() || bytes[8..12] != creates.low.to_be_bytes() {
+            return None;
+        }
+        Some(u64::from(u32::from_be_bytes(bytes[12..].try_into().ok()?)))
+    }
+
+    fn insert(
+        &mut self,
+        identity: CreatedPacketIdentity,
+        creates: WasmCreateContext,
+        existing: &Self,
+    ) -> Result<(), LixError> {
+        let (schema_key, explicit_key, create_ref) = match identity {
+            CreatedPacketIdentity::Explicit(key) => {
+                let components = key
+                    .entity_pk
+                    .into_iter()
+                    .map(|component| component.as_str().to_owned())
+                    .collect::<Vec<_>>();
+                let create_ref = Self::generated_local_ref(&components, creates);
+                (
+                    key.schema_key.as_str().to_owned(),
+                    Some(components),
+                    create_ref,
+                )
+            }
+            CreatedPacketIdentity::Create {
+                schema_key,
+                local_ref,
+            } => (schema_key, None, Some(local_ref)),
+        };
+        let existing = existing.schemas.get(&schema_key);
+        let page = self.schemas.entry(schema_key).or_default();
+        match explicit_key {
+            Some(key) => {
+                if existing.is_some_and(|keys| keys.explicit_keys.contains(&key))
+                    || !page.explicit_keys.insert(key)
+                    || create_ref.is_some_and(|local_ref| {
+                        existing.is_some_and(|keys| keys.create_refs.contains(&local_ref))
+                            || page.create_refs.contains(&local_ref)
+                    })
+                {
+                    return Err(duplicate_certified_packet_key());
+                }
+                if let Some(local_ref) = create_ref {
+                    page.explicit_create_refs.insert(local_ref);
+                }
+            }
+            None => {
+                let local_ref = create_ref.expect("create identity has a local reference");
+                if existing.is_some_and(|keys| {
+                    keys.create_refs.contains(&local_ref)
+                        || keys.explicit_create_refs.contains(&local_ref)
+                }) || page.explicit_create_refs.contains(&local_ref)
+                    || !page.create_refs.insert(local_ref)
+                {
+                    return Err(duplicate_certified_packet_key());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extend(&mut self, page: Self) {
+        for (schema_key, page) in page.schemas {
+            let keys = self.schemas.entry(schema_key).or_default();
+            keys.create_refs.extend(page.create_refs);
+            keys.explicit_keys.extend(page.explicit_keys);
+            keys.explicit_create_refs.extend(page.explicit_create_refs);
+        }
+    }
+}
+
+fn duplicate_certified_packet_key() -> LixError {
+    v3_error("a component entity key may occur only once across certified packet pages")
+}
+
+fn validate_new_certified_packet_keys(
+    page: ValidatedCreatedPacketPage,
+    creates: WasmCreateContext,
+    existing: &CertifiedPacketEntityKeys,
+) -> Result<
+    (
+        std::collections::BTreeSet<String>,
+        CertifiedPacketEntityKeys,
+    ),
+    LixError,
+> {
+    let mut page_keys = CertifiedPacketEntityKeys::default();
+    for identity in page.identities {
+        page_keys.insert(identity, creates, existing)?;
+    }
+    Ok((page.schemas, page_keys))
+}
+
+/// Returns packet metadata when every framed record is an inline snapshot write.
 /// Delete, attachment, and non-certified-schema pages fall back to the generic
 /// packet decoder.
 fn validate_created_packet_page(
     record_count: u32,
     payload: &[u8],
-) -> Result<Option<std::collections::BTreeSet<String>>, String> {
+) -> Result<Option<ValidatedCreatedPacketPage>, String> {
     if record_count == 0 {
         return Err("packet page is empty".to_owned());
     }
     let mut input = TypedCsvReader { payload, offset: 0 };
     let mut schemas = std::collections::BTreeSet::new();
+    let mut identities = Vec::with_capacity(record_count as usize);
     let mut previous_local_ref = None;
     for _ in 0..record_count {
         let record_len = input.u32()? as usize;
@@ -1691,14 +1819,21 @@ fn validate_created_packet_page(
                 if component_count == 0 {
                     return Err("packet upsert key has no components".to_owned());
                 }
+                let mut components = Vec::with_capacity(component_count as usize);
                 for _ in 0..component_count {
                     let component_len = record.u32()? as usize;
-                    std::str::from_utf8(record.bytes(component_len)?)
-                        .map_err(|error| format!("packet key component is not UTF-8: {error}"))?;
+                    components.push(
+                        std::str::from_utf8(record.bytes(component_len)?)
+                            .map_err(|error| format!("packet key component is not UTF-8: {error}"))?
+                            .to_owned(),
+                    );
                 }
                 if record.u8()? > 1 {
                     return Err("packet upsert has an invalid effect".to_owned());
                 }
+                identities.push(CreatedPacketIdentity::Explicit(
+                    WasmEntityKey::from_owned_parts(schema, components),
+                ));
             }
             2 => {
                 let local_ref = record.u64()?;
@@ -1706,6 +1841,10 @@ fn validate_created_packet_page(
                     return Err("packet create local refs must be strictly increasing".to_owned());
                 }
                 previous_local_ref = Some(local_ref);
+                identities.push(CreatedPacketIdentity::Create {
+                    schema_key: schema.to_owned(),
+                    local_ref,
+                });
             }
             1 => return Ok(None),
             _ => return Err("packet page has an unknown change tag".to_owned()),
@@ -1728,7 +1867,10 @@ fn validate_created_packet_page(
     if schemas.contains("git_text_line_v2") {
         return Ok(None);
     }
-    Ok(Some(schemas))
+    Ok(Some(ValidatedCreatedPacketPage {
+        schemas,
+        identities,
+    }))
 }
 
 struct TypedCsvReader<'a> {
@@ -2699,6 +2841,7 @@ struct CursorState {
     certified_packet_rows: u64,
     certified_packet_creates: Option<WasmCreateContext>,
     certified_packet_schema_keys: std::collections::BTreeSet<String>,
+    certified_packet_entity_keys: CertifiedPacketEntityKeys,
 }
 
 struct ResolutionCursorState {
@@ -2821,6 +2964,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
                 certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
         Ok(WasmFileTransition {
@@ -2895,6 +3039,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_rows: 0,
                 certified_packet_creates: None,
                 certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
         Ok(WasmFileTransition {
@@ -3096,7 +3241,7 @@ impl WasmComponentActor for V3Actor {
                     else {
                         unreachable!("matched packet page")
                     };
-                    if let Some(schema_keys) =
+                    if let Some(validated_page) =
                         validate_created_packet_page(record_count, &payload).map_err(v3_error)?
                     {
                         // Certified immutable segments are the ownership unit
@@ -3123,12 +3268,18 @@ impl WasmComponentActor for V3Actor {
                                 "one certified packet transition used multiple create contexts",
                             ));
                         }
+                        let (schema_keys, page_keys) = validate_new_certified_packet_keys(
+                            validated_page,
+                            creates,
+                            &cursor.certified_packet_entity_keys,
+                        )?;
                         cursor.certified_packet_creates = Some(creates);
                         cursor.certified_packet_rows = cursor
                             .certified_packet_rows
                             .checked_add(u64::from(record_count))
                             .ok_or_else(|| v3_error("certified packet row count overflowed"))?;
                         cursor.certified_packet_schema_keys.extend(schema_keys);
+                        cursor.certified_packet_entity_keys.extend(page_keys);
                         cursor.certified_packet_pages.push(Bytes::from(payload));
                     } else {
                         return PendingChangePage::Packet {
@@ -3193,6 +3344,7 @@ impl WasmComponentActor for V3Actor {
             });
         }
         if let Some(creates) = cursor.certified_packet_creates.take() {
+            cursor.certified_packet_entity_keys = CertifiedPacketEntityKeys::default();
             batches.push(WasmCertifiedEntityBatch {
                 format: CERTIFIED_CREATED_PACKET_V1,
                 schema_keys: std::mem::take(&mut cursor.certified_packet_schema_keys)
@@ -3353,4 +3505,99 @@ fn v3_transition_limits(
     // single-snapshot pages (notably Markdown lexical fallbacks).
     limits.max_record_bytes = limits.max_page_bytes;
     limits.validate()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn push_text(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        output.extend_from_slice(value.as_bytes());
+    }
+
+    fn packet_page(tag: u8, schema: &str, identity: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+        let mut record = vec![tag];
+        push_text(&mut record, schema);
+        identity(&mut record);
+        record.push(0);
+        record.extend_from_slice(&2_u32.to_le_bytes());
+        record.extend_from_slice(b"{}");
+
+        let mut page = Vec::with_capacity(record.len() + 4);
+        page.extend_from_slice(&(record.len() as u32).to_le_bytes());
+        page.extend_from_slice(&record);
+        page
+    }
+
+    fn create_page(schema: &str, local_ref: u64) -> Vec<u8> {
+        packet_page(2, schema, |record| {
+            record.extend_from_slice(&local_ref.to_le_bytes());
+        })
+    }
+
+    fn upsert_page(schema: &str, component: &str) -> Vec<u8> {
+        packet_page(0, schema, |record| {
+            record.extend_from_slice(&1_u32.to_le_bytes());
+            push_text(record, component);
+            record.push(0);
+        })
+    }
+
+    fn accept_page(
+        payload: &[u8],
+        creates: WasmCreateContext,
+        existing: &mut CertifiedPacketEntityKeys,
+    ) -> Result<(), LixError> {
+        let page = validate_created_packet_page(1, payload)
+            .expect("well-framed packet")
+            .expect("certifiable packet");
+        let (_, keys) = validate_new_certified_packet_keys(page, creates, existing)?;
+        existing.extend(keys);
+        Ok(())
+    }
+
+    #[test]
+    fn certified_packet_rejects_duplicate_entity_keys_across_pages() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let mut existing = CertifiedPacketEntityKeys::default();
+
+        accept_page(&create_page("row", 7), creates, &mut existing).expect("first page is unique");
+        let duplicate_create = accept_page(&create_page("row", 7), creates, &mut existing)
+            .expect_err("a later page must not repeat a create identity");
+        assert_eq!(
+            duplicate_create.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+
+        let generated_id = creates.component(7).expect("create identity");
+        let explicit_collision =
+            accept_page(&upsert_page("row", &generated_id), creates, &mut existing)
+                .expect_err("an explicit key must not collide with an earlier create");
+        assert_eq!(
+            explicit_collision.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+
+        let mut explicit_keys = CertifiedPacketEntityKeys::default();
+        accept_page(
+            &upsert_page("row", "stable-key"),
+            creates,
+            &mut explicit_keys,
+        )
+        .expect("first explicit key is unique");
+        let duplicate_explicit = accept_page(
+            &upsert_page("row", "stable-key"),
+            creates,
+            &mut explicit_keys,
+        )
+        .expect_err("a later page must not repeat an explicit key");
+        assert_eq!(
+            duplicate_explicit.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+    }
 }
