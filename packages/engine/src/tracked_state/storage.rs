@@ -1844,7 +1844,6 @@ async fn hydrate_certified_members(
         };
         members[index].change.snapshot = snapshot;
         members[index].change.metadata = metadata;
-        members[index].certified_ref = false;
     }
     Ok(())
 }

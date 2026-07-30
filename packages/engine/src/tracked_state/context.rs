@@ -7030,6 +7030,19 @@ mod tests {
             .begin_read(StorageReadOptions::default())
             .await
             .expect("certified locator read should open");
+        let inventory = crate::tracked_state::scan_commit_delta_inventory(&read)
+            .await
+            .expect("certified inventory should hydrate");
+        let inventory_member = inventory
+            .commits
+            .get(&commit_id)
+            .and_then(|entry| entry.members.first())
+            .expect("certified inventory member should exist");
+        assert!(inventory_member.change.snapshot.is_some());
+        assert!(
+            inventory_member.is_certified_payload_ref(),
+            "hydration must preserve certified wire provenance for GC re-encoding",
+        );
         let canonical = crate::tracked_state::load_change_record_by_id(&read, durable_change_id)
             .await
             .expect("certified locator should hydrate")
