@@ -24,6 +24,7 @@ use workload::{REAL_WORKLOAD_ROWS, SMOKE_ROWS, WorkloadRow, fixture_rows, row_la
 const READ_MANY_PK_COUNT: usize = 10;
 
 fn tracked_state_crud_benches(c: &mut Criterion) {
+    init_perf_tracing();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -46,6 +47,16 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
+    }
+}
+
+fn init_perf_tracing() {
+    if std::env::var_os("LIX_TRACKED_STATE_CRUD_TRACE").is_some() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("lix_perf=debug")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_target(false)
+            .try_init();
     }
 }
 
