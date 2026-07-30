@@ -114,6 +114,7 @@ struct EntityChangeState {
     total_bytes: SharedByteBudget,
     source: EntityChangeInputSource,
     next_ordinal: u32,
+    lazy_snapshots: HashMap<u32, WasmHostBytes>,
     counters: WasmTransitionCounters,
 }
 
@@ -569,6 +570,7 @@ impl EntityChangeState {
             total_bytes,
             source: EntityChangeInputSource::Entities(source),
             next_ordinal: 0,
+            lazy_snapshots: HashMap::new(),
             counters: WasmTransitionCounters::default(),
         })
     }
@@ -584,6 +586,7 @@ impl EntityChangeState {
             total_bytes,
             source: EntityChangeInputSource::Changes(source),
             next_ordinal: 0,
+            lazy_snapshots: HashMap::new(),
             counters: WasmTransitionCounters::default(),
         })
     }
@@ -1211,6 +1214,7 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                 "v3 entity source returned an empty page".to_owned(),
             ));
         }
+        state.lazy_snapshots.clear();
         let mut boundary_bytes = 0usize;
         let mut inputs = Vec::with_capacity(changes.len());
         for change in changes {
@@ -1220,7 +1224,7 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                     "v3 entity input ordinal overflowed".to_owned(),
                 )
             })?;
-            let (schema_key, entity_pk, snapshot, effect) = match change {
+            let (schema_key, entity_pk, snapshot_content, effect) = match change {
                 WasmEntityChange::Create {
                     schema_key,
                     resolved_key,
@@ -1232,56 +1236,74 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                             "host-to-guest entity input contains an unresolved create".to_owned(),
                         )
                     })?;
-                    let snapshot_len = u32::try_from(snapshot_content.len()).map_err(|_| {
-                        bindings::lix::plugin::host::HostError::LimitExceeded(
-                            "v3 entity snapshot exceeds u32".to_owned(),
-                        )
-                    })?;
-                    let snapshot =
-                        read_host_bytes(&snapshot_content, 0, snapshot_len).map_err(|error| {
-                            bindings::lix::plugin::host::HostError::Rejected(error.message)
-                        })?;
                     (
                         schema_key,
                         key.entity_pk
                             .iter()
                             .map(ToString::to_string)
                             .collect::<Vec<_>>(),
-                        Some(snapshot),
+                        Some(snapshot_content),
                         WasmChangeEffect::Content,
                     )
                 }
-                WasmEntityChange::Upsert { entity, effect } => {
-                    let snapshot = read_host_bytes(
-                        &entity.snapshot_content,
-                        0,
-                        u32::try_from(entity.snapshot_content.len()).map_err(|_| {
-                            bindings::lix::plugin::host::HostError::LimitExceeded(
-                                "v3 entity snapshot exceeds u32".to_owned(),
-                            )
-                        })?,
-                    )
-                    .map_err(|error| {
-                        bindings::lix::plugin::host::HostError::Rejected(error.message)
-                    })?;
-                    (
-                        entity.key.schema_key.to_string(),
-                        entity
-                            .key
-                            .entity_pk
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        Some(snapshot),
-                        effect,
-                    )
-                }
+                WasmEntityChange::Upsert { entity, effect } => (
+                    entity.key.schema_key.to_string(),
+                    entity
+                        .key
+                        .entity_pk
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                    Some(entity.snapshot_content),
+                    effect,
+                ),
                 WasmEntityChange::Delete(key) => (
                     key.schema_key.to_string(),
                     key.entity_pk.iter().map(ToString::to_string).collect(),
                     None,
                     WasmChangeEffect::Content,
                 ),
+            };
+            let metadata_bytes = schema_key
+                .len()
+                .checked_add(entity_pk.iter().map(String::len).sum::<usize>())
+                .and_then(|bytes| bytes.checked_add(32))
+                .ok_or_else(|| {
+                    bindings::lix::plugin::host::HostError::LimitExceeded(
+                        "v3 entity page byte count overflowed".to_owned(),
+                    )
+                })?;
+            let snapshot_len = snapshot_content.as_ref().map(WasmHostBytes::len);
+            let inline_snapshot = if let Some(snapshot_content) = snapshot_content {
+                let length = usize::try_from(snapshot_content.len()).ok();
+                let fits_record = length.is_some_and(|length| {
+                    metadata_bytes
+                        .checked_add(length)
+                        .is_some_and(|bytes| bytes <= state.limits.max_record_bytes as usize)
+                });
+                let fits_page = length.is_some_and(|length| {
+                    boundary_bytes
+                        .checked_add(metadata_bytes)
+                        .and_then(|bytes| bytes.checked_add(length))
+                        .is_some_and(|bytes| bytes <= max_bytes as usize)
+                });
+                if fits_record && fits_page {
+                    let length = u32::try_from(snapshot_content.len()).map_err(|_| {
+                        bindings::lix::plugin::host::HostError::LimitExceeded(
+                            "v3 inline entity snapshot exceeds u32".to_owned(),
+                        )
+                    })?;
+                    Some(
+                        read_host_bytes(&snapshot_content, 0, length).map_err(|error| {
+                            bindings::lix::plugin::host::HostError::Rejected(error.message)
+                        })?,
+                    )
+                } else {
+                    state.lazy_snapshots.insert(ordinal, snapshot_content);
+                    None
+                }
+            } else {
+                None
             };
             boundary_bytes = boundary_bytes
                 .checked_add(schema_key.len())
@@ -1291,11 +1313,11 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                         .try_fold(bytes, |bytes, value| bytes.checked_add(value.len()))
                 })
                 .and_then(|bytes| {
-                    snapshot
+                    inline_snapshot
                         .as_ref()
                         .map_or(Some(bytes), |snapshot| bytes.checked_add(snapshot.len()))
                 })
-                .and_then(|bytes| bytes.checked_add(24))
+                .and_then(|bytes| bytes.checked_add(32))
                 .ok_or_else(|| {
                     bindings::lix::plugin::host::HostError::LimitExceeded(
                         "v3 entity page byte count overflowed".to_owned(),
@@ -1305,7 +1327,8 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
                 ordinal,
                 schema_key,
                 entity_pk,
-                snapshot,
+                snapshot_len,
+                snapshot: inline_snapshot,
                 effect: match effect {
                     WasmChangeEffect::Content => bindings::lix::plugin::host::ChangeEffect::Content,
                     WasmChangeEffect::FormatOnly => {
@@ -1330,6 +1353,41 @@ impl bindings::lix::plugin::host::HostEntityChangeSource for WasiHostState {
         Ok(Some(bindings::lix::plugin::host::EntityChangeInputPage {
             changes: inputs,
         }))
+    }
+
+    fn read_snapshot(
+        &mut self,
+        resource: Resource<EntityChangeSourceResource>,
+        ordinal: u32,
+        offset: u64,
+        length: u32,
+    ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
+        let shared = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        let mut state = shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.check_active()?;
+        ensure_source_page(length, state.limits.max_page_bytes)?;
+        let snapshot = state
+            .lazy_snapshots
+            .get(&ordinal)
+            .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
+        let bytes = read_host_bytes(snapshot, offset, length)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.message))?;
+        state.charge(bytes.len())?;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
+        state.counters.source_bytes_read = state
+            .counters
+            .source_bytes_read
+            .saturating_add(bytes.len() as u64);
+        Ok(Some(bytes))
     }
 
     fn drop(&mut self, resource: Resource<EntityChangeSourceResource>) -> wasmtime::Result<()> {

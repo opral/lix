@@ -52,6 +52,9 @@ interface host {
     ordinal: u32,
     schema-key: string,
     entity-pk: list<string>,
+    snapshot-len: option<u64>,
+    /// Snapshots that fit the requested page are carried inline. Oversized
+    /// snapshots leave this empty and are read through `read-snapshot`.
     snapshot: option<bytes>,
     effect: change-effect,
   }
@@ -67,6 +70,13 @@ interface host {
     next-page: func(
       max-bytes: u32,
     ) -> result<option<entity-change-input-page>, host-error>;
+    /// Read an oversized snapshot advertised by the most recent page without
+    /// forcing that snapshot into the page allocation.
+    read-snapshot: func(
+      ordinal: u32,
+      offset: u64,
+      length: u32,
+    ) -> result<option<bytes>, host-error>;
   }
 
   /// The sole host-owned atomic output capability. Checkpoints and semantic

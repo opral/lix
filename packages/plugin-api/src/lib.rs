@@ -526,16 +526,56 @@ impl EntityChangeReader<'_> {
                 input.ordinal
             )));
         }
+        let snapshot = match (input.snapshot_len, input.snapshot) {
+            (None, None) => None,
+            (Some(length), Some(snapshot)) => {
+                if snapshot.len() as u64 != length {
+                    return Err(Error::invalid_input(
+                        "inline entity snapshot length does not match its metadata",
+                    ));
+                }
+                Some(snapshot)
+            }
+            (Some(length), None) => Some(read_entity_snapshot(self.source, index, length)?),
+            (None, Some(_)) => {
+                return Err(Error::invalid_input(
+                    "inline entity snapshot is missing its length metadata",
+                ));
+            }
+        };
         Ok(Some(EntityChange {
             schema_key: input.schema_key,
             entity_pk: input.entity_pk,
-            snapshot: input.snapshot,
+            snapshot,
             effect: match input.effect {
                 WitChangeEffect::Content => ChangeEffect::Content,
                 WitChangeEffect::FormatOnly => ChangeEffect::FormatOnly,
             },
         }))
     }
+}
+
+fn read_entity_snapshot(source: &EntityChangeSource, ordinal: u32, length: u64) -> Result<Vec<u8>> {
+    const READ_BYTES: u32 = 1024 * 1024;
+    let capacity = usize::try_from(length)
+        .map_err(|_| Error::limit_exceeded("entity snapshot exceeds guest address space"))?;
+    let mut output = Vec::with_capacity(capacity);
+    while output.len() < capacity {
+        let offset = output.len() as u64;
+        let chunk = u32::try_from((capacity - output.len()).min(READ_BYTES as usize))
+            .expect("bounded entity snapshot read fits u32");
+        let bytes = source
+            .read_snapshot(ordinal, offset, chunk)
+            .map_err(|error| host_error("host entity snapshot read failed", error))?
+            .ok_or_else(|| Error::invalid_input("host entity snapshot disappeared"))?;
+        if bytes.is_empty() {
+            return Err(Error::invalid_input(
+                "host entity snapshot returned a short read",
+            ));
+        }
+        output.extend_from_slice(&bytes);
+    }
+    Ok(output)
 }
 
 #[derive(Debug)]
