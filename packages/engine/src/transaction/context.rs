@@ -4024,7 +4024,6 @@ where
                             counters.full_state_semantic_rows_materialized =
                                 u64::try_from(entity_count).unwrap_or(u64::MAX);
                             counters.full_document_reparses = 1;
-                            counters.full_renderer_invocations = 1;
                             counters.durable_semantic_changes =
                                 u64::try_from(changes.entity_change_count())
                                     .unwrap_or(u64::MAX)
