@@ -3276,7 +3276,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lix_cli"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3300,7 +3300,7 @@ dependencies = [
 
 [[package]]
 name = "lix_engine"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "ahash",
  "async-trait",
@@ -3336,7 +3336,7 @@ dependencies = [
 
 [[package]]
 name = "lix_engine_benchmarks"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "ahash",
  "async-trait",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "lix_js_sdk"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "console_error_panic_hook",
  "futures-util",
@@ -3384,18 +3384,18 @@ dependencies = [
 
 [[package]]
 name = "lix_local_filesystem"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "lix_rocksdb_storage",
 ]
 
 [[package]]
 name = "lix_order_key"
-version = "0.9.0"
+version = "0.9.1"
 
 [[package]]
 name = "lix_plugin_api_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "serde_json",
  "uuid",
@@ -3404,14 +3404,14 @@ dependencies = [
 
 [[package]]
 name = "lix_plugin_api_v3_prototype"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "wit-bindgen 0.57.1",
 ]
 
 [[package]]
 name = "lix_rocksdb_storage"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -3423,7 +3423,7 @@ dependencies = [
 
 [[package]]
 name = "lix_sdk"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3453,7 +3453,7 @@ dependencies = [
 
 [[package]]
 name = "lix_sdk_tests"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "lix_server_protocol"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "lix_slatedb_storage"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3531,7 +3531,7 @@ dependencies = [
 
 [[package]]
 name = "lix_sqlite_storage"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "blake3",
  "bytes",
@@ -4270,7 +4270,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_csv_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "lix_plugin_api_v2",
@@ -4280,7 +4280,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_csv_v3_prototype"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "lix_plugin_api_v3_prototype",
@@ -4290,7 +4290,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "lix_order_key",
@@ -4301,7 +4301,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_excalidraw_v3_prototype"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "lix_order_key",
  "lix_plugin_api_v3_prototype",
@@ -4311,7 +4311,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_git_text_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "lix_order_key",
@@ -4322,7 +4322,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json_incremental_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4333,7 +4333,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_json_v3_prototype"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "blake3",
@@ -4344,7 +4344,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_markdown_incremental_v2"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "chardetng",
@@ -4360,7 +4360,7 @@ dependencies = [
 
 [[package]]
 name = "plugin_markdown_v3_prototype"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64 0.22.1",
  "chardetng",

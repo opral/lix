@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.1 - 2026-07-30
+
+### Patch
+
+- Fixed checkpoint compaction for eager plugin rows that share a source change ID and for payload-free cascade tombstones.
+- Checkpoint publication now rewrites only interval changes instead of copying the complete HOT state.
+- Checkpoint commits now retain compact absolute deltas instead of rewriting a full immutable history root. Git replay can checkpoint at a configured commit interval and records checkpoint latency in its profile. Repository GC checkpoints now double their sweep interval so cumulative maintenance stays linear in history.
+- Whole-entity-table deletion now records one tracked collection-generation fact instead of expanding the operation into one tombstone per row.
+- Packed tracked-history sidecars now use bounded zstd compression while identity-only reads retain their uncompressed fast path.
+- Large eager Markdown imports now persist host-certified semantic pages with bounded zstd compression, batch broad page reads, and seek exact-file manifests directly.
+- Large eager generic-text imports now persist host-certified semantic pages as current-state authority instead of duplicating every line in HOT storage.
+- Current state now stores each eagerly materialized row value once in a file-first primary layout, reducing plugin-heavy repository storage and checkpoint write amplification.
+- Fixed sequential localized Markdown edits to reconcile against the latest persistent subtree.
+- Reduced storage amplification from eager working-diff materialization by persisting batches of 64 or more dirty identities in bounded, checksummed segments while preserving the direct small-batch path.
+- Storage layout profiling now accounts for certified entity batch headers, manifests, and pages.
+- Current state now records one conservative file-membership marker per schema instead of duplicating every eager plugin row into a key-only index.
+- Reduced local SlateDB disk usage by releasing completed compactor safety checkpoints and collecting obsolete WAL and compacted SST files when the last handle closes.
+
 ## 0.9.0 - 2026-07-29
 
 ### Minor

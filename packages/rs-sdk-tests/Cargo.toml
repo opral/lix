@@ -1,6 +1,6 @@
 [package]
 name = "lix_sdk_tests"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 description = "Integration tests and benchmarks for the Lix Rust SDK."
 license = "MIT"
@@ -10,11 +10,11 @@ rust-version = "1.93"
 publish = false
 
 [dependencies]
-lix_sdk = { path = "../rs-sdk", version = "0.9.0", default-features = false, features = ["default_wasm_runtime", "local_filesystem", "sqlite"] }
+lix_sdk = { path = "../rs-sdk", version = "0.9.1", default-features = false, features = ["default_wasm_runtime", "local_filesystem", "sqlite"] }
 
 [dev-dependencies]
-lix_engine = { path = "../engine", version = "0.9.0", features = ["storage-benches"] }
-lix_rocksdb_storage = { path = "../rocksdb-storage", version = "0.9.0" }
+lix_engine = { path = "../engine", version = "0.9.1", features = ["storage-benches"] }
+lix_rocksdb_storage = { path = "../rocksdb-storage", version = "0.9.1" }
 plugin_csv_v2 = { path = "../../plugins/csv-v2", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_csv_v3_prototype = { path = "../../plugins/csv-v3-prototype", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
 plugin_excalidraw_v3_prototype = { path = "../../plugins/excalidraw-v3-prototype", lib = true, artifact = "cdylib", target = "wasm32-wasip2" }
