@@ -4,16 +4,22 @@ use std::time::Instant;
 
 #[test]
 fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/wit/v3");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugin-api-v3-prototype/wit");
     let mut resolve = wit_parser::Resolve::default();
     resolve
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
     let wit = std::fs::read_to_string(path.join("lix-plugin-v3.wit")).unwrap();
     assert!(wit.contains("package lix:plugin@3.0.0"));
-    assert!(wit.contains("resource root"));
-    assert!(wit.contains("resource transaction"));
+    assert!(wit.contains("resource snapshot"));
+    assert!(wit.contains("resource transition"));
+    assert!(wit.contains("apply: func("));
+    assert!(wit.contains("output: borrow<transition>"));
+    assert!(wit.contains("resolve-conflicts: func("));
+    assert!(wit.contains("entities-changed: func("));
     assert!(!wit.contains("resource document"));
+    assert!(!wit.contains("resource change-cursor"));
 }
 
 #[derive(Clone, Copy, Debug)]

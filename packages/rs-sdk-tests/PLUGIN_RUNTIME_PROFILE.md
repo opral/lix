@@ -397,6 +397,28 @@ push pages, preserve exact file bytes and semantic cardinality, and retain the
 format-specific history and RocksDB reopen checks. CSV creates no per-row
 history segments or locator records before hot publication.
 
+The subsequent hard API cut added the borrowed atomic transition,
+host-imported conflict-resolution sink, lazy conflict/entity sources, and the
+fused semantic renderer. Paired release verification on the `origin/main`
+tracked-head/protocol changes merged in #976 shows that this control-flow cut
+retains the optimized paths:
+
+| workload | v2 p50 | hard-cut v3 p50 | speedup | v3 peak host allocation |
+| --- | ---: | ---: | ---: | ---: |
+| JSON, 10 MiB / 39,871 entities | 618.340 ms | 287.018 ms | 2.15x | 55.294 MB |
+| Markdown, exact VS Code API transition | 34.090 ms | 6.236 ms | 5.47x | 3.756 MB |
+| Excalidraw, 20,000 elements | 243.150 ms | 3.507 ms | 69.33x | 2.959 MB |
+
+JSON v3 allocated 107.3 MB cumulatively versus 352.4 MB for v2 and performed
+79,061 allocations versus 485,051. Markdown v3 allocated 21.2 MB versus
+29.5 MB and reduced peak live host allocation by 66.6%. Excalidraw reduced
+guest linear-memory high water from 42.140 MB to 25.166 MB. Every v3 lane used
+one top-level guest export and preserved exact output bytes and semantic rows.
+
+The hard-cut CSV lane remains in the same performance band at 146.824 ms p50
+with 35.024 MB peak live host allocation; its prior matched post-#976 result
+was 141.625 ms. This 3.7% movement is below the ten-percent reprofile gate.
+
 ## Reproduction
 
 ```sh

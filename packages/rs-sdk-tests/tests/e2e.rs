@@ -1420,6 +1420,98 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
 }
 
 #[tokio::test]
+#[ignore = "blocked by missing common-ancestor snapshots for certified v3 segments"]
+async fn v3_csv_same_row_branch_merge_composes_distinct_cells() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v3_prototype",
+        &build_csv_v3_prototype_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/v3-row-conflict.csv";
+    write_file(&lix, path, b"alpha,one,red\n".to_vec())
+        .await
+        .expect("base row should import");
+    let file_id = file_id_at_path(&lix, path).await;
+    let base_row_id = csv_v2_row_id(
+        &active_csv_v2_rows(&lix, &file_id).await,
+        &["alpha", "one", "red"],
+    );
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000060a".to_owned()),
+            name: "CSV v3 row conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    write_file(&lix, path, b"ALPHA,one,red\n".to_vec())
+        .await
+        .expect("target first-cell edit should commit");
+    assert_eq!(
+        csv_v2_row_id(
+            &active_csv_v2_rows(&lix, &file_id).await,
+            &["ALPHA", "one", "red"],
+        ),
+        base_row_id
+    );
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, b"alpha,one,BLU\n".to_vec())
+        .await
+        .expect("source third-cell edit should commit");
+    assert_eq!(
+        csv_v2_row_id(
+            &active_csv_v2_rows(&lix, &file_id).await,
+            &["alpha", "one", "BLU"],
+        ),
+        base_row_id
+    );
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("v3 plugin-owned row conflict should preview");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("distinct CSV cell edits should merge");
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(
+        counters.conflict_resolution_takes, 0,
+        "the composed row is one replacement, not a side selection"
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap().as_deref(),
+        Some(b"ALPHA,one,BLU\n".as_slice()),
+        "both same-row cell edits must survive",
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_json_unrelated_entity_branch_merge_accepts_certified_snapshots() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
@@ -1745,6 +1837,88 @@ async fn v2_csv_same_cell_merge_uses_canonical_stored_rank() {
         Some(expected),
         "the resolver must take the canonical higher-ranked variant, independent of branch labels"
     );
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(
+        counters.conflict_resolution_takes, 1,
+        "same-cell canonical fallback should retain the selected host snapshot zero-copy"
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_csv_same_cell_merge_uses_canonical_stored_rank() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v3_prototype",
+        &build_csv_v3_prototype_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/v3-row-canonical-fallback-conflict.csv";
+    let base = b"alpha,one,red\n".to_vec();
+    let target_bytes = b"TARGE,one,red\n".to_vec();
+    let source_bytes = b"SOURC,one,red\n".to_vec();
+    write_file(&lix, path, base).await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let row_id = csv_v2_row_id(
+        &active_csv_v2_rows(&lix, &file_id).await,
+        &["alpha", "one", "red"],
+    );
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000060b".to_owned()),
+            name: "CSV v3 row canonical B source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, source_bytes.clone())
+        .await
+        .expect("source same-cell edit should commit");
+    let source_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, target_bytes.clone())
+        .await
+        .expect("target same-cell edit should commit");
+    let target_order = csv_v2_row_ordering(&lix, &file_id, &row_id).await;
+    assert_ne!(source_order, target_order);
+    let expected = if source_order < target_order {
+        target_bytes
+    } else {
+        source_bytes
+    };
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("v3 plugin-owned same-cell conflict should preview");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("same-cell CSV conflict should resolve deterministically");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(expected));
     let counters = lix.plugin_v2_transition_counters();
     assert_eq!(counters.conflict_resolution_calls, 1);
     assert_eq!(counters.conflict_resolution_records, 1);
@@ -5298,6 +5472,107 @@ async fn v2_excalidraw_same_element_branch_merge_uses_canonical_b() {
     })
     .await
     .expect("same-element Excalidraw conflict should resolve deterministically");
+    let rendered: serde_json::Value =
+        serde_json::from_slice(&read_file(&lix, path).await.unwrap().unwrap()).unwrap();
+    assert_eq!(rendered["elements"][0]["x"], serde_json::json!(expected_x));
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.conflict_resolution_calls, 1);
+    assert_eq!(counters.conflict_resolution_records, 1);
+    assert_eq!(counters.conflict_resolution_takes, 1);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_excalidraw_same_element_branch_merge_uses_canonical_b() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw_v3_prototype",
+        &build_excalidraw_v3_prototype_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+
+    let path = "/v3-element-conflict.excalidraw";
+    write_file(
+        &lix,
+        path,
+        br#"{"type":"excalidraw","version":2,"source":"https://excalidraw.com","elements":[{"id":"shape","type":"rectangle","x":1,"y":2,"width":3,"height":4,"isDeleted":false}],"appState":{},"files":{}}"#.to_vec(),
+    )
+    .await
+    .expect("base Excalidraw scene should import");
+    let file_id = file_id_at_path(&lix, path).await;
+    let original = lix
+        .execute(
+            "SELECT element_json FROM excalidraw_element \
+             WHERE id = 'shape' AND lixcol_file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("element_json")
+        .unwrap();
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000060c".to_owned()),
+            name: "Excalidraw v3 element conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    let target_json = original.replacen(r#""x":1"#, r#""x":111"#, 1);
+    lix.execute(
+        "UPDATE excalidraw_element SET element_json = $1 \
+         WHERE id = 'shape' AND lixcol_file_id = $2",
+        &[Value::Text(target_json), Value::Text(file_id.clone())],
+    )
+    .await
+    .expect("target element edit should commit");
+    let target_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
+
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    let source_json = original.replacen(r#""x":1"#, r#""x":222"#, 1);
+    lix.execute(
+        "UPDATE excalidraw_element SET element_json = $1 \
+         WHERE id = 'shape' AND lixcol_file_id = $2",
+        &[Value::Text(source_json), Value::Text(file_id.clone())],
+    )
+    .await
+    .expect("source element edit should commit");
+    let source_order = excalidraw_v2_element_ordering(&lix, &file_id, "shape").await;
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let expected_x = if source_order < target_order {
+        111
+    } else {
+        222
+    };
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("same-element v3 Excalidraw conflict should preview");
+    assert!(preview.conflicts.is_empty(), "{:?}", preview.conflicts);
+
+    lix.reset_plugin_v2_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("same-element v3 Excalidraw conflict should resolve deterministically");
     let rendered: serde_json::Value =
         serde_json::from_slice(&read_file(&lix, path).await.unwrap().unwrap()).unwrap();
     assert_eq!(rendered["elements"][0]["x"], serde_json::json!(expected_x));

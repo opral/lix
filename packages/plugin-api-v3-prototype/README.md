@@ -4,6 +4,21 @@ Experimental, intentionally incompatible Component API used to measure a fused
 guest transition with host-owned push sinks. This is not a supported plugin
 contract.
 
+## Current contract
+
+`wit/lix-plugin-v3.wit` is the single canonical v3 definition. The host owns
+immutable `snapshot` inputs and the atomic `transition` output. A file
+successor enters the guest once through `apply(request, borrow<transition>)`;
+the guest emits bounded generic or typed pages through host imports while that
+export remains entered. Semantic edits use `entities-changed` with a lazy
+entity source and stream exact replacement bytes to the same transition.
+Conflict resolution is stateless: `resolve-conflicts` reads canonical inputs
+lazily and pushes ordered resolutions into a host-owned sink.
+
+There are no guest-owned document, edit-cursor, change-cursor, or returned
+transaction resources. A failed export, invalid page, or renderer failure
+publishes none of the staged state, semantic changes, or file bytes.
+
 The prototype is deliberately phased:
 
 - A: one exported call per transition on one persistent actor executor;
