@@ -738,7 +738,6 @@ where
         promoted_locators.extend(authoritative_promoted_locators(
             &deltas,
             crate::tracked_state::stage_commit_deltas(writes, &deltas)?,
-            &dead_packed_change_ids,
         )?);
     }
     let relocated_locators = live_commits
@@ -831,7 +830,6 @@ where
 fn authoritative_promoted_locators(
     deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
     staged_locators: Vec<crate::tracked_state::CommitDeltaChangeLocator>,
-    dead_change_ids: &BTreeSet<ChangeId>,
 ) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, LixError> {
     if staged_locators.len() != deltas.len() {
         return Err(LixError::new(
@@ -852,7 +850,7 @@ fn authoritative_promoted_locators(
                 "promoted commit-delta locator order does not match its members",
             ));
         }
-        if delta.authored && dead_change_ids.contains(&locator.change_id) {
+        if delta.authored {
             promoted.push(locator);
         }
     }
@@ -1540,7 +1538,14 @@ mod tests {
         tombstone.change_id = change_id;
         let mut promoted = packed_change("promoted-owner", "z-promoted-owner", JsonSlot::None);
         promoted.change_id = change_id;
-        let changes = [tombstone, promoted];
+        let unrelated_change_id = ChangeId::for_test_label("unrelated-authored-change");
+        let mut unrelated = packed_change(
+            "unrelated-authority",
+            "zz-unrelated-authority",
+            JsonSlot::None,
+        );
+        unrelated.change_id = unrelated_change_id;
+        let changes = [tombstone, promoted, unrelated];
         let mut deltas = commit_delta_refs(commit_id, &changes);
         deltas[0].authored = false;
         let locators = vec![
@@ -1556,14 +1561,25 @@ mod tests {
                 segment_index: 0,
                 ordinal: 1,
             },
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id: unrelated_change_id,
+                commit_id,
+                segment_index: 1,
+                ordinal: 0,
+            },
         ];
 
-        let filtered =
-            super::authoritative_promoted_locators(&deltas, locators, &BTreeSet::from([change_id]))
-                .expect("mixed promotion locators should filter");
+        let filtered = super::authoritative_promoted_locators(&deltas, locators)
+            .expect("mixed promotion locators should filter");
 
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ordinal, 1);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|locator| locator.change_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([change_id, unrelated_change_id]),
+        );
     }
 
     #[tokio::test]
