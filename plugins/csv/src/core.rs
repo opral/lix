@@ -3057,6 +3057,14 @@ impl ArenaRowIndex {
             row_snapshot_bytes(&blob, chunk, row, &id, &order_key, self.dialect)?,
         ))
     }
+
+    pub fn edit_touches_structure(&self, removed: &[u8], inserted: &[u8]) -> bool {
+        removed.iter().chain(inserted).any(|byte| {
+            *byte == self.dialect.delimiter
+                || self.dialect.quote == Some(*byte)
+                || matches!(*byte, b'\r' | b'\n')
+        })
+    }
 }
 
 fn virtual_ordinal(ordinal: usize, excluding: Option<usize>) -> usize {

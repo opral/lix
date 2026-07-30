@@ -532,12 +532,12 @@ impl Document {
         order_key: String,
         leading_json: String,
         element_json: String,
-    ) -> Result<EntityChange, String> {
+    ) -> Result<Option<EntityChange>, String> {
         let element = ElementEntity::from_source(order_key, leading_json, element_json)?;
         if element.id != id {
-            return Err("sparse Excalidraw edit changed the element id".to_owned());
+            return Ok(None);
         }
-        Ok(EntityChange::upsert(element.record()?))
+        Ok(Some(EntityChange::upsert(element.record()?)))
     }
 
     pub fn file_changed(

@@ -1249,11 +1249,12 @@ impl Document {
     pub fn scalar_change_from_arena(
         metadata: ArenaJsonScalar,
         scalar: &[u8],
-    ) -> Result<EntityChange, String> {
-        let kind = parse_complete_scalar(scalar)?;
-        if kind.is_container() {
-            return Err("JSON arena scalar edit produced a container".to_owned());
-        }
+    ) -> Result<Option<EntityChange>, String> {
+        let kind = match parse_complete_scalar(scalar) {
+            Ok(kind) => kind,
+            Err(error) if error == "expected a JSON scalar, got a container" => return Ok(None),
+            Err(error) => return Err(error),
+        };
         let scalar = std::str::from_utf8(scalar)
             .map_err(|error| format!("JSON scalar must be UTF-8: {error}"))?;
         let ArenaJsonScalar {
@@ -1313,7 +1314,7 @@ impl Document {
         if let Some(value) = empty_json {
             object.insert("empty_json".to_owned(), Value::String(value));
         }
-        Ok(EntityChange {
+        Ok(Some(EntityChange {
             schema_key: schema_key.to_owned(),
             entity_pk,
             snapshot: Some(
@@ -1321,7 +1322,7 @@ impl Document {
                     .map_err(|error| format!("serialize JSON arena scalar: {error}"))?,
             ),
             effect: ChangeEffect::Content,
-        })
+        }))
     }
 
     pub fn file_changed(

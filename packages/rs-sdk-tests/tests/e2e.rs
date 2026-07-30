@@ -762,6 +762,36 @@ async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
 }
 
 #[tokio::test]
+async fn csv_row_structure_edits_use_full_reconciliation() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/row-structure.csv";
+    write_file(&lix, path, b"a\nb\n".to_vec()).await.unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    assert_eq!(active_csv_v2_rows(&lix, &file_id).await.len(), 2);
+
+    write_file(&lix, path, b"a,b\n".to_vec())
+        .await
+        .expect("replacing a row terminator must use full CSV reconciliation");
+    let rows = active_csv_v2_rows(&lix, &file_id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].cells, ["a", "b"]);
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"a,b\n".to_vec())
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     let archive = build_markdown_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -2269,6 +2299,43 @@ async fn json_first_structural_fallback_preserves_accepted_array_identities() {
         read_file(&lix, path).await.unwrap(),
         Some(br#"["alpha","BETA"]"#.to_vec())
     );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_scalar_to_container_edit_uses_full_reconciliation() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/scalar-to-container.json";
+    write_file(&lix, path, br#"{"value":1}"#.to_vec())
+        .await
+        .unwrap();
+    write_file(&lix, path, br#"{"value":{}}"#.to_vec())
+        .await
+        .expect("a scalar-to-container edit must use full JSON reconciliation");
+
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"{"value":{}}"#.to_vec())
+    );
+    let member = lix
+        .execute(
+            "SELECT kind, scalar_json FROM json_object_member WHERE key = 'value'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(member.len(), 1);
+    assert_eq!(member.rows()[0].get::<String>("kind").unwrap(), "object");
+    assert!(member.rows()[0].get::<String>("scalar_json").is_err());
 
     lix.close().await.unwrap();
 }
@@ -5237,7 +5304,10 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     write_file(&lix, path, after_followup.clone())
         .await
         .expect("a byte edit after semantic rendering must not use stale Excalidraw spans");
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(after_followup.clone())
+    );
     let elements = lix
         .execute(
             "SELECT id, element_json FROM excalidraw_element ORDER BY id",
@@ -5257,6 +5327,24 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
             .unwrap()
             .contains(r#""x":21"#)
     );
+
+    let renamed = String::from_utf8(after_followup)
+        .unwrap()
+        .replacen(r#""id":"a""#, r#""id":"c""#, 1)
+        .into_bytes();
+    write_file(&lix, path, renamed.clone())
+        .await
+        .expect("an element ID edit must use full Excalidraw reconciliation");
+    let ids = lix
+        .execute("SELECT id FROM excalidraw_element ORDER BY id", &[])
+        .await
+        .unwrap()
+        .rows()
+        .iter()
+        .map(|row| row.get::<String>("id").unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["b", "c"]);
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(renamed));
 
     lix.close().await.unwrap();
 }

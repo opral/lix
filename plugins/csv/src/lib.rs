@@ -124,7 +124,8 @@ impl sdk::FormatPlugin for CsvPlugin {
             unreachable!("the sparse path requires exactly one edit")
         };
         let insert = &edit.insert;
-        let (index, range) = if update.before.state_len(CSV_INDEX_KEY)?.is_some() {
+        let (index, range, discovered_state) = if update.before.state_len(CSV_INDEX_KEY)?.is_some()
+        {
             let header = update
                 .before
                 .read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)?
@@ -151,7 +152,7 @@ impl sdk::FormatPlugin for CsvPlugin {
                     Ok(u32::from_le_bytes(bytes))
                 })
                 .map_err(sdk::Error::invalid_input)?;
-            (index, range)
+            (index, range, None)
         } else {
             let import = ColdInitialImport::open(
                 update.before.read_all()?,
@@ -163,8 +164,7 @@ impl sdk::FormatPlugin for CsvPlugin {
             let range = index
                 .row_range_for_edit(edit.offset, edit.delete_len)
                 .map_err(sdk::Error::invalid_input)?;
-            store_csv_index(&update.successor, &state)?;
-            (index, range)
+            (index, range, Some(state))
         };
         let (ordinal, row_start, row_end) = range;
         let mut row = update.before.read_range(row_start, row_end - row_start)?;
@@ -176,10 +176,16 @@ impl sdk::FormatPlugin for CsvPlugin {
                     sdk::Error::invalid_input("CSV edit deletion exceeds guest memory")
                 })?)
                 .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
+        if index.edit_touches_structure(&row[local_start..local_end], insert) {
+            return fallback_file_changed(update, sink);
+        }
         row.splice(local_start..local_end, insert.iter().copied());
         let change = index
             .row_change(ordinal, row)
             .map_err(sdk::Error::invalid_input)?;
+        if let Some(state) = discovered_state {
+            store_csv_index(&update.successor, &state)?;
+        }
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         encoder.push(change, update.creates, sink)?;
         encoder.flush(sink)?;

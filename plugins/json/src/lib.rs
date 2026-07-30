@@ -543,8 +543,11 @@ fn sparse_scalar_change(
         )
         .ok_or_else(|| sdk::Error::invalid_input("JSON edit range overflowed"))?;
     scalar.splice(local_start..local_end, insert.iter().copied());
-    let change =
-        Document::scalar_change_from_arena(metadata, &scalar).map_err(sdk::Error::invalid_input)?;
+    let Some(change) =
+        Document::scalar_change_from_arena(metadata, &scalar).map_err(sdk::Error::invalid_input)?
+    else {
+        return Ok(None);
+    };
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("JSON insert exceeds u64"))?;
     let delta = if insert_len >= edit.delete_len {

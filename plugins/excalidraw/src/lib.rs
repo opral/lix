@@ -276,8 +276,12 @@ fn sparse_element_change(
     element.splice(local_start..local_end, insert.iter().copied());
     let element_json = String::from_utf8(element)
         .map_err(|error| sdk::Error::invalid_input(format!("invalid Excalidraw UTF-8: {error}")))?;
-    let change = Document::element_change_from_source(&id, order_key, leading_json, element_json)
-        .map_err(sdk::Error::invalid_input)?;
+    let Some(change) =
+        Document::element_change_from_source(&id, order_key, leading_json, element_json)
+            .map_err(sdk::Error::invalid_input)?
+    else {
+        return Ok(None);
+    };
 
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("Excalidraw insert exceeds u64"))?;
