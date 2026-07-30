@@ -21,8 +21,8 @@ const BLOCKS_STATE: &[u8] = b"markdown/blocks-v1";
 const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts-v1";
 const NEXT_ID_ORDINAL_STATE: &[u8] = b"markdown/next-id-ordinal-v1";
 const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
-const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB1";
-const BLOCK_INDEX_HEADER_BYTES: u32 = 12;
+const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
+const BLOCK_INDEX_HEADER_BYTES: u32 = 16;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
 
@@ -171,15 +171,27 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         strip_duplicated_lexical_fallback(&mut changes)?;
         let (root, blocks) = document.arena_state().map_err(core_error)?;
         update.successor.put_state(ROOT_STATE, &root)?;
-        let old_page_count = block_page_count(&update.before)?;
-        let (index, pages) = encode_blocks(&blocks)?;
-        update.successor.put_state(BLOCKS_STATE, &index)?;
-        for (ordinal, page) in pages.iter().enumerate() {
+        let (old_index_pages, old_block_pages) = block_page_counts(&update.before)?;
+        let encoded = encode_blocks(&blocks)?;
+        update
+            .successor
+            .put_state(BLOCKS_STATE, &encoded.manifest)?;
+        for (ordinal, page) in encoded.index_pages.iter().enumerate() {
+            update
+                .successor
+                .put_state(&block_index_page_key(ordinal as u32), page)?;
+        }
+        for ordinal in encoded.index_pages.len() as u32..old_index_pages {
+            update
+                .successor
+                .delete_state(&block_index_page_key(ordinal))?;
+        }
+        for (ordinal, page) in encoded.block_pages.iter().enumerate() {
             update
                 .successor
                 .put_state(&block_page_key(ordinal as u32), page)?;
         }
-        for ordinal in pages.len() as u32..old_page_count {
+        for ordinal in encoded.block_pages.len() as u32..old_block_pages {
             update.successor.delete_state(&block_page_key(ordinal))?;
         }
         if let Some(shifts) = update.before.get_state(BLOCK_SHIFTS_STATE)? {
@@ -204,13 +216,19 @@ fn store_rendered_markdown_state(
 ) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     sink.put_state(ROOT_STATE, &root)?;
-    let old_page_count = block_page_count(before)?;
-    let (index, pages) = encode_blocks(&blocks)?;
-    sink.put_state(BLOCKS_STATE, &index)?;
-    for (ordinal, page) in pages.iter().enumerate() {
+    let (old_index_pages, old_block_pages) = block_page_counts(before)?;
+    let encoded = encode_blocks(&blocks)?;
+    sink.put_state(BLOCKS_STATE, &encoded.manifest)?;
+    for (ordinal, page) in encoded.index_pages.iter().enumerate() {
+        sink.put_state(&block_index_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in encoded.index_pages.len() as u32..old_index_pages {
+        sink.delete_state(&block_index_page_key(ordinal))?;
+    }
+    for (ordinal, page) in encoded.block_pages.iter().enumerate() {
         sink.put_state(&block_page_key(ordinal as u32), page)?;
     }
-    for ordinal in pages.len() as u32..old_page_count {
+    for ordinal in encoded.block_pages.len() as u32..old_block_pages {
         sink.delete_state(&block_page_key(ordinal))?;
     }
     if let Some(shifts) = before.get_state(BLOCK_SHIFTS_STATE)? {
@@ -275,9 +293,12 @@ fn store_markdown_state(
 ) -> sdk::Result<()> {
     let (root, blocks) = document.arena_state().map_err(core_error)?;
     successor.put_state(ROOT_STATE, &root)?;
-    let (index, pages) = encode_blocks(&blocks)?;
-    successor.put_state(BLOCKS_STATE, &index)?;
-    for (ordinal, page) in pages.iter().enumerate() {
+    let encoded = encode_blocks(&blocks)?;
+    successor.put_state(BLOCKS_STATE, &encoded.manifest)?;
+    for (ordinal, page) in encoded.index_pages.iter().enumerate() {
+        successor.put_state(&block_index_page_key(ordinal as u32), page)?;
+    }
+    for (ordinal, page) in encoded.block_pages.iter().enumerate() {
         successor.put_state(&block_page_key(ordinal as u32), page)?;
     }
     let next_ordinal = next_arena_ordinal(&root, &blocks, creates)?;
@@ -301,10 +322,10 @@ fn sparse_block_change(
     insert: &[u8],
     namespace: IdNamespace,
 ) -> sdk::Result<Option<SparseBlockResult>> {
-    let state_len = match update.before.state_len(BLOCKS_STATE)? {
-        Some(length) => length,
+    match update.before.state_len(BLOCKS_STATE)? {
+        Some(_) => {}
         None => return Ok(None),
-    };
+    }
     let header = update
         .before
         .read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)?
@@ -315,12 +336,6 @@ fn sparse_block_change(
         ));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("fixed Markdown header"));
-    let index_end = u64::from(BLOCK_INDEX_HEADER_BYTES)
-        .checked_add(u64::from(count) * u64::from(BLOCK_INDEX_ENTRY_BYTES))
-        .ok_or_else(|| sdk::Error::invalid_input("Markdown block index overflowed"))?;
-    if index_end > state_len {
-        return Err(sdk::Error::invalid_input("truncated Markdown block index"));
-    }
     let mut shifts = decode_block_shifts(
         update
             .before
@@ -414,12 +429,14 @@ fn sparse_block_change(
     )))
 }
 
-fn encode_blocks(blocks: &[ArenaMarkdownBlock]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
-    let entries_bytes = blocks
-        .len()
-        .checked_mul(BLOCK_INDEX_ENTRY_BYTES as usize)
-        .ok_or_else(|| sdk::Error::limit_exceeded("Markdown block index overflowed"))?;
-    let mut pages = vec![Vec::with_capacity(BLOCK_PAGE_BYTES)];
+struct EncodedBlocks {
+    manifest: Vec<u8>,
+    index_pages: Vec<Vec<u8>>,
+    block_pages: Vec<Vec<u8>>,
+}
+
+fn encode_blocks(blocks: &[ArenaMarkdownBlock]) -> sdk::Result<EncodedBlocks> {
+    let mut block_pages = vec![Vec::with_capacity(BLOCK_PAGE_BYTES)];
     let mut locations = Vec::with_capacity(blocks.len());
     for block in blocks {
         if block.tree_json.len() > BLOCK_PAGE_BYTES {
@@ -427,48 +444,70 @@ fn encode_blocks(blocks: &[ArenaMarkdownBlock]) -> sdk::Result<(Vec<u8>, Vec<Vec
                 "one Markdown block exceeds the state-page limit",
             ));
         }
-        if !pages.last().expect("one page").is_empty()
-            && pages.last().expect("one page").len() + block.tree_json.len() > BLOCK_PAGE_BYTES
+        if !block_pages.last().expect("one page").is_empty()
+            && block_pages.last().expect("one page").len() + block.tree_json.len()
+                > BLOCK_PAGE_BYTES
         {
-            pages.push(Vec::with_capacity(BLOCK_PAGE_BYTES));
+            block_pages.push(Vec::with_capacity(BLOCK_PAGE_BYTES));
         }
-        let page = u32::try_from(pages.len() - 1)
+        let page = u32::try_from(block_pages.len() - 1)
             .map_err(|_| sdk::Error::limit_exceeded("too many Markdown block pages"))?;
-        let blob_offset = u32::try_from(pages.last().expect("one page").len())
+        let blob_offset = u32::try_from(block_pages.last().expect("one page").len())
             .map_err(|_| sdk::Error::limit_exceeded("Markdown block page exceeds 4GiB"))?;
-        pages
+        block_pages
             .last_mut()
             .expect("one page")
             .extend_from_slice(&block.tree_json);
         locations.push((page, blob_offset));
     }
     if blocks.is_empty() {
-        pages.clear();
+        block_pages.clear();
     }
-    let mut output = Vec::with_capacity(BLOCK_INDEX_HEADER_BYTES as usize + entries_bytes);
-    output.extend_from_slice(BLOCK_INDEX_MAGIC);
-    output.extend_from_slice(
-        &u32::try_from(blocks.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many Markdown blocks"))?
-            .to_le_bytes(),
-    );
-    output.extend_from_slice(
-        &u32::try_from(pages.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many Markdown block pages"))?
-            .to_le_bytes(),
+    let mut entries = Vec::with_capacity(
+        blocks
+            .len()
+            .checked_mul(BLOCK_INDEX_ENTRY_BYTES as usize)
+            .ok_or_else(|| sdk::Error::limit_exceeded("Markdown block index overflowed"))?,
     );
     for (block, (page, blob_offset)) in blocks.iter().zip(locations) {
-        output.extend_from_slice(&block.start.to_le_bytes());
-        output.extend_from_slice(&block.end.to_le_bytes());
-        output.extend_from_slice(&page.to_le_bytes());
-        output.extend_from_slice(&blob_offset.to_le_bytes());
-        output.extend_from_slice(
+        entries.extend_from_slice(&block.start.to_le_bytes());
+        entries.extend_from_slice(&block.end.to_le_bytes());
+        entries.extend_from_slice(&page.to_le_bytes());
+        entries.extend_from_slice(&blob_offset.to_le_bytes());
+        entries.extend_from_slice(
             &u32::try_from(block.tree_json.len())
                 .map_err(|_| sdk::Error::limit_exceeded("Markdown block state exceeds 4GiB"))?
                 .to_le_bytes(),
         );
     }
-    Ok((output, pages))
+    let entries_per_page = BLOCK_PAGE_BYTES / BLOCK_INDEX_ENTRY_BYTES as usize;
+    let index_page_bytes = entries_per_page * BLOCK_INDEX_ENTRY_BYTES as usize;
+    let index_pages = entries
+        .chunks(index_page_bytes)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let mut manifest = Vec::with_capacity(BLOCK_INDEX_HEADER_BYTES as usize);
+    manifest.extend_from_slice(BLOCK_INDEX_MAGIC);
+    manifest.extend_from_slice(
+        &u32::try_from(blocks.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many Markdown blocks"))?
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(
+        &u32::try_from(block_pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many Markdown block pages"))?
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(
+        &u32::try_from(index_pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many Markdown block index pages"))?
+            .to_le_bytes(),
+    );
+    Ok(EncodedBlocks {
+        manifest,
+        index_pages,
+        block_pages,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -481,12 +520,12 @@ struct BlockEntry {
 }
 
 fn read_block_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<BlockEntry> {
-    let offset = u64::from(BLOCK_INDEX_HEADER_BYTES)
-        .checked_add(u64::from(ordinal) * u64::from(BLOCK_INDEX_ENTRY_BYTES))
-        .ok_or_else(|| sdk::Error::invalid_input("Markdown block index offset overflowed"))?;
+    let entries_per_page = (BLOCK_PAGE_BYTES / BLOCK_INDEX_ENTRY_BYTES as usize) as u32;
+    let page = ordinal / entries_per_page;
+    let offset = u64::from(ordinal % entries_per_page) * u64::from(BLOCK_INDEX_ENTRY_BYTES);
     let bytes = update
         .before
-        .read_state_range(BLOCKS_STATE, offset, BLOCK_INDEX_ENTRY_BYTES)?
+        .read_state_range(&block_index_page_key(page), offset, BLOCK_INDEX_ENTRY_BYTES)?
         .ok_or_else(|| sdk::Error::invalid_input("Markdown block index disappeared"))?;
     Ok(BlockEntry {
         start: u64::from_le_bytes(bytes[0..8].try_into().expect("fixed block entry")),
@@ -503,17 +542,24 @@ fn block_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn block_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+fn block_index_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"markdown/block-index-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn block_page_counts(root: &sdk::Root<'_>) -> sdk::Result<(u32, u32)> {
     let Some(header) = root.read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)? else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     if header.get(..4) != Some(BLOCK_INDEX_MAGIC) {
         return Err(sdk::Error::invalid_input(
             "unsupported Markdown block index",
         ));
     }
-    Ok(u32::from_le_bytes(
-        header[8..12].try_into().expect("fixed Markdown header"),
+    Ok((
+        u32::from_le_bytes(header[12..16].try_into().expect("fixed Markdown header")),
+        u32::from_le_bytes(header[8..12].try_into().expect("fixed Markdown header")),
     ))
 }
 
@@ -879,3 +925,38 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 
 #[cfg(target_family = "wasm")]
 lix_plugin_api::export_plugin!(MarkdownPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_block_index_is_split_into_bounded_pages() {
+        let blocks = (0..80_000_u64)
+            .map(|ordinal| ArenaMarkdownBlock {
+                start: ordinal,
+                end: ordinal + 1,
+                tree_json: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+
+        let encoded = encode_blocks(&blocks).expect("encode block index");
+
+        assert_eq!(encoded.manifest.len(), BLOCK_INDEX_HEADER_BYTES as usize);
+        assert!(encoded.index_pages.len() > 1);
+        assert!(
+            encoded
+                .index_pages
+                .iter()
+                .all(|page| page.len() <= BLOCK_PAGE_BYTES)
+        );
+        assert_eq!(
+            encoded
+                .index_pages
+                .iter()
+                .map(|page| page.len())
+                .sum::<usize>(),
+            blocks.len() * BLOCK_INDEX_ENTRY_BYTES as usize
+        );
+    }
+}

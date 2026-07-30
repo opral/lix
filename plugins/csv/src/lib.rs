@@ -18,6 +18,7 @@ const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
 const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
+const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for CsvPlugin {
     fn entities_changed(
@@ -54,7 +55,7 @@ impl sdk::FormatPlugin for CsvPlugin {
             .entity_records()
             .map_err(sdk::Error::invalid_input)?;
         sink.put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
-        sink.delete_state(CSV_INDEX_KEY)?;
+        delete_csv_index_from_sink(&update.before, sink)?;
         Ok(())
     }
 
@@ -91,7 +92,7 @@ impl sdk::FormatPlugin for CsvPlugin {
         input
             .successor
             .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        input.successor.put_state(CSV_INDEX_KEY, &state)?;
+        store_csv_index(&input.successor, &state)?;
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         encoder.push(import.table_change(), input.creates, sink)?;
         encoder.flush(sink)?;
@@ -121,21 +122,25 @@ impl sdk::FormatPlugin for CsvPlugin {
             unreachable!("the sparse path requires exactly one edit")
         };
         let insert = &edit.insert;
-        let (index, range) = if let Some(state_len) = update.before.state_len(CSV_INDEX_KEY)? {
+        let (index, range) = if update.before.state_len(CSV_INDEX_KEY)?.is_some() {
             let header = update
                 .before
                 .read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)?
                 .ok_or_else(|| sdk::Error::invalid_input("CSV arena root has no row index"))?;
-            let index = ArenaRowIndex::decode_header(&header, state_len)
+            let row_count = u32::from_le_bytes(header[32..36].try_into().expect("CSV row count"));
+            let logical_state_len = u64::from(CSV_INDEX_HEADER_BYTES)
+                .checked_add(u64::from(row_count) * 4)
+                .ok_or_else(|| sdk::Error::invalid_input("CSV row index size overflowed"))?;
+            let index = ArenaRowIndex::decode_header(&header, logical_state_len)
                 .map_err(sdk::Error::invalid_input)?;
             let range = index
                 .row_range_for_edit_reader(edit.offset, edit.delete_len, |ordinal| {
-                    let offset = u64::from(CSV_INDEX_HEADER_BYTES)
-                        .checked_add(u64::from(ordinal) * 4)
-                        .ok_or_else(|| "CSV arena row-index offset overflowed".to_owned())?;
+                    let offsets_per_page = (CSV_INDEX_PAGE_BYTES / 4) as u32;
+                    let page = ordinal / offsets_per_page;
+                    let offset = u64::from(ordinal % offsets_per_page) * 4;
                     let bytes = update
                         .before
-                        .read_state_range(CSV_INDEX_KEY, offset, 4)
+                        .read_state_range(&csv_index_page_key(page), offset, 4)
                         .map_err(|error| format!("CSV arena row-index read failed: {error:?}"))?
                         .ok_or_else(|| "CSV arena row index disappeared".to_owned())?;
                     let bytes: [u8; 4] = bytes
@@ -156,7 +161,7 @@ impl sdk::FormatPlugin for CsvPlugin {
             let range = index
                 .row_range_for_edit(edit.offset, edit.delete_len)
                 .map_err(sdk::Error::invalid_input)?;
-            update.successor.put_state(CSV_INDEX_KEY, &state)?;
+            store_csv_index(&update.successor, &state)?;
             (index, range)
         };
         let (ordinal, row_start, row_end) = range;
@@ -178,6 +183,68 @@ impl sdk::FormatPlugin for CsvPlugin {
         encoder.flush(sink)?;
         Ok(())
     }
+}
+
+fn store_csv_index(successor: &sdk::Transaction<'_>, state: &[u8]) -> sdk::Result<()> {
+    let (header, pages) = split_csv_index(state)?;
+    successor.put_state(CSV_INDEX_KEY, header)?;
+    for (ordinal, page) in pages.into_iter().enumerate() {
+        successor.put_state(&csv_index_page_key(ordinal as u32), page)?;
+    }
+    Ok(())
+}
+
+fn split_csv_index(state: &[u8]) -> sdk::Result<(&[u8], Vec<&[u8]>)> {
+    if state.len() < CSV_INDEX_HEADER_BYTES as usize {
+        return Err(sdk::Error::invalid_input("CSV row index is truncated"));
+    }
+    let header = &state[..CSV_INDEX_HEADER_BYTES as usize];
+    let pages = state[CSV_INDEX_HEADER_BYTES as usize..]
+        .chunks(CSV_INDEX_PAGE_BYTES)
+        .collect();
+    Ok((header, pages))
+}
+
+fn csv_index_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    let Some(header) = root.read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)? else {
+        return Ok(0);
+    };
+    if header.len() != CSV_INDEX_HEADER_BYTES as usize {
+        return Err(sdk::Error::invalid_input(
+            "CSV row index header is truncated",
+        ));
+    }
+    let row_count = u32::from_le_bytes(header[32..36].try_into().expect("CSV row count"));
+    let offsets_bytes = usize::try_from(row_count)
+        .expect("u32 fits usize")
+        .checked_mul(4)
+        .ok_or_else(|| sdk::Error::invalid_input("CSV row index size overflowed"))?;
+    Ok(u32::try_from(offsets_bytes.div_ceil(CSV_INDEX_PAGE_BYTES))
+        .map_err(|_| sdk::Error::limit_exceeded("too many CSV row index pages"))?)
+}
+
+fn delete_csv_index(before: &sdk::Root<'_>, successor: &sdk::Transaction<'_>) -> sdk::Result<()> {
+    let page_count = csv_index_page_count(before)?;
+    successor.delete_state(CSV_INDEX_KEY)?;
+    for ordinal in 0..page_count {
+        successor.delete_state(&csv_index_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn delete_csv_index_from_sink(before: &sdk::Root<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+    let page_count = csv_index_page_count(before)?;
+    sink.delete_state(CSV_INDEX_KEY)?;
+    for ordinal in 0..page_count {
+        sink.delete_state(&csv_index_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn csv_index_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"csv/index-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
 }
 
 fn fallback_file_changed(
@@ -240,7 +307,7 @@ fn fallback_file_changed(
     update
         .successor
         .put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
-    update.successor.delete_state(CSV_INDEX_KEY)?;
+    delete_csv_index(&update.before, &update.successor)?;
     let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
     for change in changes {
         encoder.push(change, update.creates, sink)?;
@@ -545,3 +612,26 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 
 #[cfg(target_family = "wasm")]
 lix_plugin_api::export_plugin!(CsvPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_row_index_is_split_into_bounded_pages() {
+        let row_count = 600_000_u32;
+        let mut state = vec![0; CSV_INDEX_HEADER_BYTES as usize];
+        state[32..36].copy_from_slice(&row_count.to_le_bytes());
+        state.resize(state.len() + row_count as usize * 4, 0);
+
+        let (header, pages) = split_csv_index(&state).expect("split row index");
+
+        assert_eq!(header.len(), CSV_INDEX_HEADER_BYTES as usize);
+        assert!(pages.len() > 1);
+        assert!(pages.iter().all(|page| page.len() <= CSV_INDEX_PAGE_BYTES));
+        assert_eq!(
+            pages.iter().map(|page| page.len()).sum::<usize>(),
+            row_count as usize * 4
+        );
+    }
+}

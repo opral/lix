@@ -11,9 +11,10 @@ struct ExcalidrawPlugin;
 const ELEMENT_INDEX_KEY: &[u8] = b"excalidraw/element-spans-v1";
 const ELEMENT_SHIFTS_KEY: &[u8] = b"excalidraw/element-shifts-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"excalidraw/id-namespace-v1";
-const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS1";
-const ELEMENT_INDEX_HEADER_BYTES: u32 = 8;
+const ELEMENT_INDEX_MAGIC: &[u8; 4] = b"EXS2";
+const ELEMENT_INDEX_HEADER_BYTES: u32 = 16;
 const ELEMENT_INDEX_ENTRY_BYTES: u32 = 32;
+const ELEMENT_INDEX_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for ExcalidrawPlugin {
     fn entities_changed(
@@ -46,7 +47,7 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
-        sink.delete_state(ELEMENT_INDEX_KEY)?;
+        delete_element_index_from_sink(&update.before, sink)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         Ok(())
     }
@@ -62,8 +63,8 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
         input
             .successor
             .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        input.successor.put_state(
-            ELEMENT_INDEX_KEY,
+        store_element_index(
+            &input.successor,
             &encode_element_index(&document.arena_element_spans())?,
         )?;
         emit_changes(changes, sink)?;
@@ -109,8 +110,9 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
         let (document, changes) = document
             .file_changed(&splices, namespace)
             .map_err(sdk::Error::invalid_input)?;
-        update.successor.put_state(
-            ELEMENT_INDEX_KEY,
+        replace_element_index(
+            &update.before,
+            &update.successor,
             &encode_element_index(&document.arena_element_spans())?,
         )?;
         update.successor.delete_state(ELEMENT_SHIFTS_KEY)?;
@@ -175,10 +177,10 @@ fn sparse_element_change(
     edit: &sdk::InputSplice,
     insert: &[u8],
 ) -> sdk::Result<Option<(EntityChange, Vec<u8>)>> {
-    let state_len = match update.before.state_len(ELEMENT_INDEX_KEY)? {
-        Some(length) => length,
+    match update.before.state_len(ELEMENT_INDEX_KEY)? {
+        Some(_) => {}
         None => return Ok(None),
-    };
+    }
     let header = update
         .before
         .read_state_range(ELEMENT_INDEX_KEY, 0, ELEMENT_INDEX_HEADER_BYTES)?
@@ -193,13 +195,16 @@ fn sparse_element_change(
             .try_into()
             .expect("validated Excalidraw index header"),
     );
+    let payload_len = u64::from(u32::from_le_bytes(
+        header[8..12]
+            .try_into()
+            .expect("validated Excalidraw index header"),
+    ));
     let entry_bytes = u64::from(count)
         .checked_mul(u64::from(ELEMENT_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index size overflowed"))?;
-    let blob_offset = u64::from(ELEMENT_INDEX_HEADER_BYTES)
-        .checked_add(entry_bytes)
-        .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index size overflowed"))?;
-    if blob_offset > state_len {
+    let blob_offset = entry_bytes;
+    if blob_offset > payload_len {
         return Err(sdk::Error::invalid_input(
             "truncated Excalidraw element index",
         ));
@@ -247,17 +252,10 @@ fn sparse_element_change(
         .checked_add(entry.order_key_len)
         .and_then(|length| length.checked_add(entry.leading_json_len))
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw metadata size overflowed"))?;
-    let metadata = update
-        .before
-        .read_state_range(
-            ELEMENT_INDEX_KEY,
-            blob_offset
-                .checked_add(u64::from(entry.metadata_offset))
-                .ok_or_else(|| {
-                    sdk::Error::invalid_input("Excalidraw metadata offset overflowed")
-                })?,
-            metadata_length,
-        )?
+    let metadata_offset = blob_offset
+        .checked_add(u64::from(entry.metadata_offset))
+        .ok_or_else(|| sdk::Error::invalid_input("Excalidraw metadata offset overflowed"))?;
+    let metadata = read_element_index_range(&update.before, metadata_offset, metadata_length)?
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw element index disappeared"))?;
     let id_end = entry.id_len as usize;
     let order_key_end = id_end + entry.order_key_len as usize;
@@ -293,7 +291,12 @@ fn sparse_element_change(
     Ok(Some((change, encode_shifts(&shifts))))
 }
 
-fn encode_element_index(spans: &[ArenaElementSpan]) -> sdk::Result<Vec<u8>> {
+struct EncodedElementIndex {
+    count: u32,
+    payload: Vec<u8>,
+}
+
+fn encode_element_index(spans: &[ArenaElementSpan]) -> sdk::Result<EncodedElementIndex> {
     let entries_bytes = spans
         .len()
         .checked_mul(ELEMENT_INDEX_ENTRY_BYTES as usize)
@@ -305,13 +308,9 @@ fn encode_element_index(spans: &[ArenaElementSpan]) -> sdk::Result<Vec<u8>> {
             .and_then(|value| value.checked_add(span.leading_json.len()))
             .ok_or_else(|| sdk::Error::limit_exceeded("Excalidraw metadata size overflowed"))
     })?;
-    let mut output = Vec::with_capacity(8 + entries_bytes + metadata_bytes);
-    output.extend_from_slice(ELEMENT_INDEX_MAGIC);
-    output.extend_from_slice(
-        &u32::try_from(spans.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw element spans"))?
-            .to_le_bytes(),
-    );
+    let count = u32::try_from(spans.len())
+        .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw element spans"))?;
+    let mut output = Vec::with_capacity(entries_bytes + metadata_bytes);
     let mut metadata_offset = 0_u32;
     for span in spans {
         output.extend_from_slice(&span.offset.to_le_bytes());
@@ -331,7 +330,108 @@ fn encode_element_index(spans: &[ArenaElementSpan]) -> sdk::Result<Vec<u8>> {
         output.extend_from_slice(span.order_key.as_bytes());
         output.extend_from_slice(span.leading_json.as_bytes());
     }
-    Ok(output)
+    Ok(EncodedElementIndex {
+        count,
+        payload: output,
+    })
+}
+
+fn store_element_index(
+    successor: &sdk::Transaction<'_>,
+    encoded: &EncodedElementIndex,
+) -> sdk::Result<()> {
+    let page_count = u32::try_from(encoded.payload.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES))
+        .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw index pages"))?;
+    let mut manifest = Vec::with_capacity(ELEMENT_INDEX_HEADER_BYTES as usize);
+    manifest.extend_from_slice(ELEMENT_INDEX_MAGIC);
+    manifest.extend_from_slice(&encoded.count.to_le_bytes());
+    manifest.extend_from_slice(
+        &u32::try_from(encoded.payload.len())
+            .map_err(|_| sdk::Error::limit_exceeded("Excalidraw index exceeds 4GiB"))?
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(&page_count.to_le_bytes());
+    successor.put_state(ELEMENT_INDEX_KEY, &manifest)?;
+    for (ordinal, page) in encoded.payload.chunks(ELEMENT_INDEX_PAGE_BYTES).enumerate() {
+        successor.put_state(&element_index_page_key(ordinal as u32), page)?;
+    }
+    Ok(())
+}
+
+fn replace_element_index(
+    before: &sdk::Root<'_>,
+    successor: &sdk::Transaction<'_>,
+    encoded: &EncodedElementIndex,
+) -> sdk::Result<()> {
+    let old_page_count = element_index_page_count(before)?;
+    store_element_index(successor, encoded)?;
+    let new_page_count = u32::try_from(encoded.payload.len().div_ceil(ELEMENT_INDEX_PAGE_BYTES))
+        .map_err(|_| sdk::Error::limit_exceeded("too many Excalidraw index pages"))?;
+    for ordinal in new_page_count..old_page_count {
+        successor.delete_state(&element_index_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn delete_element_index_from_sink(
+    before: &sdk::Root<'_>,
+    sink: &mut sdk::Sink<'_>,
+) -> sdk::Result<()> {
+    let page_count = element_index_page_count(before)?;
+    sink.delete_state(ELEMENT_INDEX_KEY)?;
+    for ordinal in 0..page_count {
+        sink.delete_state(&element_index_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn element_index_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    let Some(header) = root.read_state_range(ELEMENT_INDEX_KEY, 0, ELEMENT_INDEX_HEADER_BYTES)?
+    else {
+        return Ok(0);
+    };
+    if header.get(..4) != Some(ELEMENT_INDEX_MAGIC) {
+        return Err(sdk::Error::invalid_input(
+            "unsupported Excalidraw element index",
+        ));
+    }
+    Ok(u32::from_le_bytes(
+        header[12..16]
+            .try_into()
+            .expect("fixed Excalidraw manifest"),
+    ))
+}
+
+fn element_index_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"excalidraw/element-index-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn read_element_index_range(
+    root: &sdk::Root<'_>,
+    offset: u64,
+    length: u32,
+) -> sdk::Result<Option<Vec<u8>>> {
+    let mut output = Vec::with_capacity(length as usize);
+    let mut cursor = offset;
+    let end = offset
+        .checked_add(u64::from(length))
+        .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index range overflowed"))?;
+    while cursor < end {
+        let page = cursor / ELEMENT_INDEX_PAGE_BYTES as u64;
+        let page_offset = cursor % ELEMENT_INDEX_PAGE_BYTES as u64;
+        let remaining = end - cursor;
+        let take = remaining.min(ELEMENT_INDEX_PAGE_BYTES as u64 - page_offset) as u32;
+        let Some(bytes) =
+            root.read_state_range(&element_index_page_key(page as u32), page_offset, take)?
+        else {
+            return Ok(None);
+        };
+        output.extend_from_slice(&bytes);
+        cursor += u64::from(take);
+    }
+    Ok(Some(output))
 }
 
 #[derive(Clone, Copy)]
@@ -345,12 +445,10 @@ struct IndexEntry {
 }
 
 fn read_index_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<IndexEntry> {
-    let offset = u64::from(ELEMENT_INDEX_HEADER_BYTES)
-        .checked_add(u64::from(ordinal) * u64::from(ELEMENT_INDEX_ENTRY_BYTES))
+    let offset = u64::from(ordinal)
+        .checked_mul(u64::from(ELEMENT_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw index offset overflowed"))?;
-    let bytes = update
-        .before
-        .read_state_range(ELEMENT_INDEX_KEY, offset, ELEMENT_INDEX_ENTRY_BYTES)?
+    let bytes = read_element_index_range(&update.before, offset, ELEMENT_INDEX_ENTRY_BYTES)?
         .ok_or_else(|| sdk::Error::invalid_input("Excalidraw element index disappeared"))?;
     Ok(IndexEntry {
         offset: u64::from_le_bytes(bytes[0..8].try_into().expect("fixed index entry")),
@@ -543,3 +641,36 @@ fn push_inline_blob(output: &mut Vec<u8>, bytes: &[u8]) -> sdk::Result<()> {
 
 #[cfg(target_family = "wasm")]
 lix_plugin_api::export_plugin!(ExcalidrawPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn large_element_index_is_split_into_bounded_pages() {
+        let spans = (0..70_000_u64)
+            .map(|ordinal| ArenaElementSpan {
+                id: format!("element-{ordinal}"),
+                order_key: ordinal.to_string(),
+                leading_json: String::new(),
+                offset: ordinal,
+                length: 1,
+            })
+            .collect::<Vec<_>>();
+
+        let encoded = encode_element_index(&spans).expect("encode element index");
+        let pages = encoded
+            .payload
+            .chunks(ELEMENT_INDEX_PAGE_BYTES)
+            .collect::<Vec<_>>();
+
+        assert!(encoded.payload.len() > 2 * 1024 * 1024);
+        assert!(pages.len() > 1);
+        assert!(
+            pages
+                .iter()
+                .all(|page| page.len() <= ELEMENT_INDEX_PAGE_BYTES)
+        );
+        assert_eq!(encoded.count, spans.len() as u32);
+    }
+}
