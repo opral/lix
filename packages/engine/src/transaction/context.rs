@@ -1062,8 +1062,8 @@ where
             discard_plugin_actor_publications(actor_publications).await;
             return Err(error);
         }
-        let affects_filesystem_path_index =
-            prepared_transaction_write_affects_filesystem_path_index(&write);
+        let (affects_filesystem_path_index, filesystem_delta_rows) =
+            prepared_transaction_write_filesystem_index_impact(&write);
         let stage_result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_buffer_stage"
@@ -1082,8 +1082,22 @@ where
             }
         };
         if affects_filesystem_path_index {
-            self.filesystem_path_index_epoch
+            let previous_epoch = self
+                .filesystem_path_index_epoch
                 .fetch_add(1, Ordering::SeqCst);
+            let next_epoch = previous_epoch.wrapping_add(1);
+            if incremental_filesystem_index_enabled() && !filesystem_delta_rows.is_empty() {
+                self.filesystem_path_index_cache.advance_revisions(
+                    &filesystem_delta_rows,
+                    |revision| {
+                        advance_transaction_path_index_cache_revision(
+                            revision,
+                            previous_epoch,
+                            next_epoch,
+                        )
+                    },
+                );
+            }
         }
         self.pending_file_view_mutations.extend(file_view_mutations);
         self.pending_plugin_actor_publications
@@ -6685,18 +6699,22 @@ where
     }
 }
 
-fn prepared_transaction_write_affects_filesystem_path_index(
+fn prepared_transaction_write_filesystem_index_impact(
     write: &PreparedTransactionWrite,
-) -> bool {
-    prepared_transaction_write_rows(write).iter().any(|row| {
-        matches!(
-            row.schema_key.as_str(),
-            "lix_file_descriptor"
-                | "lix_directory_descriptor"
-                | BLOB_REF_SCHEMA_KEY
-                | BRANCH_REF_SCHEMA_KEY
-        )
-    })
+) -> (bool, Vec<MaterializedLiveStateRow>) {
+    let mut affects_index = false;
+    let mut delta_rows = Vec::new();
+    for row in prepared_transaction_write_rows(write).iter() {
+        match row.schema_key.as_str() {
+            FILE_DESCRIPTOR_SCHEMA_KEY | DIRECTORY_DESCRIPTOR_SCHEMA_KEY | BLOB_REF_SCHEMA_KEY => {
+                affects_index = true;
+                delta_rows.push(MaterializedLiveStateRow::from(row));
+            }
+            BRANCH_REF_SCHEMA_KEY => affects_index = true,
+            _ => {}
+        }
+    }
+    (affects_index, delta_rows)
 }
 
 fn prepared_transaction_write_rows(write: &PreparedTransactionWrite) -> &PreparedStateBatch {
@@ -6745,6 +6763,24 @@ fn transaction_path_index_cache_revision(
         None => cache_revision.push(0),
     }
     cache_revision
+}
+
+fn advance_transaction_path_index_cache_revision(
+    revision: &[u8],
+    previous_epoch: usize,
+    next_epoch: usize,
+) -> Option<Vec<u8>> {
+    const PREFIX: &[u8] = b"transaction-path-index-v1";
+    let epoch_end = PREFIX.len().checked_add(size_of::<usize>())?;
+    if revision.len() < epoch_end
+        || !revision.starts_with(PREFIX)
+        || revision[PREFIX.len()..epoch_end] != previous_epoch.to_be_bytes()
+    {
+        return None;
+    }
+    let mut next_revision = revision.to_vec();
+    next_revision[PREFIX.len()..epoch_end].copy_from_slice(&next_epoch.to_be_bytes());
+    Some(next_revision)
 }
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -10029,6 +10065,71 @@ mod tests {
             std::iter::repeat_n('a', 64).collect::<String>(),
             "the previously loaded authoritative entry remains untouched on rejection"
         );
+    }
+
+    #[tokio::test]
+    async fn staged_descriptor_batches_advance_transaction_path_index() {
+        let storage = Memory::new();
+        Engine::initialize(storage.clone())
+            .await
+            .expect("storage should initialize");
+        let engine = Engine::new(storage)
+            .await
+            .expect("engine should open initialized storage");
+        let session = engine
+            .open_workspace_session()
+            .await
+            .expect("workspace session should open");
+
+        let values = (0..32)
+            .map(|index| format!("('/seed-{index:02}.md', X'01')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        session
+            .execute(
+                &format!("INSERT INTO lix_file (path, data) VALUES {values}"),
+                &[],
+            )
+            .await
+            .expect("fixture files should commit");
+
+        let mut transaction = session
+            .begin_transaction()
+            .await
+            .expect("transaction should begin");
+        reset_transaction_path_index_build_stats();
+        for index in 0..5 {
+            transaction
+                .execute(
+                    &format!(
+                        "INSERT INTO lix_file (path, data) VALUES ('/staged-{index}.md', X'02')"
+                    ),
+                    &[],
+                )
+                .await
+                .expect("descriptor batch should stage");
+            transaction
+                .execute(
+                    "UPDATE lix_file SET data = X'03' WHERE path = '/seed-00.md'",
+                    &[],
+                )
+                .await
+                .expect("path lookup after the staged descriptor should succeed");
+        }
+
+        let stats = transaction_path_index_build_stats();
+        assert_eq!(
+            stats.builds, 1,
+            "the first staged revision may build once; later revisions must advance by delta"
+        );
+        assert!(
+            stats.descriptor_rows > 0,
+            "the regression must exercise a real transaction path-index build"
+        );
+        transaction
+            .rollback()
+            .await
+            .expect("transaction should roll back");
     }
 
     #[tokio::test]
