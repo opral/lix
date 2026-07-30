@@ -1,6 +1,7 @@
 #![allow(clippy::large_futures)]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -42,14 +43,14 @@ fn rows(count: usize) -> Vec<BenchTransactionRow> {
                 schema_key: "lix_account".to_string(),
                 file_id: None,
                 entity_pk: entity_pk.clone(),
-                value: json!({
+                value: Arc::new(json!({
                     "id": &entity_pk,
                     "name": format!("account-{index}"),
-                }),
-                updated_value: json!({
+                })),
+                updated_value: Arc::new(json!({
                     "id": entity_pk,
                     "name": format!("updated-account-{index}"),
-                }),
+                })),
             }
         })
         .collect()

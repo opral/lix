@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    io::{self, Write as _},
     ops::Deref,
     sync::{Arc, OnceLock},
 };
@@ -51,10 +52,17 @@ enum TransactionJsonCertificate {
 
 impl TransactionJson {
     pub(crate) fn from_value(value: JsonValue, context: &str) -> Result<Self, LixError> {
+        Self::from_shared_value(Arc::new(value), context)
+    }
+
+    pub(crate) fn from_shared_value(
+        value: Arc<JsonValue>,
+        context: &str,
+    ) -> Result<Self, LixError> {
         let _ = context;
         Ok(Self {
             storage: TransactionJsonStorage::Decoded {
-                value: Arc::new(value),
+                value,
                 normalized: OnceLock::new(),
             },
         })
@@ -62,6 +70,12 @@ impl TransactionJson {
 
     pub(crate) fn from_value_unchecked(value: JsonValue) -> Self {
         Self::from_value(value, "transaction JSON")
+            .expect("serializing serde_json::Value should not fail")
+    }
+
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn from_shared_value_unchecked(value: Arc<JsonValue>) -> Self {
+        Self::from_shared_value(value, "transaction JSON")
             .expect("serializing serde_json::Value should not fail")
     }
 
@@ -1480,9 +1494,11 @@ pub(crate) fn stage_json_from_value(
 ///
 /// Plugin-produced rows already carry a bounded canonical page handle and are
 /// left untouched. SQL-produced values reach this boundary without a
-/// per-row serialized `String`; the batch counts encoded lengths without
-/// allocating, reserves the exact arena once, serializes each row once, and
-/// replaces the row-owned values with cheap batch handles.
+/// per-row serialized `String`; the batch appends every row into one amortized
+/// arena, serializes each row once, and replaces the row-owned values with
+/// cheap batch handles. Avoiding an exact-size structural prepass matters for
+/// bulk writes: walking every JSON tree twice costs more than the bounded
+/// geometric growth of one shared arena.
 pub(crate) fn canonicalize_transaction_json_batch<'a>(
     slots: impl IntoIterator<Item = &'a mut Option<TransactionJson>>,
     context: &str,
@@ -1540,27 +1556,27 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         return Ok(());
     }
 
-    // Count an allocation upper bound without invoking Serialize. This is a
-    // cheap structural walk (numbers reserve their bounded maximum width);
-    // the loop below is the only canonical serialization of each snapshot.
-    let normalized_capacity =
-        values
-            .iter()
-            .zip(&cached_normalized)
-            .try_fold(0_usize, |total, (value, cached)| {
-                total
-                    .checked_add(match cached {
-                        Some(cached) => cached.len(),
-                        None => canonical_json_capacity(value)?,
-                    })
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_UNKNOWN,
-                            format!("{context} canonical JSON batch size overflowed"),
-                        )
-                    })
-            })?;
-    if u32::try_from(normalized_capacity).is_err() {
+    let cached_capacity = cached_normalized
+        .iter()
+        .flatten()
+        .try_fold(0_usize, |total, cached| total.checked_add(cached.len()))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} canonical JSON batch size overflowed"),
+            )
+        })?;
+    let decoded_capacity_hint = values
+        .len()
+        .checked_mul(256)
+        .and_then(|capacity| capacity.checked_add(cached_capacity))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} canonical JSON batch size overflowed"),
+            )
+        })?;
+    if u32::try_from(cached_capacity).is_err() {
         return Err(LixError::new(
             LixError::CODE_UNKNOWN,
             format!("{context} canonical JSON batch exceeds u32"),
@@ -1568,7 +1584,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     }
 
     let mut offsets = Vec::with_capacity(values.len());
-    let mut normalized = Vec::with_capacity(normalized_capacity);
+    let mut normalized = CanonicalJsonArena::new(decoded_capacity_hint, context)?;
     let mut serialize_count = 0usize;
     for (value, cached) in values.iter().zip(&cached_normalized) {
         let start = u32::try_from(normalized.len()).map_err(|_| {
@@ -1578,12 +1594,19 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
             )
         })?;
         if let Some(cached) = cached {
-            normalized.extend_from_slice(cached.as_bytes());
+            normalized
+                .append(cached.as_bytes())
+                .map_err(|failure| canonical_json_arena_error(context, failure))?;
         } else {
             serde_json::to_writer(&mut normalized, value).map_err(|error| {
-                LixError::new(
-                    LixError::CODE_UNKNOWN,
-                    format!("{context} failed to serialize normalized JSON: {error}"),
+                normalized.failure().map_or_else(
+                    || {
+                        LixError::new(
+                            LixError::CODE_UNKNOWN,
+                            format!("{context} failed to serialize normalized JSON: {error}"),
+                        )
+                    },
+                    |failure| canonical_json_arena_error(context, failure),
                 )
             })?;
             serialize_count += 1;
@@ -1596,10 +1619,9 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })?;
         offsets.push((start, end));
     }
-    debug_assert!(normalized.len() <= normalized.capacity());
     let rows = WasmCanonicalJson::from_batch_parts(
         values,
-        normalized,
+        normalized.into_bytes(),
         offsets,
         positions.len(),
         serialize_count,
@@ -1611,64 +1633,103 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     Ok(())
 }
 
-/// Returns a tight canonical-JSON allocation upper bound without serializing.
-///
-/// String escaping is counted exactly. `serde_json::Number` is bounded by the
-/// crate's non-arbitrary-precision i64/u64/f64 representation, so 32 bytes is
-/// a conservative constant and avoids allocating a temporary number string.
-fn canonical_json_capacity(value: &JsonValue) -> Result<usize, LixError> {
-    fn add(total: &mut usize, amount: usize) -> Result<(), LixError> {
-        *total = total.checked_add(amount).ok_or_else(|| {
-            LixError::new(LixError::CODE_UNKNOWN, "canonical JSON capacity overflowed")
-        })?;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CanonicalJsonArenaFailure {
+    ExceedsU32,
+    Allocation,
+}
+
+struct CanonicalJsonArena {
+    bytes: Vec<u8>,
+    limit: usize,
+    failure: Option<CanonicalJsonArenaFailure>,
+}
+
+impl CanonicalJsonArena {
+    fn new(capacity_hint: usize, context: &str) -> Result<Self, LixError> {
+        Self::with_limit(capacity_hint, u32::MAX as usize)
+            .map_err(|failure| canonical_json_arena_error(context, failure))
+    }
+
+    fn with_limit(capacity_hint: usize, limit: usize) -> Result<Self, CanonicalJsonArenaFailure> {
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(capacity_hint.min(limit))
+            .map_err(|_| CanonicalJsonArenaFailure::Allocation)?;
+        Ok(Self {
+            bytes,
+            limit,
+            failure: None,
+        })
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn failure(&self) -> Option<CanonicalJsonArenaFailure> {
+        self.failure
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), CanonicalJsonArenaFailure> {
+        self.write_all(bytes).map_err(|_| {
+            self.failure
+                .unwrap_or(CanonicalJsonArenaFailure::Allocation)
+        })
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl io::Write for CanonicalJsonArena {
+    fn write(&mut self, source: &[u8]) -> io::Result<usize> {
+        let required = self
+            .bytes
+            .len()
+            .checked_add(source.len())
+            .filter(|&required| required <= self.limit)
+            .ok_or_else(|| {
+                self.failure = Some(CanonicalJsonArenaFailure::ExceedsU32);
+                io::Error::other("canonical JSON arena exceeds its wire-format limit")
+            })?;
+        if required > self.bytes.capacity() {
+            let doubled = self
+                .bytes
+                .capacity()
+                .max(1)
+                .saturating_mul(2)
+                .min(self.limit);
+            let target = required.max(doubled);
+            if self
+                .bytes
+                .try_reserve_exact(target - self.bytes.len())
+                .is_err()
+            {
+                self.failure = Some(CanonicalJsonArenaFailure::Allocation);
+                return Err(io::Error::other("canonical JSON arena allocation failed"));
+            }
+        }
+        self.bytes.extend_from_slice(source);
+        Ok(source.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
 
-    fn string_capacity(value: &str, total: &mut usize) -> Result<(), LixError> {
-        add(total, 2)?;
-        for scalar in value.chars() {
-            add(
-                total,
-                match scalar {
-                    '"' | '\\' => 2,
-                    scalar if scalar <= '\u{1f}' => 6,
-                    scalar => scalar.len_utf8(),
-                },
-            )?;
+fn canonical_json_arena_error(context: &str, failure: CanonicalJsonArenaFailure) -> LixError {
+    let message = match failure {
+        CanonicalJsonArenaFailure::ExceedsU32 => {
+            format!("{context} canonical JSON batch exceeds u32")
         }
-        Ok(())
-    }
-
-    fn visit(value: &JsonValue, total: &mut usize) -> Result<(), LixError> {
-        match value {
-            JsonValue::Null | JsonValue::Bool(true) => add(total, 4),
-            JsonValue::Bool(false) => add(total, 5),
-            JsonValue::Number(_) => add(total, 32),
-            JsonValue::String(value) => string_capacity(value, total),
-            JsonValue::Array(values) => {
-                add(total, 2)?;
-                add(total, values.len().saturating_sub(1))?;
-                for value in values {
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
-            JsonValue::Object(values) => {
-                add(total, 2)?;
-                add(total, values.len().saturating_sub(1))?;
-                for (key, value) in values {
-                    string_capacity(key, total)?;
-                    add(total, 1)?;
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
+        CanonicalJsonArenaFailure::Allocation => {
+            format!("{context} canonical JSON batch allocation failed")
         }
-    }
-
-    let mut total = 0;
-    visit(value, &mut total)?;
-    Ok(total)
+    };
+    LixError::new(LixError::CODE_UNKNOWN, message)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -3775,6 +3836,24 @@ mod tests {
             first.validation_counts(),
             (2, 1),
             "only the uncached row should invoke canonical serialization"
+        );
+    }
+
+    #[test]
+    fn canonical_json_arena_rejects_uncached_bytes_before_exceeding_its_limit() {
+        let mut arena =
+            CanonicalJsonArena::with_limit(0, 8).expect("create bounded canonical JSON arena");
+        let error = serde_json::to_writer(
+            &mut arena,
+            &serde_json::json!("payload larger than the test wire limit"),
+        )
+        .expect_err("oversized uncached JSON must fail through the bounded writer");
+
+        assert!(error.is_io());
+        assert_eq!(arena.failure(), Some(CanonicalJsonArenaFailure::ExceedsU32));
+        assert!(
+            arena.len() <= 8,
+            "the arena must reject a write before growing beyond its wire limit"
         );
     }
 

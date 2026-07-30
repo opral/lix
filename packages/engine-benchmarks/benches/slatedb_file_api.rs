@@ -318,11 +318,11 @@ impl SingletonWriteFixture {
                     schema_key: "json_pointer".to_string(),
                     file_id: None,
                     entity_pk: path.clone(),
-                    value: json!({"path": path, "value": format!("seed-{index:04}")}),
-                    updated_value: json!({
+                    value: Arc::new(json!({"path": path, "value": format!("seed-{index:04}")})),
+                    updated_value: Arc::new(json!({
                         "path": format!("/singleton/{index:04}"),
                         "value": format!("updated-{index:04}"),
-                    }),
+                    })),
                 }
             })
             .collect();
