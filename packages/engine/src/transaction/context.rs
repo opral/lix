@@ -5916,6 +5916,7 @@ struct PreparedScalarRow {
     created_at: LixTimestamp,
     updated_at: LixTimestamp,
     change_id: Option<ChangeId>,
+    addressable_change_id: bool,
     commit_id: Option<CommitId>,
 }
 
@@ -5930,6 +5931,7 @@ struct PreparedScalarBatch {
     created_at: Vec<LixTimestamp>,
     updated_at: Vec<LixTimestamp>,
     change_ids: Vec<Option<ChangeId>>,
+    addressable_change_ids: Vec<bool>,
     commit_ids: Vec<Option<CommitId>>,
 }
 
@@ -5941,6 +5943,7 @@ impl PreparedScalarBatch {
             created_at: Vec::with_capacity(capacity),
             updated_at: Vec::with_capacity(capacity),
             change_ids: Vec::with_capacity(capacity),
+            addressable_change_ids: Vec::with_capacity(capacity),
             commit_ids: Vec::with_capacity(capacity),
         }
     }
@@ -5951,6 +5954,7 @@ impl PreparedScalarBatch {
         self.created_at.push(row.created_at);
         self.updated_at.push(row.updated_at);
         self.change_ids.push(row.change_id);
+        self.addressable_change_ids.push(row.addressable_change_id);
         self.commit_ids.push(row.commit_id);
     }
 
@@ -5961,6 +5965,7 @@ impl PreparedScalarBatch {
             created_at: self.created_at[index],
             updated_at: self.updated_at[index],
             change_id: self.change_ids[index],
+            addressable_change_id: self.addressable_change_ids[index],
             commit_id: self.commit_ids[index],
         }
     }
@@ -5989,6 +5994,7 @@ fn plan_prepared_row_scalars(
             "normalized transaction write row is missing entity_pk",
         ));
     }
+    let addressable_change_id = row.change_id.is_none();
     let change_id = Some(match row.change_id {
         Some(change_id) => ChangeId::parse_lix(change_id, "prepared row change_id")?,
         None => ChangeId::from(functions.call_uuid_v7()),
@@ -6003,6 +6009,7 @@ fn plan_prepared_row_scalars(
         created_at,
         updated_at,
         change_id,
+        addressable_change_id,
         commit_id,
     })
 }
@@ -6035,7 +6042,7 @@ fn push_prepared_state_row_from_planned_parts(
             "normalized transaction write row is missing entity_pk",
         )
     })?;
-    prepared.push_parts(
+    prepared.push_parts_with_change_addressability(
         scalar.schema_plan_id,
         scalar.facts,
         entity_pk,
@@ -6049,6 +6056,7 @@ fn push_prepared_state_row_from_planned_parts(
         scalar.updated_at,
         global,
         scalar.change_id,
+        scalar.addressable_change_id,
         scalar.commit_id,
         untracked,
         branch_id,
@@ -9981,6 +9989,28 @@ mod tests {
             .await
             .expect("branch ref should load")
             .expect("tracked commit should advance the global branch ref");
+        assert_eq!(
+            &tracked_change_id.as_uuid().as_bytes()[..12],
+            &head_commit_id.as_uuid().as_bytes()[..12],
+            "fresh tracked changes should carry their commit-delta address"
+        );
+        assert_eq!(
+            &head_commit_id.as_uuid().as_bytes()[12..],
+            &[0; 4],
+            "fresh commit ids should reserve the packed change address suffix"
+        );
+        let addressed_change =
+            crate::tracked_state::load_change_record_by_id(&packed_read, tracked_change_id)
+                .await
+                .expect("direct change address should load")
+                .expect("direct change address should exist");
+        assert_eq!(
+            addressed_change
+                .entity_pk
+                .as_single_string_owned()
+                .as_deref(),
+            Ok("tracked-programmatic")
+        );
 
         let tracked_row = TrackedStateContext::new()
             .reader(

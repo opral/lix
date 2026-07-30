@@ -47,6 +47,21 @@ impl CommitId {
         &self.uuid
     }
 
+    /// Creates a commit id whose low 32 bits are reserved for directly
+    /// addressable packed change ordinals.
+    ///
+    /// Fold those bits into the remaining random field before clearing them
+    /// so deterministic UUID providers still produce distinct commit ids.
+    pub(crate) fn with_change_address_space(value: Uuid) -> Self {
+        let mut bytes = *value.as_bytes();
+        bytes[8] = (bytes[8] & 0xc0) | ((bytes[8] ^ bytes[12]) & 0x3f);
+        bytes[9] ^= bytes[13];
+        bytes[10] ^= bytes[14];
+        bytes[11] ^= bytes[15];
+        bytes[12..].fill(0);
+        Self::new(Uuid::from_bytes(bytes))
+    }
+
     #[cfg(any(test, feature = "storage-benches"))]
     pub(crate) fn for_test_label(value: &str) -> Self {
         Uuid::parse_str(value)

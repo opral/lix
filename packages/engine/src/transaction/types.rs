@@ -1804,6 +1804,7 @@ impl TestPreparedStateRow {
             updated_at: self.updated_at,
             global: self.global,
             change_id: self.change_id,
+            addressable_change_id: false,
             commit_id: self.commit_id,
             untracked: self.untracked,
             branch_id: &self.branch_id,
@@ -1846,6 +1847,9 @@ struct PreparedStateSlot {
     updated_at: LixTimestamp,
     global: bool,
     change_id: Option<ChangeId>,
+    /// The engine generated this fresh tracked identity and may replace it
+    /// with its final commit-delta address during commit planning.
+    addressable_change_id: bool,
     commit_id: Option<CommitId>,
     untracked: bool,
     branch_id: u32,
@@ -1870,6 +1874,7 @@ pub(crate) struct PreparedStateRowRef<'a> {
     pub(crate) updated_at: LixTimestamp,
     pub(crate) global: bool,
     pub(crate) change_id: Option<ChangeId>,
+    pub(crate) addressable_change_id: bool,
     pub(crate) commit_id: Option<CommitId>,
     pub(crate) untracked: bool,
     pub(crate) branch_id: &'a SharedStr,
@@ -1963,6 +1968,7 @@ impl PreparedStateBatch {
             updated_at: slot.updated_at,
             global: slot.global,
             change_id: slot.change_id,
+            addressable_change_id: slot.addressable_change_id,
             commit_id: slot.commit_id,
             untracked: slot.untracked,
             branch_id: &self.strings[slot.branch_id as usize],
@@ -2008,6 +2014,7 @@ impl PreparedStateBatch {
         batch
     }
 
+    #[cfg(test)]
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn push_parts(
         &mut self,
@@ -2024,6 +2031,48 @@ impl PreparedStateBatch {
         updated_at: LixTimestamp,
         global: bool,
         change_id: Option<ChangeId>,
+        commit_id: Option<CommitId>,
+        untracked: bool,
+        branch_id: SharedStr,
+    ) {
+        self.push_parts_with_change_addressability(
+            schema_plan_id,
+            facts,
+            entity_pk,
+            schema_key,
+            file_id,
+            snapshot,
+            metadata,
+            origin,
+            origin_key,
+            created_at,
+            updated_at,
+            global,
+            change_id,
+            false,
+            commit_id,
+            untracked,
+            branch_id,
+        );
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn push_parts_with_change_addressability(
+        &mut self,
+        schema_plan_id: SchemaPlanId,
+        facts: PreparedRowFacts,
+        entity_pk: EntityPk,
+        schema_key: SharedStr,
+        file_id: Option<SharedStr>,
+        snapshot: Option<StageJson>,
+        metadata: Option<StageJson>,
+        origin: Option<TransactionWriteOrigin>,
+        origin_key: Option<&SharedStr>,
+        created_at: LixTimestamp,
+        updated_at: LixTimestamp,
+        global: bool,
+        change_id: Option<ChangeId>,
+        addressable_change_id: bool,
         commit_id: Option<CommitId>,
         untracked: bool,
         branch_id: SharedStr,
@@ -2050,6 +2099,7 @@ impl PreparedStateBatch {
             updated_at,
             global,
             change_id,
+            addressable_change_id,
             commit_id,
             untracked,
             branch_id,
@@ -2181,6 +2231,10 @@ impl PreparedStateBatch {
 
     pub(crate) fn set_commit_id(&mut self, index: usize, commit_id: Option<CommitId>) {
         self.slots[index].commit_id = commit_id;
+    }
+
+    pub(crate) fn set_change_id(&mut self, index: usize, change_id: Option<ChangeId>) {
+        self.slots[index].change_id = change_id;
     }
 
     pub(crate) fn release_validated_canonical_value_columns(&mut self) {
@@ -2364,7 +2418,7 @@ impl PreparedStateBatch {
     }
 
     fn push_borrowed_row(&mut self, row: PreparedStateRowRef<'_>) {
-        self.push_parts(
+        self.push_parts_with_change_addressability(
             row.schema_plan_id,
             row.facts,
             row.entity_pk.clone(),
@@ -2378,6 +2432,7 @@ impl PreparedStateBatch {
             row.updated_at,
             row.global,
             row.change_id,
+            row.addressable_change_id,
             row.commit_id,
             row.untracked,
             row.branch_id.clone(),
