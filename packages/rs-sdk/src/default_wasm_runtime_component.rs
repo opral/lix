@@ -1685,14 +1685,14 @@ enum CreatedPacketIdentity {
     Create { schema_key: String, local_ref: u64 },
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CertifiedPacketSchemaKeys {
     create_refs: std::collections::BTreeSet<u64>,
     explicit_keys: std::collections::BTreeSet<Vec<String>>,
     explicit_create_refs: std::collections::BTreeSet<u64>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct CertifiedPacketEntityKeys {
     schemas: std::collections::BTreeMap<String, CertifiedPacketSchemaKeys>,
 }
@@ -1800,6 +1800,32 @@ fn validate_new_certified_packet_keys(
         page_keys.insert(identity, creates, existing)?;
     }
     Ok((page.schemas, page_keys))
+}
+
+fn validate_ordinary_packet_page_keys(
+    page: &WasmChangePage,
+    creates: WasmCreateContext,
+    existing: &CertifiedPacketEntityKeys,
+) -> Result<CertifiedPacketEntityKeys, LixError> {
+    let mut page_keys = CertifiedPacketEntityKeys::default();
+    for change in &page.changes.changes {
+        let identity = match change {
+            WasmEntityChange::Create {
+                schema_key,
+                local_ref,
+                ..
+            } => CreatedPacketIdentity::Create {
+                schema_key: schema_key.clone(),
+                local_ref: *local_ref,
+            },
+            WasmEntityChange::Upsert { entity, .. } => {
+                CreatedPacketIdentity::Explicit(entity.key.clone())
+            }
+            WasmEntityChange::Delete(key) => CreatedPacketIdentity::Explicit(key.clone()),
+        };
+        page_keys.insert(identity, creates, existing)?;
+    }
+    Ok(page_keys)
 }
 
 /// Returns packet metadata when every framed record is an inline snapshot write.
@@ -3373,15 +3399,21 @@ impl WasmComponentActor for V3Actor {
                         // their durable base directly and avoids paying a new
                         // segment/manifest lifecycle for one or two rows.
                         if !cursor.complete_file_state {
-                            return PendingChangePage::Packet {
+                            let decoded = PendingChangePage::Packet {
                                 record_count,
                                 payload,
                                 max_page_bytes,
                                 limits,
                                 creates,
                             }
-                            .decode()
-                            .map(Some);
+                            .decode()?;
+                            let page_keys = validate_ordinary_packet_page_keys(
+                                &decoded,
+                                creates,
+                                &cursor.certified_packet_entity_keys,
+                            )?;
+                            cursor.certified_packet_entity_keys.extend(page_keys);
+                            return Ok(Some(decoded));
                         }
                         if cursor
                             .certified_packet_creates
@@ -3405,15 +3437,21 @@ impl WasmComponentActor for V3Actor {
                         cursor.certified_packet_entity_keys.extend(page_keys);
                         cursor.certified_packet_pages.push(Bytes::from(payload));
                     } else {
-                        return PendingChangePage::Packet {
+                        let decoded = PendingChangePage::Packet {
                             record_count,
                             payload,
                             max_page_bytes,
                             limits,
                             creates,
                         }
-                        .decode()
-                        .map(Some);
+                        .decode()?;
+                        let page_keys = validate_ordinary_packet_page_keys(
+                            &decoded,
+                            creates,
+                            &cursor.certified_packet_entity_keys,
+                        )?;
+                        cursor.certified_packet_entity_keys.extend(page_keys);
+                        return Ok(Some(decoded));
                     }
                 }
                 Some(WorkerTransitionEvent::Finished(result)) => {
@@ -3733,6 +3771,49 @@ mod tests {
         .expect_err("a later page must not repeat an explicit key");
         assert_eq!(
             duplicate_explicit.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+    }
+
+    #[test]
+    fn certified_packet_rejects_keys_repeated_by_ordinary_pages() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let generated_id = creates.component(7).expect("create identity");
+        let ordinary_payload = upsert_page("row", &generated_id);
+        let ordinary = decode_inline_change_page(
+            1,
+            ordinary_payload.clone(),
+            ordinary_payload.len() as u32,
+            WasmTransitionLimits::default(),
+        )
+        .expect("ordinary packet decodes");
+
+        let mut certified_first = CertifiedPacketEntityKeys::default();
+        accept_page(&create_page("row", 7), creates, &mut certified_first)
+            .expect("certified create is unique");
+        let duplicate_ordinary =
+            validate_ordinary_packet_page_keys(&ordinary, creates, &certified_first)
+                .expect_err("ordinary write must not repeat a certified identity");
+        assert_eq!(
+            duplicate_ordinary.message,
+            "a component entity key may occur only once across certified packet pages"
+        );
+
+        let mut ordinary_first = CertifiedPacketEntityKeys::default();
+        let ordinary_keys = validate_ordinary_packet_page_keys(&ordinary, creates, &ordinary_first)
+            .expect("ordinary write is initially unique");
+        ordinary_first.extend(ordinary_keys);
+        let duplicate_certified = accept_page(
+            &upsert_page("row", &generated_id),
+            creates,
+            &mut ordinary_first,
+        )
+        .expect_err("certified write must not repeat an ordinary identity");
+        assert_eq!(
+            duplicate_certified.message,
             "a component entity key may occur only once across certified packet pages"
         );
     }
