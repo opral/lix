@@ -916,7 +916,10 @@ impl TableSpec for LixFileSpec {
         .await
         .map_err(lix_error_to_datafusion_error)?;
         let needs_data = scan_needs_data(&self.schema, projection, &filters);
-        let needs_blob_rows = scan_needs_blob_rows(&self.schema, projection, &filters);
+        let needs_required_blob_rows =
+            scan_needs_required_blob_rows(&self.schema, projection, &filters);
+        let needs_blob_rows = needs_required_blob_rows
+            || scan_needs_content_updated_at(&self.schema, projection, &filters);
         let needs_file_timestamps = scan_needs_file_timestamps(&self.schema, projection, &filters);
         let target_file_ids = file_id_constraint_from_filters(&filters)?;
         let target_directory_ids =
@@ -1018,6 +1021,7 @@ impl TableSpec for LixFileSpec {
                     self.session_file_views.clone(),
                     needs_data,
                     needs_blob_rows,
+                    needs_required_blob_rows,
                     limit,
                 ),
                 |(
@@ -1035,10 +1039,11 @@ impl TableSpec for LixFileSpec {
                     session_file_views,
                     needs_data,
                     needs_blob_rows,
+                    needs_required_blob_rows,
                     limit,
                 )| async move {
                     if let Some(indexed_matches) = indexed_matches.as_ref()
-                        && !needs_blob_rows
+                        && !needs_required_blob_rows
                     {
                         // Without residual filters, the path-index order is the
                         // output order. Materialize only projected columns and
@@ -1101,7 +1106,7 @@ impl TableSpec for LixFileSpec {
                         ))
                     })?;
                     let acknowledge_plugin_data = needs_data && session_file_views.is_some();
-                    let plugin_render = if prepared.needs_plugin_render(needs_blob_rows)
+                    let plugin_render = if prepared.needs_plugin_render(needs_required_blob_rows)
                         || acknowledge_plugin_data
                     {
                         plugin_render_context_for_lix_file_scan(
@@ -5663,7 +5668,7 @@ fn scan_needs_data(
     projected_needs_data || filters.iter().any(|filter| contains_column(filter, "data"))
 }
 
-fn scan_needs_blob_rows(
+fn scan_needs_required_blob_rows(
     base_schema: &SchemaRef,
     projection: Option<&Vec<usize>>,
     filters: &[Expr],
@@ -5672,17 +5677,32 @@ fn scan_needs_blob_rows(
         Some(indices) => indices.iter().any(|index| {
             matches!(
                 base_schema.field(*index).name().as_str(),
-                "data" | "lixcol_change_id" | "lixcol_updated_at"
+                "data" | "lixcol_change_id"
             )
         }),
         None => true,
     };
     projects_blob_column
         || filters.iter().any(|filter| {
-            contains_column(filter, "data")
-                || contains_column(filter, "lixcol_change_id")
-                || contains_column(filter, "lixcol_updated_at")
+            contains_column(filter, "data") || contains_column(filter, "lixcol_change_id")
         })
+}
+
+fn scan_needs_content_updated_at(
+    base_schema: &SchemaRef,
+    projection: Option<&Vec<usize>>,
+    filters: &[Expr],
+) -> bool {
+    let projects_updated_at = match projection {
+        Some(indices) => indices
+            .iter()
+            .any(|index| base_schema.field(*index).name() == "lixcol_updated_at"),
+        None => true,
+    };
+    projects_updated_at
+        || filters
+            .iter()
+            .any(|filter| contains_column(filter, "lixcol_updated_at"))
 }
 
 fn should_use_path_index(path_predicate: &FilePathPredicate, needs_blob_rows: bool) -> bool {
