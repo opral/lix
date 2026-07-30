@@ -70,9 +70,29 @@ const COMMIT_DELTA_SEGMENT_MAX_ROWS: usize = 128;
 const COMMIT_DELTA_SEGMENT_TARGET_BYTES: usize = 28 * 1024;
 const COMMIT_DELTA_FORMAT_MAGIC: &[u8] = b"LXCD6";
 const COMMIT_DELTA_PAYLOAD_OFFSET_BYTES: usize = size_of::<u32>();
+#[cfg(not(test))]
 const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 64 * 1024 * 1024;
+#[cfg(test)]
+const COMMIT_DELTA_MAX_SIDECAR_BYTES: usize = 1024 * 1024;
 const COMMIT_DELTA_SIDECAR_RAW: u8 = 0;
 const COMMIT_DELTA_SIDECAR_ZSTD: u8 = 1;
+
+enum CommitDeltaSegmentEncodeError {
+    SidecarTooLarge,
+    Codec(LixError),
+}
+
+impl CommitDeltaSegmentEncodeError {
+    fn into_lix_error(self) -> LixError {
+        match self {
+            Self::SidecarTooLarge => LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "tracked_state commit_delta sidecar exceeds the format limit",
+            ),
+            Self::Codec(error) => error,
+        }
+    }
+}
 
 #[derive(Clone, Copy, musli::Encode)]
 #[musli(packed)]
@@ -648,17 +668,26 @@ pub(crate) fn stage_commit_deltas(
     let mut segment_start = 0usize;
     while segment_start < entries.len() {
         let mut segment_end = (segment_start + COMMIT_DELTA_SEGMENT_MAX_ROWS).min(entries.len());
-        let mut encoded = try_encode_commit_delta_segment_with_payloads(
-            &entries[segment_start..segment_end],
-            &payloads[segment_start..segment_end],
-        )?;
-        while encoded.len() > COMMIT_DELTA_SEGMENT_TARGET_BYTES && segment_end - segment_start > 1 {
-            segment_end = segment_start + (segment_end - segment_start).div_ceil(2);
-            encoded = try_encode_commit_delta_segment_with_payloads(
+        let encoded = loop {
+            match try_encode_commit_delta_segment_with_payloads(
                 &entries[segment_start..segment_end],
                 &payloads[segment_start..segment_end],
-            )?;
-        }
+            ) {
+                Ok(encoded)
+                    if encoded.len() <= COMMIT_DELTA_SEGMENT_TARGET_BYTES
+                        || segment_end - segment_start == 1 =>
+                {
+                    break encoded;
+                }
+                Ok(_) | Err(CommitDeltaSegmentEncodeError::SidecarTooLarge)
+                    if segment_end - segment_start > 1 =>
+                {
+                    segment_end = segment_start + (segment_end - segment_start).div_ceil(2);
+                }
+                Err(error) => return Err(error.into_lix_error()),
+                Ok(_) => unreachable!("single-row segment exits through the guarded success arm"),
+            }
+        };
         encoded_segments.push((segment_start..segment_end, encoded));
         segment_start = segment_end;
     }
@@ -2128,7 +2157,7 @@ fn encode_commit_delta_segment(entries: &[EncodedLeafEntry]) -> Vec<u8> {
 fn try_encode_commit_delta_segment_with_payloads(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
-) -> Result<Vec<u8>, LixError> {
+) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     encode_commit_delta_segment_layout(entries, payloads, true)
 }
 
@@ -2136,7 +2165,7 @@ fn encode_commit_delta_segment_layout(
     entries: &[EncodedLeafEntry],
     payloads: &[CommitDeltaPayloadRef<'_>],
     compress_sidecar: bool,
-) -> Result<Vec<u8>, LixError> {
+) -> Result<Vec<u8>, CommitDeltaSegmentEncodeError> {
     debug_assert_eq!(entries.len(), payloads.len());
     let leaf = encode_leaf_node(entries);
     let mut payload_offsets = Vec::with_capacity(payloads.len() + 1);
@@ -2158,17 +2187,9 @@ fn encode_commit_delta_segment_layout(
     let sidecar_len = 4usize
         .checked_add(directory_bytes)
         .and_then(|len| len.checked_add(payload_bytes.len()))
-        .ok_or_else(|| {
-            LixError::new(
-                LixError::CODE_INTERNAL_ERROR,
-                "tracked_state commit_delta sidecar size overflows",
-            )
-        })?;
+        .ok_or(CommitDeltaSegmentEncodeError::SidecarTooLarge)?;
     if sidecar_len > COMMIT_DELTA_MAX_SIDECAR_BYTES {
-        return Err(LixError::new(
-            LixError::CODE_INTERNAL_ERROR,
-            "tracked_state commit_delta sidecar exceeds the format limit",
-        ));
+        return Err(CommitDeltaSegmentEncodeError::SidecarTooLarge);
     }
     let mut sidecar = Vec::with_capacity(sidecar_len);
     sidecar.extend_from_slice(&entry_count.to_be_bytes());
@@ -2180,10 +2201,10 @@ fn encode_commit_delta_segment_layout(
         .then(|| crate::compression::compress_zstd_level_1(&sidecar))
         .transpose()
         .map_err(|error| {
-            LixError::new(
+            CommitDeltaSegmentEncodeError::Codec(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 format!("tracked_state commit_delta sidecar compression failed: {error}"),
-            )
+            ))
         })?;
     let (sidecar_encoding, stored_sidecar) = match compressed.as_deref() {
         Some(compressed) if compressed.len() < sidecar.len() => {
@@ -2213,6 +2234,7 @@ fn encode_commit_delta_segment_with_payloads(
     payloads: &[CommitDeltaPayloadRef<'_>],
 ) -> Vec<u8> {
     try_encode_commit_delta_segment_with_payloads(entries, payloads)
+        .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
         .expect("test commit-delta segment should encode")
 }
 
@@ -2222,6 +2244,7 @@ fn encode_commit_delta_segment_with_raw_sidecar(
     payloads: &[CommitDeltaPayloadRef<'_>],
 ) -> Vec<u8> {
     encode_commit_delta_segment_layout(entries, payloads, false)
+        .map_err(CommitDeltaSegmentEncodeError::into_lix_error)
         .expect("test raw commit-delta segment should encode")
 }
 
@@ -2430,13 +2453,13 @@ fn decode_commit_delta_segment(
     expected_bounds: Option<&CommitDeltaSegmentBounds>,
     expected_commit_id: CommitId,
 ) -> Result<DecodedLeafNodeRef, LixError> {
-    let (leaf, _) = decode_commit_delta_with_payloads(bytes, expected_bounds)?;
+    let leaf = decode_commit_delta_leaf(bytes, expected_bounds)?;
     visit_commit_delta_leaf(&leaf, expected_commit_id, |_, _, _| Ok(()))?;
     Ok(leaf)
 }
 
-/// Visits each packed delta exactly once while validating the full immutable
-/// segment contract. Scan callers decode the key and retain matching values in
+/// Visits each packed delta exactly once while validating the immutable leaf
+/// contract. Scan callers decode the key and retain matching values in
 /// the same pass; point callers use the no-op visitor before their binary
 /// search, preserving eager corruption detection.
 fn visit_commit_delta_leaf(
@@ -3581,6 +3604,151 @@ mod tests {
         assert_eq!(
             last_change.snapshot,
             crate::json_store::JsonSlot::Inline(snapshots[999].clone().into_boxed_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_candidate_sidecars_split_before_rejecting_valid_rows() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("oversized-candidate-sidecar");
+        let fixtures = (0..4)
+            .map(|index| CommitDeltaFixture {
+                schema_key: "large-sidecar".to_string(),
+                file_id: None,
+                entity_pk: EntityPk::single(format!("entity-{index}")),
+                change_id: ChangeId::for_test_label(&format!(
+                    "oversized-candidate-sidecar-change-{index}"
+                )),
+                deleted: false,
+                created_at: LixTimestamp::from_unix_millis_utc_lossy(index),
+                updated_at: LixTimestamp::from_unix_millis_utc_lossy(index + 1),
+            })
+            .collect::<Vec<_>>();
+        let snapshots = (0..fixtures.len())
+            .map(|index| {
+                format!(
+                    r#"{{"index":{index},"value":"{}"}}"#,
+                    "x".repeat(300 * 1024)
+                )
+            })
+            .collect::<Vec<_>>();
+        let deltas = fixtures
+            .iter()
+            .zip(&snapshots)
+            .map(|(fixture, snapshot)| {
+                commit_delta_ref(
+                    commit_id,
+                    fixture,
+                    crate::json_store::JsonSlotRef::Inline(snapshot),
+                    crate::json_store::JsonSlotRef::None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut writes = storage.new_write_set();
+        stage_commit_deltas(&mut writes, &deltas)
+            .expect("individually valid rows should split below the sidecar limit");
+        assert_eq!(
+            writes.stats().staged_puts,
+            3,
+            "the oversized four-row candidate should become two segments plus one manifest"
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("split sidecars should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("split sidecar read should open");
+        let members = load_commit_delta_members_with_payloads(&read, commit_id)
+            .await
+            .expect("every split payload should remain readable");
+        assert_eq!(members.len(), fixtures.len());
+        for (member, snapshot) in members.iter().zip(&snapshots) {
+            assert_eq!(
+                member.change.snapshot,
+                crate::json_store::JsonSlot::Inline(snapshot.clone().into_boxed_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn index_only_point_replay_does_not_decode_payload_sidecars() {
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("index-only-skips-sidecar");
+        let fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let entry = EncodedLeafEntry {
+            key: encode_key_ref(TrackedStateKeyRef {
+                schema_key: &fixture.schema_key,
+                file_id: fixture.file_id.as_deref(),
+                entity_pk: &fixture.entity_pk,
+            })
+            .into(),
+            value: encode_value_ref(TrackedStateIndexValueRef {
+                change_id: fixture.change_id,
+                commit_id,
+                deleted: fixture.deleted,
+                created_at: fixture.created_at,
+                updated_at: fixture.updated_at,
+            })
+            .into(),
+        };
+        let snapshot = format!(r#"{{"value":"{}"}}"#, "z".repeat(8 * 1024));
+        let mut segment = encode_commit_delta_segment_with_payloads(
+            std::slice::from_ref(&entry),
+            &[CommitDeltaPayloadRef {
+                snapshot: crate::json_store::JsonSlotRef::Inline(&snapshot),
+                metadata: crate::json_store::JsonSlotRef::None,
+                origin_key: None,
+                authored: true,
+            }],
+        );
+        segment.pop();
+        let mut writes = storage.new_write_set();
+        writes.put(
+            TRACKED_STATE_COMMIT_DELTA_MANIFEST_SPACE,
+            key(commit_delta_manifest_key(commit_id)),
+            value(
+                encode_commit_delta_manifest(&CommitDeltaManifest {
+                    inline_segment: segment,
+                    segments: Vec::new(),
+                })
+                .expect("manifest should encode"),
+            ),
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("corrupt sidecar fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("index-only read should open");
+        assert_eq!(
+            load_commit_delta_values_encoded(
+                &read,
+                commit_id,
+                &[Bytes::copy_from_slice(&entry.key)],
+            )
+            .await
+            .expect("index-only replay should ignore the payload sidecar"),
+            vec![Some(fixture.value(commit_id))]
+        );
+        let error = load_commit_delta_members_with_payloads(&read, commit_id)
+            .await
+            .expect_err("payload-aware replay must still validate the corrupt sidecar");
+        assert!(
+            error
+                .to_string()
+                .contains("compressed commit_delta sidecar failed to decode"),
+            "unexpected payload error: {error}"
         );
     }
 
