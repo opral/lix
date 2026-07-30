@@ -311,6 +311,78 @@ pub struct StorageLayoutAccounting {
     pub value_bytes: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDeltaLayoutAccounting {
+    pub commit_id: String,
+    pub segment_count: usize,
+    pub members: usize,
+    pub authored_members: usize,
+    pub selected_members: usize,
+    pub selected_tombstones: usize,
+    pub certified_members: usize,
+    pub selected_certified_members: usize,
+}
+
+pub async fn commit_delta_layout_accounting<R>(
+    read: &R,
+) -> Result<Vec<CommitDeltaLayoutAccounting>, crate::LixError>
+where
+    R: StorageAdapterRead,
+{
+    let inventory = crate::tracked_state::scan_commit_delta_inventory(read).await?;
+    let certified_change_ids = inventory
+        .commits
+        .values()
+        .flat_map(|entry| &entry.members)
+        .filter(|member| member.is_certified_payload_ref())
+        .map(|member| member.value.change_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    Ok(inventory
+        .commits
+        .into_iter()
+        .map(|(commit_id, entry)| {
+            let authored_members = entry
+                .members
+                .iter()
+                .filter(|member| member.authored)
+                .count();
+            let selected_members = entry
+                .members
+                .iter()
+                .filter(|member| member.is_selected_payload_ref())
+                .count();
+            let selected_tombstones = entry
+                .members
+                .len()
+                .saturating_sub(authored_members)
+                .saturating_sub(selected_members);
+            let certified_members = entry
+                .members
+                .iter()
+                .filter(|member| member.is_certified_payload_ref())
+                .count();
+            let selected_certified_members = entry
+                .members
+                .iter()
+                .filter(|member| {
+                    member.is_selected_payload_ref()
+                        && certified_change_ids.contains(&member.value.change_id)
+                })
+                .count();
+            CommitDeltaLayoutAccounting {
+                commit_id: commit_id.to_string(),
+                segment_count: entry.segment_count,
+                members: entry.members.len(),
+                authored_members,
+                selected_members,
+                selected_tombstones,
+                certified_members,
+                selected_certified_members,
+            }
+        })
+        .collect())
+}
+
 pub(crate) async fn commit_write_set_for_bench<StorageImpl>(
     storage: &StorageAdapter<StorageImpl>,
     writes: StorageWriteSet,
