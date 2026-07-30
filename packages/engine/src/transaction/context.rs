@@ -1445,6 +1445,10 @@ where
             ));
         }
         let materialization_bytes = materialization.bytes.clone();
+        let derived_materialization = matches!(
+            &materialization_bytes,
+            VisibleMaterializationBytes::Derived { .. }
+        );
         let validated = match materialization_bytes {
             VisibleMaterializationBytes::Blob { hash } => {
                 let base_blob_reader = self.binary_cas.reader(read);
@@ -1570,7 +1574,8 @@ where
         counters.full_state_semantic_rows_materialized =
             u64::try_from(entity_count).unwrap_or(u64::MAX);
         counters.full_document_reparses = 1;
-        counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
+        counters.full_renderer_invocations =
+            u64::from(derived_materialization || !cold_open_hydrates_without_render);
         self.plugin_host.record_transition_counters(counters);
         cache
             .install_cold_if_absent(

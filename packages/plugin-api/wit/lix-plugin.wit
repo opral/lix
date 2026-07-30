@@ -183,6 +183,12 @@ interface api {
     changes: own<entity-change-source>,
   }
 
+  record hydrate-request {
+    descriptor: file-descriptor,
+    accepted: option<own<snapshot>>,
+    entities: own<entity-change-source>,
+  }
+
   /// All file transitions use one fused guest entry and one borrowed,
   /// host-owned atomic output capability.
   apply: func(
@@ -198,6 +204,14 @@ interface api {
 
   entities-changed: func(
     input: entity-update,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  /// Rebuild one evicted arena from the complete durable entity set. Blob
+  /// plugins also receive their exact accepted bytes; derived plugins render
+  /// those bytes from entities through the transition sink.
+  hydrate: func(
+    input: hydrate-request,
     output: borrow<transition>,
   ) -> result<_, plugin-error>;
 }

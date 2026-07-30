@@ -621,6 +621,7 @@ fn read_host_bytes(value: &WasmHostBytes, offset: u64, length: u32) -> Result<Ve
     }
 }
 
+#[cfg(test)]
 fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
     let id = uuid::Uuid::parse_str(value).ok()?;
     if id.to_string() != value {
@@ -633,6 +634,7 @@ fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
     })
 }
 
+#[cfg(test)]
 fn create_context_from_generated_entity(
     plugin_key: &str,
     entity: &WasmEntity<WasmHostBytes>,
@@ -2103,7 +2105,7 @@ enum WorkerCommand {
         document: u64,
         limits: WasmTransitionLimits,
         input: WasmOpenEntitiesInput,
-        response: tokio::sync::oneshot::Sender<Result<WasmTransitionCounters, LixError>>,
+        response: tokio::sync::oneshot::Sender<Result<HydrateWorkerOutput, LixError>>,
     },
     EntitiesChanged {
         document: u64,
@@ -2149,6 +2151,11 @@ struct ResolutionWorkerOutput {
 
 struct EntityWorkerOutput {
     replacement: Bytes,
+    counters: WasmTransitionCounters,
+}
+
+struct HydrateWorkerOutput {
+    replacement: Option<Bytes>,
     counters: WasmTransitionCounters,
 }
 
@@ -2715,24 +2722,27 @@ impl V3Worker {
         document: u64,
         limits: WasmTransitionLimits,
         mut input: WasmOpenEntitiesInput,
-    ) -> Result<WasmTransitionCounters, LixError> {
+    ) -> Result<HydrateWorkerOutput, LixError> {
         let limits = v3_transition_limits(limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
-        let accepted = input
+        let bytes = input
             .accepted
-            .ok_or_else(|| v3_error("v3 cold hydration requires accepted bytes"))?;
-        let bytes = read_source_all(&accepted)?;
-        let mut creates = None;
-        let plugin_key = input.descriptor.plugin.plugin_key.as_str();
+            .as_ref()
+            .map(|accepted| read_source_all(accepted))
+            .transpose()?
+            .unwrap_or_default();
+        let mut entities = Vec::new();
         while let Some(page) = input.entities.next_page(limits.max_page_bytes)? {
             for entity in page.entities {
-                creates =
-                    creates.or_else(|| create_context_from_generated_entity(plugin_key, &entity));
+                entities.push(WasmEntityChange::Upsert {
+                    entity,
+                    effect: WasmChangeEffect::Content,
+                });
             }
         }
-        let creates = creates.unwrap_or(WasmCreateContext { high: 0, low: 0 });
+        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(limits, entities)?));
         let root = ArenaRoot::import(
             ArenaStore::default(),
             "v3-cold-successor",
@@ -2742,20 +2752,32 @@ impl V3Worker {
         );
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
-            creates,
+            WasmCreateContext { high: 0, low: 0 },
             None,
             std::mem::take(&mut self.first_transition),
-            false,
+            true,
         )?));
-        let accepted = self
+        let accepted = input
+            .accepted
+            .is_some()
+            .then(|| {
+                self.store.data_mut().table.push(SnapshotResource {
+                    root: root.clone(),
+                    state: state.clone(),
+                })
+            })
+            .transpose()
+            .map_err(|error| v3_error(format!("failed to register v3 cold snapshot: {error}")))?;
+        let source = self
             .store
             .data_mut()
             .table
-            .push(SnapshotResource {
-                root: root.clone(),
-                state: state.clone(),
+            .push(EntityChangeSourceResource {
+                state: entity_state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 cold snapshot: {error}")))?;
+            .map_err(|error| {
+                v3_error(format!("failed to register v3 hydration source: {error}"))
+            })?;
         let transition = self
             .store
             .data_mut()
@@ -2766,20 +2788,15 @@ impl V3Worker {
             })
             .map_err(|error| v3_error(format!("failed to register v3 cold transition: {error}")))?;
         let transition_rep = transition.rep();
-        let request = bindings::exports::lix::plugin::api::TransitionRequest::Open(
-            bindings::exports::lix::plugin::api::OpenRequest {
-                descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
-                    path: input.descriptor.path,
-                    media_type: input.descriptor.media_type,
-                },
-                accepted,
-                creates: bindings::exports::lix::plugin::api::CreateContext {
-                    high: creates.high,
-                    low: creates.low,
-                },
+        let request = bindings::exports::lix::plugin::api::HydrateRequest {
+            descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
+                path: input.descriptor.path,
+                media_type: input.descriptor.media_type,
             },
-        );
-        let result = self.guest.call_apply(
+            accepted,
+            entities: source,
+        };
+        let result = self.guest.call_hydrate(
             &mut self.store,
             &request,
             Resource::new_borrow(transition_rep),
@@ -2803,10 +2820,32 @@ impl V3Worker {
             }
         }
         let TransitionResource {
-            transaction,
+            mut transaction,
             state: transaction_state,
         } = transition;
         drop(transaction_state);
+        let mut transition_state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replacement = transition_state.file_replacement.take();
+        let rendered = replacement
+            .as_ref()
+            .map(|replacement| Bytes::copy_from_slice(&replacement.bytes));
+        if let Some(replacement) = replacement {
+            if !replacement.complete {
+                return Err(v3_error("v3 hydration file replacement is incomplete"));
+            }
+            transaction.edit_bytes(ArenaByteEdit {
+                offset: 0,
+                delete_len: root.bytes.len(),
+                insert: replacement.bytes,
+            });
+        } else if input.accepted.is_none() {
+            return Err(v3_error(
+                "v3 derived cold hydration did not emit a file replacement",
+            ));
+        }
+        drop(transition_state);
         let root = transaction
             .commit()
             .map_err(|error| v3_error(format!("failed to commit v3 cold root: {error}")))?;
@@ -2817,9 +2856,22 @@ impl V3Worker {
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .counters;
+        let entity_state = Arc::try_unwrap(entity_state)
+            .map_err(|_| v3_error("v3 hydration source remained live"))?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        counters.component_import_calls = counters
+            .component_import_calls
+            .saturating_add(entity_state.counters.component_import_calls);
+        counters.component_boundary_bytes = counters
+            .component_boundary_bytes
+            .saturating_add(entity_state.counters.component_boundary_bytes);
         counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
-        Ok(counters)
+        Ok(HydrateWorkerOutput {
+            replacement: rendered,
+            counters,
+        })
     }
 
     fn fork(&mut self, document: u64) -> Result<u64, LixError> {
@@ -3030,7 +3082,7 @@ impl WasmComponentActor for V3Actor {
         let document = self.allocate_document()?;
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let edits = WasmEditCursorHandle(self.allocate_handle()?);
-        let counters = self
+        let resolved = self
             .request(|response| WorkerCommand::HydrateFile {
                 document,
                 limits,
@@ -3038,15 +3090,35 @@ impl WasmComponentActor for V3Actor {
                 response,
             })
             .await?;
-        self.transitions.insert(transition.0, counters);
+        let page = if let Some(replacement) = resolved.replacement {
+            let outputs = WasmByteOutputsHandle(self.allocate_handle()?);
+            let length = replacement.len() as u64;
+            self.outputs.insert(
+                outputs.0,
+                OutputState {
+                    transition,
+                    values: vec![replacement],
+                },
+            );
+            Some(WasmEditPage {
+                edits: vec![WasmOutputSplice {
+                    offset: 0,
+                    delete_len: 0,
+                    insert: WasmGuestBytes::Output(WasmOutputRange {
+                        index: 0,
+                        offset: 0,
+                        length,
+                    }),
+                }],
+                outputs: Some(outputs),
+            })
+        } else {
+            None
+        };
+        self.transitions.insert(transition.0, resolved.counters);
         self.prospective_documents.track(transition, document);
-        self.edit_cursors.insert(
-            edits.0,
-            V3EditCursorState {
-                transition,
-                page: None,
-            },
-        );
+        self.edit_cursors
+            .insert(edits.0, V3EditCursorState { transition, page });
         Ok(WasmEntityTransition {
             transition,
             document: WasmDocumentHandle(document),

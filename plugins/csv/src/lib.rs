@@ -40,15 +40,26 @@ impl sdk::FormatPlugin for CsvPlugin {
                 },
             });
         }
-        let namespace = read_namespace(&update.before)?
-            .or_else(|| namespace_from_changes(&changes))
-            .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
-        let (document, _) = Document::open_file(
-            before.clone(),
-            update.before_file.path.as_deref(),
-            namespace,
-        )
-        .map_err(sdk::Error::invalid_input)?;
+        let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
+            let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
+            Document::open_entities(decode_entity_records(
+                record_count,
+                read_fallback_pages(&update.before, page_count)?,
+            )?)
+            .map_err(sdk::Error::invalid_input)?
+            .0
+        } else {
+            let namespace = read_namespace(&update.before)?
+                .or_else(|| namespace_from_changes(&changes))
+                .unwrap_or_else(|| IdNamespace::from_halves(0, 0));
+            Document::open_file(
+                before.clone(),
+                update.before_file.path.as_deref(),
+                namespace,
+            )
+            .map_err(sdk::Error::invalid_input)?
+            .0
+        };
         let (successor, edits) = document
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
@@ -58,6 +69,27 @@ impl sdk::FormatPlugin for CsvPlugin {
             .map_err(sdk::Error::invalid_input)?;
         store_fallback_entities_from_sink(&update.before, sink, &records)?;
         delete_csv_index_from_sink(&update.before, sink)?;
+        Ok(())
+    }
+
+    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut records = Vec::new();
+        while let Some(entity) = input.entities.next()? {
+            let snapshot = entity
+                .snapshot
+                .ok_or_else(|| sdk::Error::invalid_input("CSV hydration received a tombstone"))?;
+            records.push(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot,
+            });
+        }
+        let (document, _) =
+            Document::open_entities(records.clone()).map_err(sdk::Error::invalid_input)?;
+        store_fallback_entities_fresh(&input.successor, &records)?;
+        if input.accepted.is_none() {
+            sink.replace_file(&document.bytes())?;
+        }
         Ok(())
     }
 
@@ -353,6 +385,18 @@ fn store_fallback_entities_in_transaction(
     }
     for ordinal in pages.len() as u32..old_page_count {
         successor.delete_state(&csv_fallback_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn store_fallback_entities_fresh(
+    successor: &sdk::Transaction<'_>,
+    records: &[EntityRecord],
+) -> sdk::Result<()> {
+    let (manifest, pages) = encode_entity_records(records)?;
+    successor.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
     }
     Ok(())
 }

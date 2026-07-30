@@ -3,7 +3,9 @@
 
 mod core;
 
-use core::{ArenaElementSpan, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice};
+use core::{
+    ArenaElementSpan, ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace, InputSplice,
+};
 use lix_plugin_api as sdk;
 
 struct ExcalidrawPlugin;
@@ -50,6 +52,28 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
         sink.replace_file(&apply_edits(before, &edits)?)?;
         delete_element_index_from_sink(&update.before, sink)?;
         sink.delete_state(ELEMENT_SHIFTS_KEY)?;
+        Ok(())
+    }
+
+    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut records = Vec::new();
+        while let Some(entity) = input.entities.next()? {
+            records.push(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot: entity.snapshot.ok_or_else(|| {
+                    sdk::Error::invalid_input("Excalidraw hydration received a tombstone")
+                })?,
+            });
+        }
+        let (document, _) = Document::open_entities(records).map_err(sdk::Error::invalid_input)?;
+        store_element_index(
+            &input.successor,
+            &encode_element_index(&document.arena_element_spans())?,
+        )?;
+        if input.accepted.is_none() {
+            sink.replace_file(&document.bytes())?;
+        }
         Ok(())
     }
 

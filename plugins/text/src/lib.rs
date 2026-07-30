@@ -10,7 +10,7 @@ mod model;
 
 use core::{Document, InputSplice, LineIdentity};
 use lix_plugin_api as sdk;
-use model::{ChangeEffect, EntityChange};
+use model::{ChangeEffect, EntityChange, EntityRecord};
 
 struct GitTextPlugin;
 
@@ -75,6 +75,26 @@ impl sdk::FormatPlugin for GitTextPlugin {
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(after.bytes())?;
         replace_identities_from_sink(&update.before, sink, &after)
+    }
+
+    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut records = Vec::new();
+        while let Some(entity) = input.entities.next()? {
+            records.push(Ok(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot: entity.snapshot.ok_or_else(|| {
+                    sdk::Error::invalid_input("Git text hydration received a tombstone")
+                })?,
+            }));
+        }
+        let document =
+            Document::open_entities_fallible(records).map_err(sdk::Error::invalid_input)?;
+        store_identities_in_transaction(&input.successor, &document)?;
+        if input.accepted.is_none() {
+            sink.replace_file(document.bytes())?;
+        }
+        Ok(())
     }
 }
 

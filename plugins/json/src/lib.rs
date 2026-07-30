@@ -58,6 +58,27 @@ impl sdk::FormatPlugin for JsonPlugin {
         Ok(())
     }
 
+    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut records = Vec::new();
+        while let Some(entity) = input.entities.next()? {
+            let snapshot = entity
+                .snapshot
+                .ok_or_else(|| sdk::Error::invalid_input("JSON hydration received a tombstone"))?;
+            records.push(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot,
+            });
+        }
+        let (document, _) =
+            Document::open_entities(records.clone()).map_err(sdk::Error::invalid_input)?;
+        store_fallback_entities_fresh(&input.successor, &records)?;
+        if input.accepted.is_none() {
+            sink.replace_file(&document.bytes())?;
+        }
+        Ok(())
+    }
+
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
@@ -209,6 +230,18 @@ fn store_fallback_entities_in_transaction(
     }
     for ordinal in pages.len() as u32..old_page_count {
         successor.delete_state(&fallback_entity_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn store_fallback_entities_fresh(
+    successor: &sdk::Transaction<'_>,
+    records: &[EntityRecord],
+) -> sdk::Result<()> {
+    let (manifest, pages) = encode_entity_records(records)?;
+    successor.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
     }
     Ok(())
 }

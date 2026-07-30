@@ -11,8 +11,8 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin::api::{
-    ConflictUpdate as WitConflictUpdate, EntityUpdate as WitEntityUpdate, Guest, PluginError,
-    TransitionRequest,
+    ConflictUpdate as WitConflictUpdate, EntityUpdate as WitEntityUpdate, Guest,
+    HydrateRequest as WitHydrateRequest, PluginError, TransitionRequest,
 };
 use lix::plugin::host::{
     ChangeEffect as WitChangeEffect, ChangePage, ConflictSide as WitConflictSide, ConflictSource,
@@ -545,6 +545,14 @@ pub struct EntityUpdate<'a> {
     pub changes: EntityChangeReader<'a>,
 }
 
+#[derive(Debug)]
+pub struct HydrateFile<'a> {
+    pub file: FileInfo,
+    pub accepted: Option<Root<'a>>,
+    pub entities: EntityChangeReader<'a>,
+    pub successor: Transaction<'a>,
+}
+
 pub trait FormatPlugin: 'static {
     fn open_file(input: &OpenFile<'_>, sink: &mut Sink<'_>) -> Result<()>;
 
@@ -557,6 +565,12 @@ pub trait FormatPlugin: 'static {
     fn entities_changed(_update: &mut EntityUpdate<'_>, _sink: &mut Sink<'_>) -> Result<()> {
         Err(Error::internal(
             "this format does not implement semantic entity changes",
+        ))
+    }
+
+    fn hydrate(_input: &mut HydrateFile<'_>, _sink: &mut Sink<'_>) -> Result<()> {
+        Err(Error::internal(
+            "this format does not implement durable entity hydration",
         ))
     }
 }
@@ -757,6 +771,40 @@ impl<P: FormatPlugin> Guest for Component<P> {
             max_batch_bytes,
         };
         P::entities_changed(&mut update, &mut sink).map_err(plugin_error)
+    }
+
+    fn hydrate(
+        input: WitHydrateRequest,
+        output: &WitTransition,
+    ) -> std::result::Result<(), PluginError> {
+        let max_batch_bytes = output.max_batch_bytes();
+        if max_batch_bytes == 0 {
+            return Err(PluginError::LimitExceeded(
+                "max-batch-bytes must be positive".to_owned(),
+            ));
+        }
+        let accepted = input
+            .accepted
+            .as_ref()
+            .map(|accepted| Root { inner: accepted });
+        let mut input = HydrateFile {
+            file: FileInfo {
+                path: input.descriptor.path,
+                media_type: input.descriptor.media_type,
+            },
+            accepted,
+            entities: EntityChangeReader {
+                len: input.entities.len(),
+                source: &input.entities,
+                next: 0,
+            },
+            successor: Transaction { inner: output },
+        };
+        let mut sink = Sink {
+            inner: output,
+            max_batch_bytes,
+        };
+        P::hydrate(&mut input, &mut sink).map_err(plugin_error)
     }
 }
 

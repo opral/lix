@@ -788,6 +788,36 @@ async fn csv_row_structure_edits_use_full_reconciliation() {
         Some(b"a,b\n".to_vec())
     );
 
+    write_file(&lix, path, b"old,one\nlast,two\n".to_vec())
+        .await
+        .unwrap();
+    let before_insert = active_csv_v2_rows(&lix, &file_id).await;
+    let old_id = csv_v2_row_id(&before_insert, &["old", "one"]);
+    write_file(&lix, path, b"new,zero\nold,one\nlast,two\n".to_vec())
+        .await
+        .expect("prepending a row should use structural reconciliation");
+    lix.execute(
+        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Json(serde_json::json!(["old", "ONE"])),
+            Value::Text(old_id.clone()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .expect("semantic update after structural insert must use durable row identities");
+    let after_semantic = active_csv_v2_rows(&lix, &file_id).await;
+    assert_eq!(csv_v2_row_id(&after_semantic, &["old", "ONE"]), old_id);
+    assert!(
+        after_semantic
+            .iter()
+            .any(|row| row.cells == ["new", "zero"])
+    );
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(b"new,zero\nold,ONE\nlast,two\n".to_vec())
+    );
+
     lix.close().await.unwrap();
 }
 
@@ -4564,6 +4594,94 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
     reopened.close().await.unwrap();
 }
 
+#[tokio::test]
+async fn v3_csv_cold_hydration_preserves_multiple_create_namespaces() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+    let path = "/multi-namespace.csv";
+    write_file(&lix, path, b"old,one\nlast,two\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let original_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["old", "one"]);
+    write_file(&lix, path, b"new,zero\nold,one\nlast,two\n".to_vec())
+        .await
+        .unwrap();
+    let inserted_id = csv_v2_row_id(&active_csv_v2_rows(&lix, &file_id).await, &["new", "zero"]);
+    assert_ne!(inserted_id, original_id);
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/multi-namespace-evict-{index}.csv"),
+            format!("row,{index}\n").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    write_file(&lix, path, b"new,ZERO\nold,one\nlast,two\n".to_vec())
+        .await
+        .expect("cold hydration must retain IDs from every create namespace");
+    let rows = active_csv_v2_rows(&lix, &file_id).await;
+    assert_eq!(csv_v2_row_id(&rows, &["new", "ZERO"]), inserted_id);
+    assert_eq!(csv_v2_row_id(&rows, &["old", "one"]), original_id);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_derived_cold_hydration_renders_from_durable_entities() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_derived_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/derived-cold.json";
+    let source = br#"{"value":"durable"}"#.to_vec();
+    write_file(&lix, path, source.clone()).await.unwrap();
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/derived-evict-{index}.json"),
+            format!(r#"{{"value":{index}}}"#).into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+    lix.reset_plugin_transition_counters();
+    let successor = br#"{"value":"successor"}"#.to_vec();
+    write_file(&lix, path, successor.clone())
+        .await
+        .expect("derived cold successor should hydrate from durable entities");
+    assert_eq!(
+        read_file(&lix, path)
+            .await
+            .expect("derived cold read should render"),
+        Some(successor)
+    );
+    let counters = lix.plugin_transition_counters();
+    assert!(
+        counters.full_state_semantic_rows_materialized > 0,
+        "derived cold hydration must consume durable entities"
+    );
+    assert_eq!(
+        counters.full_renderer_invocations, 1,
+        "derived cold hydration must render exactly once"
+    );
+
+    lix.close().await.unwrap();
+}
+
 /// Matched warm file transitions over the same CSV implementation. v2 returns
 /// a guest change cursor and requires `next(Some)` plus `next(None)` exports;
 /// v3 pushes the same packet page into a borrowed host sink before its single
@@ -6970,6 +7088,38 @@ fn build_json_plugin_archive() -> Vec<u8> {
             "manifest.json",
             include_str!("../../../plugins/json/manifest.json").as_bytes(),
         ),
+        (
+            "schema/json_root.json",
+            include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),
+        ),
+        (
+            "schema/json_object_member.json",
+            include_str!("../../../plugins/json/schema/json_object_member.json").as_bytes(),
+        ),
+        (
+            "schema/json_array_item.json",
+            include_str!("../../../plugins/json/schema/json_array_item.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn build_json_derived_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_JSON_plugin_json"));
+    let wasm = std::fs::read(wasm_path).unwrap();
+    let manifest = include_str!("../../../plugins/json/manifest.json").replace(
+        r#""materialization": "blob""#,
+        r#""materialization": "derived""#,
+    );
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        ("manifest.json", manifest.as_bytes()),
         (
             "schema/json_root.json",
             include_str!("../../../plugins/json/schema/json_root.json").as_bytes(),

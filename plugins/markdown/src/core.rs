@@ -2614,9 +2614,13 @@ impl Document {
         Ok(Some((detected, Arc::new(top_level_ranges), successor_tree)))
     }
 
+    pub(crate) fn bytes(&self) -> Vec<u8> {
+        self.bytes.materialize()
+    }
+
     #[cfg(test)]
     pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
-        self.bytes.materialize()
+        self.bytes()
     }
 
     #[cfg(test)]

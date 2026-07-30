@@ -7,8 +7,8 @@ mod model;
 mod schemas;
 
 use core::{
-    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice,
-    NODE_SCHEMA_KEY, PluginError,
+    ArenaMarkdownBlock, ChangeEffect, Document, EntityChange, EntityRecord, IdNamespace,
+    InputSplice, NODE_SCHEMA_KEY, PluginError,
 };
 use lix_plugin_api as sdk;
 use serde_json::Value;
@@ -57,6 +57,34 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         let (successor, edits) = document.entities_changed(changes).map_err(core_error)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
         store_rendered_markdown_state(&update.before, sink, &successor)?;
+        Ok(())
+    }
+
+    fn hydrate(input: &mut sdk::HydrateFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let mut records = Vec::new();
+        while let Some(entity) = input.entities.next()? {
+            records.push(EntityRecord {
+                schema_key: entity.schema_key,
+                entity_pk: entity.entity_pk,
+                snapshot: entity.snapshot.ok_or_else(|| {
+                    sdk::Error::invalid_input("Markdown hydration received a tombstone")
+                })?,
+            });
+        }
+        let accepted = input
+            .accepted
+            .as_ref()
+            .map(sdk::Root::read_all)
+            .transpose()?;
+        let creates = markdown_create_context(&records)?;
+        let (document, _) = Document::open_entities(records, accepted).map_err(core_error)?;
+        input
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &creates.namespace_bytes())?;
+        store_markdown_state(&input.successor, &document, creates)?;
+        if input.accepted.is_none() {
+            sink.replace_file(&document.bytes())?;
+        }
         Ok(())
     }
 
@@ -252,6 +280,19 @@ fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
         u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
         u32::from_be_bytes(bytes[8..].try_into().expect("four bytes")),
     )))
+}
+
+fn markdown_create_context(records: &[EntityRecord]) -> sdk::Result<sdk::CreateContext> {
+    let id = records
+        .iter()
+        .flat_map(|record| &record.entity_pk)
+        .find_map(|component| uuid::Uuid::parse_str(component).ok())
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown hydration has no generated identity"))?;
+    let bytes = id.into_bytes();
+    Ok(sdk::CreateContext {
+        high: u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
+        low: u32::from_be_bytes(bytes[8..12].try_into().expect("four bytes")),
+    })
 }
 
 fn namespace_from_changes(changes: &[EntityChange]) -> Option<IdNamespace> {
