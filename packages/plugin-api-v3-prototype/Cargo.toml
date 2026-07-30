@@ -18,4 +18,5 @@ publish = false
 workspace = true
 
 [dependencies]
+uuid = { version = "1", features = ["std"] }
 wit-bindgen = "0.57"

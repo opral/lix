@@ -5,8 +5,7 @@
 mod core;
 
 use core::{
-    ChangeEffect, ColdInitialImport, Document, EntityChange, IdNamespace, ROW_SCHEMA_KEY,
-    TABLE_SCHEMA_KEY,
+    ArenaRowIndex, ChangeEffect, ColdInitialImport, EntityChange, ROW_SCHEMA_KEY, TABLE_SCHEMA_KEY,
 };
 use lix_plugin_api_v3_prototype as sdk;
 use serde_json::Value;
@@ -14,97 +13,73 @@ use serde_json::Value;
 struct CsvV3Prototype;
 
 impl sdk::FormatPlugin for CsvV3Prototype {
-    type Document = Document;
-
-    fn open_file(
-        input: sdk::OpenFile<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
-        const MAX_RETAINED_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
-        let source_len = input.source.len();
-        let bytes = input.source.read_all()?;
-        let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
-        if source_len > MAX_RETAINED_IMPORT_BYTES {
-            let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
-                .map_err(sdk::Error::invalid_input)?;
-            let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
-            encoder.push(import.table_change(), input.creates, sink)?;
-            encoder.flush(sink)?;
-            while let Some((payload, row_count)) = import
-                .next_typed_batch(sink.max_batch_bytes() as usize)
-                .map_err(sdk::Error::invalid_input)?
-            {
-                sink.emit_csv_rows(row_count, payload)?;
-            }
-            drop(import);
-            return Document::open_file(Vec::new(), input.file.path.as_deref(), namespace)
-                .map(|(document, _)| document)
-                .map_err(sdk::Error::internal);
-        }
-        let (document, mut changes) =
-            Document::open_file(bytes, input.file.path.as_deref(), namespace)
-                .map_err(sdk::Error::invalid_input)?;
-        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
-        let table = changes
-            .next()
-            .ok_or_else(|| sdk::Error::internal("CSV import omitted its table entity"))?
+    fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let bytes = input.accepted.read_all()?;
+        let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
             .map_err(sdk::Error::invalid_input)?;
-        encoder.push(table, input.creates, sink)?;
+        let state = import.arena_state(input.creates.namespace_bytes());
+        input.successor.put_state(b"csv/index-v1", &state)?;
+        let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
+        encoder.push(import.table_change(), input.creates, sink)?;
         encoder.flush(sink)?;
-        drop(changes);
-
-        let mut next_row = 0usize;
-        while let Some((payload, row_count, after)) = document
-            .initial_typed_csv_batch(next_row, sink.max_batch_bytes() as usize)
+        while let Some((payload, row_count)) = import
+            .next_typed_batch(sink.max_batch_bytes() as usize)
             .map_err(sdk::Error::invalid_input)?
         {
             sink.emit_csv_rows(row_count, payload)?;
-            next_row = after;
         }
-        Ok(document)
+        Ok(())
     }
 
-    fn file_changed(
-        document: &Self::Document,
-        update: sdk::FileUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
-        let inserts = update
-            .edits
-            .iter()
-            .map(|edit| match &edit.insert {
-                sdk::SpliceInsert::Inline(bytes) => Ok(bytes.clone()),
-                sdk::SpliceInsert::AfterRange { offset, length } => {
-                    update.after.read_range(*offset, *length)
-                }
-            })
-            .collect::<sdk::Result<Vec<_>>>()?;
-        let splices = update
-            .edits
-            .iter()
-            .zip(&inserts)
-            .map(|(edit, insert)| core::InputSplice {
-                offset: edit.offset,
-                delete_len: edit.delete_len,
-                insert,
-            })
-            .collect::<Vec<_>>();
-        let namespace =
-            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
-        let (document, changes) = document
-            .file_changed_with_paths(
-                &splices,
-                update.before_file.path.as_deref(),
-                update.after_file.path.as_deref(),
-                namespace,
-            )
+    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        if update.before_file.path != update.after_file.path {
+            return Err(sdk::Error::invalid_input(
+                "arena CSV prototype does not yet support descriptor changes",
+            ));
+        }
+        let [edit] = update.edits.as_slice() else {
+            return Err(sdk::Error::invalid_input(
+                "arena CSV prototype requires one sparse byte edit",
+            ));
+        };
+        let insert = match &edit.insert {
+            sdk::SpliceInsert::Inline(bytes) => bytes,
+            sdk::SpliceInsert::AfterRange { .. } => {
+                return Err(sdk::Error::invalid_input(
+                    "arena CSV prototype requires an inline sparse edit",
+                ));
+            }
+        };
+        if u64::try_from(insert.len()).expect("usize fits u64") != edit.delete_len {
+            return Err(sdk::Error::invalid_input(
+                "arena CSV prototype currently requires a length-preserving edit",
+            ));
+        }
+        let state = update
+            .before
+            .get_state(b"csv/index-v1")?
+            .ok_or_else(|| sdk::Error::invalid_input("CSV arena root has no row index"))?;
+        let index = ArenaRowIndex::decode(&state).map_err(sdk::Error::invalid_input)?;
+        let (ordinal, row_start, row_end) = index
+            .row_range_for_edit(edit.offset, edit.delete_len)
+            .map_err(sdk::Error::invalid_input)?;
+        let mut row = update.before.read_range(row_start, row_end - row_start)?;
+        let local_start = usize::try_from(edit.offset - row_start)
+            .map_err(|_| sdk::Error::invalid_input("CSV edit offset exceeds guest memory"))?;
+        let local_end =
+            local_start
+                .checked_add(usize::try_from(edit.delete_len).map_err(|_| {
+                    sdk::Error::invalid_input("CSV edit deletion exceeds guest memory")
+                })?)
+                .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))?;
+        row.splice(local_start..local_end, insert.iter().copied());
+        let change = index
+            .row_change(ordinal, row)
             .map_err(sdk::Error::invalid_input)?;
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
-        for change in changes {
-            encoder.push(change, update.creates, sink)?;
-        }
+        encoder.push(change, update.creates, sink)?;
         encoder.flush(sink)?;
-        Ok(document)
+        Ok(())
     }
 }
 

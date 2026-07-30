@@ -3546,19 +3546,22 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
 #[tokio::test]
 #[ignore = "Component v2 change cursor versus v3 push-sink benchmark"]
 async fn v3_file_changed_push_sink_benchmark() {
-    const SAMPLES: usize = 25;
-    const ROW_COUNT: usize = 20_000;
-    const ROW: &[u8] = b"000000000000000,1111111111,2222222222,3333333333\n";
+    const ROW_COUNT: usize = 220_000;
     const BENCHMARK: &str = "v3_file_changed_push_sink_benchmark";
 
-    let mut source = Vec::with_capacity(ROW_COUNT * ROW.len());
-    for _ in 0..ROW_COUNT {
-        source.extend_from_slice(ROW);
-    }
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(10);
+    let source = csv_ten_mib_fixture();
     let fixture = BenchmarkFixture {
         input_bytes: source.len(),
         logical_rows: 1,
     };
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
     let v2_root = tempfile::tempdir().expect("create v2 push-sink benchmark directory");
     let v3_root = tempfile::tempdir().expect("create v3 push-sink benchmark directory");
     let v2 = open_lix_with_rocksdb(v2_root.path()).await;
@@ -3590,14 +3593,14 @@ async fn v3_file_changed_push_sink_benchmark() {
 
     let mut v2_bytes = source.clone();
     let mut v3_bytes = source;
-    let mut v2_measurements = Vec::with_capacity(SAMPLES);
-    let mut v3_measurements = Vec::with_capacity(SAMPLES);
-    let mut v2_ms = Vec::with_capacity(SAMPLES);
-    let mut v3_ms = Vec::with_capacity(SAMPLES);
-    let mut v2_export_calls = Vec::with_capacity(SAMPLES);
-    let mut v3_export_calls = Vec::with_capacity(SAMPLES);
+    let mut v2_measurements = Vec::with_capacity(samples);
+    let mut v3_measurements = Vec::with_capacity(samples);
+    let mut v2_ms = Vec::with_capacity(samples);
+    let mut v3_ms = Vec::with_capacity(samples);
+    let mut v2_export_calls = Vec::with_capacity(samples);
+    let mut v3_export_calls = Vec::with_capacity(samples);
 
-    for sample in 0..SAMPLES {
+    for sample in 0..samples {
         let next = if sample % 2 == 0 { b'9' } else { b'0' };
         let lanes = if sample % 2 == 0 {
             [false, true]
@@ -3612,6 +3615,7 @@ async fn v3_file_changed_push_sink_benchmark() {
             };
             bytes[0] = next;
             lix.reset_plugin_v2_transition_counters();
+            collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(lix, path, bytes.clone())
@@ -3625,6 +3629,23 @@ async fn v3_file_changed_push_sink_benchmark() {
             let measurement =
                 BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
             let counters = lix.plugin_v2_transition_counters();
+            eprintln!(
+                "v3_file_changed_phases lane={} sample={sample} elapsed_ms={:.3} \
+                 guest_exports={} imports={} boundary_bytes={} guest_high_water_bytes={} \
+                 phase_close_live_bytes={:?} phases_ms={:?}",
+                if push_sink {
+                    "v3_push_sink"
+                } else {
+                    "v2_cursor"
+                },
+                measurement.elapsed_ms,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes,
+                counters.guest_linear_memory_high_water_bytes,
+                collector.take_close_live_bytes(),
+                collector.take_aggregate_millis(),
+            );
             assert_eq!(counters.packet_records, 1, "sample {sample}");
             assert_eq!(counters.durable_semantic_changes, 1, "sample {sample}");
             if push_sink {
@@ -3669,7 +3690,7 @@ async fn v3_file_changed_push_sink_benchmark() {
     v2_ms.sort_by(f64::total_cmp);
     v3_ms.sort_by(f64::total_cmp);
     eprintln!(
-        "v3_file_changed_push_sink bytes={} rows={} samples={SAMPLES} \
+        "v3_file_changed_push_sink bytes={} rows={} samples={samples} \
          v2_raw_ms={v2_ms:?} v2_p50_ms={:.3} v2_guest_exports={} \
          v3_raw_ms={v3_ms:?} v3_p50_ms={:.3} v3_guest_exports={} speedup={:.3}",
         fixture.input_bytes,

@@ -16,34 +16,56 @@ use serde_json::Value;
 
 struct MarkdownV3Prototype;
 
-impl sdk::FormatPlugin for MarkdownV3Prototype {
-    type Document = Document;
+const ID_NAMESPACE_STATE: &[u8] = b"markdown/id-namespace-v1";
 
-    fn open_file(
-        input: sdk::OpenFile<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
-        let bytes = input.source.read_all()?;
+impl sdk::FormatPlugin for MarkdownV3Prototype {
+    fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let bytes = input.accepted.read_all()?;
         let namespace = IdNamespace::from_halves(input.creates.high, input.creates.low);
-        let (document, changes) = Document::open_file(bytes, input.file.path.as_deref(), namespace)
-            .map_err(core_error)?;
+        input
+            .successor
+            .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
+        let (_document, changes) =
+            Document::open_file(bytes, input.file.path.as_deref(), namespace)
+                .map_err(core_error)?;
         emit_changes(changes, input.creates, sink)?;
-        Ok(document)
+        Ok(())
     }
 
-    fn file_changed(
-        document: &Self::Document,
-        update: sdk::FileUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
+    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let namespace = update
+            .before
+            .get_state(ID_NAMESPACE_STATE)?
+            .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root has no ID namespace"))?;
+        let namespace: [u8; 12] = namespace.try_into().map_err(|_| {
+            sdk::Error::invalid_input("Markdown arena ID namespace has invalid length")
+        })?;
+        let namespace = IdNamespace::from_halves(
+            u64::from_be_bytes(
+                namespace[..8]
+                    .try_into()
+                    .expect("eight-byte namespace prefix"),
+            ),
+            u32::from_be_bytes(
+                namespace[8..]
+                    .try_into()
+                    .expect("four-byte namespace suffix"),
+            ),
+        );
+        let (document, _) = Document::open_file(
+            update.before.read_all()?,
+            update.before_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(core_error)?;
         let inserts = update
             .edits
             .iter()
             .map(|edit| match &edit.insert {
                 sdk::SpliceInsert::Inline(bytes) => Ok(bytes.clone()),
-                sdk::SpliceInsert::AfterRange { offset, length } => {
-                    update.after.read_range(*offset, *length)
-                }
+                sdk::SpliceInsert::AfterRange { .. } => Err(sdk::Error::invalid_input(
+                    "arena host must lower after-range edits to inline bytes",
+                )),
             })
             .collect::<sdk::Result<Vec<_>>>()?;
         let splices = update
@@ -56,12 +78,11 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
                 insert,
             })
             .collect::<Vec<_>>();
-        let namespace = IdNamespace::from_halves(update.creates.high, update.creates.low);
-        let (document, changes) = document
+        let (_document, changes) = document
             .file_changed(&splices, namespace)
             .map_err(core_error)?;
         emit_changes(changes, update.creates, sink)?;
-        Ok(document)
+        Ok(())
     }
 }
 

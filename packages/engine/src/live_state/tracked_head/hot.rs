@@ -1157,6 +1157,33 @@ fn decode_certified_entity_batch_rows(
         high: input.u64()?,
         low: input.u32()?,
     };
+    // Exact reads from a certified CSV segment should not allocate an
+    // `EntityPk` for every row merely to reject all but one of them. Created
+    // CSV identities encode their parse-local reference in the final four
+    // UUID bytes, so compare that compact value while walking the pages and
+    // materialize an identity only for a selected row.
+    let selected_csv_local_refs =
+        (format == 1 && !request.filter.entity_pks.is_empty()).then(|| {
+            let high = creates.high.to_be_bytes();
+            let low = creates.low.to_be_bytes();
+            request
+                .filter
+                .entity_pks
+                .iter()
+                .filter_map(|entity_pk| match entity_pk.components.as_slice() {
+                    [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
+                        if bytes[..8] == high && bytes[8..12] == low =>
+                    {
+                        Some(u32::from_be_bytes(
+                            bytes[12..]
+                                .try_into()
+                                .expect("UUID local-reference suffix is four bytes"),
+                        ))
+                    }
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>()
+        });
     let page_count = input.u32()?;
     if !request.filter.schema_keys.is_empty()
         && !request
@@ -1247,17 +1274,11 @@ fn decode_certified_entity_batch_rows(
             let quote_layout_len = rows.u32()? as usize;
             let quote_layout = rows.bytes(quote_layout_len)?;
             let field_count = rows.u16()?;
-            let id = creates
-                .component_uuid_bytes(u64::from(local_ref))
-                .map_err(|error| head_value_error(error.to_string()))?;
-            let entity_pk = EntityPk::uuid_from_bytes(id);
-            let selected = request.filter.entity_pks.is_empty()
-                || request
-                    .filter
-                    .entity_pks
-                    .iter()
-                    .any(|candidate| candidate == &entity_pk);
-            let mut cells = needs_snapshot.then(|| Vec::with_capacity(field_count as usize));
+            let selected = selected_csv_local_refs
+                .as_ref()
+                .is_none_or(|selected| selected.contains(&local_ref));
+            let mut cells =
+                (selected && needs_snapshot).then(|| Vec::with_capacity(field_count as usize));
             for _ in 0..field_count {
                 let cell_len = rows.u32()? as usize;
                 let cell = std::str::from_utf8(rows.bytes(cell_len)?).map_err(|error| {
@@ -1271,6 +1292,10 @@ fn decode_certified_entity_batch_rows(
             if !selected {
                 continue;
             }
+            let id = creates
+                .component_uuid_bytes(u64::from(local_ref))
+                .map_err(|error| head_value_error(error.to_string()))?;
+            let entity_pk = EntityPk::uuid_from_bytes(id);
             let snapshot = cells
                 .map(|cells| {
                     let mut object = serde_json::Map::new();

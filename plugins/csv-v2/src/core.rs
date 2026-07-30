@@ -2723,6 +2723,40 @@ impl ColdInitialImport {
         )
     }
 
+    /// Compact host-owned state for a document-free v3 successor.
+    ///
+    /// The page retains one creation namespace, the accepted dialect, and one
+    /// u32 source offset per row. A warm byte edit can therefore locate and
+    /// reparse one row without reconstructing the persistent guest document.
+    pub fn arena_state(&self, namespace: [u8; 12]) -> Vec<u8> {
+        const MAGIC: &[u8; 8] = b"LIXCSV3\0";
+        let mut output = Vec::with_capacity(36 + self.rows.len() * size_of::<u32>());
+        output.extend_from_slice(MAGIC);
+        output.extend_from_slice(&namespace);
+        output.extend_from_slice(
+            &u64::try_from(self.bytes.len())
+                .expect("CSV file length fits u64")
+                .to_le_bytes(),
+        );
+        output.push(self.dialect.delimiter);
+        output.push(self.dialect.quote.unwrap_or(0));
+        output.push(match self.dialect.terminator {
+            Terminator::Lf => 1,
+            Terminator::CrLf => 2,
+            Terminator::Cr => 3,
+        });
+        output.push(0);
+        output.extend_from_slice(
+            &u32::try_from(self.rows.len())
+                .expect("CSV row count fits u32")
+                .to_le_bytes(),
+        );
+        for row in &self.rows {
+            output.extend_from_slice(&row.start.to_le_bytes());
+        }
+        output
+    }
+
     pub fn next_typed_batch(&mut self, max_bytes: usize) -> Result<Option<(Vec<u8>, u32)>, String> {
         if self.next_row >= self.rows.len() {
             return Ok(None);
@@ -2799,6 +2833,144 @@ impl ColdInitialImport {
             self.next_row += 1;
         }
         Ok(Some((payload, row_count)))
+    }
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+pub struct ArenaRowIndex {
+    namespace: [u8; 12],
+    file_len: u64,
+    dialect: Dialect,
+    starts: Vec<u32>,
+}
+
+#[allow(dead_code)]
+impl ArenaRowIndex {
+    pub fn decode(bytes: &[u8]) -> Result<Self, String> {
+        const HEADER_BYTES: usize = 36;
+        if bytes.len() < HEADER_BYTES || &bytes[..8] != b"LIXCSV3\0" {
+            return Err("CSV arena state has an invalid header".to_owned());
+        }
+        let namespace = bytes[8..20]
+            .try_into()
+            .expect("validated CSV arena namespace");
+        let file_len = u64::from_le_bytes(
+            bytes[20..28]
+                .try_into()
+                .expect("validated CSV arena file length"),
+        );
+        let delimiter = bytes[28];
+        let quote = (bytes[29] != 0).then_some(bytes[29]);
+        let terminator = match bytes[30] {
+            1 => Terminator::Lf,
+            2 => Terminator::CrLf,
+            3 => Terminator::Cr,
+            _ => return Err("CSV arena state has an invalid terminator".to_owned()),
+        };
+        let row_count = usize::try_from(u32::from_le_bytes(
+            bytes[32..36]
+                .try_into()
+                .expect("validated CSV arena row count"),
+        ))
+        .expect("u32 fits usize");
+        let expected = HEADER_BYTES
+            .checked_add(
+                row_count
+                    .checked_mul(size_of::<u32>())
+                    .ok_or_else(|| "CSV arena row index size overflowed".to_owned())?,
+            )
+            .ok_or_else(|| "CSV arena state size overflowed".to_owned())?;
+        if bytes.len() != expected {
+            return Err("CSV arena state row index is truncated".to_owned());
+        }
+        let starts = bytes[HEADER_BYTES..]
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte CSV row offset")))
+            .collect::<Vec<_>>();
+        if starts.first().copied() != Some(0)
+            || !starts.windows(2).all(|pair| pair[0] < pair[1])
+            || starts
+                .last()
+                .is_some_and(|start| u64::from(*start) >= file_len)
+        {
+            return Err("CSV arena state row offsets are invalid".to_owned());
+        }
+        Ok(Self {
+            namespace,
+            file_len,
+            dialect: Dialect {
+                delimiter,
+                quote,
+                terminator,
+            },
+            starts,
+        })
+    }
+
+    pub fn row_range_for_edit(
+        &self,
+        offset: u64,
+        delete_len: u64,
+    ) -> Result<(u32, u64, u64), String> {
+        let delete_end = offset
+            .checked_add(delete_len)
+            .ok_or_else(|| "CSV arena edit range overflowed".to_owned())?;
+        if delete_end > self.file_len || self.starts.is_empty() {
+            return Err("CSV arena edit exceeds the accepted file".to_owned());
+        }
+        let offset_u32 =
+            u32::try_from(offset).map_err(|_| "CSV arena edit offset exceeds u32".to_owned())?;
+        let index = self
+            .starts
+            .partition_point(|start| *start <= offset_u32)
+            .saturating_sub(1);
+        let start = u64::from(self.starts[index]);
+        let end = self
+            .starts
+            .get(index + 1)
+            .map_or(self.file_len, |start| u64::from(*start));
+        if offset < start || delete_end > end {
+            return Err("CSV arena edit crosses a row boundary".to_owned());
+        }
+        Ok((
+            u32::try_from(index).expect("CSV row ordinal fits u32"),
+            start,
+            end,
+        ))
+    }
+
+    pub fn row_change(&self, ordinal: u32, row_bytes: Vec<u8>) -> Result<EntityChange, String> {
+        let mut rows = scan_rows(&row_bytes, 0, row_bytes.len(), self.dialect)?;
+        if rows.len() != 1 {
+            return Err("CSV arena successor must contain exactly one row".to_owned());
+        }
+        let mut row = rows.remove(0);
+        row.id_slot = Some(ordinal);
+        let denominator = u128::try_from(self.starts.len() + 1).expect("usize fits u128");
+        let numerator = u128::from(ordinal + 1) * u128::from(u64::MAX);
+        row.order_rank = Some(u64::try_from(numerator / denominator).expect("rank fits u64") | 1);
+        let mut next_key = 0;
+        let chunks = build_chunks(vec![row], &mut next_key)?;
+        let blob = PersistentBlob::from_vec(row_bytes)?;
+        let chunk = chunks
+            .first()
+            .ok_or_else(|| "CSV arena successor lost its row".to_owned())?;
+        let row = chunk
+            .data
+            .rows
+            .first()
+            .ok_or_else(|| "CSV arena successor lost its row metadata".to_owned())?;
+        let mut id_bytes = [0_u8; 16];
+        id_bytes[..12].copy_from_slice(&self.namespace);
+        id_bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
+        let id = uuid::Uuid::from_bytes(id_bytes).to_string();
+        let order_key = format!("{:016x}", row.order_rank);
+        Ok(EntityChange::upsert(
+            ROW_SCHEMA_KEY,
+            id.clone(),
+            row_snapshot_bytes(&blob, chunk, row, &id, &order_key, self.dialect)?,
+        ))
     }
 }
 

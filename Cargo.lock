@@ -3407,6 +3407,7 @@ dependencies = [
 name = "lix_plugin_api_v3_prototype"
 version = "0.9.0"
 dependencies = [
+ "uuid",
  "wit-bindgen 0.57.1",
 ]
 

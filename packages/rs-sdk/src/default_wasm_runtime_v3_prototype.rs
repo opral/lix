@@ -1,9 +1,9 @@
-//! Fused Component API v3 Prototype A.
+//! Host-owned arena Component API v3 prototype.
 //!
 //! The adapter deliberately implements the existing v2 actor trait so engine
-//! reconciliation, validation, and storage lowering remain unchanged. Only
-//! initial file import is implemented: one exported guest call pushes
-//! packet-v1 pages into a host sink while the guest remains entered.
+//! reconciliation, validation, and storage lowering remain unchanged. File
+//! bytes and opaque plugin state live in immutable host roots; one exported
+//! guest call reads sparse ranges and pushes bounded semantic pages.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, mpsc};
@@ -22,32 +22,41 @@ use lix_engine::wasm::v2::{
     WasmGuestEntityChanges, WasmInputBytes, WasmOpenEntitiesInput, WasmOpenFileInput,
     WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
 };
+use lix_engine::wasm::v3::{
+    ByteEdit as ArenaByteEdit, Root as ArenaRoot, Store as ArenaStore,
+    Transaction as ArenaTransaction,
+};
 use wasmtime::Store;
-use wasmtime::component::{Component, Linker, Resource, ResourceAny};
+use wasmtime::component::{Component, Linker, Resource};
 
 use super::{
     CompileProfile, CompiledComponentKey, TimeoutTickerLease, WasiHostState, WasmtimePluginRuntime,
     add_to_linker_sync, create_store, reset_store_limits, wasm_runtime_error,
 };
 
-const MAX_RETAINED_IMPORT_BYTES: u64 = 8 * 1024 * 1024;
 const V3_MAX_BATCH_BYTES: u32 = 2 * 1024 * 1024;
 const CERTIFIED_TYPED_CSV_V1: u16 = 1;
 const CERTIFIED_CREATED_PACKET_V1: u16 = 2;
 
 pub(super) mod bindings {
     wasmtime::component::bindgen!({
-        path: "wit/v3-prototype",
+        path: "../plugin-api-v3-prototype/wit",
         world: "plugin",
         with: {
-            "lix:plugin/host.source": super::SourceResource,
+            "lix:plugin/host.root": super::RootResource,
+            "lix:plugin/host.transaction": super::TransactionResource,
             "lix:plugin/host.transition-sink": super::SinkResource,
         },
     });
 }
 
-pub struct SourceResource {
-    source: Arc<dyn lix_engine::wasm::v2::WasmByteSource>,
+pub struct RootResource {
+    root: ArenaRoot,
+    state: SharedTransitionState,
+}
+
+pub struct TransactionResource {
+    transaction: ArenaTransaction,
     state: SharedTransitionState,
 }
 
@@ -184,37 +193,48 @@ impl TransitionState {
     }
 }
 
-impl bindings::lix::plugin::host::HostSource for WasiHostState {
-    fn len(&mut self, resource: Resource<SourceResource>) -> u64 {
+impl bindings::lix::plugin::host::HostRoot for WasiHostState {
+    fn generation(&mut self, resource: Resource<RootResource>) -> String {
         self.table
             .get(&resource)
-            .expect("v3 source resource must be live")
-            .source
+            .expect("v3 root resource must be live")
+            .root
+            .generation
+            .to_string()
+    }
+
+    fn file_len(&mut self, resource: Resource<RootResource>) -> u64 {
+        self.table
+            .get(&resource)
+            .expect("v3 root resource must be live")
+            .root
+            .bytes
             .len()
     }
 
-    fn read(
+    fn read_file(
         &mut self,
-        resource: Resource<SourceResource>,
+        resource: Resource<RootResource>,
         offset: u64,
         length: u32,
     ) -> Result<Vec<u8>, bindings::lix::plugin::host::HostError> {
-        let (source, state) = {
+        let (root, state) = {
             let resource = self.table.get(&resource).map_err(host_table_error)?;
-            (resource.source.clone(), resource.state.clone())
+            (resource.root.clone(), resource.state.clone())
         };
         let end = offset
             .checked_add(u64::from(length))
             .ok_or(bindings::lix::plugin::host::HostError::InvalidRange)?;
-        if end > source.len() {
+        if end > root.bytes.len() {
             return Err(bindings::lix::plugin::host::HostError::InvalidRange);
         }
-        let bytes = source
-            .read(offset, length)
+        let bytes = root
+            .bytes
+            .read(offset, u64::from(length))
             .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
         if bytes.len() != length as usize {
             return Err(bindings::lix::plugin::host::HostError::Rejected(
-                "v3 source returned a short read".to_owned(),
+                "v3 root returned a short read".to_owned(),
             ));
         }
         let mut state = state
@@ -231,7 +251,113 @@ impl bindings::lix::plugin::host::HostSource for WasiHostState {
         Ok(bytes)
     }
 
-    fn drop(&mut self, resource: Resource<SourceResource>) -> wasmtime::Result<()> {
+    fn get_entity(
+        &mut self,
+        resource: Resource<RootResource>,
+        key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
+        let (root, state) = {
+            let resource = self.table.get(&resource).map_err(host_table_error)?;
+            (resource.root.clone(), resource.state.clone())
+        };
+        let value = root
+            .entities
+            .get(&key)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.charge_source(key.len().saturating_add(value.as_ref().map_or(0, Vec::len)))?;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        Ok(value)
+    }
+
+    fn get_state(
+        &mut self,
+        resource: Resource<RootResource>,
+        key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
+        let (root, state) = {
+            let resource = self.table.get(&resource).map_err(host_table_error)?;
+            (resource.root.clone(), resource.state.clone())
+        };
+        let value = root
+            .state
+            .get(&key)
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.charge_source(key.len().saturating_add(value.as_ref().map_or(0, Vec::len)))?;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        Ok(value)
+    }
+
+    fn drop(&mut self, resource: Resource<RootResource>) -> wasmtime::Result<()> {
+        self.table.delete(resource)?;
+        Ok(())
+    }
+}
+
+impl bindings::lix::plugin::host::HostTransaction for WasiHostState {
+    fn put_state(
+        &mut self,
+        resource: Resource<TransactionResource>,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let state = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.charge_page(key.len().saturating_add(value.len()))?;
+            state.counters.component_import_calls =
+                state.counters.component_import_calls.saturating_add(1);
+        }
+        self.table
+            .get_mut(&resource)
+            .map_err(host_table_error)?
+            .transaction
+            .put_state(key, value);
+        Ok(())
+    }
+
+    fn delete_state(
+        &mut self,
+        resource: Resource<TransactionResource>,
+        key: Vec<u8>,
+    ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        let state = self
+            .table
+            .get(&resource)
+            .map_err(host_table_error)?
+            .state
+            .clone();
+        {
+            let mut state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.charge_page(key.len())?;
+            state.counters.component_import_calls =
+                state.counters.component_import_calls.saturating_add(1);
+        }
+        self.table
+            .get_mut(&resource)
+            .map_err(host_table_error)?
+            .transaction
+            .delete_state(key);
+        Ok(())
+    }
+
+    fn drop(&mut self, resource: Resource<TransactionResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())
     }
@@ -644,6 +770,30 @@ fn host_table_error(
     bindings::lix::plugin::host::HostError::Rejected(error.to_string())
 }
 
+fn read_source_all(
+    source: &Arc<dyn lix_engine::wasm::v2::WasmByteSource>,
+) -> Result<Vec<u8>, LixError> {
+    const CHUNK_BYTES: u32 = 1024 * 1024;
+    let length = source.len();
+    let mut output = Vec::with_capacity(
+        usize::try_from(length).map_err(|_| v3_error("v3 source exceeds host address space"))?,
+    );
+    let mut offset = 0_u64;
+    while offset < length {
+        let chunk = u32::try_from((length - offset).min(u64::from(CHUNK_BYTES)))
+            .expect("bounded v3 source read fits u32");
+        let bytes = source
+            .read(offset, chunk)
+            .map_err(|error| v3_error(format!("failed to read v3 source: {error}")))?;
+        if bytes.len() != chunk as usize {
+            return Err(v3_error("v3 source returned a short read"));
+        }
+        output.extend_from_slice(&bytes);
+        offset += u64::from(chunk);
+    }
+    Ok(output)
+}
+
 struct V3Factory {
     component: Component,
     linker: Arc<Linker<WasiHostState>>,
@@ -739,7 +889,6 @@ enum WorkerCommand {
         limits: WasmTransitionLimits,
         input: WasmOpenFileInput,
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-        retire_after: bool,
     },
     FileChanged {
         document: u64,
@@ -747,7 +896,6 @@ enum WorkerCommand {
         limits: WasmTransitionLimits,
         update: WasmFileUpdate,
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
-        retire_after: bool,
     },
     Fork {
         document: u64,
@@ -764,7 +912,7 @@ struct V3Worker {
     store: Store<WasiHostState>,
     guest: bindings::exports::lix::plugin::api::Guest,
     limits: WasmLimits,
-    documents: HashMap<u64, ResourceAny>,
+    documents: HashMap<u64, ArenaRoot>,
     next_document: u64,
     first_transition: bool,
 }
@@ -778,13 +926,9 @@ impl V3Worker {
                     limits,
                     input,
                     events,
-                    retire_after,
                 } => {
                     let result = self.open_file(document, limits, input, events.clone());
                     let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
-                    if retire_after {
-                        break;
-                    }
                 }
                 WorkerCommand::FileChanged {
                     document,
@@ -792,14 +936,10 @@ impl V3Worker {
                     limits,
                     update,
                     events,
-                    retire_after,
                 } => {
                     let result =
                         self.file_changed(document, next_document, limits, update, events.clone());
                     let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
-                    if retire_after {
-                        break;
-                    }
                 }
                 WorkerCommand::Fork { document, response } => {
                     let _ = response.send(self.fork(document));
@@ -829,15 +969,33 @@ impl V3Worker {
             events,
             std::mem::take(&mut self.first_transition),
         )?));
-        let source = self
+        let bytes = read_source_all(&input.file)?;
+        let arena_store = ArenaStore::default();
+        let root = ArenaRoot::import(
+            arena_store,
+            "csv-v3-arena",
+            &bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let accepted = self
             .store
             .data_mut()
             .table
-            .push(SourceResource {
-                source: input.file,
+            .push(RootResource {
+                root: root.clone(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 source: {error}")))?;
+            .map_err(|error| v3_error(format!("failed to register v3 root: {error}")))?;
+        let successor = self
+            .store
+            .data_mut()
+            .table
+            .push(TransactionResource {
+                transaction: root.transaction(),
+                state: state.clone(),
+            })
+            .map_err(|error| v3_error(format!("failed to register v3 transaction: {error}")))?;
         let sink = self
             .store
             .data_mut()
@@ -852,7 +1010,8 @@ impl V3Worker {
                 path: input.descriptor.path,
                 media_type: input.descriptor.media_type,
             },
-            file: source,
+            accepted,
+            successor,
             creates: bindings::exports::lix::plugin::api::CreateContext {
                 high: input.creates.high,
                 low: input.creates.low,
@@ -874,7 +1033,21 @@ impl V3Worker {
                 return Err(wasm_runtime_error("v3 open-file trapped", error));
             }
         };
-        self.documents.insert(document, value.document);
+        let transaction = self
+            .store
+            .data_mut()
+            .table
+            .delete(value.successor)
+            .map_err(|error| v3_error(format!("failed to recover v3 transaction: {error}")))?;
+        let TransactionResource {
+            transaction,
+            state: transaction_state,
+        } = transaction;
+        drop(transaction_state);
+        let root = transaction
+            .commit()
+            .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))?;
+        self.documents.insert(document, root);
         self.next_document = self.next_document.max(document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| v3_error("v3 transition resources remained live after open-file"))?
@@ -905,9 +1078,10 @@ impl V3Worker {
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
-        let document_resource = *self
+        let root = self
             .documents
             .get(&document)
+            .cloned()
             .ok_or_else(|| v3_error("unknown v3 document handle"))?;
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
@@ -919,20 +1093,47 @@ impl V3Worker {
             .store
             .data_mut()
             .table
-            .push(SourceResource {
-                source: update.before,
+            .push(RootResource {
+                root: root.clone(),
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 before source: {error}")))?;
-        let after = self
+            .map_err(|error| v3_error(format!("failed to register v3 before root: {error}")))?;
+        let mut transaction = root.transaction();
+        let mut binding_edits = Vec::with_capacity(update.edits.len());
+        for edit in update.edits {
+            let insert = match edit.insert {
+                WasmInputBytes::Inline(bytes) => bytes,
+                WasmInputBytes::AfterRange(range) => update
+                    .after
+                    .read(
+                        range.offset,
+                        u32::try_from(range.length)
+                            .map_err(|_| v3_error("v3 after-range exceeds u32"))?,
+                    )
+                    .map_err(|error| {
+                        v3_error(format!("failed to read v3 after-range bytes: {error}"))
+                    })?,
+            };
+            transaction.edit_bytes(ArenaByteEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: insert.clone(),
+            });
+            binding_edits.push(bindings::exports::lix::plugin::api::InputSplice {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: bindings::exports::lix::plugin::api::InputBytes::Inline(insert),
+            });
+        }
+        let successor = self
             .store
             .data_mut()
             .table
-            .push(SourceResource {
-                source: update.after,
+            .push(TransactionResource {
+                transaction,
                 state: state.clone(),
             })
-            .map_err(|error| v3_error(format!("failed to register v3 after source: {error}")))?;
+            .map_err(|error| v3_error(format!("failed to register v3 transaction: {error}")))?;
         let sink = self
             .store
             .data_mut()
@@ -952,37 +1153,16 @@ impl V3Worker {
                 media_type: update.after_descriptor.media_type,
             },
             before,
-            edits: update
-                .edits
-                .into_iter()
-                .map(|edit| bindings::exports::lix::plugin::api::InputSplice {
-                    offset: edit.offset,
-                    delete_len: edit.delete_len,
-                    insert: match edit.insert {
-                        WasmInputBytes::Inline(bytes) => {
-                            bindings::exports::lix::plugin::api::InputBytes::Inline(bytes)
-                        }
-                        WasmInputBytes::AfterRange(range) => {
-                            bindings::exports::lix::plugin::api::InputBytes::AfterRange(
-                                bindings::exports::lix::plugin::api::SourceRange {
-                                    offset: range.offset,
-                                    length: range.length,
-                                },
-                            )
-                        }
-                    },
-                })
-                .collect(),
-            after,
+            edits: binding_edits,
+            successor,
             creates: bindings::exports::lix::plugin::api::CreateContext {
                 high: update.creates.high,
                 low: update.creates.low,
             },
             max_batch_bytes: limits.max_page_bytes,
         };
-        let result = self.guest.document().call_file_changed(
+        let result = self.guest.call_file_changed(
             &mut self.store,
-            document_resource,
             &binding_update,
             Resource::new_borrow(sink_rep),
         );
@@ -998,7 +1178,21 @@ impl V3Worker {
                 return Err(wasm_runtime_error("v3 file-changed trapped", error));
             }
         };
-        self.documents.insert(next_document, value.document);
+        let transaction = self
+            .store
+            .data_mut()
+            .table
+            .delete(value.successor)
+            .map_err(|error| v3_error(format!("failed to recover v3 transaction: {error}")))?;
+        let TransactionResource {
+            transaction,
+            state: transaction_state,
+        } = transaction;
+        drop(transaction_state);
+        let root = transaction
+            .commit()
+            .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))?;
+        self.documents.insert(next_document, root);
         self.next_document = self.next_document.max(next_document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| v3_error("v3 transition resources remained live after file-changed"))?
@@ -1018,30 +1212,22 @@ impl V3Worker {
     }
 
     fn fork(&mut self, document: u64) -> Result<u64, LixError> {
-        let resource = *self
+        let root = self
             .documents
             .get(&document)
+            .cloned()
             .ok_or_else(|| v3_error("unknown v3 document handle"))?;
-        let fork = self
-            .guest
-            .document()
-            .call_fork(&mut self.store, resource)
-            .map_err(|error| wasm_runtime_error("v3 document fork trapped", error))?;
         let handle = self.next_document;
         self.next_document = self
             .next_document
             .checked_add(1)
             .ok_or_else(|| v3_error("v3 document handle overflowed"))?;
-        self.documents.insert(handle, fork);
+        self.documents.insert(handle, root);
         Ok(handle)
     }
 
     fn drop_document(&mut self, document: u64) -> Result<(), LixError> {
-        if let Some(resource) = self.documents.remove(&document) {
-            resource
-                .resource_drop(&mut self.store)
-                .map_err(|error| wasm_runtime_error("v3 document drop trapped", error))?;
-        }
+        self.documents.remove(&document);
         Ok(())
     }
 }
@@ -1132,14 +1318,12 @@ impl WasmComponentV2Actor for V3Actor {
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
         let (events, receiver) = tokio::sync::mpsc::channel(2);
-        let retire_after = input.file.len() > MAX_RETAINED_IMPORT_BYTES;
         self.sender
             .send(WorkerCommand::OpenFile {
                 document,
                 limits,
                 input,
                 events,
-                retire_after,
             })
             .map_err(|_| v3_error("v3 actor executor stopped"))?;
         self.cursors.insert(
@@ -1184,7 +1368,6 @@ impl WasmComponentV2Actor for V3Actor {
         let transition = WasmTransitionHandle(self.allocate_handle()?);
         let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
         let (events, receiver) = tokio::sync::mpsc::channel(2);
-        let retire_after = update.after.len() > MAX_RETAINED_IMPORT_BYTES;
         self.sender
             .send(WorkerCommand::FileChanged {
                 document: document.0,
@@ -1192,7 +1375,6 @@ impl WasmComponentV2Actor for V3Actor {
                 limits,
                 update,
                 events,
-                retire_after,
             })
             .map_err(|_| v3_error("v3 actor executor stopped"))?;
         self.cursors.insert(

@@ -10,36 +10,35 @@ use lix_plugin_api_v3_prototype as sdk;
 struct ExcalidrawV3Prototype;
 
 impl sdk::FormatPlugin for ExcalidrawV3Prototype {
-    type Document = Document;
-
-    fn open_file(
-        input: sdk::OpenFile<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
+    fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
-        let (document, changes) = Document::open_file(
-            input.source.read_all()?,
+        let (_document, changes) = Document::open_file(
+            input.accepted.read_all()?,
             input.file.path.as_deref(),
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
         emit_changes(changes, sink)?;
-        Ok(document)
+        Ok(())
     }
 
-    fn file_changed(
-        document: &Self::Document,
-        update: sdk::FileUpdate<'_>,
-        sink: &mut sdk::Sink<'_>,
-    ) -> sdk::Result<Self::Document> {
+    fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
+        let namespace =
+            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let (document, _) = Document::open_file(
+            update.before.read_all()?,
+            update.before_file.path.as_deref(),
+            namespace,
+        )
+        .map_err(sdk::Error::invalid_input)?;
         let inserts = update
             .edits
             .iter()
             .map(|edit| match &edit.insert {
                 sdk::SpliceInsert::Inline(bytes) => Ok(bytes.clone()),
-                sdk::SpliceInsert::AfterRange { offset, length } => {
-                    update.after.read_range(*offset, *length)
-                }
+                sdk::SpliceInsert::AfterRange { .. } => Err(sdk::Error::invalid_input(
+                    "arena host must lower after-range edits to inline bytes",
+                )),
             })
             .collect::<sdk::Result<Vec<_>>>()?;
         let splices = update
@@ -52,13 +51,11 @@ impl sdk::FormatPlugin for ExcalidrawV3Prototype {
                 insert,
             })
             .collect::<Vec<_>>();
-        let namespace =
-            IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
-        let (document, changes) = document
+        let (_document, changes) = document
             .file_changed(&splices, namespace)
             .map_err(sdk::Error::invalid_input)?;
         emit_changes(changes.into_iter().map(Ok), sink)?;
-        Ok(document)
+        Ok(())
     }
 }
 

@@ -1,4 +1,4 @@
-//! Minimal authoring layer for the fused Component API v3 experiment.
+//! Authoring layer for the host-owned arena Component API v3 experiment.
 
 #![allow(clippy::missing_errors_doc)]
 
@@ -11,10 +11,12 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin::api::{
-    Document, FileTransition, FileUpdate as WitFileUpdate, Guest, GuestDocument, InputBytes,
-    OpenFileInput, PluginError, TransitionSummary as WitTransitionSummary,
+    FileTransition, FileUpdate as WitFileUpdate, Guest, InputBytes, OpenFileInput, PluginError,
+    TransitionSummary as WitTransitionSummary,
 };
-use lix::plugin::host::{ChangePage, CsvRowBatch, Source as WitSource, TransitionSink};
+use lix::plugin::host::{
+    ChangePage, CsvRowBatch, Root as WitRoot, Transaction as WitTransaction, TransitionSink,
+};
 use std::marker::PhantomData;
 
 pub const PACKET_FORMAT_V1: u16 = 1;
@@ -63,6 +65,13 @@ impl CreateContext {
         bytes[8..].copy_from_slice(&self.low.to_be_bytes());
         bytes
     }
+
+    pub fn id(self, local_ref: u32) -> String {
+        let mut bytes = [0_u8; 16];
+        bytes[..12].copy_from_slice(&self.namespace_bytes());
+        bytes[12..].copy_from_slice(&local_ref.to_be_bytes());
+        uuid::Uuid::from_bytes(bytes).to_string()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -71,84 +80,96 @@ pub struct FileInfo {
     pub media_type: Option<String>,
 }
 
-pub struct Source<'a> {
-    inner: &'a WitSource,
+pub struct Root<'a> {
+    inner: &'a WitRoot,
 }
 
-impl std::fmt::Debug for Source<'_> {
+impl std::fmt::Debug for Root<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("Source")
-            .field("len", &self.len())
+            .debug_struct("Root")
+            .field("generation", &self.generation())
+            .field("file_len", &self.len())
             .finish()
     }
 }
 
-impl Source<'_> {
+impl Root<'_> {
+    pub fn generation(&self) -> String {
+        self.inner.generation()
+    }
+
     pub fn len(&self) -> u64 {
-        self.inner.len()
+        self.inner.file_len()
     }
 
     pub fn read_all(&self) -> Result<Vec<u8>> {
-        const READ_BYTES: u32 = 1024 * 1024;
-        let length = self.len();
-        let capacity = usize::try_from(length)
-            .map_err(|_| Error::limit_exceeded("source length exceeds guest address space"))?;
-        if let Ok(length) = u32::try_from(length) {
-            let bytes = self
-                .inner
-                .read(0, length)
-                .map_err(|error| Error::invalid_input(format!("source read failed: {error:?}")))?;
-            if bytes.len() != capacity {
-                return Err(Error::invalid_input("source returned a short read"));
-            }
-            return Ok(bytes);
-        }
-        let mut output = Vec::with_capacity(capacity);
-        let mut offset = 0_u64;
-        while offset < length {
-            let remaining = length - offset;
-            let chunk = u32::try_from(remaining.min(u64::from(READ_BYTES)))
-                .expect("bounded source read fits u32");
-            let bytes = self
-                .inner
-                .read(offset, chunk)
-                .map_err(|error| Error::invalid_input(format!("source read failed: {error:?}")))?;
-            if bytes.len() != chunk as usize {
-                return Err(Error::invalid_input("source returned a short read"));
-            }
-            output.extend_from_slice(&bytes);
-            offset += u64::from(chunk);
-        }
-        Ok(output)
+        self.read_range(0, self.len())
     }
 
     pub fn read_range(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
         const READ_BYTES: u32 = 1024 * 1024;
         let end = offset
             .checked_add(length)
-            .ok_or_else(|| Error::invalid_input("source range overflowed"))?;
+            .ok_or_else(|| Error::invalid_input("root byte range overflowed"))?;
         if end > self.len() {
-            return Err(Error::invalid_input("source range exceeds its input"));
+            return Err(Error::invalid_input("root byte range exceeds the file"));
         }
         let capacity = usize::try_from(length)
-            .map_err(|_| Error::limit_exceeded("source range exceeds guest address space"))?;
+            .map_err(|_| Error::limit_exceeded("root range exceeds guest address space"))?;
         let mut output = Vec::with_capacity(capacity);
         let mut cursor = offset;
         while cursor < end {
             let chunk = u32::try_from((end - cursor).min(u64::from(READ_BYTES)))
-                .expect("bounded source read fits u32");
-            let bytes = self
-                .inner
-                .read(cursor, chunk)
-                .map_err(|error| Error::invalid_input(format!("source read failed: {error:?}")))?;
+                .expect("bounded root read fits u32");
+            let bytes = self.inner.read_file(cursor, chunk).map_err(|error| {
+                Error::invalid_input(format!("host root read failed: {error:?}"))
+            })?;
             if bytes.len() != chunk as usize {
-                return Err(Error::invalid_input("source returned a short read"));
+                return Err(Error::invalid_input("host root returned a short read"));
             }
             output.extend_from_slice(&bytes);
             cursor += u64::from(chunk);
         }
         Ok(output)
+    }
+
+    pub fn get_entity(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner
+            .get_entity(key)
+            .map_err(|error| Error::invalid_input(format!("host entity read failed: {error:?}")))
+    }
+
+    pub fn get_state(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner
+            .get_state(key)
+            .map_err(|error| Error::invalid_input(format!("host state read failed: {error:?}")))
+    }
+}
+
+pub struct Transaction {
+    inner: WitTransaction,
+}
+
+impl std::fmt::Debug for Transaction {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Transaction")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Transaction {
+    pub fn put_state(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        self.inner
+            .put_state(key, value)
+            .map_err(|error| Error::invalid_input(format!("host rejected state page: {error:?}")))
+    }
+
+    pub fn delete_state(&self, key: &[u8]) -> Result<()> {
+        self.inner.delete_state(key).map_err(|error| {
+            Error::invalid_input(format!("host rejected state deletion: {error:?}"))
+        })
     }
 }
 
@@ -168,7 +189,7 @@ impl std::fmt::Debug for Sink<'_> {
             .field("entity_count", &self.entity_count)
             .field("batch_count", &self.batch_count)
             .field("payload_bytes", &self.payload_bytes)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -240,7 +261,8 @@ pub struct TransitionSummary {
 #[derive(Debug)]
 pub struct OpenFile<'a> {
     pub file: FileInfo,
-    pub source: Source<'a>,
+    pub accepted: Root<'a>,
+    pub successor: Transaction,
     pub creates: CreateContext,
 }
 
@@ -261,22 +283,16 @@ pub struct InputSplice {
 pub struct FileUpdate<'a> {
     pub before_file: FileInfo,
     pub after_file: FileInfo,
-    pub before: Source<'a>,
+    pub before: Root<'a>,
     pub edits: Vec<InputSplice>,
-    pub after: Source<'a>,
+    pub successor: Transaction,
     pub creates: CreateContext,
 }
 
 pub trait FormatPlugin: 'static {
-    type Document: Clone + 'static;
+    fn open_file(input: &OpenFile<'_>, sink: &mut Sink<'_>) -> Result<()>;
 
-    fn open_file(input: OpenFile<'_>, sink: &mut Sink<'_>) -> Result<Self::Document>;
-
-    fn file_changed(
-        document: &Self::Document,
-        update: FileUpdate<'_>,
-        sink: &mut Sink<'_>,
-    ) -> Result<Self::Document>;
+    fn file_changed(update: &FileUpdate<'_>, sink: &mut Sink<'_>) -> Result<()>;
 }
 
 #[doc(hidden)]
@@ -284,39 +300,45 @@ pub trait FormatPlugin: 'static {
 pub struct Component<P>(PhantomData<P>);
 
 impl<P: FormatPlugin> Guest for Component<P> {
-    type Document = AuthorDocument<P>;
-
     fn open_file(
         input: OpenFileInput,
         sink: &TransitionSink,
     ) -> std::result::Result<FileTransition, PluginError> {
-        if input.max_batch_bytes == 0 {
+        let OpenFileInput {
+            descriptor,
+            accepted,
+            successor,
+            creates,
+            max_batch_bytes,
+        } = input;
+        if max_batch_bytes == 0 {
             return Err(PluginError::LimitExceeded(
                 "max-batch-bytes must be positive".to_owned(),
             ));
         }
-        let author_input = OpenFile {
+        let input = OpenFile {
             file: FileInfo {
-                path: input.descriptor.path,
-                media_type: input.descriptor.media_type,
+                path: descriptor.path,
+                media_type: descriptor.media_type,
             },
-            source: Source { inner: &input.file },
+            accepted: Root { inner: &accepted },
+            successor: Transaction { inner: successor },
             creates: CreateContext {
-                high: input.creates.high,
-                low: input.creates.low,
+                high: creates.high,
+                low: creates.low,
             },
         };
-        let mut author_sink = Sink {
+        let mut sink = Sink {
             inner: sink,
-            max_batch_bytes: input.max_batch_bytes,
+            max_batch_bytes,
             entity_count: 0,
             batch_count: 0,
             payload_bytes: 0,
         };
-        let document = P::open_file(author_input, &mut author_sink).map_err(plugin_error)?;
-        let summary = author_sink.summary();
+        P::open_file(&input, &mut sink).map_err(plugin_error)?;
+        let summary = sink.summary();
         Ok(FileTransition {
-            document: Document::new(AuthorDocument::<P>(document)),
+            successor: input.successor.inner,
             summary: WitTransitionSummary {
                 entity_count: summary.entity_count,
                 batch_count: summary.batch_count,
@@ -324,34 +346,26 @@ impl<P: FormatPlugin> Guest for Component<P> {
             },
         })
     }
-}
-
-#[doc(hidden)]
-pub struct AuthorDocument<P: FormatPlugin>(P::Document);
-
-impl<P: FormatPlugin> std::fmt::Debug for AuthorDocument<P> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_tuple("AuthorDocument").finish()
-    }
-}
-
-impl<P: FormatPlugin> GuestDocument for AuthorDocument<P> {
-    fn fork(&self) -> Document {
-        Document::new(Self(self.0.clone()))
-    }
 
     fn file_changed(
-        &self,
         input: WitFileUpdate,
         sink: &TransitionSink,
     ) -> std::result::Result<FileTransition, PluginError> {
-        if input.max_batch_bytes == 0 {
+        let WitFileUpdate {
+            before_descriptor,
+            after_descriptor,
+            before,
+            edits,
+            successor,
+            creates,
+            max_batch_bytes,
+        } = input;
+        if max_batch_bytes == 0 {
             return Err(PluginError::LimitExceeded(
                 "max-batch-bytes must be positive".to_owned(),
             ));
         }
-        let edits = input
-            .edits
+        let edits = edits
             .into_iter()
             .map(|edit| InputSplice {
                 offset: edit.offset,
@@ -365,38 +379,34 @@ impl<P: FormatPlugin> GuestDocument for AuthorDocument<P> {
                 },
             })
             .collect();
-        let update = FileUpdate {
+        let input = FileUpdate {
             before_file: FileInfo {
-                path: input.before_descriptor.path,
-                media_type: input.before_descriptor.media_type,
+                path: before_descriptor.path,
+                media_type: before_descriptor.media_type,
             },
             after_file: FileInfo {
-                path: input.after_descriptor.path,
-                media_type: input.after_descriptor.media_type,
+                path: after_descriptor.path,
+                media_type: after_descriptor.media_type,
             },
-            before: Source {
-                inner: &input.before,
-            },
+            before: Root { inner: &before },
             edits,
-            after: Source {
-                inner: &input.after,
-            },
+            successor: Transaction { inner: successor },
             creates: CreateContext {
-                high: input.creates.high,
-                low: input.creates.low,
+                high: creates.high,
+                low: creates.low,
             },
         };
-        let mut author_sink = Sink {
+        let mut sink = Sink {
             inner: sink,
-            max_batch_bytes: input.max_batch_bytes,
+            max_batch_bytes,
             entity_count: 0,
             batch_count: 0,
             payload_bytes: 0,
         };
-        let document = P::file_changed(&self.0, update, &mut author_sink).map_err(plugin_error)?;
-        let summary = author_sink.summary();
+        P::file_changed(&input, &mut sink).map_err(plugin_error)?;
+        let summary = sink.summary();
         Ok(FileTransition {
-            document: Document::new(Self(document)),
+            successor: input.successor.inner,
             summary: WitTransitionSummary {
                 entity_count: summary.entity_count,
                 batch_count: summary.batch_count,

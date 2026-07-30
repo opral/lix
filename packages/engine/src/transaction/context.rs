@@ -3309,8 +3309,10 @@ where
                     plugin_generation: selected.archive_blob_hash().to_string(),
                     owner_change_id,
                     semantic_chainable: false,
-                    retain_large_import_actor: selected.api_version()
-                        != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
+                    // Arena v3 retains only host-owned immutable roots after
+                    // import; keeping the actor enables >8 MiB warm successors
+                    // without retaining the transient guest parser graph.
+                    retain_large_import_actor: retain_large_import_actor(&selected),
                 };
                 if !prepared_session_keys.insert(view.session_key.clone())
                     || self
@@ -3704,8 +3706,7 @@ where
                 plugin_generation: selected.archive_blob_hash().to_string(),
                 owner_change_id,
                 semantic_chainable: false,
-                retain_large_import_actor: selected.api_version()
-                    != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
+                retain_large_import_actor: retain_large_import_actor(selected),
             };
             if self
                 .pending_plugin_actor_publications
@@ -4290,8 +4291,7 @@ where
                 plugin_generation: group.plugin.archive_blob_hash().to_string(),
                 owner_change_id: group.owner_change_id.clone(),
                 semantic_chainable: true,
-                retain_large_import_actor: group.plugin.api_version()
-                    != crate::wasm::WASM_COMPONENT_V3_PROTOTYPE_API_VERSION,
+                retain_large_import_actor: retain_large_import_actor(&group.plugin),
             };
 
             let prior_index = self
@@ -8681,6 +8681,14 @@ struct PluginBranchEntryKey {
 
 fn plugin_owner_needs_write(current: Option<&PluginFileOwner>, desired: &PluginFileOwner) -> bool {
     current != Some(desired)
+}
+
+fn retain_large_import_actor(plugin: &PluginRegistryEntry) -> bool {
+    // v2 retains its guest document as before. Arena v3 retains only the
+    // host-owned immutable root after import, so its large-file actor is also
+    // the intended warm-successor cache entry.
+    debug_assert!(!plugin.api_version().is_empty());
+    true
 }
 
 fn duplicate_plugin_lifecycle_mutation() -> LixError {
