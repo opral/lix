@@ -4,7 +4,10 @@
 #[path = "../../json-v2/src/core.rs"]
 mod core;
 
-use core::{ArenaJsonScalar, ChangeEffect, Document, EntityChange, IdNamespace, InputSplice};
+use core::{
+    ArenaJsonRelation, ArenaJsonScalar, ChangeEffect, Document, EntityChange, IdNamespace,
+    InputSplice,
+};
 use lix_plugin_api_v3_prototype as sdk;
 use serde_json::Value;
 
@@ -188,7 +191,7 @@ fn sparse_scalar_change(
             entry.blob_len,
         )?
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar page disappeared"))?;
-    let (schema_key, entity_pk, snapshot) = decode_scalar_metadata(&metadata)?;
+    let metadata = decode_scalar_metadata(&metadata)?;
     let mut scalar = update.before.read_range(start, length)?;
     let local_start = usize::try_from(edit.offset - start)
         .map_err(|_| sdk::Error::invalid_input("JSON edit offset exceeds guest memory"))?;
@@ -199,8 +202,8 @@ fn sparse_scalar_change(
         )
         .ok_or_else(|| sdk::Error::invalid_input("JSON edit range overflowed"))?;
     scalar.splice(local_start..local_end, insert.iter().copied());
-    let change = Document::scalar_change_from_arena(schema_key, entity_pk, &snapshot, &scalar)
-        .map_err(sdk::Error::invalid_input)?;
+    let change =
+        Document::scalar_change_from_arena(metadata, &scalar).map_err(sdk::Error::invalid_input)?;
     let insert_len = u64::try_from(insert.len())
         .map_err(|_| sdk::Error::limit_exceeded("JSON insert exceeds u64"))?;
     let delta = if insert_len >= edit.delete_len {
@@ -268,34 +271,126 @@ fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<(Vec<u8>, Vec
 
 fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
     let mut output = Vec::new();
-    push_state_bytes(&mut output, scalar.schema_key.as_bytes())?;
-    output.extend_from_slice(
-        &u32::try_from(scalar.entity_pk.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many JSON key components"))?
-            .to_le_bytes(),
-    );
-    for component in &scalar.entity_pk {
-        push_state_bytes(&mut output, component.as_bytes())?;
+    match (scalar.relation, scalar.entity_pk.as_slice()) {
+        (ArenaJsonRelation::Root, [id]) if id == "root" => output.push(0),
+        (ArenaJsonRelation::Object, [parent_id, key]) => {
+            output.push(1);
+            push_state_bytes(&mut output, parent_id.as_bytes())?;
+            push_state_bytes(&mut output, key.as_bytes())?;
+            push_state_bytes(
+                &mut output,
+                scalar
+                    .order_key
+                    .as_deref()
+                    .ok_or_else(|| {
+                        sdk::Error::invalid_input("JSON object scalar has no order key")
+                    })?
+                    .as_bytes(),
+            )?;
+        }
+        (ArenaJsonRelation::Array, [id]) => {
+            output.push(2);
+            push_state_bytes(&mut output, id.as_bytes())?;
+            push_state_bytes(
+                &mut output,
+                scalar
+                    .parent_id
+                    .as_deref()
+                    .ok_or_else(|| sdk::Error::invalid_input("JSON array scalar has no parent ID"))?
+                    .as_bytes(),
+            )?;
+            push_state_bytes(
+                &mut output,
+                scalar
+                    .order_key
+                    .as_deref()
+                    .ok_or_else(|| sdk::Error::invalid_input("JSON array scalar has no order key"))?
+                    .as_bytes(),
+            )?;
+        }
+        _ => {
+            return Err(sdk::Error::invalid_input(
+                "invalid JSON arena scalar identity",
+            ));
+        }
     }
-    push_state_bytes(&mut output, &scalar.snapshot)?;
+    let flags = u8::from(scalar.prefix_json.is_some())
+        | (u8::from(scalar.suffix_json.is_some()) << 1)
+        | (u8::from(scalar.empty_json.is_some()) << 2);
+    output.push(flags);
+    for value in [
+        scalar.prefix_json.as_deref(),
+        scalar.suffix_json.as_deref(),
+        scalar.empty_json.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push_state_bytes(&mut output, value.as_bytes())?;
+    }
     Ok(output)
 }
 
-fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<(String, Vec<String>, Vec<u8>)> {
+fn decode_scalar_metadata(bytes: &[u8]) -> sdk::Result<ArenaJsonScalar> {
     let mut input = bytes;
-    let schema_key = take_state_text(&mut input)?;
-    let count = take_state_u32(&mut input)? as usize;
-    let mut entity_pk = Vec::with_capacity(count);
-    for _ in 0..count {
-        entity_pk.push(take_state_text(&mut input)?);
+    let relation = *input
+        .first()
+        .ok_or_else(|| sdk::Error::invalid_input("truncated JSON scalar state"))?;
+    input = &input[1..];
+    let (relation, entity_pk, parent_id, order_key) = match relation {
+        0 => (ArenaJsonRelation::Root, vec!["root".to_owned()], None, None),
+        1 => (
+            ArenaJsonRelation::Object,
+            vec![take_state_text(&mut input)?, take_state_text(&mut input)?],
+            None,
+            Some(take_state_text(&mut input)?),
+        ),
+        2 => (
+            ArenaJsonRelation::Array,
+            vec![take_state_text(&mut input)?],
+            Some(take_state_text(&mut input)?),
+            Some(take_state_text(&mut input)?),
+        ),
+        _ => {
+            return Err(sdk::Error::invalid_input(
+                "unsupported JSON scalar relation",
+            ));
+        }
+    };
+    let flags = *input
+        .first()
+        .ok_or_else(|| sdk::Error::invalid_input("truncated JSON scalar layout"))?;
+    input = &input[1..];
+    if flags & !0b111 != 0 {
+        return Err(sdk::Error::invalid_input(
+            "unsupported JSON scalar layout flags",
+        ));
     }
-    let snapshot = take_state_value(&mut input)?.to_vec();
+    let prefix_json = (flags & 1 != 0)
+        .then(|| take_state_text(&mut input))
+        .transpose()?;
+    let suffix_json = (flags & 2 != 0)
+        .then(|| take_state_text(&mut input))
+        .transpose()?;
+    let empty_json = (flags & 4 != 0)
+        .then(|| take_state_text(&mut input))
+        .transpose()?;
     if !input.is_empty() {
         return Err(sdk::Error::invalid_input(
             "JSON scalar state has trailing bytes",
         ));
     }
-    Ok((schema_key, entity_pk, snapshot))
+    Ok(ArenaJsonScalar {
+        start: 0,
+        length: 0,
+        relation,
+        entity_pk,
+        parent_id,
+        order_key,
+        prefix_json,
+        suffix_json,
+        empty_json,
+    })
 }
 
 #[derive(Clone, Copy)]

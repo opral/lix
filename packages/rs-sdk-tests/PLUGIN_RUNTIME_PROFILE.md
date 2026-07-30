@@ -366,6 +366,17 @@ serde_json string escaping and the existing snapshot bytes; all 23 JSON
 correctness tests and the benchmark's exact-byte, semantic, history, and
 RocksDB-reopen checks pass.
 
+The scalar checkpoint then proved to be another redundant representation: its
+metadata embedded a JSON snapshot repeating the relation, identity, order, and
+layout fields already present in the same record. Replacing that snapshot with
+a compact tagged binary record reduced v3 from 320.7 ms to 264.6 ms (17.5%),
+peak host allocation from 63.2 MB to 55.2 MB, guest high water from 44.2 MB to
+35.3 MB, and boundary traffic from 33.85 MB to 29.90 MB. The paired v2 median
+was 641.3 ms, making v3 2.42x faster. Removing the checkpoint entirely measured
+258.6 ms, so only about 2.3% remains in that subsystem. A borrowed
+snapshot-direct-to-packet experiment regressed the median to 281.3 ms with
+flat memory and was removed rather than expanding the API.
+
 The same 10 MiB JSON fixture changes one scalar in 6.779 ms warm versus
 8.222 ms for v2 (1.21x). A process-cold reopen plus successor is 216.1 ms
 versus 533.6 ms (2.47x), hydrates zero semantic rows, and invokes zero
@@ -377,7 +388,7 @@ non-duplicated-source policies:
 | workload | v3 p50 | v3 p95 | peak host allocation | guest high water |
 | --- | ---: | ---: | ---: | ---: |
 | CSV, 10.68 MiB / 220,001 entities | 137.8 ms | 418.2 ms | 34.8 MB | 41.2 MB |
-| JSON, 10 MiB / 39,871 entities | 320.7 ms | 635.5 ms | 63.2 MB | 44.2 MB |
+| JSON, 10 MiB / 39,871 entities | 264.6 ms | 281.4 ms | 55.2 MB | 35.3 MB |
 | Markdown, 1.24 MiB / 3,808 entities | 5.702 ms | 5.789 ms | 3.756 MB | 53.477 MB |
 | Excalidraw, 1.85 MiB / 20,000 entities | 3.482 ms | 3.659 ms | 2.959 MB | 25.166 MB |
 

@@ -1062,9 +1062,20 @@ pub struct Document(Arc<DocumentInner>);
 pub struct ArenaJsonScalar {
     pub start: u32,
     pub length: u32,
-    pub schema_key: String,
+    pub relation: ArenaJsonRelation,
     pub entity_pk: Vec<String>,
-    pub snapshot: Vec<u8>,
+    pub parent_id: Option<String>,
+    pub order_key: Option<String>,
+    pub prefix_json: Option<String>,
+    pub suffix_json: Option<String>,
+    pub empty_json: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArenaJsonRelation {
+    Root,
+    Object,
+    Array,
 }
 
 #[derive(Debug)]
@@ -1177,13 +1188,57 @@ impl Document {
                     .spans
                     .span(ordinal)
                     .ok_or_else(|| "JSON scalar span is missing".to_owned())?;
-                let identity = node.identity();
+                let (relation, entity_pk, parent_id, order_key) = match &node.relation {
+                    NodeRelation::Root => (
+                        ArenaJsonRelation::Root,
+                        vec![ROOT_ID.to_owned()],
+                        None,
+                        None,
+                    ),
+                    NodeRelation::Object {
+                        parent_id,
+                        key,
+                        order_key,
+                        ..
+                    } => (
+                        ArenaJsonRelation::Object,
+                        vec![parent_id.to_string(), key.to_string()],
+                        None,
+                        Some(order_key.to_string()),
+                    ),
+                    NodeRelation::Array {
+                        id,
+                        parent_id,
+                        order_key,
+                    } => (
+                        ArenaJsonRelation::Array,
+                        vec![id.to_string()],
+                        Some(parent_id.to_string()),
+                        Some(order_key.to_string()),
+                    ),
+                };
                 Ok(ArenaJsonScalar {
                     start,
                     length,
-                    schema_key: identity.schema_key().to_owned(),
-                    entity_pk: identity.entity_pk(),
-                    snapshot: serialize_node_snapshot(node, None)?,
+                    relation,
+                    entity_pk,
+                    parent_id,
+                    order_key,
+                    prefix_json: node
+                        .layout
+                        .as_deref()
+                        .and_then(|layout| layout.prefix_json.as_deref())
+                        .map(str::to_owned),
+                    suffix_json: node
+                        .layout
+                        .as_deref()
+                        .and_then(|layout| layout.suffix_json.as_deref())
+                        .map(str::to_owned),
+                    empty_json: node
+                        .layout
+                        .as_deref()
+                        .and_then(|layout| layout.empty_json.as_deref())
+                        .map(str::to_owned),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -1192,9 +1247,7 @@ impl Document {
     }
 
     pub fn scalar_change_from_arena(
-        schema_key: String,
-        entity_pk: Vec<String>,
-        snapshot: &[u8],
+        metadata: ArenaJsonScalar,
         scalar: &[u8],
     ) -> Result<EntityChange, String> {
         let kind = parse_complete_scalar(scalar)?;
@@ -1203,18 +1256,68 @@ impl Document {
         }
         let scalar = std::str::from_utf8(scalar)
             .map_err(|error| format!("JSON scalar must be UTF-8: {error}"))?;
-        let mut snapshot: Value = serde_json::from_slice(snapshot)
-            .map_err(|error| format!("invalid JSON arena scalar snapshot: {error}"))?;
-        let object = snapshot
-            .as_object_mut()
-            .ok_or_else(|| "JSON arena scalar snapshot must be an object".to_owned())?;
+        let ArenaJsonScalar {
+            relation,
+            entity_pk,
+            parent_id,
+            order_key,
+            prefix_json,
+            suffix_json,
+            empty_json,
+            ..
+        } = metadata;
+        let mut object = Map::new();
+        let schema_key = match (relation, entity_pk.as_slice()) {
+            (ArenaJsonRelation::Root, [id]) if id == ROOT_ID => {
+                object.insert("id".to_owned(), Value::String(id.clone()));
+                ROOT_SCHEMA_KEY
+            }
+            (ArenaJsonRelation::Object, [parent_id, key]) => {
+                object.insert("parent_id".to_owned(), Value::String(parent_id.to_owned()));
+                object.insert("key".to_owned(), Value::String(key.to_owned()));
+                object.insert(
+                    "order_key".to_owned(),
+                    Value::String(
+                        order_key
+                            .ok_or_else(|| "JSON object scalar has no order key".to_owned())?,
+                    ),
+                );
+                OBJECT_MEMBER_SCHEMA_KEY
+            }
+            (ArenaJsonRelation::Array, [id]) => {
+                object.insert("id".to_owned(), Value::String(id.to_owned()));
+                object.insert(
+                    "parent_id".to_owned(),
+                    Value::String(
+                        parent_id.ok_or_else(|| "JSON array scalar has no parent ID".to_owned())?,
+                    ),
+                );
+                object.insert(
+                    "order_key".to_owned(),
+                    Value::String(
+                        order_key.ok_or_else(|| "JSON array scalar has no order key".to_owned())?,
+                    ),
+                );
+                ARRAY_ITEM_SCHEMA_KEY
+            }
+            _ => return Err("invalid JSON arena scalar identity".to_owned()),
+        };
         object.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
         object.insert("scalar_json".to_owned(), Value::String(scalar.to_owned()));
+        if let Some(value) = prefix_json {
+            object.insert("prefix_json".to_owned(), Value::String(value));
+        }
+        if let Some(value) = suffix_json {
+            object.insert("suffix_json".to_owned(), Value::String(value));
+        }
+        if let Some(value) = empty_json {
+            object.insert("empty_json".to_owned(), Value::String(value));
+        }
         Ok(EntityChange {
-            schema_key,
+            schema_key: schema_key.to_owned(),
             entity_pk,
             snapshot: Some(
-                serde_json::to_vec(&snapshot)
+                serde_json::to_vec(&Value::Object(object))
                     .map_err(|error| format!("serialize JSON arena scalar: {error}"))?,
             ),
             effect: ChangeEffect::Content,
