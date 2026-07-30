@@ -51,10 +51,17 @@ enum TransactionJsonCertificate {
 
 impl TransactionJson {
     pub(crate) fn from_value(value: JsonValue, context: &str) -> Result<Self, LixError> {
+        Self::from_shared_value(Arc::new(value), context)
+    }
+
+    pub(crate) fn from_shared_value(
+        value: Arc<JsonValue>,
+        context: &str,
+    ) -> Result<Self, LixError> {
         let _ = context;
         Ok(Self {
             storage: TransactionJsonStorage::Decoded {
-                value: Arc::new(value),
+                value,
                 normalized: OnceLock::new(),
             },
         })
@@ -62,6 +69,12 @@ impl TransactionJson {
 
     pub(crate) fn from_value_unchecked(value: JsonValue) -> Self {
         Self::from_value(value, "transaction JSON")
+            .expect("serializing serde_json::Value should not fail")
+    }
+
+    #[cfg(feature = "storage-benches")]
+    pub(crate) fn from_shared_value_unchecked(value: Arc<JsonValue>) -> Self {
+        Self::from_shared_value(value, "transaction JSON")
             .expect("serializing serde_json::Value should not fail")
     }
 
@@ -1469,9 +1482,11 @@ pub(crate) fn stage_json_from_value(
 ///
 /// Plugin-produced rows already carry a bounded canonical page handle and are
 /// left untouched. SQL-produced values reach this boundary without a
-/// per-row serialized `String`; the batch counts encoded lengths without
-/// allocating, reserves the exact arena once, serializes each row once, and
-/// replaces the row-owned values with cheap batch handles.
+/// per-row serialized `String`; the batch appends every row into one amortized
+/// arena, serializes each row once, and replaces the row-owned values with
+/// cheap batch handles. Avoiding an exact-size structural prepass matters for
+/// bulk writes: walking every JSON tree twice costs more than the bounded
+/// geometric growth of one shared arena.
 pub(crate) fn canonicalize_transaction_json_batch<'a>(
     slots: impl IntoIterator<Item = &'a mut Option<TransactionJson>>,
     context: &str,
@@ -1529,27 +1544,27 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         return Ok(());
     }
 
-    // Count an allocation upper bound without invoking Serialize. This is a
-    // cheap structural walk (numbers reserve their bounded maximum width);
-    // the loop below is the only canonical serialization of each snapshot.
-    let normalized_capacity =
-        values
-            .iter()
-            .zip(&cached_normalized)
-            .try_fold(0_usize, |total, (value, cached)| {
-                total
-                    .checked_add(match cached {
-                        Some(cached) => cached.len(),
-                        None => canonical_json_capacity(value)?,
-                    })
-                    .ok_or_else(|| {
-                        LixError::new(
-                            LixError::CODE_UNKNOWN,
-                            format!("{context} canonical JSON batch size overflowed"),
-                        )
-                    })
-            })?;
-    if u32::try_from(normalized_capacity).is_err() {
+    let cached_capacity = cached_normalized
+        .iter()
+        .flatten()
+        .try_fold(0_usize, |total, cached| total.checked_add(cached.len()))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} canonical JSON batch size overflowed"),
+            )
+        })?;
+    let decoded_capacity_hint = values
+        .len()
+        .checked_mul(256)
+        .and_then(|capacity| capacity.checked_add(cached_capacity))
+        .ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_UNKNOWN,
+                format!("{context} canonical JSON batch size overflowed"),
+            )
+        })?;
+    if u32::try_from(cached_capacity).is_err() {
         return Err(LixError::new(
             LixError::CODE_UNKNOWN,
             format!("{context} canonical JSON batch exceeds u32"),
@@ -1557,7 +1572,7 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
     }
 
     let mut offsets = Vec::with_capacity(values.len());
-    let mut normalized = Vec::with_capacity(normalized_capacity);
+    let mut normalized = Vec::with_capacity(decoded_capacity_hint.min(u32::MAX as usize));
     let mut serialize_count = 0usize;
     for (value, cached) in values.iter().zip(&cached_normalized) {
         let start = u32::try_from(normalized.len()).map_err(|_| {
@@ -1585,7 +1600,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         })?;
         offsets.push((start, end));
     }
-    debug_assert!(normalized.len() <= normalized.capacity());
     let rows = WasmCanonicalJson::from_batch_parts(
         values,
         normalized,
@@ -1598,66 +1612,6 @@ pub(crate) fn canonicalize_transaction_json_batch<'a>(
         *slots[position] = Some(TransactionJson::from_canonical_batch(row));
     }
     Ok(())
-}
-
-/// Returns a tight canonical-JSON allocation upper bound without serializing.
-///
-/// String escaping is counted exactly. `serde_json::Number` is bounded by the
-/// crate's non-arbitrary-precision i64/u64/f64 representation, so 32 bytes is
-/// a conservative constant and avoids allocating a temporary number string.
-fn canonical_json_capacity(value: &JsonValue) -> Result<usize, LixError> {
-    fn add(total: &mut usize, amount: usize) -> Result<(), LixError> {
-        *total = total.checked_add(amount).ok_or_else(|| {
-            LixError::new(LixError::CODE_UNKNOWN, "canonical JSON capacity overflowed")
-        })?;
-        Ok(())
-    }
-
-    fn string_capacity(value: &str, total: &mut usize) -> Result<(), LixError> {
-        add(total, 2)?;
-        for scalar in value.chars() {
-            add(
-                total,
-                match scalar {
-                    '"' | '\\' => 2,
-                    scalar if scalar <= '\u{1f}' => 6,
-                    scalar => scalar.len_utf8(),
-                },
-            )?;
-        }
-        Ok(())
-    }
-
-    fn visit(value: &JsonValue, total: &mut usize) -> Result<(), LixError> {
-        match value {
-            JsonValue::Null | JsonValue::Bool(true) => add(total, 4),
-            JsonValue::Bool(false) => add(total, 5),
-            JsonValue::Number(_) => add(total, 32),
-            JsonValue::String(value) => string_capacity(value, total),
-            JsonValue::Array(values) => {
-                add(total, 2)?;
-                add(total, values.len().saturating_sub(1))?;
-                for value in values {
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
-            JsonValue::Object(values) => {
-                add(total, 2)?;
-                add(total, values.len().saturating_sub(1))?;
-                for (key, value) in values {
-                    string_capacity(key, total)?;
-                    add(total, 1)?;
-                    visit(value, total)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
-    let mut total = 0;
-    visit(value, &mut total)?;
-    Ok(total)
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

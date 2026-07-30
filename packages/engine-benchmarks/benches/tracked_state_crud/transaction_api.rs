@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use lix_engine::storage_adapter::StorageAdapter;
 use lix_engine::transaction::bench::{
     BenchLayoutAccounting, BenchTransactionFixture, BenchTransactionRow, BenchWriteAccounting,
@@ -201,13 +203,14 @@ fn bench_rows(rows: &[WorkloadRow]) -> Vec<BenchTransactionRow> {
             schema_key: "json_pointer".to_string(),
             file_id: None,
             entity_pk: row.path.clone(),
-            value: serde_json::from_str(&snapshot_value(&row.path, &row.value_json))
-                .expect("transaction bench value should parse"),
-            updated_value: serde_json::from_str(&snapshot_value(
-                &row.path,
-                &row.updated_value_json,
-            ))
-            .expect("transaction bench updated value should parse"),
+            value: Arc::new(
+                serde_json::from_str(&snapshot_value(&row.path, &row.value_json))
+                    .expect("transaction bench value should parse"),
+            ),
+            updated_value: Arc::new(
+                serde_json::from_str(&snapshot_value(&row.path, &row.updated_value_json))
+                    .expect("transaction bench updated value should parse"),
+            ),
         })
         .collect()
 }

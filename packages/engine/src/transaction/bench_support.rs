@@ -36,8 +36,8 @@ pub struct BenchTransactionRow {
     pub schema_key: String,
     pub file_id: Option<String>,
     pub entity_pk: String,
-    pub value: JsonValue,
-    pub updated_value: JsonValue,
+    pub value: Arc<JsonValue>,
+    pub updated_value: Arc<JsonValue>,
 }
 
 #[expect(missing_debug_implementations)]
@@ -421,12 +421,14 @@ fn write_accounting(logical_rows: usize, stats: StorageWriteSetStats) -> BenchWr
     }
 }
 
-fn transaction_row(row: &BenchTransactionRow, value: &JsonValue) -> TransactionWriteRow {
+fn transaction_row(row: &BenchTransactionRow, value: &Arc<JsonValue>) -> TransactionWriteRow {
     TransactionWriteRow {
         entity_pk: Some(EntityPk::single(row.entity_pk.clone())),
         schema_key: row.schema_key.as_str().into(),
         file_id: row.file_id.as_deref().map(Into::into),
-        snapshot: Some(TransactionJson::from_value_unchecked(value.clone())),
+        snapshot: Some(TransactionJson::from_shared_value_unchecked(Arc::clone(
+            value,
+        ))),
         metadata: None,
         origin: None,
         created_at: None,
