@@ -1810,6 +1810,19 @@ where
                             )
                             .await?
                         }
+                        ExactFilesystemRead::IdManifestBatch(file_ids) => {
+                            sql2::execute_exact_lix_file_id_manifest_batch_read(
+                                &active_branch_id,
+                                live_state,
+                                filesystem_path_index,
+                                branch_ref,
+                                blob_reader,
+                                self.plugin_host.clone(),
+                                file_view_collector.clone(),
+                                &file_ids,
+                            )
+                            .await?
+                        }
                         ExactFilesystemRead::RootFileListing
                         | ExactFilesystemRead::RootDirectoryListing => unreachable!(
                             "root filesystem listings handled before file data readers"
@@ -2753,6 +2766,7 @@ enum ExactFilesystemRead {
     RootDirectoryListing,
     Point(sql2::ExactLixFileReadSelector, sql2::ExactLixFileReadColumn),
     PathDataBatch(BTreeSet<String>),
+    IdManifestBatch(BTreeSet<String>),
 }
 
 fn exact_filesystem_read_route(
@@ -2773,7 +2787,12 @@ fn exact_filesystem_read_route(
     if point_read.table_name != "lix_file" || !point_read.exact_table_shape {
         return None;
     }
-    exact_path_data_batch(point_read.select, params).map(ExactFilesystemRead::PathDataBatch)
+    exact_path_data_batch(point_read.select, params)
+        .map(ExactFilesystemRead::PathDataBatch)
+        .or_else(|| {
+            exact_id_manifest_batch(point_read.select, params)
+                .map(ExactFilesystemRead::IdManifestBatch)
+        })
 }
 
 fn exact_lix_file_root_listing(statement: &DataFusionStatement, params: &[Value]) -> bool {
@@ -2936,6 +2955,60 @@ fn exact_path_data_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<S
         paths.insert(path.clone());
     }
     Some(paths)
+}
+
+/// Recognizes the exact changed-file manifest verification shape. Keeping the
+/// projection and parameter-only id list strict avoids changing general SQL
+/// semantics while bypassing repeated DataFusion setup for bounded exact
+/// batches.
+fn exact_id_manifest_batch(select: &Select, params: &[Value]) -> Option<BTreeSet<String>> {
+    let [
+        SelectItem::UnnamedExpr(id_projection),
+        SelectItem::UnnamedExpr(path_projection),
+        SelectItem::UnnamedExpr(data_projection),
+        SelectItem::UnnamedExpr(metadata_projection),
+    ] = select.projection.as_slice()
+    else {
+        return None;
+    };
+    if exact_point_column(id_projection).as_deref() != Some("id")
+        || exact_point_column(path_projection).as_deref() != Some("path")
+        || exact_point_column(data_projection).as_deref() != Some("data")
+        || exact_point_column(metadata_projection).as_deref() != Some("lixcol_metadata")
+    {
+        return None;
+    }
+    let Expr::InList {
+        expr,
+        list,
+        negated: false,
+    } = select.selection.as_ref()?
+    else {
+        return None;
+    };
+    if exact_point_column(expr).as_deref() != Some("id")
+        || list.is_empty()
+        || list.len() != params.len()
+    {
+        return None;
+    }
+    let mut ids = BTreeSet::new();
+    for (index, (expression, param)) in list.iter().zip(params).enumerate() {
+        let Expr::Value(value) = expression else {
+            return None;
+        };
+        let SqlValue::Placeholder(placeholder) = &value.value else {
+            return None;
+        };
+        if placeholder != &format!("${}", index + 1) {
+            return None;
+        }
+        let Value::Text(id) = param else {
+            return None;
+        };
+        ids.insert(id.clone());
+    }
+    (ids.len() == list.len()).then_some(ids)
 }
 
 fn exact_point_identity(expression: &Expr, params: &[Value]) -> Option<(String, String)> {
@@ -3429,6 +3502,24 @@ mod tests {
             Some(ExactFilesystemRead::PathDataBatch(BTreeSet::from([
                 "/a.txt".to_string(),
                 "/b.txt".to_string(),
+            ])))
+        );
+
+        let manifests_by_id = sql2::parse_statement(
+            "SELECT id, path, data, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
+        )
+        .unwrap();
+        assert_eq!(
+            exact_filesystem_read_route(
+                &manifests_by_id,
+                &[
+                    Value::Text("01920000-0000-7000-8000-0000000000a2".to_string()),
+                    Value::Text("01920000-0000-7000-8000-0000000000a1".to_string()),
+                ],
+            ),
+            Some(ExactFilesystemRead::IdManifestBatch(BTreeSet::from([
+                "01920000-0000-7000-8000-0000000000a1".to_string(),
+                "01920000-0000-7000-8000-0000000000a2".to_string(),
             ])))
         );
 
@@ -4920,6 +5011,57 @@ mod tests {
             result.rows()[0].value("data").unwrap(),
             &Value::Blob(b"alpha".to_vec().into())
         );
+        assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
+        assert_eq!(
+            result.rows()[1].value("data").unwrap(),
+            &Value::Blob(b"bravo".to_vec().into())
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_id_manifest_batch_preserves_bytes_and_metadata() {
+        let session = open_session().await;
+        let a = "01920000-0000-7000-8000-0000000000a1";
+        let b = "01920000-0000-7000-8000-0000000000a2";
+        session
+            .execute(
+                "INSERT INTO lix_file (id, path, data, lixcol_metadata) \
+                 VALUES ($1, $2, $3, $4), ($5, $6, $7, $8)",
+                &[
+                    Value::Text(b.to_string()),
+                    Value::Text("/b.txt".to_string()),
+                    Value::Blob(b"bravo".to_vec().into()),
+                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"b"})),
+                    Value::Text(a.to_string()),
+                    Value::Text("/a.txt".to_string()),
+                    Value::Blob(b"alpha".to_vec().into()),
+                    Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"})),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let result = session
+            .execute(
+                "SELECT id, path, data, lixcol_metadata FROM lix_file WHERE id IN ($1, $2)",
+                &[Value::Text(b.to_string()), Value::Text(a.to_string())],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.columns(), &["id", "path", "data", "lixcol_metadata"]);
+        assert_eq!(result.rows().len(), 2);
+        assert_eq!(result.rows()[0].get::<String>("id").unwrap(), a);
+        assert_eq!(result.rows()[0].get::<String>("path").unwrap(), "/a.txt");
+        assert_eq!(
+            result.rows()[0].value("data").unwrap(),
+            &Value::Blob(b"alpha".to_vec().into())
+        );
+        assert_eq!(
+            result.rows()[0].value("lixcol_metadata").unwrap(),
+            &Value::Json(serde_json::json!({"git_mode":"100644","git_oid":"a"}))
+        );
+        assert_eq!(result.rows()[1].get::<String>("id").unwrap(), b);
         assert_eq!(result.rows()[1].get::<String>("path").unwrap(), "/b.txt");
         assert_eq!(
             result.rows()[1].value("data").unwrap(),

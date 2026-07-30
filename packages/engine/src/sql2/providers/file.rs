@@ -770,6 +770,85 @@ pub(crate) async fn execute_exact_lix_file_batch_read(
     })
 }
 
+/// Executes an exact active-branch manifest batch selected by file id without
+/// constructing a DataFusion catalog or plan. This is the multi-row analogue
+/// of [`execute_exact_lix_file_read`] for callers that need to verify durable
+/// file identity, bytes, and metadata together.
+pub(crate) async fn execute_exact_lix_file_id_manifest_batch_read(
+    active_branch_id: &str,
+    live_state: Arc<dyn LiveStateReader>,
+    filesystem_path_index: Arc<dyn FilesystemPathIndexReader>,
+    branch_ref: Arc<dyn BranchRefReader>,
+    blob_reader: Arc<dyn BlobDataReader>,
+    plugin_host: PluginRuntimeHost,
+    session_file_views: Option<SessionFileViews>,
+    file_ids: &BTreeSet<String>,
+) -> Result<SqlQueryResult, LixError> {
+    let base_schema = lix_file_schema();
+    let schema = Arc::new(Schema::new(
+        ["id", "path", "data", "lixcol_metadata"]
+            .into_iter()
+            .map(|name| {
+                base_schema
+                    .field_with_name(name)
+                    .expect("lix_file manifest column should exist")
+                    .clone()
+            })
+            .collect::<Vec<_>>(),
+    ));
+    let mut request = lix_file_scan_request(Some(active_branch_id), Some(schema.as_ref()), None);
+    let branch_binding = BranchBinding::active(active_branch_id);
+    request.filter.branch_ids = resolve_provider_branch_ids(
+        branch_ref.as_ref(),
+        &branch_binding,
+        request.filter.branch_ids,
+    )
+    .await?;
+
+    let index = filesystem_path_index
+        .path_index(
+            &FilesystemPathIndexRequest::new(request.filter.branch_ids.clone())
+                .with_blob_refs(true)
+                .with_cached_blob_data(true),
+        )
+        .await?;
+    let matches = indexed_file_id_matches(index, file_ids, &FilePathPredicate::All);
+    let rows = scan_indexed_file_batch(&matches, true)?;
+    let mut prepared = prepare_indexed_lix_file_rows(&matches, rows)?;
+    let acknowledge_plugin_data = session_file_views.is_some();
+    let plugin_render = if prepared.needs_plugin_render(true) || acknowledge_plugin_data {
+        plugin_render_context_for_lix_file_scan(
+            Arc::clone(&live_state),
+            &request,
+            plugin_host,
+            &prepared,
+            acknowledge_plugin_data,
+        )
+        .await?
+        .map(|context| context.with_session_file_views(session_file_views))
+    } else {
+        None
+    };
+    hydrate_derived_materialization_rows(
+        live_state,
+        &request,
+        plugin_render.as_ref(),
+        &mut prepared,
+    )
+    .await?;
+    let batch =
+        lix_file_record_batch_from_prepared(&schema, &blob_reader, plugin_render, true, prepared)
+            .await?;
+    crate::sql2::exec::datafusion::query_result_from_batches(
+        &schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+        &[batch],
+    )
+}
+
 fn lix_file_dml_source_state(
     captured: &SharedLixFileDmlSourceState,
     action: &str,
