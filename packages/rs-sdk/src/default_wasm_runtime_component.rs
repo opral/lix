@@ -89,12 +89,13 @@ pub struct ResolutionSinkResource {
 type SharedTransitionState = Arc<Mutex<TransitionState>>;
 type SharedResolutionState = Arc<Mutex<ResolutionState>>;
 type SharedEntityChangeState = Arc<Mutex<EntityChangeState>>;
+type SharedByteBudget = Arc<Mutex<u64>>;
 
 struct TransitionState {
     limits: WasmTransitionLimits,
     creates: WasmCreateContext,
     started: Instant,
-    total_bytes: u64,
+    total_bytes: SharedByteBudget,
     events: Option<tokio::sync::mpsc::Sender<WorkerTransitionEvent>>,
     counters: WasmTransitionCounters,
     allow_file_replacement: bool,
@@ -110,7 +111,7 @@ struct PendingFileReplacement {
 struct EntityChangeState {
     limits: WasmTransitionLimits,
     started: Instant,
-    total_bytes: u64,
+    total_bytes: SharedByteBudget,
     changes: Vec<WasmEntityChange<WasmHostBytes>>,
     counters: WasmTransitionCounters,
 }
@@ -383,6 +384,15 @@ fn component_limit(message: impl Into<String>) -> LixError {
     LixError::new(LixError::CODE_INVALID_PARAM, message)
 }
 
+fn validate_source_admission(length: u64, limits: WasmTransitionLimits) -> Result<(), LixError> {
+    if length > limits.max_total_bytes {
+        return Err(component_limit(
+            "v3 source exceeds max-total-bytes before admission",
+        ));
+    }
+    Ok(())
+}
+
 impl TransitionState {
     fn new(
         limits: WasmTransitionLimits,
@@ -390,12 +400,13 @@ impl TransitionState {
         events: Option<tokio::sync::mpsc::Sender<WorkerTransitionEvent>>,
         executor_thread_created: bool,
         allow_file_replacement: bool,
+        total_bytes: Option<SharedByteBudget>,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
             creates,
             started: Instant::now(),
-            total_bytes: 0,
+            total_bytes: total_bytes.unwrap_or_default(),
             events,
             counters: WasmTransitionCounters {
                 guest_export_calls: 1,
@@ -435,12 +446,16 @@ impl TransitionState {
     }
 
     fn charge_total(&mut self, bytes: usize) -> Result<(), bindings::lix::plugin::host::HostError> {
-        self.total_bytes = self.total_bytes.checked_add(bytes as u64).ok_or_else(|| {
+        let mut total_bytes = self
+            .total_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *total_bytes = total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
                 "v3 transition byte count overflowed".to_owned(),
             )
         })?;
-        if self.total_bytes > self.limits.max_total_bytes {
+        if *total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
                 "v3 transition exceeds max-total-bytes".to_owned(),
             ));
@@ -540,11 +555,12 @@ impl EntityChangeState {
     fn new(
         limits: WasmTransitionLimits,
         changes: Vec<WasmEntityChange<WasmHostBytes>>,
+        total_bytes: SharedByteBudget,
     ) -> Result<Self, LixError> {
         Ok(Self {
             limits: limits.validate()?,
             started: Instant::now(),
-            total_bytes: 0,
+            total_bytes,
             changes,
             counters: WasmTransitionCounters::default(),
         })
@@ -566,12 +582,16 @@ impl EntityChangeState {
                 "v3 entity-change chunk exceeds max-page-bytes".to_owned(),
             ));
         }
-        self.total_bytes = self.total_bytes.checked_add(bytes as u64).ok_or_else(|| {
+        let mut total_bytes = self
+            .total_bytes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *total_bytes = total_bytes.checked_add(bytes as u64).ok_or_else(|| {
             bindings::lix::plugin::host::HostError::LimitExceeded(
                 "v3 entity-change byte count overflowed".to_owned(),
             )
         })?;
-        if self.total_bytes > self.limits.max_total_bytes {
+        if *total_bytes > self.limits.max_total_bytes {
             return Err(bindings::lix::plugin::host::HostError::LimitExceeded(
                 "v3 entity transition exceeds max-total-bytes".to_owned(),
             ));
@@ -2353,6 +2373,7 @@ impl V3Worker {
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
     ) -> Result<WasmTransitionCounters, LixError> {
         let limits = v3_transition_limits(limits)?;
+        validate_source_admission(input.file.len(), limits)?;
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
@@ -2362,6 +2383,7 @@ impl V3Worker {
             Some(events),
             std::mem::take(&mut self.first_transition),
             false,
+            None,
         )?));
         let bytes = read_source_all(&input.file)?;
         let arena_store = ArenaStore::default();
@@ -2472,6 +2494,7 @@ impl V3Worker {
             Some(events),
             false,
             false,
+            None,
         )?));
         let before = self
             .store
@@ -2706,13 +2729,19 @@ impl V3Worker {
             }
             changes.extend(page.changes);
         }
-        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(limits, changes)?));
+        let total_bytes = SharedByteBudget::default();
+        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(
+            limits,
+            changes,
+            total_bytes.clone(),
+        )?));
         let transition_state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             WasmCreateContext { high: 0, low: 0 },
             None,
             false,
             true,
+            Some(total_bytes),
         )?));
         let before = self
             .store
@@ -2854,6 +2883,7 @@ impl V3Worker {
             .as_ref()
             .map(|accepted| accepted.len())
             .unwrap_or(0);
+        validate_source_admission(accepted_len, limits)?;
         let bytes = input
             .accepted
             .as_ref()
@@ -2869,7 +2899,12 @@ impl V3Worker {
                 });
             }
         }
-        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(limits, entities)?));
+        let total_bytes = SharedByteBudget::default();
+        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(
+            limits,
+            entities,
+            total_bytes.clone(),
+        )?));
         let root = ArenaRoot::import(
             ArenaStore::default(),
             "v3-cold-successor",
@@ -2883,6 +2918,7 @@ impl V3Worker {
             None,
             std::mem::take(&mut self.first_transition),
             true,
+            Some(total_bytes),
         )?));
         let accepted = input
             .accepted
@@ -3997,6 +4033,41 @@ mod tests {
             validate_typed_csv_order_rank(0x100).unwrap_err(),
             "typed CSV row has an invalid order rank"
         );
+    }
+
+    #[test]
+    fn entity_sources_and_transition_sinks_share_one_byte_budget() {
+        let mut limits = WasmTransitionLimits::default();
+        limits.max_page_bytes = 10;
+        limits.max_record_bytes = 10;
+        limits.max_total_bytes = 10;
+        limits.max_inline_input_bytes = 10;
+        let budget = SharedByteBudget::default();
+        let mut source =
+            EntityChangeState::new(limits, Vec::new(), budget.clone()).expect("source state");
+        let mut sink = TransitionState::new(
+            limits,
+            WasmCreateContext { high: 0, low: 0 },
+            None,
+            false,
+            true,
+            Some(budget),
+        )
+        .expect("sink state");
+
+        source.charge(6).expect("first resource uses shared budget");
+        assert!(matches!(
+            sink.charge_page(5),
+            Err(bindings::lix::plugin::host::HostError::LimitExceeded(_))
+        ));
+    }
+
+    #[test]
+    fn oversized_sources_are_rejected_before_materialization() {
+        let mut limits = WasmTransitionLimits::default();
+        limits.max_total_bytes = 10;
+        assert!(validate_source_admission(10, limits).is_ok());
+        assert!(validate_source_admission(11, limits).is_err());
     }
 
     #[test]
