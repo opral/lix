@@ -924,36 +924,42 @@ pub(crate) async fn load_change_record_by_id(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<crate::changelog::ChangeRecord>, LixError> {
+    let mut direct_error = None;
     if let Some(locator) = direct_change_locator(change_id)
         && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
     {
-        if let Some(record) =
-            try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await?
-        {
-            return Ok(Some(record));
+        match try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await {
+            Ok(Some(record)) => return Ok(Some(record)),
+            Ok(None) => {}
+            Err(error) => direct_error = Some(error),
         }
     }
-    let Some(locator) = load_change_locator_by_id(store, change_id).await? else {
-        return Ok(None);
-    };
-    load_change_record_at_locator(store, locator)
-        .await
-        .map(Some)
+    if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
+        return load_change_record_at_locator(store, locator)
+            .await
+            .map(Some);
+    }
+    direct_error.map_or(Ok(None), Err)
 }
 
 async fn load_canonical_change_locator(
     store: &(impl StorageAdapterRead + ?Sized),
     change_id: crate::changelog::ChangeId,
 ) -> Result<Option<CommitDeltaChangeLocator>, LixError> {
+    let mut direct_error = None;
     if let Some(locator) = direct_change_locator(change_id)
         && let Some(manifest) = load_commit_delta_manifest(store, locator.commit_id).await?
-        && try_load_change_record_at_locator_in_manifest(store, locator, &manifest)
-            .await?
-            .is_some()
     {
+        match try_load_change_record_at_locator_in_manifest(store, locator, &manifest).await {
+            Ok(Some(_)) => return Ok(Some(locator)),
+            Ok(None) => {}
+            Err(error) => direct_error = Some(error),
+        }
+    }
+    if let Some(locator) = load_change_locator_by_id(store, change_id).await? {
         return Ok(Some(locator));
     }
-    load_change_locator_by_id(store, change_id).await
+    direct_error.map_or(Ok(None), Err)
 }
 
 fn direct_change_locator(
@@ -3327,6 +3333,62 @@ mod tests {
             .await
             .expect("canonical locator read should succeed")
             .expect("explicit collision should retain a canonical locator");
+        assert_eq!(canonical.commit_id, explicit_commit_id);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_address_shaped_explicit_id_falls_back_to_its_locator() {
+        let storage = StorageAdapter::new(Memory::new());
+        let addressable_commit_id = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_5678_0000_0000,
+        ));
+        let address_target = packed_commit_delta_fixtures()
+            .into_iter()
+            .next()
+            .expect("fixture should exist");
+        let mut writes = storage.new_write_set();
+        let target_deltas =
+            commit_delta_refs(addressable_commit_id, std::slice::from_ref(&address_target));
+        let target_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &target_deltas, &[false])
+                .expect("inline target should stage");
+        stage_change_locators(&mut writes, &target_staged.locators);
+
+        let explicit_change_id = super::addressable_change_id(addressable_commit_id, 1, 0)
+            .expect("out-of-range segment should retain a valid direct shape");
+        let explicit_commit_id = CommitId::for_test_label("out-of-range-explicit-commit");
+        let mut explicit = packed_commit_delta_fixtures()
+            .into_iter()
+            .nth(1)
+            .expect("second fixture should exist");
+        explicit.change_id = explicit_change_id;
+        let explicit_deltas =
+            commit_delta_refs(explicit_commit_id, std::slice::from_ref(&explicit));
+        let explicit_staged =
+            super::stage_addressable_commit_deltas(&mut writes, &explicit_deltas, &[false])
+                .expect("out-of-range explicit change should stage");
+        assert_eq!(explicit_staged.locators.len(), 1);
+        stage_change_locators(&mut writes, &explicit_staged.locators);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("out-of-range collision fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("collision read should open");
+        let loaded = load_change_record_by_id(&read, explicit_change_id)
+            .await
+            .expect("out-of-range explicit read should succeed")
+            .expect("out-of-range explicit id should resolve through its locator");
+        assert_eq!(loaded.change_id, explicit_change_id);
+        assert_eq!(loaded.schema_key, explicit.schema_key);
+        assert_eq!(loaded.entity_pk, explicit.entity_pk);
+        let canonical = super::load_canonical_change_locator(&read, explicit_change_id)
+            .await
+            .expect("canonical locator read should succeed")
+            .expect("out-of-range explicit id should retain a canonical locator");
         assert_eq!(canonical.commit_id, explicit_commit_id);
     }
 
