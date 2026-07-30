@@ -145,22 +145,6 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     else {
         return Ok(None);
     };
-    let mut unique_identities =
-        std::collections::HashSet::with_capacity(parameter_batch.num_rows());
-    for candidate in write_rows.iter() {
-        let Some(entity_pk) = candidate.entity_pk else {
-            return Ok(None);
-        };
-        if !unique_identities.insert((
-            candidate.schema_key.clone(),
-            entity_pk.clone(),
-            candidate.file_id.cloned(),
-            candidate.branch_id.clone(),
-        )) {
-            return Ok(None);
-        }
-    }
-    drop(unique_identities);
     drop(certification_span);
     let committed = if collection_is_certifiably_empty(ctx, &spec.schema_key).await? {
         MaterializedLiveStateBatch::default()
@@ -2606,11 +2590,12 @@ fn certified_direct_parameter_insert_batch(
         })?);
     let mut offsets = Vec::with_capacity(row_count);
     let mut entity_pks = Vec::with_capacity(row_count);
+    let mut unique_entity_pks = std::collections::HashSet::with_capacity(row_count);
     let mut primary_key_parts = Vec::with_capacity(primary_key_columns.len());
     let mut typed_fields = Vec::with_capacity(columns.len());
 
     for statement_index in 0..row_count {
-        let row_result = (|| -> Result<(), LixError> {
+        let row_result = (|| -> Result<bool, LixError> {
             let start = normalized.len();
             typed_fields.clear();
             normalized.push(b'{');
@@ -2715,11 +2700,18 @@ fn certified_direct_parameter_insert_batch(
                 &typed_fields,
                 &primary_key_parts,
             )?;
+            if !unique_entity_pks.insert(entity_pk.clone()) {
+                return Ok(false);
+            }
             offsets.push((start, normalized.len()));
             entity_pks.push(entity_pk);
-            Ok(())
+            Ok(true)
         })();
-        row_result.map_err(|error| with_parameter_batch_statement_index(error, statement_index))?;
+        if !row_result
+            .map_err(|error| with_parameter_batch_statement_index(error, statement_index))?
+        {
+            return Ok(None);
+        }
     }
 
     let snapshots = WasmCanonicalJson::from_certified_arena_parts(
@@ -2839,6 +2831,7 @@ fn certified_entity_insert_rows<'a>(
     let mut offsets = Vec::with_capacity(row_count);
     let mut entity_pks = Vec::with_capacity(row_count);
     let mut row_parts = Vec::with_capacity(row_count);
+    let mut unique_identities = std::collections::HashSet::with_capacity(row_count);
     let mut row_values = (0..layout.columns.len())
         .map(|_| None)
         .collect::<Vec<Option<JsonValue>>>();
@@ -2849,7 +2842,7 @@ fn certified_entity_insert_rows<'a>(
         let row = input.row;
         let params = input.params.as_slice();
         let statement_index = input.statement_index;
-        let row_result = (|| -> Result<(), LixError> {
+        let row_result = (|| -> Result<bool, LixError> {
             if row.len() != layout.columns.len() {
                 return Err(LixError::new(
                     LixError::CODE_UNSUPPORTED_SQL,
@@ -3029,25 +3022,37 @@ fn certified_entity_insert_rows<'a>(
                 normalized.extend_from_slice(&canonical);
             }
             let end = normalized.len();
-            offsets.push((start, end));
-            entity_pks.push(certified.entity_pk);
             let global = global.unwrap_or(false);
-            row_parts.push(CertifiedInsertRow {
+            let row_parts_entry = CertifiedInsertRow {
                 file_id: file_id.map(Into::into),
                 metadata,
                 global,
                 untracked: untracked.unwrap_or(false),
                 branch_id: entity_row_branch_id(plan, explicit_branch_id, global)?.into(),
-            });
+            };
+            if !unique_identities.insert((
+                certified.entity_pk.clone(),
+                row_parts_entry.file_id.clone(),
+                row_parts_entry.branch_id.clone(),
+                global,
+            )) {
+                return Ok(false);
+            }
+            offsets.push((start, end));
+            entity_pks.push(certified.entity_pk);
+            row_parts.push(row_parts_entry);
             for value in &mut row_values {
                 *value = None;
             }
-            Ok(())
+            Ok(true)
         })();
-        row_result.map_err(|error| match statement_index {
+        let unique = row_result.map_err(|error| match statement_index {
             Some(index) => with_parameter_batch_statement_index(error, index),
             None => error,
         })?;
+        if !unique {
+            return Ok(None);
+        }
     }
 
     let row_count = offsets.len();

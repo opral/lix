@@ -4209,6 +4209,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_preserves_early_duplicate_before_later_schema_error() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_error_order_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string", "minLength": 1 }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql = "INSERT INTO parameter_insert_error_order_probe (id, value) VALUES ($1, $2)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("valid".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("also valid".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![Value::Text("b".to_string()), Value::Text(String::new())],
+                },
+            ])
+            .await
+            .expect_err("the earlier duplicate must precede later schema validation");
+        assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+        let rows = session
+            .execute("SELECT id FROM parameter_insert_error_order_probe", &[])
+            .await
+            .unwrap();
+        assert!(rows.rows().is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_batch_preserves_later_missing_branch_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
