@@ -33,7 +33,7 @@ fn print_write_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRow
         "| ----- | ------- | --------- | -----------: | ---: | ------------: | ------------: | -------------: | ------------: | ----------: | -------------: | ------------: | ------: | ---------: |"
     );
 
-    for profile in STORAGE_PROFILES {
+    for &profile in STORAGE_PROFILES {
         let mut kv_insert = runtime.block_on(kv_layout::empty_fixture(profile, rows));
         print_kv_write(
             profile,
@@ -127,7 +127,7 @@ fn print_layout_accounting(runtime: &tokio::runtime::Runtime, rows: &[WorkloadRo
     println!("| Layer | Storage | Space id | Space | Rows | Key bytes | Value bytes |");
     println!("| ----- | ------- | -------: | ----- | ---: | --------: | ----------: |");
 
-    for profile in STORAGE_PROFILES {
+    for &profile in STORAGE_PROFILES {
         let kv = runtime.block_on(kv_layout::seeded_fixture(profile, rows));
         for row in runtime.block_on(kv.layout_accounting()) {
             print_kv_layout(profile, "kv_layout", row);

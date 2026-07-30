@@ -2,6 +2,8 @@ use std::fmt::Write as _;
 
 use lix_engine::{Engine, ExecuteBatchStatement, ExecuteResult, SessionContext, Storage, Value};
 
+#[cfg(feature = "slatedb")]
+use crate::storage::SlateDB;
 use crate::storage::{ProfileStorage, RocksDB, SQLite, StorageProfile};
 use crate::workload::{WorkloadRow, sql_string};
 
@@ -26,6 +28,8 @@ impl UntrackedFixture {
 pub(crate) enum SqlFixture {
     SQLite(GenericSqlFixture<SQLite>),
     RocksDB(GenericSqlFixture<RocksDB>),
+    #[cfg(feature = "slatedb")]
+    SlateDB(GenericSqlFixture<SlateDB>),
 }
 
 pub(crate) struct GenericSqlFixture<StorageImpl: Storage> {
@@ -83,9 +87,13 @@ pub(crate) async fn empty_fixture_with_read_many_pk_count(
             dir,
         )),
         #[cfg(feature = "slatedb")]
-        ProfileStorage::SlateDB { .. } => {
-            unreachable!("SlateDB is currently profiled through the transaction CRUD layer")
-        }
+        ProfileStorage::SlateDB { storage, _dir: dir } => SqlFixture::SlateDB(fixture_for_session(
+            prepare_session(storage).await,
+            rows,
+            read_many_by_pk_count,
+            untracked_fixture,
+            dir,
+        )),
     }
 }
 
@@ -109,6 +117,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.insert_all().await,
             Self::RocksDB(fixture) => fixture.insert_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.insert_all().await,
         }
     }
 
@@ -116,6 +126,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.insert_untracked_probe().await,
             Self::RocksDB(fixture) => fixture.insert_untracked_probe().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.insert_untracked_probe().await,
         }
     }
 
@@ -123,6 +135,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_all().await,
             Self::RocksDB(fixture) => fixture.read_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_all().await,
         }
     }
 
@@ -132,6 +146,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_all_result().await,
             Self::RocksDB(fixture) => fixture.read_all_result().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_all_result().await,
         }
     }
 
@@ -139,6 +155,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_many_by_pk().await,
             Self::RocksDB(fixture) => fixture.read_many_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_many_by_pk().await,
         }
     }
 
@@ -148,6 +166,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_many_by_pk_result().await,
             Self::RocksDB(fixture) => fixture.read_many_by_pk_result().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_many_by_pk_result().await,
         }
     }
 
@@ -155,6 +175,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.read_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_one_by_pk().await,
         }
     }
 
@@ -164,6 +186,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.read_one_by_pk_result().await,
             Self::RocksDB(fixture) => fixture.read_one_by_pk_result().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.read_one_by_pk_result().await,
         }
     }
 
@@ -171,6 +195,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.update_all().await,
             Self::RocksDB(fixture) => fixture.update_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_all().await,
         }
     }
 
@@ -181,6 +207,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.update_all_bound().await,
             Self::RocksDB(fixture) => fixture.update_all_bound().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_all_bound().await,
         }
     }
 
@@ -188,6 +216,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.update_bound_rows(row_count).await,
             Self::RocksDB(fixture) => fixture.update_bound_rows(row_count).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_bound_rows(row_count).await,
         }
     }
 
@@ -195,6 +225,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.update_spread_bound_rows(row_count).await,
             Self::RocksDB(fixture) => fixture.update_spread_bound_rows(row_count).await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_spread_bound_rows(row_count).await,
         }
     }
 
@@ -202,6 +234,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.update_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.update_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.update_one_by_pk().await,
         }
     }
 
@@ -209,6 +243,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.delete_all().await,
             Self::RocksDB(fixture) => fixture.delete_all().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.delete_all().await,
         }
     }
 
@@ -216,6 +252,8 @@ impl SqlFixture {
         match self {
             Self::SQLite(fixture) => fixture.delete_one_by_pk().await,
             Self::RocksDB(fixture) => fixture.delete_one_by_pk().await,
+            #[cfg(feature = "slatedb")]
+            Self::SlateDB(fixture) => fixture.delete_one_by_pk().await,
         }
     }
 }
