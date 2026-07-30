@@ -714,6 +714,54 @@ async fn v2_transport_splice_provenance_is_bound_to_the_observed_file() {
 }
 
 #[tokio::test]
+async fn csv_byte_edit_after_semantic_render_uses_successor_row_boundaries() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv",
+        &build_csv_plugin_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/semantic-then-byte.csv";
+    write_file(&lix, path, b"short,x\nsecond,y\n".to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let initial = active_csv_v2_rows(&lix, &file_id).await;
+    let first_id = csv_v2_row_id(&initial, &["short", "x"]);
+    let second_id = csv_v2_row_id(&initial, &["second", "y"]);
+
+    lix.execute(
+        "UPDATE csv_v2_row SET cells = $1 WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Json(serde_json::json!(["much-longer", "x"])),
+            Value::Text(first_id.clone()),
+            Value::Text(file_id.clone()),
+        ],
+    )
+    .await
+    .unwrap();
+    let after_semantic = b"much-longer,x\nsecond,y\n".to_vec();
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(after_semantic.clone())
+    );
+
+    let after_followup = b"much-longer,x\nsecond,z\n".to_vec();
+    write_file(&lix, path, after_followup.clone())
+        .await
+        .expect("a byte edit after semantic rendering must not use stale CSV row offsets");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
+    let rows = active_csv_v2_rows(&lix, &file_id).await;
+    assert_eq!(csv_v2_row_id(&rows, &["much-longer", "x"]), first_id);
+    assert_eq!(csv_v2_row_id(&rows, &["second", "z"]), second_id);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     let archive = build_markdown_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -769,17 +817,43 @@ async fn v2_markdown_roundtrips_gfm_and_renders_one_direct_entity_edit() {
     let paragraph_id = paragraph.get::<String>("id").unwrap();
     assert_eq!(paragraph_id.len(), 36);
 
-    let payload_json =
-        serde_json::json!({"inline":[{"type":"text","value":"Edited paragraph."}]}).to_string();
+    let payload_json = serde_json::json!({
+        "inline": [{
+            "type": "text",
+            "value": "Edited paragraph with a much longer tail."
+        }]
+    })
+    .to_string();
     lix.execute(
         "UPDATE markdown_node_v2 SET payload_json = $1 WHERE id = $2",
         &[Value::Text(payload_json), Value::Text(paragraph_id)],
     )
     .await
     .unwrap();
+    let after_semantic = b"# Heading\n\nEdited paragraph with a much longer tail.\n".to_vec();
     assert_eq!(
-        read_file(&lix, path).await.unwrap().as_deref(),
-        Some(b"# Heading\n\nEdited paragraph.\n".as_slice())
+        read_file(&lix, path).await.unwrap(),
+        Some(after_semantic.clone())
+    );
+    let after_followup = String::from_utf8(after_semantic)
+        .unwrap()
+        .replacen("tail", "TAIL", 1)
+        .into_bytes();
+    write_file(&lix, path, after_followup.clone())
+        .await
+        .expect("a byte edit after semantic rendering must not use stale Markdown spans");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
+    assert!(
+        lix.execute(
+            "SELECT payload_json FROM markdown_node_v2 WHERE kind = 'paragraph'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+            .get::<String>("payload_json")
+            .unwrap()
+            .contains("TAIL")
     );
 
     lix.close().await.unwrap();
@@ -2130,6 +2204,71 @@ async fn v2_csv_rename_vs_same_row_edit_remains_a_descriptor_conflict() {
         "a rejected merge must preserve the target descriptor and bytes"
     );
     assert_eq!(read_file(&lix, tsv_path).await.unwrap(), None);
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn json_first_structural_fallback_preserves_accepted_array_identities() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/array-identity.json";
+    write_file(&lix, path, br#"["removed","alpha","beta"]"#.to_vec())
+        .await
+        .unwrap();
+    let file_id = file_id_at_path(&lix, path).await;
+    let before = lix
+        .execute(
+            "SELECT id, scalar_json FROM json_array_item \
+             WHERE lixcol_file_id = $1 ORDER BY order_key",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    let alpha_id = before.rows()[1].get::<String>("id").unwrap();
+    let beta_id = before.rows()[2].get::<String>("id").unwrap();
+
+    write_file(&lix, path, br#"["alpha","beta"]"#.to_vec())
+        .await
+        .expect("the first structural fallback should preserve accepted identities");
+    let after = lix
+        .execute(
+            "SELECT id, scalar_json FROM json_array_item \
+             WHERE lixcol_file_id = $1 ORDER BY order_key",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.rows().len(), 2);
+    assert_eq!(
+        after.rows()[0].get::<String>("scalar_json").unwrap(),
+        r#""alpha""#
+    );
+    assert_eq!(after.rows()[0].get::<String>("id").unwrap(), alpha_id);
+    assert_eq!(after.rows()[1].get::<String>("id").unwrap(), beta_id);
+
+    lix.execute(
+        "UPDATE json_array_item SET scalar_json = $1 \
+         WHERE id = $2 AND lixcol_file_id = $3",
+        &[
+            Value::Text(r#""BETA""#.to_owned()),
+            Value::Text(beta_id),
+            Value::Text(file_id),
+        ],
+    )
+    .await
+    .expect("the preserved durable identity should remain semantically writable");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap(),
+        Some(br#"["alpha","BETA"]"#.to_vec())
+    );
 
     lix.close().await.unwrap();
 }
@@ -5071,6 +5210,52 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
     assert_eq!(
         parsed["elements"][1]["isDeleted"],
         serde_json::Value::Bool(true)
+    );
+
+    let first_element = lix
+        .execute(
+            "SELECT element_json FROM excalidraw_element WHERE id = 'a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("element_json")
+        .unwrap()
+        .replacen(r#""x":123.5"#, r#""x":123456.75"#, 1);
+    lix.execute(
+        "UPDATE excalidraw_element SET element_json = $1 WHERE id = 'a'",
+        &[Value::Text(first_element)],
+    )
+    .await
+    .expect("semantic element growth should render");
+    let after_semantic = read_file(&lix, path).await.unwrap().unwrap();
+    let after_followup = String::from_utf8(after_semantic)
+        .unwrap()
+        .replacen(r#""x":20"#, r#""x":21"#, 1)
+        .into_bytes();
+    write_file(&lix, path, after_followup.clone())
+        .await
+        .expect("a byte edit after semantic rendering must not use stale Excalidraw spans");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after_followup));
+    let elements = lix
+        .execute(
+            "SELECT id, element_json FROM excalidraw_element ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert!(
+        elements.rows()[0]
+            .get::<String>("element_json")
+            .unwrap()
+            .contains("123456.75")
+    );
+    assert!(
+        elements.rows()[1]
+            .get::<String>("element_json")
+            .unwrap()
+            .contains(r#""x":21"#)
     );
 
     lix.close().await.unwrap();

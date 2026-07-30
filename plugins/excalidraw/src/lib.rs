@@ -46,6 +46,8 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
+        sink.delete_state(ELEMENT_INDEX_KEY)?;
+        sink.delete_state(ELEMENT_SHIFTS_KEY)?;
         Ok(())
     }
 
@@ -111,6 +113,7 @@ impl sdk::FormatPlugin for ExcalidrawPlugin {
             ELEMENT_INDEX_KEY,
             &encode_element_index(&document.arena_element_spans())?,
         )?;
+        update.successor.delete_state(ELEMENT_SHIFTS_KEY)?;
         emit_changes(changes.into_iter().map(Ok), sink)?;
         Ok(())
     }

@@ -53,8 +53,9 @@ impl sdk::FormatPlugin for MarkdownPlugin {
             namespace,
         )
         .map_err(core_error)?;
-        let (_, edits) = document.entities_changed(changes).map_err(core_error)?;
+        let (successor, edits) = document.entities_changed(changes).map_err(core_error)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
+        store_rendered_markdown_state(&update.before, sink, &successor)?;
         Ok(())
     }
 
@@ -170,7 +171,7 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         strip_duplicated_lexical_fallback(&mut changes)?;
         let (root, blocks) = document.arena_state().map_err(core_error)?;
         update.successor.put_state(ROOT_STATE, &root)?;
-        let old_page_count = block_page_count(update)?;
+        let old_page_count = block_page_count(&update.before)?;
         let (index, pages) = encode_blocks(&blocks)?;
         update.successor.put_state(BLOCKS_STATE, &index)?;
         for (ordinal, page) in pages.iter().enumerate() {
@@ -194,6 +195,31 @@ impl sdk::FormatPlugin for MarkdownPlugin {
         emit_changes(changes, update.creates, Some(next_ordinal), sink)?;
         Ok(())
     }
+}
+
+fn store_rendered_markdown_state(
+    before: &sdk::Root<'_>,
+    sink: &mut sdk::Sink<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
+    let (root, blocks) = document.arena_state().map_err(core_error)?;
+    sink.put_state(ROOT_STATE, &root)?;
+    let old_page_count = block_page_count(before)?;
+    let (index, pages) = encode_blocks(&blocks)?;
+    sink.put_state(BLOCKS_STATE, &index)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        sink.put_state(&block_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        sink.delete_state(&block_page_key(ordinal))?;
+    }
+    if let Some(shifts) = before.get_state(BLOCK_SHIFTS_STATE)? {
+        for (ordinal, _) in decode_block_shifts(&shifts)? {
+            sink.delete_state(&block_overlay_key(ordinal))?;
+        }
+    }
+    sink.delete_state(BLOCK_SHIFTS_STATE)?;
+    Ok(())
 }
 
 fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<Option<IdNamespace>> {
@@ -477,11 +503,8 @@ fn block_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn block_page_count(update: &sdk::FileUpdate<'_>) -> sdk::Result<u32> {
-    let Some(header) = update
-        .before
-        .read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)?
-    else {
+fn block_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    let Some(header) = root.read_state_range(BLOCKS_STATE, 0, BLOCK_INDEX_HEADER_BYTES)? else {
         return Ok(0);
     };
     if header.get(..4) != Some(BLOCK_INDEX_MAGIC) {

@@ -46,10 +46,15 @@ impl sdk::FormatPlugin for CsvPlugin {
             namespace,
         )
         .map_err(sdk::Error::invalid_input)?;
-        let (_, edits) = document
+        let (successor, edits) = document
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
+        let records = successor
+            .entity_records()
+            .map_err(sdk::Error::invalid_input)?;
+        sink.put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
+        sink.delete_state(CSV_INDEX_KEY)?;
         Ok(())
     }
 

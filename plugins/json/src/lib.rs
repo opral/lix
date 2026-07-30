@@ -70,8 +70,10 @@ impl sdk::FormatPlugin for JsonPlugin {
     }
 
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        let namespace =
+        let create_namespace =
             IdNamespace::from_halves(update.creates.high, u64::from(update.creates.low));
+        let accepted_namespace =
+            read_namespace(&update.before, ID_NAMESPACE_STATE)?.unwrap_or(create_namespace);
         let inserts = update
             .edits
             .iter()
@@ -102,10 +104,10 @@ impl sdk::FormatPlugin for JsonPlugin {
             &update.before,
             before_bytes,
             update.before_file.path.as_deref(),
-            namespace,
+            accepted_namespace,
         )?;
         let (document, changes) = document
-            .file_changed(&splices, namespace)
+            .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
         let old_page_count = scalar_page_count(update)?;
         update.successor.put_state(
