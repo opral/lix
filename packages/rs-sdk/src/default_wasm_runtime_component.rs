@@ -1607,6 +1607,7 @@ fn decode_typed_csv_rows(
         if field_count == 0 {
             return Err("typed CSV row has no fields".to_owned());
         }
+        validate_typed_csv_quote_layout(quote_layout, field_count)?;
         let snapshot_start = snapshots.len();
         snapshots.extend_from_slice(b"{\"cells\":[");
         for field in 0..field_count {
@@ -1707,11 +1708,12 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
             return Err("typed CSV row has an invalid terminator code".to_owned());
         }
         let quote_layout_len = input.u32()? as usize;
-        let _quote_layout = input.bytes(quote_layout_len)?;
+        let quote_layout = input.bytes(quote_layout_len)?;
         let field_count = input.u16()?;
         if field_count == 0 {
             return Err("typed CSV row has no fields".to_owned());
         }
+        validate_typed_csv_quote_layout(quote_layout, field_count)?;
         for _ in 0..field_count {
             let cell_len = input.u32()? as usize;
             std::str::from_utf8(input.bytes(cell_len)?)
@@ -1730,6 +1732,29 @@ fn validate_typed_csv_rows(row_count: u32, payload: &[u8]) -> Result<(u32, u32),
 fn validate_typed_csv_order_rank(order_rank: u64) -> Result<(), String> {
     if order_rank & 0xff == 0 {
         return Err("typed CSV row has an invalid order rank".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_typed_csv_quote_layout(quote_layout: &[u8], field_count: u16) -> Result<(), String> {
+    if quote_layout.is_empty() {
+        return Ok(());
+    }
+    let maximum = usize::from(field_count).div_ceil(8);
+    if quote_layout.len() > maximum || quote_layout.last() == Some(&0) {
+        return Err(
+            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
+                .to_owned(),
+        );
+    }
+    let remainder = field_count % 8;
+    if remainder != 0
+        && quote_layout.len() == maximum
+        && quote_layout
+            .last()
+            .is_some_and(|byte| byte & !((1 << remainder) - 1) != 0)
+    {
+        return Err("typed CSV quote layout has bits beyond the final field".to_owned());
     }
     Ok(())
 }
@@ -4032,6 +4057,48 @@ mod tests {
         assert_eq!(
             validate_typed_csv_order_rank(0x100).unwrap_err(),
             "typed CSV row has an invalid order rank"
+        );
+    }
+
+    #[test]
+    fn typed_csv_certification_rejects_noncanonical_quote_layouts() {
+        fn row(quote_layout: &[u8], field_count: u16) -> Vec<u8> {
+            let mut payload = Vec::new();
+            payload.extend_from_slice(&1u32.to_le_bytes());
+            payload.extend_from_slice(&1u64.to_le_bytes());
+            payload.push(0);
+            payload.extend_from_slice(&(quote_layout.len() as u32).to_le_bytes());
+            payload.extend_from_slice(quote_layout);
+            payload.extend_from_slice(&field_count.to_le_bytes());
+            for _ in 0..field_count {
+                payload.extend_from_slice(&0u32.to_le_bytes());
+            }
+            payload
+        }
+
+        assert!(validate_typed_csv_quote_layout(&[], 9).is_ok());
+        assert!(validate_typed_csv_quote_layout(&[1], 9).is_ok());
+        assert!(validate_typed_csv_quote_layout(&[0, 1], 9).is_ok());
+        assert_eq!(
+            validate_typed_csv_quote_layout(&[1, 0], 9).unwrap_err(),
+            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
+        );
+        assert_eq!(
+            validate_typed_csv_quote_layout(&[1, 2], 9).unwrap_err(),
+            "typed CSV quote layout has bits beyond the final field"
+        );
+        assert_eq!(
+            validate_typed_csv_quote_layout(&[1, 1, 1], 9).unwrap_err(),
+            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
+        );
+        assert!(validate_typed_csv_rows(1, &row(&[0, 1], 9)).is_ok());
+        assert_eq!(
+            validate_typed_csv_rows(1, &row(&[1, 0], 9)).unwrap_err(),
+            "typed CSV quote layout must be a minimal nonzero bitset within the field count"
+        );
+        assert_eq!(
+            validate_typed_csv_rows(1, &row(&[1, 2], 9)).unwrap_err(),
+            "typed CSV quote layout has bits beyond the final field"
         );
     }
 
