@@ -7134,6 +7134,52 @@ async fn v2_generation_upgrade_with_disjoint_edits_remains_a_merge_conflict() {
 }
 
 #[tokio::test]
+async fn v4_csv_dialect_rename_after_eviction_uses_predecessor_descriptor() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_plugin(&lix, "plugin_csv", &build_csv_plugin_archive())
+        .await
+        .unwrap();
+    let before_path = "/dialect-before.csv";
+    let after_path = "/dialect-after.tsv";
+    let source = b"first,one\n".to_vec();
+    write_file(&lix, before_path, source.clone()).await.unwrap();
+    let file_id = file_id_at_path(&lix, before_path).await;
+    assert_eq!(
+        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        ["first", "one"]
+    );
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/dialect-evict-{index}.csv"),
+            format!("eviction,{index}\n").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    lix.execute(
+        "UPDATE lix_file SET path = $1 WHERE path = $2",
+        &[
+            Value::Text(after_path.to_owned()),
+            Value::Text(before_path.to_owned()),
+        ],
+    )
+    .await
+    .expect("an evicted CSV actor must observe the CSV to TSV descriptor transition");
+
+    assert_eq!(read_file(&lix, before_path).await.unwrap(), None);
+    assert_eq!(read_file(&lix, after_path).await.unwrap(), Some(source));
+    assert_eq!(
+        active_csv_v2_rows(&lix, &file_id).await[0].cells,
+        ["first,one"],
+        "the successor must be reparsed with TSV delimiter semantics"
+    );
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_csv_path_only_rename_rekeys_actor_and_cleans_owner_on_unmatch() {
     let archive = build_csv_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();

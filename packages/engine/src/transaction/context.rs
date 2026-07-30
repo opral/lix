@@ -3774,6 +3774,9 @@ where
                     };
                     if cold_successor_candidate {
                         let cold_limits = cold_successor_transition_limits(submitted_bytes.len());
+                        let cold_before_descriptor = acknowledged_observation
+                            .map(|observation| v2_file_descriptor_from_actor_key(observation.key()))
+                            .unwrap_or_else(|| v2_file_descriptor_from_actor_key(&actor_key));
                         let cold_open_guard = cache.cold_open_guard().await;
                         let visible_materialization = self
                         .visible_materialization(&file_key)
@@ -3950,9 +3953,7 @@ where
                                 .cold_file_changed(
                                     cold_limits,
                                     WasmColdFileUpdate {
-                                        before_descriptor: v2_file_descriptor_from_actor_key(
-                                            &actor_key,
-                                        ),
+                                        before_descriptor: cold_before_descriptor,
                                         after_descriptor: descriptor.clone(),
                                         before: cold_before,
                                         edits: cold_edits,
