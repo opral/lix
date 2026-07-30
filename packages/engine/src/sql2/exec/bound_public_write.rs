@@ -2528,6 +2528,14 @@ fn certified_direct_parameter_insert_batch(
                 parameter_batch.num_columns()
             )));
         };
+        if crate::sql2::result_metadata::field_is_json(
+            parameter_batch.schema().field(parameter_index),
+        ) {
+            // Utf8 is also the physical carrier for public JSON parameters.
+            // Direct decoding as text would turn JSON objects/arrays into
+            // string literals and diverge from sequential type validation.
+            return Ok(None);
+        }
         let type_matches = match column_type {
             EntityColumnType::String => array.as_any().is::<StringArray>(),
             EntityColumnType::Boolean => array.as_any().is::<BooleanArray>(),

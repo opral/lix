@@ -4153,6 +4153,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_declines_json_marked_utf8_for_string_columns() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_json_string_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql = "INSERT INTO parameter_insert_json_string_probe (id, value) VALUES ($1, $2)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Json(serde_json::json!({"not": "text"})),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Json(serde_json::json!({"also": "not text"})),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("JSON objects must not be coerced into string column values");
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+        let rows = session
+            .execute("SELECT id FROM parameter_insert_json_string_probe", &[])
+            .await
+            .unwrap();
+        assert!(rows.rows().is_empty());
+    }
+
+    #[tokio::test]
     async fn execute_batch_preserves_later_missing_branch_index() {
         let session = open_session().await;
         let schema = serde_json::json!({
