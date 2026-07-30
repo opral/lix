@@ -39,14 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V22 orders the authoritative hot-state identity by
-/// `(schema_key, file_id, entity_pk)`. Opening an older store must fail closed
-/// rather than decoding or mixing V21 `(schema_key, entity_pk, file_id)` rows
-/// under the new physical order.
+/// V23 replaces the per-row file projection with conservative schema-level
+/// membership markers. Opening an older store must fail closed because the
+/// physical space ID remains stable and V22 stores do not contain markers.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"file-first-hot-state.v22";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"schema-file-membership.v23";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately

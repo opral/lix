@@ -1,10 +1,11 @@
 //! Unified, materialized live state for one branch head.
 //!
-//! The V17 hot index has one file-first row per full identity. Each row is tagged
+//! The V18 hot state has one authoritative file-first row per full identity
+//! plus one conservative file-membership marker per schema. Each row is tagged
 //! `tracked` or `untracked`: tracked mutations also enter history, while
 //! untracked mutations exist only in this serving plane. Normal reads consult
-//! this single index rather than merging a tracked snapshot with an untracked
-//! overlay.
+//! this single row index rather than merging a tracked snapshot with an
+//! untracked overlay.
 
 mod hot;
 
@@ -3464,7 +3465,7 @@ mod tests {
         let projection_read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open file projection verification read");
+            .expect("open file schema marker verification read");
         let projection_rows = ScanPlan::prefix(
             HOT_FILE_SPACE,
             StoragePrefix {
@@ -3473,10 +3474,14 @@ mod tests {
         )
         .collect(&projection_read, StorageScanOptions::default())
         .await
-        .expect("file projection should scan")
+        .expect("file schema markers should scan")
         .value
         .entries;
-        assert_eq!(projection_rows.len(), 3, "every file row has a projection");
+        assert_eq!(
+            projection_rows.len(),
+            1,
+            "file rows share one conservative schema marker"
+        );
         drop(projection_read);
 
         let read = storage
@@ -3607,7 +3612,7 @@ mod tests {
         );
 
         // The branch control validates the published hot generation. Exact
-        // file identity and schema-scoped file-id reads route through the V17
+        // file identity and schema-scoped file-id reads route through the V18
         // file-first primary index.
         let read = storage
             .begin_read(StorageReadOptions::default())
@@ -3929,7 +3934,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn incremental_row_update_preserves_siblings_and_file_projection() {
+    async fn incremental_row_update_preserves_siblings_and_file_schema_marker() {
         let storage = StorageAdapter::new(Memory::new());
         let branch_id = "branch";
         let generation = CommitId::for_test_label("first-head");
@@ -4050,7 +4055,7 @@ mod tests {
         let read = storage
             .begin_read(StorageReadOptions::default())
             .await
-            .expect("open file-projection verification read");
+            .expect("open file-schema marker verification read");
         let projections = ScanPlan::prefix(
             HOT_FILE_SPACE,
             StoragePrefix {
@@ -4059,15 +4064,15 @@ mod tests {
         )
         .collect(&read, StorageScanOptions::default())
         .await
-        .expect("scan file projection")
+        .expect("scan file-schema markers")
         .value
         .entries;
-        assert_eq!(projections.len(), 2);
+        assert_eq!(projections.len(), 1);
         assert!(
             projections.into_iter().all(|projection| {
                 full_value_bytes(projection.value).is_ok_and(|bytes| bytes.is_empty())
             }),
-            "file-first projections retain only identity keys"
+            "schema membership markers remain key-only"
         );
     }
 
@@ -4770,7 +4775,7 @@ mod tests {
             .expect("open current-state GC verification read");
         for (label, space) in [
             ("primary hot row", HOT_ROW_SPACE),
-            ("file-first hot index", HOT_FILE_SPACE),
+            ("file-schema hot markers", HOT_FILE_SPACE),
         ] {
             let entries = ScanPlan::prefix(
                 space,
@@ -4788,7 +4793,7 @@ mod tests {
                 full_value_bytes(entries.into_iter().next().expect("one hot value").value)
                     .expect("hot value is present");
             if space == HOT_FILE_SPACE {
-                assert!(encoded.is_empty(), "file-first index remains key-only");
+                assert!(encoded.is_empty(), "file-schema markers remain key-only");
                 continue;
             }
             let value = decode_head_value(&encoded).expect("active hot value decodes");

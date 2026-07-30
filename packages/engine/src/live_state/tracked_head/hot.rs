@@ -1,4 +1,4 @@
-//! V17 row-addressable current state with file-first physical keys.
+//! V18 row-addressable current state with schema-level file membership.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
@@ -28,11 +28,15 @@ use crate::wasm::WasmCertifiedEntityBatch;
 use super::*;
 
 pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v17";
-pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file.v17";
+pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_ROW_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001b), HOT_ROW_NAMESPACE);
-/// File-id-first key-only index. The primary hot row owns every value.
+/// Conservative `(branch, generation, schema)` file-membership markers.
+///
+/// The authoritative hot row owns every value and file identity. Markers are
+/// never removed within a generation, so they may produce a harmless false
+/// positive after the last file member is deleted but cannot hide live rows.
 pub(crate) const HOT_FILE_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_001c), HOT_FILE_NAMESPACE);
 /// Reserved for the row-level first-before working-diff index.
@@ -91,6 +95,7 @@ pub(crate) struct DeferredFreshHotPlan {
     generation: CommitId,
     checkpoint_commit_id: Option<CommitId>,
     row_indices: Vec<usize>,
+    file_schema_keys: Vec<String>,
     put_count: u64,
     written_bytes: u64,
     backend_capacity_hint_bytes: usize,
@@ -121,6 +126,7 @@ impl DeferredFreshHotPlan {
         let mut backend_capacity_hint_bytes = 0_usize;
         let mut put_count = 0_u64;
         let mut coverage_key = Vec::new();
+        let mut file_schema_keys = BTreeSet::new();
         for &row_index in row_indices {
             let row = state_rows.row(row_index);
             let delta =
@@ -143,25 +149,21 @@ impl DeferredFreshHotPlan {
                     .ok_or_else(|| {
                         head_value_error("deferred fresh hot value length overflowed")
                     })?;
-            let entry_count = 1_u64 + u64::from(delta.file_id.is_some());
+            if delta.file_id.is_some() {
+                file_schema_keys.insert(delta.schema_key.to_owned());
+            }
             written_bytes = written_bytes
                 .checked_add(u64::try_from(value_len).unwrap_or(u64::MAX))
                 .ok_or_else(|| head_value_error("deferred fresh hot written bytes overflowed"))?;
             backend_capacity_hint_bytes = backend_capacity_hint_bytes
                 .checked_add(key_len)
-                .and_then(|capacity| match delta.file_id {
-                    Some(_) => capacity.checked_add(key_len),
-                    None => Some(capacity),
-                })
                 .and_then(|capacity| capacity.checked_add(value_len))
-                .and_then(|capacity| {
-                    capacity.checked_add(16_usize.checked_mul(entry_count as usize)?)
-                })
+                .and_then(|capacity| capacity.checked_add(16))
                 .ok_or_else(|| {
                     head_value_error("deferred fresh hot backend capacity overflowed")
                 })?;
             put_count = put_count
-                .checked_add(entry_count)
+                .checked_add(1)
                 .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
             if let Some(diff_scope) = diff_scope.as_deref() {
                 coverage_key.clear();
@@ -188,12 +190,32 @@ impl DeferredFreshHotPlan {
                     .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
             }
         }
+        for schema_key in &file_schema_keys {
+            let marker_len = scope
+                .len()
+                .checked_add(encoded_key_bytes_len(schema_key.as_bytes()).ok_or_else(|| {
+                    head_value_error("deferred fresh hot schema marker length overflowed")
+                })?)
+                .ok_or_else(|| {
+                    head_value_error("deferred fresh hot schema marker length overflowed")
+                })?;
+            backend_capacity_hint_bytes = backend_capacity_hint_bytes
+                .checked_add(marker_len)
+                .and_then(|capacity| capacity.checked_add(16))
+                .ok_or_else(|| {
+                    head_value_error("deferred fresh hot backend capacity overflowed")
+                })?;
+            put_count = put_count
+                .checked_add(1)
+                .ok_or_else(|| head_value_error("deferred fresh hot put count overflowed"))?;
+        }
         *coverage = next_coverage;
         Ok(Self {
             branch_id: branch_id.to_owned(),
             generation,
             checkpoint_commit_id,
             row_indices: row_indices.to_vec(),
+            file_schema_keys: file_schema_keys.into_iter().collect(),
             put_count,
             written_bytes,
             backend_capacity_hint_bytes,
@@ -208,6 +230,7 @@ impl DeferredFreshHotPlan {
             plan: self,
             state_rows,
             cursor: 0,
+            schema_markers_emitted: false,
             pending_pages: VecDeque::new(),
         })
     }
@@ -217,6 +240,7 @@ struct DeferredFreshHotSource {
     plan: DeferredFreshHotPlan,
     state_rows: Arc<dyn DeferredFreshHotRows>,
     cursor: usize,
+    schema_markers_emitted: bool,
     pending_pages: VecDeque<DeferredFinalPutPage>,
 }
 
@@ -240,6 +264,30 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
     fn next_page(&mut self) -> Option<DeferredFinalPutPage> {
         if let Some(page) = self.pending_pages.pop_front() {
             return Some(page);
+        }
+        if !self.schema_markers_emitted {
+            self.schema_markers_emitted = true;
+            if !self.plan.file_schema_keys.is_empty() {
+                let scope = hot_scope_prefix(&self.plan.branch_id, self.plan.generation);
+                return Some(DeferredFinalPutPage {
+                    space: HOT_FILE_SPACE,
+                    entries: PutBatch {
+                        entries: self
+                            .plan
+                            .file_schema_keys
+                            .iter()
+                            .map(|schema_key| PutEntry {
+                                key: StorageKey(Bytes::from(encode_hot_file_schema_key(
+                                    &scope, schema_key,
+                                ))),
+                                value: StorageValue {
+                                    bytes: Bytes::new(),
+                                },
+                            })
+                            .collect(),
+                    },
+                });
+            }
         }
         if self.cursor == self.plan.row_indices.len() {
             return None;
@@ -269,8 +317,7 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                     delta.entity_pk,
                     delta.file_id,
                 )
-                .unwrap_or(0)
-                .saturating_mul(1 + usize::from(delta.file_id.is_some())),
+                .unwrap_or(0),
             );
             if let Some(diff_scope) = diff_scope.as_deref() {
                 key_capacity = key_capacity.saturating_add(
@@ -326,7 +373,6 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
         let key_bytes = Bytes::from(key_bytes);
         let value_bytes = Bytes::from(value_bytes);
         let mut row_entries = Vec::with_capacity(indices.len());
-        let mut file_entries = Vec::with_capacity(indices.len());
         for (identity, value) in key_ranges.into_iter().zip(value_ranges) {
             let value = StorageValue {
                 bytes: value_bytes.slice(value.clone()),
@@ -336,24 +382,6 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                     identity.row_key.offset()..identity.row_key.offset() + identity.row_key.len(),
                 )),
                 value: value.clone(),
-            });
-            if let Some(file_key) = identity.file_key {
-                file_entries.push(PutEntry {
-                    key: StorageKey(
-                        key_bytes.slice(file_key.offset()..file_key.offset() + file_key.len()),
-                    ),
-                    value: StorageValue {
-                        bytes: Bytes::new(),
-                    },
-                });
-            }
-        }
-        if !file_entries.is_empty() {
-            self.pending_pages.push_back(DeferredFinalPutPage {
-                space: HOT_FILE_SPACE,
-                entries: PutBatch {
-                    entries: file_entries,
-                },
             });
         }
         if !diff_key_ranges.is_empty() {
@@ -2756,7 +2784,7 @@ async fn stage_incremental_file_delete_cascades(
                 &identity.entity_pk,
                 identity.file_id.as_deref(),
             )?;
-            total.checked_add(key_len.checked_mul(2)?)
+            total.checked_add(key_len)
         })
         .unwrap_or(0);
     let mut mutations = HotCascadeMutationBuffers::with_capacity(
@@ -2792,12 +2820,12 @@ async fn stage_incremental_file_delete_cascades(
                 identity
                     .file_id
                     .as_deref()
-                    .expect("file projection identity requires file id"),
+                    .expect("file-backed identity requires file id"),
             )
             .expect("file scan only returns requested cascade ids");
         let Some(previous) = previous else {
             return Err(head_value_error(
-                "hot file projection has no authoritative primary row",
+                "hot file-backed identity has no authoritative primary row",
             ));
         };
         let existing = decode_head_value(&previous)?;
@@ -2814,20 +2842,9 @@ async fn stage_incremental_file_delete_cascades(
         write_file_id(&mut mutations.key_bytes, identity.file_id.as_deref());
         write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
         let row_key = BufferRange::new(row_start, mutations.key_bytes.len() - row_start);
-        let file_start = mutations.key_bytes.len();
-        mutations.key_bytes.extend_from_slice(&scope);
-        write_key_string(
-            &mut mutations.key_bytes,
-            &identity.schema_key,
-            KEY_PART_FINAL,
-        );
-        write_file_id(&mut mutations.key_bytes, identity.file_id.as_deref());
-        write_entity_pk(&mut mutations.key_bytes, &identity.entity_pk);
-        let file_key = BufferRange::new(file_start, mutations.key_bytes.len() - file_start);
         if existing.untracked {
             collect_hot_untracked_refs(existing, retired_untracked_json_refs);
             mutations.row_deletes.push(row_key);
-            mutations.file_deletes.push(file_key);
             continue;
         }
         let (baseline, newly_dirty) = if reset_working_diff_baselines {
@@ -2872,10 +2889,6 @@ async fn stage_incremental_file_delete_cascades(
             key: row_key,
             value,
         });
-        mutations.file_puts.push(EncodedPut {
-            key: file_key,
-            value,
-        });
     }
     stage_hot_diff_batch(
         writes,
@@ -2890,8 +2903,7 @@ async fn stage_incremental_file_delete_cascades(
             Bytes::from(mutations.value_bytes),
             mutations.row_puts,
             mutations.row_deletes,
-            mutations.file_puts,
-            mutations.file_deletes,
+            Vec::new(),
         );
     }
     Ok(())
@@ -2902,8 +2914,6 @@ struct HotCascadeMutationBuffers {
     value_bytes: Vec<u8>,
     row_puts: Vec<EncodedPut>,
     row_deletes: Vec<BufferRange>,
-    file_puts: Vec<EncodedPut>,
-    file_deletes: Vec<BufferRange>,
 }
 
 impl HotCascadeMutationBuffers {
@@ -2922,8 +2932,6 @@ impl HotCascadeMutationBuffers {
             value_bytes: Vec::with_capacity(value_capacity),
             row_puts: Vec::with_capacity(row_capacity),
             row_deletes: Vec::with_capacity(row_capacity),
-            file_puts: Vec::with_capacity(row_capacity),
-            file_deletes: Vec::with_capacity(row_capacity),
         }
     }
 }
@@ -3262,7 +3270,7 @@ struct EncodedHotMutationIdentities {
 #[derive(Clone, Copy)]
 struct EncodedHotMutationIdentityRanges {
     row_key: BufferRange,
-    file_key: Option<BufferRange>,
+    file_schema_key: Option<BufferRange>,
 }
 
 fn encode_hot_mutation_identities(
@@ -3294,7 +3302,12 @@ fn encoded_hot_mutation_identity_capacity(
             delta.entity_pk,
             delta.file_id,
         )?;
-        total.checked_add(key_len.checked_mul(if delta.file_id.is_some() { 2 } else { 1 })?)
+        let marker_len = if delta.file_id.is_some() {
+            scope_len.checked_add(encoded_key_bytes_len(delta.schema_key.as_bytes())?)?
+        } else {
+            0
+        };
+        total.checked_add(key_len)?.checked_add(marker_len)
     })
 }
 
@@ -3310,15 +3323,16 @@ fn append_hot_mutation_identity(
     write_entity_pk(encoded, delta.entity_pk);
     let row_key = BufferRange::new(row_start, encoded.len() - row_start);
 
-    let file_key = delta.file_id.map(|file_id| {
-        let file_start = encoded.len();
+    let file_schema_key = delta.file_id.map(|_| {
+        let marker_start = encoded.len();
         encoded.extend_from_slice(scope);
         write_key_string(encoded, delta.schema_key, KEY_PART_FINAL);
-        write_file_id(encoded, Some(file_id));
-        write_entity_pk(encoded, delta.entity_pk);
-        BufferRange::new(file_start, encoded.len() - file_start)
+        BufferRange::new(marker_start, encoded.len() - marker_start)
     });
-    EncodedHotMutationIdentityRanges { row_key, file_key }
+    EncodedHotMutationIdentityRanges {
+        row_key,
+        file_schema_key,
+    }
 }
 
 async fn hot_load_primary_mutation_identity_refs(
@@ -3460,12 +3474,11 @@ fn stage_hot_mutation_batch(
     let file_count = identities
         .key_ranges
         .iter()
-        .filter(|identity| identity.file_key.is_some())
+        .filter(|identity| identity.file_schema_key.is_some())
         .count();
     let mut row_puts = Vec::with_capacity(put_count);
     let mut row_deletes = Vec::with_capacity(delete_count);
-    let mut file_puts = Vec::with_capacity(file_count.min(put_count));
-    let mut file_deletes = Vec::with_capacity(file_count.min(delete_count));
+    let mut file_schema_puts = Vec::with_capacity(file_count);
     for (identity, value) in identities.key_ranges.iter().zip(&value_ranges) {
         if let Some(value) = value {
             let value = buffer_range(value);
@@ -3473,16 +3486,23 @@ fn stage_hot_mutation_batch(
                 key: identity.row_key,
                 value,
             });
-            if let Some(key) = identity.file_key {
-                file_puts.push(EncodedPut { key, value });
-            }
         } else {
             row_deletes.push(identity.row_key);
-            if let Some(key) = identity.file_key {
-                file_deletes.push(key);
-            }
+        }
+        if let Some(key) = identity.file_schema_key {
+            file_schema_puts.push(key);
         }
     }
+    file_schema_puts.sort_unstable_by(|left, right| {
+        let left = &identities.key_bytes[left.offset()..left.offset().saturating_add(left.len())];
+        let right =
+            &identities.key_bytes[right.offset()..right.offset().saturating_add(right.len())];
+        left.cmp(right)
+    });
+    file_schema_puts.dedup_by(|left, right| {
+        identities.key_bytes[left.offset()..left.offset().saturating_add(left.len())]
+            == identities.key_bytes[right.offset()..right.offset().saturating_add(right.len())]
+    });
 
     stage_hot_encoded_mutation_ranges(
         writes,
@@ -3490,8 +3510,7 @@ fn stage_hot_mutation_batch(
         value_bytes,
         row_puts,
         row_deletes,
-        file_puts,
-        file_deletes,
+        file_schema_puts,
     );
 }
 
@@ -3501,8 +3520,7 @@ fn stage_hot_encoded_mutation_ranges(
     value_bytes: Bytes,
     row_puts: Vec<EncodedPut>,
     row_deletes: Vec<BufferRange>,
-    mut file_puts: Vec<EncodedPut>,
-    file_deletes: Vec<BufferRange>,
+    mut file_schema_puts: Vec<BufferRange>,
 ) {
     let row_batch = EncodedMutationBatch::try_new(
         key_bytes.clone(),
@@ -3512,13 +3530,23 @@ fn stage_hot_encoded_mutation_ranges(
     )
     .expect("hot row ranges originate in the supplied encoded buffers");
     writes.stage_encoded_batch(HOT_ROW_SPACE, row_batch);
-    if !file_puts.is_empty() || !file_deletes.is_empty() {
-        for put in &mut file_puts {
-            put.value = BufferRange::new(0, 0);
-        }
+    file_schema_puts.retain(|key| {
+        !writes.contains_put(
+            HOT_FILE_SPACE,
+            &key_bytes[key.offset()..key.offset().saturating_add(key.len())],
+        )
+    });
+    if !file_schema_puts.is_empty() {
+        let file_puts = file_schema_puts
+            .into_iter()
+            .map(|key| EncodedPut {
+                key,
+                value: BufferRange::new(0, 0),
+            })
+            .collect();
         let file_batch =
-            EncodedMutationBatch::try_new(key_bytes, Bytes::new(), file_puts, file_deletes)
-                .expect("hot file ranges originate in the supplied encoded buffers");
+            EncodedMutationBatch::try_new(key_bytes, Bytes::new(), file_puts, Vec::new())
+                .expect("hot file schema ranges originate in the supplied encoded buffers");
         writes.stage_encoded_batch(HOT_FILE_SPACE, file_batch);
     }
 }
@@ -3646,12 +3674,22 @@ fn stage_complete_hot_rows(
         return;
     }
     let scope = hot_scope_prefix(branch_id, generation);
-    let file_count = rows
+    let file_schema_keys = rows
         .keys()
         .filter(|identity| identity.file_id.is_some())
-        .count();
+        .map(|identity| identity.schema_key.clone())
+        .collect::<BTreeSet<_>>();
     let value_capacity = rows.values().map(Bytes::len).sum();
-    let key_capacity = (rows.len() + file_count)
+    let marker_key_capacity = file_schema_keys
+        .iter()
+        .map(|schema_key| {
+            scope
+                .len()
+                .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0))
+        })
+        .sum::<usize>();
+    let key_capacity = rows
+        .len()
         .saturating_mul(scope.len() + 32)
         .saturating_add(
             rows.keys()
@@ -3668,11 +3706,12 @@ fn stage_complete_hot_rows(
                         )
                 })
                 .sum(),
-        );
+        )
+        .saturating_add(marker_key_capacity);
     let mut key_bytes = Vec::with_capacity(key_capacity);
     let mut value_bytes = Vec::with_capacity(value_capacity);
     let mut row_puts = Vec::with_capacity(rows.len());
-    let mut file_puts = Vec::with_capacity(file_count);
+    let mut file_puts = Vec::with_capacity(file_schema_keys.len());
     for (identity, value) in rows {
         let value_start = value_bytes.len();
         value_bytes.extend_from_slice(value.as_ref());
@@ -3687,18 +3726,15 @@ fn stage_complete_hot_rows(
             key: BufferRange::new(row_start, key_bytes.len() - row_start),
             value,
         });
-
-        if let Some(file_id) = identity.file_id.as_deref() {
-            let file_start = key_bytes.len();
-            key_bytes.extend_from_slice(&scope);
-            write_key_string(&mut key_bytes, &identity.schema_key, KEY_PART_FINAL);
-            write_file_id(&mut key_bytes, Some(file_id));
-            write_entity_pk(&mut key_bytes, &identity.entity_pk);
-            file_puts.push(EncodedPut {
-                key: BufferRange::new(file_start, key_bytes.len() - file_start),
-                value: BufferRange::new(0, 0),
-            });
-        }
+    }
+    for schema_key in file_schema_keys {
+        let file_start = key_bytes.len();
+        key_bytes.extend_from_slice(&scope);
+        write_key_string(&mut key_bytes, &schema_key, KEY_PART_FINAL);
+        file_puts.push(EncodedPut {
+            key: BufferRange::new(file_start, key_bytes.len() - file_start),
+            value: BufferRange::new(0, 0),
+        });
     }
     let key_bytes = Bytes::from(key_bytes);
     let value_bytes = Bytes::from(value_bytes);
@@ -3706,6 +3742,12 @@ fn stage_complete_hot_rows(
         EncodedMutationBatch::try_new(key_bytes.clone(), value_bytes.clone(), row_puts, Vec::new())
             .expect("complete hot row ranges originate in the supplied encoded buffers");
     writes.stage_encoded_batch(HOT_ROW_SPACE, row_batch);
+    file_puts.retain(|put| {
+        !writes.contains_put(
+            HOT_FILE_SPACE,
+            &key_bytes[put.key.offset()..put.key.offset().saturating_add(put.key.len())],
+        )
+    });
     if !file_puts.is_empty() {
         let file_batch =
             EncodedMutationBatch::try_new(key_bytes, Bytes::new(), file_puts, Vec::new())
@@ -4456,7 +4498,7 @@ async fn hot_load_file_scope_identities(
 ) -> Result<Vec<HeadIdentity>, LixError> {
     let scope = hot_scope_prefix(branch_id, generation);
     let plan = ScanPlan::prefix(
-        HOT_FILE_SPACE,
+        HOT_ROW_SPACE,
         StoragePrefix {
             bytes: Bytes::from(scope.clone()),
         },
@@ -4476,7 +4518,7 @@ async fn hot_load_file_scope_identities(
             .await?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
-            let row = decode_hot_file_key_in_scope(entry.key.0.as_ref(), &scope)?;
+            let row = decode_hot_row_key_in_scope(entry.key.0.as_ref(), &scope)?;
             if !row
                 .file_id
                 .as_ref()
@@ -5064,24 +5106,17 @@ async fn hot_schema_has_file_member(
     generation: CommitId,
     schema_key: &str,
 ) -> Result<bool, LixError> {
-    let mut prefix = hot_scope_prefix(branch_id, generation);
-    write_key_string(&mut prefix, schema_key, KEY_PART_FINAL);
-    let page = ScanPlan::prefix(
-        HOT_FILE_SPACE,
-        StoragePrefix {
-            bytes: Bytes::from(prefix),
-        },
-    )
-    .collect(
-        store,
-        StorageScanOptions {
-            projection: StorageCoreProjection::KeyOnly,
-            limit_rows: 1,
-            ..StorageScanOptions::default()
-        },
-    )
-    .await?;
-    Ok(!page.value.entries.is_empty())
+    let scope = hot_scope_prefix(branch_id, generation);
+    let key = StorageKey(Bytes::from(encode_hot_file_schema_key(&scope, schema_key)));
+    let values = PointReadPlan::new(HOT_FILE_SPACE, &[key])
+        .materialize(
+            store,
+            StorageGetOptions {
+                projection: StorageCoreProjection::KeyOnly,
+            },
+        )
+        .await?;
+    Ok(values.value.into_iter().next().flatten().is_some())
 }
 
 fn hot_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
@@ -5225,39 +5260,6 @@ fn decode_hot_scan_row_key_in_scope(key: Bytes, scope: &[u8]) -> Result<HotScanI
         schema_key,
         entity_pk,
         file_id,
-    })
-}
-
-#[cfg(test)]
-fn decode_hot_scan_file_key_in_scope(
-    key: Bytes,
-    scope: &[u8],
-) -> Result<HotScanIdentity, LixError> {
-    if !key.starts_with(scope) {
-        return Err(key_codec_error(
-            "hot file row does not begin with its scanned scope",
-        ));
-    }
-    let mut offset = scope.len();
-    let (schema_key, schema_terminator) =
-        read_hot_scan_key_string(&key, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot file row schema key has an invalid terminator",
-        ));
-    }
-    let Some(file_id) = read_hot_scan_file_id(&key, &mut offset)? else {
-        return Err(key_codec_error("hot file row is missing its file id"));
-    };
-    let entity_pk = read_hot_scan_entity_pk(&key, &mut offset)?;
-    if offset != key.len() {
-        return Err(key_codec_error("hot file row key has trailing bytes"));
-    }
-    Ok(HotScanIdentity {
-        key,
-        schema_key,
-        entity_pk,
-        file_id: Some(file_id),
     })
 }
 
@@ -5467,7 +5469,6 @@ fn read_hot_scan_shared_bytes(
         .map(|(value, terminator)| (Bytes::from(value), terminator))
 }
 
-#[cfg(test)]
 fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
     if !bytes.starts_with(scope) {
         return Err(key_codec_error(
@@ -5493,7 +5494,7 @@ fn decode_hot_row_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIden
     })
 }
 
-fn decode_hot_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
+fn decode_hot_row_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
     if branch_terminator != KEY_PART_FINAL {
@@ -5513,71 +5514,41 @@ fn decode_hot_row_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
     if offset != bytes.len() {
         return Err(key_codec_error("hot row key has trailing bytes"));
     }
-    Ok(HeadIdentity {
-        branch_id,
-        generation,
-        schema_key,
-        entity_pk,
-        file_id,
-    })
+    let _ = (schema_key, entity_pk, file_id);
+    Ok((branch_id, generation))
 }
 
-fn decode_hot_file_key_in_scope(bytes: &[u8], scope: &[u8]) -> Result<HeadRowIdentity, LixError> {
-    if !bytes.starts_with(scope) {
-        return Err(key_codec_error(
-            "hot file row does not begin with its scanned scope",
-        ));
-    }
-    let mut offset = scope.len();
-    let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
-    if schema_terminator != KEY_PART_FINAL {
-        return Err(key_codec_error(
-            "hot file row schema key has an invalid terminator",
-        ));
-    }
-    let Some(file_id) = read_file_id(bytes, &mut offset)? else {
-        return Err(key_codec_error("hot file row is missing its file id"));
-    };
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
-    if offset != bytes.len() {
-        return Err(key_codec_error("hot file row key has trailing bytes"));
-    }
-    Ok(HeadRowIdentity {
-        schema_key,
-        entity_pk,
-        file_id: Some(file_id),
-    })
+fn encode_hot_file_schema_key(scope: &[u8], schema_key: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(
+        scope
+            .len()
+            .saturating_add(encoded_key_bytes_len(schema_key.as_bytes()).unwrap_or(0)),
+    );
+    key.extend_from_slice(scope);
+    write_key_string(&mut key, schema_key, KEY_PART_FINAL);
+    key
 }
 
-fn decode_hot_file_key(bytes: &[u8]) -> Result<HeadIdentity, LixError> {
+fn decode_hot_file_scope(bytes: &[u8]) -> Result<(String, CommitId), LixError> {
     let mut offset = 0;
     let (branch_id, branch_terminator) = read_key_string(bytes, &mut offset, "branch id")?;
     if branch_terminator != KEY_PART_FINAL {
         return Err(key_codec_error(
-            "hot file row branch id has an invalid terminator",
+            "hot file schema branch id has an invalid terminator",
         ));
     }
     let generation = read_generation(bytes, &mut offset)?;
     let (schema_key, schema_terminator) = read_key_string(bytes, &mut offset, "schema key")?;
     if schema_terminator != KEY_PART_FINAL {
         return Err(key_codec_error(
-            "hot file row schema key has an invalid terminator",
+            "hot file schema key has an invalid terminator",
         ));
     }
-    let Some(file_id) = read_file_id(bytes, &mut offset)? else {
-        return Err(key_codec_error("hot file row is missing its file id"));
-    };
-    let entity_pk = read_entity_pk(bytes, &mut offset)?;
     if offset != bytes.len() {
-        return Err(key_codec_error("hot file row key has trailing bytes"));
+        return Err(key_codec_error("hot file schema key has trailing bytes"));
     }
-    Ok(HeadIdentity {
-        branch_id,
-        generation,
-        schema_key,
-        entity_pk,
-        file_id: Some(file_id),
-    })
+    let _ = schema_key;
+    Ok((branch_id, generation))
 }
 
 struct HotDiffSegmentScope {
@@ -5753,18 +5724,18 @@ where
         store,
         writes,
         HOT_ROW_SPACE,
-        decode_hot_row_key,
+        decode_hot_row_scope,
         &active,
         &mut stale_untracked_refs,
     )
     .await?;
-    // Sweep the key-only file index independently so orphaned generations do
-    // not retain file-scoped lookup entries.
+    // Sweep schema membership markers independently so orphaned generations
+    // cannot retain conservative file-membership hints.
     stage_collect_stale_hot_space(
         store,
         writes,
         HOT_FILE_SPACE,
-        decode_hot_file_key,
+        decode_hot_file_scope,
         &active,
         &mut stale_untracked_refs,
     )
@@ -5779,7 +5750,7 @@ async fn stage_collect_stale_hot_space(
     store: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     space: StorageSpace,
-    decode_key: fn(&[u8]) -> Result<HeadIdentity, LixError>,
+    decode_key: fn(&[u8]) -> Result<(String, CommitId), LixError>,
     active: &BTreeSet<(String, CommitId)>,
     stale_untracked_refs: &mut BTreeSet<[u8; JSON_REF_BYTES]>,
 ) -> Result<(), LixError> {
@@ -5802,8 +5773,8 @@ async fn stage_collect_stale_hot_space(
             .await?;
         resume_after = page.value.entries.last().map(|entry| entry.key.clone());
         for entry in page.value.entries {
-            let active_generation = decode_key(entry.key.0.as_ref())
-                .is_ok_and(|identity| active.contains(&(identity.branch_id, identity.generation)));
+            let active_generation =
+                decode_key(entry.key.0.as_ref()).is_ok_and(|identity| active.contains(&identity));
             if active_generation {
                 continue;
             }
@@ -6381,12 +6352,12 @@ mod tests {
         assert_eq!(ranges[0].row_key.offset(), 0);
         assert_eq!(
             ranges[0]
-                .file_key
-                .expect("first identity has a file projection")
+                .file_schema_key
+                .expect("first identity has a file schema marker")
                 .offset()
                 + ranges[0]
-                    .file_key
-                    .expect("first identity has a file projection")
+                    .file_schema_key
+                    .expect("first identity has a file schema marker")
                     .len(),
             ranges[1].row_key.offset()
         );
@@ -6416,23 +6387,12 @@ mod tests {
                 "only escaped metadata should take an owned fallback"
             );
 
-            if let Some(file_key) = range.file_key {
-                let file_start = file_key.offset();
-                let file = decode_hot_file_key_in_scope(
-                    &key_bytes[file_start..file_start + file_key.len()],
-                    &scope,
-                )
-                .expect("decode shared file key");
-                assert_eq!(file, row);
-
-                let scan_file = decode_hot_scan_file_key_in_scope(
-                    Bytes::copy_from_slice(&key_bytes[file_start..file_start + file_key.len()]),
-                    &scope,
-                )
-                .expect("decode shared file key for direct scan");
-                assert_eq!(scan_file.schema_key(), delta.schema_key);
-                assert_eq!(scan_file.entity_pk, *delta.entity_pk);
-                assert_eq!(scan_file.file_id(), delta.file_id);
+            if let Some(marker) = range.file_schema_key {
+                let marker_start = marker.offset();
+                assert_eq!(
+                    &key_bytes[marker_start..marker_start + marker.len()],
+                    encode_hot_file_schema_key(&scope, delta.schema_key)
+                );
             }
         }
 
@@ -6441,7 +6401,7 @@ mod tests {
         assert_eq!(encoded.key_ranges.len(), ranges.len());
         for (encoded, expected) in encoded.key_ranges.iter().zip(ranges) {
             assert_eq!(encoded.row_key, expected.row_key);
-            assert_eq!(encoded.file_key, expected.file_key);
+            assert_eq!(encoded.file_schema_key, expected.file_schema_key);
         }
     }
 
@@ -6638,13 +6598,13 @@ mod tests {
 
     #[test]
     fn hot_batch_staging_retains_encoded_key_and_value_arenas() {
-        let key_bytes = Bytes::from_static(b"row-keyfile-key");
+        let key_bytes = Bytes::from_static(b"row-keymarker");
         let value_bytes = Bytes::from_static(b"value");
         let identities = EncodedHotMutationIdentities {
             key_bytes: key_bytes.clone(),
             key_ranges: vec![EncodedHotMutationIdentityRanges {
                 row_key: BufferRange::new(0, 7),
-                file_key: Some(BufferRange::new(7, 8)),
+                file_schema_key: Some(BufferRange::new(7, 6)),
             }],
         };
         let mut writes = StorageWriteSet::new();
@@ -6689,8 +6649,6 @@ mod tests {
         let value_allocation = buffers.value_bytes.as_ptr();
         let row_put_allocation = buffers.row_puts.as_ptr();
         let row_delete_allocation = buffers.row_deletes.as_ptr();
-        let file_put_allocation = buffers.file_puts.as_ptr();
-        let file_delete_allocation = buffers.file_deletes.as_ptr();
         let descriptor = EncodedPut {
             key: BufferRange::default(),
             value: BufferRange::default(),
@@ -6700,8 +6658,6 @@ mod tests {
                 .expect("append planned cascade tombstone");
             buffers.row_puts.push(descriptor);
             buffers.row_deletes.push(BufferRange::default());
-            buffers.file_puts.push(descriptor);
-            buffers.file_deletes.push(BufferRange::default());
         }
 
         assert_eq!(
@@ -6711,12 +6667,8 @@ mod tests {
         assert_eq!(buffers.value_bytes.as_ptr(), value_allocation);
         assert_eq!(buffers.row_puts.as_ptr(), row_put_allocation);
         assert_eq!(buffers.row_deletes.as_ptr(), row_delete_allocation);
-        assert_eq!(buffers.file_puts.as_ptr(), file_put_allocation);
-        assert_eq!(buffers.file_deletes.as_ptr(), file_delete_allocation);
         assert!(buffers.row_puts.capacity() >= ROW_COUNT);
         assert!(buffers.row_deletes.capacity() >= ROW_COUNT);
-        assert!(buffers.file_puts.capacity() >= ROW_COUNT);
-        assert!(buffers.file_deletes.capacity() >= ROW_COUNT);
     }
 
     #[tokio::test]
