@@ -558,10 +558,10 @@ pub(crate) async fn stage_certified_entity_batches(
                     .to_le_bytes(),
             );
             for (page_index, page) in batch.pages.iter().enumerate() {
-                let (first_local_ref, last_local_ref) = if batch.format == 1 {
-                    certified_csv_page_local_ref_range(page)?
-                } else {
-                    (0, u32::MAX)
+                let (first_local_ref, last_local_ref) = match batch.format {
+                    1 => certified_csv_page_local_ref_range(page)?,
+                    2 => certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX)),
+                    _ => (0, u32::MAX),
                 };
                 value.extend_from_slice(&first_local_ref.to_le_bytes());
                 value.extend_from_slice(&last_local_ref.to_le_bytes());
@@ -654,6 +654,39 @@ fn certified_csv_page_local_ref_range(page: &[u8]) -> Result<(u32, u32), LixErro
         .ok_or_else(|| head_value_error("certified CSV page is empty"))
 }
 
+/// Returns an ordinal range only when every packet row is a keyless create
+/// and those local references are strictly increasing. A keyed or mixed page
+/// remains conservatively unindexed.
+fn certified_packet_page_local_ref_range(page: &[u8]) -> Result<Option<(u32, u32)>, LixError> {
+    let mut rows = CertifiedCsvReader {
+        bytes: page,
+        offset: 0,
+    };
+    let mut first = None;
+    let mut last = None;
+    while rows.offset < rows.bytes.len() {
+        let record_len = rows.u32()? as usize;
+        let record_bytes = rows.bytes(record_len)?;
+        let mut record = CertifiedCsvReader {
+            bytes: record_bytes,
+            offset: 0,
+        };
+        if record.u8()? != 2 {
+            return Ok(None);
+        }
+        let schema_len = record.u32()? as usize;
+        let _schema = record.bytes(schema_len)?;
+        let local_ref = u32::try_from(record.u64()?)
+            .map_err(|_| head_value_error("certified packet local reference exceeds u32"))?;
+        if last.is_some_and(|previous| previous >= local_ref) {
+            return Ok(None);
+        }
+        first.get_or_insert(local_ref);
+        last = Some(local_ref);
+    }
+    Ok(first.zip(last))
+}
+
 fn certified_external_page_plan(
     bytes: &[u8],
     content_key: &[u8],
@@ -676,27 +709,31 @@ fn certified_external_page_plan(
         high: input.u64()?,
         low: input.u32()?,
     };
-    let selected_local_refs = (format == 1 && !request.filter.entity_pks.is_empty()).then(|| {
+    let selected_local_refs = ((format == 1 || format == 2)
+        && !request.filter.entity_pks.is_empty())
+    .then(|| {
         let high = creates.high.to_be_bytes();
         let low = creates.low.to_be_bytes();
         request
             .filter
             .entity_pks
             .iter()
-            .filter_map(|entity_pk| match entity_pk.components.as_slice() {
+            .map(|entity_pk| match entity_pk.components.as_slice() {
                 [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
                     if bytes[..8] == high && bytes[8..12] == low =>
                 {
-                    Some(u32::from_be_bytes(
+                    Ok(u32::from_be_bytes(
                         bytes[12..]
                             .try_into()
                             .expect("UUID local-reference suffix is four bytes"),
                     ))
                 }
-                _ => None,
+                _ => Err(()),
             })
-            .collect::<BTreeSet<_>>()
-    });
+            .collect::<Result<BTreeSet<_>, _>>()
+            .ok()
+    })
+    .flatten();
     let page_count = input.u32()?;
     let mut pages = Vec::with_capacity(page_count as usize);
     for page_index in 0..page_count {
@@ -1234,19 +1271,10 @@ fn decode_certified_packet_rows(
         }
         let snapshot = if needs_snapshot {
             if let Some(id) = &created_id {
-                let mut snapshot: serde_json::Value = serde_json::from_slice(snapshot_bytes)
-                    .map_err(|error| {
-                        head_value_error(format!("invalid certified JSON: {error}"))
-                    })?;
-                let object = snapshot.as_object_mut().ok_or_else(|| {
-                    head_value_error("certified create snapshot is not a JSON object")
-                })?;
-                object.insert(
-                    "id".to_owned(),
-                    serde_json::Value::String(uuid::Uuid::from_bytes(*id).to_string()),
-                );
-                let json = serde_json::to_vec(&snapshot)
-                    .map_err(|error| head_value_error(error.to_string()))?;
+                let json = insert_created_id_into_canonical_object(
+                    snapshot_bytes,
+                    &uuid::Uuid::from_bytes(*id).to_string(),
+                )?;
                 Some(
                     SharedStr::from_utf8(Bytes::from(json))
                         .map_err(|error| head_value_error(error.to_string()))?,
@@ -1290,6 +1318,136 @@ fn decode_certified_packet_rows(
         }
     }
     Ok(decoded)
+}
+
+/// Inserts the generated `id` into an already validated canonical JSON object
+/// without materializing its value tree. Keys emitted by serde_json are
+/// lexicographically ordered, so locating the top-level insertion boundary is
+/// sufficient to reproduce the exact canonical snapshot.
+fn insert_created_id_into_canonical_object(snapshot: &[u8], id: &str) -> Result<Vec<u8>, LixError> {
+    if snapshot.first() != Some(&b'{') || snapshot.last() != Some(&b'}') {
+        return Err(head_value_error(
+            "certified create snapshot is not a JSON object",
+        ));
+    }
+    let field = format!("\"id\":\"{id}\"");
+    if snapshot == b"{}" {
+        let mut output = Vec::with_capacity(field.len() + 2);
+        output.push(b'{');
+        output.extend_from_slice(field.as_bytes());
+        output.push(b'}');
+        return Ok(output);
+    }
+
+    let mut entry_start = 1;
+    loop {
+        if snapshot.get(entry_start) != Some(&b'"') {
+            return Err(head_value_error(
+                "certified canonical object has an invalid key",
+            ));
+        }
+        let key_end = json_string_end(snapshot, entry_start)?;
+        let encoded_key = &snapshot[entry_start..key_end];
+        let key = if encoded_key[1..encoded_key.len() - 1]
+            .iter()
+            .any(|byte| *byte == b'\\')
+        {
+            serde_json::from_slice::<String>(encoded_key)
+                .map_err(|error| head_value_error(format!("invalid canonical key: {error}")))?
+        } else {
+            std::str::from_utf8(&encoded_key[1..encoded_key.len() - 1])
+                .map_err(|error| head_value_error(format!("invalid canonical key: {error}")))?
+                .to_owned()
+        };
+        if key.as_str() >= "id" {
+            if key == "id" {
+                return Err(head_value_error(
+                    "certified keyless create snapshot already contains id",
+                ));
+            }
+            let mut output = Vec::with_capacity(snapshot.len() + field.len() + 1);
+            output.extend_from_slice(&snapshot[..entry_start]);
+            output.extend_from_slice(field.as_bytes());
+            output.push(b',');
+            output.extend_from_slice(&snapshot[entry_start..]);
+            return Ok(output);
+        }
+
+        let colon = snapshot
+            .get(key_end..)
+            .and_then(|tail| tail.iter().position(|byte| *byte == b':'))
+            .map(|offset| key_end + offset)
+            .ok_or_else(|| head_value_error("certified canonical object key has no value"))?;
+        match json_top_level_value_end(snapshot, colon + 1)? {
+            JsonObjectBoundary::Next(next) => entry_start = next,
+            JsonObjectBoundary::End(end) => {
+                let mut output = Vec::with_capacity(snapshot.len() + field.len() + 1);
+                output.extend_from_slice(&snapshot[..end]);
+                output.push(b',');
+                output.extend_from_slice(field.as_bytes());
+                output.extend_from_slice(&snapshot[end..]);
+                return Ok(output);
+            }
+        }
+    }
+}
+
+fn json_string_end(bytes: &[u8], start: usize) -> Result<usize, LixError> {
+    let mut escaped = false;
+    for (offset, byte) in bytes[start + 1..].iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if *byte == b'\\' {
+            escaped = true;
+        } else if *byte == b'"' {
+            return Ok(start + offset + 2);
+        }
+    }
+    Err(head_value_error("unterminated canonical JSON string"))
+}
+
+enum JsonObjectBoundary {
+    Next(usize),
+    End(usize),
+}
+
+fn json_top_level_value_end(bytes: &[u8], start: usize) -> Result<JsonObjectBoundary, LixError> {
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in bytes[start..].iter().enumerate() {
+        let index = start + offset;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if *byte == b'\\' {
+                escaped = true;
+            } else if *byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match *byte {
+            b'"' => in_string = true,
+            b'[' | b'{' => {
+                depth = depth
+                    .checked_add(1)
+                    .ok_or_else(|| head_value_error("canonical JSON nesting overflowed"))?;
+            }
+            b']' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or_else(|| head_value_error("invalid canonical JSON array"))?;
+            }
+            b'}' if depth > 0 => depth -= 1,
+            b',' if depth == 0 => return Ok(JsonObjectBoundary::Next(index + 1)),
+            b'}' if depth == 0 => return Ok(JsonObjectBoundary::End(index)),
+            _ => {}
+        }
+    }
+    Err(head_value_error(
+        "canonical JSON object has no closing boundary",
+    ))
 }
 
 struct CertifiedBatchReader<'a> {
@@ -5742,6 +5900,55 @@ mod tests {
 
     fn timestamp() -> LixTimestamp {
         LixTimestamp::expect_parse("hot working-diff test timestamp", "2026-01-01T00:00:00Z")
+    }
+
+    #[test]
+    fn created_id_is_inserted_without_materializing_canonical_json() {
+        let id = "018f47a2-cafe-7000-8000-000000000001";
+        assert_eq!(
+            insert_created_id_into_canonical_object(b"{}", id).unwrap(),
+            format!(r#"{{"id":"{id}"}}"#).as_bytes()
+        );
+        assert_eq!(
+            insert_created_id_into_canonical_object(
+                br#"{"format":{"nested":"},\\\""},"kind":"paragraph","parent_id":null}"#,
+                id,
+            )
+            .unwrap(),
+            format!(
+                r#"{{"format":{{"nested":"}},\\\""}},"id":"{id}","kind":"paragraph","parent_id":null}}"#
+            )
+            .as_bytes()
+        );
+        assert_eq!(
+            insert_created_id_into_canonical_object(br#"{"alpha":1}"#, id).unwrap(),
+            format!(r#"{{"alpha":1,"id":"{id}"}}"#).as_bytes()
+        );
+    }
+
+    #[test]
+    fn create_only_packet_pages_expose_their_local_ref_range() {
+        fn create_record(local_ref: u64) -> Vec<u8> {
+            let mut record = vec![2];
+            record.extend_from_slice(&6_u32.to_le_bytes());
+            record.extend_from_slice(b"schema");
+            record.extend_from_slice(&local_ref.to_le_bytes());
+            let mut framed = Vec::new();
+            framed.extend_from_slice(&(record.len() as u32).to_le_bytes());
+            framed.extend_from_slice(&record);
+            framed
+        }
+
+        let mut page = create_record(7);
+        page.extend_from_slice(&create_record(11));
+        assert_eq!(
+            certified_packet_page_local_ref_range(&page).unwrap(),
+            Some((7, 11))
+        );
+
+        let mut keyed = create_record(7);
+        keyed[4] = 0;
+        assert_eq!(certified_packet_page_local_ref_range(&keyed).unwrap(), None);
     }
 
     fn diff_identity(branch_id: &str, generation: CommitId, entity: &str) -> HeadIdentity {

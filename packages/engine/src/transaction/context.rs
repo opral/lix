@@ -1595,7 +1595,7 @@ where
         plugin: &PluginRegistryEntry,
         changes: WasmHostEntityChanges,
         file_key: &PluginFileWriteKey,
-    ) -> Result<WasmHostEntityChanges, LixError> {
+    ) -> Result<(WasmHostEntityChanges, BTreeSet<WasmEntityKey>), LixError> {
         let format_only_keys = changes
             .changes
             .iter()
@@ -1610,7 +1610,7 @@ where
             })
             .collect::<Vec<_>>();
         if format_only_keys.is_empty() {
-            return Ok(changes);
+            return Ok((changes, BTreeSet::new()));
         }
 
         let requests = format_only_keys
@@ -1632,7 +1632,16 @@ where
                 include_tombstones: false,
             })
             .await?;
-        suppress_v2_format_only_noops_against_batch(changes, &format_only_keys, &current)
+        let observed_existing = format_only_keys
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| current.row(*slot).is_some())
+            .map(|(_, key)| key.clone())
+            .collect();
+        Ok((
+            suppress_v2_format_only_noops_against_batch(changes, &format_only_keys, &current)?,
+            observed_existing,
+        ))
     }
 
     /// Materializes keyless creates and returns the one durable mutation
@@ -1645,8 +1654,14 @@ where
         bound: BoundCreateContext,
         file_key: &PluginFileWriteKey,
         existing_reservation: Option<&MaterializedLiveStateRow>,
+        known_existing_authorities: Option<&BTreeSet<WasmEntityKey>>,
     ) -> Result<RawWriteBatch, LixError> {
-        let validation = validate_create_changes(plugin, changes)?;
+        let mut validation = validate_create_changes(plugin, changes)?;
+        if let Some(known) = known_existing_authorities {
+            validation
+                .existing_authorities
+                .retain(|key| !known.contains(key));
+        }
         materialize_keyless_creates(changes, bound.creates())?;
         if !validation.requires_reservation && validation.existing_authorities.is_empty() {
             return Ok(RawWriteBatch::new());
@@ -3439,6 +3454,7 @@ where
                         pending.create_context,
                         &pending.file_key,
                         pending.existing_create_reservation.as_ref(),
+                        None,
                     )
                     .await?;
                 let mut counters = validated.counters;
@@ -3820,7 +3836,7 @@ where
                 write.set_certified_entity_batches(detected_transition.certified_batches.clone());
                 let detection_document = detected_transition.document;
                 let mut counters = detected_transition.counters;
-                let mut changes = match self
+                let (mut changes, observed_existing_authorities) = match self
                     .suppress_v2_format_only_noops(selected, detected_transition.changes, &file_key)
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
@@ -3845,6 +3861,7 @@ where
                         create_context,
                         &file_key,
                         existing_create_reservation.as_ref(),
+                        Some(&observed_existing_authorities),
                     )
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
@@ -4025,6 +4042,7 @@ where
                         create_context,
                         &file_key,
                         existing_create_reservation.as_ref(),
+                        None,
                     )
                     .instrument(tracing::debug_span!(
                         target: "lix_perf",
