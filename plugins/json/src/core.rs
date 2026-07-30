@@ -154,6 +154,23 @@ impl PersistentBlob {
         output
     }
 
+    fn bytes_equal(&self, other: &[u8]) -> bool {
+        if self.len() != other.len() {
+            return false;
+        }
+        let mut cursor = 0usize;
+        for piece in self.pieces.iter() {
+            let start = usize::try_from(piece.start).expect("u32 fits usize");
+            let len = usize::try_from(piece.len).expect("u32 fits usize");
+            let end = start + len;
+            if piece.bytes[start..end] != other[cursor..cursor + len] {
+                return false;
+            }
+            cursor += len;
+        }
+        cursor == other.len()
+    }
+
     fn range(&self, start: u32, end: u32) -> Result<Vec<u8>, String> {
         if start > end || end > self.len {
             return Err("JSON byte range is out of bounds".to_owned());
@@ -1162,6 +1179,14 @@ impl Document {
 
     pub fn bytes(&self) -> Vec<u8> {
         self.0.blob.materialize()
+    }
+
+    pub fn bytes_equal(&self, other: &[u8]) -> bool {
+        self.0.blob.bytes_equal(other)
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.0.blob.len()
     }
 
     pub fn retained_bytes_estimate(&self) -> usize {

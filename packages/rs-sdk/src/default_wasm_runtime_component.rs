@@ -18,7 +18,7 @@ use lix_engine::wasm::v3::{
 };
 use lix_engine::wasm::{
     PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmCertifiedEntityBatch, WasmChangeCursorHandle,
-    WasmChangeEffect, WasmChangePage, WasmComponentActor, WasmComponentFactory,
+    WasmChangeEffect, WasmChangePage, WasmColdFileUpdate, WasmComponentActor, WasmComponentFactory,
     WasmConflictResolution, WasmConflictResolutionPage, WasmConflictTake, WasmConflictTransition,
     WasmConflictUpdate, WasmCreateContext, WasmDocumentHandle, WasmEditCursorHandle, WasmEditPage,
     WasmEntity, WasmEntityChange, WasmEntityChanges, WasmEntityKey, WasmEntityTransition,
@@ -2255,6 +2255,12 @@ enum WorkerCommand {
         update: WasmFileUpdate,
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
     },
+    ColdFileChanged {
+        document: u64,
+        limits: WasmTransitionLimits,
+        update: WasmColdFileUpdate,
+        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
+    },
     HydrateFile {
         document: u64,
         limits: WasmTransitionLimits,
@@ -2348,6 +2354,15 @@ impl V3Worker {
                 } => {
                     let result =
                         self.file_changed(document, next_document, limits, update, events.clone());
+                    let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
+                }
+                WorkerCommand::ColdFileChanged {
+                    document,
+                    limits,
+                    update,
+                    events,
+                } => {
+                    let result = self.cold_file_changed(document, limits, update, events.clone());
                     let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
                 }
                 WorkerCommand::HydrateFile {
@@ -2629,6 +2644,203 @@ impl V3Worker {
             .map_err(|_| v3_error("v3 transition resources remained live after file-changed"))?
             .into_inner()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.counters.guest_linear_memory_high_water_bytes =
+            self.store.data().limits.linear_memory_high_water_bytes();
+        Ok(state.counters)
+    }
+
+    fn cold_file_changed(
+        &mut self,
+        document: u64,
+        limits: WasmTransitionLimits,
+        mut cold: WasmColdFileUpdate,
+        events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
+    ) -> Result<WasmTransitionCounters, LixError> {
+        let limits = v3_transition_limits(limits)?;
+        cold.update.validate(limits)?;
+        reset_store_limits(&mut self.store, self.limits)?;
+        let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
+        self.store.set_epoch_deadline(ticks.max(1));
+        let before_bytes = read_source_all(&cold.update.before)?;
+        let root = ArenaRoot::import(
+            ArenaStore::default(),
+            "v3-cold-successor",
+            &before_bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let total_bytes = SharedByteBudget::default();
+        let state = Arc::new(Mutex::new(TransitionState::new(
+            limits,
+            cold.update.creates,
+            Some(events),
+            std::mem::take(&mut self.first_transition),
+            false,
+            Some(total_bytes.clone()),
+        )?));
+        let before = self
+            .store
+            .data_mut()
+            .table
+            .push(SnapshotResource {
+                root: root.clone(),
+                state: state.clone(),
+            })
+            .map_err(|error| {
+                v3_error(format!(
+                    "failed to register v3 cold-successor snapshot: {error}"
+                ))
+            })?;
+        let mut entities = Vec::new();
+        while let Some(page) = cold.entities.next_page(limits.max_page_bytes)? {
+            for entity in page.entities {
+                entities.push(WasmEntityChange::Upsert {
+                    entity,
+                    effect: WasmChangeEffect::Content,
+                });
+            }
+        }
+        let entity_state = Arc::new(Mutex::new(EntityChangeState::new(
+            limits,
+            entities,
+            total_bytes,
+        )?));
+        let source = self
+            .store
+            .data_mut()
+            .table
+            .push(EntityChangeSourceResource {
+                state: entity_state.clone(),
+            })
+            .map_err(|error| {
+                v3_error(format!(
+                    "failed to register v3 cold-successor entity source: {error}"
+                ))
+            })?;
+        let mut transaction = root.transaction();
+        let mut binding_edits = Vec::with_capacity(cold.update.edits.len());
+        for edit in cold.update.edits {
+            let insert = match edit.insert {
+                WasmInputBytes::Inline(bytes) => bytes,
+                WasmInputBytes::AfterRange(range) => cold
+                    .update
+                    .after
+                    .read(
+                        range.offset,
+                        u32::try_from(range.length)
+                            .map_err(|_| v3_error("v3 after-range exceeds u32"))?,
+                    )
+                    .map_err(|error| {
+                        v3_error(format!("failed to read v3 after-range bytes: {error}"))
+                    })?,
+            };
+            transaction.edit_bytes(ArenaByteEdit {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert: insert.clone(),
+            });
+            binding_edits.push(bindings::exports::lix::plugin::api::InputSplice {
+                offset: edit.offset,
+                delete_len: edit.delete_len,
+                insert,
+            });
+        }
+        let transition = self
+            .store
+            .data_mut()
+            .table
+            .push(TransitionResource {
+                transaction,
+                state: state.clone(),
+            })
+            .map_err(|error| {
+                v3_error(format!(
+                    "failed to register v3 cold-successor transition: {error}"
+                ))
+            })?;
+        let transition_rep = transition.rep();
+        let binding_input = bindings::exports::lix::plugin::api::ColdSuccessorRequest {
+            before_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
+                path: cold.update.before_descriptor.path,
+                media_type: cold.update.before_descriptor.media_type,
+            },
+            after_descriptor: bindings::exports::lix::plugin::api::FileDescriptor {
+                path: cold.update.after_descriptor.path,
+                media_type: cold.update.after_descriptor.media_type,
+            },
+            before,
+            edits: binding_edits,
+            entities: source,
+            creates: bindings::exports::lix::plugin::api::CreateContext {
+                high: cold.update.creates.high,
+                low: cold.update.creates.low,
+            },
+        };
+        let result = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.v3_guest_cold_successor"
+        )
+        .in_scope(|| {
+            self.guest.call_cold_successor(
+                &mut self.store,
+                &binding_input,
+                Resource::new_borrow(transition_rep),
+            )
+        });
+        let transition = take_borrowed_resource(
+            &mut self.store.data_mut().table,
+            transition,
+            "failed to recover v3 cold-successor transaction",
+        )?;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                drop(transition);
+                return Err(v3_error(format!(
+                    "v3 cold-successor rejected input: {error:?}"
+                )));
+            }
+            Err(error) => {
+                drop(transition);
+                return Err(wasm_runtime_error("v3 cold-successor trapped", error));
+            }
+        }
+        let TransitionResource {
+            transaction,
+            state: transaction_state,
+        } = transition;
+        drop(transaction_state);
+        let root = transaction.commit().map_err(|error| {
+            v3_error(format!(
+                "failed to commit v3 cold-successor arena root: {error}"
+            ))
+        })?;
+        self.documents.insert(document, V3Document { root });
+        self.next_document = self.next_document.max(document.saturating_add(1));
+        let entity_state = Arc::try_unwrap(entity_state)
+            .map_err(|_| v3_error("v3 cold-successor entity source remained live"))?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = Arc::try_unwrap(state)
+            .map_err(|_| v3_error("v3 cold-successor resources remained live"))?
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.counters.component_import_calls = state
+            .counters
+            .component_import_calls
+            .saturating_add(entity_state.counters.component_import_calls);
+        state.counters.component_boundary_bytes = state
+            .counters
+            .component_boundary_bytes
+            .saturating_add(entity_state.counters.component_boundary_bytes);
+        state.counters.source_read_calls = state
+            .counters
+            .source_read_calls
+            .saturating_add(entity_state.counters.source_read_calls);
+        state.counters.source_bytes_read = state
+            .counters
+            .source_bytes_read
+            .saturating_add(entity_state.counters.source_bytes_read);
         state.counters.guest_linear_memory_high_water_bytes =
             self.store.data().limits.linear_memory_high_water_bytes();
         Ok(state.counters)
@@ -3348,6 +3560,49 @@ impl WasmComponentActor for V3Actor {
         Ok(WasmFileTransition {
             transition,
             document: WasmDocumentHandle(next_document),
+            changes: cursor,
+        })
+    }
+
+    async fn cold_file_changed(
+        &mut self,
+        limits: WasmTransitionLimits,
+        update: WasmColdFileUpdate,
+    ) -> Result<WasmFileTransition, LixError> {
+        update.update.validate(limits)?;
+        let document = self.allocate_document()?;
+        let transition = WasmTransitionHandle(self.allocate_handle()?);
+        let cursor = WasmChangeCursorHandle(self.allocate_handle()?);
+        let (events, receiver) = tokio::sync::mpsc::channel(2);
+        self.sender
+            .send(WorkerCommand::ColdFileChanged {
+                document,
+                limits,
+                update,
+                events,
+            })
+            .map_err(|_| v3_error("v3 actor executor stopped"))?;
+        self.cursors.insert(
+            cursor.0,
+            CursorState {
+                transition,
+                events: receiver,
+                complete_file_state: false,
+                certified_csv_pages: Vec::new(),
+                certified_csv_rows: 0,
+                certified_csv_creates: None,
+                certified_csv_last_local_ref: None,
+                certified_packet_pages: Vec::new(),
+                certified_packet_rows: 0,
+                certified_packet_creates: None,
+                certified_packet_schema_keys: std::collections::BTreeSet::new(),
+                certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
+            },
+        );
+        self.prospective_documents.track(transition, document);
+        Ok(WasmFileTransition {
+            transition,
+            document: WasmDocumentHandle(document),
             changes: cursor,
         })
     }

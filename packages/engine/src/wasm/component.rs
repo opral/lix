@@ -173,7 +173,7 @@ impl WasmTransitionCounters {
     ///
     /// Counters saturate instead of wrapping so diagnostic instrumentation can
     /// never report a deceptively small value after a long-running process.
-    pub(crate) fn accumulate(&mut self, other: Self) {
+    pub fn accumulate(&mut self, other: Self) {
         self.source_read_calls = self
             .source_read_calls
             .saturating_add(other.source_read_calls);
@@ -1092,6 +1092,20 @@ pub struct WasmFileUpdate {
     pub creates: WasmCreateContext,
 }
 
+pub struct WasmColdFileUpdate {
+    pub update: WasmFileUpdate,
+    pub entities: Box<dyn WasmEntitySource>,
+}
+
+impl fmt::Debug for WasmColdFileUpdate {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WasmColdFileUpdate")
+            .field("update", &self.update)
+            .finish_non_exhaustive()
+    }
+}
+
 impl fmt::Debug for WasmFileUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -1657,6 +1671,17 @@ pub trait WasmComponentActor: Send {
         limits: WasmTransitionLimits,
         update: WasmFileUpdate,
     ) -> Result<WasmFileTransition, LixError>;
+
+    async fn cold_file_changed(
+        &mut self,
+        limits: WasmTransitionLimits,
+        update: WasmColdFileUpdate,
+    ) -> Result<WasmFileTransition, LixError> {
+        let _ = (limits, update);
+        Err(invalid_param(
+            "this component actor does not implement cold successor reconciliation",
+        ))
+    }
 
     async fn entities_changed(
         &mut self,

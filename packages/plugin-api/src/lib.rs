@@ -11,8 +11,9 @@ wit_bindgen::generate!({
 });
 
 use exports::lix::plugin::api::{
-    ConflictUpdate as WitConflictUpdate, EntityUpdate as WitEntityUpdate, Guest,
-    HydrateRequest as WitHydrateRequest, PluginError, TransitionRequest,
+    ColdSuccessorRequest as WitColdSuccessorRequest, ConflictUpdate as WitConflictUpdate,
+    EntityUpdate as WitEntityUpdate, Guest, HydrateRequest as WitHydrateRequest, PluginError,
+    TransitionRequest,
 };
 use lix::plugin::host::{
     ChangeEffect as WitChangeEffect, ChangePage, ConflictSide as WitConflictSide, ConflictSource,
@@ -553,6 +554,17 @@ pub struct HydrateFile<'a> {
     pub successor: Transaction<'a>,
 }
 
+#[derive(Debug)]
+pub struct ColdFileUpdate<'a> {
+    pub before_file: FileInfo,
+    pub after_file: FileInfo,
+    pub before: Root<'a>,
+    pub edits: Vec<InputSplice>,
+    pub entities: EntityChangeReader<'a>,
+    pub successor: Transaction<'a>,
+    pub creates: CreateContext,
+}
+
 pub trait FormatPlugin: 'static {
     fn open_file(input: &OpenFile<'_>, sink: &mut Sink<'_>) -> Result<()>;
 
@@ -571,6 +583,12 @@ pub trait FormatPlugin: 'static {
     fn hydrate(_input: &mut HydrateFile<'_>, _sink: &mut Sink<'_>) -> Result<()> {
         Err(Error::internal(
             "this format does not implement durable entity hydration",
+        ))
+    }
+
+    fn cold_file_changed(_update: &mut ColdFileUpdate<'_>, _sink: &mut Sink<'_>) -> Result<()> {
+        Err(Error::internal(
+            "this format does not implement cold successor reconciliation",
         ))
     }
 }
@@ -805,6 +823,55 @@ impl<P: FormatPlugin> Guest for Component<P> {
             max_batch_bytes,
         };
         P::hydrate(&mut input, &mut sink).map_err(plugin_error)
+    }
+
+    fn cold_successor(
+        input: WitColdSuccessorRequest,
+        output: &WitTransition,
+    ) -> std::result::Result<(), PluginError> {
+        let max_batch_bytes = output.max_batch_bytes();
+        if max_batch_bytes == 0 {
+            return Err(PluginError::LimitExceeded(
+                "max-batch-bytes must be positive".to_owned(),
+            ));
+        }
+        let mut input = ColdFileUpdate {
+            before_file: FileInfo {
+                path: input.before_descriptor.path,
+                media_type: input.before_descriptor.media_type,
+            },
+            after_file: FileInfo {
+                path: input.after_descriptor.path,
+                media_type: input.after_descriptor.media_type,
+            },
+            before: Root {
+                inner: &input.before,
+            },
+            edits: input
+                .edits
+                .into_iter()
+                .map(|edit| InputSplice {
+                    offset: edit.offset,
+                    delete_len: edit.delete_len,
+                    insert: edit.insert,
+                })
+                .collect(),
+            entities: EntityChangeReader {
+                len: input.entities.len(),
+                source: &input.entities,
+                next: 0,
+            },
+            successor: Transaction { inner: output },
+            creates: CreateContext {
+                high: input.creates.high,
+                low: input.creates.low,
+            },
+        };
+        let mut sink = Sink {
+            inner: output,
+            max_batch_bytes,
+        };
+        P::cold_file_changed(&mut input, &mut sink).map_err(plugin_error)
     }
 }
 

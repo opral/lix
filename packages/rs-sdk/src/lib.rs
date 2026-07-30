@@ -9,6 +9,9 @@
 mod client_state;
 #[cfg(feature = "default_wasm_runtime")]
 mod default_wasm_runtime;
+#[cfg(feature = "default_wasm_runtime")]
+#[doc(hidden)]
+pub use default_wasm_runtime::runtime as default_wasm_runtime;
 #[cfg(all(not(target_family = "wasm"), feature = "local_filesystem"))]
 mod filesystem;
 mod lix;

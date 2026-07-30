@@ -189,6 +189,18 @@ interface api {
     entities: own<entity-change-source>,
   }
 
+  /// Rebuild an evicted actor directly as the successor of a byte transition.
+  /// Durable entities provide identity; `before` preserves exact formatting;
+  /// the output transaction already contains `edits`.
+  record cold-successor-request {
+    before-descriptor: file-descriptor,
+    after-descriptor: file-descriptor,
+    before: own<snapshot>,
+    edits: list<input-splice>,
+    entities: own<entity-change-source>,
+    creates: create-context,
+  }
+
   /// All file transitions use one fused guest entry and one borrowed,
   /// host-owned atomic output capability.
   apply: func(
@@ -212,6 +224,13 @@ interface api {
   /// those bytes from entities through the transition sink.
   hydrate: func(
     input: hydrate-request,
+    output: borrow<transition>,
+  ) -> result<_, plugin-error>;
+
+  /// Cold update fast path: parse/reconcile the successor once without first
+  /// materializing a predecessor document in a separate guest export.
+  cold-successor: func(
+    input: cold-successor-request,
     output: borrow<transition>,
   ) -> result<_, plugin-error>;
 }
