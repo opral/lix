@@ -51,7 +51,7 @@ const { rows } = await lix.execute(
   "SELECT commit_id FROM lix_branch WHERE id = $1",
   [branchId],
 );
-const commitId = rows[0].value("commit_id").asText();
+const commitId = rows[0].get("commit_id") as string;
 
 await lix.execute(
   `SELECT lixcol_depth, title

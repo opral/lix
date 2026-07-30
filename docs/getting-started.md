@@ -75,23 +75,16 @@ const result = await lix.execute(
 );
 
 const row = result.rows[0]!;
-console.log(row.value("title").asText(), row.value("done").asBoolean());
+console.log(row.get("title"), row.get("done"));
 ```
 
 `execute()` returns `{ columns, rows, rowsAffected, notices }`.
 
 ## Read result values
 
-Each row is a `Row`. Use `row.value(name)` for a typed `Value`, or `row.get(name)` / `row.toObject()` for plain JavaScript values.
-
-| Accessor      | Use for                                                 |
-| ------------- | ------------------------------------------------------- |
-| `asText()`    | text columns                                            |
-| `asBoolean()` | boolean columns                                         |
-| `asInteger()` | integer columns                                         |
-| `asReal()`    | decimal columns                                         |
-| `asJson()`    | JSON columns such as `snapshot_content` and `entity_pk` |
-| `asBytes()`   | binary columns such as `lix_file.data`                  |
+Each row is a `Row`. Use `row.get(name)` or `row.toObject()` for plain
+JavaScript values. Use `row.value(name).toJS()` when you also need the value's
+SQL kind, and `row.value(name).asBytes()` for a defensive copy of binary data.
 
 Use `asBytes()` for byte content:
 
