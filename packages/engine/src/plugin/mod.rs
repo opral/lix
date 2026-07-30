@@ -27,10 +27,10 @@ pub(crate) use create_context::{
     validate_create_changes, validate_create_reservation,
 };
 pub(crate) use incremental::{
-    ArcByteSource, FileBytesSha256, V2SchemaAllowlist, ValidatedConflictTransition,
-    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
-    drain_conflict_transition_resolutions, drain_entity_transition_edits,
+    ArcByteSource, FileBytesSha256, LiveBatchEntitySource, V2SchemaAllowlist,
+    ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
+    VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
+    canonicalize_v2_snapshot, drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, transport_splice_preserves_git_text,
     transport_splice_preserves_utf8,
