@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
-use std::sync::Mutex;
+use std::cell::Cell;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -324,34 +324,31 @@ struct TransactionPathIndexBuildStats {
 }
 
 #[cfg(test)]
-static TRANSACTION_PATH_INDEX_BUILD_STATS: Mutex<TransactionPathIndexBuildStats> =
-    Mutex::new(TransactionPathIndexBuildStats {
-        builds: 0,
-        descriptor_rows: 0,
-    });
+thread_local! {
+    static TRANSACTION_PATH_INDEX_BUILD_STATS: Cell<TransactionPathIndexBuildStats> =
+        const { Cell::new(TransactionPathIndexBuildStats {
+            builds: 0,
+            descriptor_rows: 0,
+        }) };
+}
 
 #[cfg(test)]
 fn reset_transaction_path_index_build_stats() {
-    *TRANSACTION_PATH_INDEX_BUILD_STATS
-        .lock()
-        .expect("transaction path index build stats lock") =
-        TransactionPathIndexBuildStats::default();
+    TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats::default());
 }
 
 #[cfg(test)]
 fn transaction_path_index_build_stats() -> TransactionPathIndexBuildStats {
-    *TRANSACTION_PATH_INDEX_BUILD_STATS
-        .lock()
-        .expect("transaction path index build stats lock")
+    TRANSACTION_PATH_INDEX_BUILD_STATS.get()
 }
 
 #[cfg(test)]
 fn record_transaction_path_index_build(descriptor_rows: usize) {
-    let mut stats = TRANSACTION_PATH_INDEX_BUILD_STATS
-        .lock()
-        .expect("transaction path index build stats lock");
-    stats.builds += 1;
-    stats.descriptor_rows += descriptor_rows;
+    let stats = TRANSACTION_PATH_INDEX_BUILD_STATS.get();
+    TRANSACTION_PATH_INDEX_BUILD_STATS.set(TransactionPathIndexBuildStats {
+        builds: stats.builds + 1,
+        descriptor_rows: stats.descriptor_rows + descriptor_rows,
+    });
 }
 
 /// One execution-scoped transaction capability for engine write paths.
