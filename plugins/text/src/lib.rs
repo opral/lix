@@ -8,13 +8,16 @@
 mod core;
 mod model;
 
-use core::{Document, InputSplice};
+use core::{Document, InputSplice, LineIdentity};
 use lix_plugin_api as sdk;
 use model::{ChangeEffect, EntityChange};
 
 struct GitTextPlugin;
 
 const ID_NAMESPACE_STATE: &[u8] = b"git-text/id-namespace-v1";
+const LINE_IDENTITIES_STATE: &[u8] = b"git-text/line-identities-v1";
+const LINE_IDENTITIES_MAGIC: &[u8; 4] = b"GTI1";
+const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for GitTextPlugin {
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
@@ -26,17 +29,13 @@ impl sdk::FormatPlugin for GitTextPlugin {
         input
             .successor
             .put_state(ID_NAMESPACE_STATE, &namespace.namespace_bytes())?;
+        store_identities_in_transaction(&input.successor, &document)?;
         emit_changes(changes, namespace, sink)?;
-        drop(document);
         Ok(())
     }
 
     fn file_changed(update: &sdk::FileUpdate<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
-        let original_namespace = read_namespace(&update.before)?;
-        let (before, _) = Document::open_file(update.before.read_all()?, |ordinal| {
-            original_namespace.id(local_ref(ordinal))
-        })
-        .map_err(sdk::Error::invalid_input)?;
+        let before = read_document(&update.before)?;
         let splices = update
             .edits
             .iter()
@@ -47,9 +46,10 @@ impl sdk::FormatPlugin for GitTextPlugin {
             })
             .collect::<Vec<_>>();
         let creates = update.creates;
-        let (_, changes) = before
+        let (after, changes) = before
             .file_changed(&splices, |ordinal| creates.id(local_ref(ordinal)))
             .map_err(sdk::Error::invalid_input)?;
+        replace_identities_in_transaction(&update.before, &update.successor, &after)?;
         emit_changes(changes.into_iter().map(Ok), creates, sink)
     }
 
@@ -57,11 +57,7 @@ impl sdk::FormatPlugin for GitTextPlugin {
         update: &mut sdk::EntityUpdate<'_>,
         sink: &mut sdk::Sink<'_>,
     ) -> sdk::Result<()> {
-        let namespace = read_namespace(&update.before)?;
-        let (before, _) = Document::open_file(update.before.read_all()?, |ordinal| {
-            namespace.id(local_ref(ordinal))
-        })
-        .map_err(sdk::Error::invalid_input)?;
+        let before = read_document(&update.before)?;
         let mut changes = Vec::new();
         while let Some(change) = update.changes.next()? {
             changes.push(EntityChange {
@@ -77,8 +73,71 @@ impl sdk::FormatPlugin for GitTextPlugin {
         let (after, _edits) = before
             .entities_changed(changes)
             .map_err(sdk::Error::invalid_input)?;
-        sink.replace_file(after.bytes())
+        sink.replace_file(after.bytes())?;
+        replace_identities_from_sink(&update.before, sink, &after)
     }
+}
+
+fn read_document(root: &sdk::Root<'_>) -> sdk::Result<Document> {
+    let manifest = root
+        .get_state(LINE_IDENTITIES_STATE)?
+        .ok_or_else(|| sdk::Error::invalid_input("Git text identity state is missing"))?;
+    let (line_count, page_count) = decode_identity_manifest(&manifest)?;
+    let mut pages = Vec::with_capacity(page_count as usize);
+    for ordinal in 0..page_count {
+        pages.push(
+            root.get_state(&line_identity_page_key(ordinal))?
+                .ok_or_else(|| sdk::Error::invalid_input("Git text identity page disappeared"))?,
+        );
+    }
+    Document::open_file_with_identities(root.read_all()?, decode_identities(line_count, pages)?)
+        .map_err(sdk::Error::invalid_input)
+}
+
+fn store_identities_in_transaction(
+    successor: &sdk::Transaction<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
+    let (manifest, pages) = encode_identities(&document.identities())?;
+    successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&line_identity_page_key(ordinal as u32), page)?;
+    }
+    Ok(())
+}
+
+fn replace_identities_in_transaction(
+    before: &sdk::Root<'_>,
+    successor: &sdk::Transaction<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
+    let old_page_count = identity_page_count(before)?;
+    let (manifest, pages) = encode_identities(&document.identities())?;
+    successor.put_state(LINE_IDENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&line_identity_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        successor.delete_state(&line_identity_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn replace_identities_from_sink(
+    before: &sdk::Root<'_>,
+    sink: &mut sdk::Sink<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
+    let old_page_count = identity_page_count(before)?;
+    let (manifest, pages) = encode_identities(&document.identities())?;
+    sink.put_state(LINE_IDENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        sink.put_state(&line_identity_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        sink.delete_state(&line_identity_page_key(ordinal))?;
+    }
+    Ok(())
 }
 
 fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<sdk::CreateContext> {
@@ -92,6 +151,151 @@ fn read_namespace(root: &sdk::Root<'_>) -> sdk::Result<sdk::CreateContext> {
         high: u64::from_be_bytes(bytes[..8].try_into().expect("eight bytes")),
         low: u32::from_be_bytes(bytes[8..].try_into().expect("four bytes")),
     })
+}
+
+fn encode_identities(identities: &[LineIdentity]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let mut pages = Vec::new();
+    let mut page = Vec::with_capacity(STATE_PAGE_BYTES);
+    for identity in identities {
+        let mut record = Vec::new();
+        push_text(&mut record, &identity.id)?;
+        push_text(&mut record, &identity.order_key)?;
+        push_paged_state(&mut pages, &mut page, &record);
+    }
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    let mut manifest = Vec::with_capacity(12);
+    manifest.extend_from_slice(LINE_IDENTITIES_MAGIC);
+    manifest.extend_from_slice(
+        &u32::try_from(identities.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many Git text lines"))?
+            .to_le_bytes(),
+    );
+    manifest.extend_from_slice(
+        &u32::try_from(pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many Git text identity pages"))?
+            .to_le_bytes(),
+    );
+    Ok((manifest, pages))
+}
+
+fn decode_identities(line_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<LineIdentity>> {
+    let mut reader = IdentityReader::new(pages);
+    let mut identities = Vec::with_capacity(line_count as usize);
+    for _ in 0..line_count {
+        identities.push(LineIdentity {
+            id: reader.text()?,
+            order_key: reader.text()?,
+        });
+    }
+    if !reader.finished() {
+        return Err(sdk::Error::invalid_input(
+            "Git text identity state contains trailing bytes",
+        ));
+    }
+    Ok(identities)
+}
+
+fn decode_identity_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
+    if bytes.len() != 12 || bytes.get(..4) != Some(LINE_IDENTITIES_MAGIC) {
+        return Err(sdk::Error::invalid_input(
+            "unsupported Git text identity state",
+        ));
+    }
+    Ok((
+        u32::from_le_bytes(bytes[4..8].try_into().expect("fixed identity manifest")),
+        u32::from_le_bytes(bytes[8..12].try_into().expect("fixed identity manifest")),
+    ))
+}
+
+fn identity_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    let Some(manifest) = root.get_state(LINE_IDENTITIES_STATE)? else {
+        return Ok(0);
+    };
+    decode_identity_manifest(&manifest).map(|(_, page_count)| page_count)
+}
+
+fn line_identity_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"git-text/line-identity-page-v1/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn push_paged_state(pages: &mut Vec<Vec<u8>>, page: &mut Vec<u8>, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let available = STATE_PAGE_BYTES - page.len();
+        let take = available.min(bytes.len());
+        page.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if page.len() == STATE_PAGE_BYTES {
+            pages.push(std::mem::replace(
+                page,
+                Vec::with_capacity(STATE_PAGE_BYTES),
+            ));
+        }
+    }
+}
+
+struct IdentityReader {
+    pages: Vec<Vec<u8>>,
+    page: usize,
+    offset: usize,
+}
+
+impl IdentityReader {
+    fn new(pages: Vec<Vec<u8>>) -> Self {
+        Self {
+            pages,
+            page: 0,
+            offset: 0,
+        }
+    }
+
+    fn bytes(&mut self, mut length: usize) -> sdk::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(length);
+        while length > 0 {
+            let page = self
+                .pages
+                .get(self.page)
+                .ok_or_else(|| sdk::Error::invalid_input("Git text identity state is truncated"))?;
+            let available = page.len().saturating_sub(self.offset);
+            if available == 0 {
+                self.page += 1;
+                self.offset = 0;
+                continue;
+            }
+            let take = available.min(length);
+            output.extend_from_slice(&page[self.offset..self.offset + take]);
+            self.offset += take;
+            length -= take;
+        }
+        Ok(output)
+    }
+
+    fn text(&mut self) -> sdk::Result<String> {
+        let length = u32::from_le_bytes(
+            self.bytes(4)?
+                .try_into()
+                .expect("identity reader returned four bytes"),
+        ) as usize;
+        String::from_utf8(self.bytes(length)?)
+            .map_err(|_| sdk::Error::invalid_input("Git text identity is not UTF-8"))
+    }
+
+    fn finished(&self) -> bool {
+        match self.pages.get(self.page) {
+            None => true,
+            Some(page) => {
+                self.offset == page.len()
+                    && self
+                        .pages
+                        .iter()
+                        .skip(self.page.saturating_add(1))
+                        .all(Vec::is_empty)
+            }
+        }
+    }
 }
 
 fn local_ref(ordinal: u64) -> u32 {

@@ -4,6 +4,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::{Value, json};
 
 use crate::core::{Document, InputSplice, LINE_SCHEMA_KEY, Line};
+use crate::{STATE_PAGE_BYTES, decode_identities, decode_identity_manifest, encode_identities};
 
 fn open(bytes: &[u8]) -> (Document, Vec<lix::EntityChange>) {
     let (document, changes) =
@@ -176,6 +177,62 @@ fn line_insertion_adds_one_row_without_rewriting_existing_line_entities() {
     assert_eq!(changes.len(), 1);
     assert_eq!(changes[0].entity_pk, ["new-0"]);
     assert!(changes[0].snapshot.is_some());
+}
+
+#[test]
+fn durable_identities_survive_insert_reopen_and_second_edit() {
+    let (document, _) = open(b"alpha\nomega\n");
+    let (after_insert, _) = document
+        .file_changed(
+            &[InputSplice {
+                offset: 6,
+                delete_len: 0,
+                insert: b"middle\n".to_vec(),
+            }],
+            |ordinal| format!("created-{ordinal}"),
+        )
+        .expect("line insertion should reconcile");
+    let inserted_id = ids(&after_insert)[1].clone();
+    let reopened = Document::open_file_with_identities(
+        after_insert.bytes().to_vec(),
+        after_insert.identities(),
+    )
+    .expect("durable identities should reopen");
+
+    let (after_edit, changes) = reopened
+        .file_changed(
+            &[InputSplice {
+                offset: 6,
+                delete_len: 6,
+                insert: b"MIDDLE".to_vec(),
+            }],
+            |ordinal| format!("second-{ordinal}"),
+        )
+        .expect("second edit should reconcile");
+
+    assert_eq!(ids(&after_edit)[1], inserted_id);
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].entity_pk, [inserted_id]);
+}
+
+#[test]
+fn large_identity_mapping_is_split_into_bounded_pages() {
+    let identities = (0..30_000)
+        .map(|ordinal| crate::core::LineIdentity {
+            id: format!("line-{ordinal:08}"),
+            order_key: "80".repeat(8),
+        })
+        .collect::<Vec<_>>();
+
+    let (manifest, pages) = encode_identities(&identities).expect("encode identities");
+    let (line_count, page_count) =
+        decode_identity_manifest(&manifest).expect("decode identity manifest");
+    let decoded = decode_identities(line_count, pages.clone()).expect("decode identities");
+
+    assert!(pages.len() > 1);
+    assert!(pages.iter().all(|page| page.len() <= STATE_PAGE_BYTES));
+    assert_eq!(page_count as usize, pages.len());
+    assert_eq!(decoded, identities);
 }
 
 #[test]

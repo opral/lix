@@ -24,6 +24,12 @@ pub(crate) struct InputSplice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Document(Arc<DocumentInner>);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LineIdentity {
+    pub(crate) id: String,
+    pub(crate) order_key: String,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct DocumentInner {
     bytes: Arc<Vec<u8>>,
@@ -130,6 +136,45 @@ impl Document {
             index: 0,
         };
         Ok((document, changes))
+    }
+
+    pub(crate) fn open_file_with_identities(
+        bytes: Vec<u8>,
+        identities: Vec<LineIdentity>,
+    ) -> Result<Self, String> {
+        validate_git_text(&bytes)?;
+        let bytes = Arc::new(bytes);
+        let chunks = split_lines(Arc::clone(&bytes));
+        if chunks.len() != identities.len() {
+            return Err("Git text identity state has the wrong line count".to_owned());
+        }
+        let lines = chunks
+            .into_iter()
+            .zip(identities)
+            .map(|(bytes, identity)| {
+                Ok(Line {
+                    id: identity.id,
+                    order_key: OrderKey::from_snapshot_string(&identity.order_key)
+                        .map_err(|error| format!("invalid line order key: {error}"))?,
+                    bytes,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let document = Self::from_lines(lines)?;
+        if document.bytes() != bytes.as_slice() {
+            return Err("Git text identity order does not match accepted bytes".to_owned());
+        }
+        Ok(document)
+    }
+
+    pub(crate) fn identities(&self) -> Vec<LineIdentity> {
+        self.lines()
+            .iter()
+            .map(|line| LineIdentity {
+                id: line.id.clone(),
+                order_key: line.order_key.to_snapshot_string(),
+            })
+            .collect()
     }
 
     #[cfg(test)]

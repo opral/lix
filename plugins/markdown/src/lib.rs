@@ -25,6 +25,7 @@ const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB2";
 const BLOCK_INDEX_HEADER_BYTES: u32 = 16;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
 const BLOCK_PAGE_BYTES: usize = 1024 * 1024;
+const MAX_BLOCK_SHIFT_RECORDS: usize = 4096;
 
 impl sdk::FormatPlugin for MarkdownPlugin {
     fn entities_changed(
@@ -416,7 +417,9 @@ fn sparse_block_change(
         -i64::try_from(edit.delete_len - insert_len)
             .map_err(|_| sdk::Error::limit_exceeded("Markdown block shrink exceeds i64"))?
     };
-    shifts.push((ordinal, delta));
+    if !add_block_shift(&mut shifts, ordinal, delta)? {
+        return Ok(None);
+    }
     let next_ordinal = successor_next_ordinal(&changes, update.creates, create_from_ordinal)?;
     Ok(Some((
         changes,
@@ -589,15 +592,48 @@ fn decode_block_shifts(bytes: &[u8]) -> sdk::Result<Vec<(u32, i64)>> {
             "truncated Markdown block shift overlay",
         ));
     }
-    Ok(bytes
-        .chunks_exact(12)
-        .map(|record| {
-            (
-                u32::from_le_bytes(record[0..4].try_into().expect("fixed shift record")),
-                i64::from_le_bytes(record[4..12].try_into().expect("fixed shift record")),
-            )
-        })
-        .collect())
+    let mut compact = std::collections::BTreeMap::<u32, i64>::new();
+    for record in bytes.chunks_exact(12) {
+        let ordinal = u32::from_le_bytes(record[0..4].try_into().expect("fixed shift record"));
+        let delta = i64::from_le_bytes(record[4..12].try_into().expect("fixed shift record"));
+        let total = compact
+            .get(&ordinal)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(delta)
+            .ok_or_else(|| sdk::Error::invalid_input("Markdown block shift overflowed"))?;
+        if total == 0 {
+            compact.remove(&ordinal);
+        } else {
+            compact.insert(ordinal, total);
+        }
+    }
+    Ok(compact.into_iter().collect())
+}
+
+fn add_block_shift(shifts: &mut Vec<(u32, i64)>, ordinal: u32, delta: i64) -> sdk::Result<bool> {
+    if delta == 0 {
+        return Ok(true);
+    }
+    match shifts.binary_search_by_key(&ordinal, |(ordinal, _)| *ordinal) {
+        Ok(index) => {
+            let total = shifts[index]
+                .1
+                .checked_add(delta)
+                .ok_or_else(|| sdk::Error::invalid_input("Markdown block shift overflowed"))?;
+            if total == 0 {
+                shifts.remove(index);
+            } else {
+                shifts[index].1 = total;
+            }
+            Ok(true)
+        }
+        Err(index) if shifts.len() < MAX_BLOCK_SHIFT_RECORDS => {
+            shifts.insert(index, (ordinal, delta));
+            Ok(true)
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 fn encode_block_shifts(shifts: &[(u32, i64)]) -> Vec<u8> {
@@ -957,6 +993,26 @@ mod tests {
                 .map(|page| page.len())
                 .sum::<usize>(),
             blocks.len() * BLOCK_INDEX_ENTRY_BYTES as usize
+        );
+    }
+
+    #[test]
+    fn sparse_block_shifts_are_coalesced_and_bounded() {
+        let mut shifts = Vec::new();
+        for _ in 0..100_000 {
+            assert!(add_block_shift(&mut shifts, 7, 1).expect("coalesce shift"));
+        }
+        assert_eq!(shifts, [(7, 100_000)]);
+        assert!(add_block_shift(&mut shifts, 7, -100_000).expect("cancel shift"));
+        assert!(shifts.is_empty());
+
+        for ordinal in 0..MAX_BLOCK_SHIFT_RECORDS as u32 {
+            assert!(add_block_shift(&mut shifts, ordinal, 1).expect("insert bounded shift"));
+        }
+        assert!(!add_block_shift(&mut shifts, u32::MAX, 1).expect("request index rebuild"));
+        assert_eq!(
+            encode_block_shifts(&shifts).len(),
+            MAX_BLOCK_SHIFT_RECORDS * 12
         );
     }
 }

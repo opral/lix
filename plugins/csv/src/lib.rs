@@ -16,9 +16,11 @@ struct CsvPlugin;
 const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
 const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
 const CSV_FALLBACK_ENTITIES_KEY: &[u8] = b"csv/fallback-entities-v1";
+const CSV_FALLBACK_ENTITIES_MAGIC: &[u8; 4] = b"CFE2";
 const ID_NAMESPACE_STATE: &[u8] = b"csv/id-namespace-v1";
 const CSV_INDEX_HEADER_BYTES: u32 = 36;
 const CSV_INDEX_PAGE_BYTES: usize = 1024 * 1024;
+const CSV_STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for CsvPlugin {
     fn entities_changed(
@@ -54,7 +56,7 @@ impl sdk::FormatPlugin for CsvPlugin {
         let records = successor
             .entity_records()
             .map_err(sdk::Error::invalid_input)?;
-        sink.put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
+        store_fallback_entities_from_sink(&update.before, sink, &records)?;
         delete_csv_index_from_sink(&update.before, sink)?;
         Ok(())
     }
@@ -252,8 +254,10 @@ fn fallback_file_changed(
     sink: &mut sdk::Sink<'_>,
 ) -> sdk::Result<()> {
     let before_bytes = update.before.read_all()?;
-    let document = if let Some(encoded) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
-        let (document, _) = Document::open_entities(decode_entity_records(&encoded)?)
+    let document = if let Some(manifest) = update.before.get_state(CSV_FALLBACK_ENTITIES_KEY)? {
+        let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
+        let pages = read_fallback_pages(&update.before, page_count)?;
+        let (document, _) = Document::open_entities(decode_entity_records(record_count, pages)?)
             .map_err(sdk::Error::invalid_input)?;
         let rendered = document.bytes();
         if rendered == before_bytes {
@@ -304,9 +308,7 @@ fn fallback_file_changed(
     let records = successor
         .entity_records()
         .map_err(sdk::Error::invalid_input)?;
-    update
-        .successor
-        .put_state(CSV_FALLBACK_ENTITIES_KEY, &encode_entity_records(&records)?)?;
+    store_fallback_entities_in_transaction(&update.before, &update.successor, &records)?;
     delete_csv_index(&update.before, &update.successor)?;
     let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
     for change in changes {
@@ -315,38 +317,82 @@ fn fallback_file_changed(
     encoder.flush(sink)
 }
 
-fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output.extend_from_slice(
-        &u32::try_from(records.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback entities"))?
-            .to_le_bytes(),
-    );
+fn store_fallback_entities_from_sink(
+    before: &sdk::Root<'_>,
+    sink: &mut sdk::Sink<'_>,
+    records: &[EntityRecord],
+) -> sdk::Result<()> {
+    let old_page_count = fallback_entity_page_count(before)?;
+    let (manifest, pages) = encode_entity_records(records)?;
+    sink.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        sink.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        sink.delete_state(&csv_fallback_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn store_fallback_entities_in_transaction(
+    before: &sdk::Root<'_>,
+    successor: &sdk::Transaction<'_>,
+    records: &[EntityRecord],
+) -> sdk::Result<()> {
+    let old_page_count = fallback_entity_page_count(before)?;
+    let (manifest, pages) = encode_entity_records(records)?;
+    successor.put_state(CSV_FALLBACK_ENTITIES_KEY, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&csv_fallback_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        successor.delete_state(&csv_fallback_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let record_count = u32::try_from(records.len())
+        .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback entities"))?;
+    let mut pages = Vec::new();
+    let mut page = Vec::with_capacity(CSV_STATE_PAGE_BYTES);
     for record in records {
-        push_text(&mut output, &record.schema_key)?;
-        output.extend_from_slice(
+        let mut encoded = Vec::new();
+        push_text(&mut encoded, &record.schema_key)?;
+        encoded.extend_from_slice(
             &u32::try_from(record.entity_pk.len())
                 .map_err(|_| sdk::Error::limit_exceeded("too many CSV key components"))?
                 .to_le_bytes(),
         );
         for component in &record.entity_pk {
-            push_text(&mut output, component)?;
+            push_text(&mut encoded, component)?;
         }
-        output.extend_from_slice(
+        encoded.extend_from_slice(
             &u32::try_from(record.snapshot.len())
                 .map_err(|_| sdk::Error::limit_exceeded("CSV snapshot is too large"))?
                 .to_le_bytes(),
         );
-        output.extend_from_slice(&record.snapshot);
+        encoded.extend_from_slice(&record.snapshot);
+        push_csv_paged_state(&mut pages, &mut page, &encoded);
     }
-    Ok(output)
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    let mut manifest = Vec::with_capacity(12);
+    manifest.extend_from_slice(CSV_FALLBACK_ENTITIES_MAGIC);
+    manifest.extend_from_slice(&record_count.to_le_bytes());
+    manifest.extend_from_slice(
+        &u32::try_from(pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many CSV fallback pages"))?
+            .to_le_bytes(),
+    );
+    Ok((manifest, pages))
 }
 
-fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
-    let mut input = StateReader { bytes, offset: 0 };
-    let count = input.u32()? as usize;
-    let mut records = Vec::with_capacity(count.min(bytes.len() / 16));
-    for _ in 0..count {
+fn decode_entity_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<EntityRecord>> {
+    let mut input = StateReader::new(pages);
+    let mut records = Vec::with_capacity(record_count as usize);
+    for _ in 0..record_count {
         let schema_key = input.text()?;
         let component_count = input.u32()? as usize;
         let mut entity_pk = Vec::with_capacity(component_count.min(4));
@@ -354,14 +400,14 @@ fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
             entity_pk.push(input.text()?);
         }
         let snapshot_len = input.u32()? as usize;
-        let snapshot = input.bytes(snapshot_len)?.to_vec();
+        let snapshot = input.bytes(snapshot_len)?;
         records.push(EntityRecord {
             schema_key,
             entity_pk,
             snapshot,
         });
     }
-    if input.offset != bytes.len() {
+    if !input.finished() {
         return Err(sdk::Error::invalid_input(
             "CSV fallback state contains trailing bytes",
         ));
@@ -369,35 +415,121 @@ fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
     Ok(records)
 }
 
-struct StateReader<'a> {
-    bytes: &'a [u8],
+fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
+    if bytes.len() != 12 || bytes.get(..4) != Some(CSV_FALLBACK_ENTITIES_MAGIC) {
+        return Err(sdk::Error::invalid_input("unsupported CSV fallback state"));
+    }
+    Ok((
+        u32::from_le_bytes(bytes[4..8].try_into().expect("fixed CSV fallback manifest")),
+        u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .expect("fixed CSV fallback manifest"),
+        ),
+    ))
+}
+
+fn fallback_entity_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    let Some(manifest) = root.get_state(CSV_FALLBACK_ENTITIES_KEY)? else {
+        return Ok(0);
+    };
+    decode_fallback_manifest(&manifest).map(|(_, page_count)| page_count)
+}
+
+fn read_fallback_pages(root: &sdk::Root<'_>, page_count: u32) -> sdk::Result<Vec<Vec<u8>>> {
+    let mut pages = Vec::with_capacity(page_count as usize);
+    for ordinal in 0..page_count {
+        pages.push(
+            root.get_state(&csv_fallback_page_key(ordinal))?
+                .ok_or_else(|| sdk::Error::invalid_input("CSV fallback page disappeared"))?,
+        );
+    }
+    Ok(pages)
+}
+
+fn csv_fallback_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"csv/fallback-entity-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn push_csv_paged_state(pages: &mut Vec<Vec<u8>>, page: &mut Vec<u8>, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let available = CSV_STATE_PAGE_BYTES - page.len();
+        let take = available.min(bytes.len());
+        page.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if page.len() == CSV_STATE_PAGE_BYTES {
+            pages.push(std::mem::replace(
+                page,
+                Vec::with_capacity(CSV_STATE_PAGE_BYTES),
+            ));
+        }
+    }
+}
+
+struct StateReader {
+    pages: Vec<Vec<u8>>,
+    page: usize,
     offset: usize,
 }
 
-impl StateReader<'_> {
-    fn bytes(&mut self, length: usize) -> sdk::Result<&[u8]> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(|| sdk::Error::invalid_input("CSV fallback state range overflowed"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| sdk::Error::invalid_input("CSV fallback state is truncated"))?;
-        self.offset = end;
-        Ok(value)
+impl StateReader {
+    fn new(pages: Vec<Vec<u8>>) -> Self {
+        Self {
+            pages,
+            page: 0,
+            offset: 0,
+        }
+    }
+
+    fn bytes(&mut self, mut length: usize) -> sdk::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(length);
+        while length > 0 {
+            let page = self
+                .pages
+                .get(self.page)
+                .ok_or_else(|| sdk::Error::invalid_input("CSV fallback state is truncated"))?;
+            let available = page.len().saturating_sub(self.offset);
+            if available == 0 {
+                self.page += 1;
+                self.offset = 0;
+                continue;
+            }
+            let take = available.min(length);
+            output.extend_from_slice(&page[self.offset..self.offset + take]);
+            self.offset += take;
+            length -= take;
+        }
+        Ok(output)
     }
 
     fn u32(&mut self) -> sdk::Result<u32> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().map_err(
-            |_| sdk::Error::invalid_input("invalid CSV fallback u32"),
-        )?))
+        Ok(u32::from_le_bytes(
+            self.bytes(4)?
+                .try_into()
+                .expect("paged reader returned four bytes"),
+        ))
     }
 
     fn text(&mut self) -> sdk::Result<String> {
         let length = self.u32()? as usize;
-        String::from_utf8(self.bytes(length)?.to_vec())
+        String::from_utf8(self.bytes(length)?)
             .map_err(|_| sdk::Error::invalid_input("CSV fallback text is not UTF-8"))
+    }
+
+    fn finished(&self) -> bool {
+        match self.pages.get(self.page) {
+            None => true,
+            Some(page) => {
+                self.offset == page.len()
+                    && self
+                        .pages
+                        .iter()
+                        .skip(self.page.saturating_add(1))
+                        .all(Vec::is_empty)
+            }
+        }
     }
 }
 
@@ -633,5 +765,27 @@ mod tests {
             pages.iter().map(|page| page.len()).sum::<usize>(),
             row_count as usize * 4
         );
+    }
+
+    #[test]
+    fn large_fallback_checkpoint_is_split_into_bounded_pages() {
+        let records = (0..30_000)
+            .map(|ordinal| EntityRecord {
+                schema_key: ROW_SCHEMA_KEY.to_owned(),
+                entity_pk: vec![format!("row-{ordinal}")],
+                snapshot: vec![b'x'; 96],
+            })
+            .collect::<Vec<_>>();
+
+        let (manifest, pages) = encode_entity_records(&records).expect("encode fallback rows");
+        let (record_count, page_count) =
+            decode_fallback_manifest(&manifest).expect("decode manifest");
+        let decoded =
+            decode_entity_records(record_count, pages.clone()).expect("decode fallback rows");
+
+        assert!(pages.len() > 1);
+        assert!(pages.iter().all(|page| page.len() <= CSV_STATE_PAGE_BYTES));
+        assert_eq!(page_count as usize, pages.len());
+        assert_eq!(decoded, records);
     }
 }

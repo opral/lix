@@ -109,6 +109,25 @@ async fn git_text_plugin_persists_lossless_line_rows_and_leaves_binary_raw() {
     assert_eq!(render_rows(&reopened_rows), reopened_successor);
     assert_derived_materialization(&reopened, &text_file_id, &reopened_successor).await;
 
+    // An inserted line receives a fresh durable identity. A following byte
+    // edit must reopen from the persisted ID/order mapping rather than derive
+    // identities from the original namespace and current ordinal.
+    let inserted = [0xff, b'\n', b'M', b'\n', b'X', b'\n'].to_vec();
+    write_file(&reopened, text_path, &inserted)
+        .await
+        .expect("line insertion should write");
+    let inserted_rows = git_text_rows(&reopened, &text_file_id).await;
+    assert_eq!(inserted_rows.len(), 3);
+    let inserted_id = inserted_rows[1].id.clone();
+    let edited_insert = [0xff, b'\n', b'N', b'\n', b'X', b'\n'].to_vec();
+    write_file(&reopened, text_path, &edited_insert)
+        .await
+        .expect("second edit of inserted line should write");
+    let edited_rows = git_text_rows(&reopened, &text_file_id).await;
+    assert_eq!(edited_rows.len(), 3);
+    assert_eq!(edited_rows[1].id, inserted_id);
+    assert_eq!(render_rows(&edited_rows), edited_insert);
+
     // Crossing Git's NUL boundary must retire the derived proof and make a
     // raw successor visible to history rather than treating its tombstone as
     // a second live materialization.
