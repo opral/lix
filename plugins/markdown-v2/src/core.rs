@@ -1643,9 +1643,10 @@ impl PersistentBytes {
 
     fn range(&self, range: Range<usize>) -> Result<Vec<u8>, PluginError> {
         if !(range.start..=self.len).contains(&range.end) {
-            return Err(PluginError::InvalidInput(
-                "Markdown byte range is out of bounds".to_owned(),
-            ));
+            return Err(PluginError::InvalidInput(format!(
+                "Markdown byte range {}..{} is out of bounds for {} bytes",
+                range.start, range.end, self.len
+            )));
         }
         let mut output = Vec::with_capacity(range.end - range.start);
         let mut logical_start = 0usize;
@@ -1672,9 +1673,10 @@ impl PersistentBytes {
         output: &mut Vec<BytePiece>,
     ) -> Result<(), PluginError> {
         if !(range.start..=self.len).contains(&range.end) {
-            return Err(PluginError::InvalidInput(
-                "Markdown byte range is out of bounds".to_owned(),
-            ));
+            return Err(PluginError::InvalidInput(format!(
+                "Markdown byte range {}..{} is out of bounds for {} bytes",
+                range.start, range.end, self.len
+            )));
         }
         let mut logical_start = 0usize;
         for piece in self.pieces.iter() {
@@ -2206,6 +2208,9 @@ impl Document {
         let Some(range) = self.top_level_ranges.get(block_index) else {
             return Ok(None);
         };
+        if range.end > self.bytes.len {
+            return Ok(None);
+        }
         let new: NodeSnapshot = serde_json::from_str(snapshot_content).map_err(|error| {
             PluginError::InvalidInput(format!(
                 "invalid Markdown paragraph snapshot for incremental rendering: {error}"
@@ -2299,6 +2304,9 @@ impl Document {
         else {
             return Ok(None);
         };
+        if range.end > bytes.len {
+            return Ok(None);
+        }
 
         if self
             .tree
@@ -2328,12 +2336,11 @@ impl Document {
             return Ok(None);
         }
 
-        let mut old = self.tree.base.children[block_index].clone();
-        old.node.clone_from(
-            self.tree
-                .top_level_node(block_index)
-                .expect("validated top-level paragraph exists"),
-        );
+        let old = self
+            .tree
+            .top_level_tree(block_index)
+            .expect("validated top-level paragraph exists")
+            .clone();
         let mut new = replacement.root.children.remove(0);
         let generated_ids = collect_generated_ids(&new);
         let generated_node_id = new.node.id.clone();
@@ -2420,6 +2427,9 @@ impl Document {
             .end
             .checked_add_signed(delta)
             .ok_or_else(|| PluginError::Internal("Markdown block range shift overflow".into()))?;
+        if successor_end > bytes.len {
+            return Ok(None);
+        }
         let fragment_bytes = bytes.range(range.start..successor_end)?;
         let fragment = std::str::from_utf8(&fragment_bytes).map_err(|error| {
             PluginError::InvalidInput(format!(
