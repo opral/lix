@@ -622,30 +622,36 @@ fn read_host_bytes(value: &WasmHostBytes, offset: u64, length: u32) -> Result<Ve
 }
 
 fn create_context_from_uuid(value: &str) -> Option<WasmCreateContext> {
-    let bytes = uuid::Uuid::parse_str(value).ok()?.into_bytes();
+    let id = uuid::Uuid::parse_str(value).ok()?;
+    if id.to_string() != value {
+        return None;
+    }
+    let bytes = id.into_bytes();
     Some(WasmCreateContext {
         high: u64::from_be_bytes(bytes[..8].try_into().expect("eight UUID bytes")),
         low: u32::from_be_bytes(bytes[8..12].try_into().expect("four UUID bytes")),
     })
 }
 
-fn create_context_from_snapshot(value: &WasmHostBytes) -> Option<WasmCreateContext> {
-    const MAX_SCAN_BYTES: u64 = 1024 * 1024;
-    if value.len() > MAX_SCAN_BYTES {
+fn create_context_from_generated_entity(
+    plugin_key: &str,
+    entity: &WasmEntity<WasmHostBytes>,
+) -> Option<WasmCreateContext> {
+    let generated_schema = match plugin_key {
+        "plugin_csv" => "csv_v2_row",
+        "plugin_json" => "json_array_item",
+        "plugin_markdown" => "markdown_node_v2",
+        "plugin_git_text" => "git_text_line_v2",
+        // Excalidraw identities are native format IDs, not host-generated IDs.
+        _ => return None,
+    };
+    if entity.key.schema_key.as_str() != generated_schema {
         return None;
     }
-    let bytes = read_host_bytes(value, 0, value.len() as u32).ok()?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    create_context_from_json(&value)
-}
-
-fn create_context_from_json(value: &serde_json::Value) -> Option<WasmCreateContext> {
-    match value {
-        serde_json::Value::String(value) => create_context_from_uuid(value),
-        serde_json::Value::Array(values) => values.iter().find_map(create_context_from_json),
-        serde_json::Value::Object(values) => values.values().find_map(create_context_from_json),
-        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => None,
-    }
+    let [id] = entity.key.entity_pk.as_slice() else {
+        return None;
+    };
+    create_context_from_uuid(id.as_str())
 }
 
 impl bindings::lix::plugin::host::HostSnapshot for WasiHostState {
@@ -2072,6 +2078,7 @@ impl WasmComponentFactory for V3Factory {
             edit_cursors: HashMap::new(),
             outputs: HashMap::new(),
             transitions: HashMap::new(),
+            prospective_documents: ProspectiveDocuments::default(),
             retired: false,
             next_document: 1,
         }))
@@ -2718,17 +2725,11 @@ impl V3Worker {
             .ok_or_else(|| v3_error("v3 cold hydration requires accepted bytes"))?;
         let bytes = read_source_all(&accepted)?;
         let mut creates = None;
+        let plugin_key = input.descriptor.plugin.plugin_key.as_str();
         while let Some(page) = input.entities.next_page(limits.max_page_bytes)? {
             for entity in page.entities {
-                creates = creates
-                    .or_else(|| {
-                        entity
-                            .key
-                            .entity_pk
-                            .iter()
-                            .find_map(|component| create_context_from_uuid(component))
-                    })
-                    .or_else(|| create_context_from_snapshot(&entity.snapshot_content));
+                creates =
+                    creates.or_else(|| create_context_from_generated_entity(plugin_key, &entity));
             }
         }
         let creates = creates.unwrap_or(WasmCreateContext { high: 0, low: 0 });
@@ -2882,8 +2883,30 @@ struct V3Actor {
     edit_cursors: HashMap<u64, V3EditCursorState>,
     outputs: HashMap<u64, OutputState>,
     transitions: HashMap<u64, WasmTransitionCounters>,
+    prospective_documents: ProspectiveDocuments,
     retired: bool,
     next_document: u64,
+}
+
+#[derive(Default)]
+struct ProspectiveDocuments(HashMap<u64, u64>);
+
+impl ProspectiveDocuments {
+    fn track(&mut self, transition: WasmTransitionHandle, document: u64) {
+        self.0.insert(transition.0, document);
+    }
+
+    fn accept(&mut self, transition: WasmTransitionHandle) {
+        self.0.remove(&transition.0);
+    }
+
+    fn reject(&mut self, transition: WasmTransitionHandle) -> Option<u64> {
+        self.0.remove(&transition.0)
+    }
+}
+
+fn is_guest_trap(error: &LixError) -> bool {
+    error.code == LixError::CODE_INTERNAL_ERROR && error.message.contains(" trapped")
 }
 
 impl V3Actor {
@@ -2916,9 +2939,20 @@ impl V3Actor {
         self.sender
             .send(build(sender))
             .map_err(|_| v3_error("v3 actor executor stopped"))?;
-        receiver
+        let result = receiver
             .await
-            .map_err(|_| v3_error("v3 actor executor dropped its response"))?
+            .map_err(|_| v3_error("v3 actor executor dropped its response"))?;
+        if let Err(error) = &result {
+            self.retire_after_trap(error);
+        }
+        result
+    }
+
+    fn retire_after_trap(&mut self, error: &LixError) {
+        if is_guest_trap(error) {
+            self.retired = true;
+            let _ = self.sender.send(WorkerCommand::Shutdown);
+        }
     }
 }
 
@@ -2980,6 +3014,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
+        self.prospective_documents.track(transition, document);
         Ok(WasmFileTransition {
             transition,
             document: WasmDocumentHandle(document),
@@ -3004,6 +3039,7 @@ impl WasmComponentActor for V3Actor {
             })
             .await?;
         self.transitions.insert(transition.0, counters);
+        self.prospective_documents.track(transition, document);
         self.edit_cursors.insert(
             edits.0,
             V3EditCursorState {
@@ -3055,6 +3091,7 @@ impl WasmComponentActor for V3Actor {
                 certified_packet_entity_keys: CertifiedPacketEntityKeys::default(),
             },
         );
+        self.prospective_documents.track(transition, next_document);
         Ok(WasmFileTransition {
             transition,
             document: WasmDocumentHandle(next_document),
@@ -3091,6 +3128,7 @@ impl WasmComponentActor for V3Actor {
             },
         );
         self.transitions.insert(transition.0, resolved.counters);
+        self.prospective_documents.track(transition, next_document);
         self.edit_cursors.insert(
             edits.0,
             V3EditCursorState {
@@ -3307,7 +3345,13 @@ impl WasmComponentActor for V3Actor {
                     }
                 }
                 Some(WorkerTransitionEvent::Finished(result)) => {
-                    let counters = result?;
+                    let counters = match result {
+                        Ok(counters) => counters,
+                        Err(error) => {
+                            self.retire_after_trap(&error);
+                            return Err(error);
+                        }
+                    };
                     self.transitions.insert(transition.0, counters);
                     return Ok(None);
                 }
@@ -3448,6 +3492,7 @@ impl WasmComponentActor for V3Actor {
             .retain(|_, cursor| cursor.transition != transition);
         self.outputs
             .retain(|_, outputs| outputs.transition != transition);
+        self.prospective_documents.accept(transition);
         self.transitions
             .remove(&transition.0)
             .ok_or_else(|| v3_error("unknown v3 transition"))
@@ -3466,6 +3511,12 @@ impl WasmComponentActor for V3Actor {
         self.outputs
             .retain(|_, outputs| outputs.transition != transition);
         self.transitions.remove(&transition.0);
+        if let Some(document) = self.prospective_documents.reject(transition)
+            && !self.retired
+        {
+            self.request(|response| WorkerCommand::DropDocument { document, response })
+                .await?;
+        }
         Ok(())
     }
 
@@ -3485,11 +3536,11 @@ impl WasmComponentActor for V3Actor {
         if !self.retired {
             self.retired = true;
             let _ = self.sender.send(WorkerCommand::Shutdown);
-            if let Some(thread) = self.thread.take() {
-                thread
-                    .join()
-                    .map_err(|_| v3_error("v3 actor executor panicked"))?;
-            }
+        }
+        if let Some(thread) = self.thread.take() {
+            thread
+                .join()
+                .map_err(|_| v3_error("v3 actor executor panicked"))?;
         }
         Ok(())
     }
@@ -3625,5 +3676,62 @@ mod tests {
 
         assert_eq!(recovered, vec![1, 2, 3]);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn rejected_transition_returns_only_its_prospective_document() {
+        let accepted = WasmTransitionHandle(1);
+        let rejected = WasmTransitionHandle(2);
+        let mut documents = ProspectiveDocuments::default();
+        documents.track(accepted, 11);
+        documents.track(rejected, 12);
+
+        documents.accept(accepted);
+
+        assert_eq!(documents.reject(rejected), Some(12));
+        assert_eq!(documents.reject(accepted), None);
+    }
+
+    #[test]
+    fn cold_namespace_ignores_uuid_shaped_user_keys() {
+        let creates = WasmCreateContext {
+            high: 0x019a_0000_0000_7000,
+            low: 0x8000_0000,
+        };
+        let generated_id = creates.component(7).expect("generated id");
+        let user_key = WasmEntity {
+            key: WasmEntityKey::from_owned_parts(
+                "json_object_member",
+                vec!["root".to_owned(), generated_id.clone()],
+            ),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from(format!(
+                r#"{{"key":"{generated_id}"}}"#
+            ))),
+        };
+        assert_eq!(
+            create_context_from_generated_entity("plugin_json", &user_key),
+            None
+        );
+
+        let generated_item = WasmEntity {
+            key: WasmEntityKey::from_owned_parts("json_array_item", vec![generated_id]),
+            snapshot_content: WasmHostBytes::Inline(Bytes::from_static(b"{}")),
+        };
+        assert_eq!(
+            create_context_from_generated_entity("plugin_json", &generated_item),
+            Some(creates)
+        );
+    }
+
+    #[test]
+    fn only_runtime_traps_trigger_actor_retirement() {
+        assert!(is_guest_trap(&LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "v3 file-changed trapped: unreachable"
+        )));
+        assert!(!is_guest_trap(&LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "v3 file-changed rejected input"
+        )));
     }
 }
