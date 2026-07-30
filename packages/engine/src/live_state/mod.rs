@@ -14,13 +14,13 @@ pub(crate) use reader::load_exact_batch_via_scan_for_test;
 pub(crate) use tracked_head::TrackedHeadDeltaRef;
 #[allow(unused_imports)]
 pub(crate) use tracked_head::{
-    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_SPACE,
-    CertifiedEntityBatchFileRef, CurrentStateDeltaRef, DeferredFreshHotPlan,
-    DeferredFreshHotRowRef, DeferredFreshHotRows, HOT_DIFF_SPACE, HOT_FILE_SPACE, HOT_ROW_SPACE,
-    HotTrackedSnapshot, TRACKED_WORKING_DIFF_MARKER_SPACE, TrackedHeadContext, TrackedWorkingDiff,
-    TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage, scan_certified_history_rows,
-    stage_certified_entity_batches, stage_collect_stale_working_diff_indexes,
-    stage_tracked_working_diff_epoch,
+    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE, CERTIFIED_ENTITY_BATCH_PAGE_SPACE,
+    CERTIFIED_ENTITY_BATCH_SPACE, CertifiedEntityBatchFileRef, CurrentStateDeltaRef,
+    DeferredFreshHotPlan, DeferredFreshHotRowRef, DeferredFreshHotRows, HOT_DIFF_SPACE,
+    HOT_FILE_SPACE, HOT_ROW_SPACE, HotTrackedSnapshot, TRACKED_WORKING_DIFF_MARKER_SPACE,
+    TrackedHeadContext, TrackedWorkingDiff, TrackedWorkingDiffEpoch, WorkingDiffIndexCoverage,
+    scan_certified_history_rows, stage_certified_entity_batches,
+    stage_collect_stale_working_diff_indexes, stage_tracked_working_diff_epoch,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
