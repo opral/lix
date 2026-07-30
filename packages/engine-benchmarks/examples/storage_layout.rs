@@ -10,7 +10,7 @@ use lix_slatedb_storage::SlateDB;
 use object_store::local::LocalFileSystem;
 use slatedb::{SstReader, ValueDeletable};
 
-const HOT_SPACE: &str = "live_state.hot_row.v19";
+const HOT_SPACE: &str = "live_state.hot_row.v20";
 
 #[derive(Default)]
 struct HotGroup {

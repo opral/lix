@@ -1,4 +1,4 @@
-//! V19 row-addressable current state with dirty-inline fingerprints.
+//! V20 row-addressable current state with checkpoint-owned dirty baselines.
 //!
 //! V12 packed every file member of one logical entity into a group. That made
 //! a logical-PK lookup cheap, but it also made every normal commit read,
@@ -27,7 +27,7 @@ use crate::wasm::WasmCertifiedEntityBatch;
 
 use super::*;
 
-pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v19";
+pub(crate) const HOT_ROW_NAMESPACE: &str = "live_state.hot_row.v20";
 pub(crate) const HOT_FILE_NAMESPACE: &str = "live_state.hot_file_schema.v18";
 pub(crate) const HOT_DIFF_NAMESPACE: &str = "live_state.hot_diff.v17";
 pub(crate) const HOT_COLLECTION_CONTROL_NAMESPACE: &str = "live_state.hot_collection_control.v1";
@@ -356,8 +356,10 @@ impl DeferredFinalPutSource for DeferredFreshHotSource {
                     &mut value_bytes,
                     &delta.value_ref(
                         delta.created_at,
-                        if self.plan.checkpoint_commit_id.is_some() {
-                            WorkingDiffBaseline::BeforeAbsent
+                        if let Some(checkpoint_commit_id) = self.plan.checkpoint_commit_id {
+                            WorkingDiffBaseline::BeforeAbsent {
+                                checkpoint_commit_id,
+                            }
                         } else {
                             WorkingDiffBaseline::Disabled
                         },
@@ -1979,6 +1981,7 @@ fn stage_incremental_collection_controls(
     use crate::collection_generation::{
         COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_entity_pk,
     };
+    let mut dirty_scopes = BTreeSet::new();
     for (delta, previous) in deltas.iter().zip(previous_values) {
         if delta.schema_key == COLLECTION_GENERATION_SCHEMA_KEY {
             let scope = collection_scope_from_entity_pk(delta.entity_pk)?;
@@ -1994,6 +1997,7 @@ fn stage_incremental_collection_controls(
                 head_value_error("tracked collection-generation row lacks commit_id")
             })?;
             control.live_count = 0;
+            dirty_scopes.insert(scope);
             continue;
         }
 
@@ -2036,6 +2040,7 @@ fn stage_incremental_collection_controls(
                     .checked_sub(1)
                     .ok_or_else(|| head_value_error("hot collection live count underflow"))?
             };
+            dirty_scopes.insert(scope);
         }
     }
 
@@ -2047,9 +2052,13 @@ fn stage_incremental_collection_controls(
             .live_count
             .checked_add(*increment)
             .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
+        dirty_scopes.insert(scope.clone());
     }
 
     for ((schema_key, file_id), control) in controls {
+        if !dirty_scopes.contains(&(schema_key.clone(), file_id.clone())) {
+            continue;
+        }
         stage_hot_collection_control(
             writes,
             branch_id,
@@ -3309,20 +3318,60 @@ where
                 existing.created_at
             });
         }
+        let validated_delta_keys = sorted
+            .iter()
+            .map(|delta| TrackedStateKey {
+                schema_key: delta.schema_key.to_string(),
+                entity_pk: delta.entity_pk.clone(),
+                file_id: delta.file_id.map(str::to_string),
+            })
+            .collect::<BTreeSet<_>>();
+        // A checkpoint often selects immutable change records whose HOT row
+        // is already the exact authoritative value. Re-publishing those rows
+        // only changes the row-local dirty marker and commit ownership, even
+        // though the checkpoint delta already records historical membership.
+        //
+        // Retain only this provably identical case. A squashed selection has
+        // a new change ID and must still be written so canonical timestamps
+        // and payload ownership match historical rebuilds.
+        let (sorted, previous_values, created_ats) = if reset_working_diff_baselines {
+            let mut retained_deltas = Vec::with_capacity(sorted.len());
+            let mut retained_previous = Vec::with_capacity(previous_values.len());
+            let mut retained_created_ats = Vec::with_capacity(created_ats.len());
+            for ((delta, previous), created_at) in
+                sorted.into_iter().zip(previous_values).zip(created_ats)
+            {
+                let identical_immutable_change = !delta.untracked
+                    && delta.schema_key
+                        != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                    && previous
+                        .as_deref()
+                        .map(decode_head_value)
+                        .transpose()?
+                        .is_some_and(|value| {
+                            value.change_id == delta.change_id
+                                && value.deleted == delta.deleted
+                                && value.created_at == delta.created_at
+                                && value.updated_at == delta.updated_at
+                        });
+                if identical_immutable_change {
+                    continue;
+                }
+                retained_deltas.push(delta);
+                retained_previous.push(previous);
+                retained_created_ats.push(created_at);
+            }
+            (retained_deltas, retained_previous, retained_created_ats)
+        } else {
+            (sorted, previous_values, created_ats)
+        };
+        let identities = encode_hot_mutation_identities(branch_id, generation, &sorted);
         let unmatched_guards = if absence_guards_validated || absence_guards.is_empty() {
             BTreeSet::new()
         } else {
-            let delta_keys = sorted
-                .iter()
-                .map(|delta| TrackedStateKey {
-                    schema_key: delta.schema_key.to_string(),
-                    entity_pk: delta.entity_pk.clone(),
-                    file_id: delta.file_id.map(str::to_string),
-                })
-                .collect::<BTreeSet<_>>();
             absence_guards
                 .iter()
-                .filter(|key| !delta_keys.contains(*key))
+                .filter(|key| !validated_delta_keys.contains(*key))
                 .cloned()
                 .collect::<BTreeSet<_>>()
         };
@@ -3743,7 +3792,7 @@ struct HotCascadeMutationBuffers {
 impl HotCascadeMutationBuffers {
     fn with_capacity(row_capacity: usize, key_capacity: usize, active_checkpoint: bool) -> Self {
         let checkpoint_bytes = if active_checkpoint {
-            WORKING_DIFF_VERSION_BYTES
+            WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
         } else {
             0
         };
@@ -3775,19 +3824,51 @@ fn next_cascade_working_diff_baseline(
     active_checkpoint_commit_id: Option<CommitId>,
     previous: HeadValueView<'_>,
 ) -> Result<(WorkingDiffBaseline, bool), LixError> {
-    if active_checkpoint_commit_id.is_none() {
+    let Some(active_checkpoint_commit_id) = active_checkpoint_commit_id else {
         return Ok((WorkingDiffBaseline::Disabled, false));
-    }
+    };
     match previous.working_diff_baseline {
         WorkingDiffBaseline::Clean => {
             let before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
-            Ok((WorkingDiffBaseline::BeforePresent(before), true))
+            Ok((
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id: active_checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ))
         }
-        WorkingDiffBaseline::BeforeAbsent => Ok((WorkingDiffBaseline::BeforeAbsent, false)),
-        WorkingDiffBaseline::BeforePresent(before) => {
-            Ok((WorkingDiffBaseline::BeforePresent(before), false))
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id,
+        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id,
+            },
+            false,
+        )),
+        WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id,
+            version,
+        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id,
+                version,
+            },
+            false,
+        )),
+        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
+            let before = previous
+                .working_diff_version()
+                .ok_or_else(|| head_value_error("tracked cascade member has no version"))?;
+            Ok((
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id: active_checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ))
         }
         WorkingDiffBaseline::Disabled => Err(head_value_error(
             "active checkpoint generation contains a cascade member without a baseline",
@@ -3805,11 +3886,19 @@ fn next_hot_working_diff_baseline(
     delta: &CurrentStateDeltaRef<'_>,
     previous: Option<HeadValueView<'_>>,
 ) -> Result<(WorkingDiffBaseline, bool), LixError> {
-    if delta.untracked || active_checkpoint_commit_id.is_none() {
+    let Some(active_checkpoint_commit_id) = active_checkpoint_commit_id else {
+        return Ok((WorkingDiffBaseline::Disabled, false));
+    };
+    if delta.untracked {
         return Ok((WorkingDiffBaseline::Disabled, false));
     }
     let Some(previous) = previous else {
-        return Ok((WorkingDiffBaseline::BeforeAbsent, true));
+        return Ok((
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id: active_checkpoint_commit_id,
+            },
+            true,
+        ));
     };
     if previous.untracked {
         return Err(head_value_error(
@@ -3821,11 +3910,43 @@ fn next_hot_working_diff_baseline(
             let before = previous
                 .working_diff_version()
                 .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
-            Ok((WorkingDiffBaseline::BeforePresent(before), true))
+            Ok((
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id: active_checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ))
         }
-        WorkingDiffBaseline::BeforeAbsent => Ok((WorkingDiffBaseline::BeforeAbsent, false)),
-        WorkingDiffBaseline::BeforePresent(before) => {
-            Ok((WorkingDiffBaseline::BeforePresent(before), false))
+        WorkingDiffBaseline::BeforeAbsent {
+            checkpoint_commit_id,
+        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id,
+            },
+            false,
+        )),
+        WorkingDiffBaseline::BeforePresent {
+            checkpoint_commit_id,
+            version,
+        } if checkpoint_commit_id == active_checkpoint_commit_id => Ok((
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id,
+                version,
+            },
+            false,
+        )),
+        WorkingDiffBaseline::BeforeAbsent { .. } | WorkingDiffBaseline::BeforePresent { .. } => {
+            let before = previous
+                .working_diff_version()
+                .ok_or_else(|| head_value_error("tracked mutation has no working-diff version"))?;
+            Ok((
+                WorkingDiffBaseline::BeforePresent {
+                    checkpoint_commit_id: active_checkpoint_commit_id,
+                    version: before,
+                },
+                true,
+            ))
         }
         WorkingDiffBaseline::Disabled => Err(head_value_error(
             "active checkpoint generation contains a tracked row without a baseline",
@@ -4263,7 +4384,7 @@ fn checked_add_hot_next_value_capacity(
     u32::try_from(snapshot_len).ok()?;
     u32::try_from(metadata_len).ok()?;
     let baseline_len = if active_checkpoint && !delta.untracked {
-        WORKING_DIFF_VERSION_BYTES
+        WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES
     } else {
         0
     };
@@ -5373,8 +5494,8 @@ fn working_diff_baseline_before(
     baseline: WorkingDiffBaseline,
 ) -> Option<Option<WorkingDiffVersion>> {
     match baseline {
-        WorkingDiffBaseline::BeforeAbsent => Some(None),
-        WorkingDiffBaseline::BeforePresent(version) => Some(Some(version)),
+        WorkingDiffBaseline::BeforeAbsent { .. } => Some(None),
+        WorkingDiffBaseline::BeforePresent { version, .. } => Some(Some(version)),
         WorkingDiffBaseline::Disabled | WorkingDiffBaseline::Clean => None,
     }
 }
@@ -5952,7 +6073,7 @@ fn hot_scope_prefix(branch_id: &str, generation: CommitId) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
+pub(super) fn encode_hot_row_key(identity: &HeadIdentity) -> Vec<u8> {
     encode_hot_row_key_parts(
         &identity.branch_id,
         identity.generation,
@@ -7869,8 +7990,14 @@ mod tests {
             })
             .expect("checkpoint test values have a representable encoded size");
         let checkpoint_baselines = [
-            WorkingDiffBaseline::BeforePresent(before),
-            WorkingDiffBaseline::BeforePresent(before),
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
+                version: before,
+            },
+            WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
+                version: before,
+            },
             WorkingDiffBaseline::Disabled,
             WorkingDiffBaseline::Disabled,
         ];
@@ -7895,8 +8022,12 @@ mod tests {
         assert_eq!(checkpoint.capacity(), checkpoint_capacity);
         assert_eq!(checkpoint.as_ptr(), checkpoint_allocation);
 
-        let before_absent =
-            tracked.value_ref(tracked.created_at, WorkingDiffBaseline::BeforeAbsent);
+        let before_absent = tracked.value_ref(
+            tracked.created_at,
+            WorkingDiffBaseline::BeforeAbsent {
+                checkpoint_commit_id: CommitId::for_test_label("checkpoint"),
+            },
+        );
         let before_absent_bytes =
             encode_head_value(&before_absent).expect("encode before-absent checkpoint value");
         let tracked_checkpoint_capacity = checked_add_hot_next_value_capacity(0, &tracked, true)
@@ -7978,15 +8109,16 @@ mod tests {
             updated_at: timestamp(),
             snapshot: JsonSlotRef::None,
             metadata: JsonSlotRef::None,
-            working_diff_baseline: WorkingDiffBaseline::BeforePresent(working_diff_version(
-                "cascade-reserve-before",
-            )),
+            working_diff_baseline: WorkingDiffBaseline::BeforePresent {
+                checkpoint_commit_id: CommitId::for_test_label("cascade-reserve-checkpoint"),
+                version: working_diff_version("cascade-reserve-before"),
+            },
         };
         let encoded_tombstone =
             encode_head_value(&tombstone).expect("encode maximum cascade tombstone");
         assert_eq!(
             encoded_tombstone.len(),
-            HEAD_VALUE_HEADER_BYTES + WORKING_DIFF_VERSION_BYTES,
+            HEAD_VALUE_HEADER_BYTES + WORKING_DIFF_CHECKPOINT_BYTES + WORKING_DIFF_VERSION_BYTES,
             "the cascade value reservation must cover the largest checkpoint tombstone"
         );
 
@@ -8007,7 +8139,10 @@ mod tests {
 
         assert_eq!(
             buffers.value_bytes.len(),
-            ROW_COUNT * (HEAD_VALUE_HEADER_BYTES + WORKING_DIFF_VERSION_BYTES)
+            ROW_COUNT
+                * (HEAD_VALUE_HEADER_BYTES
+                    + WORKING_DIFF_CHECKPOINT_BYTES
+                    + WORKING_DIFF_VERSION_BYTES)
         );
         assert_eq!(buffers.value_bytes.as_ptr(), value_allocation);
         assert_eq!(buffers.row_puts.as_ptr(), row_put_allocation);
