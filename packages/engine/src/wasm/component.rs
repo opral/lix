@@ -5,6 +5,7 @@
 //! each branch/file actor owns one isolated mutable instance and all document,
 //! cursor, output-table, and transition handles created by that instance.
 
+use std::any::Any;
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -1404,6 +1405,46 @@ macro_rules! handle_type {
 }
 
 handle_type!(WasmDocumentHandle);
+
+/// Runtime-private immutable document state retained outside a Wasm Store.
+///
+/// The engine treats the payload as opaque. A compatible component runtime
+/// may restore it into a fresh Store after actor eviction, avoiding durable
+/// entity hydration while preserving the same semantic authority checks.
+#[derive(Clone)]
+pub struct WasmDocumentCheckpoint {
+    payload: Arc<dyn Any + Send + Sync>,
+    retained_bytes: u64,
+}
+
+impl fmt::Debug for WasmDocumentCheckpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WasmDocumentCheckpoint")
+            .field("retained_bytes", &self.retained_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl WasmDocumentCheckpoint {
+    pub fn new<T>(payload: T, retained_bytes: u64) -> Self
+    where
+        T: Any + Send + Sync,
+    {
+        Self {
+            payload: Arc::new(payload),
+            retained_bytes,
+        }
+    }
+
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.payload.downcast_ref()
+    }
+
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained_bytes
+    }
+}
 handle_type!(WasmChangeCursorHandle);
 handle_type!(WasmResolutionCursorHandle);
 handle_type!(WasmEditCursorHandle);
@@ -1823,6 +1864,26 @@ pub trait WasmComponentActor: Send {
         &mut self,
         document: WasmDocumentHandle,
     ) -> Result<WasmDocumentHandle, LixError>;
+
+    /// Captures runtime-private immutable state without serializing it through
+    /// the Component boundary. Implementations that cannot externalize a
+    /// document return `None` and retain the normal hydration path.
+    async fn checkpoint_document(
+        &mut self,
+        _document: WasmDocumentHandle,
+    ) -> Result<Option<WasmDocumentCheckpoint>, LixError> {
+        Ok(None)
+    }
+
+    /// Restores a compatible runtime-private checkpoint into this fresh actor.
+    async fn restore_document(
+        &mut self,
+        _checkpoint: &WasmDocumentCheckpoint,
+    ) -> Result<WasmDocumentHandle, LixError> {
+        Err(invalid_param(
+            "this component actor does not support decoded document checkpoints",
+        ))
+    }
 
     async fn open_file(
         &mut self,
