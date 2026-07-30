@@ -8909,7 +8909,6 @@ fn transaction_write_branch_ids(write: &TransactionWrite) -> BTreeSet<String> {
     }
 }
 
-#[cfg(feature = "storage-benches")]
 fn transaction_write_row_count(write: &TransactionWrite) -> usize {
     match write {
         TransactionWrite::Rows { rows, .. } => rows.len(),
