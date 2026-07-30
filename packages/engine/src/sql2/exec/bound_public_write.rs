@@ -3,6 +3,7 @@ use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use serde_json::Value as JsonValue;
+use tracing::Instrument;
 
 use crate::changelog::CommitId;
 use crate::common::{
@@ -129,6 +130,11 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     let mut write_rows = RawWriteBatch::with_capacity(parameter_batch.num_rows());
     let mut unique_identities =
         std::collections::HashSet::with_capacity(parameter_batch.num_rows());
+    let certification_span = tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.entity_insert_parameter_batch.certify"
+    )
+    .entered();
     for row_index in 0..parameter_batch.num_rows() {
         let params = super::write::parameter_row(parameter_batch, row_index)
             .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
@@ -162,7 +168,18 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         }
         write_rows.append_taken_row(&mut row, 0);
     }
-    let committed = scan_entity_conflict_candidates(ctx, &spec, &write_rows).await?;
+    drop(certification_span);
+    let committed = scan_entity_conflict_candidates(ctx, &spec, &write_rows)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_insert_parameter_batch.conflict_scan"
+        ))
+        .await?;
+    let conflict_attribution_span = tracing::debug_span!(
+        target: "lix_perf",
+        "lix.perf.entity_insert_parameter_batch.conflict_attribution"
+    )
+    .entered();
     let committed_conflict = if committed.is_empty() {
         None
     } else {
@@ -228,7 +245,13 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         }
         conflict
     };
-    stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await?;
+    drop(conflict_attribution_span);
+    stage_rows(ctx, TransactionWriteMode::Insert, write_rows)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.entity_insert_parameter_batch.stage_rows"
+        ))
+        .await?;
     if let Some(error) = committed_conflict {
         return Err(error);
     }
