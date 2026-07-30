@@ -23,7 +23,8 @@ use crate::functions::FunctionContext;
 use crate::json_store::{JsonStoreContext, JsonWritePlacementRef, NormalizedJsonRef};
 use crate::live_state::{
     HotTrackedSnapshot, MaterializedLiveStateRow, TrackedHeadContext, TrackedWorkingDiffEpoch,
-    WorkingDiffIndexCoverage, stage_tracked_working_diff_epoch,
+    WorkingDiffIndexCoverage, stage_delete_tracked_working_diff_epoch,
+    stage_tracked_working_diff_epoch,
 };
 use crate::storage_adapter::{StorageAdapterRead, StoragePrecondition, StorageWriteSet};
 use crate::tracked_state::{
@@ -259,6 +260,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &commit_rows,
         &selected_change_records,
+        &host_certified_file_schemas,
     )?;
 
     let staged_commits = stage_changelog_commits(
@@ -346,10 +348,13 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         );
     }
     stage_checkpoint_working_diff_epochs(
+        read,
         &mut writes,
         &prepared_writes.checkpoint_publications,
         &staged_hot_heads.controls,
-    )?;
+        &branch_control_observations,
+    )
+    .await?;
     let published_branch_controls = stage_branch_head_control_publications(
         read,
         &mut writes,
@@ -810,6 +815,7 @@ fn tracked_commit_delta_from_state_row(
         ),
         origin_key: row.origin_key.map(crate::common::SharedStr::as_str),
         authored: true,
+        certified: false,
     })
 }
 
@@ -865,6 +871,7 @@ fn tracked_commit_delta_from_selected_change_ref<'a>(
         }),
         origin_key: record.and_then(|record| record.origin_key.as_deref()),
         authored: false,
+        certified: false,
     })
 }
 
@@ -911,13 +918,15 @@ fn current_state_delta_from_state_row(
 fn host_certified_batch_owns_live_row(
     row: PreparedStateRowRef<'_>,
     branch_id: &str,
+    certified_commit_id: CommitId,
     host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 ) -> bool {
     // A complete certified batch replaces only the incoming live rows. An
     // ownership transition may stage tombstones for the previous plugin under
     // the same file/schema pair; those must remain HOT overlays so the old
     // entity identities disappear and collection counts are decremented.
-    row.snapshot.is_some()
+    row.commit_id == Some(certified_commit_id)
+        && row.snapshot.is_some()
         && row.file_id.is_some_and(|file_id| {
             host_certified_file_schemas
                 .get(branch_id)
@@ -1090,6 +1099,7 @@ fn stage_tracked_commit_delta_index(
     tracked_roots: &[PendingTrackedRoot],
     commit_rows: &[FinalizedCommitRow],
     selected_change_records: &HashMap<SelectedChangeKey, ChangeRecord>,
+    host_certified_file_schemas: &BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 ) -> Result<(), LixError> {
     let commit_rows = commit_rows
         .iter()
@@ -1116,7 +1126,15 @@ fn stage_tracked_commit_delta_index(
         for &row_index in state_row_indices {
             let row = state_rows.row(row_index);
             addressable.push(row.addressable_change_id);
-            deltas.push(tracked_commit_delta_from_state_row(row)?);
+            let mut delta = tracked_commit_delta_from_state_row(row)?;
+            delta.certified = root.publish_head
+                && host_certified_batch_owns_live_row(
+                    row,
+                    &root.branch_id,
+                    root.commit_id,
+                    host_certified_file_schemas,
+                );
+            deltas.push(delta);
         }
         for change_ref in selected_changes(&staged.selected_change_batches) {
             let key = selected_change_key(change_ref);
@@ -2060,6 +2078,7 @@ async fn stage_tracked_head(
                     !host_certified_batch_owns_live_row(
                         row,
                         &root.branch_id,
+                        root.commit_id,
                         host_certified_file_schemas,
                     )
                 })
@@ -2474,10 +2493,12 @@ fn selected_tracked_ref_untracked_collision_error(
 /// A checkpoint cleans exactly its selected interval changes in the current
 /// hot generation. Unchanged rows were already clean, so rotating to an empty
 /// sparse dirty-key index starts the next epoch without a full-state rewrite.
-fn stage_checkpoint_working_diff_epochs(
+async fn stage_checkpoint_working_diff_epochs(
+    read: &(impl StorageAdapterRead + ?Sized),
     writes: &mut StorageWriteSet,
     publications: &[crate::gc::CheckpointPublication],
     controls: &BTreeMap<String, BranchHeadControl>,
+    observations: &BTreeMap<String, BranchHeadControlObservation>,
 ) -> Result<(), LixError> {
     let mut branches = BTreeSet::new();
     for publication in publications {
@@ -2516,6 +2537,22 @@ fn stage_checkpoint_working_diff_epochs(
         // the remaining working diff from the two durable roots.
         if control.head_commit_id != recovery.checkpoint_commit_id {
             continue;
+        }
+        if let Some(previous) = observations
+            .get(&recovery.branch_id)
+            .and_then(|observation| observation.control)
+            && let Some(previous_checkpoint) = previous.working_diff_checkpoint_commit_id
+            && (previous_checkpoint != recovery.checkpoint_commit_id
+                || previous.generation != control.generation)
+        {
+            stage_delete_tracked_working_diff_epoch(
+                read,
+                writes,
+                &recovery.branch_id,
+                previous_checkpoint,
+                previous.generation,
+            )
+            .await?;
         }
         stage_tracked_working_diff_epoch(
             writes,
@@ -3543,6 +3580,9 @@ mod tests {
         new_plugin_live.entity_pk = EntityPk::single("new-plugin-line");
         new_plugin_live.schema_key = "git_text_line_v2".into();
         new_plugin_live.file_id = Some("file-a".into());
+        let published_commit_id = new_plugin_live
+            .commit_id
+            .expect("test live row should have a commit");
 
         let certified = BTreeMap::from([(
             "main".to_string(),
@@ -3556,6 +3596,7 @@ mod tests {
             !host_certified_batch_owns_live_row(
                 old_plugin_tombstone.borrowed(),
                 "main",
+                published_commit_id,
                 &certified,
             ),
             "the previous owner's tombstone must remain in HOT publication",
@@ -3567,8 +3608,50 @@ mod tests {
             "the retained row must decrement collection counts as a deletion",
         );
         assert!(
-            host_certified_batch_owns_live_row(new_plugin_live.borrowed(), "main", &certified),
+            host_certified_batch_owns_live_row(
+                new_plugin_live.borrowed(),
+                "main",
+                published_commit_id,
+                &certified,
+            ),
             "the certified batch owns the replacement live row",
+        );
+    }
+
+    #[test]
+    fn host_certified_batch_does_not_own_intermediate_commit_rows() {
+        let published_commit_id = commit_id("published-certified-batch");
+        let mut published = tracked_branch_row("main", "published-live-row");
+        published.commit_id = Some(published_commit_id);
+        published.schema_key = "git_text_line_v2".into();
+        published.file_id = Some("file-a".into());
+
+        let mut intermediate = published.clone();
+        intermediate.commit_id = Some(commit_id("intermediate-write"));
+        intermediate.change_id = Some(change_id("intermediate-live-row"));
+
+        let certified = BTreeMap::from([(
+            "main".to_string(),
+            BTreeMap::from([(
+                "file-a".to_string(),
+                BTreeSet::from(["git_text_line_v2".to_string()]),
+            )]),
+        )]);
+
+        assert!(host_certified_batch_owns_live_row(
+            published.borrowed(),
+            "main",
+            published_commit_id,
+            &certified,
+        ));
+        assert!(
+            !host_certified_batch_owns_live_row(
+                intermediate.borrowed(),
+                "main",
+                published_commit_id,
+                &certified,
+            ),
+            "an intermediate commit has no certified batch under its own commit id",
         );
     }
 

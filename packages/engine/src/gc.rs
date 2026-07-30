@@ -567,6 +567,52 @@ where
         pending.extend(commits.parent_commit_ids(commit).iter().copied());
     }
 
+    // A selected cascade tombstone intentionally carries no payload and
+    // cannot be promoted into canonical change authority. If it is the only
+    // surviving reference to a change, retain the authored owner's commit
+    // ancestry as an authority root. Ordinary selected rows carry matching
+    // identity and are promoted below, so they do not retain dead history.
+    let referenced_change_ids = live_commits
+        .iter()
+        .filter_map(|commit_id| packed.commits.get(commit_id))
+        .flat_map(|entry| entry.members.iter().map(|member| member.value.change_id))
+        .collect::<BTreeSet<_>>();
+    let promotable_change_ids = live_commits
+        .iter()
+        .filter_map(|commit_id| packed.commits.get(commit_id))
+        .flat_map(|entry| entry.members.iter())
+        .filter(|member| member.authored || member.is_selected_payload_ref())
+        .map(|member| member.value.change_id)
+        .collect::<BTreeSet<_>>();
+    let mut authority_roots = packed
+        .commits
+        .iter()
+        .filter(|(commit_id, _)| !live_commits.contains(commit_id))
+        .filter_map(|(commit_id, entry)| {
+            entry
+                .members
+                .iter()
+                .any(|member| {
+                    member.authored
+                        && referenced_change_ids.contains(&member.value.change_id)
+                        && !promotable_change_ids.contains(&member.value.change_id)
+                })
+                .then_some(*commit_id)
+        })
+        .collect::<Vec<_>>();
+    while let Some(commit_id) = authority_roots.pop() {
+        if !live_commits.insert(commit_id) {
+            continue;
+        }
+        let commit = commits.get(commit_id).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                format!("canonical authority references missing commit '{commit_id}'"),
+            )
+        })?;
+        authority_roots.extend(commits.parent_commit_ids(commit).iter().copied());
+    }
+
     let standalone_root_ids = roots
         .iter()
         .filter_map(|root| match root {
@@ -651,6 +697,49 @@ where
         writes,
         dead_packed_change_ids.difference(&live_change_ids).copied(),
     );
+    // Selected commit rows persist only a canonical-reference tag. When GC
+    // removes the original authored owner, promote a surviving full selected
+    // row in-place before relocating the locator. This keeps immutable
+    // history self-contained without retaining an otherwise dead commit.
+    let mut promoted_locators = Vec::new();
+    for commit_id in &live_commits {
+        let Some(entry) = packed.commits.get(commit_id) else {
+            continue;
+        };
+        if !entry.members.iter().any(|member| {
+            dead_packed_change_ids.contains(&member.value.change_id)
+                && member.is_selected_payload_ref()
+        }) {
+            continue;
+        }
+        let deltas = entry
+            .members
+            .iter()
+            .map(|member| crate::tracked_state::TrackedStateCommitDeltaRef {
+                delta: crate::tracked_state::TrackedStateDeltaRef {
+                    schema_key: &member.key.schema_key,
+                    file_id: member.key.file_id.as_deref(),
+                    entity_pk: &member.key.entity_pk,
+                    change_id: member.value.change_id,
+                    commit_id: *commit_id,
+                    deleted: member.value.deleted,
+                    created_at: member.value.created_at,
+                    updated_at: member.value.updated_at,
+                },
+                snapshot: member.change.snapshot.as_ref_slot(),
+                metadata: member.change.metadata.as_ref_slot(),
+                origin_key: member.change.origin_key.as_deref(),
+                authored: member.authored
+                    || (dead_packed_change_ids.contains(&member.value.change_id)
+                        && member.is_selected_payload_ref()),
+                certified: member.is_certified_payload_ref(),
+            })
+            .collect::<Vec<_>>();
+        promoted_locators.extend(authoritative_promoted_locators(
+            &deltas,
+            crate::tracked_state::stage_commit_deltas(writes, &deltas)?,
+        )?);
+    }
     let relocated_locators = live_commits
         .iter()
         .filter_map(|commit_id| {
@@ -664,7 +753,9 @@ where
             entry.members.iter().filter_map(move |member| {
                 dead_packed_change_ids
                     .contains(&member.value.change_id)
-                    .then_some(crate::tracked_state::CommitDeltaChangeLocator {
+                    .then_some(member)
+                    .filter(|member| member.authored)
+                    .map(|member| crate::tracked_state::CommitDeltaChangeLocator {
                         change_id: member.value.change_id,
                         commit_id,
                         segment_index: member.segment_index,
@@ -673,6 +764,15 @@ where
                     })
             })
         })
+        .fold(BTreeMap::new(), |mut locators, locator| {
+            locators.entry(locator.change_id).or_insert(locator);
+            locators
+        })
+        .into_values()
+        .collect::<Vec<_>>();
+    let relocated_locators = promoted_locators
+        .into_iter()
+        .chain(relocated_locators)
         .fold(BTreeMap::new(), |mut locators, locator| {
             locators.entry(locator.change_id).or_insert(locator);
             locators
@@ -725,6 +825,36 @@ where
         },
         repair: GcRepairSet::default(),
     })
+}
+
+fn authoritative_promoted_locators(
+    deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
+    staged_locators: Vec<crate::tracked_state::CommitDeltaChangeLocator>,
+) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, LixError> {
+    if staged_locators.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "promoted commit-delta locator count does not match its members",
+        ));
+    }
+    // The caller supplies decoded members and staged locators in the same
+    // physical-key order. Only rows that are authoritative after promotion
+    // may become canonical locator targets; selected cascade tombstones
+    // intentionally remain payload-free even when another row causes this
+    // commit to be packed again.
+    let mut promoted = Vec::new();
+    for (delta, locator) in deltas.iter().zip(staged_locators) {
+        if delta.delta.change_id != locator.change_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "promoted commit-delta locator order does not match its members",
+            ));
+        }
+        if delta.authored {
+            promoted.push(locator);
+        }
+    }
+    Ok(promoted)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -859,6 +989,7 @@ fn elapsed_micros(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
@@ -1398,6 +1529,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn promoted_locator_filter_excludes_selected_tombstones() {
+        let commit_id = CommitId::for_test_label("mixed-promotion-commit");
+        let change_id = ChangeId::for_test_label("shared-promotion-change");
+        let mut tombstone =
+            packed_change("selected-tombstone", "a-selected-tombstone", JsonSlot::None);
+        tombstone.change_id = change_id;
+        let mut promoted = packed_change("promoted-owner", "z-promoted-owner", JsonSlot::None);
+        promoted.change_id = change_id;
+        let unrelated_change_id = ChangeId::for_test_label("unrelated-authored-change");
+        let mut unrelated = packed_change(
+            "unrelated-authority",
+            "zz-unrelated-authority",
+            JsonSlot::None,
+        );
+        unrelated.change_id = unrelated_change_id;
+        let changes = [tombstone, promoted, unrelated];
+        let mut deltas = commit_delta_refs(commit_id, &changes);
+        deltas[0].authored = false;
+        let locators = vec![
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id,
+                commit_id,
+                segment_index: 0,
+                ordinal: 0,
+            },
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id,
+                commit_id,
+                segment_index: 0,
+                ordinal: 1,
+            },
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id: unrelated_change_id,
+                commit_id,
+                segment_index: 1,
+                ordinal: 0,
+            },
+        ];
+
+        let filtered = super::authoritative_promoted_locators(&deltas, locators)
+            .expect("mixed promotion locators should filter");
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|locator| locator.change_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([change_id, unrelated_change_id]),
+        );
+    }
+
     #[tokio::test]
     async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
         let storage = Memory::new();
@@ -1483,7 +1667,7 @@ mod tests {
                     snapshot: snapshot_slot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
                 }],
-                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 None,
@@ -1595,6 +1779,7 @@ mod tests {
                 metadata: change.metadata.as_ref_slot(),
                 origin_key: change.origin_key.as_deref(),
                 authored: true,
+                certified: false,
             })
             .collect()
     }

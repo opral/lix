@@ -392,6 +392,7 @@ impl PackedHistoryDelta {
             metadata: JsonSlotRef::None,
             origin_key: None,
             authored: true,
+            certified: false,
         }
     }
 }
