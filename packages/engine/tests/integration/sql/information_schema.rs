@@ -3,6 +3,58 @@ use lix_engine::{LixError, Value};
 use super::assert_rows_eq;
 
 simulation_test!(
+    information_schema_columns_select_star_is_safe_for_public_results,
+    |sim| async move {
+        let engine = sim.boot_engine().await;
+        let session = sim.wrap_session(
+            engine
+                .open_workspace_session()
+                .await
+                .expect("main session should open"),
+            &engine,
+        );
+
+        let result = session
+            .execute(
+                "SELECT * FROM information_schema.columns WHERE table_name = 'lix_file'",
+                &[],
+            )
+            .await
+            .expect("the complete lix_file column contract should be readable");
+        assert!(!result.rows().is_empty());
+        assert!(
+            result
+                .columns()
+                .iter()
+                .any(|column| column == "lix_value_kind")
+        );
+        assert!(
+            result
+                .columns()
+                .iter()
+                .any(|column| column == "lix_insert_policy")
+        );
+
+        let data_row = result
+            .rows()
+            .iter()
+            .find(|row| {
+                row.value("column_name")
+                    .expect("column_name should be present")
+                    == &Value::Text("data".to_string())
+            })
+            .expect("lix_file data column should be described");
+        assert_eq!(
+            data_row
+                .value("character_octet_length")
+                .expect("character_octet_length should be present"),
+            &Value::Null,
+            "unbounded binary data must not advertise an artificial i64::MAX length",
+        );
+    }
+);
+
+simulation_test!(
     information_schema_exposes_executable_lix_column_contract,
     |sim| async move {
         let engine = sim.boot_engine().await;
