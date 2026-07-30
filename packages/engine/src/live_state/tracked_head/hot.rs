@@ -486,6 +486,7 @@ pub(crate) async fn stage_certified_entity_batches(
         Vec::new()
     };
 
+    let mut inherited_manifests = BTreeMap::new();
     for (branch_id, control) in controls {
         let source_generations = observations
             .get(branch_id)
@@ -527,15 +528,28 @@ pub(crate) async fn stage_certified_entity_batches(
                 }
                 let mut key = control.generation.as_uuid().as_bytes().to_vec();
                 key.extend_from_slice(suffix);
-                writes.put(
-                    CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
-                    StorageKey(Bytes::from(key)),
-                    StorageValue {
-                        bytes: full_value_bytes(entry.value)?,
-                    },
-                );
+                let value = full_value_bytes(entry.value)?;
+                match inherited_manifests.entry(key) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry)
+                        if entry.get() == &value => {}
+                    std::collections::btree_map::Entry::Occupied(_) => {
+                        return Err(head_value_error(
+                            "certified manifests disagree for the same inherited key",
+                        ));
+                    }
+                }
             }
         }
+    }
+    for (key, value) in inherited_manifests {
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_MANIFEST_SPACE,
+            StorageKey(Bytes::from(key)),
+            StorageValue { bytes: value },
+        );
     }
 
     for file in file_writes {
@@ -6539,6 +6553,7 @@ mod tests {
     async fn branch_creation_inherits_certified_manifests_from_same_head() {
         const EMPTY_BRANCH: &str = "a-empty";
         const DONOR_BRANCH: &str = "donor";
+        const SECOND_DONOR_BRANCH: &str = "donor-two";
         const CREATED_BRANCH: &str = "created";
         const FILE_ID: &str = "inherited.csv";
         const SCHEMA_KEY: &str = "inherited_row";
@@ -6561,6 +6576,11 @@ mod tests {
         let empty_control = BranchHeadControl {
             generation: CommitId::for_test_label("certified-inherited-empty"),
             ref_change_id: ChangeId::for_test_label("certified-inherited-empty-ref"),
+            ..donor_control
+        };
+        let second_donor_control = BranchHeadControl {
+            generation: CommitId::for_test_label("certified-inherited-donor-two"),
+            ref_change_id: ChangeId::for_test_label("certified-inherited-donor-two-ref"),
             ..donor_control
         };
         let creates = WasmCreateContext {
@@ -6619,6 +6639,35 @@ mod tests {
             .commit_write_set(writes, StorageWriteOptions::default())
             .await
             .expect("donor certified batch should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("second donor read should open");
+        let mut writes = StorageWriteSet::new();
+        stage_branch_head_control(&mut writes, SECOND_DONOR_BRANCH, second_donor_control)
+            .expect("second donor control should stage");
+        stage_certified_entity_batches(
+            &read,
+            &mut writes,
+            &[],
+            &BTreeMap::from([(SECOND_DONOR_BRANCH.to_owned(), second_donor_control)]),
+            &BTreeMap::from([(
+                SECOND_DONOR_BRANCH.to_owned(),
+                crate::branch::BranchHeadControlObservation {
+                    control: None,
+                    raw_token: None,
+                },
+            )]),
+            &BTreeMap::new(),
+        )
+        .await
+        .expect("second donor should inherit certified manifests");
+        drop(read);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("second donor certified manifests should commit");
 
         let created_control = BranchHeadControl {
             generation: created_generation,
