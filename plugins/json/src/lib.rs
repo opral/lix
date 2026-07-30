@@ -16,10 +16,12 @@ const SCALAR_INDEX_STATE: &[u8] = b"json/scalar-index-v1";
 const SCALAR_SHIFTS_STATE: &[u8] = b"json/scalar-shifts-v1";
 const ID_NAMESPACE_STATE: &[u8] = b"json/id-namespace-v1";
 const FALLBACK_ENTITIES_STATE: &[u8] = b"json/fallback-entities-v1";
-const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS1";
-const SCALAR_INDEX_HEADER_BYTES: u32 = 12;
+const SCALAR_INDEX_MAGIC: &[u8; 4] = b"JSS2";
+const FALLBACK_ENTITIES_MAGIC: &[u8; 4] = b"JFE2";
+const SCALAR_INDEX_HEADER_BYTES: u32 = 16;
 const SCALAR_INDEX_ENTRY_BYTES: u32 = 20;
 const SCALAR_PAGE_BYTES: usize = 1024 * 1024;
+const STATE_PAGE_BYTES: usize = 1024 * 1024;
 
 impl sdk::FormatPlugin for JsonPlugin {
     fn entities_changed(
@@ -52,7 +54,7 @@ impl sdk::FormatPlugin for JsonPlugin {
             .entities_changed(&changes)
             .map_err(sdk::Error::invalid_input)?;
         sink.replace_file(&apply_edits(before, &edits)?)?;
-        store_fallback_entities(sink, &successor)?;
+        store_fallback_entities(&update.before, sink, &successor)?;
         Ok(())
     }
 
@@ -109,17 +111,15 @@ impl sdk::FormatPlugin for JsonPlugin {
         let (document, changes) = document
             .file_changed(&splices, create_namespace)
             .map_err(sdk::Error::invalid_input)?;
-        let old_page_count = scalar_page_count(update)?;
-        update.successor.put_state(
-            FALLBACK_ENTITIES_STATE,
-            &encode_entity_records(
-                &document
-                    .entity_records()
-                    .map_err(sdk::Error::invalid_input)?,
-            )?,
-        )?;
+        store_fallback_entities_in_transaction(&update.before, &update.successor, &document)?;
+        let (old_index_page_count, old_scalar_page_count) = scalar_page_counts(update)?;
         update.successor.delete_state(SCALAR_INDEX_STATE)?;
-        for ordinal in 0..old_page_count {
+        for ordinal in 0..old_index_page_count {
+            update
+                .successor
+                .delete_state(&scalar_index_page_key(ordinal))?;
+        }
+        for ordinal in 0..old_scalar_page_count {
             update.successor.delete_state(&scalar_page_key(ordinal))?;
         }
         update.successor.delete_state(SCALAR_SHIFTS_STATE)?;
@@ -134,12 +134,20 @@ fn read_fallback_document(
     path: Option<&str>,
     namespace: IdNamespace,
 ) -> sdk::Result<Document> {
-    let Some(encoded) = root.get_state(FALLBACK_ENTITIES_STATE)? else {
+    let Some(manifest) = root.get_state(FALLBACK_ENTITIES_STATE)? else {
         return Document::open_file(accepted, path, namespace)
             .map(|(document, _)| document)
             .map_err(sdk::Error::invalid_input);
     };
-    let (document, _) = Document::open_entities(decode_entity_records(&encoded)?)
+    let (record_count, page_count) = decode_fallback_manifest(&manifest)?;
+    let mut pages = Vec::with_capacity(page_count as usize);
+    for ordinal in 0..page_count {
+        pages.push(
+            root.get_state(&fallback_entity_page_key(ordinal))?
+                .ok_or_else(|| sdk::Error::invalid_input("JSON fallback page disappeared"))?,
+        );
+    }
+    let (document, _) = Document::open_entities(decode_entity_records(record_count, pages)?)
         .map_err(sdk::Error::invalid_input)?;
     let rendered = document.bytes();
     if rendered == accepted {
@@ -156,45 +164,131 @@ fn read_fallback_document(
         .map_err(sdk::Error::invalid_input)
 }
 
-fn store_fallback_entities(sink: &mut sdk::Sink<'_>, document: &Document) -> sdk::Result<()> {
+fn store_fallback_entities(
+    before: &sdk::Root<'_>,
+    sink: &mut sdk::Sink<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
     let records = document
         .entity_records()
         .map_err(sdk::Error::invalid_input)?;
-    sink.put_state(FALLBACK_ENTITIES_STATE, &encode_entity_records(&records)?)
+    let old_page_count = fallback_entity_page_count(before)?;
+    let (manifest, pages) = encode_entity_records(&records)?;
+    sink.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        sink.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        sink.delete_state(&fallback_entity_page_key(ordinal))?;
+    }
+    let (index_page_count, scalar_page_count) = scalar_page_counts_root(before)?;
+    sink.delete_state(SCALAR_INDEX_STATE)?;
+    for ordinal in 0..index_page_count {
+        sink.delete_state(&scalar_index_page_key(ordinal))?;
+    }
+    for ordinal in 0..scalar_page_count {
+        sink.delete_state(&scalar_page_key(ordinal))?;
+    }
+    sink.delete_state(SCALAR_SHIFTS_STATE)?;
+    Ok(())
 }
 
-fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    output.extend_from_slice(
-        &u32::try_from(records.len())
-            .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback entities"))?
-            .to_le_bytes(),
-    );
+fn store_fallback_entities_in_transaction(
+    before: &sdk::Root<'_>,
+    successor: &sdk::Transaction<'_>,
+    document: &Document,
+) -> sdk::Result<()> {
+    let records = document
+        .entity_records()
+        .map_err(sdk::Error::invalid_input)?;
+    let old_page_count = fallback_entity_page_count(before)?;
+    let (manifest, pages) = encode_entity_records(&records)?;
+    successor.put_state(FALLBACK_ENTITIES_STATE, &manifest)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&fallback_entity_page_key(ordinal as u32), page)?;
+    }
+    for ordinal in pages.len() as u32..old_page_count {
+        successor.delete_state(&fallback_entity_page_key(ordinal))?;
+    }
+    Ok(())
+}
+
+fn encode_entity_records(records: &[EntityRecord]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
+    let record_count = u32::try_from(records.len())
+        .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback entities"))?;
+    let mut pages = Vec::new();
+    let mut page = Vec::with_capacity(STATE_PAGE_BYTES);
     for record in records {
-        push_text(&mut output, &record.schema_key)?;
-        output.extend_from_slice(
+        let mut encoded = Vec::new();
+        push_text(&mut encoded, &record.schema_key)?;
+        encoded.extend_from_slice(
             &u32::try_from(record.entity_pk.len())
                 .map_err(|_| sdk::Error::limit_exceeded("too many JSON key components"))?
                 .to_le_bytes(),
         );
         for component in &record.entity_pk {
-            push_text(&mut output, component)?;
+            push_text(&mut encoded, component)?;
         }
-        output.extend_from_slice(
+        encoded.extend_from_slice(
             &u32::try_from(record.snapshot.len())
                 .map_err(|_| sdk::Error::limit_exceeded("JSON snapshot is too large"))?
                 .to_le_bytes(),
         );
-        output.extend_from_slice(&record.snapshot);
+        encoded.extend_from_slice(&record.snapshot);
+        push_paged_state(&mut pages, &mut page, &encoded);
     }
-    Ok(output)
+    if !page.is_empty() {
+        pages.push(page);
+    }
+    let mut manifest = Vec::with_capacity(12);
+    manifest.extend_from_slice(FALLBACK_ENTITIES_MAGIC);
+    manifest.extend_from_slice(&record_count.to_le_bytes());
+    manifest.extend_from_slice(
+        &u32::try_from(pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many JSON fallback pages"))?
+            .to_le_bytes(),
+    );
+    Ok((manifest, pages))
 }
 
-fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
-    let mut input = StateReader { bytes, offset: 0 };
-    let count = input.u32()? as usize;
-    let mut records = Vec::with_capacity(count.min(bytes.len() / 16));
-    for _ in 0..count {
+fn push_paged_state(pages: &mut Vec<Vec<u8>>, page: &mut Vec<u8>, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        let available = STATE_PAGE_BYTES - page.len();
+        let take = available.min(bytes.len());
+        page.extend_from_slice(&bytes[..take]);
+        bytes = &bytes[take..];
+        if page.len() == STATE_PAGE_BYTES {
+            pages.push(std::mem::replace(
+                page,
+                Vec::with_capacity(STATE_PAGE_BYTES),
+            ));
+        }
+    }
+}
+
+fn decode_fallback_manifest(bytes: &[u8]) -> sdk::Result<(u32, u32)> {
+    if bytes.len() != 12 || bytes.get(..4) != Some(FALLBACK_ENTITIES_MAGIC) {
+        return Err(sdk::Error::invalid_input(
+            "unsupported JSON fallback entity manifest",
+        ));
+    }
+    Ok((
+        u32::from_le_bytes(bytes[4..8].try_into().expect("record count")),
+        u32::from_le_bytes(bytes[8..12].try_into().expect("page count")),
+    ))
+}
+
+fn fallback_entity_page_count(root: &sdk::Root<'_>) -> sdk::Result<u32> {
+    root.get_state(FALLBACK_ENTITIES_STATE)?
+        .map(|manifest| decode_fallback_manifest(&manifest).map(|(_, pages)| pages))
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+fn decode_entity_records(record_count: u32, pages: Vec<Vec<u8>>) -> sdk::Result<Vec<EntityRecord>> {
+    let mut input = PagedStateReader::new(pages);
+    let mut records = Vec::with_capacity(record_count as usize);
+    for _ in 0..record_count {
         let schema_key = input.text()?;
         let component_count = input.u32()? as usize;
         let mut entity_pk = Vec::with_capacity(component_count.min(4));
@@ -202,14 +296,14 @@ fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
             entity_pk.push(input.text()?);
         }
         let snapshot_len = input.u32()? as usize;
-        let snapshot = input.bytes(snapshot_len)?.to_vec();
+        let snapshot = input.bytes(snapshot_len)?;
         records.push(EntityRecord {
             schema_key,
             entity_pk,
             snapshot,
         });
     }
-    if input.offset != bytes.len() {
+    if !input.finished() {
         return Err(sdk::Error::invalid_input(
             "JSON fallback state contains trailing bytes",
         ));
@@ -217,36 +311,75 @@ fn decode_entity_records(bytes: &[u8]) -> sdk::Result<Vec<EntityRecord>> {
     Ok(records)
 }
 
-struct StateReader<'a> {
-    bytes: &'a [u8],
+struct PagedStateReader {
+    pages: Vec<Vec<u8>>,
+    page: usize,
     offset: usize,
 }
 
-impl StateReader<'_> {
-    fn bytes(&mut self, length: usize) -> sdk::Result<&[u8]> {
-        let end = self
-            .offset
-            .checked_add(length)
-            .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state range overflowed"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state is truncated"))?;
-        self.offset = end;
-        Ok(value)
+impl PagedStateReader {
+    fn new(pages: Vec<Vec<u8>>) -> Self {
+        Self {
+            pages,
+            page: 0,
+            offset: 0,
+        }
+    }
+
+    fn bytes(&mut self, mut length: usize) -> sdk::Result<Vec<u8>> {
+        let mut output = Vec::with_capacity(length);
+        while length > 0 {
+            let page = self
+                .pages
+                .get(self.page)
+                .ok_or_else(|| sdk::Error::invalid_input("JSON fallback state is truncated"))?;
+            let available = page.len().saturating_sub(self.offset);
+            if available == 0 {
+                self.page += 1;
+                self.offset = 0;
+                continue;
+            }
+            let take = available.min(length);
+            output.extend_from_slice(&page[self.offset..self.offset + take]);
+            self.offset += take;
+            length -= take;
+        }
+        Ok(output)
     }
 
     fn u32(&mut self) -> sdk::Result<u32> {
-        Ok(u32::from_le_bytes(self.bytes(4)?.try_into().map_err(
-            |_| sdk::Error::invalid_input("invalid JSON fallback u32"),
-        )?))
+        Ok(u32::from_le_bytes(
+            self.bytes(4)?
+                .try_into()
+                .expect("paged reader returned four bytes"),
+        ))
     }
 
     fn text(&mut self) -> sdk::Result<String> {
         let length = self.u32()? as usize;
-        String::from_utf8(self.bytes(length)?.to_vec())
+        String::from_utf8(self.bytes(length)?)
             .map_err(|_| sdk::Error::invalid_input("JSON fallback text is not UTF-8"))
     }
+
+    fn finished(&self) -> bool {
+        match self.pages.get(self.page) {
+            None => true,
+            Some(page) => {
+                self.offset == page.len()
+                    && self
+                        .pages
+                        .iter()
+                        .skip(self.page.saturating_add(1))
+                        .all(Vec::is_empty)
+            }
+        }
+    }
+}
+
+fn fallback_entity_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"json/fallback-entity-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
 }
 
 fn read_namespace(root: &sdk::Root<'_>, key: &[u8]) -> sdk::Result<Option<IdNamespace>> {
@@ -319,13 +452,16 @@ fn apply_file_splices(mut bytes: Vec<u8>, splices: &[InputSplice<'_>]) -> sdk::R
 }
 
 fn store_scalar_state(successor: &sdk::Transaction, document: &Document) -> sdk::Result<()> {
-    let (index, pages) = encode_scalar_state(
+    let state = encode_scalar_state(
         &document
             .arena_scalars()
             .map_err(sdk::Error::invalid_input)?,
     )?;
-    successor.put_state(SCALAR_INDEX_STATE, &index)?;
-    for (ordinal, page) in pages.iter().enumerate() {
+    successor.put_state(SCALAR_INDEX_STATE, &state.manifest)?;
+    for (ordinal, page) in state.index_pages.iter().enumerate() {
+        successor.put_state(&scalar_index_page_key(ordinal as u32), page)?;
+    }
+    for (ordinal, page) in state.scalar_pages.iter().enumerate() {
         successor.put_state(&scalar_page_key(ordinal as u32), page)?;
     }
     Ok(())
@@ -336,10 +472,15 @@ fn sparse_scalar_change(
     edit: &sdk::InputSplice,
     insert: &[u8],
 ) -> sdk::Result<Option<(EntityChange, Vec<u8>)>> {
-    let state_len = match update.before.state_len(SCALAR_INDEX_STATE)? {
+    let manifest_len = match update.before.state_len(SCALAR_INDEX_STATE)? {
         Some(length) => length,
         None => return Ok(None),
     };
+    if manifest_len != u64::from(SCALAR_INDEX_HEADER_BYTES) {
+        return Err(sdk::Error::invalid_input(
+            "invalid JSON scalar index manifest length",
+        ));
+    }
     let header = update
         .before
         .read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
@@ -348,12 +489,6 @@ fn sparse_scalar_change(
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
     let count = u32::from_le_bytes(header[4..8].try_into().expect("fixed JSON index header"));
-    let index_end = u64::from(SCALAR_INDEX_HEADER_BYTES)
-        .checked_add(u64::from(count) * u64::from(SCALAR_INDEX_ENTRY_BYTES))
-        .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index overflowed"))?;
-    if index_end > state_len {
-        return Err(sdk::Error::invalid_input("truncated JSON scalar index"));
-    }
     let mut shifts = decode_scalar_shifts(
         update
             .before
@@ -436,8 +571,14 @@ fn sparse_scalar_change(
     Ok(Some((change, encode_scalar_shifts(&shifts))))
 }
 
-fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<(Vec<u8>, Vec<Vec<u8>>)> {
-    let mut pages = vec![Vec::with_capacity(SCALAR_PAGE_BYTES)];
+struct EncodedScalarState {
+    manifest: Vec<u8>,
+    index_pages: Vec<Vec<u8>>,
+    scalar_pages: Vec<Vec<u8>>,
+}
+
+fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<EncodedScalarState> {
+    let mut scalar_pages = vec![Vec::with_capacity(SCALAR_PAGE_BYTES)];
     let mut locations = Vec::with_capacity(scalars.len());
     for scalar in scalars {
         let metadata = encode_scalar_metadata(scalar)?;
@@ -446,46 +587,64 @@ fn encode_scalar_state(scalars: &[ArenaJsonScalar]) -> sdk::Result<(Vec<u8>, Vec
                 "one JSON scalar state exceeds the page limit",
             ));
         }
-        if !pages.last().expect("one page").is_empty()
-            && pages.last().expect("one page").len() + metadata.len() > SCALAR_PAGE_BYTES
+        if !scalar_pages.last().expect("one page").is_empty()
+            && scalar_pages.last().expect("one page").len() + metadata.len() > SCALAR_PAGE_BYTES
         {
-            pages.push(Vec::with_capacity(SCALAR_PAGE_BYTES));
+            scalar_pages.push(Vec::with_capacity(SCALAR_PAGE_BYTES));
         }
-        let page = u32::try_from(pages.len() - 1)
+        let page = u32::try_from(scalar_pages.len() - 1)
             .map_err(|_| sdk::Error::limit_exceeded("too many JSON scalar pages"))?;
-        let offset = u32::try_from(pages.last().expect("one page").len())
+        let offset = u32::try_from(scalar_pages.last().expect("one page").len())
             .map_err(|_| sdk::Error::limit_exceeded("JSON scalar page exceeds 4GiB"))?;
-        pages
+        scalar_pages
             .last_mut()
             .expect("one page")
             .extend_from_slice(&metadata);
         locations.push((page, offset, metadata.len() as u32));
     }
     if scalars.is_empty() {
-        pages.clear();
+        scalar_pages.clear();
     }
-    let mut index = Vec::with_capacity(
-        SCALAR_INDEX_HEADER_BYTES as usize + scalars.len() * SCALAR_INDEX_ENTRY_BYTES as usize,
-    );
-    index.extend_from_slice(SCALAR_INDEX_MAGIC);
-    index.extend_from_slice(
+    let entries_per_page = STATE_PAGE_BYTES / SCALAR_INDEX_ENTRY_BYTES as usize;
+    let mut index_pages = Vec::with_capacity(scalars.len().div_ceil(entries_per_page));
+    for chunk_start in (0..scalars.len()).step_by(entries_per_page) {
+        let chunk_end = (chunk_start + entries_per_page).min(scalars.len());
+        let mut page =
+            Vec::with_capacity((chunk_end - chunk_start) * SCALAR_INDEX_ENTRY_BYTES as usize);
+        for (scalar, (metadata_page, offset, length)) in scalars[chunk_start..chunk_end]
+            .iter()
+            .zip(&locations[chunk_start..chunk_end])
+        {
+            page.extend_from_slice(&scalar.start.to_le_bytes());
+            page.extend_from_slice(&scalar.length.to_le_bytes());
+            page.extend_from_slice(&metadata_page.to_le_bytes());
+            page.extend_from_slice(&offset.to_le_bytes());
+            page.extend_from_slice(&length.to_le_bytes());
+        }
+        index_pages.push(page);
+    }
+    let mut manifest = Vec::with_capacity(SCALAR_INDEX_HEADER_BYTES as usize);
+    manifest.extend_from_slice(SCALAR_INDEX_MAGIC);
+    manifest.extend_from_slice(
         &u32::try_from(scalars.len())
             .map_err(|_| sdk::Error::limit_exceeded("too many JSON scalars"))?
             .to_le_bytes(),
     );
-    index.extend_from_slice(
-        &u32::try_from(pages.len())
+    manifest.extend_from_slice(
+        &u32::try_from(scalar_pages.len())
             .map_err(|_| sdk::Error::limit_exceeded("too many JSON scalar pages"))?
             .to_le_bytes(),
     );
-    for (scalar, (page, offset, length)) in scalars.iter().zip(locations) {
-        index.extend_from_slice(&scalar.start.to_le_bytes());
-        index.extend_from_slice(&scalar.length.to_le_bytes());
-        index.extend_from_slice(&page.to_le_bytes());
-        index.extend_from_slice(&offset.to_le_bytes());
-        index.extend_from_slice(&length.to_le_bytes());
-    }
-    Ok((index, pages))
+    manifest.extend_from_slice(
+        &u32::try_from(index_pages.len())
+            .map_err(|_| sdk::Error::limit_exceeded("too many JSON scalar index pages"))?
+            .to_le_bytes(),
+    );
+    Ok(EncodedScalarState {
+        manifest,
+        index_pages,
+        scalar_pages,
+    })
 }
 
 fn encode_scalar_metadata(scalar: &ArenaJsonScalar) -> sdk::Result<Vec<u8>> {
@@ -622,12 +781,20 @@ struct ScalarEntry {
 }
 
 fn read_scalar_entry(update: &sdk::FileUpdate<'_>, ordinal: u32) -> sdk::Result<ScalarEntry> {
-    let offset = u64::from(SCALAR_INDEX_HEADER_BYTES)
-        .checked_add(u64::from(ordinal) * u64::from(SCALAR_INDEX_ENTRY_BYTES))
+    let entries_per_page = u32::try_from(STATE_PAGE_BYTES / SCALAR_INDEX_ENTRY_BYTES as usize)
+        .expect("scalar index page capacity fits u32");
+    let page = ordinal / entries_per_page;
+    let page_ordinal = ordinal % entries_per_page;
+    let offset = u64::from(page_ordinal)
+        .checked_mul(u64::from(SCALAR_INDEX_ENTRY_BYTES))
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index offset overflowed"))?;
     let bytes = update
         .before
-        .read_state_range(SCALAR_INDEX_STATE, offset, SCALAR_INDEX_ENTRY_BYTES)?
+        .read_state_range(
+            &scalar_index_page_key(page),
+            offset,
+            SCALAR_INDEX_ENTRY_BYTES,
+        )?
         .ok_or_else(|| sdk::Error::invalid_input("JSON scalar index disappeared"))?;
     Ok(ScalarEntry {
         start: u32::from_le_bytes(bytes[0..4].try_into().expect("fixed scalar entry")),
@@ -675,19 +842,27 @@ fn scalar_page_key(ordinal: u32) -> Vec<u8> {
     key
 }
 
-fn scalar_page_count(update: &sdk::FileUpdate<'_>) -> sdk::Result<u32> {
-    let Some(header) =
-        update
-            .before
-            .read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
+fn scalar_index_page_key(ordinal: u32) -> Vec<u8> {
+    let mut key = b"json/scalar-index-page-v2/".to_vec();
+    key.extend_from_slice(&ordinal.to_le_bytes());
+    key
+}
+
+fn scalar_page_counts(update: &sdk::FileUpdate<'_>) -> sdk::Result<(u32, u32)> {
+    scalar_page_counts_root(&update.before)
+}
+
+fn scalar_page_counts_root(root: &sdk::Root<'_>) -> sdk::Result<(u32, u32)> {
+    let Some(header) = root.read_state_range(SCALAR_INDEX_STATE, 0, SCALAR_INDEX_HEADER_BYTES)?
     else {
-        return Ok(0);
+        return Ok((0, 0));
     };
     if header.get(..4) != Some(SCALAR_INDEX_MAGIC) {
         return Err(sdk::Error::invalid_input("unsupported JSON scalar index"));
     }
-    Ok(u32::from_le_bytes(
-        header[8..12].try_into().expect("fixed JSON index header"),
+    Ok((
+        u32::from_le_bytes(header[12..16].try_into().expect("index page count")),
+        u32::from_le_bytes(header[8..12].try_into().expect("scalar page count")),
     ))
 }
 
@@ -956,5 +1131,54 @@ mod tests {
         let shifts = decode_scalar_shifts(&encoded).expect("valid shift overlay");
         assert_eq!(shifts, vec![(7, 2)]);
         assert_eq!(encode_scalar_shifts(&shifts).len(), 12);
+    }
+
+    #[test]
+    fn scalar_index_is_split_into_bounded_state_pages() {
+        let scalar = ArenaJsonScalar {
+            start: 0,
+            length: 4,
+            relation: ArenaJsonRelation::Root,
+            entity_pk: vec!["root".to_owned()],
+            parent_id: None,
+            order_key: None,
+            prefix_json: None,
+            suffix_json: None,
+            empty_json: None,
+        };
+        let scalars = vec![scalar; 105_000];
+
+        let encoded = encode_scalar_state(&scalars).expect("large scalar index");
+
+        assert_eq!(encoded.manifest.len(), SCALAR_INDEX_HEADER_BYTES as usize);
+        assert!(encoded.index_pages.len() > 1);
+        assert!(
+            encoded
+                .index_pages
+                .iter()
+                .all(|page| page.len() <= STATE_PAGE_BYTES)
+        );
+    }
+
+    #[test]
+    fn fallback_entities_roundtrip_across_bounded_state_pages() {
+        let records = (0..16_000)
+            .map(|ordinal| EntityRecord {
+                schema_key: "json_object_member".to_owned(),
+                entity_pk: vec!["root".to_owned(), format!("key-{ordinal}")],
+                snapshot: vec![b'x'; 128],
+            })
+            .collect::<Vec<_>>();
+
+        let (manifest, pages) = encode_entity_records(&records).expect("large fallback state");
+        let (record_count, page_count) =
+            decode_fallback_manifest(&manifest).expect("fallback manifest");
+        assert!(pages.len() > 1);
+        assert_eq!(page_count as usize, pages.len());
+        assert!(pages.iter().all(|page| page.len() <= STATE_PAGE_BYTES));
+        assert_eq!(
+            decode_entity_records(record_count, pages).expect("paged fallback roundtrip"),
+            records
+        );
     }
 }
