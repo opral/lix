@@ -1348,10 +1348,7 @@ fn insert_created_id_into_canonical_object(snapshot: &[u8], id: &str) -> Result<
         }
         let key_end = json_string_end(snapshot, entry_start)?;
         let encoded_key = &snapshot[entry_start..key_end];
-        let key = if encoded_key[1..encoded_key.len() - 1]
-            .iter()
-            .any(|byte| *byte == b'\\')
-        {
+        let key = if encoded_key[1..encoded_key.len() - 1].contains(&b'\\') {
             serde_json::from_slice::<String>(encoded_key)
                 .map_err(|error| head_value_error(format!("invalid canonical key: {error}")))?
         } else {
