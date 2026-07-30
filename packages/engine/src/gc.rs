@@ -735,11 +735,11 @@ where
                 certified: member.is_certified_payload_ref(),
             })
             .collect::<Vec<_>>();
-        promoted_locators.extend(
-            crate::tracked_state::stage_commit_deltas(writes, &deltas)?
-                .into_iter()
-                .filter(|locator| dead_packed_change_ids.contains(&locator.change_id)),
-        );
+        promoted_locators.extend(authoritative_promoted_locators(
+            &deltas,
+            crate::tracked_state::stage_commit_deltas(writes, &deltas)?,
+            &dead_packed_change_ids,
+        )?);
     }
     let relocated_locators = live_commits
         .iter()
@@ -826,6 +826,37 @@ where
         },
         repair: GcRepairSet::default(),
     })
+}
+
+fn authoritative_promoted_locators(
+    deltas: &[crate::tracked_state::TrackedStateCommitDeltaRef<'_>],
+    staged_locators: Vec<crate::tracked_state::CommitDeltaChangeLocator>,
+    dead_change_ids: &BTreeSet<ChangeId>,
+) -> Result<Vec<crate::tracked_state::CommitDeltaChangeLocator>, LixError> {
+    if staged_locators.len() != deltas.len() {
+        return Err(LixError::new(
+            LixError::CODE_INTERNAL_ERROR,
+            "promoted commit-delta locator count does not match its members",
+        ));
+    }
+    // The caller supplies decoded members and staged locators in the same
+    // physical-key order. Only rows that are authoritative after promotion
+    // may become canonical locator targets; selected cascade tombstones
+    // intentionally remain payload-free even when another row causes this
+    // commit to be packed again.
+    let mut promoted = Vec::new();
+    for (delta, locator) in deltas.iter().zip(staged_locators) {
+        if delta.delta.change_id != locator.change_id {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "promoted commit-delta locator order does not match its members",
+            ));
+        }
+        if delta.authored && dead_change_ids.contains(&locator.change_id) {
+            promoted.push(locator);
+        }
+    }
+    Ok(promoted)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -960,6 +991,7 @@ fn elapsed_micros(started: Instant) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use crate::branch::{BranchHeadControlContext, stage_branch_head_control};
@@ -1499,6 +1531,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn promoted_locator_filter_excludes_selected_tombstones() {
+        let commit_id = CommitId::for_test_label("mixed-promotion-commit");
+        let change_id = ChangeId::for_test_label("shared-promotion-change");
+        let mut tombstone =
+            packed_change("selected-tombstone", "a-selected-tombstone", JsonSlot::None);
+        tombstone.change_id = change_id;
+        let mut promoted = packed_change("promoted-owner", "z-promoted-owner", JsonSlot::None);
+        promoted.change_id = change_id;
+        let changes = [tombstone, promoted];
+        let mut deltas = commit_delta_refs(commit_id, &changes);
+        deltas[0].authored = false;
+        let locators = vec![
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id,
+                commit_id,
+                segment_index: 0,
+                ordinal: 0,
+            },
+            crate::tracked_state::CommitDeltaChangeLocator {
+                change_id,
+                commit_id,
+                segment_index: 0,
+                ordinal: 1,
+            },
+        ];
+
+        let filtered =
+            super::authoritative_promoted_locators(&deltas, locators, &BTreeSet::from([change_id]))
+                .expect("mixed promotion locators should filter");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].ordinal, 1);
+    }
+
     #[tokio::test]
     async fn repository_gc_reclaims_candidate_after_last_live_untracked_owner_disappears() {
         let storage = Memory::new();
@@ -1584,7 +1651,7 @@ mod tests {
                     snapshot: snapshot_slot.as_ref_slot(),
                     metadata: crate::json_store::JsonSlotRef::None,
                 }],
-                &std::collections::BTreeSet::new(),
+                &BTreeSet::new(),
                 None,
                 None,
                 None,

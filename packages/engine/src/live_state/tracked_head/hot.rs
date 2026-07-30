@@ -1079,50 +1079,70 @@ pub(crate) async fn scan_certified_history_rows(
         .any(|column| column == "snapshot_content");
     let mut builder = MaterializedLiveStateBatchBuilder::with_capacity(commit_ids.len() * 1024);
     for commit_id in commit_ids {
-        let page = ScanPlan::prefix(
+        let plan = ScanPlan::prefix(
             CERTIFIED_ENTITY_BATCH_SPACE,
             StoragePrefix {
                 bytes: Bytes::copy_from_slice(commit_id.as_uuid().as_bytes()),
             },
-        )
-        .collect(store, StorageScanOptions::default())
-        .await?;
-        for entry in page.value.entries {
-            let value = full_value_bytes(entry.value)?;
-            if certified_batch_commit_id(&value)? != *commit_id {
-                continue;
-            }
-            let external_plan =
-                certified_external_page_plan(&value, entry.key.0.as_ref(), request)?;
-            let external_pages = if let Some(plan) = &external_plan {
-                let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
-                let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
-                    .materialize(store, StorageGetOptions::default())
-                    .await?
-                    .value;
-                Some(
-                    plan.iter()
-                        .zip(values)
-                        .map(|((page_index, _), value)| {
-                            let value = value.ok_or_else(|| {
-                                head_value_error("certified history batch page is missing")
-                            })?;
-                            Ok((*page_index, full_value_bytes(value)?))
-                        })
-                        .collect::<Result<Vec<_>, LixError>>()?,
+        );
+        let mut resume_after = None;
+        loop {
+            let page = plan
+                .collect(
+                    store,
+                    StorageScanOptions {
+                        resume_after,
+                        ..StorageScanOptions::default()
+                    },
                 )
-            } else {
-                None
-            };
-            decode_certified_entity_batch_rows(
-                &value,
-                external_pages.as_deref(),
-                "",
-                request,
-                needs_snapshot,
-                None,
-                &mut builder,
-            )?;
+                .await?;
+            let has_more = page.value.has_more;
+            resume_after = page.value.entries.last().map(|entry| entry.key.clone());
+            for entry in page.value.entries {
+                let value = full_value_bytes(entry.value)?;
+                if certified_batch_commit_id(&value)? != *commit_id {
+                    continue;
+                }
+                let external_plan =
+                    certified_external_page_plan(&value, entry.key.0.as_ref(), request)?;
+                let external_pages = if let Some(plan) = &external_plan {
+                    let keys = plan.iter().map(|(_, key)| key.clone()).collect::<Vec<_>>();
+                    let values = PointReadPlan::new(CERTIFIED_ENTITY_BATCH_PAGE_SPACE, &keys)
+                        .materialize(store, StorageGetOptions::default())
+                        .await?
+                        .value;
+                    Some(
+                        plan.iter()
+                            .zip(values)
+                            .map(|((page_index, _), value)| {
+                                let value = value.ok_or_else(|| {
+                                    head_value_error("certified history batch page is missing")
+                                })?;
+                                Ok((*page_index, full_value_bytes(value)?))
+                            })
+                            .collect::<Result<Vec<_>, LixError>>()?,
+                    )
+                } else {
+                    None
+                };
+                decode_certified_entity_batch_rows(
+                    &value,
+                    external_pages.as_deref(),
+                    "",
+                    request,
+                    needs_snapshot,
+                    None,
+                    &mut builder,
+                )?;
+            }
+            if !has_more {
+                break;
+            }
+            if resume_after.is_none() {
+                return Err(head_value_error(
+                    "certified history scan reported more rows without a resume key",
+                ));
+            }
         }
     }
     Ok(builder.finish().into_rows())
@@ -6844,6 +6864,69 @@ mod tests {
         .expect("unrelated malformed batch must not affect the requested commit");
 
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn certified_history_scan_paginates_past_1024_batches() {
+        fn empty_batch(commit_id: CommitId, file_id: &str) -> Vec<u8> {
+            let mut value = CERTIFIED_ENTITY_BATCH_MAGIC_V2.to_vec();
+            value.extend_from_slice(&1_u16.to_le_bytes());
+            append_batch_text(&mut value, "test_schema").unwrap();
+            append_batch_text(&mut value, file_id).unwrap();
+            value.extend_from_slice(commit_id.as_uuid().as_bytes());
+            append_batch_text(&mut value, "2026-01-01T00:00:00Z").unwrap();
+            value.extend_from_slice(&crate::wasm::HOST_CERTIFIED_PACKET_FORMAT.to_le_bytes());
+            value.extend_from_slice(&0_u64.to_le_bytes());
+            value.extend_from_slice(&0_u64.to_le_bytes());
+            value.extend_from_slice(&0_u32.to_le_bytes());
+            value.extend_from_slice(&0_u32.to_le_bytes());
+            value
+        }
+
+        let storage = StorageAdapter::new(Memory::new());
+        let commit_id = CommitId::for_test_label("paginated-certified-history");
+        let mut writes = storage.new_write_set();
+        for index in 0..crate::storage_adapter::MAX_SCAN_PAGE_ROWS {
+            let file_id = format!("file-{index:04}");
+            let mut key = commit_id.as_uuid().as_bytes().to_vec();
+            append_batch_text(&mut key, &file_id).unwrap();
+            writes.put(
+                CERTIFIED_ENTITY_BATCH_SPACE,
+                StorageKey(Bytes::from(key)),
+                StorageValue {
+                    bytes: Bytes::from(empty_batch(commit_id, &file_id)),
+                },
+            );
+        }
+        let mut malformed_key = commit_id.as_uuid().as_bytes().to_vec();
+        append_batch_text(&mut malformed_key, "zzzz-after-first-page").unwrap();
+        writes.put(
+            CERTIFIED_ENTITY_BATCH_SPACE,
+            StorageKey(Bytes::from(malformed_key)),
+            StorageValue {
+                bytes: Bytes::from_static(b"malformed"),
+            },
+        );
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("paginated certified fixture should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("certified history read should open");
+        assert!(
+            scan_certified_history_rows(
+                &read,
+                &BTreeSet::from([commit_id]),
+                &TrackedStateScanRequest::default(),
+            )
+            .await
+            .expect_err("the malformed batch after row 1024 must be visited")
+            .to_string()
+            .contains("certified"),
+        );
     }
 
     #[test]
