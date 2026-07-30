@@ -1884,6 +1884,42 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
             .collect();
         MaterializedLiveStateExactBatch::new(builder.finish(), slots)
     }
+
+    fn collection_replaced(
+        &self,
+        branch_id: &str,
+        schema_key: &str,
+        file_id: Option<&str>,
+    ) -> Result<bool, LixError> {
+        self.staged_writes.ensure_identity_index(false)?;
+        let rows_guard = self.staged_writes.rows.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged writes lock",
+            )
+        })?;
+        let StagedPreparedRows::Indexed { rows, .. } = &*rows_guard else {
+            return Ok(false);
+        };
+        for index in 0..rows.len() {
+            let row = rows.row(index);
+            if row.schema_key.as_str()
+                != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+                || row.branch_id.as_str() != branch_id
+                || row.snapshot.is_none()
+            {
+                continue;
+            }
+            let (target_schema_key, target_file_id) =
+                crate::collection_generation::collection_scope_from_entity_pk(row.entity_pk)?;
+            if target_schema_key == schema_key
+                && (target_file_id.is_none() || target_file_id.as_deref() == file_id)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 #[cfg(test)]

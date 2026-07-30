@@ -33,6 +33,7 @@ pub(crate) mod cel;
 #[allow(unused_imports)]
 pub mod changelog;
 pub(crate) mod checkpoint;
+pub(crate) mod collection_generation;
 pub(crate) mod commit_graph;
 mod common;
 pub(crate) mod compression;

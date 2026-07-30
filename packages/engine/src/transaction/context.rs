@@ -982,6 +982,7 @@ where
             // ordinary mutation and then swap authority ahead of it.
             self.ensure_plugin_generation_read_guard().await;
         }
+        self.reject_write_after_collection_replacement(&write)?;
         require_valid_transaction_write_storage_scopes(&write)?;
         // A normal write targets the branch this transaction already opened
         // against, so its existence is checked together with the coherent
@@ -1054,6 +1055,42 @@ where
         self.pending_plugin_actor_publications
             .extend(actor_publications);
         Ok(outcome)
+    }
+
+    fn reject_write_after_collection_replacement(
+        &self,
+        write: &TransactionWrite,
+    ) -> Result<(), LixError> {
+        let rows = match write {
+            TransactionWrite::Rows { rows, .. }
+            | TransactionWrite::RowsWithFileData { rows, .. } => rows,
+        };
+        let staged = self.staged_writes.staging_overlay()?;
+        for row in rows.iter() {
+            if row.schema_key.as_str()
+                == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+            {
+                continue;
+            }
+            if StagedLiveStateRows::collection_replaced(
+                &staged,
+                row.branch_id,
+                row.schema_key,
+                row.file_id.map(SharedStr::as_str),
+            )? {
+                return Err(LixError::new(
+                    LixError::CODE_CONSTRAINT_VIOLATION,
+                    format!(
+                        "collection '{}' was deleted earlier in this transaction",
+                        row.schema_key
+                    ),
+                )
+                .with_hint(
+                    "Commit the collection deletion before recreating rows in its next generation.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Validates descriptor-path changes against the current batch before it
@@ -6162,6 +6199,64 @@ where
             .ref_reader(read)
             .load_head_commit_id(branch_id)
             .await
+    }
+
+    async fn load_collection_generation(
+        &mut self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<Option<crate::collection_generation::CollectionGeneration>, LixError> {
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let Some(control) = BranchHeadControlContext::new()
+            .reader(read.clone())
+            .load(branch_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let mut generation = TrackedHeadContext::new()
+            .reader(read)
+            .collection_generation(branch_id, control.generation, scope)
+            .await?;
+        let staged = self.staged_writes.staging_overlay()?;
+        if StagedLiveStateRows::collection_replaced(
+            &staged,
+            branch_id,
+            scope.schema_key,
+            scope.file_id,
+        )? {
+            generation.live_count = 0;
+        }
+        Ok(Some(generation))
+    }
+
+    fn has_staged_collection_rows(
+        &self,
+        branch_id: &str,
+        scope: crate::collection_generation::CollectionScopeRef<'_>,
+    ) -> Result<bool, LixError> {
+        let staged = self.staged_writes.staging_overlay()?;
+        let file_ids = scope
+            .file_id
+            .map(|file_id| vec![NullableKeyFilter::Value(file_id.to_string())])
+            .unwrap_or_default();
+        Ok(!staged
+            .staged_batch(&LiveStateScanRequest {
+                filter: LiveStateFilter {
+                    schema_keys: vec![scope.schema_key.to_string()],
+                    branch_ids: vec![branch_id.to_string()],
+                    file_ids,
+                    include_tombstones: true,
+                    ..Default::default()
+                },
+                limit: Some(1),
+                ..Default::default()
+            })?
+            .is_empty())
     }
 
     async fn stage_write(

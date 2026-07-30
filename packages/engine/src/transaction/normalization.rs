@@ -54,7 +54,7 @@ pub(crate) fn normalize_raw_write_row_in_place(
 ) -> Result<NormalizedRowFacts, LixError> {
     let row = rows.row(row_index);
     validate_transaction_write_row_schema_identity(row)?;
-    ensure_internal_checkpoint_schema(row, schema_catalog)?;
+    ensure_internal_control_schema(row, schema_catalog)?;
 
     let Some((schema_plan_id, schema_plan)) =
         schema_catalog.snapshot().plan_for_key(&row.schema_key)
@@ -289,25 +289,27 @@ fn validate_normalized_row_content(
     Ok(())
 }
 
-/// Checkpoint markers were introduced after repositories already existed.
-///
-/// Their schema is fixed and intentionally hidden from public entity
-/// surfaces, so legacy stores can validate this one engine-owned row from the
-/// compile-time definition without mutating their visible schema catalog.
-fn ensure_internal_checkpoint_schema(
+/// Engine-owned control rows have fixed schemas and are intentionally hidden
+/// from public entity surfaces. Internal producers may therefore validate
+/// them from the compile-time definition without first materializing that
+/// definition in the transaction's visible schema catalog.
+fn ensure_internal_control_schema(
     row: RawWriteRowRef<'_>,
     schema_catalog: &mut TransactionCatalog,
 ) -> Result<(), LixError> {
-    if row.schema_key != crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
-        || schema_catalog.snapshot().schema(&row.schema_key).is_some()
-    {
+    let internal = matches!(
+        row.schema_key.as_str(),
+        crate::checkpoint::CHECKPOINT_MARKER_SCHEMA_KEY
+            | crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
+    );
+    if !internal || schema_catalog.snapshot().schema(&row.schema_key).is_some() {
         return Ok(());
     }
     let schema = crate::schema::seed_schema_definition(&row.schema_key)
         .ok_or_else(|| {
             LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
-                "compile-time checkpoint marker schema is missing",
+                "compile-time internal control schema is missing",
             )
         })?
         .clone();

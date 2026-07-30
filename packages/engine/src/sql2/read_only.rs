@@ -52,6 +52,9 @@ fn read_only_schema_message(schema_key: &str) -> Option<&'static str> {
         "lix_checkpoint_marker" => Some(
             "Checkpoint markers are internal; use the create_checkpoint API to create checkpoints.",
         ),
+        "lix_collection_generation" => Some(
+            "Collection generations are internal; use whole-collection delete operations to replace a generation.",
+        ),
         _ => None,
     }
 }
