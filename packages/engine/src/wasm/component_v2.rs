@@ -27,6 +27,7 @@ pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
 
 const MIB: u64 = 1024 * 1024;
 const MIB_U32: u32 = 1024 * 1024;
+const TRANSITION_PAGE_BYTES: u32 = 2 * MIB_U32;
 const COLD_FILE_MAX_DEADLINE_NANOSECONDS: u64 = 60_000_000_000;
 const COLD_FILE_EXTRA_DEADLINE_NANOSECONDS_PER_MIB: u64 = 1_000_000_000;
 
@@ -48,7 +49,10 @@ impl Default for WasmTransitionLimits {
     fn default() -> Self {
         Self {
             max_record_bytes: MIB_U32,
-            max_page_bytes: MIB_U32,
+            // Match the largest fixed page schedule that the v3 push sink
+            // safely uses under the same Wasm linear-memory limit. Records
+            // remain capped independently at one MiB.
+            max_page_bytes: TRANSITION_PAGE_BYTES,
             max_pages: 1_024,
             // A 10 MiB recursive JSON import can legitimately carry roughly
             // one compact entity per leaf plus packet keys. Keep the
