@@ -1565,6 +1565,7 @@ pub struct WasmCertifiedEntityBatch {
 /// completed host validation. Guest-emitted certified batches intentionally
 /// cannot claim this format.
 pub(crate) const HOST_CERTIFIED_PACKET_FORMAT: u16 = 3;
+pub(crate) const HOST_CERTIFIED_ZSTD_PACKET_FORMAT: u16 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmEntityTransition {

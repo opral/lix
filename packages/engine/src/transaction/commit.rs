@@ -92,7 +92,12 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         BTreeMap::<String, BTreeMap<(String, Option<String>), u64>>::new();
     for file in &prepared_writes.file_data_writes {
         for batch in file.certified_entity_batches().iter().filter(|batch| {
-            batch.complete_file_state && batch.format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+            batch.complete_file_state
+                && matches!(
+                    batch.format,
+                    crate::wasm::HOST_CERTIFIED_PACKET_FORMAT
+                        | crate::wasm::HOST_CERTIFIED_ZSTD_PACKET_FORMAT
+                )
         }) {
             let [schema_key] = batch.schema_keys.as_slice() else {
                 return Err(LixError::new(
