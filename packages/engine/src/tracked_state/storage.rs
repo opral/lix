@@ -4454,6 +4454,91 @@ mod tests {
             changes[0].snapshot,
             crate::json_store::JsonSlot::Inline(shared_snapshot.into())
         );
+        assert_selected_direct_address_hydrates_inventory_gc_and_root_rebuild_paths().await;
+    }
+
+    async fn assert_selected_direct_address_hydrates_inventory_gc_and_root_rebuild_paths() {
+        let storage = StorageAdapter::new(Memory::new());
+        let mut fixture = packed_commit_delta_fixtures()
+            .into_iter()
+            .find(|fixture| !fixture.deleted)
+            .expect("fixture should exist");
+        let owner_commit = CommitId::with_change_address_space(uuid::Uuid::from_u128(
+            0x0192_0000_0000_7000_8000_4321_0000_0000,
+        ));
+        let selected_commit = CommitId::for_test_label("selected-direct-address");
+        let snapshot = r#"{"direct":true}"#;
+        let owner = commit_delta_ref(
+            owner_commit,
+            &fixture,
+            crate::json_store::JsonSlotRef::Inline(snapshot),
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        let mut writes = storage.new_write_set();
+        let staged = super::stage_addressable_commit_deltas(&mut writes, &[owner], &[true])
+            .expect("direct owner should stage");
+        assert!(staged.locators.is_empty());
+        fixture.change_id = staged.assigned_change_ids[0];
+
+        let mut selected = commit_delta_ref(
+            selected_commit,
+            &fixture,
+            crate::json_store::JsonSlotRef::None,
+            crate::json_store::JsonSlotRef::None,
+            None,
+        );
+        selected.authored = false;
+        let selected_locators =
+            stage_commit_deltas(&mut writes, &[selected]).expect("selected row should stage");
+        assert_eq!(selected_locators.len(), 1);
+        storage
+            .commit_write_set(writes, StorageWriteOptions::default())
+            .await
+            .expect("direct owner and selected reference should commit");
+
+        let read = storage
+            .begin_read(StorageReadOptions::default())
+            .await
+            .expect("selected direct-address read should open");
+        assert!(
+            super::load_change_locator_by_id(&read, fixture.change_id)
+                .await
+                .expect("locator absence should read")
+                .is_none(),
+            "ordinary direct-addressed owners intentionally persist no locator row"
+        );
+        let owner = load_change_record_by_id(&read, fixture.change_id)
+            .await
+            .expect("direct owner read should succeed")
+            .expect("direct owner should exist");
+        assert_eq!(
+            owner.snapshot,
+            crate::json_store::JsonSlot::Inline(snapshot.into())
+        );
+        let selected_members = load_commit_delta_members_with_payloads(&read, selected_commit)
+            .await
+            .expect("root rebuild should hydrate the selected direct-address payload");
+        assert_eq!(selected_members.len(), 1);
+        assert_eq!(
+            selected_members[0].change.snapshot,
+            crate::json_store::JsonSlot::Inline(snapshot.into())
+        );
+        let inventory = scan_commit_delta_inventory(&read)
+            .await
+            .expect("GC inventory should hydrate the selected direct-address payload");
+        assert_eq!(inventory.commits.len(), 2);
+        assert_eq!(
+            inventory.commits[&selected_commit].members[0]
+                .change
+                .snapshot,
+            crate::json_store::JsonSlot::Inline(snapshot.into())
+        );
+        let changes = scan_change_records_from_commit_deltas(&read)
+            .await
+            .expect("canonical history should deduplicate selected direct authority");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change_id, fixture.change_id);
     }
 
     fn decoded_commit_delta_rows(
