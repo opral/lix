@@ -159,7 +159,14 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         .filter(|root| root.publish_head)
         .map(branch_ref_change_record)
         .collect::<Result<Vec<_>, _>>()?;
-    let has_checkpoint_publication = !prepared_writes.checkpoint_publications.is_empty();
+    // Checkpoints are logical compaction boundaries, not full immutable-tree
+    // snapshots. Their absolute commit-delta segments plus the previous
+    // checkpoint parent already form the persistent history representation;
+    // forcing a second full-state root made N checkpoints rewrite
+    // 1 + 2 + ... + N rows. Rootless history readers reconstruct from the
+    // nearest available ancestor root when a historical scan actually needs
+    // one, while eager HOT state remains complete at publication time.
+    let force_root_fence = false;
     // The current-state protocol publishes automatic tracked heads through
     // one direct control record.
     // Do not also synthesize a mutable `lix_branch_ref` current row for every
@@ -201,7 +208,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &[],
         &row_index.tracked_row_indices_by_commit,
         &commit_rows,
-        has_checkpoint_publication,
+        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -247,7 +254,7 @@ pub(crate) async fn commit_prepared_writes_with_parent_heads(
         &tracked_roots,
         &staged_commits,
         &insert_selection,
-        has_checkpoint_publication,
+        force_root_fence,
     )
     .instrument(tracing::debug_span!(
         target: "lix_perf",
@@ -894,9 +901,9 @@ fn current_state_delta_from_engine_row(
 }
 
 /// Stages a compact, identity-addressable change record for every tracked
-/// commit. Sparse immutable roots remain the scan/checkpoint structure; this
-/// index is the missing point-read structure for rootless first-parent
-/// history.
+/// commit. Immutable roots are optional cold accelerators; this index is the
+/// authoritative point-read and reconstruction structure for rootless
+/// first-parent history.
 async fn load_selected_change_records(
     read: &(impl StorageAdapterRead + ?Sized),
     staged_commits: &BTreeMap<CommitId, StagedChangelogCommit>,
@@ -1099,9 +1106,15 @@ fn lifecycle_snapshot_commit_ids(
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id
         );
-        if !parent_is_published
-            || selected_refs_require_complete_snapshot(&staged.selected_change_batches)
-            || checkpoint_epochs.get(&root.branch_id) == Some(&root.commit_id)
+        let checkpoint_can_reuse_generation = checkpoint_epochs.get(&root.branch_id)
+            == Some(&root.commit_id)
+            && observations
+                .get(&root.branch_id)
+                .and_then(|observation| observation.control)
+                .is_some();
+        if !checkpoint_can_reuse_generation
+            && (!parent_is_published
+                || selected_refs_require_complete_snapshot(&staged.selected_change_batches))
         {
             required.insert(root.commit_id);
         }
@@ -1792,7 +1805,10 @@ async fn stage_tracked_head(
                 certified_fresh_plugin_file_id,
             )
         };
+        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
+        let is_checkpoint_publication = checkpoint_commit_id == Some(root.commit_id);
         let parent_generation = match (root.parent_commit_id, parent_control) {
+            (_, Some(control)) if is_checkpoint_publication => Some(control.generation),
             (Some(parent_commit_id), Some(control))
                 if control.head_commit_id == parent_commit_id =>
             {
@@ -1800,7 +1816,6 @@ async fn stage_tracked_head(
             }
             _ => None,
         };
-        let checkpoint_commit_id = checkpoint_epochs.get(&root.branch_id).copied();
 
         if !staged.selected_change_batches.is_empty() {
             reject_selected_tracked_refs_with_untracked_rows(
@@ -1975,7 +1990,26 @@ async fn stage_tracked_head(
         let has_validated_insert_deltas = staged.selected_change_batches.is_empty()
             && (!absence_guards.is_empty() || certified_fresh_plugin_file_id.is_some());
         let mut writer = tracked_head.writer(read, writes);
-        let generation = if has_validated_insert_deltas {
+        let generation = if is_checkpoint_publication {
+            let checkpoint_commit_id =
+                checkpoint_commit_id.expect("checkpoint publication has an epoch commit id");
+            coverage = WorkingDiffIndexCoverage::default();
+            writer
+                .stage_checkpoint_current_state(
+                    &root.branch_id,
+                    parent_generation,
+                    root.commit_id,
+                    &deltas,
+                    &owned_absence_guards(&absence_guards),
+                    checkpoint_commit_id,
+                    &mut coverage,
+                )
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.materialization.tracked_head.stage_checkpoint"
+                ))
+                .await?
+        } else if has_validated_insert_deltas {
             writer
                 .stage_validated_insert_current_state_with_working_diff(
                     &root.branch_id,
@@ -2308,10 +2342,9 @@ fn selected_tracked_ref_untracked_collision_error(
     }))
 }
 
-/// A checkpoint materializes one complete hot generation. Every tracked row
-/// in that generation is encoded as a clean row-local baseline, so its sparse
-/// dirty-key index starts empty and later ordinary writes capture their own
-/// first-before images without querying a separate diff store.
+/// A checkpoint cleans exactly its selected interval changes in the current
+/// hot generation. Unchanged rows were already clean, so rotating to an empty
+/// sparse dirty-key index starts the next epoch without a full-state rewrite.
 fn stage_checkpoint_working_diff_epochs(
     writes: &mut StorageWriteSet,
     publications: &[crate::gc::CheckpointPublication],
@@ -2997,10 +3030,11 @@ async fn stage_tracked_roots(
     Ok(())
 }
 
-/// Immutable roots are a cold-path history structure. Keep them at topology
-/// and checkpoint fences, plus any staged first-parent ancestors necessary to
-/// build that fence in one atomic write set. Ordinary serial commits are
-/// represented only by the changelog and the durable current-state projection.
+/// Immutable roots are an optional cold-path history accelerator. A caller
+/// that explicitly requests a fence also stages any missing first-parent
+/// ancestors in the same atomic write set. Normal serial and checkpoint
+/// commits use compact absolute deltas plus the durable current-state
+/// projection.
 fn tracked_root_fence_ids(
     tracked_roots: &[PendingTrackedRoot],
     force_all: bool,
