@@ -1404,11 +1404,13 @@ async fn try_load_change_record_at_locator_in_manifest(
     };
     let mut loaded = vec![Some(decode_change_at_locator(&segment, bounds, locator)?)];
     hydrate_certified_loaded_entries(store, &mut loaded).await?;
-    Ok(loaded
-        .pop()
-        .flatten()
-        .expect("one decoded change locator must remain")
-        .change_record)
+    Ok(Some(
+        loaded
+            .pop()
+            .flatten()
+            .expect("one decoded change locator must remain")
+            .change_record,
+    ))
 }
 
 fn decode_change_locator(
