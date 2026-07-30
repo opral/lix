@@ -30,10 +30,10 @@ pub(crate) use incremental::{
     ArcByteSource, FileBytesSha256, LiveBatchEntitySource, V2SchemaAllowlist,
     ValidatedConflictTransition, ValidatedFileTransition, ValidatedSameLengthOutputSplice,
     VecEntityChangeSource, VecEntityConflictSource, VecEntitySource, build_file_update_splices,
-    canonicalize_v2_snapshot, drain_conflict_transition_resolutions, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
-    host_entity_with_lazy_snapshot, transport_splice_preserves_git_text,
-    transport_splice_preserves_utf8,
+    canonicalize_v2_snapshot, certify_dense_v2_fresh_file, drain_conflict_transition_resolutions,
+    drain_entity_transition_edits, drain_file_transition_changes,
+    host_entity_change_with_lazy_snapshot, host_entity_with_lazy_snapshot,
+    transport_splice_preserves_git_text, transport_splice_preserves_utf8,
 };
 pub(crate) use install::{PluginArchiveInstallPlan, plugin_install_plan_from_archive_path};
 pub(crate) use manifest::{

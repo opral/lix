@@ -593,7 +593,9 @@ pub(crate) async fn stage_certified_entity_batches(
             for (page_index, page) in batch.pages.iter().enumerate() {
                 let (first_local_ref, last_local_ref) = match batch.format {
                     1 => certified_csv_page_local_ref_range(page)?,
-                    2 => certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX)),
+                    2 | crate::wasm::HOST_CERTIFIED_PACKET_FORMAT => {
+                        certified_packet_page_local_ref_range(page)?.unwrap_or((0, u32::MAX))
+                    }
                     _ => (0, u32::MAX),
                 };
                 value.extend_from_slice(&first_local_ref.to_le_bytes());
@@ -742,31 +744,32 @@ fn certified_external_page_plan(
         high: input.u64()?,
         low: input.u32()?,
     };
-    let selected_local_refs = ((format == 1 || format == 2)
-        && !request.filter.entity_pks.is_empty())
-    .then(|| {
-        let high = creates.high.to_be_bytes();
-        let low = creates.low.to_be_bytes();
-        request
-            .filter
-            .entity_pks
-            .iter()
-            .map(|entity_pk| match entity_pk.components.as_slice() {
-                [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
-                    if bytes[..8] == high && bytes[8..12] == low =>
-                {
-                    Ok(u32::from_be_bytes(
-                        bytes[12..]
-                            .try_into()
-                            .expect("UUID local-reference suffix is four bytes"),
-                    ))
-                }
-                _ => Err(()),
-            })
-            .collect::<Result<BTreeSet<_>, _>>()
-            .ok()
-    })
-    .flatten();
+    let selected_local_refs =
+        ((format == 1 || format == 2 || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT)
+            && !request.filter.entity_pks.is_empty())
+        .then(|| {
+            let high = creates.high.to_be_bytes();
+            let low = creates.low.to_be_bytes();
+            request
+                .filter
+                .entity_pks
+                .iter()
+                .map(|entity_pk| match entity_pk.components.as_slice() {
+                    [crate::entity_pk::EntityPkComponent::Uuid(bytes)]
+                        if bytes[..8] == high && bytes[8..12] == low =>
+                    {
+                        Ok(u32::from_be_bytes(
+                            bytes[12..]
+                                .try_into()
+                                .expect("UUID local-reference suffix is four bytes"),
+                        ))
+                    }
+                    _ => Err(()),
+                })
+                .collect::<Result<BTreeSet<_>, _>>()
+                .ok()
+        })
+        .flatten();
     let page_count = input.u32()?;
     let mut pages = Vec::with_capacity(page_count as usize);
     for page_index in 0..page_count {
@@ -1002,7 +1005,7 @@ fn decode_certified_entity_batch_rows(
     );
     let timestamp = LixTimestamp::parse(input.text()?).map_err(head_value_error)?;
     let format = input.u16()?;
-    if format != 1 && format != 2 {
+    if format != 1 && format != 2 && format != crate::wasm::HOST_CERTIFIED_PACKET_FORMAT {
         return Err(head_value_error(format!(
             "unsupported certified entity batch format {format}"
         )));
@@ -1062,7 +1065,7 @@ fn decode_certified_entity_batch_rows(
             let page_len = input.u32()? as usize;
             input.bytes(page_len)?
         };
-        if format == 2 {
+        if format == 2 || format == crate::wasm::HOST_CERTIFIED_PACKET_FORMAT {
             decoded_rows = decoded_rows.saturating_add(decode_certified_packet_rows(
                 page,
                 &creates,
@@ -1751,6 +1754,7 @@ fn stage_incremental_collection_controls(
     deltas: &[&CurrentStateDeltaRef<'_>],
     previous_values: &[Option<Bytes>],
     mut controls: BTreeMap<(String, Option<String>), HotCollectionControl>,
+    certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
 ) -> Result<(), LixError> {
     use crate::collection_generation::{
         COLLECTION_GENERATION_SCHEMA_KEY, CollectionScopeRef, collection_scope_from_entity_pk,
@@ -1813,6 +1817,16 @@ fn stage_incremental_collection_controls(
                     .ok_or_else(|| head_value_error("hot collection live count underflow"))?
             };
         }
+    }
+
+    for (scope, increment) in certified_live_increments {
+        let control = controls
+            .get_mut(scope)
+            .expect("certified collection scope was loaded above");
+        control.live_count = control
+            .live_count
+            .checked_add(*increment)
+            .ok_or_else(|| head_value_error("hot collection live count exceeds u64"))?;
     }
 
     for ((schema_key, file_id), control) in controls {
@@ -2731,6 +2745,38 @@ where
             None,
             None,
             false,
+            &BTreeMap::new(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_current_state_with_certified_counts(
+        &mut self,
+        branch_id: &str,
+        parent_generation: Option<CommitId>,
+        new_head: CommitId,
+        deltas: &[CurrentStateDeltaRef<'_>],
+        absence_guards: &BTreeSet<TrackedStateKey>,
+        working_diff_capture_checkpoint_commit_id: Option<CommitId>,
+        coverage: &mut WorkingDiffIndexCoverage,
+        certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
+    ) -> Result<CommitId, LixError> {
+        self.stage_current_state_with_working_diff_inner(
+            branch_id,
+            parent_generation,
+            new_head,
+            deltas,
+            absence_guards,
+            None,
+            None,
+            working_diff_capture_checkpoint_commit_id,
+            coverage,
+            false,
+            None,
+            None,
+            false,
+            certified_live_increments,
         )
         .await
     }
@@ -2765,6 +2811,7 @@ where
             None,
             None,
             true,
+            &BTreeMap::new(),
         )
         .await
     }
@@ -2810,6 +2857,7 @@ where
                     validated_absent_file_id,
                     None,
                     false,
+                    &BTreeMap::new(),
                 )
                 .await;
         }
@@ -2828,6 +2876,7 @@ where
             validated_absent_file_id,
             Some(absence_guards),
             false,
+            &BTreeMap::new(),
         )
         .await
     }
@@ -2848,6 +2897,7 @@ where
         validated_absent_file_id: Option<&str>,
         borrowed_absence_guards: Option<&[TrackedStateKeyRef<'_>]>,
         reset_working_diff_baselines: bool,
+        certified_live_increments: &BTreeMap<(String, Option<String>), u64>,
     ) -> Result<CommitId, LixError> {
         let generation = parent_generation.unwrap_or(new_head);
         let sorted = {
@@ -2940,9 +2990,40 @@ where
             })
             .collect::<Vec<_>>();
         debug_assert_eq!(loaded_previous_values.len(), 0);
-        let collection_controls =
+        let mut collection_controls =
             load_incremental_collection_controls(self.store, branch_id, generation, &sorted)
                 .await?;
+        let missing_certified_scopes = certified_live_increments
+            .keys()
+            .filter(|scope| !collection_controls.contains_key(*scope))
+            .map(
+                |(schema_key, file_id)| crate::collection_generation::CollectionScopeRef {
+                    schema_key,
+                    file_id: file_id.as_deref(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let missing_certified_controls = load_hot_collection_controls(
+            self.store,
+            branch_id,
+            generation,
+            &missing_certified_scopes,
+        )
+        .await?;
+        collection_controls.extend(
+            missing_certified_scopes
+                .into_iter()
+                .zip(missing_certified_controls)
+                .map(|(scope, control)| {
+                    (
+                        (
+                            scope.schema_key.to_owned(),
+                            scope.file_id.map(str::to_owned),
+                        ),
+                        control,
+                    )
+                }),
+        );
         for (delta, previous) in sorted.iter().zip(&mut previous_values) {
             if delta.schema_key == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY {
                 continue;
@@ -3118,6 +3199,7 @@ where
             &sorted,
             &previous_values,
             collection_controls,
+            certified_live_increments,
         )?;
 
         let _stage_span = tracing::debug_span!(

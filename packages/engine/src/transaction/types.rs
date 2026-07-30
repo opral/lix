@@ -1116,6 +1116,10 @@ pub(crate) struct TransactionFileData {
     /// Plugin installation uses this for the extracted WASM component so
     /// steady-state reads can load it directly without reopening the archive.
     auxiliary_payloads: Vec<BlobPayload>,
+    /// Reconciliation may retain this record only as the owner of certified
+    /// semantic batches after its file payload has already been materialized
+    /// through the ordinary plugin path.
+    stage_payload_at_commit: bool,
     /// Certified v3 semantic owners which remain encoded through commit.
     certified_entity_batches: Vec<WasmCertifiedEntityBatch>,
 }
@@ -1144,6 +1148,7 @@ impl TransactionFileData {
             mutation_identity: None,
             payload: BlobPayload::from_bytes(data),
             auxiliary_payloads: Vec::new(),
+            stage_payload_at_commit: true,
             certified_entity_batches: Vec::new(),
         }
     }
@@ -1188,6 +1193,14 @@ impl TransactionFileData {
 
     pub(crate) fn certified_entity_batches(&self) -> &[WasmCertifiedEntityBatch] {
         &self.certified_entity_batches
+    }
+
+    pub(crate) fn retain_certified_batches_only(&mut self) {
+        self.stage_payload_at_commit = false;
+    }
+
+    pub(crate) fn stage_payload_at_commit(&self) -> bool {
+        self.stage_payload_at_commit
     }
 
     pub(crate) fn data(&self) -> &[u8] {

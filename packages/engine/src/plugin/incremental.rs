@@ -1808,6 +1808,108 @@ fn validate_certified_entity_batches(
     Ok(())
 }
 
+const HOST_CERTIFIED_PACKET_TARGET_BYTES: usize = 256 * 1024;
+const HOST_CERTIFIED_PACKET_MIN_ROWS: usize = 64;
+const DENSE_TEXT_SCHEMA_KEY: &str = "git_text_line_v2";
+
+/// Retains a complete, eagerly validated generic-text import in dense packet
+/// pages. The ordinary v2 change list remains intact for changelog and
+/// transaction materialization; the tracked-head writer may use this complete
+/// batch as the authoritative current-state owner instead of persisting a
+/// second expanded HOT row per line.
+pub(crate) fn certify_dense_v2_fresh_file(
+    transition: &mut ValidatedFileTransition,
+    creates: crate::wasm::WasmCreateContext,
+    schemas: &V2SchemaAllowlist,
+) -> Result<(), LixError> {
+    if !transition.certified_batches.is_empty()
+        || transition.changes.changes.len() < HOST_CERTIFIED_PACKET_MIN_ROWS
+    {
+        return Ok(());
+    }
+    if !transition.changes.changes.iter().all(|change| {
+        matches!(
+            change,
+            WasmEntityChange::Create {
+                schema_key,
+                resolved_key: None,
+                snapshot_content: WasmHostBytes::CanonicalJson(_),
+                ..
+            } if schema_key == DENSE_TEXT_SCHEMA_KEY
+        )
+    }) {
+        return Ok(());
+    }
+    schemas.validate(DENSE_TEXT_SCHEMA_KEY)?;
+
+    let mut pages = Vec::new();
+    let mut page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES);
+    for change in &transition.changes.changes {
+        let WasmEntityChange::Create {
+            schema_key,
+            local_ref,
+            snapshot_content: WasmHostBytes::CanonicalJson(snapshot),
+            ..
+        } = change
+        else {
+            unreachable!("dense text eligibility was checked above");
+        };
+        let schema_bytes = schema_key.as_bytes();
+        let snapshot_bytes = snapshot.normalized().as_bytes();
+        let record_len = 1_usize
+            .checked_add(4)
+            .and_then(|len| len.checked_add(schema_bytes.len()))
+            .and_then(|len| len.checked_add(8 + 1 + 4))
+            .and_then(|len| len.checked_add(snapshot_bytes.len()))
+            .ok_or_else(|| invalid_guest("host certified packet record size overflowed"))?;
+        let framed_len = 4_usize
+            .checked_add(record_len)
+            .ok_or_else(|| invalid_guest("host certified packet frame size overflowed"))?;
+        if !page.is_empty()
+            && page.len().saturating_add(framed_len) > HOST_CERTIFIED_PACKET_TARGET_BYTES
+        {
+            pages.push(Bytes::from(std::mem::take(&mut page)));
+            page = Vec::with_capacity(HOST_CERTIFIED_PACKET_TARGET_BYTES.max(framed_len));
+        }
+        page.extend_from_slice(
+            &u32::try_from(record_len)
+                .map_err(|_| invalid_guest("host certified packet record exceeds u32"))?
+                .to_le_bytes(),
+        );
+        page.push(2);
+        page.extend_from_slice(
+            &u32::try_from(schema_bytes.len())
+                .map_err(|_| invalid_guest("host certified packet schema exceeds u32"))?
+                .to_le_bytes(),
+        );
+        page.extend_from_slice(schema_bytes);
+        page.extend_from_slice(&local_ref.to_le_bytes());
+        page.push(0);
+        page.extend_from_slice(
+            &u32::try_from(snapshot_bytes.len())
+                .map_err(|_| invalid_guest("host certified packet snapshot exceeds u32"))?
+                .to_le_bytes(),
+        );
+        page.extend_from_slice(snapshot_bytes);
+    }
+    if !page.is_empty() {
+        pages.push(Bytes::from(page));
+    }
+    let batch = WasmCertifiedEntityBatch {
+        // Format 3 is the host-only equivalent of the format-2 packet codec.
+        // Guest batches are validated before this synthesis point and the
+        // guest-facing validator intentionally rejects format 3.
+        format: crate::wasm::HOST_CERTIFIED_PACKET_FORMAT,
+        schema_keys: vec![DENSE_TEXT_SCHEMA_KEY.to_owned()],
+        row_count: transition.changes.changes.len() as u64,
+        creates,
+        complete_file_state: true,
+        pages,
+    };
+    transition.certified_batches.push(batch);
+    Ok(())
+}
+
 fn validate_certified_snapshot_packets(
     batch: &WasmCertifiedEntityBatch,
     schemas: &V2SchemaAllowlist,
