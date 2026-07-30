@@ -5109,6 +5109,8 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
         eviction_counters.full_state_semantic_rows_materialized, 0,
         "an in-process decoded checkpoint must avoid durable entity hydration after Store eviction"
     );
+    assert_eq!(eviction_counters.private_document_cache_hits, 1);
+    assert_eq!(eviction_counters.full_document_reparses, 0);
     assert_eq!(eviction_counters.durable_semantic_changes, 1);
     assert_eq!(
         lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
@@ -5138,6 +5140,16 @@ async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
             .full_state_semantic_rows_materialized
             > 0,
         "process restart must fall back to durable entity hydration"
+    );
+    assert_eq!(
+        reopened
+            .plugin_transition_counters()
+            .private_document_cache_hits,
+        0
+    );
+    assert_eq!(
+        reopened.plugin_transition_counters().full_document_reparses,
+        1
     );
     assert_eq!(
         reopened

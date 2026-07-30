@@ -64,11 +64,12 @@ use crate::plugin::{
     ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256,
     LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
     PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
-    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentType,
-    PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry, PluginRegistryEntry,
-    PluginRegistryEntryInput, PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition,
-    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
-    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_snapshot,
+    PluginActorStagedCheckpoint, PluginActorStore, PluginActorStorePermit,
+    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
+    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
+    PluginRuntimeHost, SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
+    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
+    VecEntitySource, build_file_update_splices, canonicalize_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -3956,6 +3957,7 @@ where
                             let decoded_checkpoint = cold_before.as_ref().and_then(|_| {
                                 cache.checkpoint(&actor_key, &visible_materialization.semantic_root)
                             });
+                            let restored_checkpoint = decoded_checkpoint.is_some();
                             let store_permit = loop {
                                 match cache.admit_cold_store(&mut cold_install) {
                                     Ok(permit) => break permit,
@@ -4121,7 +4123,8 @@ where
                                     .unwrap_or(0);
                             counters.full_state_semantic_rows_materialized =
                                 u64::try_from(entity_count).unwrap_or(u64::MAX);
-                            counters.full_document_reparses = 1;
+                            counters.private_document_cache_hits = u64::from(restored_checkpoint);
+                            counters.full_document_reparses = u64::from(!restored_checkpoint);
                             counters.full_renderer_invocations = u64::from(matches!(
                                 selected.materialization(),
                                 PluginMaterialization::Derived
@@ -7675,15 +7678,8 @@ enum PendingPluginActorPublication {
     Uncached {
         path: String,
         view: PendingPluginActorView,
-        checkpoint: Option<PendingPluginCheckpoint>,
+        checkpoint: Option<PluginActorStagedCheckpoint>,
     },
-}
-
-struct PendingPluginCheckpoint {
-    cache: PluginActorCache,
-    key: PluginActorKey,
-    semantic_root: Arc<str>,
-    checkpoint: Option<WasmDocumentCheckpoint>,
 }
 
 impl PendingPluginActorPublication {
@@ -7697,14 +7693,9 @@ impl PendingPluginActorPublication {
                 let checkpoint =
                     lease
                         .successor_checkpoint()
-                        .map(
-                            |(cache, semantic_root, checkpoint)| PendingPluginCheckpoint {
-                                cache,
-                                key: successor_key.clone(),
-                                semantic_root,
-                                checkpoint,
-                            },
-                        );
+                        .and_then(|(cache, semantic_root, checkpoint)| {
+                            cache.stage_checkpoint(successor_key.clone(), semantic_root, checkpoint)
+                        });
                 let _ = lease.discard_successor().await;
                 Self::Uncached {
                     path: successor_key.path,
@@ -7727,12 +7718,7 @@ impl PendingPluginActorPublication {
                 Self::Uncached {
                     path: key.path.clone(),
                     view,
-                    checkpoint: Some(PendingPluginCheckpoint {
-                        cache,
-                        key,
-                        semantic_root,
-                        checkpoint,
-                    }),
+                    checkpoint: cache.stage_checkpoint(key, semantic_root, checkpoint),
                 }
             }
             publication @ Self::Uncached { .. } => publication,
@@ -7794,11 +7780,7 @@ impl PendingPluginActorPublication {
                 checkpoint,
             } => {
                 if let Some(checkpoint) = checkpoint {
-                    checkpoint.cache.remember_checkpoint(
-                        &checkpoint.key,
-                        &checkpoint.semantic_root,
-                        checkpoint.checkpoint,
-                    );
+                    checkpoint.publish();
                 }
                 (None, view, path)
             }

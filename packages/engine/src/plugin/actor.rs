@@ -123,12 +123,21 @@ impl PluginActorSlot {
 struct PluginActorCacheState {
     actors: BTreeMap<PluginActorKey, Arc<PluginActorSlot>>,
     checkpoints: BTreeMap<(PluginActorKey, String), PluginActorCheckpoint>,
+    pending_checkpoints: BTreeMap<u64, PluginActorPendingCheckpoint>,
     checkpoint_bytes: u64,
     clock: u64,
     next_nonce: u64,
+    next_checkpoint_nonce: u64,
 }
 
 struct PluginActorCheckpoint {
+    checkpoint: WasmDocumentCheckpoint,
+    last_used: u64,
+}
+
+struct PluginActorPendingCheckpoint {
+    key: PluginActorKey,
+    semantic_root: Arc<str>,
     checkpoint: WasmDocumentCheckpoint,
     last_used: u64,
 }
@@ -140,6 +149,27 @@ pub(crate) struct PluginActorCache {
     store_admission: Arc<Semaphore>,
     state: Arc<Mutex<PluginActorCacheState>>,
     cold_open_gate: Arc<AsyncMutex<()>>,
+}
+
+pub(crate) struct PluginActorStagedCheckpoint {
+    cache: PluginActorCache,
+    nonce: Option<u64>,
+}
+
+impl PluginActorStagedCheckpoint {
+    pub(crate) fn publish(mut self) {
+        if let Some(nonce) = self.nonce.take() {
+            self.cache.publish_staged_checkpoint(nonce);
+        }
+    }
+}
+
+impl Drop for PluginActorStagedCheckpoint {
+    fn drop(&mut self) {
+        if let Some(nonce) = self.nonce.take() {
+            self.cache.discard_staged_checkpoint(nonce);
+        }
+    }
 }
 
 /// RAII admission for exactly one live Component Store.
@@ -197,9 +227,11 @@ impl PluginActorCache {
             state: Arc::new(Mutex::new(PluginActorCacheState {
                 actors: BTreeMap::new(),
                 checkpoints: BTreeMap::new(),
+                pending_checkpoints: BTreeMap::new(),
                 checkpoint_bytes: 0,
                 clock: 0,
                 next_nonce: 1,
+                next_checkpoint_nonce: 1,
             })),
             cold_open_gate: Arc::new(AsyncMutex::new(())),
         })
@@ -250,18 +282,8 @@ impl PluginActorCache {
             },
         );
         while state.checkpoint_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
-            let oldest = state
-                .checkpoints
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| key.clone());
-            let Some(oldest) = oldest else {
+            if !evict_oldest_checkpoint(&mut state) {
                 break;
-            };
-            if let Some(evicted) = state.checkpoints.remove(&oldest) {
-                state.checkpoint_bytes = state
-                    .checkpoint_bytes
-                    .saturating_sub(evicted.checkpoint.retained_bytes());
             }
         }
     }
@@ -281,6 +303,82 @@ impl PluginActorCache {
                 entry.last_used = last_used;
                 entry.checkpoint.clone()
             })
+    }
+
+    pub(crate) fn stage_checkpoint(
+        &self,
+        key: PluginActorKey,
+        semantic_root: Arc<str>,
+        checkpoint: Option<WasmDocumentCheckpoint>,
+    ) -> Option<PluginActorStagedCheckpoint> {
+        let checkpoint = checkpoint?;
+        let retained_bytes = checkpoint.retained_bytes();
+        if retained_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            return None;
+        }
+        let mut state = self.lock();
+        state.clock = state.clock.wrapping_add(1);
+        let last_used = state.clock;
+        let nonce = state.next_checkpoint_nonce;
+        state.next_checkpoint_nonce = state.next_checkpoint_nonce.wrapping_add(1).max(1);
+        state.checkpoint_bytes = state.checkpoint_bytes.saturating_add(retained_bytes);
+        state.pending_checkpoints.insert(
+            nonce,
+            PluginActorPendingCheckpoint {
+                key,
+                semantic_root,
+                checkpoint,
+                last_used,
+            },
+        );
+        while state.checkpoint_bytes > DEFAULT_MAX_DECODED_CHECKPOINT_BYTES {
+            if !evict_oldest_checkpoint(&mut state) {
+                break;
+            }
+        }
+        drop(state);
+        Some(PluginActorStagedCheckpoint {
+            cache: self.clone(),
+            nonce: Some(nonce),
+        })
+    }
+
+    fn publish_staged_checkpoint(&self, nonce: u64) {
+        let mut state = self.lock();
+        let Some(mut pending) = state.pending_checkpoints.remove(&nonce) else {
+            return;
+        };
+        let stale_keys = state
+            .checkpoints
+            .keys()
+            .filter(|(existing, _)| existing == &pending.key)
+            .cloned()
+            .collect::<Vec<_>>();
+        for stale_key in stale_keys {
+            if let Some(stale) = state.checkpoints.remove(&stale_key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(stale.checkpoint.retained_bytes());
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        pending.last_used = state.clock;
+        state.checkpoints.insert(
+            (pending.key, pending.semantic_root.to_string()),
+            PluginActorCheckpoint {
+                checkpoint: pending.checkpoint,
+                last_used: pending.last_used,
+            },
+        );
+    }
+
+    fn discard_staged_checkpoint(&self, nonce: u64) {
+        let mut state = self.lock();
+        if let Some(pending) = state.pending_checkpoints.remove(&nonce) {
+            state.checkpoint_bytes = state
+                .checkpoint_bytes
+                .saturating_sub(pending.checkpoint.retained_bytes());
+        }
     }
 
     fn forget_checkpoints(&self, key: &PluginActorKey) {
@@ -804,6 +902,52 @@ impl PluginActorCache {
         self.state
             .lock()
             .expect("plugin actor cache mutex should not poison")
+    }
+}
+
+fn evict_oldest_checkpoint(state: &mut PluginActorCacheState) -> bool {
+    let committed = state
+        .checkpoints
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(key, entry)| (entry.last_used, key.clone()));
+    let pending = state
+        .pending_checkpoints
+        .iter()
+        .min_by_key(|(_, entry)| entry.last_used)
+        .map(|(nonce, entry)| (entry.last_used, *nonce));
+    match (committed, pending) {
+        (None, None) => false,
+        (Some((_, key)), None) => {
+            if let Some(evicted) = state.checkpoints.remove(&key) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
+        (None, Some((_, nonce))) => {
+            if let Some(evicted) = state.pending_checkpoints.remove(&nonce) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
+        (Some((committed_used, key)), Some((pending_used, nonce))) => {
+            if committed_used <= pending_used {
+                if let Some(evicted) = state.checkpoints.remove(&key) {
+                    state.checkpoint_bytes = state
+                        .checkpoint_bytes
+                        .saturating_sub(evicted.checkpoint.retained_bytes());
+                }
+            } else if let Some(evicted) = state.pending_checkpoints.remove(&nonce) {
+                state.checkpoint_bytes = state
+                    .checkpoint_bytes
+                    .saturating_sub(evicted.checkpoint.retained_bytes());
+            }
+            true
+        }
     }
 }
 
@@ -1439,6 +1583,40 @@ mod tests {
                 .checkpoint(&key("main", "/other.csv", "g1"), "root-1")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn pending_and_published_checkpoints_share_one_hard_budget() {
+        let cache = PluginActorCache::new(2).unwrap();
+        let first_key = key("main", "/first.csv", "g1");
+        let second_key = key("main", "/second.csv", "g1");
+        let retained_bytes = 40 * 1024 * 1024;
+        let first = cache
+            .stage_checkpoint(
+                first_key.clone(),
+                Arc::from("root-1"),
+                Some(WasmDocumentCheckpoint::new(1_u64, retained_bytes)),
+            )
+            .unwrap();
+        let second = cache
+            .stage_checkpoint(
+                second_key.clone(),
+                Arc::from("root-2"),
+                Some(WasmDocumentCheckpoint::new(2_u64, retained_bytes)),
+            )
+            .unwrap();
+
+        assert!(cache.checkpoint(&second_key, "root-2").is_none());
+        first.publish();
+        second.publish();
+        assert!(cache.checkpoint(&first_key, "root-1").is_none());
+        assert_eq!(
+            cache
+                .checkpoint(&second_key, "root-2")
+                .and_then(|checkpoint| checkpoint.downcast_ref::<u64>().copied()),
+            Some(2)
+        );
+        assert!(cache.lock().checkpoint_bytes <= DEFAULT_MAX_DECODED_CHECKPOINT_BYTES);
     }
 
     #[tokio::test]

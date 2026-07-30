@@ -281,6 +281,7 @@ pub struct ByteArena {
     len: u64,
     segments: Arc<[Segment]>,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl ByteArena {
@@ -309,11 +310,20 @@ impl ByteArena {
             parts.push(segment.len.to_le_bytes().to_vec());
         }
         let id = digest(b"lix-plugin-v3/bytes\0", parts);
+        let retained_heap_bytes = size_of::<ByteArena>()
+            .saturating_add(segments.len().saturating_mul(size_of::<Segment>()))
+            .saturating_add(2 * size_of::<usize>())
+            .saturating_add(segments.iter().fold(0_usize, |total, segment| {
+                total
+                    .saturating_add(segment.page.bytes.len())
+                    .saturating_add(2 * size_of::<usize>())
+            }));
         Self {
             store,
             len,
             segments: segments.into(),
             id,
+            retained_heap_bytes,
         }
     }
 
@@ -532,6 +542,7 @@ pub struct MapArena {
     store: Store,
     entries: Arc<BTreeMap<Vec<u8>, ByteArena>>,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl MapArena {
@@ -541,15 +552,22 @@ impl MapArena {
 
     fn from_entries(store: Store, entries: BTreeMap<Vec<u8>, ByteArena>) -> Self {
         let mut parts = Vec::with_capacity(entries.len() * 2);
+        let mut retained_heap_bytes = size_of::<MapArena>();
         for (key, value) in &entries {
             parts.push(key.clone());
             parts.push(value.id.0.to_vec());
+            retained_heap_bytes = retained_heap_bytes
+                .saturating_add(key.capacity())
+                .saturating_add(size_of::<(Vec<u8>, ByteArena)>())
+                .saturating_add(64)
+                .saturating_add(value.retained_heap_bytes);
         }
         let id = digest(b"lix-plugin-v3/map\0", parts);
         Self {
             store,
             entries: Arc::new(entries),
             id,
+            retained_heap_bytes,
         }
     }
 
@@ -643,6 +661,7 @@ pub struct Root {
     pub entities: MapArena,
     pub state: MapArena,
     id: Digest,
+    retained_heap_bytes: usize,
 }
 
 impl Root {
@@ -688,12 +707,17 @@ impl Root {
                 state.id.as_bytes(),
             ],
         );
+        let retained_heap_bytes = size_of::<Root>()
+            .saturating_add(bytes.retained_heap_bytes)
+            .saturating_add(entities.retained_heap_bytes)
+            .saturating_add(state.retained_heap_bytes);
         Self {
             generation,
             bytes,
             entities,
             state,
             id,
+            retained_heap_bytes,
         }
     }
 
@@ -703,39 +727,13 @@ impl Root {
 
     /// Approximate heap bytes retained by this immutable root.
     ///
-    /// This includes unique page payloads plus the per-entity keys, arenas,
+    /// This includes page payloads plus the per-entity keys, arenas,
     /// segment arrays, and a conservative allowance for `BTreeMap` nodes and
-    /// allocation headers. It deliberately overcounts shared metadata so a
-    /// decoded-root cache remains a hard memory bound without serializing or
-    /// copying payloads merely to measure them.
+    /// allocation headers. It deliberately overcounts shared pages and
+    /// metadata so a decoded-root cache remains a hard memory bound. The value
+    /// is maintained while immutable arenas are built, so reading it is O(1).
     pub fn retained_heap_bytes(&self) -> usize {
-        let mut pages = BTreeMap::<Digest, usize>::new();
-        record_byte_pages(&self.bytes, &mut pages);
-        let mut retained = byte_arena_metadata_bytes(&self.bytes);
-        for value in self.entities.entries.values() {
-            record_byte_pages(value, &mut pages);
-            retained = retained.saturating_add(byte_arena_metadata_bytes(value));
-        }
-        for value in self.state.entries.values() {
-            record_byte_pages(value, &mut pages);
-            retained = retained.saturating_add(byte_arena_metadata_bytes(value));
-        }
-        for (key, _) in self
-            .entities
-            .entries
-            .iter()
-            .chain(self.state.entries.iter())
-        {
-            retained = retained
-                .saturating_add(key.capacity())
-                .saturating_add(size_of::<(Vec<u8>, ByteArena)>())
-                .saturating_add(64);
-        }
-        pages.values().fold(retained, |total, payload| {
-            total
-                .saturating_add(*payload)
-                .saturating_add(2 * size_of::<usize>())
-        })
+        self.retained_heap_bytes
     }
 
     pub fn transaction(&self) -> Transaction {
@@ -818,20 +816,6 @@ impl Root {
             a.state.clone(),
         ))
     }
-}
-
-fn record_byte_pages(arena: &ByteArena, output: &mut BTreeMap<Digest, usize>) {
-    for segment in arena.segments.iter() {
-        output
-            .entry(segment.page.id)
-            .or_insert(segment.page.bytes.len());
-    }
-}
-
-fn byte_arena_metadata_bytes(arena: &ByteArena) -> usize {
-    size_of::<ByteArena>()
-        .saturating_add(arena.segments.len().saturating_mul(size_of::<Segment>()))
-        .saturating_add(2 * size_of::<usize>())
 }
 
 fn same_value(a: Option<&ByteArena>, b: Option<&ByteArena>) -> bool {
