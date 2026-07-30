@@ -86,9 +86,13 @@ struct IdAllocator {
 
 impl IdAllocator {
     fn new(namespace: IdNamespace) -> Self {
+        Self::with_ordinal(namespace, 0)
+    }
+
+    fn with_ordinal(namespace: IdNamespace, ordinal: u32) -> Self {
         Self {
             namespace,
-            ordinal: 0,
+            ordinal: u64::from(ordinal),
         }
     }
 
@@ -171,7 +175,7 @@ impl MarkdownPlugin {
         let mut after = parse_file(&file)?;
         retain_noncanonical_source(&mut after, &file.data)?;
         let (changes, _) =
-            detect_changes_for_markdown(&before_view, before_root.as_ref(), after, namespace)?;
+            detect_changes_for_markdown(&before_view, before_root.as_ref(), after, namespace, 0)?;
         Ok(changes)
     }
 
@@ -238,6 +242,7 @@ fn detect_changes_for_markdown(
     before_root: Option<&NodeTree>,
     mut after: ParsedMarkdown,
     namespace: IdNamespace,
+    minimum_ordinal: u32,
 ) -> Result<(Vec<DetectedChange>, NodeTree), PluginError> {
     let generated_ids = collect_generated_ids(&after.root);
     let mut replacements = BTreeMap::new();
@@ -277,7 +282,7 @@ fn detect_changes_for_markdown(
         initialize_subtree(&mut after.root, None)?;
     }
 
-    let mut allocator = IdAllocator::new(namespace);
+    let mut allocator = IdAllocator::with_ordinal(namespace, minimum_ordinal);
     allocate_generated_ids(
         &mut after.root,
         &generated_ids,
@@ -2025,7 +2030,7 @@ impl Document {
         retain_noncanonical_source(&mut parsed, &file.data)?;
         let top_level_ranges = parsed.top_level_ranges.clone();
         let (detected, root) =
-            detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace)?;
+            detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace, 0)?;
         let changes = detected
             .into_iter()
             .map(detected_to_entity_change)
@@ -2128,6 +2133,7 @@ impl Document {
         block_end: u64,
         splice: InputSplice<'_>,
         namespace: IdNamespace,
+        minimum_ordinal: u32,
     ) -> Result<Option<(Vec<EntityChange>, Vec<u8>, Vec<u8>)>, PluginError> {
         let (&fallback_flag, root_json) = root_json
             .split_first()
@@ -2153,12 +2159,16 @@ impl Document {
             top_level_ranges: Arc::new(vec![start..end]),
         };
         let successor_bytes = document.bytes.splice(&[splice])?;
-        let Some((detected, top_level_ranges, tree)) =
-            document.try_top_level_replacement(&[splice], &successor_bytes, namespace)?
+        let Some((detected, top_level_ranges, tree)) = document.try_top_level_replacement(
+            &[splice],
+            &successor_bytes,
+            namespace,
+            minimum_ordinal,
+        )?
         else {
             return Ok(None);
         };
-        let mut changes = detected
+        let changes = detected
             .into_iter()
             .map(detected_to_entity_change)
             .collect::<Result<Vec<_>, _>>()?;
@@ -2167,30 +2177,6 @@ impl Document {
             tree,
             top_level_ranges,
         };
-        if fallback_flag != 0 {
-            let mut successor_root = successor.tree.root_node().clone();
-            let format = successor_root.format.as_object_mut().ok_or_else(|| {
-                PluginError::Internal("Markdown document format must be an object".to_owned())
-            })?;
-            format.insert(
-                LEXICAL_FALLBACK_FIELD.to_owned(),
-                serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(successor.bytes.materialize()),
-                ),
-            );
-            changes.push(detected_to_entity_change(DetectedChange {
-                entity_pk: vec![successor_root.id.clone()],
-                schema_key: NODE_SCHEMA_KEY.to_owned(),
-                snapshot_content: Some(serde_json::to_string(&successor_root).map_err(
-                    |error| {
-                        PluginError::Internal(format!(
-                            "serialize successor Markdown arena root change: {error}"
-                        ))
-                    },
-                )?),
-                metadata: Some(r#"{"impact":"format"}"#.to_owned()),
-            })?);
-        }
         let root_json = {
             let mut bytes = vec![fallback_flag];
             bytes.extend_from_slice(root_json);
@@ -2216,7 +2202,7 @@ impl Document {
         {
             incremental
         } else if let Some(incremental) =
-            self.try_top_level_replacement(splices, &successor_bytes, namespace)?
+            self.try_top_level_replacement(splices, &successor_bytes, namespace, 0)?
         {
             incremental
         } else {
@@ -2231,7 +2217,7 @@ impl Document {
             retain_noncanonical_source(&mut parsed, &file.data)?;
             let top_level_ranges = Arc::new(parsed.top_level_ranges.clone());
             let (detected, root) =
-                detect_changes_for_markdown(&before, Some(&current_root), parsed, namespace)?;
+                detect_changes_for_markdown(&before, Some(&current_root), parsed, namespace, 0)?;
             (detected, top_level_ranges, PersistentTree::new(root))
         };
         let changes = detected
@@ -2511,6 +2497,7 @@ impl Document {
         splices: &[InputSplice<'_>],
         bytes: &PersistentBytes,
         namespace: IdNamespace,
+        minimum_ordinal: u32,
     ) -> Result<Option<(Vec<DetectedChange>, Arc<Vec<Range<usize>>>, PersistentTree)>, PluginError>
     {
         let [splice] = splices else {
@@ -2593,8 +2580,13 @@ impl Document {
         replacement.root.node.payload = new_root_node.payload;
         replacement.root.node.format = new_root_node.format;
         let before = ProjectionView::from_tree(&old_root);
-        let (detected, mut reconciled) =
-            detect_changes_for_markdown(&before, Some(&old_root), replacement, namespace)?;
+        let (detected, mut reconciled) = detect_changes_for_markdown(
+            &before,
+            Some(&old_root),
+            replacement,
+            namespace,
+            minimum_ordinal,
+        )?;
         let reconciled_block = reconciled.children.pop().ok_or_else(|| {
             PluginError::Internal("incremental Markdown parse lost its changed block".into())
         })?;

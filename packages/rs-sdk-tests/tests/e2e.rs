@@ -53,6 +53,14 @@ fn is_import_perf_span(name: &str) -> bool {
         "lix.perf.transaction_plan_and_stage"
             | "lix.perf.plugin_reconciliation"
             | "lix.perf.plugin_factory_compile"
+            | "lix.perf.plugin_file_changed"
+            | "lix.perf.plugin_drain_changes"
+            | "lix.perf.plugin_suppress_noops"
+            | "lix.perf.plugin_create_rows"
+            | "lix.perf.plugin_splice_discovery"
+            | "lix.perf.v3_guest_file_changed"
+            | "lix.perf.v3_arena_prepare"
+            | "lix.perf.v3_arena_commit"
             | "lix.perf.plugin_open_file"
             | "lix.perf.plugin_open_file_drain"
             | "lix.perf.plugin_drain_next_page"
@@ -64,6 +72,15 @@ fn is_import_perf_span(name: &str) -> bool {
             | "lix.perf.plugin_change_rows"
             | "lix.perf.plugin_semantic_prepare_rows"
             | "lix.perf.transaction_validation"
+            | "lix.perf.validation.registered_schema_identity"
+            | "lix.perf.validation.file_owner"
+            | "lix.perf.validation.committed_foreign_keys"
+            | "lix.perf.validation.delete_restrictions"
+            | "lix.perf.validation.branch_ref_delete_restrictions"
+            | "lix.perf.validation.insert_identities"
+            | "lix.perf.validation.unique_constraints"
+            | "lix.perf.validation.directory_parent_graph"
+            | "lix.perf.validation.filesystem_namespace"
             | "lix.perf.transaction_materialization"
             | "lix.perf.materialization.finalize_commit_rows"
             | "lix.perf.materialization.changelog"
@@ -862,6 +879,58 @@ async fn v3_markdown_certified_open_sparse_successor_history_and_reopen() {
 }
 
 #[tokio::test]
+async fn v3_markdown_noncanonical_source_stays_in_file_arena_not_semantic_root() {
+    let root = tempfile::tempdir().expect("create noncanonical v3 Markdown directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_markdown_v3_prototype",
+        &build_markdown_v3_prototype_archive(),
+        &["markdown_node_v2"],
+    )
+    .await;
+
+    let path = "/noncanonical-v3.md";
+    let before =
+        b"---\nDateApproved: 6/10/2020\n---\n\n\n# Title\n\nA large untouched suffix.\n".to_vec();
+    write_file(&lix, path, before.clone()).await.unwrap();
+    let document = lix
+        .execute(
+            "SELECT format_json FROM markdown_node_v2 WHERE kind = 'document'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(document.rows().len(), 1);
+    assert!(
+        !document.rows()[0]
+            .get::<String>("format_json")
+            .unwrap()
+            .contains("lexical_fallback_base64"),
+        "v3 semantic state must not duplicate accepted source bytes"
+    );
+
+    let after = String::from_utf8(before)
+        .unwrap()
+        .replacen("6/10", "7/9", 1)
+        .into_bytes();
+    lix.reset_plugin_v2_transition_counters();
+    write_file(&lix, path, after.clone()).await.unwrap();
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(counters.guest_export_calls, 1);
+    assert_eq!(
+        counters.durable_semantic_changes, 1,
+        "only the changed frontmatter entity should be durable"
+    );
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(after));
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "exact VS Code Docs d5badf Markdown transition v2 versus v3 benchmark"]
 async fn v3_markdown_vscode_api_exact_transition_benchmark() {
     const BENCHMARK: &str = "v3_markdown_vscode_api_exact_transition_benchmark";
@@ -881,6 +950,9 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
         .unwrap_or_else(|error| panic!("read VS Code after fixture {after_path}: {error}"));
     assert_eq!(before.len(), 1_237_841);
     assert_eq!(after.len(), 1_237_840);
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
 
     let lanes = [
         (
@@ -895,6 +967,7 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
         ),
     ];
     let mut expected_rows = None;
+    let mut lane_medians = BTreeMap::new();
     for (label, plugin_key, archive) in lanes {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
@@ -914,8 +987,17 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
             write_file(&lix, PATH, before.clone())
                 .await
                 .unwrap_or_else(|error| panic!("{label} opening import failed: {error}"));
+            let before_ids = lix
+                .execute("SELECT id FROM markdown_node_v2", &[])
+                .await
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("id").unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
 
             lix.reset_plugin_v2_transition_counters();
+            collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(&lix, PATH, after.clone())
@@ -932,6 +1014,19 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 .rows()[0]
                 .get::<i64>("count")
                 .unwrap() as usize;
+            let after_ids = lix
+                .execute("SELECT id FROM markdown_node_v2", &[])
+                .await
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|row| row.get::<String>("id").unwrap())
+                .collect::<std::collections::BTreeSet<_>>();
+            eprintln!(
+                "vscode_markdown_identity lane={label} removed={:?} added={:?}",
+                before_ids.difference(&after_ids).collect::<Vec<_>>(),
+                after_ids.difference(&before_ids).collect::<Vec<_>>(),
+            );
             if let Some(expected) = expected_rows {
                 assert_eq!(rows, expected, "{label} semantic row count");
             } else {
@@ -956,6 +1051,12 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
                 counters.durable_semantic_changes,
                 counters.full_state_semantic_rows_materialized,
             );
+            eprintln!(
+                "vscode_markdown_phases lane={label} sample={sample} phases_ms={:?} \
+                 phase_close_live_bytes={:?}",
+                collector.take_aggregate_millis(),
+                collector.take_close_live_bytes(),
+            );
             elapsed_ms.push(measurement.elapsed_ms);
             measurements.push(measurement);
             lix.close().await.unwrap();
@@ -976,6 +1077,13 @@ async fn v3_markdown_vscode_api_exact_transition_benchmark() {
             BenchmarkGate::BulkWrite,
             &measurements,
         );
+        lane_medians.insert(label, benchmark_medians(&measurements));
+    }
+    if let (Some(v2), Some(v3)) = (
+        lane_medians.get("v2_cursor"),
+        lane_medians.get("v3_push_sink"),
+    ) {
+        assert_v3_benchmark_win(BENCHMARK, *v2, *v3);
     }
 }
 
@@ -3344,6 +3452,7 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in lanes {
         let mut measurements = Vec::with_capacity(samples);
@@ -3478,7 +3587,13 @@ async fn v3_json_ten_mib_push_sink_benchmark() {
             BenchmarkGate::BulkWrite,
             &measurements,
         );
+        lane_medians.insert(label, benchmark_medians(&measurements));
     }
+    assert_v3_benchmark_win(
+        BENCHMARK,
+        lane_medians["v2_cursor"],
+        lane_medians["v3_push_sink"],
+    );
 }
 
 #[tokio::test]
@@ -3496,6 +3611,7 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
     let collector = PerfSpanCollector::default();
     let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
     let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let mut lane_medians = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
         (
@@ -3509,11 +3625,18 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
             build_json_v3_prototype_archive(),
         ),
     ] {
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
+            continue;
+        }
         let mut elapsed_ms = Vec::with_capacity(samples);
         let mut measurements = Vec::with_capacity(samples);
         for sample in 0..samples {
             let root = tempfile::tempdir().expect("create sparse JSON benchmark directory");
-            let lix = open_lix_with_rocksdb(root.path()).await;
+            let storage = RocksDB::open(root.path().join(".lix"))
+                .expect("open sparse JSON benchmark RocksDB");
+            let lix = open_lix_with_storage(storage.clone())
+                .await
+                .expect("open sparse JSON benchmark workspace");
             install_reference_plugin_in_blank_registry(
                 &lix,
                 plugin_key,
@@ -3524,6 +3647,9 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
             write_file(&lix, PATH, before.clone())
                 .await
                 .unwrap_or_else(|error| panic!("{label} opening import failed: {error}"));
+            storage
+                .flush()
+                .expect("flush sparse JSON benchmark cold import");
 
             lix.reset_plugin_v2_transition_counters();
             collector.clear();
@@ -3590,6 +3716,131 @@ async fn v3_json_ten_mib_sparse_successor_benchmark() {
             BenchmarkGate::ElapsedRegression,
             &measurements,
         );
+        lane_medians.insert(label, benchmark_medians(&measurements));
+    }
+    if let (Some(v2), Some(v3)) = (lane_medians.get("v2_actor"), lane_medians.get("v3_arena")) {
+        assert_v3_benchmark_win("v3_json_ten_mib_sparse_successor_benchmark", *v2, *v3);
+    }
+}
+
+#[tokio::test]
+#[ignore = "10 MiB JSON process-cold hydrate plus sparse successor benchmark"]
+async fn v3_json_ten_mib_cold_successor_benchmark() {
+    const PATH: &str = "/v3-json-cold-successor.json";
+    let samples = std::env::var("LIX_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|samples| *samples > 0)
+        .unwrap_or(3);
+    let (before, edit_offset, edited_key) = json_ten_mib_flat_fixture();
+    let mut after = before.clone();
+    after[edit_offset] = alternate_ascii_hex(after[edit_offset]);
+    let mut lane_medians = BTreeMap::new();
+
+    for (label, plugin_key, archive) in [
+        (
+            "v2_actor",
+            "plugin_json_incremental_v2",
+            build_json_v2_plugin_archive(),
+        ),
+        (
+            "v3_arena",
+            "plugin_json_v3_prototype",
+            build_json_v3_prototype_archive(),
+        ),
+    ] {
+        if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
+            continue;
+        }
+        let mut elapsed_ms = Vec::with_capacity(samples);
+        let mut measurements = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let root = tempfile::tempdir().expect("create cold JSON benchmark directory");
+            let storage =
+                RocksDB::open(root.path().join(".lix")).expect("open cold JSON benchmark RocksDB");
+            let lix = open_lix_with_storage(storage.clone()).await.unwrap();
+            install_reference_plugin_in_blank_registry(
+                &lix,
+                plugin_key,
+                &archive,
+                &["json_root", "json_object_member", "json_array_item"],
+            )
+            .await;
+            write_file(&lix, PATH, before.clone()).await.unwrap();
+            storage.flush().expect("flush cold JSON benchmark import");
+            lix.close().await.unwrap();
+
+            let reopened = open_lix_with_rocksdb(root.path()).await;
+            reopened.reset_plugin_v2_transition_counters();
+            let allocation_scope = AllocationScope::start();
+            let started = Instant::now();
+            assert_eq!(
+                read_file(&reopened, PATH).await.unwrap(),
+                Some(before.clone())
+            );
+            write_file(&reopened, PATH, after.clone()).await.unwrap();
+            let measurement =
+                BenchmarkMeasurement::new(started.elapsed(), allocation_scope.finish());
+            let counters = reopened.plugin_v2_transition_counters();
+            assert_eq!(
+                read_file(&reopened, PATH).await.unwrap(),
+                Some(after.clone())
+            );
+            assert_eq!(counters.durable_semantic_changes, 1);
+            assert_eq!(
+                reopened
+                    .execute(
+                        "SELECT scalar_json FROM json_object_member WHERE key = $1",
+                        &[Value::Text(edited_key.clone())],
+                    )
+                    .await
+                    .unwrap()
+                    .rows()[0]
+                    .get::<String>("scalar_json")
+                    .unwrap()
+                    .contains(char::from(after[edit_offset])),
+                true
+            );
+            eprintln!(
+                "json_cold_successor lane={label} sample={sample} elapsed_ms={:.3} \
+                 allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
+                 guest_exports={} imports={} boundary_bytes={} guest_high_water_mb={:.3} \
+                 semantic_rows_hydrated={} full_renders={}",
+                measurement.elapsed_ms,
+                measurement.allocations.allocation_count,
+                measurement.allocations.allocated_bytes as f64 / 1_000_000.0,
+                measurement.allocations.peak_live_bytes_delta as f64 / 1_000_000.0,
+                counters.guest_export_calls,
+                counters.component_import_calls,
+                counters.component_boundary_bytes,
+                counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+                counters.full_state_semantic_rows_materialized,
+                counters.full_renderer_invocations,
+            );
+            elapsed_ms.push(measurement.elapsed_ms);
+            measurements.push(measurement);
+            reopened.close().await.unwrap();
+        }
+        elapsed_ms.sort_by(f64::total_cmp);
+        eprintln!(
+            "json_cold_successor lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3} p95_ms={:.3}",
+            p50_ms(&elapsed_ms),
+            p95_ms(&elapsed_ms),
+        );
+        emit_summary(
+            "v3_json_ten_mib_cold_successor_benchmark",
+            label,
+            BenchmarkFixture {
+                input_bytes: after.len(),
+                logical_rows: JSON_TEN_MIB_PROPERTY_COUNT,
+            },
+            BenchmarkGate::ElapsedRegression,
+            &measurements,
+        );
+        lane_medians.insert(label, benchmark_medians(&measurements));
+    }
+    if let (Some(v2), Some(v3)) = (lane_medians.get("v2_actor"), lane_medians.get("v3_arena")) {
+        assert_v3_benchmark_win("v3_json_ten_mib_cold_successor_benchmark", *v2, *v3);
     }
 }
 
@@ -3619,7 +3870,7 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
 
     let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
     write_file(&lix, path, after.clone()).await.unwrap();
-    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after));
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
     let current = lix
         .execute(
             "SELECT key, scalar_json FROM json_object_member ORDER BY key",
@@ -3649,6 +3900,165 @@ async fn v3_json_certified_batch_survives_sparse_successor_and_time_travel() {
         r#""one""#
     );
     lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_json_cold_hydration_after_actor_eviction_preserves_sparse_successor() {
+    let root = tempfile::tempdir().expect("create v3 JSON eviction directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json_v3_prototype",
+        &build_json_v3_prototype_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+    let path = "/v3-json-evicted.json";
+    let before = br#"{"a":"one","b":"two"}"#.to_vec();
+    write_file(&lix, path, before).await.unwrap();
+    assert_eq!(read_file(&lix, path).await.unwrap().unwrap().len(), 21);
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/v3-json-eviction-{index}.json"),
+            format!(r#"{{"value":"{index:04}"}}"#).into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    lix.reset_plugin_v2_transition_counters();
+    let after = br#"{"a":"ONE","b":"two"}"#.to_vec();
+    write_file(&lix, path, after.clone()).await.unwrap();
+    let counters = lix.plugin_v2_transition_counters();
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(after.clone()));
+    assert_eq!(counters.durable_semantic_changes, 1);
+    assert_eq!(
+        lix.execute(
+            "SELECT scalar_json FROM json_object_member WHERE key = 'a'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .rows()[0]
+            .get::<String>("scalar_json")
+            .unwrap(),
+        r#""ONE""#
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(after));
+    let after_reopen = br#"{"a":"ONE","b":"TWO"}"#.to_vec();
+    reopened.reset_plugin_v2_transition_counters();
+    write_file(&reopened, path, after_reopen.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(after_reopen)
+    );
+    assert_eq!(
+        reopened
+            .execute(
+                "SELECT scalar_json FROM json_object_member WHERE key = 'b'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("scalar_json")
+            .unwrap(),
+        r#""TWO""#
+    );
+    assert_eq!(
+        reopened
+            .plugin_v2_transition_counters()
+            .durable_semantic_changes,
+        1
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_csv_cold_successor_after_eviction_and_reopen_preserves_identity() {
+    let root = tempfile::tempdir().expect("create v3 CSV eviction directory");
+    let lix = open_lix_with_rocksdb(root.path()).await;
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v3_prototype",
+        &build_csv_v3_prototype_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+    let path = "/v3-csv-evicted.csv";
+    write_file(&lix, path, b"alpha,one\nbeta,two\n".to_vec())
+        .await
+        .unwrap();
+    let first_id = lix
+        .execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[])
+        .await
+        .unwrap()
+        .rows()[0]
+        .get::<String>("id")
+        .unwrap();
+
+    for index in 0..20 {
+        write_file(
+            &lix,
+            &format!("/v3-csv-eviction-{index}.csv"),
+            format!("row,{index:04}\n").into_bytes(),
+        )
+        .await
+        .unwrap();
+    }
+
+    lix.reset_plugin_v2_transition_counters();
+    let after_eviction = b"alpha,ONE\nbeta,two\n".to_vec();
+    write_file(&lix, path, after_eviction).await.unwrap();
+    assert_eq!(
+        lix.plugin_v2_transition_counters().durable_semantic_changes,
+        1
+    );
+    assert_eq!(
+        lix.execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap(),
+        first_id
+    );
+    lix.close().await.unwrap();
+
+    let reopened = open_lix_with_rocksdb(root.path()).await;
+    reopened.reset_plugin_v2_transition_counters();
+    let after_reopen = b"alpha,One\nbeta,two\n".to_vec();
+    write_file(&reopened, path, after_reopen.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .plugin_v2_transition_counters()
+            .durable_semantic_changes,
+        1
+    );
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(after_reopen)
+    );
+    assert_eq!(
+        reopened
+            .execute("SELECT id FROM csv_v2_row ORDER BY order_key LIMIT 1", &[],)
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap(),
+        first_id
+    );
+    reopened.close().await.unwrap();
 }
 
 /// Matched warm file transitions over the same CSV implementation. v2 returns
@@ -4473,6 +4883,7 @@ async fn v3_excalidraw_certified_open_sparse_successor_history_and_reopen() {
 async fn v3_excalidraw_large_transition_benchmark() {
     const ELEMENTS: usize = 20_000;
     const PATH: &str = "/large.excalidraw";
+    const BENCHMARK: &str = "v3_excalidraw_large_transition_benchmark";
     let samples = std::env::var("LIX_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -4500,6 +4911,14 @@ async fn v3_excalidraw_large_transition_benchmark() {
         )
         .into_bytes();
     assert_eq!(before.len() + 1, after.len());
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let fixture = BenchmarkFixture {
+        input_bytes: after.len(),
+        logical_rows: ELEMENTS,
+    };
+    let mut lane_measurements = BTreeMap::new();
 
     for (label, plugin_key, archive) in [
         (
@@ -4516,7 +4935,7 @@ async fn v3_excalidraw_large_transition_benchmark() {
         if std::env::var("LIX_BENCH_LANE").is_ok_and(|lane| lane != label) {
             continue;
         }
-        let mut elapsed_ms = Vec::with_capacity(samples);
+        let mut measurements = Vec::with_capacity(samples);
         for sample in 0..samples {
             let root = tempfile::tempdir().expect("create Excalidraw benchmark directory");
             let lix = open_lix_with_rocksdb(root.path()).await;
@@ -4530,6 +4949,7 @@ async fn v3_excalidraw_large_transition_benchmark() {
             write_file(&lix, PATH, before.clone()).await.unwrap();
 
             lix.reset_plugin_v2_transition_counters();
+            collector.clear();
             let allocation_scope = AllocationScope::start();
             let started = Instant::now();
             write_file(&lix, PATH, after.clone()).await.unwrap();
@@ -4553,7 +4973,8 @@ async fn v3_excalidraw_large_transition_benchmark() {
             eprintln!(
                 "large_excalidraw lane={label} sample={sample} input_mb={:.3} \
                  elapsed_ms={:.3} allocations={} allocated_mb={:.3} peak_live_mb={:.3} \
-                 guest_exports={} imports={} boundary_mb={:.3} guest_high_water_mb={:.3}",
+                 guest_exports={} imports={} boundary_mb={:.3} guest_high_water_mb={:.3} \
+                 phase_close_live_bytes={:?} phases_ms={:?}",
                 after.len() as f64 / 1_000_000.0,
                 measurement.elapsed_ms,
                 measurement.allocations.allocation_count,
@@ -4563,16 +4984,75 @@ async fn v3_excalidraw_large_transition_benchmark() {
                 counters.component_import_calls,
                 counters.component_boundary_bytes as f64 / 1_000_000.0,
                 counters.guest_linear_memory_high_water_bytes as f64 / 1_000_000.0,
+                collector.take_close_live_bytes(),
+                collector.take_aggregate_millis(),
             );
-            elapsed_ms.push(measurement.elapsed_ms);
+            emit_sample(
+                BENCHMARK,
+                label,
+                sample,
+                fixture,
+                BenchmarkGate::ElapsedRegression,
+                measurement,
+            );
+            measurements.push(measurement);
             lix.close().await.unwrap();
         }
+        emit_summary(
+            BENCHMARK,
+            label,
+            fixture,
+            BenchmarkGate::ElapsedRegression,
+            &measurements,
+        );
+        let mut elapsed_ms = measurements
+            .iter()
+            .map(|measurement| measurement.elapsed_ms)
+            .collect::<Vec<_>>();
         elapsed_ms.sort_by(f64::total_cmp);
         eprintln!(
             "large_excalidraw lane={label} raw_ms={elapsed_ms:?} p50_ms={:.3}",
             elapsed_ms[elapsed_ms.len() / 2]
         );
+        let mut allocated_bytes = measurements
+            .iter()
+            .map(|measurement| measurement.allocations.allocated_bytes)
+            .collect::<Vec<_>>();
+        allocated_bytes.sort_unstable();
+        let mut peak_live_bytes = measurements
+            .iter()
+            .map(|measurement| measurement.allocations.peak_live_bytes_delta)
+            .collect::<Vec<_>>();
+        peak_live_bytes.sort_unstable();
+        lane_measurements.insert(
+            label,
+            (
+                elapsed_ms[elapsed_ms.len() / 2],
+                allocated_bytes[allocated_bytes.len() / 2],
+                peak_live_bytes[peak_live_bytes.len() / 2],
+            ),
+        );
     }
+    let &(v2_ms, v2_allocated, v2_peak) = lane_measurements
+        .get("v2_cursor")
+        .expect("v2 Excalidraw lane must run");
+    let &(v3_ms, v3_allocated, v3_peak) = lane_measurements
+        .get("v3_push_sink")
+        .expect("v3 Excalidraw lane must run");
+    assert!(
+        v3_ms < v2_ms * 0.9,
+        "v3 Excalidraw must be at least 10% faster: v2={v2_ms:.3}ms v3={v3_ms:.3}ms"
+    );
+    assert!(
+        v3_allocated <= v2_allocated.saturating_mul(105) / 100,
+        "v3 Excalidraw cumulative host allocation regressed by more than 5%: \
+         v2={v2_allocated} v3={v3_allocated}"
+    );
+    assert!(
+        v3_peak <= v2_peak.saturating_mul(105) / 100,
+        "v3 Excalidraw peak live host allocation regressed by more than 5%: \
+         v2={v2_peak} v3={v3_peak}"
+    );
 }
 
 #[tokio::test]
@@ -5594,6 +6074,60 @@ fn p50_ms(sorted: &[f64]) -> f64 {
 fn p95_ms(sorted: &[f64]) -> f64 {
     let index = ((sorted.len() * 95).div_ceil(100)).saturating_sub(1);
     sorted[index]
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BenchmarkMedians {
+    elapsed_ms: f64,
+    allocated_bytes: u64,
+    peak_live_bytes: u64,
+}
+
+fn benchmark_medians(measurements: &[BenchmarkMeasurement]) -> BenchmarkMedians {
+    assert!(!measurements.is_empty());
+    let mut elapsed = measurements
+        .iter()
+        .map(|measurement| measurement.elapsed_ms)
+        .collect::<Vec<_>>();
+    elapsed.sort_by(f64::total_cmp);
+    let mut allocated = measurements
+        .iter()
+        .map(|measurement| measurement.allocations.allocated_bytes)
+        .collect::<Vec<_>>();
+    allocated.sort_unstable();
+    let mut peak = measurements
+        .iter()
+        .map(|measurement| measurement.allocations.peak_live_bytes_delta)
+        .collect::<Vec<_>>();
+    peak.sort_unstable();
+    BenchmarkMedians {
+        elapsed_ms: elapsed[elapsed.len() / 2],
+        allocated_bytes: allocated[allocated.len() / 2],
+        peak_live_bytes: peak[peak.len() / 2],
+    }
+}
+
+fn assert_v3_benchmark_win(benchmark: &str, v2: BenchmarkMedians, v3: BenchmarkMedians) {
+    assert!(
+        v3.elapsed_ms < v2.elapsed_ms * 0.9,
+        "{benchmark}: v3 must be at least 10% faster; v2={:.3}ms v3={:.3}ms",
+        v2.elapsed_ms,
+        v3.elapsed_ms,
+    );
+    assert!(
+        u128::from(v3.allocated_bytes) * 100 <= u128::from(v2.allocated_bytes) * 105,
+        "{benchmark}: v3 cumulative host allocation regressed by more than 5%; \
+         v2={} v3={}",
+        v2.allocated_bytes,
+        v3.allocated_bytes,
+    );
+    assert!(
+        u128::from(v3.peak_live_bytes) * 100 <= u128::from(v2.peak_live_bytes) * 105,
+        "{benchmark}: v3 peak live host allocation regressed by more than 5%; \
+         v2={} v3={}",
+        v2.peak_live_bytes,
+        v3.peak_live_bytes,
+    );
 }
 
 async fn install_plugin<StorageImpl>(

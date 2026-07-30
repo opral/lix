@@ -1178,20 +1178,12 @@ impl Document {
                     .span(ordinal)
                     .ok_or_else(|| "JSON scalar span is missing".to_owned())?;
                 let identity = node.identity();
-                let mut snapshot: Value = serde_json::from_slice(&self.node_snapshot(ordinal)?)
-                    .map_err(|error| format!("parse JSON arena scalar snapshot: {error}"))?;
-                snapshot
-                    .as_object_mut()
-                    .ok_or_else(|| "JSON arena scalar snapshot must be an object".to_owned())?
-                    .remove("scalar_json");
                 Ok(ArenaJsonScalar {
                     start,
                     length,
                     schema_key: identity.schema_key().to_owned(),
                     entity_pk: identity.entity_pk(),
-                    snapshot: serde_json::to_vec(&snapshot).map_err(|error| {
-                        format!("serialize JSON arena scalar snapshot: {error}")
-                    })?,
+                    snapshot: serialize_node_snapshot(node, None)?,
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -2081,6 +2073,10 @@ fn snapshot_node(
                 .map_err(|error| format!("retained JSON scalar is not UTF-8: {error}"))?,
         )
     };
+    serialize_node_snapshot(node, scalar)
+}
+
+fn serialize_node_snapshot(node: &Node, scalar: Option<String>) -> Result<Vec<u8>, String> {
     let value = match &node.relation {
         NodeRelation::Root => {
             let mut value = Map::new();

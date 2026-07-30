@@ -2011,16 +2011,69 @@ fn validate_certified_snapshot_packets(
                             "certified batch schema '{schema_key}' has no validation plan"
                         ))
                     })?;
-                    plan.certify_or_normalize_v2_plugin_row_parts(
-                        snapshot,
-                        schema_key,
-                        &components,
-                    )?
-                    .ok_or_else(|| {
-                        invalid_guest(format!(
-                            "certified batch schema '{schema_key}' has no streaming validator"
-                        ))
-                    })?
+                    if schema_key == "markdown_node_v2" {
+                        if !batch.complete_file_state {
+                            return Err(invalid_guest(
+                                "sparse certified Markdown batches require a durable-base observation",
+                            ));
+                        }
+                        let [id] = components.as_slice() else {
+                            return Err(invalid_guest(
+                                "certified Markdown node key must contain exactly one id",
+                            ));
+                        };
+                        let value: serde_json::Value =
+                            serde_json::from_slice(snapshot).map_err(|error| {
+                                invalid_guest(format!(
+                                    "certified Markdown snapshot is invalid JSON: {error}"
+                                ))
+                            })?;
+                        let object = value.as_object().ok_or_else(|| {
+                            invalid_guest("certified Markdown snapshot must be an object")
+                        })?;
+                        if object.get("id").and_then(serde_json::Value::as_str) != Some(*id) {
+                            return Err(invalid_guest(
+                                "certified Markdown snapshot id does not match its entity key",
+                            ));
+                        }
+                        if object
+                            .get("parent_id")
+                            .is_some_and(|value| !value.is_null() && value.as_str().is_none())
+                        {
+                            return Err(invalid_guest(
+                                "certified Markdown parent_id must be a string or null",
+                            ));
+                        }
+                        if let Err(errors) = plan.compiled_schema.validate(&value) {
+                            let details = errors
+                                .take(3)
+                                .map(|error| error.to_string())
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            return Err(invalid_guest(format!(
+                                "certified Markdown snapshot failed schema validation: {details}"
+                            )));
+                        }
+                        markdown_ids.insert((*id).to_owned());
+                        markdown_parent_ids.extend(
+                            object
+                                .get("parent_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_owned),
+                        );
+                        None
+                    } else {
+                        plan.certify_or_normalize_v2_plugin_row_parts(
+                            snapshot,
+                            schema_key,
+                            &components,
+                        )?
+                        .ok_or_else(|| {
+                            invalid_guest(format!(
+                                "certified batch schema '{schema_key}' has no streaming validator"
+                            ))
+                        })?
+                    }
                 }
                 2 => {
                     let local_ref = record.u64()?;

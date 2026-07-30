@@ -1599,6 +1599,18 @@ pub trait WasmComponentV2Factory: Send + Sync {
 /// cancellation, or uncertain completion.
 #[async_trait]
 pub trait WasmComponentV2Actor: Send {
+    /// True when `open_entities` retains accepted bytes only and returns them
+    /// unchanged without invoking a semantic renderer.
+    fn cold_open_hydrates_without_render(&self) -> bool {
+        false
+    }
+
+    /// False when a cold actor reconstructs its transition state from the
+    /// accepted file bytes and does not consume durable semantic rows.
+    fn cold_open_requires_entities(&self) -> bool {
+        true
+    }
+
     async fn fork_document(
         &mut self,
         document: WasmDocumentHandle,

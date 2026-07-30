@@ -358,6 +358,11 @@ impl bindings::lix::plugin::host::HostTransaction for WasiHostState {
         key: Vec<u8>,
         value: Vec<u8>,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        if key.starts_with(b"\0lix/") {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "v3 host-reserved state key".to_owned(),
+            ));
+        }
         let state = self
             .table
             .get(&resource)
@@ -385,6 +390,11 @@ impl bindings::lix::plugin::host::HostTransaction for WasiHostState {
         resource: Resource<TransactionResource>,
         key: Vec<u8>,
     ) -> Result<(), bindings::lix::plugin::host::HostError> {
+        if key.starts_with(b"\0lix/") {
+            return Err(bindings::lix::plugin::host::HostError::Rejected(
+                "v3 host-reserved state key".to_owned(),
+            ));
+        }
         let state = self
             .table
             .get(&resource)
@@ -926,6 +936,7 @@ impl WasmComponentV2Factory for V3Factory {
             _timeout_ticker: timeout_ticker,
             next_handle: 1,
             cursors: HashMap::new(),
+            edit_cursors: HashMap::new(),
             transitions: HashMap::new(),
             retired: false,
             next_document: 1,
@@ -947,6 +958,12 @@ enum WorkerCommand {
         update: WasmFileUpdate,
         events: tokio::sync::mpsc::Sender<WorkerTransitionEvent>,
     },
+    HydrateFile {
+        document: u64,
+        limits: WasmTransitionLimits,
+        input: WasmOpenEntitiesInput,
+        response: tokio::sync::oneshot::Sender<Result<WasmTransitionCounters, LixError>>,
+    },
     Fork {
         document: u64,
         response: tokio::sync::oneshot::Sender<Result<u64, LixError>>,
@@ -962,9 +979,14 @@ struct V3Worker {
     store: Store<WasiHostState>,
     guest: bindings::exports::lix::plugin::api::Guest,
     limits: WasmLimits,
-    documents: HashMap<u64, ArenaRoot>,
+    documents: HashMap<u64, V3Document>,
     next_document: u64,
     first_transition: bool,
+}
+
+#[derive(Clone)]
+struct V3Document {
+    root: ArenaRoot,
 }
 
 impl V3Worker {
@@ -990,6 +1012,14 @@ impl V3Worker {
                     let result =
                         self.file_changed(document, next_document, limits, update, events.clone());
                     let _ = events.blocking_send(WorkerTransitionEvent::Finished(result));
+                }
+                WorkerCommand::HydrateFile {
+                    document,
+                    limits,
+                    input,
+                    response,
+                } => {
+                    let _ = response.send(self.hydrate_file(document, limits, input));
                 }
                 WorkerCommand::Fork { document, response } => {
                     let _ = response.send(self.fork(document));
@@ -1097,7 +1127,7 @@ impl V3Worker {
         let root = transaction
             .commit()
             .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))?;
-        self.documents.insert(document, root);
+        self.documents.insert(document, V3Document { root });
         self.next_document = self.next_document.max(document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| v3_error("v3 transition resources remained live after open-file"))?
@@ -1128,11 +1158,16 @@ impl V3Worker {
         reset_store_limits(&mut self.store, self.limits)?;
         let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
         self.store.set_epoch_deadline(ticks.max(1));
-        let root = self
-            .documents
-            .get(&document)
-            .cloned()
-            .ok_or_else(|| v3_error("unknown v3 document handle"))?;
+        let root = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.v3_arena_prepare"
+        )
+        .in_scope(|| {
+            self.documents
+                .get(&document)
+                .map(|document| document.root.clone())
+                .ok_or_else(|| v3_error("unknown v3 document handle"))
+        })?;
         let state = Arc::new(Mutex::new(TransitionState::new(
             limits,
             update.creates,
@@ -1211,11 +1246,14 @@ impl V3Worker {
             },
             max_batch_bytes: limits.max_page_bytes,
         };
-        let result = self.guest.call_file_changed(
-            &mut self.store,
-            &binding_update,
-            Resource::new_borrow(sink_rep),
-        );
+        let result = tracing::debug_span!(target: "lix_perf", "lix.perf.v3_guest_file_changed")
+            .in_scope(|| {
+                self.guest.call_file_changed(
+                    &mut self.store,
+                    &binding_update,
+                    Resource::new_borrow(sink_rep),
+                )
+            });
         let _ = self.store.data_mut().table.delete(sink);
         let value = match result {
             Ok(Ok(value)) => value,
@@ -1239,10 +1277,14 @@ impl V3Worker {
             state: transaction_state,
         } = transaction;
         drop(transaction_state);
-        let root = transaction
-            .commit()
-            .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))?;
-        self.documents.insert(next_document, root);
+        let root = tracing::debug_span!(target: "lix_perf", "lix.perf.v3_arena_commit").in_scope(
+            || {
+                transaction
+                    .commit()
+                    .map_err(|error| v3_error(format!("failed to commit v3 arena root: {error}")))
+            },
+        )?;
+        self.documents.insert(next_document, V3Document { root });
         self.next_document = self.next_document.max(next_document.saturating_add(1));
         let mut state = Arc::try_unwrap(state)
             .map_err(|_| v3_error("v3 transition resources remained live after file-changed"))?
@@ -1261,8 +1303,40 @@ impl V3Worker {
         Ok(state.counters)
     }
 
+    fn hydrate_file(
+        &mut self,
+        document: u64,
+        limits: WasmTransitionLimits,
+        input: WasmOpenEntitiesInput,
+    ) -> Result<WasmTransitionCounters, LixError> {
+        let limits = v3_transition_limits(limits)?;
+        reset_store_limits(&mut self.store, self.limits)?;
+        let ticks = limits.total_deadline_nanoseconds.saturating_add(999_999) / 1_000_000;
+        self.store.set_epoch_deadline(ticks.max(1));
+        let accepted = input
+            .accepted
+            .ok_or_else(|| v3_error("v3 cold hydration requires accepted bytes"))?;
+        let bytes = read_source_all(&accepted)?;
+        let root = ArenaRoot::import(
+            ArenaStore::default(),
+            "v3-cold-successor",
+            &bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        drop(input.entities);
+        self.documents.insert(document, V3Document { root });
+        self.next_document = self.next_document.max(document.saturating_add(1));
+        let mut counters = WasmTransitionCounters::default();
+        counters.actor_executor_threads_created =
+            u64::from(std::mem::take(&mut self.first_transition));
+        counters.guest_linear_memory_high_water_bytes =
+            self.store.data().limits.linear_memory_high_water_bytes();
+        Ok(counters)
+    }
+
     fn fork(&mut self, document: u64) -> Result<u64, LixError> {
-        let root = self
+        let document = self
             .documents
             .get(&document)
             .cloned()
@@ -1272,7 +1346,7 @@ impl V3Worker {
             .next_document
             .checked_add(1)
             .ok_or_else(|| v3_error("v3 document handle overflowed"))?;
-        self.documents.insert(handle, root);
+        self.documents.insert(handle, document);
         Ok(handle)
     }
 
@@ -1302,6 +1376,7 @@ struct V3Actor {
     _timeout_ticker: TimeoutTickerLease,
     next_handle: u64,
     cursors: HashMap<u64, CursorState>,
+    edit_cursors: HashMap<u64, WasmTransitionHandle>,
     transitions: HashMap<u64, WasmTransitionCounters>,
     retired: bool,
     next_document: u64,
@@ -1345,6 +1420,14 @@ impl V3Actor {
 
 #[async_trait]
 impl WasmComponentV2Actor for V3Actor {
+    fn cold_open_hydrates_without_render(&self) -> bool {
+        true
+    }
+
+    fn cold_open_requires_entities(&self) -> bool {
+        false
+    }
+
     async fn fork_document(
         &mut self,
         document: WasmDocumentHandle,
@@ -1401,10 +1484,27 @@ impl WasmComponentV2Actor for V3Actor {
 
     async fn open_entities(
         &mut self,
-        _limits: WasmTransitionLimits,
-        _input: WasmOpenEntitiesInput,
+        limits: WasmTransitionLimits,
+        input: WasmOpenEntitiesInput,
     ) -> Result<WasmEntityTransition, LixError> {
-        Err(v3_unsupported("open-entities"))
+        let document = self.allocate_document()?;
+        let transition = WasmTransitionHandle(self.allocate_handle()?);
+        let edits = WasmEditCursorHandle(self.allocate_handle()?);
+        let counters = self
+            .request(|response| WorkerCommand::HydrateFile {
+                document,
+                limits,
+                input,
+                response,
+            })
+            .await?;
+        self.transitions.insert(transition.0, counters);
+        self.edit_cursors.insert(edits.0, transition);
+        Ok(WasmEntityTransition {
+            transition,
+            document: WasmDocumentHandle(document),
+            edits,
+        })
     }
 
     async fn file_changed(
@@ -1611,12 +1711,18 @@ impl WasmComponentV2Actor for V3Actor {
 
     async fn next_edit_page(
         &mut self,
-        _transition: WasmTransitionHandle,
-        _cursor: WasmEditCursorHandle,
+        transition: WasmTransitionHandle,
+        cursor: WasmEditCursorHandle,
         _max_edits: u32,
         _max_inline_bytes: u32,
     ) -> Result<Option<WasmEditPage>, LixError> {
-        Err(v3_unsupported("edit cursor"))
+        match self.edit_cursors.remove(&cursor.0) {
+            Some(owner) if owner == transition => Ok(None),
+            Some(_) => Err(v3_error(
+                "v3 hydration edit cursor belongs to another transition",
+            )),
+            None => Err(v3_error("unknown v3 hydration edit cursor")),
+        }
     }
 
     async fn output_len(
@@ -1645,6 +1751,7 @@ impl WasmComponentV2Actor for V3Actor {
     ) -> Result<WasmTransitionCounters, LixError> {
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
+        self.edit_cursors.retain(|_, owner| *owner != transition);
         self.transitions
             .remove(&transition.0)
             .ok_or_else(|| v3_error("unknown v3 transition"))
@@ -1656,6 +1763,7 @@ impl WasmComponentV2Actor for V3Actor {
     ) -> Result<(), LixError> {
         self.cursors
             .retain(|_, cursor| cursor.transition != transition);
+        self.edit_cursors.retain(|_, owner| *owner != transition);
         self.transitions.remove(&transition.0);
         Ok(())
     }

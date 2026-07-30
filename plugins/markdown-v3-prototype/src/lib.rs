@@ -22,6 +22,8 @@ const ID_NAMESPACE_STATE: &[u8] = b"markdown/id-namespace-v1";
 const ROOT_STATE: &[u8] = b"markdown/root-v1";
 const BLOCKS_STATE: &[u8] = b"markdown/blocks-v1";
 const BLOCK_SHIFTS_STATE: &[u8] = b"markdown/block-shifts-v1";
+const NEXT_ID_ORDINAL_STATE: &[u8] = b"markdown/next-id-ordinal-v1";
+const LEXICAL_FALLBACK_FIELD: &str = "lexical_fallback_base64";
 const BLOCK_INDEX_MAGIC: &[u8; 4] = b"MDB1";
 const BLOCK_INDEX_HEADER_BYTES: u32 = 12;
 const BLOCK_INDEX_ENTRY_BYTES: u32 = 28;
@@ -34,18 +36,12 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
         input
             .successor
             .put_state(ID_NAMESPACE_STATE, &input.creates.namespace_bytes())?;
-        let (document, changes) = Document::open_file(bytes, input.file.path.as_deref(), namespace)
-            .map_err(core_error)?;
-        let (root, blocks) = document.arena_state().map_err(core_error)?;
-        input.successor.put_state(ROOT_STATE, &root)?;
-        let (index, pages) = encode_blocks(&blocks)?;
-        input.successor.put_state(BLOCKS_STATE, &index)?;
-        for (ordinal, page) in pages.iter().enumerate() {
-            input
-                .successor
-                .put_state(&block_page_key(ordinal as u32), page)?;
-        }
-        emit_changes(changes, input.creates, sink)?;
+        let (document, mut changes) =
+            Document::open_file(bytes, input.file.path.as_deref(), namespace)
+                .map_err(core_error)?;
+        strip_duplicated_lexical_fallback(&mut changes)?;
+        store_markdown_state(&input.successor, &document, input.creates)?;
+        emit_changes(changes, input.creates, None, sink)?;
         Ok(())
     }
 
@@ -91,13 +87,23 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
             .collect::<Vec<_>>();
         if update.before_file.path == update.after_file.path
             && let [edit] = update.edits.as_slice()
-            && let Some((changes, root, block_key, block, shifts)) =
-                sparse_block_change(update, edit, &inserts[0], namespace)?
+            && let Some((
+                changes,
+                create_from_ordinal,
+                next_ordinal,
+                root,
+                block_key,
+                block,
+                shifts,
+            )) = sparse_block_change(update, edit, &inserts[0], namespace)?
         {
             update.successor.put_state(ROOT_STATE, &root)?;
             update.successor.put_state(&block_key, &block)?;
             update.successor.put_state(BLOCK_SHIFTS_STATE, &shifts)?;
-            emit_changes(changes, update.creates, sink)?;
+            update
+                .successor
+                .put_state(NEXT_ID_ORDINAL_STATE, &next_ordinal.to_le_bytes())?;
+            emit_changes(changes, update.creates, Some(create_from_ordinal), sink)?;
             return Ok(());
         }
 
@@ -107,9 +113,11 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
             namespace,
         )
         .map_err(core_error)?;
-        let (document, changes) = document
+        let next_ordinal = read_next_ordinal(update)?;
+        let (document, mut changes) = document
             .file_changed(&splices, namespace)
             .map_err(core_error)?;
+        strip_duplicated_lexical_fallback(&mut changes)?;
         let (root, blocks) = document.arena_state().map_err(core_error)?;
         update.successor.put_state(ROOT_STATE, &root)?;
         let old_page_count = block_page_count(update)?;
@@ -129,12 +137,41 @@ impl sdk::FormatPlugin for MarkdownV3Prototype {
             }
         }
         update.successor.delete_state(BLOCK_SHIFTS_STATE)?;
-        emit_changes(changes, update.creates, sink)?;
+        let successor_next = successor_next_ordinal(&changes, update.creates, next_ordinal)?;
+        update
+            .successor
+            .put_state(NEXT_ID_ORDINAL_STATE, &successor_next.to_le_bytes())?;
+        emit_changes(changes, update.creates, Some(next_ordinal), sink)?;
         Ok(())
     }
 }
 
-type SparseBlockResult = (Vec<EntityChange>, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+fn store_markdown_state(
+    successor: &sdk::Transaction,
+    document: &Document,
+    creates: sdk::CreateContext,
+) -> sdk::Result<()> {
+    let (root, blocks) = document.arena_state().map_err(core_error)?;
+    successor.put_state(ROOT_STATE, &root)?;
+    let (index, pages) = encode_blocks(&blocks)?;
+    successor.put_state(BLOCKS_STATE, &index)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&block_page_key(ordinal as u32), page)?;
+    }
+    let next_ordinal = next_arena_ordinal(&root, &blocks, creates)?;
+    successor.put_state(NEXT_ID_ORDINAL_STATE, &next_ordinal.to_le_bytes())?;
+    Ok(())
+}
+
+type SparseBlockResult = (
+    Vec<EntityChange>,
+    u32,
+    u32,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+    Vec<u8>,
+);
 
 fn sparse_block_change(
     update: &sdk::FileUpdate<'_>,
@@ -210,19 +247,24 @@ fn sparse_block_change(
         .before
         .get_state(ROOT_STATE)?
         .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is missing"))?;
-    let before = update.before.read_all()?;
+    let create_from_ordinal = read_next_ordinal(update)?;
+    let block_len = end
+        .checked_sub(start)
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown block range is inverted"))?;
+    let before = update.before.read_range(start, block_len)?;
     let Some((changes, root, block)) = Document::file_changed_from_arena_block(
         before,
         &root,
         &block,
-        start,
-        end,
+        0,
+        block_len,
         InputSplice {
-            offset: edit.offset,
+            offset: edit.offset - start,
             delete_len: edit.delete_len,
             insert,
         },
         namespace,
+        create_from_ordinal,
     )
     .map_err(core_error)?
     else {
@@ -238,8 +280,11 @@ fn sparse_block_change(
             .map_err(|_| sdk::Error::limit_exceeded("Markdown block shrink exceeds i64"))?
     };
     shifts.push((ordinal, delta));
+    let next_ordinal = successor_next_ordinal(&changes, update.creates, create_from_ordinal)?;
     Ok(Some((
         changes,
+        create_from_ordinal,
+        next_ordinal,
         root,
         block_key,
         block,
@@ -406,14 +451,147 @@ fn core_error(error: PluginError) -> sdk::Error {
     }
 }
 
+fn strip_duplicated_lexical_fallback(changes: &mut [EntityChange]) -> sdk::Result<()> {
+    for change in changes {
+        let Some(snapshot) = &mut change.snapshot else {
+            continue;
+        };
+        if !snapshot
+            .windows(LEXICAL_FALLBACK_FIELD.len())
+            .any(|window| window == LEXICAL_FALLBACK_FIELD.as_bytes())
+        {
+            continue;
+        }
+        let mut value: Value = serde_json::from_slice(snapshot).map_err(|error| {
+            sdk::Error::invalid_input(format!("invalid Markdown root snapshot: {error}"))
+        })?;
+        let Some(format_json) = value
+            .as_object_mut()
+            .and_then(|object| object.get_mut("format_json"))
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        let mut format: Value = serde_json::from_str(format_json).map_err(|error| {
+            sdk::Error::invalid_input(format!("invalid Markdown root format_json: {error}"))
+        })?;
+        if format
+            .as_object_mut()
+            .and_then(|format| format.remove(LEXICAL_FALLBACK_FIELD))
+            .is_none()
+        {
+            continue;
+        }
+        value
+            .as_object_mut()
+            .expect("validated Markdown wire snapshot is an object")
+            .insert(
+                "format_json".to_owned(),
+                Value::String(serde_json::to_string(&format).map_err(|error| {
+                    sdk::Error::internal(format!("encode compact Markdown root format: {error}"))
+                })?),
+            );
+        *snapshot = serde_json::to_vec(&value).map_err(|error| {
+            sdk::Error::internal(format!("encode compact Markdown root snapshot: {error}"))
+        })?;
+    }
+    Ok(())
+}
+
+fn next_arena_ordinal(
+    root: &[u8],
+    blocks: &[ArenaMarkdownBlock],
+    creates: sdk::CreateContext,
+) -> sdk::Result<u32> {
+    let root = root
+        .get(1..)
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown arena root is empty"))?;
+    let mut next = next_json_ordinal(root, creates, 0)?;
+    for block in blocks {
+        next = next_json_ordinal(&block.tree_json, creates, next)?;
+    }
+    Ok(next)
+}
+
+fn next_json_ordinal(bytes: &[u8], creates: sdk::CreateContext, current: u32) -> sdk::Result<u32> {
+    fn visit(value: &Value, creates: sdk::CreateContext, next: &mut u32) -> sdk::Result<()> {
+        match value {
+            Value::Object(object) => {
+                if let Some(ordinal) = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|id| local_ref(creates, id))
+                {
+                    *next = (*next).max(ordinal.checked_add(1).ok_or_else(|| {
+                        sdk::Error::limit_exceeded("Markdown ID ordinal space is exhausted")
+                    })?);
+                }
+                for value in object.values() {
+                    visit(value, creates, next)?;
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    visit(value, creates, next)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| {
+        sdk::Error::invalid_input(format!("invalid Markdown arena JSON: {error}"))
+    })?;
+    let mut next = current;
+    visit(&value, creates, &mut next)?;
+    Ok(next)
+}
+
+fn read_next_ordinal(update: &sdk::FileUpdate<'_>) -> sdk::Result<u32> {
+    let bytes = update
+        .before
+        .get_state(NEXT_ID_ORDINAL_STATE)?
+        .ok_or_else(|| sdk::Error::invalid_input("Markdown arena has no ID high-water mark"))?;
+    let bytes: [u8; 4] = bytes.try_into().map_err(|_| {
+        sdk::Error::invalid_input("Markdown arena ID high-water mark has invalid length")
+    })?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn successor_next_ordinal(
+    changes: &[EntityChange],
+    creates: sdk::CreateContext,
+    current: u32,
+) -> sdk::Result<u32> {
+    let mut next = current;
+    for change in changes {
+        if let Some(id) = change
+            .entity_pk
+            .first()
+            .filter(|_| change.entity_pk.len() == 1)
+            && let Some(ordinal) = local_ref(creates, id)
+        {
+            next = next.max(ordinal.checked_add(1).ok_or_else(|| {
+                sdk::Error::limit_exceeded("Markdown ID ordinal space is exhausted")
+            })?);
+        }
+        if let Some(snapshot) = &change.snapshot {
+            next = next_json_ordinal(snapshot, creates, next)?;
+        }
+    }
+    Ok(next)
+}
+
 fn emit_changes(
     changes: impl IntoIterator<Item = EntityChange>,
     creates: sdk::CreateContext,
+    create_from_ordinal: Option<u32>,
     sink: &mut sdk::Sink<'_>,
 ) -> sdk::Result<()> {
     let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
     for change in changes {
-        encoder.push(change, creates, sink)?;
+        encoder.push(change, creates, create_from_ordinal, sink)?;
     }
     encoder.flush(sink)
 }
@@ -439,10 +617,11 @@ impl BatchEncoder {
         &mut self,
         change: EntityChange,
         creates: sdk::CreateContext,
+        create_from_ordinal: Option<u32>,
         sink: &mut sdk::Sink<'_>,
     ) -> sdk::Result<()> {
         let mut record = Vec::new();
-        let is_create = encode_change(change, creates, &mut record)?;
+        let is_create = encode_change(change, creates, create_from_ordinal, &mut record)?;
         if record.len() > self.max_bytes {
             return Err(sdk::Error::limit_exceeded(
                 "one Markdown entity exceeds the v3 batch limit",
@@ -477,41 +656,40 @@ impl BatchEncoder {
 fn encode_change(
     change: EntityChange,
     creates: sdk::CreateContext,
+    create_from_ordinal: Option<u32>,
     output: &mut Vec<u8>,
 ) -> sdk::Result<bool> {
     let record_start = output.len();
     output.extend_from_slice(&0_u32.to_le_bytes());
-    let is_create = match change.snapshot {
+    match change.snapshot {
         Some(snapshot) => {
             let local_ref = change
                 .entity_pk
                 .first()
                 .filter(|_| change.entity_pk.len() == 1)
-                .and_then(|id| local_ref(creates, id));
+                .and_then(|id| local_ref(creates, id))
+                .filter(|ordinal| create_from_ordinal.is_none_or(|minimum| *ordinal >= minimum));
             if let Some(local_ref) = local_ref {
                 output.push(2);
                 push_text(output, &change.schema_key)?;
                 output.extend_from_slice(&u64::from(local_ref).to_le_bytes());
                 push_inline_blob(output, &remove_created_id(snapshot)?)?;
-                true
             } else {
                 output.push(0);
                 push_entity_key(output, &change.schema_key, &change.entity_pk)?;
                 output.push(effect_tag(change.effect));
                 push_inline_blob(output, &snapshot)?;
-                false
             }
         }
         None => {
             output.push(1);
             push_entity_key(output, &change.schema_key, &change.entity_pk)?;
-            false
         }
-    };
+    }
     let record_len = u32::try_from(output.len() - record_start - 4)
         .map_err(|_| sdk::Error::limit_exceeded("Markdown packet record exceeds 4GiB"))?;
     output[record_start..record_start + 4].copy_from_slice(&record_len.to_le_bytes());
-    Ok(is_create)
+    Ok(output[record_start + 4] == 2)
 }
 
 fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {

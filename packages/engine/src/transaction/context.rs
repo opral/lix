@@ -1405,26 +1405,31 @@ where
             }
         };
         let limits = WasmTransitionLimits::default();
-        let rows = overlay_scan_batch(
-            &base,
-            &staged,
-            &LiveStateScanRequest {
-                filter: LiveStateFilter {
-                    schema_keys: plugin.schema_keys().to_vec(),
-                    branch_ids: vec![actor_key.branch_id.clone()],
-                    file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
-                    untracked: Some(false),
+        let mut actor = factory.instantiate_actor().await?;
+        let cold_open_hydrates_without_render = actor.cold_open_hydrates_without_render();
+        let rows = if actor.cold_open_requires_entities() {
+            overlay_scan_batch(
+                &base,
+                &staged,
+                &LiveStateScanRequest {
+                    filter: LiveStateFilter {
+                        schema_keys: plugin.schema_keys().to_vec(),
+                        branch_ids: vec![actor_key.branch_id.clone()],
+                        file_ids: vec![NullableKeyFilter::Value(actor_key.file_id.clone())],
+                        untracked: Some(false),
+                        ..Default::default()
+                    },
+                    projection: plugin_state_live_state_projection(),
                     ..Default::default()
                 },
-                projection: plugin_state_live_state_projection(),
-                ..Default::default()
-            },
-        )
-        .await?;
+            )
+            .await?
+        } else {
+            MaterializedLiveStateBatch::default()
+        };
         let entity_ordinals =
             v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
         let entity_count = entity_ordinals.len();
-        let mut actor = factory.instantiate_actor().await?;
         if let VisibleV2MaterializationBytes::Derived { path, .. } = &materialization.bytes
             && descriptor.path.as_deref() != Some(path.as_str())
         {
@@ -1565,7 +1570,7 @@ where
         counters.full_state_semantic_rows_materialized =
             u64::try_from(entity_count).unwrap_or(u64::MAX);
         counters.full_document_reparses = 1;
-        counters.full_renderer_invocations = 1;
+        counters.full_renderer_invocations = u64::from(!cold_open_hydrates_without_render);
         self.plugin_host.record_v2_transition_counters(counters);
         cache
             .install_cold_if_absent(

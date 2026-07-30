@@ -23,17 +23,7 @@ impl sdk::FormatPlugin for JsonV3Prototype {
         let namespace = IdNamespace::from_halves(input.creates.high, u64::from(input.creates.low));
         let (document, changes) = Document::open_file(bytes, input.file.path.as_deref(), namespace)
             .map_err(sdk::Error::invalid_input)?;
-        let (index, pages) = encode_scalar_state(
-            &document
-                .arena_scalars()
-                .map_err(sdk::Error::invalid_input)?,
-        )?;
-        input.successor.put_state(SCALAR_INDEX_STATE, &index)?;
-        for (ordinal, page) in pages.iter().enumerate() {
-            input
-                .successor
-                .put_state(&scalar_page_key(ordinal as u32), page)?;
-        }
+        store_scalar_state(&input.successor, &document)?;
         emit_changes(changes, input.creates, sink)?;
         Ok(())
     }
@@ -98,6 +88,38 @@ impl sdk::FormatPlugin for JsonV3Prototype {
         emit_changes(changes.into_iter().map(Ok), update.creates, sink)?;
         Ok(())
     }
+}
+
+fn apply_file_splices(mut bytes: Vec<u8>, splices: &[InputSplice<'_>]) -> sdk::Result<Vec<u8>> {
+    for splice in splices.iter().rev() {
+        let start = usize::try_from(splice.offset)
+            .map_err(|_| sdk::Error::invalid_input("JSON splice offset exceeds guest memory"))?;
+        let end = start
+            .checked_add(usize::try_from(splice.delete_len).map_err(|_| {
+                sdk::Error::invalid_input("JSON splice deletion exceeds guest memory")
+            })?)
+            .ok_or_else(|| sdk::Error::invalid_input("JSON splice range overflowed"))?;
+        if end > bytes.len() {
+            return Err(sdk::Error::invalid_input(
+                "JSON splice exceeds accepted bytes",
+            ));
+        }
+        bytes.splice(start..end, splice.insert.iter().copied());
+    }
+    Ok(bytes)
+}
+
+fn store_scalar_state(successor: &sdk::Transaction, document: &Document) -> sdk::Result<()> {
+    let (index, pages) = encode_scalar_state(
+        &document
+            .arena_scalars()
+            .map_err(sdk::Error::invalid_input)?,
+    )?;
+    successor.put_state(SCALAR_INDEX_STATE, &index)?;
+    for (ordinal, page) in pages.iter().enumerate() {
+        successor.put_state(&scalar_page_key(ordinal as u32), page)?;
+    }
+    Ok(())
 }
 
 fn sparse_scalar_change(
@@ -453,21 +475,23 @@ impl BatchEncoder {
         creates: sdk::CreateContext,
         sink: &mut sdk::Sink<'_>,
     ) -> sdk::Result<()> {
-        let mut record = Vec::new();
-        let is_create = encode_change(change, creates, &mut record)?;
-        if record.len() > self.max_bytes {
+        let record_start = self.payload.len();
+        let is_create = encode_change(&change, creates, &mut self.payload)?;
+        if self.records > 0
+            && (self.payload.len() > self.max_bytes || self.creates_only != Some(is_create))
+        {
+            self.payload.truncate(record_start);
+            self.flush(sink)?;
+            let is_create_after_flush = encode_change(&change, creates, &mut self.payload)?;
+            debug_assert_eq!(is_create_after_flush, is_create);
+        }
+        if self.payload.len() > self.max_bytes {
+            self.payload.clear();
             return Err(sdk::Error::limit_exceeded(
                 "one JSON entity exceeds the v3 batch limit",
             ));
         }
-        if self.records > 0
-            && (self.payload.len() + record.len() > self.max_bytes
-                || self.creates_only != Some(is_create))
-        {
-            self.flush(sink)?;
-        }
         self.creates_only = Some(is_create);
-        self.payload.extend_from_slice(&record);
         self.records = self
             .records
             .checked_add(1)
@@ -487,13 +511,13 @@ impl BatchEncoder {
 }
 
 fn encode_change(
-    change: EntityChange,
+    change: &EntityChange,
     creates: sdk::CreateContext,
     output: &mut Vec<u8>,
 ) -> sdk::Result<bool> {
     let record_start = output.len();
     output.extend_from_slice(&0_u32.to_le_bytes());
-    let is_create = match change.snapshot {
+    let is_create = match &change.snapshot {
         Some(snapshot) => {
             let local_ref = change
                 .entity_pk
@@ -511,7 +535,7 @@ fn encode_change(
                 output.push(0);
                 push_entity_key(output, &change.schema_key, &change.entity_pk)?;
                 output.push(effect_tag(change.effect));
-                push_inline_blob(output, &snapshot)?;
+                push_inline_blob(output, snapshot)?;
                 false
             }
         }
@@ -536,8 +560,8 @@ fn local_ref(creates: sdk::CreateContext, id: &str) -> Option<u32> {
     Some(u32::from_be_bytes(bytes[12..].try_into().ok()?))
 }
 
-fn remove_created_id(snapshot: Vec<u8>) -> sdk::Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(&snapshot)
+fn remove_created_id(snapshot: &[u8]) -> sdk::Result<Vec<u8>> {
+    let mut value: Value = serde_json::from_slice(snapshot)
         .map_err(|error| sdk::Error::invalid_input(format!("invalid JSON snapshot: {error}")))?;
     value
         .as_object_mut()
