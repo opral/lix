@@ -4024,8 +4024,8 @@ async fn v3_csv_ten_mib_typed_batch_benchmark() {
             "Prototype B must enter the guest exactly once"
         );
         assert_eq!(
-            counters.actor_executor_threads_created, 1,
-            "Prototype B must create one persistent actor executor, not one thread per import"
+            counters.actor_executor_threads_created, 0,
+            "Prototype B must not create actor executor threads"
         );
         assert_eq!(
             counters.packet_records,
