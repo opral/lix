@@ -89,6 +89,25 @@ impl BoundCreateContext {
         }
     }
 
+    pub(crate) fn creates_v3(self) -> crate::wasm::v3::WasmV3CreateContext {
+        crate::wasm::v3::WasmV3CreateContext {
+            high: u64::from_be_bytes(
+                self.prefix[..8]
+                    .try_into()
+                    .expect("UUID prefix has high bytes"),
+            ),
+            low: u64::from(u32::from_be_bytes(
+                self.prefix[8..]
+                    .try_into()
+                    .expect("UUID prefix has low bytes"),
+            )),
+        }
+    }
+
+    pub(crate) fn owns_v3_id(self, id: &str) -> bool {
+        uuid::Uuid::parse_str(id).is_ok_and(|id| id.as_bytes()[..12] == self.prefix)
+    }
+
     pub(crate) fn reservation_key(self) -> String {
         format!("{RESERVATION_PREFIX}{}", encode_hex(&self.prefix))
     }

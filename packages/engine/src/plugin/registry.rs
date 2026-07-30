@@ -125,6 +125,10 @@ impl PluginRegistryEntry {
         &self.key
     }
 
+    pub(crate) fn runtime(&self) -> PluginRuntime {
+        self.runtime
+    }
+
     pub(crate) fn content_type(&self) -> Option<PluginContentType> {
         self.content_type
     }

@@ -26,12 +26,32 @@ impl IdNamespace {
     }
 
     pub fn encode(self, ordinal: u64) -> String {
+        String::from_utf8(self.encode_ascii(ordinal).to_vec())
+            .expect("generated CSV identity is ASCII")
+    }
+
+    pub fn encode_ascii(self, ordinal: u64) -> [u8; 36] {
         let ordinal = u32::try_from(ordinal)
             .expect("one CSV mutation cannot allocate more than u32::MAX rows");
         let mut bytes = [0; 16];
         bytes[..12].copy_from_slice(&self.0[..12]);
         bytes[12..].copy_from_slice(&ordinal.to_be_bytes());
-        uuid::Uuid::from_bytes(bytes).to_string()
+        let mut output = [0_u8; 36];
+        let mut nibble = 0usize;
+        for (index, output_byte) in output.iter_mut().enumerate() {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *output_byte = b'-';
+                continue;
+            }
+            let value = bytes[nibble / 2];
+            *output_byte = b"0123456789abcdef"[(if nibble.is_multiple_of(2) {
+                value >> 4
+            } else {
+                value & 0x0f
+            }) as usize];
+            nibble += 1;
+        }
+        output
     }
 
     /// Converts one API-generated ID back into the compact namespace retained
@@ -1352,6 +1372,77 @@ pub struct V3RowIndexRecord {
     pub id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V3RowWindowCheckpoint {
+    pub page: u64,
+    pub row_start: u32,
+    pub read_end: u32,
+    pub first_ordinal: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct V3ColdIndex {
+    pub namespace: [u8; 16],
+    pub windows: Vec<V3RowWindowCheckpoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct V3ColdMetadata {
+    dialect: Dialect,
+    namespace: IdNamespace,
+    row_count: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct V3RowFramer {
+    pending: Vec<u8>,
+    pending_start: usize,
+    absolute_offset: u64,
+    dialect: Dialect,
+}
+
+#[derive(Clone, Debug)]
+pub struct V3StreamAnalyzer {
+    framer: V3RowFramer,
+    namespace: IdNamespace,
+    window_bytes: u64,
+    row_count: usize,
+    terminator_counts: [usize; 3],
+    windows: Vec<V3RowWindowCheckpoint>,
+}
+
+impl V3ColdMetadata {
+    pub fn row_count(self) -> usize {
+        self.row_count
+    }
+
+    pub fn row_id(self, ordinal: usize) -> Result<String, String> {
+        if ordinal >= self.row_count {
+            return Err("CSV streaming row ordinal is out of range".to_owned());
+        }
+        Ok(self.namespace.encode(ordinal as u64))
+    }
+
+    pub fn row_id_ascii(self, ordinal: usize) -> Result<[u8; 36], String> {
+        if ordinal >= self.row_count {
+            return Err("CSV streaming row ordinal is out of range".to_owned());
+        }
+        Ok(self.namespace.encode_ascii(ordinal as u64))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct V3InitialChanges {
+    bytes: Arc<Vec<u8>>,
+    cursor: usize,
+    row_count: usize,
+    ordinal: usize,
+    dialect: Dialect,
+    namespace: IdNamespace,
+    table_pending: bool,
+    failed: bool,
+}
+
 #[derive(Debug)]
 struct DocumentInner {
     blob: PersistentBlob,
@@ -1841,6 +1932,475 @@ fn render_import_cell(
     }
     output.push(quote);
     Ok(true)
+}
+
+pub fn v3_open_file_stream(
+    bytes: Vec<u8>,
+    path: Option<&str>,
+    namespace: IdNamespace,
+    window_bytes: u64,
+) -> Result<(V3ColdIndex, V3InitialChanges), String> {
+    std::str::from_utf8(&bytes).map_err(|error| format!("CSV must be UTF-8: {error}"))?;
+    let mut analyzer = V3StreamAnalyzer::new(path, namespace, window_bytes)?;
+    analyzer.push(&bytes)?;
+    let (index, metadata) = analyzer.finish()?;
+    let bytes = Arc::new(bytes);
+    Ok((
+        index,
+        V3InitialChanges {
+            bytes,
+            cursor: 0,
+            row_count: metadata.row_count,
+            ordinal: 0,
+            dialect: metadata.dialect,
+            namespace,
+            table_pending: true,
+            failed: false,
+        },
+    ))
+}
+
+impl V3RowFramer {
+    pub fn new(path: Option<&str>) -> Self {
+        Self {
+            pending: Vec::new(),
+            pending_start: 0,
+            absolute_offset: 0,
+            dialect: Dialect::for_path(path),
+        }
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.pending_start == self.pending.len() {
+            self.pending.clear();
+            self.pending_start = 0;
+        } else if self.pending_start > 0 {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
+        }
+        self.pending
+            .try_reserve(bytes.len())
+            .map_err(|_| "CSV streaming row buffer allocation failed".to_owned())?;
+        self.pending.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    pub fn next_row(&mut self, eof: bool) -> Result<Option<(u64, Vec<u8>)>, String> {
+        let available = &self.pending[self.pending_start..];
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let Some(row) = scan_complete_row(available, self.dialect, eof)? else {
+            return Ok(None);
+        };
+        let end = row.byte_len as usize;
+        let row = available[..end].to_vec();
+        let offset = self.absolute_offset;
+        self.absolute_offset = self
+            .absolute_offset
+            .checked_add(end as u64)
+            .ok_or_else(|| "CSV streaming offset overflowed".to_owned())?;
+        self.pending_start += end;
+        Ok(Some((offset, row)))
+    }
+
+    fn next_row_summary(
+        &mut self,
+        eof: bool,
+    ) -> Result<Option<(u64, u32, Option<Terminator>)>, String> {
+        let available = &self.pending[self.pending_start..];
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let Some(row) = scan_complete_row(available, self.dialect, eof)? else {
+            return Ok(None);
+        };
+        let end = row.byte_len as usize;
+        let result = (self.absolute_offset, row.byte_len, row.ending);
+        self.absolute_offset = self
+            .absolute_offset
+            .checked_add(end as u64)
+            .ok_or_else(|| "CSV streaming offset overflowed".to_owned())?;
+        self.pending_start += end;
+        Ok(Some(result))
+    }
+
+    pub fn next_change(
+        &mut self,
+        eof: bool,
+        ordinal: usize,
+        metadata: V3ColdMetadata,
+    ) -> Result<Option<EntityChange>, String> {
+        let mut snapshot = Vec::with_capacity(128);
+        let Some(id) = self.next_snapshot_into(eof, ordinal, metadata, &mut snapshot)? else {
+            return Ok(None);
+        };
+        Ok(Some(EntityChange::upsert(ROW_SCHEMA_KEY, id, snapshot)))
+    }
+
+    pub fn next_snapshot_into(
+        &mut self,
+        eof: bool,
+        ordinal: usize,
+        metadata: V3ColdMetadata,
+        snapshot: &mut Vec<u8>,
+    ) -> Result<Option<String>, String> {
+        if self.pending_start == self.pending.len() {
+            return Ok(None);
+        }
+        let id = metadata.row_id(ordinal)?;
+        self.next_snapshot_into_with_id(eof, ordinal, metadata, &id, snapshot)
+            .map(|result| result.map(|()| id))
+    }
+
+    pub fn next_snapshot_into_with_id(
+        &mut self,
+        eof: bool,
+        ordinal: usize,
+        metadata: V3ColdMetadata,
+        id: &str,
+        snapshot: &mut Vec<u8>,
+    ) -> Result<Option<()>, String> {
+        let available = &self.pending[self.pending_start..];
+        if available.is_empty() {
+            return Ok(None);
+        }
+        let snapshot_start = snapshot.len();
+        let Some(end) =
+            v3_stream_snapshot_complete(available, eof, ordinal, metadata, id, snapshot)?
+        else {
+            snapshot.truncate(snapshot_start);
+            return Ok(None);
+        };
+        self.absolute_offset = self
+            .absolute_offset
+            .checked_add(end as u64)
+            .ok_or_else(|| "CSV streaming offset overflowed".to_owned())?;
+        self.pending_start += end;
+        Ok(Some(()))
+    }
+}
+
+fn v3_stream_snapshot_complete(
+    bytes: &[u8],
+    eof: bool,
+    ordinal: usize,
+    metadata: V3ColdMetadata,
+    id: &str,
+    snapshot: &mut Vec<u8>,
+) -> Result<Option<usize>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    if ordinal >= metadata.row_count {
+        return Err(format!(
+            "CSV streaming row ordinal {ordinal} is outside row count {} with {} unconsumed bytes",
+            metadata.row_count,
+            bytes.len()
+        ));
+    }
+    let dialect = metadata.dialect;
+    snapshot.extend_from_slice(b"{\"cells\":[");
+    let mut force_quote = Vec::new();
+    let mut field_start = 0usize;
+    let mut field_index = 0usize;
+    let mut quoted = false;
+    let mut field_was_quoted = false;
+    let mut just_closed_quote = false;
+    let mut cursor = 0usize;
+    let (row_end, ending) = loop {
+        if cursor == bytes.len() {
+            if !eof {
+                return Ok(None);
+            }
+            if quoted {
+                return Err(format!("unterminated quoted field at offset {field_start}"));
+            }
+            append_v3_stream_field(
+                snapshot,
+                &mut force_quote,
+                field_index,
+                bytes,
+                field_start,
+                cursor,
+                field_was_quoted,
+                dialect,
+            )?;
+            break (cursor, None);
+        }
+        let byte = bytes[cursor];
+        if quoted {
+            if Some(byte) == dialect.quote {
+                if cursor + 1 == bytes.len() && !eof {
+                    return Ok(None);
+                }
+                if cursor + 1 < bytes.len() && bytes[cursor + 1] == byte {
+                    cursor += 2;
+                    continue;
+                }
+                quoted = false;
+                just_closed_quote = true;
+            }
+            cursor += 1;
+            continue;
+        }
+        if just_closed_quote {
+            let is_terminator = byte == b'\r' || byte == b'\n';
+            if byte != dialect.delimiter && !is_terminator {
+                return Err(format!(
+                    "unexpected byte after closing quote at offset {cursor}"
+                ));
+            }
+        }
+        if Some(byte) == dialect.quote && cursor == field_start {
+            quoted = true;
+            field_was_quoted = true;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        if byte == dialect.delimiter {
+            append_v3_stream_field(
+                snapshot,
+                &mut force_quote,
+                field_index,
+                bytes,
+                field_start,
+                cursor,
+                field_was_quoted,
+                dialect,
+            )?;
+            field_index += 1;
+            field_start = cursor + 1;
+            field_was_quoted = false;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        let ending = if byte == b'\r' {
+            if cursor + 1 == bytes.len() && !eof {
+                return Ok(None);
+            }
+            if bytes.get(cursor + 1) == Some(&b'\n') {
+                Some((Terminator::CrLf, 2usize))
+            } else {
+                Some((Terminator::Cr, 1usize))
+            }
+        } else if byte == b'\n' {
+            Some((Terminator::Lf, 1usize))
+        } else {
+            None
+        };
+        if let Some((terminator, ending_len)) = ending {
+            append_v3_stream_field(
+                snapshot,
+                &mut force_quote,
+                field_index,
+                bytes,
+                field_start,
+                cursor,
+                field_was_quoted,
+                dialect,
+            )?;
+            break (cursor + ending_len, Some(terminator));
+        }
+        just_closed_quote = false;
+        cursor += 1;
+    };
+
+    let denominator = u128::try_from(metadata.row_count + 1).expect("usize fits u128");
+    let numerator = u128::try_from(ordinal + 1).expect("usize fits u128") * u128::from(u64::MAX);
+    let order_rank = u64::try_from(numerator / denominator).expect("ratio fits u64") | 1;
+    snapshot.extend_from_slice(b"],\"id\":");
+    write_canonical_json_string(snapshot, id);
+    let exceptional_ending = (ending != Some(dialect.terminator)).then_some(ending);
+    if !force_quote.is_empty() || exceptional_ending.is_some() {
+        snapshot.extend_from_slice(b",\"layout\":{");
+        let needs_comma = if !force_quote.is_empty() {
+            snapshot.extend_from_slice(b"\"force_quote\":");
+            write_canonical_json_string(snapshot, &URL_SAFE_NO_PAD.encode(force_quote));
+            true
+        } else {
+            false
+        };
+        if let Some(ending) = exceptional_ending {
+            if needs_comma {
+                snapshot.push(b',');
+            }
+            snapshot.extend_from_slice(b"\"terminator\":");
+            write_canonical_json_string(
+                snapshot,
+                ending.map_or("", |terminator| terminator.snapshot()),
+            );
+        }
+        snapshot.push(b'}');
+    }
+    snapshot.extend_from_slice(b",\"order_key\":\"");
+    for shift in (0..16).rev() {
+        snapshot.push(b"0123456789abcdef"[((order_rank >> (shift * 4)) & 0x0f) as usize]);
+    }
+    snapshot.extend_from_slice(b"\"}");
+    Ok(Some(row_end))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_v3_stream_field(
+    snapshot: &mut Vec<u8>,
+    force_quote: &mut Vec<u8>,
+    field_index: usize,
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    quoted: bool,
+    dialect: Dialect,
+) -> Result<(), String> {
+    if field_index > 0 {
+        snapshot.push(b',');
+    }
+    if !quoted {
+        let value = std::str::from_utf8(&bytes[start..end])
+            .map_err(|error| format!("CSV field is not UTF-8: {error}"))?;
+        write_canonical_json_string(snapshot, value);
+        return Ok(());
+    }
+    let field = FieldRange::new(start, end - start, quoted)?;
+    if field_has_unnecessary_quotes(bytes, 0, field, dialect)? {
+        if force_quote.len() <= field_index / 8 {
+            force_quote.resize(field_index / 8 + 1, 0);
+        }
+        force_quote[field_index / 8] |= 1 << (field_index % 8);
+    }
+    let value = decoded_field(bytes, 0, field, dialect.quote)?;
+    write_canonical_json_string(snapshot, &value);
+    Ok(())
+}
+
+impl V3StreamAnalyzer {
+    pub fn new(
+        path: Option<&str>,
+        namespace: IdNamespace,
+        window_bytes: u64,
+    ) -> Result<Self, String> {
+        if window_bytes == 0 {
+            return Err("CSV v3 index window must be nonzero".to_owned());
+        }
+        Ok(Self {
+            framer: V3RowFramer::new(path),
+            namespace,
+            window_bytes,
+            row_count: 0,
+            terminator_counts: [0; 3],
+            windows: Vec::new(),
+        })
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.framer.push(bytes)?;
+        while let Some((offset, row_len, ending)) = self.framer.next_row_summary(false)? {
+            self.record_row(offset, row_len, ending)?;
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<(V3ColdIndex, V3ColdMetadata), String> {
+        while let Some((offset, row_len, ending)) = self.framer.next_row_summary(true)? {
+            self.record_row(offset, row_len, ending)?;
+        }
+        let mut dialect = self.framer.dialect;
+        dialect.terminator =
+            preferred_terminator_from_counts(self.terminator_counts, Terminator::Lf);
+        Ok((
+            V3ColdIndex {
+                namespace: self.namespace.0,
+                windows: self.windows,
+            },
+            V3ColdMetadata {
+                dialect,
+                namespace: self.namespace,
+                row_count: self.row_count,
+            },
+        ))
+    }
+
+    fn record_row(
+        &mut self,
+        offset: u64,
+        row_len: u32,
+        ending: Option<Terminator>,
+    ) -> Result<(), String> {
+        match ending {
+            Some(Terminator::Lf) => self.terminator_counts[0] += 1,
+            Some(Terminator::CrLf) => self.terminator_counts[1] += 1,
+            Some(Terminator::Cr) => self.terminator_counts[2] += 1,
+            None => {}
+        }
+        let row_start = u32::try_from(offset).map_err(|_| "CSV offset exceeds 4GiB".to_owned())?;
+        let read_end = row_start
+            .checked_add(row_len)
+            .ok_or_else(|| "CSV row range overflowed".to_owned())?;
+        let first = offset / self.window_bytes;
+        let last = u64::from(read_end.saturating_sub(1)) / self.window_bytes;
+        for page in first..=last {
+            if let Some(checkpoint) = self.windows.last_mut().filter(|entry| entry.page == page) {
+                checkpoint.read_end = checkpoint.read_end.max(read_end);
+            } else {
+                debug_assert!(self.windows.last().is_none_or(|entry| entry.page < page));
+                self.windows.push(V3RowWindowCheckpoint {
+                    page,
+                    row_start,
+                    read_end,
+                    first_ordinal: u32::try_from(self.row_count)
+                        .map_err(|_| "CSV has too many rows".to_owned())?,
+                });
+            }
+        }
+        self.row_count = self
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| "CSV has too many rows".to_owned())?;
+        Ok(())
+    }
+}
+
+pub fn v3_stream_row_change(
+    row_bytes: &[u8],
+    ordinal: usize,
+    metadata: V3ColdMetadata,
+) -> Result<EntityChange, String> {
+    if ordinal >= metadata.row_count {
+        return Err("CSV streaming row ordinal is out of range".to_owned());
+    }
+    let row = scan_one_row(row_bytes, 0, row_bytes.len(), metadata.dialect)?
+        .ok_or_else(|| "CSV streaming source produced an empty row".to_owned())?;
+    v3_stream_row_change_from_draft(row_bytes, &row, ordinal, metadata)
+}
+
+fn v3_stream_row_change_from_draft(
+    row_bytes: &[u8],
+    row: &RowDraft,
+    ordinal: usize,
+    metadata: V3ColdMetadata,
+) -> Result<EntityChange, String> {
+    let denominator = u128::try_from(metadata.row_count + 1).expect("usize fits u128");
+    let numerator = u128::try_from(ordinal + 1).expect("usize fits u128") * u128::from(u64::MAX);
+    let order_rank = u64::try_from(numerator / denominator).expect("ratio fits u64") | 1;
+    let id = metadata.namespace.encode(ordinal as u64);
+    let snapshot = v3_row_snapshot_bytes(
+        row_bytes,
+        row,
+        &id,
+        &format!("{order_rank:016x}"),
+        metadata.dialect,
+    )?;
+    Ok(EntityChange::upsert(ROW_SCHEMA_KEY, id, snapshot))
+}
+
+pub fn v3_stream_table_change(metadata: V3ColdMetadata) -> EntityChange {
+    EntityChange::upsert(
+        TABLE_SCHEMA_KEY,
+        ROOT_ENTITY_PK.to_owned(),
+        table_snapshot(metadata.dialect),
+    )
 }
 
 impl Document {
@@ -2654,12 +3214,239 @@ fn preferred_terminator_for_document(rows: &[RowDraft], fallback: Terminator) ->
             None => {}
         }
     }
+    preferred_terminator_from_counts(counts, fallback)
+}
+
+fn preferred_terminator_from_counts(counts: [usize; 3], fallback: Terminator) -> Terminator {
     match counts.iter().enumerate().max_by_key(|(_, count)| *count) {
         Some((0, count)) if *count > 0 => Terminator::Lf,
         Some((1, count)) if *count > 0 => Terminator::CrLf,
         Some((2, count)) if *count > 0 => Terminator::Cr,
         _ => fallback,
     }
+}
+
+/// Parse one page-fed row in a single pass. Unlike `scan_one_row`, reaching
+/// the buffer end is not a row boundary until the host has reported EOF.
+fn scan_complete_row(
+    bytes: &[u8],
+    dialect: Dialect,
+    eof: bool,
+) -> Result<Option<RowDraft>, String> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    let mut field_start = 0usize;
+    let mut fields = Vec::new();
+    let mut quoted = false;
+    let mut field_was_quoted = false;
+    let mut just_closed_quote = false;
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let byte = bytes[cursor];
+        if quoted {
+            if Some(byte) == dialect.quote {
+                if cursor + 1 == bytes.len() && !eof {
+                    return Ok(None);
+                }
+                if cursor + 1 < bytes.len() && bytes[cursor + 1] == byte {
+                    cursor += 2;
+                    continue;
+                }
+                quoted = false;
+                just_closed_quote = true;
+            }
+            cursor += 1;
+            continue;
+        }
+        if just_closed_quote {
+            let is_terminator = byte == b'\r' || byte == b'\n';
+            if byte != dialect.delimiter && !is_terminator {
+                return Err(format!(
+                    "unexpected byte after closing quote at offset {cursor}"
+                ));
+            }
+        }
+        if Some(byte) == dialect.quote && cursor == field_start {
+            quoted = true;
+            field_was_quoted = true;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        if byte == dialect.delimiter {
+            fields.push(FieldRange::new(
+                field_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            field_start = cursor + 1;
+            field_was_quoted = false;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        let ending = if byte == b'\r' {
+            if cursor + 1 == bytes.len() && !eof {
+                return Ok(None);
+            }
+            if bytes.get(cursor + 1) == Some(&b'\n') {
+                Some((Terminator::CrLf, 2usize))
+            } else {
+                Some((Terminator::Cr, 1usize))
+            }
+        } else if byte == b'\n' {
+            Some((Terminator::Lf, 1usize))
+        } else {
+            None
+        };
+        if let Some((terminator, ending_len)) = ending {
+            fields.push(FieldRange::new(
+                field_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            return Ok(Some(RowDraft {
+                start: 0,
+                byte_len: u32::try_from(cursor + ending_len)
+                    .map_err(|_| "CSV row exceeds 4GiB".to_owned())?,
+                ending: Some(terminator),
+                fields,
+                id_slot: None,
+                order_rank: None,
+            }));
+        }
+        just_closed_quote = false;
+        cursor += 1;
+    }
+    if !eof {
+        return Ok(None);
+    }
+    if quoted {
+        return Err(format!("unterminated quoted field at offset {field_start}"));
+    }
+    fields.push(FieldRange::new(
+        field_start,
+        bytes.len() - field_start,
+        field_was_quoted,
+    )?);
+    Ok(Some(RowDraft {
+        start: 0,
+        byte_len: u32::try_from(bytes.len()).map_err(|_| "CSV row exceeds 4GiB".to_owned())?,
+        ending: None,
+        fields,
+        id_slot: None,
+        order_rank: None,
+    }))
+}
+
+fn scan_one_row(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    dialect: Dialect,
+) -> Result<Option<RowDraft>, String> {
+    if start > end || end > bytes.len() {
+        return Err("invalid CSV scan range".to_owned());
+    }
+    if start == end {
+        return Ok(None);
+    }
+    let row_start = start;
+    let mut field_start = start;
+    let mut fields = Vec::new();
+    let mut quoted = false;
+    let mut field_was_quoted = false;
+    let mut just_closed_quote = false;
+    let mut cursor = start;
+    while cursor < end {
+        let byte = bytes[cursor];
+        if quoted {
+            if Some(byte) == dialect.quote {
+                if cursor + 1 < end && bytes[cursor + 1] == byte {
+                    cursor += 2;
+                    continue;
+                }
+                quoted = false;
+                just_closed_quote = true;
+            }
+            cursor += 1;
+            continue;
+        }
+        if just_closed_quote {
+            let is_terminator = byte == b'\r' || byte == b'\n';
+            if byte != dialect.delimiter && !is_terminator {
+                return Err(format!(
+                    "unexpected byte after closing quote at offset {cursor}"
+                ));
+            }
+        }
+        if Some(byte) == dialect.quote && cursor == field_start {
+            quoted = true;
+            field_was_quoted = true;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        if byte == dialect.delimiter {
+            fields.push(FieldRange::new(
+                field_start - row_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            field_start = cursor + 1;
+            field_was_quoted = false;
+            just_closed_quote = false;
+            cursor += 1;
+            continue;
+        }
+        let ending = if byte == b'\r' {
+            if cursor + 1 < end && bytes[cursor + 1] == b'\n' {
+                Some((Terminator::CrLf, 2usize))
+            } else {
+                Some((Terminator::Cr, 1usize))
+            }
+        } else if byte == b'\n' {
+            Some((Terminator::Lf, 1usize))
+        } else {
+            None
+        };
+        if let Some((terminator, ending_len)) = ending {
+            fields.push(FieldRange::new(
+                field_start - row_start,
+                cursor - field_start,
+                field_was_quoted,
+            )?);
+            return Ok(Some(RowDraft {
+                start: u32::try_from(row_start)
+                    .map_err(|_| "CSV offset exceeds 4GiB".to_owned())?,
+                byte_len: u32::try_from(cursor + ending_len - row_start)
+                    .map_err(|_| "CSV row exceeds 4GiB".to_owned())?,
+                ending: Some(terminator),
+                fields,
+                id_slot: None,
+                order_rank: None,
+            }));
+        }
+        just_closed_quote = false;
+        cursor += 1;
+    }
+    if quoted {
+        return Err(format!("unterminated quoted field at offset {field_start}"));
+    }
+    fields.push(FieldRange::new(
+        field_start - row_start,
+        end - field_start,
+        field_was_quoted,
+    )?);
+    Ok(Some(RowDraft {
+        start: u32::try_from(row_start).map_err(|_| "CSV offset exceeds 4GiB".to_owned())?,
+        byte_len: u32::try_from(end - row_start).map_err(|_| "CSV row exceeds 4GiB".to_owned())?,
+        ending: None,
+        fields,
+        id_slot: None,
+        order_rank: None,
+    }))
 }
 
 fn scan_rows(
@@ -3562,6 +4349,62 @@ fn row_snapshot_bytes(
     Ok(output)
 }
 
+fn v3_row_snapshot_bytes(
+    bytes: &[u8],
+    row: &RowDraft,
+    id: &str,
+    order_key: &str,
+    dialect: Dialect,
+) -> Result<Vec<u8>, String> {
+    let mut output = Vec::with_capacity(128);
+    output.extend_from_slice(b"{\"cells\":[");
+    let row_start = usize::try_from(row.start).expect("u32 fits usize");
+    let mut force_quote = Vec::new();
+    for (index, field) in row.fields.iter().copied().enumerate() {
+        if index > 0 {
+            output.push(b',');
+        }
+        if field_has_unnecessary_quotes(bytes, row_start, field, dialect)? {
+            if force_quote.len() <= index / 8 {
+                force_quote.resize(index / 8 + 1, 0);
+            }
+            force_quote[index / 8] |= 1 << (index % 8);
+        }
+        let value = decoded_field(bytes, row_start, field, dialect.quote)?;
+        write_canonical_json_string(&mut output, &value);
+    }
+    output.push(b']');
+    output.extend_from_slice(b",\"id\":");
+    write_canonical_json_string(&mut output, id);
+    let has_force_quote = !force_quote.is_empty();
+    let exceptional_ending = (row.ending != Some(dialect.terminator)).then_some(row.ending);
+    if has_force_quote || exceptional_ending.is_some() {
+        output.extend_from_slice(b",\"layout\":{");
+        let needs_comma = if has_force_quote {
+            output.extend_from_slice(b"\"force_quote\":");
+            write_canonical_json_string(&mut output, &URL_SAFE_NO_PAD.encode(force_quote));
+            true
+        } else {
+            false
+        };
+        if let Some(ending) = exceptional_ending {
+            if needs_comma {
+                output.push(b',');
+            }
+            output.extend_from_slice(b"\"terminator\":");
+            write_canonical_json_string(
+                &mut output,
+                ending.map_or("", |terminator| terminator.snapshot()),
+            );
+        }
+        output.push(b'}');
+    }
+    output.extend_from_slice(b",\"order_key\":");
+    write_canonical_json_string(&mut output, order_key);
+    output.push(b'}');
+    Ok(output)
+}
+
 fn table_snapshot(dialect: Dialect) -> Vec<u8> {
     let mut output = Vec::with_capacity(96);
     output.extend_from_slice(b"{\"dialect\":{\"delimiter\":");
@@ -3705,6 +4548,57 @@ impl Iterator for InitialChanges {
         Some(self.document.row_snapshot(location).map(|snapshot| {
             EntityChange::upsert(ROW_SCHEMA_KEY, self.document.row_id(location), snapshot)
         }))
+    }
+}
+
+impl Iterator for V3InitialChanges {
+    type Item = Result<EntityChange, String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        if self.ordinal >= self.row_count {
+            return if self.table_pending {
+                self.table_pending = false;
+                Some(Ok(EntityChange::upsert(
+                    TABLE_SCHEMA_KEY,
+                    ROOT_ENTITY_PK.to_owned(),
+                    table_snapshot(self.dialect),
+                )))
+            } else {
+                None
+            };
+        }
+        let row = match scan_one_row(&self.bytes, self.cursor, self.bytes.len(), self.dialect) {
+            Ok(Some(row)) => row,
+            Ok(None) => {
+                self.failed = true;
+                return Some(Err(
+                    "CSV streaming import ended before the counted row total".to_owned(),
+                ));
+            }
+            Err(error) => {
+                self.failed = true;
+                return Some(Err(error));
+            }
+        };
+        let ordinal = self.ordinal;
+        let denominator = u128::try_from(self.row_count + 1).expect("usize fits u128");
+        let numerator =
+            u128::try_from(ordinal + 1).expect("usize fits u128") * u128::from(u64::MAX);
+        let order_rank = u64::try_from(numerator / denominator).expect("ratio fits u64") | 1;
+        let id = self.namespace.encode(ordinal as u64);
+        let snapshot = v3_row_snapshot_bytes(
+            &self.bytes,
+            &row,
+            &id,
+            &format!("{order_rank:016x}"),
+            self.dialect,
+        );
+        self.cursor = usize::try_from(row.start + row.byte_len).expect("u32 fits usize");
+        self.ordinal += 1;
+        Some(snapshot.map(|snapshot| EntityChange::upsert(ROW_SCHEMA_KEY, id, snapshot)))
     }
 }
 

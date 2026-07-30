@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::binary_cas::BlobHash;
 use crate::common::LixError;
-use crate::wasm::{WasmComponentV2Factory, WasmLimits, WasmRuntime, WasmTransitionCounters};
+use crate::wasm::{
+    WasmComponentV2Factory, WasmComponentV3Factory, WasmLimits, WasmRuntime,
+    WasmTransitionCounters, WasmV3TransitionCounters,
+};
 
 use super::{
     CompiledPluginCatalog, DEFAULT_MAX_LIVE_PLUGIN_STORES, InstalledPlugin, PluginActorCache,
@@ -45,6 +48,12 @@ struct CachedPluginV2Factory {
     factory: Arc<dyn WasmComponentV2Factory>,
 }
 
+#[derive(Clone)]
+struct CachedPluginV3Factory {
+    wasm_hash: BlobHash,
+    factory: Arc<dyn WasmComponentV3Factory>,
+}
+
 #[derive(Default)]
 struct PluginRegistryReadCache {
     snapshot: Option<u128>,
@@ -55,9 +64,11 @@ struct PluginRegistryReadCache {
 pub(crate) struct PluginRuntimeHost {
     wasm_runtime: Arc<dyn WasmRuntime>,
     plugin_v2_factory_cache: Arc<Mutex<BTreeMap<String, CachedPluginV2Factory>>>,
+    plugin_v3_factory_cache: Arc<Mutex<BTreeMap<String, CachedPluginV3Factory>>>,
     plugin_v2_wasm_limits: WasmLimits,
     plugin_actor_cache: PluginActorCache,
     plugin_v2_transition_counters: Arc<Mutex<WasmTransitionCounters>>,
+    plugin_v3_transition_counters: Arc<Mutex<WasmV3TransitionCounters>>,
     plugin_catalog_cache: Arc<Mutex<PluginCatalogCache>>,
     plugin_registry_read_cache: Arc<Mutex<PluginRegistryReadCache>>,
     /// Ordinary plugin writes share this gate; lifecycle replacements take it
@@ -85,9 +96,13 @@ impl PluginRuntimeHost {
         Ok(Self {
             wasm_runtime,
             plugin_v2_factory_cache: Arc::new(Mutex::new(BTreeMap::new())),
+            plugin_v3_factory_cache: Arc::new(Mutex::new(BTreeMap::new())),
             plugin_v2_wasm_limits: plugin_v2_wasm_limits(max_memory_bytes)?,
             plugin_actor_cache: PluginActorCache::new(max_live_stores)?,
             plugin_v2_transition_counters: Arc::new(Mutex::new(WasmTransitionCounters::default())),
+            plugin_v3_transition_counters: Arc::new(
+                Mutex::new(WasmV3TransitionCounters::default()),
+            ),
             plugin_catalog_cache: Arc::new(Mutex::new(PluginCatalogCache::default())),
             plugin_registry_read_cache: Arc::new(Mutex::new(PluginRegistryReadCache::default())),
             plugin_generation_fence: Arc::new(tokio::sync::RwLock::new(())),
@@ -204,6 +219,52 @@ impl PluginRuntimeHost {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = WasmTransitionCounters::default();
     }
 
+    pub(crate) fn record_v3_transition_counters(&self, counters: WasmV3TransitionCounters) {
+        let mut total = self
+            .plugin_v3_transition_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        total.component_boundary_bytes = total
+            .component_boundary_bytes
+            .saturating_add(counters.component_boundary_bytes);
+        total.file_page_reads = total
+            .file_page_reads
+            .saturating_add(counters.file_page_reads);
+        total.file_page_bytes = total
+            .file_page_bytes
+            .saturating_add(counters.file_page_bytes);
+        total.entity_page_reads = total
+            .entity_page_reads
+            .saturating_add(counters.entity_page_reads);
+        total.entity_page_bytes = total
+            .entity_page_bytes
+            .saturating_add(counters.entity_page_bytes);
+        total.state_page_reads = total
+            .state_page_reads
+            .saturating_add(counters.state_page_reads);
+        total.state_page_bytes = total
+            .state_page_bytes
+            .saturating_add(counters.state_page_bytes);
+        total.guest_linear_memory_high_water_bytes = total
+            .guest_linear_memory_high_water_bytes
+            .max(counters.guest_linear_memory_high_water_bytes);
+    }
+
+    pub(crate) fn v3_transition_counters(&self) -> WasmV3TransitionCounters {
+        *self
+            .plugin_v3_transition_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn reset_v3_transition_counters(&self) {
+        *self
+            .plugin_v3_transition_counters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            WasmV3TransitionCounters::default();
+    }
+
     /// Shares only compiled code. Every file actor created from this factory
     /// receives a distinct Store/instance through `instantiate_actor`.
     pub(crate) async fn load_or_compile_v2_factory(
@@ -243,6 +304,51 @@ impl PluginRuntimeHost {
     ) -> Result<Option<Arc<dyn WasmComponentV2Factory>>, LixError> {
         let cache = self
             .plugin_v2_factory_cache
+            .lock()
+            .map_err(|_| component_cache_lock_error())?;
+        Ok(cache
+            .get(plugin_key)
+            .filter(|cached| cached.wasm_hash == wasm_hash)
+            .map(|cached| Arc::clone(&cached.factory)))
+    }
+
+    pub(crate) async fn load_or_compile_v3_factory(
+        &self,
+        plugin: &InstalledPlugin,
+    ) -> Result<Arc<dyn WasmComponentV3Factory>, LixError> {
+        if let Some(factory) = self.cached_plugin_v3_factory(&plugin.key, plugin.wasm_hash)? {
+            return Ok(factory);
+        }
+        let compiled = self
+            .wasm_runtime
+            .compile_component_v3(plugin.wasm.clone(), self.plugin_v2_wasm_limits)
+            .await?;
+        let mut cache = self
+            .plugin_v3_factory_cache
+            .lock()
+            .map_err(|_| component_cache_lock_error())?;
+        if let Some(cached) = cache.get(&plugin.key)
+            && cached.wasm_hash == plugin.wasm_hash
+        {
+            return Ok(Arc::clone(&cached.factory));
+        }
+        cache.insert(
+            plugin.key.clone(),
+            CachedPluginV3Factory {
+                wasm_hash: plugin.wasm_hash,
+                factory: Arc::clone(&compiled),
+            },
+        );
+        Ok(compiled)
+    }
+
+    pub(crate) fn cached_plugin_v3_factory(
+        &self,
+        plugin_key: &str,
+        wasm_hash: BlobHash,
+    ) -> Result<Option<Arc<dyn WasmComponentV3Factory>>, LixError> {
+        let cache = self
+            .plugin_v3_factory_cache
             .lock()
             .map_err(|_| component_cache_lock_error())?;
         Ok(cache

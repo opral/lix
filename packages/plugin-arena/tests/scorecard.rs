@@ -1,19 +1,131 @@
 use lix_plugin_arena::{ByteEdit, PerformanceMeasurement, Root, Store, compare_to_v2};
+use serde_json::Value;
 use std::hint::black_box;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[test]
 fn component_v3_wit_is_valid_and_has_no_guest_document_resource() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/wit/v3");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../engine/wit/v3");
+    let sdk_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../rs-sdk/wit/v3");
     let mut resolve = wit_parser::Resolve::default();
     resolve
         .push_dir(&path)
         .unwrap_or_else(|error| panic!("parse {}: {error:#}", path.display()));
     let wit = std::fs::read_to_string(path.join("lix-plugin-v3.wit")).unwrap();
-    assert!(wit.contains("package lix:plugin@3.0.0"));
+    let sdk_wit = std::fs::read_to_string(sdk_path.join("lix-plugin-v3.wit")).unwrap();
+    assert_eq!(
+        wit, sdk_wit,
+        "engine and SDK must compile the exact same v3 Component contract"
+    );
+    assert!(wit.contains("package lix:plugin@3.2.0"));
     assert!(wit.contains("resource root"));
     assert!(wit.contains("resource transaction"));
+    assert!(wit.contains("scan-entity-pages"));
+    assert!(wit.contains("resource conflict-set"));
+    assert!(wit.contains("resolve-conflicts"));
+    assert!(wit.contains("declare-ordered-entity-output"));
+    assert!(wit.contains("first-change-packet: bytes"));
+    assert!(wit.contains("result<option<bytes>, plugin-error>"));
     assert!(!wit.contains("resource document"));
+    assert!(!wit.contains("first-changes: list<entity-change>"));
+}
+
+#[test]
+fn v3_manifests_are_a_hard_cut_and_all_schemas_match_v2_byte_for_byte() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let formats = [
+        (
+            "json",
+            "json-v2",
+            "json-v3",
+            &[
+                "json_root.json",
+                "json_object_member.json",
+                "json_array_item.json",
+            ][..],
+        ),
+        (
+            "csv",
+            "csv-v2",
+            "csv-v3",
+            &["csv_v2_table.json", "csv_v2_row.json"][..],
+        ),
+        (
+            "markdown",
+            "markdown-v2",
+            "markdown-v3",
+            &["markdown_node_v2.json"][..],
+        ),
+        (
+            "excalidraw",
+            "excalidraw-v2",
+            "excalidraw-v3",
+            &[
+                "excalidraw_scene.json",
+                "excalidraw_element.json",
+                "excalidraw_file.json",
+            ][..],
+        ),
+    ];
+
+    for (format, v2, v3, schemas) in formats {
+        let v3_directory = repository.join("plugins").join(v3);
+        let manifest_path = v3_directory.join("manifest.json");
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(&manifest_path)
+                .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display())),
+        )
+        .unwrap_or_else(|error| panic!("parse {}: {error}", manifest_path.display()));
+        assert_eq!(
+            manifest["api_version"], "3.2.0",
+            "{format} must use only the v3 API"
+        );
+        assert_eq!(
+            manifest["runtime"], "wasm-component-v3",
+            "{format} must use only the v3 Component runtime"
+        );
+        assert_ne!(
+            manifest["api_version"], "2.1.0",
+            "{format} must not advertise v2 compatibility"
+        );
+
+        let declared = manifest["schemas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{format} manifest schemas must be an array"));
+        assert_eq!(
+            declared.len(),
+            schemas.len(),
+            "{format} must preserve schema granularity"
+        );
+        for schema in schemas {
+            let relative = format!("schema/{schema}");
+            assert!(
+                declared.iter().any(|entry| entry == &relative),
+                "{format} manifest must declare {relative}"
+            );
+            assert_schema_bytes_equal(
+                &repository.join("plugins").join(v2).join(&relative),
+                &v3_directory.join(&relative),
+                format,
+            );
+        }
+    }
+}
+
+fn assert_schema_bytes_equal(v2: &PathBuf, v3: &PathBuf, format: &str) {
+    let v2_bytes =
+        std::fs::read(v2).unwrap_or_else(|error| panic!("read {}: {error}", v2.display()));
+    let v3_bytes =
+        std::fs::read(v3).unwrap_or_else(|error| panic!("read {}: {error}", v3.display()));
+    assert_eq!(
+        v3_bytes,
+        v2_bytes,
+        "{format} v3 schema {} must remain byte-identical to v2",
+        v3.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<invalid path>")
+    );
 }
 
 #[derive(Clone, Copy, Debug)]

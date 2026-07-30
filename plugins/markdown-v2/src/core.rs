@@ -1518,6 +1518,13 @@ pub struct Document {
     top_level_ranges: Arc<Vec<Range<usize>>>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3TopLevelIndexRecord {
+    pub start: u64,
+    pub len: u64,
+    pub id: String,
+}
+
 /// Persistent top-level Markdown tree. The common paragraph-edit path changes
 /// one top-level node, so retaining the parsed base avoids cloning thousands
 /// of unrelated `NodeSnapshot` JSON values on every keystroke.
@@ -1965,7 +1972,17 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
-        Self::open_file_with_literal_fast_path(bytes, path, namespace, true)
+        Self::open_file_with_literal_fast_path(bytes, path, namespace, true, true)
+    }
+
+    /// API v3 keeps exact accepted bytes in the host arena, so the document
+    /// root must not duplicate the complete source as lexical fallback.
+    pub fn open_file_host_owned(
+        bytes: Vec<u8>,
+        path: Option<&str>,
+        namespace: IdNamespace,
+    ) -> Result<(Self, Vec<EntityChange>), PluginError> {
+        Self::open_file_with_literal_fast_path(bytes, path, namespace, true, false)
     }
 
     #[cfg(test)]
@@ -1974,7 +1991,7 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
-        Self::open_file_with_literal_fast_path(bytes, path, namespace, false)
+        Self::open_file_with_literal_fast_path(bytes, path, namespace, false, true)
     }
 
     fn open_file_with_literal_fast_path(
@@ -1982,13 +1999,16 @@ impl Document {
         path: Option<&str>,
         namespace: IdNamespace,
         allow_literal_fast_path: bool,
+        retain_lexical_fallback: bool,
     ) -> Result<(Self, Vec<EntityChange>), PluginError> {
         let file = File {
             filename: path.map(ToOwned::to_owned),
             data: bytes.clone(),
         };
         let mut parsed = parse_file_with_literal_fast_path(&file, allow_literal_fast_path)?;
-        retain_noncanonical_source(&mut parsed, &file.data)?;
+        if retain_lexical_fallback {
+            retain_noncanonical_source(&mut parsed, &file.data)?;
+        }
         let top_level_ranges = parsed.top_level_ranges.clone();
         let (detected, root) =
             detect_changes_for_markdown(&ProjectionView::default(), None, parsed, namespace)?;
@@ -2056,6 +2076,22 @@ impl Document {
 
     pub fn fork(&self) -> Self {
         self.clone()
+    }
+
+    pub fn v3_top_level_index_records(&self) -> Vec<V3TopLevelIndexRecord> {
+        self.top_level_ranges
+            .iter()
+            .enumerate()
+            .filter_map(|(index, range)| {
+                self.tree
+                    .top_level_node(index)
+                    .map(|node| V3TopLevelIndexRecord {
+                        start: range.start as u64,
+                        len: (range.end - range.start) as u64,
+                        id: node.id.clone(),
+                    })
+            })
+            .collect()
     }
 
     pub fn file_changed(
@@ -2345,6 +2381,53 @@ impl Document {
     pub(crate) fn accepted_bytes(&self) -> Vec<u8> {
         self.bytes.materialize()
     }
+}
+
+pub fn v3_single_top_level_snapshot(
+    bytes: Vec<u8>,
+    path: Option<&str>,
+    namespace: IdNamespace,
+) -> Result<Vec<u8>, PluginError> {
+    let (document, _) = Document::open_file(bytes, path, namespace)?;
+    if document.top_level_ranges.len() != 1 {
+        return Err(PluginError::InvalidInput(
+            "Markdown affected range is not exactly one top-level node".to_owned(),
+        ));
+    }
+    let node = document.tree.top_level_node(0).ok_or_else(|| {
+        PluginError::Internal("Markdown parser omitted the affected top-level node".to_owned())
+    })?;
+    let logical = serde_json::to_string(node).map_err(|error| {
+        PluginError::Internal(format!("failed to encode affected Markdown node: {error}"))
+    })?;
+    logical_to_wire(&logical)
+}
+
+pub fn v3_reidentify_snapshot(
+    before: &[u8],
+    generated: &[u8],
+) -> Result<(Vec<u8>, ChangeEffect), PluginError> {
+    let before: WireNodeSnapshot = serde_json::from_slice(before).map_err(|error| {
+        PluginError::InvalidInput(format!("invalid durable Markdown snapshot: {error}"))
+    })?;
+    let mut generated: WireNodeSnapshot = serde_json::from_slice(generated).map_err(|error| {
+        PluginError::Internal(format!("invalid generated Markdown snapshot: {error}"))
+    })?;
+    let effect = if before.payload_json == generated.payload_json {
+        ChangeEffect::FormatOnly
+    } else {
+        ChangeEffect::Content
+    };
+    generated.id = before.id;
+    generated.parent_id = before.parent_id;
+    generated.order_key = before.order_key;
+    serde_json::to_vec(&generated)
+        .map(|snapshot| (snapshot, effect))
+        .map_err(|error| {
+            PluginError::Internal(format!(
+                "failed to encode reidentified Markdown snapshot: {error}"
+            ))
+        })
 }
 
 /// A single base-relative text replacement. Keeping this deliberately narrow

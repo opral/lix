@@ -15,9 +15,9 @@ use plugin_json_incremental_core::{
 };
 
 const INDEX_VERSION_KEY: &[u8] = b"json/v3/index-version";
-const INDEX_VERSION: &[u8] = b"scalar-byte-windows-v1";
+const INDEX_VERSION: &[u8] = b"scalar-byte-windows-v2";
 const INDEX_KEY_PREFIX: &[u8] = b"json/v3/scalars/";
-const INDEX_WINDOW_BYTES: u64 = 64 * 1024;
+const INDEX_WINDOW_BYTES: u64 = 8 * 1024;
 
 struct JsonV3Plugin;
 
@@ -31,13 +31,11 @@ impl sdk::FormatPlugin for JsonV3Plugin {
         write_scalar_index(&input.successor, budget, &document)?;
         Ok(sdk::FileResult {
             successor: input.successor,
-            changes: changes
-                .map(|change| {
-                    change
-                        .map(core_change_to_sdk)
-                        .map_err(sdk::Error::invalid_input)
-                })
-                .collect::<sdk::Result<Vec<_>>>()?,
+            changes: sdk::EntityChanges::from_results(changes.map(|change| {
+                change
+                    .map(core_change_to_sdk)
+                    .map_err(sdk::Error::invalid_input)
+            })),
         })
     }
 
@@ -45,7 +43,7 @@ impl sdk::FormatPlugin for JsonV3Plugin {
         if let Some(changes) = sparse_scalar_file_changed(&input, budget)? {
             return Ok(sdk::FileResult {
                 successor: input.successor,
-                changes,
+                changes: changes.into(),
             });
         }
         let document = document_from_root(&input.before, budget)?;
@@ -81,7 +79,11 @@ impl sdk::FormatPlugin for JsonV3Plugin {
         write_scalar_index(&input.successor, budget, &after)?;
         Ok(sdk::FileResult {
             successor: input.successor,
-            changes: changes.into_iter().map(core_change_to_sdk).collect(),
+            changes: changes
+                .into_iter()
+                .map(core_change_to_sdk)
+                .collect::<Vec<_>>()
+                .into(),
         })
     }
 

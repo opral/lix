@@ -59,6 +59,11 @@ fn is_import_perf_span(name: &str) -> bool {
             | "lix.perf.plugin_factory_compile"
             | "lix.perf.plugin_open_file"
             | "lix.perf.plugin_open_file_drain"
+            | "lix.perf.plugin_v3_actor_instantiate"
+            | "lix.perf.plugin_v3_open_file"
+            | "lix.perf.plugin_v3_open_file_drain"
+            | "lix.perf.plugin_v3_drain_next_page"
+            | "lix.perf.plugin_v3_drain_finish"
             | "lix.perf.plugin_drain_next_page"
             | "lix.perf.plugin_drain_guest_next"
             | "lix.perf.plugin_drain_decode_packet"
@@ -184,6 +189,147 @@ impl WasmRuntime for HistoryRejectingRuntime {
             "file history must not execute a plugin",
         ))
     }
+}
+
+#[tokio::test]
+async fn v3_2_csv_fresh_import_runs_through_engine_and_persists_arena_ref() {
+    let storage = lix_sdk::Memory::new();
+    let lix = open_lix(OpenLixOptions::new(storage.clone()))
+        .await
+        .expect("workspace should open");
+    install_plugin(&lix, "plugin_csv_v3", &build_csv_v3_plugin_archive())
+        .await
+        .expect("CSV v3.2 plugin should install");
+
+    let path = "/arena-e2e.csv";
+    let bytes = b"name,value\nfirst,1\nsecond,2\n".to_vec();
+    write_file(&lix, path, bytes.clone())
+        .await
+        .expect("v3.2 engine import should commit");
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(bytes));
+    let file_id = file_id_at_path(&lix, path).await;
+    let rows = active_csv_v2_rows(&lix, &file_id).await;
+    assert_eq!(rows.len(), 3);
+    let arena_ref = lix
+        .execute(
+            "SELECT snapshot_content FROM lix_change \
+             WHERE schema_key = 'lix_binary_blob_ref' AND file_id = $1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("v3.2 arena reference should be queryable");
+    assert_eq!(arena_ref.rows().len(), 1);
+    let arena_ref = arena_ref.rows()[0]
+        .get::<serde_json::Value>("snapshot_content")
+        .expect("arena reference snapshot should be JSON");
+    let initial_root = arena_ref["plugin_arena_root"]
+        .as_str()
+        .expect("arena root should be text")
+        .to_owned();
+    for property in [
+        "plugin_arena_hash",
+        "plugin_arena_root",
+        "plugin_generation",
+    ] {
+        assert!(
+            !arena_ref[property]
+                .as_str()
+                .expect("arena reference property should be text")
+                .is_empty()
+        );
+    }
+    lix.close().await.unwrap();
+
+    let reopened = open_lix(OpenLixOptions::new(storage))
+        .await
+        .expect("workspace should reopen");
+    assert_eq!(
+        active_csv_v2_rows(&reopened, &file_id).await.len(),
+        3,
+        "v3.2 semantic rows must survive a full engine reopen"
+    );
+    let updated = b"name,value\nfirst,1\nsecond,updated\n".to_vec();
+    write_file(&reopened, path, updated.clone())
+        .await
+        .expect("v3.2 byte update should reopen and transition the durable arena");
+    assert_eq!(read_file(&reopened, path).await.unwrap(), Some(updated));
+    let rows = active_csv_v2_rows(&reopened, &file_id).await;
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().any(|row| row.cells == ["second", "updated"]));
+    let latest_ref = reopened
+        .execute(
+            "SELECT snapshot_content FROM lix_change \
+             WHERE schema_key = 'lix_binary_blob_ref' AND file_id = $1 \
+             ORDER BY created_at DESC LIMIT 1",
+            &[Value::Text(file_id.clone())],
+        )
+        .await
+        .expect("updated v3.2 arena reference should be queryable");
+    let latest_ref = latest_ref.rows()[0]
+        .get::<serde_json::Value>("snapshot_content")
+        .unwrap();
+    assert_ne!(
+        latest_ref["plugin_arena_root"].as_str().unwrap(),
+        initial_root,
+        "a byte successor must publish a new immutable arena root"
+    );
+    let edited = rows
+        .iter()
+        .find(|row| row.cells == ["second", "updated"])
+        .expect("updated CSV row should exist");
+    reopened
+        .execute(
+            "UPDATE csv_v2_row SET cells = $1 \
+             WHERE id = $2 AND lixcol_file_id = $3",
+            &[
+                Value::Json(serde_json::json!(["second", "semantic"])),
+                Value::Text(edited.id.clone()),
+                Value::Text(file_id.clone()),
+            ],
+        )
+        .await
+        .expect("v3.2 semantic update should render through the durable arena");
+    assert_eq!(
+        read_file(&reopened, path).await.unwrap(),
+        Some(b"name,value\nfirst,1\nsecond,semantic\n".to_vec())
+    );
+    reopened.close().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "220k-row production-engine v3.2 cold-file import benchmark"]
+async fn v3_2_csv_220k_row_engine_cold_import_is_under_600ms() {
+    let lix = open_lix(OpenLixOptions::default())
+        .await
+        .expect("workspace should open");
+    install_plugin(&lix, "plugin_csv_v3", &build_csv_v3_plugin_archive())
+        .await
+        .expect("CSV v3.2 plugin should install");
+    // Compile the installed generation once so this measures cold file
+    // import, not component compilation.
+    write_file(&lix, "/compile-primer.csv", b"h\nv\n".to_vec())
+        .await
+        .expect("compile primer should import");
+
+    let bytes = csv_ten_mib_fixture();
+    let collector = PerfSpanCollector::default();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(collector.clone()));
+    let _dispatcher = tracing::dispatcher::set_default(&dispatch);
+    let started = Instant::now();
+    write_file(&lix, "/arena-220k.csv", bytes)
+        .await
+        .expect("220k-row v3.2 engine import should commit");
+    let elapsed = started.elapsed();
+    eprintln!(
+        "csv_v3_2_engine_cold_import rows=220000 elapsed_ms={:.3} phases_ms={:?}",
+        elapsed.as_secs_f64() * 1_000.0,
+        collector.take_aggregate_millis()
+    );
+    assert!(
+        elapsed < Duration::from_millis(600),
+        "220k-row v3.2 engine cold import took {elapsed:?}, expected <600ms"
+    );
+    lix.close().await.unwrap();
 }
 
 #[tokio::test]
@@ -1030,6 +1176,79 @@ async fn v2_csv_same_row_branch_merge_composes_distinct_cells() {
     assert_eq!(
         counters.conflict_resolution_takes, 0,
         "the composed row is one replacement, not a side selection"
+    );
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn v3_2_csv_same_row_branch_merge_runs_component_resolver() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_csv_v3",
+        &build_csv_v3_plugin_archive(),
+        &["csv_v2_table", "csv_v2_row"],
+    )
+    .await;
+
+    let path = "/arena-row-conflict.csv";
+    write_file(&lix, path, b"alpha,one,red\n".to_vec())
+        .await
+        .expect("base row should import through v3.2");
+    let target_branch_id = lix.active_branch_id().await.unwrap();
+    let source = lix
+        .create_branch(CreateBranchOptions {
+            id: Some("01920000-0000-7000-8000-00000000050b".to_owned()),
+            name: "CSV v3.2 row conflict source".to_owned(),
+            from_commit_id: None,
+        })
+        .await
+        .unwrap();
+
+    write_file(&lix, path, b"ALPHA,one,red\n".to_vec())
+        .await
+        .expect("target first-cell edit should commit through v3.2");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: source.id.clone(),
+    })
+    .await
+    .unwrap();
+    write_file(&lix, path, b"alpha,one,BLUE\n".to_vec())
+        .await
+        .expect("source third-cell edit should commit through v3.2");
+    lix.switch_branch(SwitchBranchOptions {
+        branch_id: target_branch_id,
+    })
+    .await
+    .unwrap();
+
+    let preview = lix
+        .merge_branch_preview(MergeBranchPreviewOptions {
+            source_branch_id: source.id.clone(),
+        })
+        .await
+        .expect("v3.2 plugin-owned row conflict should preview");
+    assert!(
+        preview.conflicts.is_empty(),
+        "the CSV v3.2 component must own the row conflict: {:?}",
+        preview.conflicts
+    );
+
+    lix.reset_plugin_v3_transition_counters();
+    lix.merge_branch(MergeBranchOptions {
+        source_branch_id: source.id,
+    })
+    .await
+    .expect("v3.2 should compose distinct CSV cell edits");
+    assert_eq!(
+        read_file(&lix, path).await.unwrap().as_deref(),
+        Some(b"ALPHA,one,BLUE\n".as_slice()),
+        "both same-row cell edits must survive the v3.2 component resolver",
+    );
+    assert!(
+        lix.plugin_v3_transition_counters().component_boundary_bytes > 0,
+        "the merge must cross the production v3.2 component boundary"
     );
 
     lix.close().await.unwrap();
@@ -2029,6 +2248,7 @@ async fn v2_json_ten_mib_ordinary_sql_byte_edit_benchmark() {
 async fn v3_json_ten_mib_affected_page_allocator_benchmark() {
     const WARMUPS: usize = 100;
     const SAMPLES: usize = 200;
+    const V2_P95_NS: u64 = 5_928_000;
     const V2_CONSERVATIVE_TOTAL_BYTES: u64 = 37_158_912;
     const V3_TARGET_BYTES: u64 = V2_CONSERVATIVE_TOTAL_BYTES / 3;
 
@@ -2181,18 +2401,569 @@ async fn v3_json_ten_mib_affected_page_allocator_benchmark() {
         V2_CONSERVATIVE_TOTAL_BYTES as f64 / peak_owned as f64,
         last_counters.component_boundary_bytes,
     );
-    assert!(p95_ns <= 2_750_000, "JSON v3 must clear 2x latency");
+    assert!(
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        "JSON v3 must clear 2x latency"
+    );
     assert!(
         peak_owned <= V3_TARGET_BYTES,
         "JSON v3 must clear 3x memory including transient allocations"
     );
+    assert!(
+        last_counters.component_boundary_bytes <= 4 * 1024,
+        "JSON v3 hot boundary must remain below 4 KiB"
+    );
 }
 
 #[tokio::test]
-#[ignore = "10.68 MiB v3 CSV allocator and resident-memory benchmark"]
+#[ignore = "10.68 MB v3 CSV cold-import allocator benchmark"]
+async fn v3_csv_ten_mib_cold_import_allocator_benchmark() {
+    const WARMUPS: usize = 2;
+    const SAMPLES: usize = 10;
+    const ROWS: usize = 220_000;
+    const V2_P95_NS: u64 = 1_021_834_000;
+    const V2_TOTAL_OWNED_BYTES: u64 = 63_698_624;
+    const V2_BOUNDARY_BYTES: u64 = 39_400_111;
+    const REQUIRED_BOUNDARY_PERCENT: u64 = 90;
+
+    let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_plugin_csv_v3");
+    let wasm = std::fs::read(wasm_path).expect("read CSV v3 component");
+    let runtime = lix_sdk::default_wasm_runtime().expect("initialize default Wasmtime runtime");
+    let factory = runtime
+        .compile_component_v3(
+            wasm,
+            WasmLimits {
+                max_memory_bytes: 128 * 1024 * 1024,
+                max_fuel: None,
+                timeout_ms: Some(120_000),
+            },
+        )
+        .await
+        .expect("compile CSV v3 component");
+    let bytes = csv_ten_mib_fixture();
+    let descriptor = WasmV3FileDescriptor {
+        path: Some("/ten-mib.csv".to_owned()),
+        media_type: Some("text/csv".to_owned()),
+        plugin_key: "plugin_csv_v3".to_owned(),
+        generation: "csv-v3-generation".to_owned(),
+    };
+    let limits = WasmV3TransitionLimits {
+        max_page_bytes: 256 * 1024,
+        max_pages: 2_048,
+        max_total_bytes: 256 * 1024 * 1024,
+        deadline_nanoseconds: 120_000_000_000,
+    };
+    let creates = WasmV3CreateContext {
+        high: 0x1234_5678_9abc_def0,
+        low: 0x0fed_cba9_8765_4321,
+    };
+    let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+    let mut peak_owned_bytes = Vec::with_capacity(SAMPLES);
+    let mut retained_owned_bytes = Vec::with_capacity(SAMPLES);
+    let mut boundaries = Vec::with_capacity(SAMPLES);
+
+    for sample in 0..WARMUPS + SAMPLES {
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("instantiate fresh CSV v3 actor");
+        let store = V3Store::default();
+        let imported = V3Root::import(
+            store.clone(),
+            "csv-v3-generation",
+            &bytes,
+            std::iter::empty(),
+            std::iter::empty(),
+        );
+        let baseline_host_bytes = store.resident_page_bytes() as u64;
+        let allocation_scope = (sample >= WARMUPS).then(AllocationScope::start);
+        let started = Instant::now();
+        let opened = actor
+            .open_file(
+                limits,
+                WasmV3OpenFileInput {
+                    descriptor: descriptor.clone(),
+                    accepted: imported.clone(),
+                    successor: imported.transaction(),
+                    creates,
+                },
+            )
+            .await
+            .expect("cold import CSV v3");
+        let mut changes = 0usize;
+        while let Some(page) = actor
+            .next_change_page(opened.transition, opened.changes, 256 * 1024)
+            .await
+            .expect("drain cold CSV v3 changes")
+        {
+            changes += page.len();
+        }
+        assert_eq!(changes, ROWS + 1);
+        let (accepted, counters) = actor
+            .finish_transition(opened.transition)
+            .await
+            .expect("commit cold CSV v3 import");
+        let elapsed = started.elapsed();
+        if let Some(scope) = allocation_scope {
+            let allocations = scope.finish();
+            elapsed_ns.push(elapsed.as_nanos() as u64);
+            peak_owned_bytes.push(
+                baseline_host_bytes
+                    .saturating_add(counters.guest_linear_memory_high_water_bytes)
+                    .saturating_add(allocations.peak_live_bytes_delta),
+            );
+            store.retain_reachable(&accepted);
+            store.evict_resident_pages();
+            retained_owned_bytes.push(
+                store
+                    .resident_page_bytes()
+                    .saturating_add(counters.guest_linear_memory_high_water_bytes as usize)
+                    as u64,
+            );
+            boundaries.push(counters.component_boundary_bytes);
+        }
+    }
+
+    elapsed_ns.sort_unstable();
+    peak_owned_bytes.sort_unstable();
+    retained_owned_bytes.sort_unstable();
+    boundaries.sort_unstable();
+    let p95_index = (SAMPLES * 95).div_ceil(100) - 1;
+    let p50_ns = elapsed_ns[SAMPLES / 2];
+    let p95_ns = elapsed_ns[p95_index];
+    let p95_peak_owned = peak_owned_bytes[p95_index];
+    let p95_retained_owned = retained_owned_bytes[p95_index];
+    eprintln!(
+        "csv_v3_cold_allocator bytes={} rows={ROWS} warmups={WARMUPS} samples={SAMPLES} \
+         p50_ms={:.3} p95_ms={:.3} speedup_vs_v2={:.3} \
+         p95_peak_owned_bytes={} peak_reduction_vs_v2={:.3} \
+         p95_evicted_retained_owned_bytes={} p95_boundary_bytes={} \
+         latency_passes={} memory_passes={} boundary_passes={}",
+        bytes.len(),
+        p50_ns as f64 / 1_000_000.0,
+        p95_ns as f64 / 1_000_000.0,
+        V2_P95_NS as f64 / p95_ns as f64,
+        p95_peak_owned,
+        V2_TOTAL_OWNED_BYTES as f64 / p95_peak_owned as f64,
+        p95_retained_owned,
+        boundaries[p95_index],
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        p95_peak_owned.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+        boundaries[p95_index].saturating_mul(100)
+            <= V2_BOUNDARY_BYTES.saturating_mul(REQUIRED_BOUNDARY_PERCENT),
+    );
+    assert!(
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        "CSV v3 cold import must clear 2x latency"
+    );
+    assert!(
+        p95_peak_owned.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+        "CSV v3 cold import must clear 3x peak owned memory"
+    );
+    assert!(
+        boundaries[p95_index].saturating_mul(100)
+            <= V2_BOUNDARY_BYTES.saturating_mul(REQUIRED_BOUNDARY_PERCENT),
+        "CSV v3 cold import must reduce v2 boundary materialization by at least 10%"
+    );
+}
+
+#[tokio::test]
+#[ignore = "real VS Code API Markdown v3 allocator benchmark"]
+async fn v3_markdown_vscode_api_real_history_allocator_benchmark() {
+    const WARMUPS: usize = 20;
+    const SAMPLES: usize = 200;
+    const V2_P95_NS: u64 = 841_728_000;
+    const V2_TOTAL_OWNED_BYTES: u64 = 102_432_768 + 1_237_841;
+    const PATH: &str = "api/references/vscode-api.md";
+
+    let repository = std::env::var("LIX_MARKDOWN_BENCH_REPO")
+        .unwrap_or_else(|_| "/root/projects/vscode-api-repro".to_owned());
+    let git_show = |commit: &str| {
+        let output = std::process::Command::new("git")
+            .args(["-C", &repository, "show", &format!("{commit}:{PATH}")])
+            .output()
+            .expect("run git show for Markdown allocator benchmark");
+        assert!(output.status.success());
+        output.stdout
+    };
+    let before = git_show("b668f69");
+    let after = git_show("578def9");
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(left, right)| left == right)
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let delete_len = before.len() - prefix - suffix;
+    let insert = after[prefix..after.len() - suffix].to_vec();
+    let wasm_path =
+        env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V3_plugin_markdown_incremental_v3");
+    let wasm = std::fs::read(wasm_path).expect("read Markdown v3 component");
+    let runtime = lix_sdk::default_wasm_runtime().expect("initialize Wasmtime runtime");
+    let factory = runtime
+        .compile_component_v3(
+            wasm,
+            WasmLimits {
+                max_memory_bytes: 128 * 1024 * 1024,
+                max_fuel: None,
+                timeout_ms: Some(120_000),
+            },
+        )
+        .await
+        .expect("compile Markdown v3 component");
+    let store = V3Store::default();
+    let imported = V3Root::import(
+        store.clone(),
+        "markdown-v3-generation",
+        &before,
+        std::iter::empty(),
+        std::iter::empty(),
+    );
+    let descriptor = WasmV3FileDescriptor {
+        path: Some(format!("/{PATH}")),
+        media_type: Some("text/markdown".to_owned()),
+        plugin_key: "plugin_markdown_incremental_v3".to_owned(),
+        generation: "markdown-v3-generation".to_owned(),
+    };
+    let limits = WasmV3TransitionLimits {
+        max_page_bytes: 64 * 1024,
+        max_pages: 4_096,
+        max_total_bytes: 256 * 1024 * 1024,
+        deadline_nanoseconds: 120_000_000_000,
+    };
+    let creates = WasmV3CreateContext {
+        high: 0x1234_5678_9abc_def0,
+        low: 0x0fed_cba9_8765_4321,
+    };
+    let mut cold_actor = factory
+        .instantiate_actor()
+        .await
+        .expect("instantiate Markdown cold actor");
+    let opened = cold_actor
+        .open_file(
+            limits,
+            WasmV3OpenFileInput {
+                descriptor: descriptor.clone(),
+                accepted: imported.clone(),
+                successor: imported.transaction(),
+                creates,
+            },
+        )
+        .await
+        .expect("open Markdown allocator fixture");
+    while cold_actor
+        .next_change_page(opened.transition, opened.changes, 64 * 1024)
+        .await
+        .expect("drain Markdown cold changes")
+        .is_some()
+    {}
+    let (accepted, _) = cold_actor
+        .finish_transition(opened.transition)
+        .await
+        .expect("finish Markdown cold import");
+    drop(cold_actor);
+    store.retain_reachable(&accepted);
+    store.evict_resident_pages();
+    let baseline_host_bytes = store.resident_page_bytes() as u64;
+    let mut actor = factory
+        .instantiate_actor()
+        .await
+        .expect("instantiate Markdown cold-successor actor");
+    let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+    let mut peak_owned_bytes = Vec::with_capacity(SAMPLES);
+    let mut boundaries = Vec::with_capacity(SAMPLES);
+    for sample in 0..WARMUPS + SAMPLES {
+        let mut transaction = accepted.transaction();
+        transaction.edit_bytes(V3ByteEdit {
+            offset: prefix as u64,
+            delete_len: delete_len as u64,
+            insert: insert.clone(),
+        });
+        let allocation_scope = (sample >= WARMUPS).then(AllocationScope::start);
+        let started = Instant::now();
+        let updated = actor
+            .file_changed(
+                limits,
+                WasmV3FileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor.clone(),
+                    before: accepted.clone(),
+                    edits: vec![WasmV3InputSplice {
+                        offset: prefix as u64,
+                        delete_len: delete_len as u64,
+                        insert: WasmV3InputBytes::Inline(insert.clone()),
+                    }],
+                    successor: transaction,
+                    creates: WasmV3CreateContext {
+                        high: creates.high,
+                        low: creates.low + sample as u64 + 1,
+                    },
+                },
+            )
+            .await
+            .expect("run Markdown allocator transition");
+        let mut changes = 0usize;
+        while let Some(page) = actor
+            .next_change_page(updated.transition, updated.changes, 64 * 1024)
+            .await
+            .expect("drain Markdown allocator changes")
+        {
+            changes += page.len();
+        }
+        assert_eq!(changes, 1);
+        let (successor, counters) = actor
+            .finish_transition(updated.transition)
+            .await
+            .expect("finish Markdown allocator transition");
+        let elapsed = started.elapsed().as_nanos() as u64;
+        assert_eq!(successor.bytes.len(), after.len() as u64);
+        drop(successor);
+        if let Some(scope) = allocation_scope {
+            let allocations = scope.finish();
+            elapsed_ns.push(elapsed);
+            peak_owned_bytes.push(
+                baseline_host_bytes
+                    .saturating_add(counters.guest_linear_memory_high_water_bytes)
+                    .saturating_add(allocations.peak_live_bytes_delta),
+            );
+            boundaries.push(counters.component_boundary_bytes);
+        }
+        store.retain_reachable(&accepted);
+        store.evict_resident_pages();
+    }
+    elapsed_ns.sort_unstable();
+    peak_owned_bytes.sort_unstable();
+    boundaries.sort_unstable();
+    let p95_index = (SAMPLES * 95).div_ceil(100) - 1;
+    let p50_ns = elapsed_ns[SAMPLES / 2];
+    let p95_ns = elapsed_ns[p95_index];
+    let p95_peak = peak_owned_bytes[p95_index];
+    eprintln!(
+        "markdown_v3_vscode_api_allocator bytes_before={} bytes_after={} warmups={WARMUPS} \
+         samples={SAMPLES} p50_ms={:.3} p95_ms={:.3} speedup_vs_v2={:.3} \
+         baseline_host_bytes={} p95_peak_owned_bytes={} reduction_vs_v2={:.3} \
+         p95_boundary_bytes={} latency_passes={} memory_passes={}",
+        before.len(),
+        after.len(),
+        p50_ns as f64 / 1_000_000.0,
+        p95_ns as f64 / 1_000_000.0,
+        V2_P95_NS as f64 / p95_ns as f64,
+        baseline_host_bytes,
+        p95_peak,
+        V2_TOTAL_OWNED_BYTES as f64 / p95_peak as f64,
+        boundaries[p95_index],
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        p95_peak.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+    );
+    assert!(
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        "Markdown v3 must clear 2x latency"
+    );
+    assert!(
+        p95_peak.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+        "Markdown v3 must clear 3x peak owned memory"
+    );
+    assert!(
+        boundaries[p95_index] <= 4 * 1024,
+        "Markdown v3 hot boundary must remain below 4 KiB"
+    );
+}
+
+#[tokio::test]
+#[ignore = "production-shaped 12.5 MiB Excalidraw v3 allocator benchmark"]
+async fn v3_excalidraw_ten_mib_sparse_edit_allocator_benchmark() {
+    const WARMUPS: usize = 20;
+    const SAMPLES: usize = 200;
+    const V2_P95_NS: u64 = 955_150_000;
+    const V2_TOTAL_OWNED_BYTES: u64 = 225_877_856;
+
+    let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V3_plugin_excalidraw_v3");
+    let wasm = std::fs::read(wasm_path).expect("read Excalidraw v3 component");
+    let runtime = lix_sdk::default_wasm_runtime().expect("initialize default Wasmtime runtime");
+    let factory = runtime
+        .compile_component_v3(
+            wasm,
+            WasmLimits {
+                max_memory_bytes: 256 * 1024 * 1024,
+                max_fuel: None,
+                timeout_ms: Some(120_000),
+            },
+        )
+        .await
+        .expect("compile Excalidraw v3 component");
+    let bytes = excalidraw_ten_mib_fixture();
+    let needle = b"\"id\":\"shape-21000\",\"type\":\"rectangle\",\"x\":21000";
+    let object_offset = bytes
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .expect("large Excalidraw target element exists");
+    let edit_offset = object_offset + needle.len() - 5;
+    let store = V3Store::default();
+    let imported = V3Root::import(
+        store.clone(),
+        "excalidraw-v3-generation",
+        &bytes,
+        std::iter::empty(),
+        std::iter::empty(),
+    );
+    let descriptor = WasmV3FileDescriptor {
+        path: Some("/large.excalidraw".to_owned()),
+        media_type: Some("application/json".to_owned()),
+        plugin_key: "plugin_excalidraw_v3".to_owned(),
+        generation: "excalidraw-v3-generation".to_owned(),
+    };
+    let limits = WasmV3TransitionLimits {
+        max_page_bytes: 64 * 1024,
+        max_pages: 8_192,
+        max_total_bytes: 512 * 1024 * 1024,
+        deadline_nanoseconds: 120_000_000_000,
+    };
+    let creates = WasmV3CreateContext {
+        high: 0x1234_5678_9abc_def0,
+        low: 0x0fed_cba9_8765_4321,
+    };
+    let mut cold_actor = factory.instantiate_actor().await.unwrap();
+    let opened = cold_actor
+        .open_file(
+            limits,
+            WasmV3OpenFileInput {
+                descriptor: descriptor.clone(),
+                accepted: imported.clone(),
+                successor: imported.transaction(),
+                creates,
+            },
+        )
+        .await
+        .expect("cold import Excalidraw v3");
+    let mut cold_changes = 0usize;
+    while let Some(page) = cold_actor
+        .next_change_page(opened.transition, opened.changes, 64 * 1024)
+        .await
+        .unwrap()
+    {
+        cold_changes += page.len();
+    }
+    assert_eq!(cold_changes, 42_001);
+    let (accepted, _) = cold_actor
+        .finish_transition(opened.transition)
+        .await
+        .expect("commit cold Excalidraw v3 import");
+    drop(cold_actor);
+    store.retain_reachable(&accepted);
+    store.evict_resident_pages();
+    let baseline_host_bytes = store.resident_page_bytes() as u64;
+    let mut actor = factory.instantiate_actor().await.unwrap();
+    let mut elapsed_ns = Vec::with_capacity(SAMPLES);
+    let mut peak_owned_bytes = Vec::with_capacity(SAMPLES);
+    let mut boundaries = Vec::with_capacity(SAMPLES);
+    for sample in 0..WARMUPS + SAMPLES {
+        let mut transaction = accepted.transaction();
+        transaction.edit_bytes(V3ByteEdit {
+            offset: edit_offset as u64,
+            delete_len: 5,
+            insert: b"21001".to_vec(),
+        });
+        let allocation_scope = (sample >= WARMUPS).then(AllocationScope::start);
+        let started = Instant::now();
+        let updated = actor
+            .file_changed(
+                limits,
+                WasmV3FileUpdate {
+                    before_descriptor: descriptor.clone(),
+                    after_descriptor: descriptor.clone(),
+                    before: accepted.clone(),
+                    edits: vec![WasmV3InputSplice {
+                        offset: edit_offset as u64,
+                        delete_len: 5,
+                        insert: WasmV3InputBytes::Inline(b"21001".to_vec()),
+                    }],
+                    successor: transaction,
+                    creates: WasmV3CreateContext {
+                        high: creates.high,
+                        low: creates.low + sample as u64 + 1,
+                    },
+                },
+            )
+            .await
+            .expect("run Excalidraw v3 sparse edit");
+        let mut changes = Vec::new();
+        while let Some(page) = actor
+            .next_change_page(updated.transition, updated.changes, 64 * 1024)
+            .await
+            .unwrap()
+        {
+            changes.extend(page);
+        }
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].schema_key, "excalidraw_element");
+        assert_eq!(changes[0].entity_pk, ["shape-21000"]);
+        let (successor, counters) = actor
+            .finish_transition(updated.transition)
+            .await
+            .expect("commit Excalidraw v3 sparse successor");
+        assert_eq!(successor.bytes.len(), bytes.len() as u64);
+        if let Some(scope) = allocation_scope {
+            let allocations = scope.finish();
+            elapsed_ns.push(started.elapsed().as_nanos() as u64);
+            peak_owned_bytes.push(
+                baseline_host_bytes
+                    .saturating_add(counters.guest_linear_memory_high_water_bytes)
+                    .saturating_add(allocations.peak_live_bytes_delta),
+            );
+            boundaries.push(counters.component_boundary_bytes);
+        }
+        drop(successor);
+        store.retain_reachable(&accepted);
+        store.evict_resident_pages();
+    }
+    elapsed_ns.sort_unstable();
+    peak_owned_bytes.sort_unstable();
+    boundaries.sort_unstable();
+    let p95_index = (SAMPLES * 95).div_ceil(100) - 1;
+    let p50_ns = elapsed_ns[SAMPLES / 2];
+    let p95_ns = elapsed_ns[p95_index];
+    let p95_peak = peak_owned_bytes[p95_index];
+    eprintln!(
+        "excalidraw_v3_allocator bytes={} elements=42000 warmups={WARMUPS} \
+         samples={SAMPLES} p50_ms={:.3} p95_ms={:.3} speedup_vs_v2={:.3} \
+         baseline_host_bytes={} p95_peak_owned_bytes={} reduction_vs_v2={:.3} \
+         p95_boundary_bytes={} latency_passes={} memory_passes={}",
+        bytes.len(),
+        p50_ns as f64 / 1_000_000.0,
+        p95_ns as f64 / 1_000_000.0,
+        V2_P95_NS as f64 / p95_ns as f64,
+        baseline_host_bytes,
+        p95_peak,
+        V2_TOTAL_OWNED_BYTES as f64 / p95_peak as f64,
+        boundaries[p95_index],
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        p95_peak.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+    );
+    assert!(
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        "Excalidraw v3 must clear 2x latency"
+    );
+    assert!(
+        p95_peak.saturating_mul(3) <= V2_TOTAL_OWNED_BYTES,
+        "Excalidraw v3 must clear 3x peak owned memory"
+    );
+    assert!(
+        boundaries[p95_index] <= 4 * 1024,
+        "Excalidraw v3 hot boundary must remain below 4 KiB"
+    );
+}
+
+#[tokio::test]
+#[ignore = "10.68 MB v3 CSV allocator and resident-memory benchmark"]
 async fn v3_csv_ten_mib_affected_page_allocator_benchmark() {
     const WARMUPS: usize = 100;
     const SAMPLES: usize = 200;
+    const V2_P95_NS: u64 = 1_166_000;
     const V2_CONSERVATIVE_TOTAL_BYTES: u64 = 72_677_056;
     const V3_TARGET_BYTES: u64 = V2_CONSERVATIVE_TOTAL_BYTES / 3;
 
@@ -2345,10 +3116,17 @@ async fn v3_csv_ten_mib_affected_page_allocator_benchmark() {
         V2_CONSERVATIVE_TOTAL_BYTES as f64 / peak_owned as f64,
         last_counters.component_boundary_bytes,
     );
-    assert!(p95_ns <= 594_000, "CSV v3 must clear 2x latency");
+    assert!(
+        p95_ns.saturating_mul(2) <= V2_P95_NS,
+        "CSV v3 must clear 2x latency"
+    );
     assert!(
         peak_owned <= V3_TARGET_BYTES,
         "CSV v3 must clear 3x memory including transient allocations"
+    );
+    assert!(
+        last_counters.component_boundary_bytes <= 4 * 1024,
+        "CSV v3 hot boundary must remain below 4 KiB"
     );
 }
 
@@ -3018,7 +3796,7 @@ async fn v2_json_ten_mib_rocksdb_import_parity_benchmark() {
     );
 }
 
-/// Compares the 10.68 MiB / 220,000-row CSV v2 file import with the same
+/// Compares the 10.68 MB / 220,000-row CSV v2 file import with the same
 /// table and row entities written directly through typed SQL. Each pair
 /// alternates lane order so machine drift cannot systematically favor either
 /// path. Plugin installation, schema registration, fixture construction, and
@@ -4988,6 +5766,38 @@ fn build_csv_v2_plugin_archive() -> Vec<u8> {
     )
 }
 
+fn build_csv_v3_plugin_archive() -> Vec<u8> {
+    let wasm_path = Path::new(env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V3_plugin_csv_v3"));
+    let wasm = std::fs::read(wasm_path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read bindep-built CSV v3.2 plugin wasm at {}: {error}",
+            wasm_path.display()
+        )
+    });
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (path, bytes) in [
+        (
+            "manifest.json",
+            include_str!("../../../plugins/csv-v3/manifest.json").as_bytes(),
+        ),
+        (
+            "schema/csv_v2_row.json",
+            include_str!("../../../plugins/csv-v3/schema/csv_v2_row.json").as_bytes(),
+        ),
+        (
+            "schema/csv_v2_table.json",
+            include_str!("../../../plugins/csv-v3/schema/csv_v2_table.json").as_bytes(),
+        ),
+        ("plugin.wasm", wasm.as_slice()),
+    ] {
+        writer.start_file(path, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
 fn build_markdown_v2_plugin_archive() -> Vec<u8> {
     let wasm_path = Path::new(env!(
         "CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2"
@@ -5333,6 +6143,27 @@ fn csv_ten_mib_fixture() -> Vec<u8> {
         bytes.extend_from_slice(SHORT_ROW);
     }
     assert_eq!(bytes.len(), 10_680_000);
+    bytes
+}
+
+fn excalidraw_ten_mib_fixture() -> Vec<u8> {
+    const ELEMENTS: usize = 42_000;
+    let mut bytes =
+        br#"{"type":"excalidraw","version":2,"source":"https://excalidraw.com","elements":["#
+            .to_vec();
+    for index in 0..ELEMENTS {
+        if index != 0 {
+            bytes.push(b',');
+        }
+        bytes.extend_from_slice(
+            format!(
+                "{{\"id\":\"shape-{index:05}\",\"type\":\"rectangle\",\"x\":{index},\"y\":20,\"width\":100,\"height\":80,\"angle\":0,\"strokeColor\":\"#1b1b1f\",\"backgroundColor\":\"transparent\",\"fillStyle\":\"solid\",\"strokeWidth\":1,\"roughness\":1,\"opacity\":100,\"isDeleted\":false,\"customData\":{{\"benchmarkPadding\":\"0123456789abcdef0123456789abcdef\"}}}}"
+            )
+            .as_bytes(),
+        );
+    }
+    bytes.extend_from_slice(br#"],"appState":{"gridSize":20},"files":{}}"#);
+    assert!(bytes.len() >= 10 * 1024 * 1024);
     bytes
 }
 

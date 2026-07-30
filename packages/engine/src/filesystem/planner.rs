@@ -331,6 +331,14 @@ pub(crate) struct BlobRefRowInput {
 
 impl BlobRefRowInput {
     pub(crate) fn append_to(self, rows: &mut RawWriteBatch) -> Result<(), LixError> {
+        self.append_to_with_plugin_arena(rows, None)
+    }
+
+    pub(crate) fn append_to_with_plugin_arena(
+        self,
+        rows: &mut RawWriteBatch,
+        plugin_arena: Option<PluginArenaRefInput<'_>>,
+    ) -> Result<(), LixError> {
         let size_bytes = u64::try_from(self.size_bytes).map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -340,11 +348,28 @@ impl BlobRefRowInput {
                 ),
             )
         })?;
-        let snapshot = json!({
+        let mut snapshot = json!({
             "id": self.file_id,
             "blob_hash": self.blob_hash.to_hex(),
             "size_bytes": size_bytes,
         });
+        if let Some(plugin_arena) = plugin_arena {
+            let snapshot = snapshot
+                .as_object_mut()
+                .expect("binary blob reference snapshot is an object");
+            snapshot.insert(
+                "plugin_arena_hash".to_string(),
+                JsonValue::String(plugin_arena.hash.to_hex()),
+            );
+            snapshot.insert(
+                "plugin_arena_root".to_string(),
+                JsonValue::String(plugin_arena.root.to_string()),
+            );
+            snapshot.insert(
+                "plugin_generation".to_string(),
+                JsonValue::String(plugin_arena.generation.to_owned()),
+            );
+        }
         let file_id = self.file_id;
         append_state_row(
             rows,
@@ -358,6 +383,13 @@ impl BlobRefRowInput {
         );
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PluginArenaRefInput<'a> {
+    pub(crate) hash: BlobHash,
+    pub(crate) root: lix_plugin_arena::Digest,
+    pub(crate) generation: &'a str,
 }
 
 /// Durable proof for a plugin-owned file whose bytes are reconstructed from

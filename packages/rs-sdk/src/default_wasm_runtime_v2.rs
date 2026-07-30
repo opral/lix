@@ -2145,6 +2145,27 @@ mod tests {
         bytes
     }
 
+    fn large_excalidraw_bytes() -> Vec<u8> {
+        const ELEMENTS: usize = 42_000;
+        let mut bytes =
+            br#"{"type":"excalidraw","version":2,"source":"https://excalidraw.com","elements":["#
+                .to_vec();
+        for index in 0..ELEMENTS {
+            if index != 0 {
+                bytes.push(b',');
+            }
+            bytes.extend_from_slice(
+                format!(
+                    "{{\"id\":\"shape-{index:05}\",\"type\":\"rectangle\",\"x\":{index},\"y\":20,\"width\":100,\"height\":80,\"angle\":0,\"strokeColor\":\"#1b1b1f\",\"backgroundColor\":\"transparent\",\"fillStyle\":\"solid\",\"strokeWidth\":1,\"roughness\":1,\"opacity\":100,\"isDeleted\":false,\"customData\":{{\"benchmarkPadding\":\"0123456789abcdef0123456789abcdef\"}}}}"
+                )
+                .as_bytes(),
+            );
+        }
+        bytes.extend_from_slice(br#"],"appState":{"gridSize":20},"files":{}}"#);
+        assert!(bytes.len() >= 10 * 1024 * 1024);
+        bytes
+    }
+
     async fn csv_test_actor_with_limits(limits: WasmLimits) -> Box<dyn WasmComponentV2Actor> {
         let Some(wasm_path) = option_env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2") else {
             panic!("the CSV v2 artifact dependency must be available");
@@ -3170,6 +3191,105 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual release-mode 10 MiB CSV v2 cold-import scorecard"]
+    async fn csv_v2_ten_mib_cold_import_benchmark() {
+        const WARMUPS: usize = 2;
+        const SAMPLES: usize = 20;
+
+        let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_CSV_V2_plugin_csv_v2");
+        let wasm = std::fs::read(wasm_path).expect("CSV v2 component should be readable");
+        let runtime = WasmtimePluginRuntime::new().expect("test runtime should initialize");
+        let factory = runtime
+            .compile_component_v2(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 128 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(120_000),
+                },
+            )
+            .await
+            .expect("CSV v2 component should compile");
+        let bytes = Arc::new(large_csv_bytes());
+        let limits = WasmTransitionLimits {
+            total_deadline_nanoseconds: 120_000_000_000,
+            ..WasmTransitionLimits::default()
+        };
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut guest_high_waters = Vec::with_capacity(SAMPLES);
+        let mut boundaries = Vec::with_capacity(SAMPLES);
+
+        for sample in 0..WARMUPS + SAMPLES {
+            // A fresh actor makes this a cold import distribution rather than
+            // measuring reuse of a previously grown Wasm linear memory.
+            let mut actor = factory
+                .instantiate_actor()
+                .await
+                .expect("CSV v2 cold actor should instantiate");
+            let started = Instant::now();
+            let opened = actor
+                .open_file(
+                    limits,
+                    WasmOpenFileInput {
+                        descriptor: memory_probe_descriptor(),
+                        file: Arc::new(TestByteSource(bytes.clone())),
+                        creates: WasmCreateContext {
+                            high: 0x4c49_5832,
+                            low: sample as u32,
+                        },
+                    },
+                )
+                .await
+                .expect("CSV v2 cold import should open");
+            let mut changes = 0usize;
+            while let Some(page) = actor
+                .next_change_page(opened.transition, opened.changes, limits.max_page_bytes)
+                .await
+                .expect("CSV v2 cold import changes should drain")
+            {
+                changes += page.changes.entity_change_count();
+            }
+            assert_eq!(changes, LARGE_CSV_ROWS as usize + 1);
+            let counters = actor
+                .finish_transition(opened.transition)
+                .await
+                .expect("CSV v2 cold import should finish");
+            let elapsed = started.elapsed().as_nanos() as u64;
+            actor
+                .drop_document(opened.document)
+                .await
+                .expect("CSV v2 cold document should drop");
+            if sample >= WARMUPS {
+                samples.push(elapsed);
+                guest_high_waters.push(counters.guest_linear_memory_high_water_bytes);
+                boundaries.push(counters.component_boundary_bytes);
+            }
+        }
+
+        samples.sort_unstable();
+        guest_high_waters.sort_unstable();
+        boundaries.sort_unstable();
+        let percentile = |values: &[u64], value: usize| {
+            let rank = (values.len() * value).div_ceil(100);
+            values[rank.saturating_sub(1)]
+        };
+        let p95_guest = percentile(&guest_high_waters, 95);
+        let p95_total_owned = p95_guest.saturating_add(bytes.len() as u64);
+        eprintln!(
+            "csv_v2_cold_import bytes={} rows={LARGE_CSV_ROWS} warmups={WARMUPS} \
+             samples={SAMPLES} p50_ms={:.3} p95_ms={:.3} \
+             p95_guest_high_water_bytes={} p95_total_owned_bytes={} \
+             p95_boundary_bytes={}",
+            bytes.len(),
+            percentile(&samples, 50) as f64 / 1_000_000.0,
+            percentile(&samples, 95) as f64 / 1_000_000.0,
+            p95_guest,
+            p95_total_owned,
+            percentile(&boundaries, 95),
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "large-file CSV v2 warm-edit latency scorecard"]
     async fn csv_v2_ten_mib_warm_edit_benchmark() {
         const WARMUPS: usize = 100;
@@ -3307,6 +3427,341 @@ mod tests {
             .drop_document(base_document)
             .await
             .expect("drop CSV v2 benchmark base");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual real VS Code API Markdown v2 affected-range control"]
+    async fn markdown_v2_vscode_api_real_history_benchmark() {
+        const WARMUPS: usize = 20;
+        const SAMPLES: usize = 200;
+        const BEFORE_COMMIT: &str = "b668f69";
+        const AFTER_COMMIT: &str = "578def9";
+        const PATH: &str = "api/references/vscode-api.md";
+
+        let repository = env::var("LIX_MARKDOWN_BENCH_REPO")
+            .unwrap_or_else(|_| "/root/projects/vscode-api-repro".to_owned());
+        let git_show = |commit: &str| {
+            let output = std::process::Command::new("git")
+                .args(["-C", &repository, "show", &format!("{commit}:{PATH}")])
+                .output()
+                .expect("run git show for Markdown v2 benchmark");
+            assert!(
+                output.status.success(),
+                "git show failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            output.stdout
+        };
+        let before = Arc::new(git_show(BEFORE_COMMIT));
+        let after = Arc::new(git_show(AFTER_COMMIT));
+        let prefix = before
+            .iter()
+            .zip(after.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let suffix = before[prefix..]
+            .iter()
+            .rev()
+            .zip(after[prefix..].iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let delete_len = before.len() - prefix - suffix;
+        let insert = after[prefix..after.len() - suffix].to_vec();
+        let descriptor = || WasmFileDescriptor {
+            path: Some(format!("/{PATH}")),
+            media_type: Some("text/markdown".to_owned()),
+            plugin: lix_engine::wasm::v2::WasmPluginSelection {
+                plugin_key: "plugin_markdown_incremental_v2".to_owned(),
+                generation: "markdown-v2-generation".to_owned(),
+            },
+        };
+        let wasm_path =
+            env!("CARGO_CDYLIB_FILE_PLUGIN_MARKDOWN_INCREMENTAL_V2_plugin_markdown_incremental_v2");
+        let wasm = std::fs::read(wasm_path).expect("read Markdown v2 component");
+        let runtime = WasmtimePluginRuntime::new().expect("initialize Wasmtime runtime");
+        let factory = runtime
+            .compile_component_v2(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 128 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(120_000),
+                },
+            )
+            .await
+            .expect("compile Markdown v2 component");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("instantiate Markdown v2 actor");
+        let limits = WasmTransitionLimits {
+            total_deadline_nanoseconds: 120_000_000_000,
+            ..WasmTransitionLimits::default()
+        };
+        let opened = actor
+            .open_file(
+                limits,
+                WasmOpenFileInput {
+                    descriptor: descriptor(),
+                    file: Arc::new(TestByteSource(before.clone())),
+                    creates: WasmCreateContext {
+                        high: 0x4d44_5632,
+                        low: 0,
+                    },
+                },
+            )
+            .await
+            .expect("open real Markdown v2 fixture");
+        while actor
+            .next_change_page(opened.transition, opened.changes, limits.max_page_bytes)
+            .await
+            .expect("drain Markdown v2 cold changes")
+            .is_some()
+        {}
+        let cold_counters = actor
+            .finish_transition(opened.transition)
+            .await
+            .expect("finish Markdown v2 cold import");
+        let base_document = opened.document;
+
+        let mut elapsed = Vec::with_capacity(SAMPLES);
+        let mut boundaries = Vec::with_capacity(SAMPLES);
+        let mut guest_high_waters = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUPS + SAMPLES {
+            let detection_base = actor
+                .fork_document(base_document)
+                .await
+                .expect("fork Markdown v2 base");
+            let started = Instant::now();
+            let transition = actor
+                .file_changed(
+                    detection_base,
+                    limits,
+                    WasmFileUpdate {
+                        before_descriptor: descriptor(),
+                        after_descriptor: descriptor(),
+                        before: Arc::new(TestByteSource(before.clone())),
+                        edits: vec![lix_engine::wasm::v2::WasmInputSplice {
+                            offset: prefix as u64,
+                            delete_len: delete_len as u64,
+                            insert: WasmInputBytes::Inline(insert.clone()),
+                        }],
+                        after: Arc::new(TestByteSource(after.clone())),
+                        creates: WasmCreateContext {
+                            high: 0x4d44_5632,
+                            low: sample as u32 + 1,
+                        },
+                    },
+                )
+                .await
+                .expect("run Markdown v2 affected-range transition");
+            let mut changes = 0usize;
+            while let Some(page) = actor
+                .next_change_page(
+                    transition.transition,
+                    transition.changes,
+                    limits.max_page_bytes,
+                )
+                .await
+                .expect("drain Markdown v2 changes")
+            {
+                changes += page.changes.entity_change_count();
+            }
+            assert_eq!(
+                changes, 2,
+                "v2 changes the affected node and its source-copy root"
+            );
+            let counters = actor
+                .finish_transition(transition.transition)
+                .await
+                .expect("finish Markdown v2 transition");
+            if sample >= WARMUPS {
+                elapsed.push(started.elapsed().as_nanos() as u64);
+                boundaries.push(counters.component_boundary_bytes);
+                guest_high_waters.push(counters.guest_linear_memory_high_water_bytes);
+            }
+            actor
+                .drop_document(transition.document)
+                .await
+                .expect("drop Markdown v2 successor");
+            actor
+                .drop_document(detection_base)
+                .await
+                .expect("drop Markdown v2 fork");
+        }
+        elapsed.sort_unstable();
+        boundaries.sort_unstable();
+        guest_high_waters.sort_unstable();
+        let percentile = |values: &[u64], value: usize| {
+            let rank = (values.len() * value).div_ceil(100);
+            values[rank.saturating_sub(1)]
+        };
+        eprintln!(
+            "markdown_v2_vscode_api bytes_before={} bytes_after={} edit_offset={} \
+             delete_bytes={} insert_bytes={} warmups={WARMUPS} samples={SAMPLES} \
+             p50_ms={:.3} p95_ms={:.3} p95_guest_high_water_bytes={} \
+             p95_boundary_bytes={} cold_guest_high_water_bytes={}",
+            before.len(),
+            after.len(),
+            prefix,
+            delete_len,
+            insert.len(),
+            percentile(&elapsed, 50) as f64 / 1_000_000.0,
+            percentile(&elapsed, 95) as f64 / 1_000_000.0,
+            percentile(&guest_high_waters, 95),
+            percentile(&boundaries, 95),
+            cold_counters.guest_linear_memory_high_water_bytes,
+        );
+        actor
+            .drop_document(base_document)
+            .await
+            .expect("drop Markdown v2 base");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual production-shaped 10 MiB Excalidraw v2 sparse-edit control"]
+    async fn excalidraw_v2_ten_mib_sparse_edit_benchmark() {
+        const WARMUPS: usize = 3;
+        const SAMPLES: usize = 20;
+        let wasm_path = env!("CARGO_CDYLIB_FILE_PLUGIN_EXCALIDRAW_V2_plugin_excalidraw_v2");
+        let wasm = std::fs::read(wasm_path).expect("read Excalidraw v2 component");
+        let runtime = WasmtimePluginRuntime::new().expect("initialize Wasmtime runtime");
+        let factory = runtime
+            .compile_component_v2(
+                wasm,
+                WasmLimits {
+                    max_memory_bytes: 256 * 1024 * 1024,
+                    max_fuel: None,
+                    timeout_ms: Some(120_000),
+                },
+            )
+            .await
+            .expect("compile Excalidraw v2 component");
+        let mut actor = factory
+            .instantiate_actor()
+            .await
+            .expect("instantiate Excalidraw v2 actor");
+        let before = Arc::new(large_excalidraw_bytes());
+        let needle = b"\"id\":\"shape-21000\",\"type\":\"rectangle\",\"x\":21000";
+        let object_offset = before
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("large Excalidraw target element exists");
+        let edit_offset = object_offset + needle.len() - 5;
+        let mut after = before.as_ref().clone();
+        after[edit_offset..edit_offset + 5].copy_from_slice(b"21001");
+        let after = Arc::new(after);
+        let descriptor = || WasmFileDescriptor {
+            path: Some("/large.excalidraw".to_owned()),
+            media_type: Some("application/json".to_owned()),
+            plugin: lix_engine::wasm::v2::WasmPluginSelection {
+                plugin_key: "plugin_excalidraw_v2".to_owned(),
+                generation: "excalidraw-v2-benchmark".to_owned(),
+            },
+        };
+        let limits = WasmTransitionLimits {
+            total_deadline_nanoseconds: 120_000_000_000,
+            ..WasmTransitionLimits::default()
+        };
+        let opened = actor
+            .open_file(
+                limits,
+                WasmOpenFileInput {
+                    descriptor: descriptor(),
+                    file: Arc::new(TestByteSource(before.clone())),
+                    creates: WasmCreateContext {
+                        high: 0x4558_5632,
+                        low: 0,
+                    },
+                },
+            )
+            .await
+            .expect("open large Excalidraw v2 base");
+        let mut cold_changes = 0usize;
+        while let Some(page) = actor
+            .next_change_page(opened.transition, opened.changes, limits.max_page_bytes)
+            .await
+            .expect("drain Excalidraw v2 cold changes")
+        {
+            cold_changes += page.changes.entity_change_count();
+        }
+        assert_eq!(cold_changes, 42_001);
+        let cold_counters = actor.finish_transition(opened.transition).await.unwrap();
+        let base_document = opened.document;
+        let mut elapsed = Vec::with_capacity(SAMPLES);
+        let mut boundaries = Vec::with_capacity(SAMPLES);
+        let mut guest_high_waters = Vec::with_capacity(SAMPLES);
+        for sample in 0..WARMUPS + SAMPLES {
+            let detection_base = actor.fork_document(base_document).await.unwrap();
+            let started = Instant::now();
+            let transition = actor
+                .file_changed(
+                    detection_base,
+                    limits,
+                    WasmFileUpdate {
+                        before_descriptor: descriptor(),
+                        after_descriptor: descriptor(),
+                        before: Arc::new(TestByteSource(before.clone())),
+                        edits: vec![lix_engine::wasm::v2::WasmInputSplice {
+                            offset: edit_offset as u64,
+                            delete_len: 5,
+                            insert: WasmInputBytes::Inline(b"21001".to_vec()),
+                        }],
+                        after: Arc::new(TestByteSource(after.clone())),
+                        creates: WasmCreateContext {
+                            high: 0x4558_5632,
+                            low: sample as u32 + 1,
+                        },
+                    },
+                )
+                .await
+                .expect("run Excalidraw v2 sparse edit");
+            let mut changes = 0usize;
+            while let Some(page) = actor
+                .next_change_page(
+                    transition.transition,
+                    transition.changes,
+                    limits.max_page_bytes,
+                )
+                .await
+                .unwrap()
+            {
+                changes += page.changes.entity_change_count();
+            }
+            assert_eq!(changes, 1);
+            let counters = actor
+                .finish_transition(transition.transition)
+                .await
+                .unwrap();
+            if sample >= WARMUPS {
+                elapsed.push(started.elapsed().as_nanos() as u64);
+                boundaries.push(counters.component_boundary_bytes);
+                guest_high_waters.push(counters.guest_linear_memory_high_water_bytes);
+            }
+            actor.drop_document(transition.document).await.unwrap();
+            actor.drop_document(detection_base).await.unwrap();
+        }
+        elapsed.sort_unstable();
+        boundaries.sort_unstable();
+        guest_high_waters.sort_unstable();
+        let percentile = |values: &[u64], value: usize| {
+            values[(values.len() * value).div_ceil(100).saturating_sub(1)]
+        };
+        eprintln!(
+            "excalidraw_v2_sparse_edit bytes={} elements=42000 warmups={WARMUPS} \
+             samples={SAMPLES} p50_ms={:.3} p95_ms={:.3} \
+             p95_guest_high_water_bytes={} conservative_total_owned_bytes={} \
+             p95_boundary_bytes={} cold_guest_high_water_bytes={} cold_boundary_bytes={}",
+            before.len(),
+            percentile(&elapsed, 50) as f64 / 1_000_000.0,
+            percentile(&elapsed, 95) as f64 / 1_000_000.0,
+            percentile(&guest_high_waters, 95),
+            percentile(&guest_high_waters, 95).saturating_add((before.len() * 2) as u64),
+            percentile(&boundaries, 95),
+            cold_counters.guest_linear_memory_high_water_bytes,
+            cold_counters.component_boundary_bytes,
+        );
+        actor.drop_document(base_document).await.unwrap();
     }
 
     #[tokio::test]

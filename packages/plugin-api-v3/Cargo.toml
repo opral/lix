@@ -16,4 +16,5 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+lz4_flex = "0.13"
 wit-bindgen = "0.57"

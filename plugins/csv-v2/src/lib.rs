@@ -7,8 +7,10 @@ mod core;
 pub use core::{
     ByteEdit, ChangeEffect, Dialect, Document, EntityChange, EntityRecord, IdNamespace,
     InitialChanges, InputSplice, ROOT_ENTITY_PK, ROW_SCHEMA_KEY, RowSnapshot, TABLE_SCHEMA_KEY,
-    Terminator, V3RowIndexRecord, describe_memory, encode_row_snapshot, parse_row_snapshot,
-    render_row,
+    Terminator, V3ColdIndex, V3ColdMetadata, V3InitialChanges, V3RowFramer, V3RowIndexRecord,
+    V3RowWindowCheckpoint, V3StreamAnalyzer, describe_memory, encode_row_snapshot,
+    parse_row_snapshot, render_row, v3_open_file_stream, v3_stream_row_change,
+    v3_stream_table_change,
 };
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");

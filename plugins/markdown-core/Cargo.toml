@@ -1,0 +1,26 @@
+[package]
+name = "plugin_markdown_core"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "ABI-neutral incremental Markdown semantic core"
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.22"
+chardetng = "1"
+encoding_rs = "0.8"
+lix_order_key.workspace = true
+markdown-syntax = "=0.2.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "std", "js", "fast-rng"] }

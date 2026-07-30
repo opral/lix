@@ -1122,3 +1122,51 @@ fn rank_allocation_skips_reserved_suffix_without_false_exhaustion() {
         [0x101, 0x102]
     );
 }
+#[test]
+fn v3_page_framed_cold_import_is_snapshot_exact_across_split_boundaries() {
+    let bytes =
+        b"plain,\"quoted,cell\"\r\n\"line\nbreak\",\"escaped \"\"quote\"\"\"\nlast,unterminated"
+            .to_vec();
+    let namespace = IdNamespace::from_halves(0x1122_3344_5566_7788, 0x99aa_bbcc);
+    let (_, expected) = Document::open_file(bytes.clone(), Some("fixture.csv"), namespace).unwrap();
+    let mut expected = expected.collect::<Result<Vec<_>, _>>().unwrap();
+
+    let mut analyzer =
+        V3StreamAnalyzer::new(Some("fixture.csv"), namespace, 7).expect("create analyzer");
+    for chunk in bytes.chunks(3) {
+        analyzer.push(chunk).expect("analyze split CSV page");
+    }
+    let (_index, metadata) = analyzer.finish().expect("finish split analysis");
+    let mut framer = V3RowFramer::new(Some("fixture.csv"));
+    let mut actual = Vec::new();
+    let mut ordinal = 0usize;
+    for chunk in bytes.chunks(5) {
+        framer.push(chunk).expect("feed split CSV source");
+        while let Some(change) = framer
+            .next_change(false, ordinal, metadata)
+            .expect("frame split CSV row")
+        {
+            actual.push(change);
+            ordinal += 1;
+        }
+    }
+    while let Some(change) = framer
+        .next_change(true, ordinal, metadata)
+        .expect("frame final CSV row")
+    {
+        actual.push(change);
+        ordinal += 1;
+    }
+    actual.push(v3_stream_table_change(metadata));
+
+    let sort_changes = |changes: &mut Vec<EntityChange>| {
+        changes.sort_by(|left, right| {
+            left.schema_key
+                .cmp(&right.schema_key)
+                .then_with(|| left.entity_pk.cmp(&right.entity_pk))
+        });
+    };
+    sort_changes(&mut expected);
+    sort_changes(&mut actual);
+    assert_eq!(actual, expected);
+}

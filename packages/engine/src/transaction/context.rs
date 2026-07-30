@@ -43,7 +43,7 @@ use crate::entity_pk::EntityPk;
 use crate::filesystem::{
     BlobRefRowInput, DERIVED_FILE_REF_SCHEMA_KEY, DerivedFileRefRowInput, FilesystemPathIndex,
     FilesystemPathIndexCache, FilesystemPathIndexReader, FilesystemPathIndexRequest,
-    FilesystemPathKind, FilesystemRowContext, append_blob_ref_tombstone_row,
+    FilesystemPathKind, FilesystemRowContext, PluginArenaRefInput, append_blob_ref_tombstone_row,
     append_derived_file_ref_tombstone_row, load_path_index_revision,
 };
 use crate::functions::{FunctionContext, FunctionProviderHandle};
@@ -66,11 +66,12 @@ use crate::plugin::{
     PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit,
     PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
     PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
-    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
-    VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
-    drain_conflict_transition_resolutions, drain_entity_transition_edits,
-    drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
+    PluginRuntime, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
+    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    canonicalize_v3_plugin_snapshot, drain_conflict_transition_resolutions,
+    drain_entity_transition_edits, drain_file_transition_changes, drain_v3_entity_transition_edits,
+    drain_v3_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
     is_reservation_key, local_mutation_identity, materialize_keyless_creates,
     plugin_archive_file_id_matches, plugin_install_plan_from_archive_path,
@@ -120,11 +121,18 @@ use crate::transaction::validation::{
     prepared_tracked_rows_have_row_local_certificates, validate_certified_fresh_plugin_file_import,
     validate_certified_tracked_insert_identities, validate_prepared_writes,
 };
+use crate::wasm::v3::{
+    ByteEdit as WasmV3ArenaByteEdit, WasmComponentV3Factory, WasmV3ChangedEntity,
+    WasmV3ConflictChoice, WasmV3ConflictUpdate, WasmV3EntityConflict, WasmV3EntityUpdate,
+    WasmV3FileDescriptor, WasmV3FileUpdate, WasmV3InputBytes, WasmV3InputSplice,
+    WasmV3OpenFileInput, WasmV3TransitionLimits, entity_arena_key,
+};
 use crate::wasm::{
-    WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictUpdate,
-    WasmDocumentHandle, WasmEntityChange, WasmEntityConflict, WasmEntityKey, WasmEntityUpdate,
-    WasmFileDescriptor, WasmFileUpdate, WasmHostBytes, WasmHostEntity, WasmHostEntityChanges,
-    WasmOpenEntitiesInput, WasmOpenFileInput, WasmPluginSelection, WasmTransitionLimits,
+    WasmChangeEffect, WasmComponentV2Actor, WasmComponentV2Factory, WasmConflictResolution,
+    WasmConflictTake, WasmConflictUpdate, WasmDocumentHandle, WasmEntityChange, WasmEntityConflict,
+    WasmEntityKey, WasmEntityUpdate, WasmFileDescriptor, WasmFileUpdate, WasmHostBytes,
+    WasmHostEntity, WasmHostEntityChanges, WasmOpenEntitiesInput, WasmOpenFileInput,
+    WasmPluginSelection, WasmTransitionLimits,
 };
 use crate::{LixError, NullableKeyFilter, SqlQueryResult, Value};
 
@@ -141,6 +149,14 @@ pub(crate) struct TransactionCommitOutcome {
 struct VisibleV2Materialization {
     semantic_root: String,
     bytes: VisibleV2MaterializationBytes,
+    arena: Option<VisibleArenaMaterialization>,
+}
+
+#[derive(Debug, Clone)]
+struct VisibleArenaMaterialization {
+    hash: BlobHash,
+    root: String,
+    generation: String,
 }
 
 #[derive(Debug, Clone)]
@@ -200,6 +216,7 @@ fn decode_visible_v2_materialization_parts(
             ),
         )
     })?;
+    let mut arena = None;
     let bytes = match schema_key {
         BLOB_REF_SCHEMA_KEY => {
             let snapshot: PluginUpgradeBlobRefSnapshot =
@@ -219,6 +236,41 @@ fn decode_visible_v2_materialization_parts(
                     ),
                 ));
             }
+            arena = match (
+                snapshot.plugin_arena_hash,
+                snapshot.plugin_arena_root,
+                snapshot.plugin_generation,
+            ) {
+                (None, None, None) => None,
+                (Some(hash), Some(root), Some(generation)) => {
+                    if root.len() != 64
+                        || !root
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                        || generation.is_empty()
+                    {
+                        return Err(LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!(
+                                "owned v3.2 plugin file '{file_id}' has an invalid arena reference"
+                            ),
+                        ));
+                    }
+                    Some(VisibleArenaMaterialization {
+                        hash: BlobHash::from_hex(&hash)?,
+                        root,
+                        generation,
+                    })
+                }
+                _ => {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        format!(
+                            "owned v3.2 plugin file '{file_id}' has an incomplete arena reference"
+                        ),
+                    ));
+                }
+            };
             VisibleV2MaterializationBytes::Blob {
                 hash: BlobHash::from_hex(&snapshot.blob_hash)?,
             }
@@ -266,6 +318,7 @@ fn decode_visible_v2_materialization_parts(
     Ok(VisibleV2Materialization {
         semantic_root,
         bytes,
+        arena,
     })
 }
 
@@ -1016,6 +1069,139 @@ where
         conflicts: Vec<WasmEntityConflict<WasmHostBytes>>,
     ) -> Result<ValidatedConflictTransition, LixError> {
         self.ensure_plugin_generation_read_guard().await;
+        if plugin.runtime() == PluginRuntime::WasmComponentV3 {
+            let limits = WasmV3TransitionLimits::default();
+            let expected_count = conflicts.len();
+            let schemas = V2SchemaAllowlist::from_catalog(
+                plugin.schema_keys(),
+                Arc::clone(&self.sql_schema_snapshot),
+            )?;
+            let mut keys = Vec::with_capacity(expected_count);
+            let mut v3_conflicts = Vec::with_capacity(expected_count);
+            for conflict in conflicts {
+                let key = conflict.key;
+                let arena_key = entity_arena_key(
+                    &key.schema_key,
+                    &key.entity_pk
+                        .iter()
+                        .map(|part| part.to_string())
+                        .collect::<Vec<_>>(),
+                )?;
+                let materialize = |value: Option<WasmHostBytes>| {
+                    value.map(materialize_v3_conflict_snapshot).transpose()
+                };
+                v3_conflicts.push(WasmV3EntityConflict {
+                    key: arena_key,
+                    base: materialize(conflict.base)?,
+                    a: materialize(conflict.a)?,
+                    b: materialize(conflict.b)?,
+                });
+                keys.push(key);
+            }
+            let wasm_hash = BlobHash::from_hex(plugin.wasm_blob_hash())?;
+            let factory = match self
+                .plugin_host
+                .cached_plugin_v3_factory(plugin.key(), wasm_hash)?
+            {
+                Some(factory) => factory,
+                None => {
+                    let read = SharedStorageAdapterRead::new(
+                        self.storage
+                            .begin_read(StorageReadOptions::default())
+                            .await?,
+                    );
+                    let reader = self.binary_cas.reader(read);
+                    let wasm =
+                        load_transaction_blob_bytes(&reader, &self.staged_writes, &[wasm_hash])
+                            .await?
+                            .into_vec()
+                            .into_iter()
+                            .next()
+                            .flatten()
+                            .ok_or_else(|| {
+                                LixError::new(
+                                    LixError::CODE_INVALID_PLUGIN,
+                                    format!(
+                                        "plugin registry references missing WASM blob '{}'",
+                                        wasm_hash.to_hex()
+                                    ),
+                                )
+                            })?;
+                    let installed = plugin.to_installed_plugin(wasm)?;
+                    self.plugin_host
+                        .load_or_compile_v3_factory(&installed)
+                        .await?
+                }
+            };
+            let _permit = self.plugin_host.actor_cache().admit_store()?;
+            let mut actor = factory.instantiate_actor().await?;
+            let transition = actor
+                .resolve_conflicts(
+                    limits,
+                    WasmV3ConflictUpdate {
+                        descriptor: WasmV3FileDescriptor {
+                            path: descriptor.path,
+                            media_type: descriptor.media_type,
+                            plugin_key: descriptor.plugin.plugin_key,
+                            generation: descriptor.plugin.generation,
+                        },
+                        conflicts: v3_conflicts,
+                    },
+                )
+                .await?;
+            let mut resolutions = Vec::with_capacity(expected_count);
+            while let Some(page) = actor
+                .next_resolution_page(
+                    transition.transition,
+                    transition.resolutions,
+                    limits.max_page_bytes,
+                )
+                .await?
+            {
+                resolutions.extend(page);
+            }
+            if resolutions.len() != expected_count {
+                let _ = actor.abort_transition(transition.transition).await;
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "v3.2 conflict resolver did not return one resolution per conflict",
+                ));
+            }
+            let counters = actor
+                .finish_conflict_transition(transition.transition)
+                .await?;
+            self.plugin_host.record_v3_transition_counters(counters);
+            let resolutions = resolutions
+                .into_iter()
+                .zip(keys)
+                .map(|(resolution, key)| {
+                    Ok(match resolution.choice {
+                        WasmV3ConflictChoice::TakeBase => {
+                            WasmConflictResolution::Take(WasmConflictTake::Base)
+                        }
+                        WasmV3ConflictChoice::TakeA => {
+                            WasmConflictResolution::Take(WasmConflictTake::A)
+                        }
+                        WasmV3ConflictChoice::TakeB => {
+                            WasmConflictResolution::Take(WasmConflictTake::B)
+                        }
+                        WasmV3ConflictChoice::Replace { snapshot, effect } => {
+                            WasmConflictResolution::Replace {
+                                snapshot_content: WasmHostBytes::CanonicalJson(
+                                    canonicalize_v3_plugin_snapshot(snapshot, &key, &schemas)?,
+                                ),
+                                effect,
+                            }
+                        }
+                        WasmV3ConflictChoice::Delete => WasmConflictResolution::Delete,
+                    })
+                })
+                .collect::<Result<Vec<_>, LixError>>()?;
+            return Ok(ValidatedConflictTransition {
+                resolutions,
+                counters: Default::default(),
+            });
+        }
         let limits = WasmTransitionLimits::default();
         let expected_count = conflicts.len();
         let source = VecEntityConflictSource::new(conflicts, limits)?;
@@ -1158,6 +1344,101 @@ where
         rows.get(0)
             .map(|row| decode_visible_v2_materialization_ref(row, &key.file_id))
             .transpose()
+    }
+
+    async fn visible_v3_arena_root(
+        &mut self,
+        key: &PluginFileWriteKey,
+        plugin: &PluginRegistryEntry,
+    ) -> Result<(lix_plugin_arena::Root, BlobHash), LixError> {
+        let visible = self.visible_v2_materialization(key).await?.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                format!(
+                    "owned v3.2 plugin file '{}' has no visible materialization root",
+                    key.file_id
+                ),
+            )
+        })?;
+        let accepted_hash = match visible.bytes {
+            VisibleV2MaterializationBytes::Blob { hash } => hash,
+            VisibleV2MaterializationBytes::Derived { .. } => {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v3.2 plugin file '{}' must retain exact accepted bytes",
+                        key.file_id
+                    ),
+                ));
+            }
+        };
+        let arena = visible.arena.ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v3.2 plugin file '{}' is missing its durable arena reference",
+                    key.file_id
+                ),
+            )
+        })?;
+        if arena.generation != plugin.archive_blob_hash() {
+            return Err(LixError::new(
+                LixError::CODE_PLUGIN_OBSERVATION_STALE,
+                format!(
+                    "owned v3.2 plugin file '{}' arena generation is stale",
+                    key.file_id
+                ),
+            ));
+        }
+        let read = SharedStorageAdapterRead::new(
+            self.storage
+                .begin_read(StorageReadOptions::default())
+                .await?,
+        );
+        let reader = self.binary_cas.reader(read);
+        let encoded = load_transaction_blob_bytes(&reader, &self.staged_writes, &[arena.hash])
+            .await?
+            .into_vec()
+            .into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "owned v3.2 plugin file '{}' references a missing arena blob",
+                        key.file_id
+                    ),
+                )
+            })?;
+        let archive = lix_plugin_arena::Archive::decode(&encoded).map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v3.2 plugin file '{}' arena archive is corrupt: {error}",
+                    key.file_id
+                ),
+            )
+        })?;
+        let (_, root) = archive.reopen().map_err(|error| {
+            LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v3.2 plugin file '{}' arena root cannot reopen: {error}",
+                    key.file_id
+                ),
+            )
+        })?;
+        if root.id().to_string() != arena.root || root.generation.as_ref() != arena.generation {
+            return Err(LixError::new(
+                LixError::CODE_INVALID_PLUGIN,
+                format!(
+                    "owned v3.2 plugin file '{}' arena identity does not match its durable reference",
+                    key.file_id
+                ),
+            ));
+        }
+        Ok((root, accepted_hash))
     }
 
     async fn cold_open_v2_semantic_actor(
@@ -1621,6 +1902,108 @@ where
         Ok(rows)
     }
 
+    /// Validates v3.2's already-materialized UUID creates. IDs in the current
+    /// bound namespace are new creates and share one durable reservation;
+    /// other IDs on creatable schemas must already exist in this file.
+    async fn v3_create_rows(
+        &mut self,
+        plugin: &PluginRegistryEntry,
+        changes: &WasmHostEntityChanges,
+        bound: BoundCreateContext,
+        file_key: &PluginFileWriteKey,
+        existing_reservation: Option<&MaterializedLiveStateRow>,
+    ) -> Result<RawWriteBatch, LixError> {
+        let mut requires_reservation = false;
+        let mut existing_authorities = Vec::new();
+        for change in &changes.changes {
+            let WasmEntityChange::Upsert { entity, .. } = change else {
+                continue;
+            };
+            if plugin
+                .create_schema_keys()
+                .binary_search_by(|candidate| {
+                    candidate.as_str().cmp(entity.key.schema_key.as_str())
+                })
+                .is_err()
+            {
+                continue;
+            }
+            let [id] = entity.key.entity_pk.as_slice() else {
+                return Err(LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "creatable schema '{}' requires one UUID primary-key component",
+                        entity.key.schema_key
+                    ),
+                ));
+            };
+            EntityPk::uuid_from_canonical(id).map_err(|error| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!("v3.2 plugin emitted invalid entity_pk: {error}"),
+                )
+            })?;
+            if bound.owns_v3_id(id) {
+                requires_reservation = true;
+            } else {
+                existing_authorities.push(entity.key.clone());
+            }
+        }
+        existing_authorities.sort();
+        existing_authorities.dedup();
+
+        let exact_rows = existing_authorities
+            .iter()
+            .map(|key| {
+                let [id] = key.entity_pk.as_slice() else {
+                    unreachable!("creatable v3.2 identity shape was validated");
+                };
+                Ok(LiveStateExactRowRequest {
+                    schema_key: key.schema_key.to_string(),
+                    branch_id: file_key.branch_id.clone(),
+                    entity_pk: EntityPk::uuid_from_canonical(id).map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("v3.2 plugin emitted invalid entity_pk: {error}"),
+                        )
+                    })?,
+                    file_id: Some(file_key.file_id.clone()),
+                })
+            })
+            .collect::<Result<Vec<_>, LixError>>()?;
+        let loaded = if exact_rows.is_empty() {
+            MaterializedLiveStateExactBatch::default()
+        } else {
+            self.load_visible_exact_live_state_batch(&LiveStateExactBatchRequest {
+                rows: exact_rows,
+                projection: plugin_state_live_state_projection(),
+                untracked: Some(false),
+                include_tombstones: false,
+            })
+            .await?
+        };
+        require_existing_id_authorities(
+            plugin,
+            &existing_authorities,
+            &loaded,
+            &file_key.file_id,
+            &file_key.branch_id,
+        )?;
+
+        let mut rows = RawWriteBatch::with_capacity(usize::from(requires_reservation));
+        if requires_reservation
+            && let Some(row) = reserve_create_row(
+                existing_reservation,
+                bound,
+                &file_key.file_id,
+                &file_key.branch_id,
+            )?
+        {
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
     async fn preflight_v2_create(
         &mut self,
         bound: BoundCreateContext,
@@ -1793,7 +2176,7 @@ where
                                     ),
                                 )
                             })?;
-                        BlobRefRowInput {
+                        let blob_ref = BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
                             blob_hash: payload
                                 .blob_hash()
@@ -1806,8 +2189,16 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        }
-                        .append_to(&mut materialization_rows)?;
+                        };
+                        let arena = reconciliation.arena_materializations.get(file_key);
+                        blob_ref.append_to_with_plugin_arena(
+                            &mut materialization_rows,
+                            arena.map(|arena| PluginArenaRefInput {
+                                hash: arena.archive_hash,
+                                root: arena.root,
+                                generation: &arena.generation,
+                            }),
+                        )?;
                     }
                     materialization_rows.set_change_id(
                         materialized_row_index,
@@ -1899,7 +2290,7 @@ where
                                     ),
                                 )
                             })?;
-                        BlobRefRowInput {
+                        let blob_ref = BlobRefRowInput {
                             file_id: file_key.file_id.clone(),
                             blob_hash: payload
                                 .blob_hash()
@@ -1912,8 +2303,16 @@ where
                                 file_id: None,
                                 metadata: None,
                             },
-                        }
-                        .append_to(&mut materialization_rows)?;
+                        };
+                        let arena = reconciliation.arena_materializations.get(file_key);
+                        blob_ref.append_to_with_plugin_arena(
+                            &mut materialization_rows,
+                            arena.map(|arena| PluginArenaRefInput {
+                                hash: arena.archive_hash,
+                                root: arena.root,
+                                generation: &arena.generation,
+                            }),
+                        )?;
                     }
                     materialization_rows.set_change_id(
                         materialized_row_index,
@@ -3011,22 +3410,39 @@ where
         // per file without recompiling the component.
         let mut component_v2_factories =
             BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentV2Factory>>::new();
+        let mut component_v3_factories =
+            BTreeMap::<PluginBranchEntryKey, Arc<dyn WasmComponentV3Factory>>::new();
         let mut cold_v2_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
+        let mut cold_v3_entries = BTreeMap::<PluginBranchEntryKey, PluginRegistryEntry>::new();
         for (key, entry) in selected_entries {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
-            let cached_factory = self
-                .plugin_host
-                .cached_plugin_v2_factory(entry.key(), hash)?;
-            if let Some(factory) = cached_factory {
-                component_v2_factories.insert(key, factory);
-            } else {
-                cold_v2_entries.insert(key, entry);
+            match entry.runtime() {
+                PluginRuntime::WasmComponentV2 => {
+                    let cached_factory = self
+                        .plugin_host
+                        .cached_plugin_v2_factory(entry.key(), hash)?;
+                    if let Some(factory) = cached_factory {
+                        component_v2_factories.insert(key, factory);
+                    } else {
+                        cold_v2_entries.insert(key, entry);
+                    }
+                }
+                PluginRuntime::WasmComponentV3 => {
+                    let cached_factory = self
+                        .plugin_host
+                        .cached_plugin_v3_factory(entry.key(), hash)?;
+                    if let Some(factory) = cached_factory {
+                        component_v3_factories.insert(key, factory);
+                    } else {
+                        cold_v3_entries.insert(key, entry);
+                    }
+                }
             }
         }
 
         let mut wasm_by_hash = current_install_wasm;
         let mut missing_hashes = Vec::<BlobHash>::new();
-        for entry in cold_v2_entries.values() {
+        for entry in cold_v2_entries.values().chain(cold_v3_entries.values()) {
             let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
             if !wasm_by_hash.contains_key(&hash) && !missing_hashes.contains(&hash) {
                 missing_hashes.push(hash);
@@ -3076,6 +3492,28 @@ where
                 .await?;
             component_v2_factories.insert(key, factory);
         }
+        for (key, entry) in cold_v3_entries {
+            let hash = BlobHash::from_hex(entry.wasm_blob_hash())?;
+            let wasm = wasm_by_hash.get(&hash).cloned().ok_or_else(|| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    format!(
+                        "plugin registry references unavailable WASM blob '{}'",
+                        hash.to_hex()
+                    ),
+                )
+            })?;
+            let plugin = entry.to_installed_plugin(wasm)?;
+            let factory = self
+                .plugin_host
+                .load_or_compile_v3_factory(&plugin)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.plugin_v3_factory_compile"
+                ))
+                .await?;
+            component_v3_factories.insert(key, factory);
+        }
 
         let mut reconciled_file_keys = BTreeSet::<PluginFileWriteKey>::new();
         let fresh_file_indices = file_data
@@ -3098,6 +3536,174 @@ where
 
         let fresh_parallelism = self.plugin_host.max_live_plugin_stores();
         for file_indices in fresh_file_indices.chunks(fresh_parallelism) {
+            for &file_index in file_indices {
+                let write = &file_data[file_index];
+                let file_key = PluginFileWriteKey::from(write);
+                let selected = selected_plugins
+                    .get(&file_key)
+                    .expect("fresh plugin candidate has a selection")
+                    .clone();
+                if selected.runtime() != PluginRuntime::WasmComponentV3 {
+                    continue;
+                }
+                let path = write
+                    .path
+                    .as_deref()
+                    .expect("fresh plugin candidate has a path")
+                    .to_string();
+                let installed_key = PluginBranchEntryKey {
+                    branch_id: write.branch_id.clone(),
+                    plugin_key: selected.key().to_string(),
+                };
+                let factory = component_v3_factories
+                    .get(&installed_key)
+                    .expect("selected v3.2 plugin should have a compiled factory")
+                    .clone();
+                let desired_owner =
+                    PluginFileOwner::from_registry_entry(write.file_id.clone(), &selected)?;
+                let owner_change_id = self.functions.call_uuid_v7().to_string();
+                let mut owner_row = desired_owner.write_row(&write.branch_id)?;
+                owner_row.change_id = Some(owner_change_id.clone());
+                let actor_key = PluginActorKey {
+                    branch_id: write.branch_id.clone(),
+                    file_id: write.file_id.clone(),
+                    path: path.clone(),
+                    owner_change_id,
+                    plugin_key: selected.key().to_string(),
+                    plugin_generation: selected.archive_blob_hash().to_string(),
+                };
+                let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
+                    local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
+                });
+                let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
+                let existing_create_reservation =
+                    self.preflight_v2_create(create_context, &file_key).await?;
+                let submitted_bytes = write.payload().shared_bytes();
+                let limits = WasmV3TransitionLimits {
+                    max_page_bytes: 1024 * 1024,
+                    max_pages: 4096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    deadline_nanoseconds: 60_000_000_000,
+                };
+                let descriptor = v3_file_descriptor(write, &selected);
+                let schemas = V2SchemaAllowlist::from_catalog(
+                    selected.schema_keys(),
+                    Arc::clone(&self.sql_schema_snapshot),
+                )?;
+                let _store_permit = self
+                    .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
+                    .await?;
+                let mut actor = factory
+                    .instantiate_actor()
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_v3_actor_instantiate"
+                    ))
+                    .await?;
+                let arena_store = lix_plugin_arena::Store::default();
+                let accepted = lix_plugin_arena::Root::import(
+                    arena_store,
+                    selected.archive_blob_hash(),
+                    &submitted_bytes,
+                    std::iter::empty(),
+                    std::iter::empty(),
+                );
+                let transition = actor
+                    .open_file(
+                        limits,
+                        WasmV3OpenFileInput {
+                            descriptor,
+                            accepted: accepted.clone(),
+                            successor: accepted.transaction(),
+                            creates: create_context.creates_v3(),
+                        },
+                    )
+                    .instrument(tracing::debug_span!(
+                        target: "lix_perf",
+                        "lix.perf.plugin_v3_open_file"
+                    ))
+                    .await?;
+                let validated =
+                    drain_v3_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
+                        .instrument(tracing::debug_span!(
+                            target: "lix_perf",
+                            "lix.perf.plugin_v3_open_file_drain"
+                        ))
+                        .await?;
+                let create_rows = self
+                    .v3_create_rows(
+                        &selected,
+                        &validated.changes,
+                        create_context,
+                        &file_key,
+                        existing_create_reservation.as_ref(),
+                    )
+                    .await?;
+                self.plugin_host
+                    .record_v3_transition_counters(validated.counters);
+
+                rows.push(owner_row);
+                rows.append(create_rows);
+                let write = &mut file_data[file_index];
+                let context = FilesystemRowContext {
+                    branch_id: write.branch_id.clone(),
+                    global: false,
+                    untracked: false,
+                    file_id: None,
+                    metadata: None,
+                };
+                append_plugin_change_rows_from_v2(
+                    rows,
+                    &selected,
+                    validated.changes,
+                    &write.file_id,
+                    &context,
+                )?;
+                let materialization_version = self.functions.call_uuid_v7().to_string();
+                match selected.materialization() {
+                    PluginMaterialization::Blob => {
+                        reconciliation
+                            .materialized_file_keys
+                            .insert(file_key.clone());
+                    }
+                    PluginMaterialization::Derived => {
+                        reconciliation.derived_materializations.insert(
+                            file_key.clone(),
+                            DerivedMaterializationProof::from_bytes(&submitted_bytes, path.clone()),
+                        );
+                    }
+                }
+                let root_id = validated.root.id();
+                let archive = validated
+                    .root
+                    .archive()
+                    .and_then(|archive| archive.encode())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("failed to encode v3.2 arena root: {error}"),
+                        )
+                    })?;
+                let archive_hash = BlobHash::from_content(&archive);
+                write.add_auxiliary_payload(archive);
+                reconciliation.arena_materializations.insert(
+                    file_key.clone(),
+                    DurableArenaMaterialization {
+                        archive_hash,
+                        root: root_id,
+                        generation: selected.archive_blob_hash().to_string(),
+                    },
+                );
+                reconciliation
+                    .materialization_versions
+                    .insert(file_key.clone(), materialization_version);
+                reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                    &write.branch_id,
+                    &write.file_id,
+                ));
+                reconciled_file_keys.insert(file_key);
+            }
+
             let mut prepared_opens = Vec::with_capacity(file_indices.len());
             let mut prepared_session_keys = BTreeSet::new();
             for &file_index in file_indices {
@@ -3112,6 +3718,9 @@ where
                     .get(&file_key)
                     .expect("fresh plugin candidate has a selection")
                     .clone();
+                if selected.runtime() != PluginRuntime::WasmComponentV2 {
+                    continue;
+                }
                 let installed_key = PluginBranchEntryKey {
                     branch_id: write.branch_id.clone(),
                     plugin_key: selected.key().to_string(),
@@ -3474,6 +4083,180 @@ where
                 branch_id: write.branch_id.clone(),
                 plugin_key: selected.key().to_string(),
             };
+            if selected.runtime() == PluginRuntime::WasmComponentV3 {
+                if selected.materialization() != PluginMaterialization::Blob {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "v3.2 arena plugins must retain exact blob materialization",
+                    ));
+                }
+                let factory = component_v3_factories
+                    .get(&installed_key)
+                    .expect("selected v3.2 plugin should have a compiled factory")
+                    .clone();
+                let same_plugin_owner =
+                    owner.is_some_and(|owner| owner.plugin_key() == selected.key());
+                let current_owner_change_id = same_plugin_owner
+                    .then(|| owner_change_ids.get(&file_key).cloned())
+                    .flatten();
+                let desired_owner =
+                    PluginFileOwner::from_registry_entry(write.file_id.clone(), selected)?;
+                let owner_needs_write = plugin_owner_needs_write(owner, &desired_owner);
+                let owner_change_id = if owner_needs_write {
+                    let owner_change_id = self.functions.call_uuid_v7().to_string();
+                    let mut owner_row = desired_owner.write_row(&write.branch_id)?;
+                    owner_row.change_id = Some(owner_change_id.clone());
+                    rows.push(owner_row);
+                    owner_change_id
+                } else {
+                    current_owner_change_id.clone().ok_or_else(|| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!(
+                                "durable v3.2 plugin owner for file '{}' is missing its incarnation",
+                                write.file_id
+                            ),
+                        )
+                    })?
+                };
+                let actor_key = PluginActorKey {
+                    branch_id: write.branch_id.clone(),
+                    file_id: write.file_id.clone(),
+                    path: path.to_string(),
+                    owner_change_id,
+                    plugin_key: selected.key().to_string(),
+                    plugin_generation: selected.archive_blob_hash().to_string(),
+                };
+                let mutation_identity = write.mutation_identity().unwrap_or_else(|| {
+                    local_mutation_identity(self.functions.call_uuid_v7().into_bytes())
+                });
+                let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
+                let existing_create_reservation =
+                    self.preflight_v2_create(create_context, &file_key).await?;
+                let descriptor = v3_file_descriptor(write, selected);
+                let schemas = V2SchemaAllowlist::from_catalog(
+                    selected.schema_keys(),
+                    Arc::clone(&self.sql_schema_snapshot),
+                )?;
+                let limits = WasmV3TransitionLimits {
+                    max_page_bytes: 1024 * 1024,
+                    max_pages: 4096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    deadline_nanoseconds: 60_000_000_000,
+                };
+                let submitted_bytes = write.payload().shared_bytes();
+                let mut actor = factory.instantiate_actor().await?;
+                let transition = if same_plugin_owner {
+                    let (before, accepted_hash) =
+                        self.visible_v3_arena_root(&file_key, selected).await?;
+                    let (successor, edits) =
+                        v3_successor_from_complete_bytes(&before, &submitted_bytes, accepted_hash)?;
+                    actor
+                        .file_changed(
+                            limits,
+                            WasmV3FileUpdate {
+                                before_descriptor: descriptor.clone(),
+                                after_descriptor: descriptor.clone(),
+                                before,
+                                edits,
+                                successor,
+                                creates: create_context.creates_v3(),
+                            },
+                        )
+                        .await?
+                } else {
+                    let store = lix_plugin_arena::Store::default();
+                    let accepted = lix_plugin_arena::Root::import(
+                        store,
+                        selected.archive_blob_hash(),
+                        &submitted_bytes,
+                        std::iter::empty(),
+                        std::iter::empty(),
+                    );
+                    actor
+                        .open_file(
+                            limits,
+                            WasmV3OpenFileInput {
+                                descriptor,
+                                accepted: accepted.clone(),
+                                successor: accepted.transaction(),
+                                creates: create_context.creates_v3(),
+                            },
+                        )
+                        .await?
+                };
+                let validated =
+                    drain_v3_file_transition_changes(actor.as_mut(), transition, &schemas, limits)
+                        .await?;
+                let create_rows = self
+                    .v3_create_rows(
+                        selected,
+                        &validated.changes,
+                        create_context,
+                        &file_key,
+                        existing_create_reservation.as_ref(),
+                    )
+                    .await?;
+                self.plugin_host
+                    .record_v3_transition_counters(validated.counters);
+                rows.append(create_rows);
+                append_plugin_change_rows_from_v2(
+                    rows,
+                    selected,
+                    validated.changes,
+                    &write.file_id,
+                    &context,
+                )?;
+                let accepted_bytes = validated
+                    .root
+                    .bytes
+                    .read(0, validated.root.bytes.len())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("failed to validate v3.2 accepted bytes: {error}"),
+                        )
+                    })?;
+                if accepted_bytes.as_slice() != submitted_bytes.as_ref() {
+                    return Err(LixError::new(
+                        LixError::CODE_INVALID_PLUGIN,
+                        "v3.2 file transition did not accept the exact submitted bytes",
+                    ));
+                }
+                let root_id = validated.root.id();
+                let archive = validated
+                    .root
+                    .archive()
+                    .and_then(|archive| archive.encode())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("failed to encode v3.2 arena root: {error}"),
+                        )
+                    })?;
+                let archive_hash = BlobHash::from_content(&archive);
+                write.add_auxiliary_payload(archive);
+                reconciliation
+                    .materialized_file_keys
+                    .insert(file_key.clone());
+                reconciliation.arena_materializations.insert(
+                    file_key.clone(),
+                    DurableArenaMaterialization {
+                        archive_hash,
+                        root: root_id,
+                        generation: selected.archive_blob_hash().to_string(),
+                    },
+                );
+                reconciliation
+                    .materialization_versions
+                    .insert(file_key.clone(), self.functions.call_uuid_v7().to_string());
+                reconciliation.remove_session_file_view(SessionFileViewKey::new(
+                    &write.branch_id,
+                    &write.file_id,
+                ));
+                reconciled_file_keys.insert(file_key);
+                continue;
+            }
             let factory = component_v2_factories
                 .get(&installed_key)
                 .expect("selected v2 plugin should have a compiled factory")
@@ -4017,26 +4800,6 @@ where
                 branch_id: file_key.branch_id.clone(),
                 plugin_key: group.plugin.key().to_string(),
             };
-            let factory = component_v2_factories
-                .get(&installed_key)
-                .expect("semantic v2 plugin should have a compiled factory")
-                .clone();
-            let descriptor = WasmFileDescriptor {
-                path: Some(group.path.clone()),
-                media_type: inferred_media_type_for_path(Some(&group.path)).map(str::to_owned),
-                plugin: WasmPluginSelection {
-                    plugin_key: group.plugin.key().to_string(),
-                    generation: group.plugin.archive_blob_hash().to_string(),
-                },
-            };
-            let actor_key = PluginActorKey {
-                branch_id: file_key.branch_id.clone(),
-                file_id: file_key.file_id.clone(),
-                path: group.path.clone(),
-                owner_change_id: group.owner_change_id.clone(),
-                plugin_key: group.plugin.key().to_string(),
-                plugin_generation: group.plugin.archive_blob_hash().to_string(),
-            };
             // Move semantic sources out exactly once. Their typed slots retain
             // the original batch positions while the plugin renderer runs.
             let semantic_rows = {
@@ -4079,6 +4842,175 @@ where
                     "v2 semantic write batch must contain at least one entity change",
                 ));
             }
+            if group.plugin.runtime() == PluginRuntime::WasmComponentV3 {
+                let factory = component_v3_factories
+                    .get(&installed_key)
+                    .expect("semantic v3.2 plugin should have a compiled factory")
+                    .clone();
+                let (before, accepted_hash) =
+                    self.visible_v3_arena_root(&file_key, &group.plugin).await?;
+                let mut successor = before.transaction();
+                let mut changed_entities = Vec::with_capacity(prepared.len());
+                for row in prepared.iter() {
+                    let entity_pk = row.entity_pk.clone().into_parts();
+                    let arena_key = entity_arena_key(
+                        row.schema_key.as_str(),
+                        &entity_pk
+                            .iter()
+                            .map(|part| part.to_string())
+                            .collect::<Vec<_>>(),
+                    )?;
+                    if let Some(snapshot) = row.snapshot {
+                        successor.upsert_entity(
+                            arena_key.clone(),
+                            snapshot.normalized().as_bytes().to_vec(),
+                        );
+                    } else {
+                        successor.delete_entity(arena_key.clone());
+                    }
+                    changed_entities.push(WasmV3ChangedEntity {
+                        key: arena_key,
+                        format_only: row.metadata.is_some_and(|metadata| {
+                            metadata.normalized() == V2_FORMAT_ONLY_METADATA_JSON
+                        }),
+                    });
+                }
+                let actor_key = PluginActorKey {
+                    branch_id: file_key.branch_id.clone(),
+                    file_id: file_key.file_id.clone(),
+                    path: group.path.clone(),
+                    owner_change_id: group.owner_change_id.clone(),
+                    plugin_key: group.plugin.key().to_string(),
+                    plugin_generation: group.plugin.archive_blob_hash().to_string(),
+                };
+                let mutation_identity =
+                    local_mutation_identity(self.functions.call_uuid_v7().into_bytes());
+                let create_context = BoundCreateContext::bind(mutation_identity, &actor_key)?;
+                let v3_limits = WasmV3TransitionLimits {
+                    max_page_bytes: 1024 * 1024,
+                    max_pages: 4096,
+                    max_total_bytes: 256 * 1024 * 1024,
+                    deadline_nanoseconds: 60_000_000_000,
+                };
+                let descriptor = WasmV3FileDescriptor {
+                    path: Some(group.path.clone()),
+                    media_type: inferred_media_type_for_path(Some(&group.path)).map(str::to_owned),
+                    plugin_key: group.plugin.key().to_string(),
+                    generation: group.plugin.archive_blob_hash().to_string(),
+                };
+                let _store_permit = self
+                    .admit_fresh_plugin_store(&mut reconciliation.actor_publications)
+                    .await?;
+                let mut actor = factory.instantiate_actor().await?;
+                let transition = actor
+                    .entities_changed(
+                        v3_limits,
+                        WasmV3EntityUpdate {
+                            before_descriptor: descriptor.clone(),
+                            after_descriptor: descriptor,
+                            before,
+                            changed_entities,
+                            successor,
+                            creates: create_context.creates_v3(),
+                        },
+                    )
+                    .await?;
+                let validated =
+                    drain_v3_entity_transition_edits(actor.as_mut(), transition, v3_limits).await?;
+                self.plugin_host
+                    .record_v3_transition_counters(validated.counters);
+                let same_length_output_splice = match validated.edits.as_slice() {
+                    [edit]
+                        if edit.delete_len == edit.insert.len() as u64
+                            && !edit.insert.is_empty() =>
+                    {
+                        Some(ValidatedSameLengthOutputSplice {
+                            offset: usize::try_from(edit.offset).map_err(|_| {
+                                LixError::new(
+                                    LixError::CODE_INVALID_PLUGIN,
+                                    "v3.2 output edit offset exceeds usize",
+                                )
+                            })?,
+                            length: edit.insert.len(),
+                        })
+                    }
+                    _ => None,
+                };
+                let rendered_bytes = validated
+                    .root
+                    .bytes
+                    .read(0, validated.root.bytes.len())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INVALID_PLUGIN,
+                            format!("failed to read v3.2 rendered bytes: {error}"),
+                        )
+                    })?;
+                let root_id = validated.root.id();
+                let archive = validated
+                    .root
+                    .archive()
+                    .and_then(|archive| archive.encode())
+                    .map_err(|error| {
+                        LixError::new(
+                            LixError::CODE_INTERNAL_ERROR,
+                            format!("failed to encode v3.2 arena root: {error}"),
+                        )
+                    })?;
+                let archive_hash = BlobHash::from_content(&archive);
+                let mut rendered_file = semantic_rendered_file_data(
+                    file_key.file_id.clone(),
+                    group.path,
+                    group.filename,
+                    file_key.branch_id.clone(),
+                    accepted_hash,
+                    rendered_bytes.into(),
+                    same_length_output_splice,
+                );
+                rendered_file.add_auxiliary_payload(archive);
+                file_data.push(rendered_file);
+                reconciliation
+                    .materialized_file_keys
+                    .insert(file_key.clone());
+                reconciliation.arena_materializations.insert(
+                    file_key.clone(),
+                    DurableArenaMaterialization {
+                        archive_hash,
+                        root: root_id,
+                        generation: group.plugin.archive_blob_hash().to_string(),
+                    },
+                );
+                reconciliation
+                    .materialization_versions
+                    .insert(file_key.clone(), self.functions.call_uuid_v7().to_string());
+                let rows = reconciled_rows
+                    .as_mut()
+                    .expect("semantic groups promote the reconciled row batch");
+                rows.put_prepared_batch_at(&group.row_indices, prepared)?;
+                reconciliation.remove_session_file_view(session_key);
+                reconciled_file_keys.insert(file_key);
+                continue;
+            }
+            let factory = component_v2_factories
+                .get(&installed_key)
+                .expect("semantic v2 plugin should have a compiled factory")
+                .clone();
+            let descriptor = WasmFileDescriptor {
+                path: Some(group.path.clone()),
+                media_type: inferred_media_type_for_path(Some(&group.path)).map(str::to_owned),
+                plugin: WasmPluginSelection {
+                    plugin_key: group.plugin.key().to_string(),
+                    generation: group.plugin.archive_blob_hash().to_string(),
+                },
+            };
+            let actor_key = PluginActorKey {
+                branch_id: file_key.branch_id.clone(),
+                file_id: file_key.file_id.clone(),
+                path: group.path.clone(),
+                owner_change_id: group.owner_change_id.clone(),
+                plugin_key: group.plugin.key().to_string(),
+                plugin_generation: group.plugin.archive_blob_hash().to_string(),
+            };
             let view = PendingPluginActorView {
                 session_key: session_key.clone(),
                 plugin_key: group.plugin.key().to_string(),
@@ -4630,9 +5562,19 @@ where
             #[cfg(feature = "storage-benches")]
             crate::storage_bench::record_transaction_validation_branch();
             let live_state = self.live_state.reader(read);
-            validate_certified_fresh_plugin_file_import(&live_state, certificate).await?;
+            validate_certified_fresh_plugin_file_import(&live_state, certificate)
+                .instrument(tracing::debug_span!(
+                    target: "lix_perf",
+                    "lix.perf.validation.certified_fresh_plugin_import"
+                ))
+                .await?;
             return Ok(());
         }
+        let _generic_validation_span = tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.validation.generic"
+        )
+        .entered();
         let validation_index = prepared_writes.validation_index();
         for scope in validation_index.schema_scopes() {
             #[cfg(feature = "storage-benches")]
@@ -6124,6 +7066,90 @@ fn v2_file_descriptor(
     }
 }
 
+fn v3_file_descriptor(
+    write: &TransactionFileData,
+    plugin: &PluginRegistryEntry,
+) -> WasmV3FileDescriptor {
+    WasmV3FileDescriptor {
+        path: write.path.clone(),
+        media_type: inferred_media_type_for_path(write.path.as_deref()).map(str::to_owned),
+        plugin_key: plugin.key().to_string(),
+        generation: plugin.archive_blob_hash().to_string(),
+    }
+}
+
+fn v3_successor_from_complete_bytes(
+    before: &lix_plugin_arena::Root,
+    after: &[u8],
+    accepted_hash: BlobHash,
+) -> Result<(lix_plugin_arena::Transaction, Vec<WasmV3InputSplice>), LixError> {
+    let before_bytes = before.bytes.read(0, before.bytes.len()).map_err(|error| {
+        LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            format!("failed to read accepted v3.2 arena bytes: {error}"),
+        )
+    })?;
+    if BlobHash::from_content(&before_bytes) != accepted_hash {
+        return Err(LixError::new(
+            LixError::CODE_INVALID_PLUGIN,
+            "v3.2 arena accepted bytes do not match the durable file blob",
+        ));
+    }
+    let prefix = before_bytes
+        .iter()
+        .zip(after)
+        .take_while(|(before, after)| before == after)
+        .count();
+    let suffix_limit = before_bytes
+        .len()
+        .saturating_sub(prefix)
+        .min(after.len().saturating_sub(prefix));
+    let suffix = before_bytes[before_bytes.len().saturating_sub(suffix_limit)..]
+        .iter()
+        .rev()
+        .zip(
+            after[after.len().saturating_sub(suffix_limit)..]
+                .iter()
+                .rev(),
+        )
+        .take_while(|(before, after)| before == after)
+        .count();
+    if prefix == before_bytes.len() && prefix == after.len() {
+        return Ok((before.transaction(), Vec::new()));
+    }
+    let delete_len = before_bytes.len().saturating_sub(prefix + suffix);
+    let insert = after[prefix..after.len().saturating_sub(suffix)].to_vec();
+    let edit = WasmV3InputSplice {
+        offset: prefix as u64,
+        delete_len: delete_len as u64,
+        insert: WasmV3InputBytes::Inline(insert.clone()),
+    };
+    let mut successor = before.transaction();
+    successor.edit_bytes(WasmV3ArenaByteEdit {
+        offset: edit.offset,
+        delete_len: edit.delete_len,
+        insert,
+    });
+    Ok((successor, vec![edit]))
+}
+
+fn materialize_v3_conflict_snapshot(value: WasmHostBytes) -> Result<Vec<u8>, LixError> {
+    match value {
+        WasmHostBytes::Inline(bytes) => Ok(bytes.to_vec()),
+        WasmHostBytes::CanonicalJson(json) => Ok(json.normalized().as_bytes().to_vec()),
+        WasmHostBytes::Source(source) => {
+            source.validate()?;
+            let length = u32::try_from(source.range.length).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INVALID_PLUGIN,
+                    "v3.2 conflict snapshot exceeds the u32 page limit",
+                )
+            })?;
+            source.source.read(source.range.offset, length)
+        }
+    }
+}
+
 fn v2_file_descriptor_from_actor_key(key: &PluginActorKey) -> WasmFileDescriptor {
     WasmFileDescriptor {
         path: Some(key.path.clone()),
@@ -6826,9 +7852,16 @@ struct PluginWriteReconciliation {
     materialized_file_keys: BTreeSet<PluginFileWriteKey>,
     materialization_versions: BTreeMap<PluginFileWriteKey, String>,
     derived_materializations: BTreeMap<PluginFileWriteKey, DerivedMaterializationProof>,
+    arena_materializations: BTreeMap<PluginFileWriteKey, DurableArenaMaterialization>,
     file_view_mutations: BTreeMap<SessionFileViewKey, SessionFileViewMutation>,
     actor_publications: Vec<PendingPluginActorPublication>,
     reconciled_rows: Option<ReconciledRowBatch>,
+}
+
+struct DurableArenaMaterialization {
+    archive_hash: BlobHash,
+    root: lix_plugin_arena::Digest,
+    generation: String,
 }
 
 struct PreparedFreshPluginOpen {
@@ -7216,6 +8249,12 @@ struct PluginGenerationUpgrade {
 struct PluginUpgradeBlobRefSnapshot {
     id: String,
     blob_hash: String,
+    #[serde(default)]
+    plugin_arena_hash: Option<String>,
+    #[serde(default)]
+    plugin_arena_root: Option<String>,
+    #[serde(default)]
+    plugin_generation: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]

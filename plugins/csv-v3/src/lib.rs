@@ -10,36 +10,177 @@ use lix_plugin_api_v3 as sdk;
 use plugin_csv_core::{
     ByteEdit as CoreByteEdit, ChangeEffect as CoreChangeEffect, Document as CoreDocument,
     EntityChange as CoreEntityChange, EntityRecord as CoreEntityRecord, IdNamespace,
-    InputSplice as CoreInputSplice, ROW_SCHEMA_KEY, V3RowIndexRecord, encode_row_snapshot,
-    parse_row_snapshot,
+    InputSplice as CoreInputSplice, ROW_SCHEMA_KEY, RowConflictResolution, V3ColdIndex,
+    V3ColdMetadata, V3RowFramer, V3RowWindowCheckpoint, V3StreamAnalyzer, encode_row_snapshot,
+    parse_row_snapshot, resolve_row_conflict, v3_stream_table_change,
 };
 
-const INDEX_VERSION_KEY: &[u8] = b"csv/v3/index-version";
-const INDEX_VERSION: &[u8] = b"row-byte-windows-v1";
+const INDEX_METADATA_KEY: &[u8] = b"csv/v3/index-metadata";
+const INDEX_VERSION: &[u8] = b"row-window-checkpoints-v3";
 const INDEX_KEY_PREFIX: &[u8] = b"csv/v3/rows/";
 const INDEX_WINDOW_BYTES: u64 = 16 * 1024;
 
 struct CsvV3Plugin;
 
+struct CsvColdSource {
+    root: sdk::Root,
+    framer: V3RowFramer,
+    metadata: V3ColdMetadata,
+    file_len: u64,
+    read_offset: u64,
+    ordinal: usize,
+    table_pending: bool,
+    pending_record: Option<Vec<u8>>,
+}
+
+impl CsvColdSource {
+    fn load_page(&mut self, budget: &sdk::Budget) -> sdk::Result<()> {
+        if self.read_offset == self.file_len {
+            return Err(sdk::Error::invalid_input(
+                "CSV page source ended before the analyzed row count",
+            ));
+        }
+        let requested = u32::try_from(
+            (self.file_len - self.read_offset)
+                .min(u64::from(budget.limits().max_page_bytes.max(1))),
+        )
+        .expect("CSV page request is bounded by max-page-bytes");
+        let page = self
+            .root
+            .read_file(budget, self.read_offset, requested)
+            .map_err(arena_error)?;
+        self.read_offset += page.len() as u64;
+        self.framer.push(&page).map_err(sdk::Error::invalid_input)
+    }
+}
+
+impl sdk::EntityChangePacketSource for CsvColdSource {
+    fn next_packet(
+        &mut self,
+        budget: &sdk::Budget,
+        max_bytes: u32,
+    ) -> sdk::Result<Option<Vec<u8>>> {
+        let mut packet = sdk::EntityChangePacketBuilder::new(max_bytes)?;
+        if let Some(record) = self.pending_record.take() {
+            if let Some(record) = packet.try_push_encoded_record(record)? {
+                self.pending_record = Some(record);
+                return Ok(packet.finish());
+            }
+        }
+        loop {
+            if self.ordinal < self.metadata.row_count() {
+                let id = self
+                    .metadata
+                    .row_id_ascii(self.ordinal)
+                    .map_err(sdk::Error::invalid_input)?;
+                let id = std::str::from_utf8(&id)
+                    .map_err(|_| sdk::Error::internal("generated CSV row ID is not ASCII"))?;
+                let eof = self.read_offset == self.file_len;
+                match packet.try_push_with_snapshot(ROW_SCHEMA_KEY, &[&id], false, |output| {
+                    self.framer
+                        .next_snapshot_into_with_id(eof, self.ordinal, self.metadata, id, output)
+                        .map(|snapshot| snapshot.is_some())
+                        .map_err(sdk::Error::invalid_input)
+                })? {
+                    sdk::DirectPacketPush::Pushed => {
+                        self.ordinal += 1;
+                    }
+                    sdk::DirectPacketPush::Pending(record) => {
+                        self.ordinal += 1;
+                        self.pending_record = Some(record);
+                        return Ok(packet.finish());
+                    }
+                    sdk::DirectPacketPush::NoRecord => self.load_page(budget)?,
+                }
+                continue;
+            }
+            if self.table_pending {
+                let table = core_change_to_sdk(v3_stream_table_change(self.metadata));
+                if packet.try_push(table)?.is_some() {
+                    return Ok(packet.finish());
+                }
+                self.table_pending = false;
+            }
+            return Ok(packet.finish());
+        }
+    }
+}
+
 impl sdk::FormatPlugin for CsvV3Plugin {
+    fn resolve_conflict(conflict: sdk::EntityConflict<'_>) -> sdk::Result<sdk::ConflictResolution> {
+        const MAX_HEURISTIC_SNAPSHOT_BYTES: u64 = 64 * 1024;
+
+        if conflict.schema_key != ROW_SCHEMA_KEY {
+            return Ok(conflict.take_b_or_delete());
+        }
+        let (Some(base), Some(a), Some(b)) = (&conflict.base, &conflict.a, &conflict.b) else {
+            return Ok(conflict.take_b_or_delete());
+        };
+        if [base, a, b]
+            .into_iter()
+            .any(|snapshot| snapshot.len() > MAX_HEURISTIC_SNAPSHOT_BYTES)
+        {
+            return Ok(sdk::ConflictResolution::TakeB);
+        }
+        let base = base.read()?;
+        let a = a.read()?;
+        let b = b.read()?;
+        Ok(
+            match resolve_row_conflict(Some(&base), Some(&a), Some(&b)) {
+                RowConflictResolution::TakeA => sdk::ConflictResolution::TakeA,
+                RowConflictResolution::TakeB => sdk::ConflictResolution::TakeB,
+                RowConflictResolution::Replace(snapshot) => {
+                    sdk::ConflictResolution::Replace(snapshot)
+                }
+                RowConflictResolution::Delete => sdk::ConflictResolution::Delete,
+            },
+        )
+    }
+
     fn open_file(budget: &sdk::Budget, input: sdk::OpenFileInput) -> sdk::Result<sdk::FileResult> {
-        let bytes = read_root_bytes(&input.accepted, budget)?;
-        let (document, changes) = CoreDocument::open_file(
-            bytes,
+        let file_len = input.accepted.file_len();
+        let mut analyzer = V3StreamAnalyzer::new(
             input.descriptor.path.as_deref(),
             namespace(input.creates),
+            INDEX_WINDOW_BYTES,
         )
         .map_err(sdk::Error::invalid_input)?;
-        write_row_index(&input.successor, budget, &document)?;
+        let mut offset = 0_u64;
+        while offset < file_len {
+            let requested = u32::try_from(
+                (file_len - offset).min(u64::from(budget.limits().max_page_bytes.max(1))),
+            )
+            .expect("CSV page request is bounded by max-page-bytes");
+            let page = input
+                .accepted
+                .read_file(budget, offset, requested)
+                .map_err(arena_error)?;
+            offset += page.len() as u64;
+            analyzer.push(&page).map_err(sdk::Error::invalid_input)?;
+        }
+        let (index, metadata) = analyzer.finish().map_err(sdk::Error::invalid_input)?;
+        write_cold_row_index(
+            &input.successor,
+            budget,
+            &index,
+            metadata.row_count() as u64,
+        )?;
+        input
+            .successor
+            .declare_ordered_entity_output()
+            .map_err(arena_error)?;
         Ok(sdk::FileResult {
             successor: input.successor,
-            changes: changes
-                .map(|change| {
-                    change
-                        .map(core_change_to_sdk)
-                        .map_err(sdk::Error::invalid_input)
-                })
-                .collect::<sdk::Result<Vec<_>>>()?,
+            changes: sdk::EntityChanges::from_packet_source(CsvColdSource {
+                root: input.accepted,
+                framer: V3RowFramer::new(input.descriptor.path.as_deref()),
+                metadata,
+                file_len,
+                read_offset: 0,
+                ordinal: 0,
+                table_pending: true,
+                pending_record: None,
+            }),
         })
     }
 
@@ -47,7 +188,7 @@ impl sdk::FormatPlugin for CsvV3Plugin {
         if let Some(changes) = sparse_row_file_changed(&input, budget)? {
             return Ok(sdk::FileResult {
                 successor: input.successor,
-                changes,
+                changes: changes.into(),
             });
         }
         let document = document_from_root(&input.before, budget)?;
@@ -88,7 +229,11 @@ impl sdk::FormatPlugin for CsvV3Plugin {
         write_row_index(&input.successor, budget, &after)?;
         Ok(sdk::FileResult {
             successor: input.successor,
-            changes: changes.into_iter().map(core_change_to_sdk).collect(),
+            changes: changes
+                .into_iter()
+                .map(core_change_to_sdk)
+                .collect::<Vec<_>>()
+                .into(),
         })
     }
 
@@ -200,28 +345,96 @@ fn read_entities_from_root(
     Ok(entities)
 }
 
+fn write_cold_row_index(
+    transaction: &sdk::Transaction,
+    budget: &sdk::Budget,
+    index: &V3ColdIndex,
+    row_count: u64,
+) -> sdk::Result<()> {
+    for checkpoint in &index.windows {
+        transaction
+            .put_state(
+                budget,
+                &row_index_key(checkpoint.page),
+                &encode_row_checkpoint(*checkpoint),
+            )
+            .map_err(arena_error)?;
+    }
+    transaction
+        .put_state(
+            budget,
+            INDEX_METADATA_KEY,
+            &encode_index_metadata(index.namespace, row_count),
+        )
+        .map_err(arena_error)
+}
+
 fn write_row_index(
     transaction: &sdk::Transaction,
     budget: &sdk::Budget,
     document: &CoreDocument,
 ) -> sdk::Result<()> {
-    let mut pages = std::collections::BTreeMap::<u64, Vec<V3RowIndexRecord>>::new();
-    for record in document.v3_row_index_records() {
+    let records = document.v3_row_index_records();
+    let row_count = records.len() as u64;
+    let Some(first_record) = records.first() else {
+        transaction
+            .delete_state(budget, INDEX_METADATA_KEY)
+            .map_err(arena_error)?;
+        return Ok(());
+    };
+    let namespace =
+        IdNamespace::from_generated_id(&first_record.id).map_err(sdk::Error::invalid_input)?;
+    if records
+        .iter()
+        .enumerate()
+        .any(|(ordinal, record)| record.id != namespace.encode(ordinal as u64))
+    {
+        // One compact namespace can represent the normal import sequence.
+        // Mixed imported/generated identities deliberately take the complete
+        // durable-entity fallback instead of accepting a lossy locator.
+        transaction
+            .delete_state(budget, INDEX_METADATA_KEY)
+            .map_err(arena_error)?;
+        return Ok(());
+    }
+
+    let mut pages = std::collections::BTreeMap::<u64, V3RowWindowCheckpoint>::new();
+    for (ordinal, record) in records.into_iter().enumerate() {
         let first = u64::from(record.row_start) / INDEX_WINDOW_BYTES;
         let inclusive_end =
             u64::from(record.row_start).saturating_add(u64::from(record.row_len).saturating_sub(1));
         let last = inclusive_end / INDEX_WINDOW_BYTES;
         for page in first..=last {
-            pages.entry(page).or_default().push(record.clone());
+            pages
+                .entry(page)
+                .and_modify(|checkpoint| {
+                    checkpoint.read_end = checkpoint
+                        .read_end
+                        .max(record.row_start.saturating_add(record.row_len));
+                })
+                .or_insert(V3RowWindowCheckpoint {
+                    page,
+                    row_start: record.row_start,
+                    read_end: record.row_start.saturating_add(record.row_len),
+                    first_ordinal: ordinal as u32,
+                });
         }
     }
-    for (page, records) in pages {
+    for (page, checkpoint) in pages {
         transaction
-            .put_state(budget, &row_index_key(page), &encode_row_index(&records)?)
+            .put_state(
+                budget,
+                &row_index_key(page),
+                &encode_row_checkpoint(checkpoint),
+            )
             .map_err(arena_error)?;
     }
     transaction
-        .put_state(budget, INDEX_VERSION_KEY, INDEX_VERSION)
+        .put_state(
+            budget,
+            INDEX_METADATA_KEY,
+            &encode_index_metadata(namespace.0, row_count),
+        )
         .map_err(arena_error)
 }
 
@@ -252,15 +465,14 @@ fn sparse_row_file_changed(
     if deleted != inserted {
         return Ok(None);
     }
-    if input
+    let Some(metadata) = input
         .before
-        .get_state(budget, INDEX_VERSION_KEY)
+        .get_state(budget, INDEX_METADATA_KEY)
         .map_err(arena_error)?
-        .as_deref()
-        != Some(INDEX_VERSION)
-    {
+    else {
         return Ok(None);
-    }
+    };
+    let (indexed_namespace, indexed_row_count) = decode_index_metadata(&metadata)?;
     let first_offset = input.edits[0].offset;
     let Some(index) = input
         .before
@@ -269,54 +481,155 @@ fn sparse_row_file_changed(
     else {
         return Ok(None);
     };
-    let Some(record) = decode_row_index(&index)?.into_iter().find(|record| {
-        let start = u64::from(record.row_start);
-        let end = start.saturating_add(u64::from(record.row_len));
-        input.edits.iter().all(|edit| {
-            edit.offset
-                .checked_add(edit.delete_len)
-                .is_some_and(|edit_end| edit.offset >= start && edit_end <= end)
-        })
-    }) else {
-        return Ok(None);
-    };
-    let row_bytes = input
-        .successor
-        .read_file(budget, u64::from(record.row_start), record.row_len)
-        .map_err(arena_error)?;
-    let (_, changes) = CoreDocument::open_file(
-        row_bytes,
+    let checkpoint = decode_row_checkpoint(&index)?;
+    let fast_row = read_unquoted_lf_row(input, budget, checkpoint)?;
+    let used_fast_row = fast_row.is_some();
+    let (window_bytes, window_start, indexed_local_ordinal) =
+        if let Some((row, row_start, local_ordinal)) = fast_row {
+            (row, row_start, Some(local_ordinal))
+        } else {
+            (
+                input
+                    .successor
+                    .read_file(
+                        budget,
+                        u64::from(checkpoint.row_start),
+                        checkpoint.read_end - checkpoint.row_start,
+                    )
+                    .map_err(arena_error)?,
+                u64::from(checkpoint.row_start),
+                None,
+            )
+        };
+    let (window_document, changes) = CoreDocument::open_file(
+        window_bytes,
         input.after_descriptor.path.as_deref(),
-        namespace(input.creates),
+        indexed_namespace,
     )
     .map_err(sdk::Error::invalid_input)?;
-    let generated = changes
-        .filter_map(Result::ok)
-        .find(|change| change.schema_key == ROW_SCHEMA_KEY)
-        .and_then(|change| change.snapshot)
-        .ok_or_else(|| sdk::Error::invalid_input("edited CSV range is not exactly one row"))?;
-    let key = sdk::entity_key(ROW_SCHEMA_KEY, std::slice::from_ref(&record.id))?;
-    let Some(before_snapshot) = input.before.get_entity(budget, &key).map_err(arena_error)? else {
+    let relative_edits = input
+        .edits
+        .iter()
+        .map(|edit| {
+            edit.offset
+                .checked_sub(window_start)
+                .map(|offset| (offset, edit.delete_len))
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(relative_edits) = relative_edits else {
         return Ok(None);
     };
-    let before = parse_row_snapshot(&before_snapshot).map_err(sdk::Error::invalid_input)?;
-    if before.id != record.id {
-        return Err(sdk::Error::internal("CSV row locator identity drifted"));
-    }
+    let Some((document_local_ordinal, _record)) = window_document
+        .v3_row_index_records()
+        .into_iter()
+        .enumerate()
+        .find(|(_, record)| {
+            let start = u64::from(record.row_start);
+            let end = start.saturating_add(u64::from(record.row_len));
+            relative_edits.iter().all(|(offset, delete_len)| {
+                offset
+                    .checked_add(*delete_len)
+                    .is_some_and(|edit_end| *offset >= start && edit_end <= end)
+            })
+        })
+    else {
+        return Ok(None);
+    };
+    let local_ordinal = indexed_local_ordinal.unwrap_or(document_local_ordinal as u64);
+    let actual_ordinal = u64::from(checkpoint.first_ordinal)
+        .checked_add(local_ordinal)
+        .ok_or_else(|| sdk::Error::internal("CSV row index ordinal overflowed"))?;
+    let actual_id = indexed_namespace.encode(actual_ordinal);
+    let generated = changes
+        .filter_map(Result::ok)
+        .filter(|change| change.schema_key == ROW_SCHEMA_KEY)
+        .nth(document_local_ordinal)
+        .and_then(|change| change.snapshot)
+        .ok_or_else(|| sdk::Error::invalid_input("edited CSV range is not exactly one row"))?;
     let mut after = parse_row_snapshot(&generated).map_err(sdk::Error::invalid_input)?;
-    after.id.clone_from(&before.id);
-    after.order_key.clone_from(&before.order_key);
-    let format_only = before.cells == after.cells;
+    let format_only = if used_fast_row {
+        after.id.clone_from(&actual_id);
+        after.order_key = initial_order_key(actual_ordinal, indexed_row_count)?;
+        false
+    } else {
+        let key = sdk::entity_key(ROW_SCHEMA_KEY, std::slice::from_ref(&actual_id))?;
+        let Some(before_snapshot) = input.before.get_entity(budget, &key).map_err(arena_error)?
+        else {
+            return Ok(None);
+        };
+        let before = parse_row_snapshot(&before_snapshot).map_err(sdk::Error::invalid_input)?;
+        if before.id != actual_id {
+            return Err(sdk::Error::internal("CSV row locator identity drifted"));
+        }
+        after.id.clone_from(&before.id);
+        after.order_key.clone_from(&before.order_key);
+        let format_only = before.cells == after.cells;
+        let snapshot = encode_row_snapshot(&after).map_err(sdk::Error::invalid_input)?;
+        if snapshot == before_snapshot {
+            return Ok(Some(Vec::new()));
+        }
+        format_only
+    };
     let snapshot = encode_row_snapshot(&after).map_err(sdk::Error::invalid_input)?;
-    if snapshot == before_snapshot {
-        return Ok(Some(Vec::new()));
-    }
     Ok(Some(vec![sdk::EntityChange {
         schema_key: ROW_SCHEMA_KEY.to_owned(),
-        entity_pk: vec![record.id],
+        entity_pk: vec![actual_id],
         snapshot: Some(snapshot),
         format_only,
     }]))
+}
+
+fn read_unquoted_lf_row(
+    input: &sdk::FileUpdate,
+    budget: &sdk::Budget,
+    checkpoint: V3RowWindowCheckpoint,
+) -> sdk::Result<Option<(Vec<u8>, u64, u64)>> {
+    if input.edits.iter().any(|edit| match &edit.insert {
+        sdk::InputBytes::Inline(bytes) => bytes
+            .iter()
+            .any(|byte| matches!(byte, b'\n' | b'\r' | b'"')),
+        sdk::InputBytes::AfterRange(_) => true,
+    }) {
+        return Ok(None);
+    }
+    let checkpoint_start = u64::from(checkpoint.row_start);
+    let checkpoint_end = u64::from(checkpoint.read_end);
+    let checkpoint_len = checkpoint_end
+        .checked_sub(checkpoint_start)
+        .ok_or_else(|| sdk::Error::internal("CSV checkpoint range is invalid"))?;
+    let edit_start = input
+        .edits
+        .iter()
+        .map(|edit| edit.offset)
+        .min()
+        .ok_or_else(|| sdk::Error::internal("CSV sparse edit unexpectedly has no splice"))?;
+    let edit_end = input.edits.iter().try_fold(edit_start, |end, edit| {
+        edit.offset
+            .checked_add(edit.delete_len)
+            .map(|candidate| end.max(candidate))
+            .ok_or_else(|| sdk::Error::invalid_input("CSV edit range overflowed"))
+    })?;
+    if edit_start < checkpoint_start || edit_end > checkpoint_end {
+        return Ok(None);
+    }
+    let Some(locator) = input
+        .successor
+        .locate_file_record(
+            budget,
+            checkpoint_start,
+            checkpoint_len,
+            edit_start,
+            b'\n',
+            &[b'"', b'\r'],
+        )
+        .map_err(arena_error)?
+    else {
+        return Ok(None);
+    };
+    if edit_end > locator.offset.saturating_add(locator.length) {
+        return Ok(None);
+    }
+    Ok(Some((locator.content, locator.offset, locator.ordinal)))
 }
 
 fn row_index_key(page: u64) -> Vec<u8> {
@@ -325,43 +638,58 @@ fn row_index_key(page: u64) -> Vec<u8> {
     key
 }
 
-fn encode_row_index(records: &[V3RowIndexRecord]) -> sdk::Result<Vec<u8>> {
-    let mut output = Vec::new();
-    for record in records {
-        let id = record.id.as_bytes();
-        let id_len =
-            u32::try_from(id.len()).map_err(|_| sdk::Error::RecordTooLarge(id.len() as u64))?;
-        output.extend_from_slice(&record.row_start.to_le_bytes());
-        output.extend_from_slice(&record.row_len.to_le_bytes());
-        output.extend_from_slice(&id_len.to_le_bytes());
-        output.extend_from_slice(id);
-    }
-    Ok(output)
+fn encode_index_metadata(namespace: [u8; 16], row_count: u64) -> Vec<u8> {
+    let mut output = Vec::with_capacity(INDEX_VERSION.len() + namespace.len() + 8);
+    output.extend_from_slice(INDEX_VERSION);
+    output.extend_from_slice(&namespace);
+    output.extend_from_slice(&row_count.to_le_bytes());
+    output
 }
 
-fn decode_row_index(mut bytes: &[u8]) -> sdk::Result<Vec<V3RowIndexRecord>> {
-    let mut records = Vec::new();
-    while !bytes.is_empty() {
-        if bytes.len() < 12 {
-            return Err(sdk::Error::internal("truncated CSV row index"));
-        }
-        let row_start = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let row_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let id_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-        bytes = &bytes[12..];
-        if bytes.len() < id_len {
-            return Err(sdk::Error::internal("truncated CSV row index identity"));
-        }
-        let id = String::from_utf8(bytes[..id_len].to_vec())
-            .map_err(|_| sdk::Error::internal("CSV row index identity is not UTF-8"))?;
-        bytes = &bytes[id_len..];
-        records.push(V3RowIndexRecord {
-            row_start,
-            row_len,
-            id,
-        });
+fn decode_index_metadata(bytes: &[u8]) -> sdk::Result<(IdNamespace, u64)> {
+    let payload = bytes
+        .strip_prefix(INDEX_VERSION)
+        .ok_or_else(|| sdk::Error::internal("CSV row index metadata is invalid"))?;
+    if payload.len() != 24 {
+        return Err(sdk::Error::internal("CSV row index metadata is invalid"));
     }
-    Ok(records)
+    let namespace = <[u8; 16]>::try_from(&payload[..16]).unwrap();
+    let row_count = u64::from_le_bytes(payload[16..].try_into().unwrap());
+    Ok((IdNamespace(namespace), row_count))
+}
+
+fn initial_order_key(ordinal: u64, row_count: u64) -> sdk::Result<String> {
+    let denominator = u128::from(row_count)
+        .checked_add(1)
+        .ok_or_else(|| sdk::Error::internal("CSV row count overflowed"))?;
+    let numerator = u128::from(ordinal)
+        .checked_add(1)
+        .and_then(|ordinal| ordinal.checked_mul(u128::from(u64::MAX)))
+        .ok_or_else(|| sdk::Error::internal("CSV row ordinal overflowed"))?;
+    let rank = u64::try_from(numerator / denominator)
+        .map_err(|_| sdk::Error::internal("CSV row rank overflowed"))?
+        | 1;
+    Ok(format!("{rank:016x}"))
+}
+
+fn encode_row_checkpoint(checkpoint: V3RowWindowCheckpoint) -> [u8; 12] {
+    let mut output = [0; 12];
+    output[..4].copy_from_slice(&checkpoint.row_start.to_le_bytes());
+    output[4..8].copy_from_slice(&checkpoint.read_end.to_le_bytes());
+    output[8..].copy_from_slice(&checkpoint.first_ordinal.to_le_bytes());
+    output
+}
+
+fn decode_row_checkpoint(bytes: &[u8]) -> sdk::Result<V3RowWindowCheckpoint> {
+    if bytes.len() != 12 {
+        return Err(sdk::Error::internal("CSV row checkpoint is invalid"));
+    }
+    Ok(V3RowWindowCheckpoint {
+        page: 0,
+        row_start: u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+        read_end: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+        first_ordinal: u32::from_le_bytes(bytes[8..].try_into().unwrap()),
+    })
 }
 
 fn namespace(creates: sdk::CreateContext) -> IdNamespace {

@@ -1,6 +1,7 @@
 use lix_engine::telemetry::TelemetrySink;
 use lix_engine::wasm::WasmRuntime;
 use lix_engine::wasm::v2::WasmTransitionCounters;
+use lix_engine::wasm::v3::WasmV3TransitionCounters;
 use lix_engine::{
     Blob, CreateBranchOptions, CreateBranchReceipt, CreateCheckpointReceipt, Engine, EngineOptions,
     ExecuteBatchStatement, ExecuteIdempotency, ExecuteOptions, ExecuteResult,
@@ -449,6 +450,18 @@ where
     #[doc(hidden)]
     pub fn reset_plugin_v2_transition_counters(&self) {
         self.engine.reset_plugin_v2_transition_counters();
+    }
+
+    /// Returns engine-local v3.2 arena transition counters for profiling.
+    #[doc(hidden)]
+    pub fn plugin_v3_transition_counters(&self) -> WasmV3TransitionCounters {
+        self.engine.plugin_v3_transition_counters()
+    }
+
+    /// Starts a new engine-local v3.2 arena transition measurement window.
+    #[doc(hidden)]
+    pub fn reset_plugin_v3_transition_counters(&self) {
+        self.engine.reset_plugin_v3_transition_counters();
     }
 }
 

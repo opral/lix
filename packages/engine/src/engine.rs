@@ -270,6 +270,16 @@ where
         self.plugin_host.reset_v2_transition_counters();
     }
 
+    #[doc(hidden)]
+    pub fn plugin_v3_transition_counters(&self) -> crate::wasm::v3::WasmV3TransitionCounters {
+        self.plugin_host.v3_transition_counters()
+    }
+
+    #[doc(hidden)]
+    pub fn reset_plugin_v3_transition_counters(&self) {
+        self.plugin_host.reset_v3_transition_counters();
+    }
+
     /// Rebuilds the tracked serving commit root for one branch from changelog.
     ///
     /// This is intentionally an engine-level operation: callers should not need

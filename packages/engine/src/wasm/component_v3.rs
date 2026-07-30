@@ -7,9 +7,11 @@
 use async_trait::async_trait;
 use lix_plugin_arena::{Root, Transaction};
 
+use super::component_v2::WasmChangeEffect;
 use crate::LixError;
 
 const MIB: u64 = 1024 * 1024;
+pub const WASM_COMPONENT_V3_API_VERSION: &str = "3.2.0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmV3TransitionLimits {
@@ -104,6 +106,39 @@ pub struct WasmV3ChangedEntity {
     pub format_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmV3ConflictSide {
+    Base,
+    A,
+    B,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmV3EntityConflict {
+    pub key: Vec<u8>,
+    pub base: Option<Vec<u8>>,
+    pub a: Option<Vec<u8>>,
+    pub b: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WasmV3ConflictChoice {
+    TakeBase,
+    TakeA,
+    TakeB,
+    Replace {
+        snapshot: Vec<u8>,
+        effect: WasmChangeEffect,
+    },
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmV3ConflictResolution {
+    pub ordinal: u64,
+    pub choice: WasmV3ConflictChoice,
+}
+
 #[derive(Debug)]
 pub struct WasmV3OpenFileInput {
     pub descriptor: WasmV3FileDescriptor,
@@ -140,6 +175,15 @@ pub struct WasmV3EntityUpdate {
     pub creates: WasmV3CreateContext,
 }
 
+#[derive(Debug)]
+pub struct WasmV3ConflictUpdate {
+    pub descriptor: WasmV3FileDescriptor,
+    /// Conflicts are ordered canonically by entity key. For every record the
+    /// host has already canonicalized `a` and `b` by durable
+    /// `(updated_at, change_id)`.
+    pub conflicts: Vec<WasmV3EntityConflict>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WasmV3TransitionHandle(pub u64);
 
@@ -148,6 +192,9 @@ pub struct WasmV3ChangeCursorHandle(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WasmV3EditCursorHandle(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WasmV3ResolutionCursorHandle(pub u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WasmV3FileTransition {
@@ -161,6 +208,12 @@ pub struct WasmV3EntityTransition {
     pub edits: WasmV3EditCursorHandle,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WasmV3ConflictTransition {
+    pub transition: WasmV3TransitionHandle,
+    pub resolutions: WasmV3ResolutionCursorHandle,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WasmV3TransitionCounters {
     pub component_boundary_bytes: u64,
@@ -170,6 +223,10 @@ pub struct WasmV3TransitionCounters {
     pub entity_page_bytes: u64,
     pub state_page_reads: u64,
     pub state_page_bytes: u64,
+    pub guest_change_cursor_nanoseconds: u64,
+    pub change_packet_decode_nanoseconds: u64,
+    pub ordered_entity_stage_nanoseconds: u64,
+    pub change_output_nanoseconds: u64,
     pub guest_linear_memory_high_water_bytes: u64,
 }
 
@@ -204,6 +261,12 @@ pub trait WasmComponentV3Actor: Send {
         input: WasmV3EntityUpdate,
     ) -> Result<WasmV3EntityTransition, LixError>;
 
+    async fn resolve_conflicts(
+        &mut self,
+        limits: WasmV3TransitionLimits,
+        input: WasmV3ConflictUpdate,
+    ) -> Result<WasmV3ConflictTransition, LixError>;
+
     async fn next_change_page(
         &mut self,
         transition: WasmV3TransitionHandle,
@@ -218,10 +281,22 @@ pub trait WasmComponentV3Actor: Send {
         max_bytes: u32,
     ) -> Result<Option<Vec<WasmV3ByteEdit>>, LixError>;
 
+    async fn next_resolution_page(
+        &mut self,
+        transition: WasmV3TransitionHandle,
+        cursor: WasmV3ResolutionCursorHandle,
+        max_bytes: u32,
+    ) -> Result<Option<Vec<WasmV3ConflictResolution>>, LixError>;
+
     async fn finish_transition(
         &mut self,
         transition: WasmV3TransitionHandle,
     ) -> Result<(Root, WasmV3TransitionCounters), LixError>;
+
+    async fn finish_conflict_transition(
+        &mut self,
+        transition: WasmV3TransitionHandle,
+    ) -> Result<WasmV3TransitionCounters, LixError>;
 
     async fn abort_transition(
         &mut self,

@@ -104,6 +104,14 @@ struct Span {
     length: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct V3ObjectIndexRecord {
+    pub schema_key: String,
+    pub id: String,
+    pub offset: u64,
+    pub len: u64,
+}
+
 #[derive(Clone, Debug)]
 pub struct Document(Arc<DocumentInner>);
 
@@ -494,6 +502,32 @@ impl Document {
         InitialChanges { changes }
     }
 
+    pub fn v3_object_index_records(&self) -> Vec<V3ObjectIndexRecord> {
+        let mut records = Vec::with_capacity(self.0.elements.len() + self.0.files.len());
+        for element in self.0.elements.iter() {
+            if let Some(span) = self.0.element_spans.get(&element.id) {
+                records.push(V3ObjectIndexRecord {
+                    schema_key: ELEMENT_SCHEMA_KEY.to_owned(),
+                    id: element.id.clone(),
+                    offset: span.offset,
+                    len: span.length,
+                });
+            }
+        }
+        for file in self.0.files.iter() {
+            if let Some(span) = self.0.file_spans.get(&file.id) {
+                records.push(V3ObjectIndexRecord {
+                    schema_key: FILE_SCHEMA_KEY.to_owned(),
+                    id: file.id.clone(),
+                    offset: span.offset,
+                    len: span.length,
+                });
+            }
+        }
+        records.sort_unstable_by_key(|record| record.offset);
+        records
+    }
+
     pub fn file_changed(
         &self,
         splices: &[InputSplice<'_>],
@@ -671,6 +705,27 @@ impl Document {
         builder.finish()
     }
 
+    pub fn open_entities_with_accepted(
+        entities: Vec<EntityRecord>,
+        accepted: Vec<u8>,
+    ) -> Result<Self, String> {
+        let (parsed, _) = Self::open_file(accepted, None, IdNamespace([0; 16]))?;
+        let expected = entities
+            .iter()
+            .map(|record| (record_key(record), record.snapshot.as_slice()))
+            .collect::<HashMap<_, _>>();
+        let actual = parsed.records()?;
+        let matches = actual.len() == expected.len()
+            && actual.iter().all(|record| {
+                expected.get(&record_key(record)).copied() == Some(record.snapshot.as_slice())
+            });
+        if matches {
+            Ok(parsed)
+        } else {
+            Self::open_entities(entities).map(|(document, _)| document)
+        }
+    }
+
     fn records(&self) -> Result<Vec<EntityRecord>, String> {
         let mut records = Vec::with_capacity(1 + self.0.elements.len() + self.0.files.len());
         records.push(self.0.scene.record()?);
@@ -689,6 +744,47 @@ impl Document {
                 .collect::<Result<Vec<_>, _>>()?,
         );
         Ok(records)
+    }
+}
+
+#[allow(dead_code)] // Shared source: called by the v3 crate, not the v2 crate.
+pub fn v3_reparse_object_snapshot(
+    schema_key: &str,
+    id: &str,
+    before_snapshot: &[u8],
+    successor_json: &[u8],
+) -> Result<Vec<u8>, String> {
+    let successor_json = std::str::from_utf8(successor_json)
+        .map_err(|error| format!("Excalidraw object is not UTF-8: {error}"))?
+        .to_owned();
+    let before = EntityRecord {
+        schema_key: schema_key.to_owned(),
+        entity_pk: vec![id.to_owned()],
+        snapshot: before_snapshot.to_vec(),
+    };
+    match schema_key {
+        ELEMENT_SCHEMA_KEY => {
+            let before = ElementEntity::parse(&before)?;
+            let successor =
+                ElementEntity::from_source(before.order_key, before.leading_json, successor_json)?;
+            if successor.id != id {
+                return Err("Excalidraw element edit changed its durable identity".to_owned());
+            }
+            successor.record().map(|record| record.snapshot)
+        }
+        FILE_SCHEMA_KEY => {
+            let before = FileEntity::parse(&before)?;
+            let successor = FileEntity::from_source(
+                id.to_owned(),
+                before.order_key,
+                before.prefix_json,
+                successor_json,
+            )?;
+            successor.record().map(|record| record.snapshot)
+        }
+        other => Err(format!(
+            "Excalidraw sparse object path does not support schema {other:?}"
+        )),
     }
 }
 

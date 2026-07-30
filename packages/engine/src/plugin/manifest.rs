@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::LixError;
-use crate::wasm::WASM_COMPONENT_V2_API_VERSION;
+use crate::wasm::{WASM_COMPONENT_V2_API_VERSION, WASM_COMPONENT_V3_API_VERSION};
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
 static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceLock::new();
@@ -15,6 +15,7 @@ static PLUGIN_MANIFEST_VALIDATOR: OnceLock<Result<JSONSchema, LixError>> = OnceL
 #[serde(rename_all = "kebab-case")]
 pub enum PluginRuntime {
     WasmComponentV2,
+    WasmComponentV3,
 }
 
 /// Durable byte-materialization contract for a Component-v2 plugin.
@@ -138,11 +139,15 @@ pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, 
 /// durable-registry boundaries. The latter matters because registry snapshots
 /// can outlive the process that originally validated an archive.
 pub(crate) fn validate_runtime_api_version(manifest: &PluginManifest) -> Result<(), LixError> {
-    if manifest.api_version != WASM_COMPONENT_V2_API_VERSION {
+    let (runtime, required) = match manifest.runtime {
+        PluginRuntime::WasmComponentV2 => ("wasm-component-v2", WASM_COMPONENT_V2_API_VERSION),
+        PluginRuntime::WasmComponentV3 => ("wasm-component-v3", WASM_COMPONENT_V3_API_VERSION),
+    };
+    if manifest.api_version != required {
         return Err(LixError::new(
             LixError::CODE_INVALID_PLUGIN,
             format!(
-                "wasm-component-v2 requires api_version '{WASM_COMPONENT_V2_API_VERSION}', got '{}'",
+                "{runtime} requires api_version '{required}', got '{}'",
                 manifest.api_version
             ),
         ));

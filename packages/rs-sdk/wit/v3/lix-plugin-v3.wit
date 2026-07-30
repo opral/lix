@@ -1,5 +1,7 @@
-package lix:plugin@3.0.0;
+package lix:plugin@3.2.0;
 
+/// Host-owned immutable arenas. Resource handles are capabilities scoped to
+/// one plugin generation; they never expose storage addresses or host memory.
 interface arena {
   type bytes = list<u8>;
 
@@ -42,6 +44,54 @@ interface arena {
     pages: list<semantic-page>,
   }
 
+  enum conflict-side {
+    base,
+    a,
+    b,
+  }
+
+  /// One host-owned semantic conflict. Snapshot bytes stay in the host until
+  /// the resolver explicitly reads one side.
+  record conflict-summary {
+    ordinal: u64,
+    key: bytes,
+    base-length: option<u64>,
+    a-length: option<u64>,
+    b-length: option<u64>,
+  }
+
+  record conflict-page {
+    next-ordinal: option<u64>,
+    entries: list<conflict-summary>,
+  }
+
+  /// Ordered immutable conflict arena. `a` and `b` are already canonicalized
+  /// by durable `(updated-at, change-id)`, so resolution is independent of
+  /// merge direction.
+  resource conflict-set {
+    scan: func(
+      budget: borrow<budget>,
+      after-ordinal: option<u64>,
+      max-bytes: u32,
+    ) -> result<conflict-page, arena-error>;
+    read-value: func(
+      budget: borrow<budget>,
+      ordinal: u64,
+      side: conflict-side,
+      offset: u64,
+      length: u32,
+    ) -> result<bytes, arena-error>;
+  }
+
+  record byte-record-locator {
+    offset: u64,
+    length: u64,
+    ordinal: u64,
+    content: bytes,
+  }
+
+  /// One accepted immutable version. The host may evict decoded pages while
+  /// retaining the content-addressed root in durable storage.
   resource root {
     generation: func() -> string;
     file-len: func() -> u64;
@@ -50,6 +100,14 @@ interface arena {
       offset: u64,
       length: u32,
     ) -> result<bytes, arena-error>;
+    locate-file-record: func(
+      budget: borrow<budget>,
+      range-offset: u64,
+      range-length: u64,
+      position: u64,
+      delimiter: u8,
+      forbidden: bytes,
+    ) -> result<option<byte-record-locator>, arena-error>;
     get-entity: func(
       budget: borrow<budget>,
       key: bytes,
@@ -75,6 +133,11 @@ interface arena {
     ) -> result<keyed-page, arena-error>;
   }
 
+  /// Host-staged successor. It is initially a structural alias of `before`
+  /// with the already verified candidate file rope. Guest calls may replace
+  /// only opaque state keys. The host applies validated semantic output to the
+  /// entity arena and publishes all three arenas as one root after every
+  /// output cursor reaches valid EOF. Dropping this resource rolls back.
   resource transaction {
     file-len: func() -> result<u64, arena-error>;
     read-file: func(
@@ -82,6 +145,14 @@ interface arena {
       offset: u64,
       length: u32,
     ) -> result<bytes, arena-error>;
+    locate-file-record: func(
+      budget: borrow<budget>,
+      range-offset: u64,
+      range-length: u64,
+      position: u64,
+      delimiter: u8,
+      forbidden: bytes,
+    ) -> result<option<byte-record-locator>, arena-error>;
     get-entity: func(
       budget: borrow<budget>,
       key: bytes,
@@ -114,11 +185,14 @@ interface arena {
       budget: borrow<budget>,
       key: bytes,
     ) -> result<_, arena-error>;
+    /// Enables the host's append-only fast path. The guest must subsequently
+    /// emit strictly increasing durable entity keys for the whole transition.
+    declare-ordered-entity-output: func() -> result<_, arena-error>;
   }
 }
 
 interface api {
-  use arena.{budget, root, transaction};
+  use arena.{budget, conflict-set, conflict-side, root, transaction};
   type bytes = list<u8>;
 
   variant plugin-error {
@@ -136,6 +210,9 @@ interface api {
     generation: string,
   }
 
+  /// Deterministic UUIDv7 namespace allocated by the host for one transition.
+  /// Plugins derive IDs by stable local ordinal; the seed contains no host
+  /// storage address or mutable global state.
   record create-context {
     high: u64,
     low: u64,
@@ -176,22 +253,53 @@ interface api {
   }
 
   resource change-cursor {
+    /// Returns a bounded binary packet of complete sparse changes. Empty
+    /// packets are invalid; keys are unique over the complete cursor and EOF
+    /// is permanent.
     next: func(
       budget: borrow<budget>,
       max-bytes: u32,
-    ) -> result<option<list<entity-change>>, plugin-error>;
+    ) -> result<option<bytes>, plugin-error>;
   }
 
   resource edit-cursor {
+    /// All coordinates address the immutable accepted base in `root`.
     next: func(
       budget: borrow<budget>,
       max-bytes: u32,
     ) -> result<option<list<byte-edit>>, plugin-error>;
   }
 
+  record conflict-replacement {
+    snapshot: bytes,
+    format-only: bool,
+  }
+
+  variant conflict-choice {
+    take-base,
+    take-a,
+    take-b,
+    replace(conflict-replacement),
+    delete,
+  }
+
+  record conflict-resolution {
+    ordinal: u64,
+    choice: conflict-choice,
+  }
+
+  resource resolution-cursor {
+    /// Results are globally ordered and exactly one result must be returned
+    /// for every conflict ordinal.
+    next: func(
+      budget: borrow<budget>,
+      max-bytes: u32,
+    ) -> result<option<list<conflict-resolution>>, plugin-error>;
+  }
+
   record file-transition {
     successor: own<transaction>,
-    first-changes: list<entity-change>,
+    first-change-packet: bytes,
     changes: option<own<change-cursor>>,
   }
 
@@ -199,6 +307,11 @@ interface api {
     successor: own<transaction>,
     first-edits: list<byte-edit>,
     edits: option<own<edit-cursor>>,
+  }
+
+  record conflict-transition {
+    first-resolutions: list<conflict-resolution>,
+    resolutions: option<own<resolution-cursor>>,
   }
 
   record open-file-input {
@@ -233,6 +346,14 @@ interface api {
     creates: create-context,
   }
 
+  record conflict-update {
+    descriptor: file-descriptor,
+    conflicts: own<conflict-set>,
+  }
+
+  /// v3.2 has no guest-owned document resource. Every accepted version is a
+  /// host root; every operation returns a transaction that can publish exactly
+  /// one immutable successor after sparse output validation.
   open-file: func(budget: borrow<budget>, input: open-file-input)
     -> result<file-transition, plugin-error>;
   file-changed: func(budget: borrow<budget>, input: file-update)
@@ -241,6 +362,10 @@ interface api {
     -> result<entity-transition, plugin-error>;
   entities-changed: func(budget: borrow<budget>, input: entity-update)
     -> result<entity-transition, plugin-error>;
+  /// Resolves only colliding durable entities. Snapshot bytes remain in the
+  /// host conflict arena unless the plugin reads a bounded range.
+  resolve-conflicts: func(budget: borrow<budget>, input: conflict-update)
+    -> result<conflict-transition, plugin-error>;
 }
 
 world plugin {

@@ -18,17 +18,22 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::wasm::v3::{
+    WasmComponentV3Actor, WasmV3ByteEdit, WasmV3EntityTransition, WasmV3FileTransition,
+    WasmV3TransitionCounters, WasmV3TransitionLimits,
+};
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
-    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmChangeDrainValidator, WasmChangePage,
-    WasmComponentV2Actor, WasmConflictResolution, WasmConflictResolutionDrainValidator,
-    WasmConflictResolutionPage, WasmConflictTransition, WasmDocumentHandle, WasmEditDrainValidator,
-    WasmEditPage, WasmEntity, WasmEntityChange, WasmEntityChangeSource, WasmEntityChanges,
-    WasmEntityConflict, WasmEntityConflictPage, WasmEntityConflictSource, WasmEntityPage,
-    WasmEntitySource, WasmEntityTransition, WasmFileTransition, WasmGuestBytes, WasmHostBytes,
-    WasmHostConflictResolution, WasmHostEntity, WasmHostEntityChanges, WasmInputBytes,
-    WasmInputSplice, WasmOutputRange, WasmSourceRange, WasmTransitionCounters,
-    WasmTransitionHandle, WasmTransitionLimits, validate_change_cursor_key_uniqueness,
+    WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmChangeDrainValidator, WasmChangeEffect,
+    WasmChangePage, WasmComponentV2Actor, WasmConflictResolution,
+    WasmConflictResolutionDrainValidator, WasmConflictResolutionPage, WasmConflictTransition,
+    WasmDocumentHandle, WasmEditDrainValidator, WasmEditPage, WasmEntity, WasmEntityChange,
+    WasmEntityChangeSource, WasmEntityChanges, WasmEntityConflict, WasmEntityConflictPage,
+    WasmEntityConflictSource, WasmEntityPage, WasmEntitySource, WasmEntityTransition,
+    WasmFileTransition, WasmGuestBytes, WasmHostBytes, WasmHostConflictResolution, WasmHostEntity,
+    WasmHostEntityChanges, WasmInputBytes, WasmInputSplice, WasmOutputRange, WasmSourceRange,
+    WasmTransitionCounters, WasmTransitionHandle, WasmTransitionLimits,
+    validate_change_cursor_key_uniqueness,
 };
 use crate::{Blob, LixError};
 
@@ -173,7 +178,7 @@ pub(crate) fn host_entity_with_lazy_snapshot(
 pub(crate) fn host_entity_change_with_lazy_snapshot(
     key: crate::wasm::WasmEntityKey,
     snapshot: Bytes,
-    effect: crate::wasm::WasmChangeEffect,
+    effect: WasmChangeEffect,
     limits: WasmTransitionLimits,
 ) -> Result<WasmEntityChange<WasmHostBytes>, LixError> {
     let limits = limits.validate()?;
@@ -736,6 +741,21 @@ pub(crate) fn canonicalize_v2_snapshot(bytes: &[u8]) -> Result<Vec<u8>, LixError
     let mut canonical = Vec::new();
     encode_number_free_json(&value, &mut canonical)?;
     Ok(canonical)
+}
+
+pub(crate) fn canonicalize_v3_plugin_snapshot(
+    bytes: Vec<u8>,
+    key: &crate::wasm::WasmEntityKey,
+    schemas: &V2SchemaAllowlist,
+) -> Result<WasmCanonicalJson, LixError> {
+    schemas.validate(&key.schema_key)?;
+    let mut batch = CanonicalJsonBatchBuilder::with_row_capacity(1);
+    batch.push_plugin(Bytes::from(bytes), key, schemas)?;
+    batch
+        .finish()?
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid_guest("v3.2 canonical snapshot batch is empty"))
 }
 
 #[derive(Debug)]
@@ -1628,6 +1648,20 @@ pub(crate) struct ValidatedFileTransition {
     pub(crate) counters: WasmTransitionCounters,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedV3FileTransition {
+    pub(crate) root: lix_plugin_arena::Root,
+    pub(crate) changes: WasmHostEntityChanges,
+    pub(crate) counters: WasmV3TransitionCounters,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedV3EntityTransition {
+    pub(crate) root: lix_plugin_arena::Root,
+    pub(crate) edits: Vec<WasmV3ByteEdit>,
+    pub(crate) counters: WasmV3TransitionCounters,
+}
+
 /// Fully drained static conflict-resolution output. Results remain aligned to
 /// the caller's conflict list; the merge planner owns the entity keys and
 /// historical rows used by a `Take` result.
@@ -1686,6 +1720,149 @@ pub(crate) async fn drain_file_transition_changes(
     match drain_file_transition_changes_inner(actor, transition, schemas, limits).await {
         Ok(validated) => Ok(validated),
         Err(error) => Err(cleanup_rejected_transition(actor, transition_handle, error).await),
+    }
+}
+
+/// Drains a v3.2 file transition into engine-owned canonical rows before
+/// publishing its immutable arena root. The actor's arena transaction is
+/// aborted on any schema, identity, JSON, ordering, or budget failure.
+pub(crate) async fn drain_v3_file_transition_changes(
+    actor: &mut dyn WasmComponentV3Actor,
+    transition: WasmV3FileTransition,
+    schemas: &V2SchemaAllowlist,
+    limits: WasmV3TransitionLimits,
+) -> Result<ValidatedV3FileTransition, LixError> {
+    let transition_handle = transition.transition;
+    match drain_v3_file_transition_changes_inner(actor, transition, schemas, limits).await {
+        Ok(validated) => Ok(validated),
+        Err(error) => {
+            let _ = actor.abort_transition(transition_handle).await;
+            Err(error)
+        }
+    }
+}
+
+async fn drain_v3_file_transition_changes_inner(
+    actor: &mut dyn WasmComponentV3Actor,
+    transition: WasmV3FileTransition,
+    schemas: &V2SchemaAllowlist,
+    limits: WasmV3TransitionLimits,
+) -> Result<ValidatedV3FileTransition, LixError> {
+    let mut seen = BTreeSet::new();
+    let mut changes = Vec::new();
+    loop {
+        let Some(page) = actor
+            .next_change_page(
+                transition.transition,
+                transition.changes,
+                limits.max_page_bytes,
+            )
+            .instrument(tracing::debug_span!(
+                target: "lix_perf",
+                "lix.perf.plugin_v3_drain_next_page"
+            ))
+            .await?
+        else {
+            break;
+        };
+        let snapshot_count = page
+            .iter()
+            .filter(|change| change.snapshot.is_some())
+            .count();
+        let page_start = changes.len();
+        let mut snapshots = CanonicalJsonBatchBuilder::with_row_capacity(snapshot_count);
+        for change in page {
+            schemas.validate(&change.schema_key)?;
+            let key =
+                crate::wasm::WasmEntityKey::from_owned_parts(change.schema_key, change.entity_pk);
+            if !seen.insert(key.clone()) {
+                return Err(invalid_guest("v3 change cursor repeated an entity key"));
+            }
+            match change.snapshot {
+                Some(snapshot) => {
+                    snapshots.push_plugin(Bytes::from(snapshot), &key, schemas)?;
+                    changes.push(WasmEntityChange::Upsert {
+                        entity: WasmEntity {
+                            key,
+                            snapshot_content: WasmHostBytes::Inline(Bytes::new()),
+                        },
+                        effect: if change.format_only {
+                            WasmChangeEffect::FormatOnly
+                        } else {
+                            WasmChangeEffect::Content
+                        },
+                    });
+                }
+                None => {
+                    if change.format_only {
+                        return Err(invalid_guest("v3 deletion cannot be marked format-only"));
+                    }
+                    changes.push(WasmEntityChange::Delete(key));
+                }
+            }
+        }
+
+        let mut canonical = snapshots.finish()?.into_iter();
+        for change in &mut changes[page_start..] {
+            if let WasmEntityChange::Upsert { entity, .. } = change {
+                entity.snapshot_content = WasmHostBytes::CanonicalJson(
+                    canonical
+                        .next()
+                        .expect("one canonical snapshot exists for every v3 upsert"),
+                );
+            }
+        }
+        debug_assert!(canonical.next().is_none());
+    }
+    let (root, counters) = actor
+        .finish_transition(transition.transition)
+        .instrument(tracing::debug_span!(
+            target: "lix_perf",
+            "lix.perf.plugin_v3_drain_finish"
+        ))
+        .await?;
+    Ok(ValidatedV3FileTransition {
+        root,
+        changes: WasmEntityChanges { changes },
+        counters,
+    })
+}
+
+pub(crate) async fn drain_v3_entity_transition_edits(
+    actor: &mut dyn WasmComponentV3Actor,
+    transition: WasmV3EntityTransition,
+    limits: WasmV3TransitionLimits,
+) -> Result<ValidatedV3EntityTransition, LixError> {
+    let transition_handle = transition.transition;
+    let result = async {
+        let mut edits = Vec::new();
+        loop {
+            let Some(page) = actor
+                .next_edit_page(
+                    transition.transition,
+                    transition.edits,
+                    limits.max_page_bytes,
+                )
+                .await?
+            else {
+                break;
+            };
+            edits.extend(page);
+        }
+        let (root, counters) = actor.finish_transition(transition.transition).await?;
+        Ok(ValidatedV3EntityTransition {
+            root,
+            edits,
+            counters,
+        })
+    }
+    .await;
+    match result {
+        Ok(validated) => Ok(validated),
+        Err(error) => {
+            let _ = actor.abort_transition(transition_handle).await;
+            Err(error)
+        }
     }
 }
 

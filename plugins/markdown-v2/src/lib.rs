@@ -1,5 +1,6 @@
 //! GitHub Flavored Markdown guest for the Lix Wasm Component plugin API v2.
 
+#[cfg(feature = "component-v2")]
 mod bindings;
 mod core;
 mod markdown_file;
@@ -9,6 +10,7 @@ pub mod schemas;
 pub use core::{
     ByteEdit, ChangeEffect, DetectedChange, Document, EntityChange, EntityRecord, EntityState,
     File, IdNamespace, InputSplice, MarkdownPlugin, NODE_SCHEMA_KEY, PluginError,
+    V3TopLevelIndexRecord, v3_reidentify_snapshot, v3_single_top_level_snapshot,
 };
 
 pub const MANIFEST_JSON: &str = include_str!("../manifest.json");

@@ -19,6 +19,21 @@
       "type": "integer",
       "minimum": 0,
       "description": "Logical uncompressed file size in bytes for the referenced binary payload."
+    },
+    "plugin_arena_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Optional CAS hash of the canonical v3.2 immutable arena archive."
+    },
+    "plugin_arena_root": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Optional v3.2 arena root digest authenticated by plugin_arena_hash."
+    },
+    "plugin_generation": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Installed plugin archive generation that owns the arena root."
     }
   },
   "required": [
