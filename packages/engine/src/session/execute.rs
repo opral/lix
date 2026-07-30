@@ -3973,6 +3973,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_declines_uncertified_entity_insert_rows() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_fallback_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": {
+                    "type": "object",
+                    "properties": { "ok": { "type": "boolean" } },
+                    "required": ["ok"],
+                    "additionalProperties": false
+                }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+
+        sql2::take_certified_entity_insert_parameter_batch_executions();
+        let sql =
+            "INSERT INTO parameter_insert_fallback_probe (id, value) VALUES ($1, lix_json($2))";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("\"invalid-shape\"".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("not-json".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the first row's schema failure must precede later expression evaluation");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(error.details.unwrap()["statementIndex"], 0);
+        assert_eq!(
+            sql2::take_certified_entity_insert_parameter_batch_executions(),
+            0
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({

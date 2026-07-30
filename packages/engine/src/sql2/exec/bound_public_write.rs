@@ -125,7 +125,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     for row_index in 0..parameter_batch.num_rows() {
         let params = super::write::parameter_row(parameter_batch, row_index)
             .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-        let mut row = if let Some(row) = certified_entity_insert_batch(
+        let Some(mut row) = certified_entity_insert_batch(
             ctx,
             plan,
             &spec,
@@ -135,22 +135,8 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
             active_branch_commit_id.as_ref(),
         )
         .map_err(|error| with_parameter_batch_statement_index(error, row_index))?
-        {
-            row
-        } else {
-            let mut row = RawWriteBatch::with_capacity(1);
-            append_entity_insert_row(
-                &mut row,
-                ctx,
-                plan,
-                &spec,
-                &layout,
-                &values.rows[0],
-                &params,
-                active_branch_commit_id.as_ref(),
-            )
-            .map_err(|error| with_parameter_batch_statement_index(error, row_index))?;
-            row
+        else {
+            return Ok(None);
         };
         if row.len() != 1 {
             return Ok(None);
