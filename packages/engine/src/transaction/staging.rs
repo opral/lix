@@ -1898,16 +1898,24 @@ impl crate::live_state::StagedLiveStateRows for PreparedStateRowOverlay {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        let StagedPreparedRows::Indexed { rows, .. } = &*rows_guard else {
+        let StagedPreparedRows::Indexed {
+            rows, by_candidate, ..
+        } = &*rows_guard
+        else {
             return Ok(false);
         };
-        for index in 0..rows.len() {
-            let row = rows.row(index);
-            if row.schema_key.as_str()
-                != crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
-                || row.branch_id.as_str() != branch_id
-                || row.snapshot.is_none()
-            {
+        let Some(marker_slots) = by_candidate
+            .slots_by_schema
+            .get(crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY)
+        else {
+            return Ok(false);
+        };
+        for slot in marker_slots {
+            let RowSlot::State(index) = *slot;
+            let Some(row) = rows.get(index) else {
+                continue;
+            };
+            if row.branch_id.as_str() != branch_id || row.snapshot.is_none() {
                 continue;
             }
             let (target_schema_key, target_file_id) =
