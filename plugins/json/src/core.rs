@@ -1252,8 +1252,10 @@ impl Document {
     ) -> Result<Option<EntityChange>, String> {
         let kind = match parse_complete_scalar(scalar) {
             Ok(kind) => kind,
-            Err(error) if error == "expected a JSON scalar, got a container" => return Ok(None),
-            Err(error) => return Err(error),
+            // The indexed scalar span may now contain adjacent structural
+            // syntax (for example `1,"b":2`). That is a valid optimization
+            // miss: the complete-document fallback owns validation.
+            Err(_) => return Ok(None),
         };
         let scalar = std::str::from_utf8(scalar)
             .map_err(|error| format!("JSON scalar must be UTF-8: {error}"))?;

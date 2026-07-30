@@ -754,4 +754,24 @@ mod tests {
         assert!(!add_element_shift(&mut shifts, u32::MAX, 1).expect("request index rebuild"));
         assert_eq!(encode_shifts(&shifts).len(), MAX_ELEMENT_SHIFT_RECORDS * 12);
     }
+
+    #[test]
+    fn sparse_element_path_falls_back_when_edit_adds_an_element() {
+        let element_and_sibling = concat!(
+            r#"{"id":"a","type":"rectangle"}"#,
+            ",",
+            r#"{"id":"b","type":"ellipse"}"#
+        );
+
+        assert_eq!(
+            Document::element_change_from_source(
+                "a",
+                "80".to_owned(),
+                String::new(),
+                element_and_sibling.to_owned(),
+            )
+            .expect("structural edit is an optimization miss"),
+            None
+        );
+    }
 }

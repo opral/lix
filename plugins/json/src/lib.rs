@@ -1217,4 +1217,25 @@ mod tests {
             records
         );
     }
+
+    #[test]
+    fn scalar_sparse_path_falls_back_when_edit_adds_a_sibling() {
+        let metadata = ArenaJsonScalar {
+            start: 5,
+            length: 1,
+            relation: ArenaJsonRelation::Object,
+            entity_pk: vec!["root".to_owned(), "a".to_owned()],
+            parent_id: None,
+            order_key: Some("80".to_owned()),
+            prefix_json: Some("\"a\":".to_owned()),
+            suffix_json: None,
+            empty_json: None,
+        };
+
+        assert_eq!(
+            Document::scalar_change_from_arena(metadata, br#"1,"b":2"#)
+                .expect("structural edit is an optimization miss"),
+            None
+        );
+    }
 }

@@ -230,12 +230,21 @@ impl ElementEntity {
         leading_json: String,
         element_json: String,
     ) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(&element_json)
+            .map_err(|error| format!("invalid Excalidraw element JSON: {error}"))?;
+        Self::from_parsed_source(order_key, leading_json, element_json, value)
+    }
+
+    fn from_parsed_source(
+        order_key: String,
+        leading_json: String,
+        element_json: String,
+        value: Value,
+    ) -> Result<Self, String> {
         validate_order_key(&order_key)?;
         if !is_json_whitespace(&leading_json) {
             return Err("element leading_json must contain only JSON whitespace".to_owned());
         }
-        let value: Value = serde_json::from_str(&element_json)
-            .map_err(|error| format!("invalid Excalidraw element JSON: {error}"))?;
         let object = value
             .as_object()
             .ok_or_else(|| "Excalidraw elements must be JSON objects".to_owned())?;
@@ -533,7 +542,15 @@ impl Document {
         leading_json: String,
         element_json: String,
     ) -> Result<Option<EntityChange>, String> {
-        let element = ElementEntity::from_source(order_key, leading_json, element_json)?;
+        let value = match serde_json::from_str(&element_json) {
+            Ok(value) => value,
+            // A structural insertion can make the old element span contain
+            // two adjacent objects. Let the full-document path validate and
+            // reconcile that successor instead of rejecting it here.
+            Err(_) => return Ok(None),
+        };
+        let element =
+            ElementEntity::from_parsed_source(order_key, leading_json, element_json, value)?;
         if element.id != id {
             return Ok(None);
         }

@@ -2502,6 +2502,42 @@ async fn json_scalar_to_container_edit_uses_full_reconciliation() {
 }
 
 #[tokio::test]
+async fn json_scalar_boundary_insert_adds_sibling_through_full_reconciliation() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_json",
+        &build_json_plugin_archive(),
+        &["json_root", "json_object_member", "json_array_item"],
+    )
+    .await;
+
+    let path = "/scalar-sibling.json";
+    write_file(&lix, path, br#"{"a":1}"#.to_vec())
+        .await
+        .unwrap();
+    let successor = br#"{"a":1,"b":2}"#.to_vec();
+    write_file(&lix, path, successor.clone())
+        .await
+        .expect("a scalar-boundary sibling insertion must fall back to full reconciliation");
+
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
+    let members = lix
+        .execute(
+            "SELECT key, scalar_json FROM json_object_member ORDER BY key",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members.rows()[0].get::<String>("key").unwrap(), "a");
+    assert_eq!(members.rows()[1].get::<String>("key").unwrap(), "b");
+    assert_eq!(members.rows()[1].get::<String>("scalar_json").unwrap(), "2");
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn v2_json_roundtrips_recursive_state_and_keeps_leaf_edits_sparse() {
     let archive = build_json_plugin_archive();
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
@@ -5594,6 +5630,45 @@ async fn v2_excalidraw_roundtrips_and_renders_local_element_edits() {
         .collect::<Vec<_>>();
     assert_eq!(ids, ["b", "c"]);
     assert_eq!(read_file(&lix, path).await.unwrap(), Some(renamed));
+
+    lix.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn excalidraw_element_boundary_insert_adds_element_through_full_reconciliation() {
+    let lix = open_lix(OpenLixOptions::default()).await.unwrap();
+    install_reference_plugin_in_blank_registry(
+        &lix,
+        "plugin_excalidraw",
+        &build_excalidraw_plugin_archive(),
+        &["excalidraw_scene", "excalidraw_element", "excalidraw_file"],
+    )
+    .await;
+
+    let path = "/element-insert.excalidraw";
+    let before =
+        br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle"}]}"#.to_vec();
+    write_file(&lix, path, before).await.unwrap();
+    let successor = br#"{"type":"excalidraw","version":2,"elements":[{"id":"a","type":"rectangle"},{"id":"b","type":"ellipse"}]}"#.to_vec();
+    write_file(&lix, path, successor.clone())
+        .await
+        .expect("an element-boundary insertion must fall back to full reconciliation");
+
+    assert_eq!(read_file(&lix, path).await.unwrap(), Some(successor));
+    let elements = lix
+        .execute(
+            "SELECT id, element_type FROM excalidraw_element ORDER BY id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(elements.len(), 2);
+    assert_eq!(elements.rows()[0].get::<String>("id").unwrap(), "a");
+    assert_eq!(elements.rows()[1].get::<String>("id").unwrap(), "b");
+    assert_eq!(
+        elements.rows()[1].get::<String>("element_type").unwrap(),
+        "ellipse"
+    );
 
     lix.close().await.unwrap();
 }
