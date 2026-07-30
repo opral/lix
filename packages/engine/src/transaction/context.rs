@@ -971,6 +971,25 @@ where
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, None).await
+    }
+
+    async fn stage_parameter_batch_insert(
+        &mut self,
+        write: TransactionWrite,
+        statement_indices: Vec<u32>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write_inner(write, Some(statement_indices)).await
+    }
+
+    async fn stage_write_inner(
+        &mut self,
+        write: TransactionWrite,
+        statement_indices: Option<Vec<u32>>,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        if let Some(statement_indices) = &statement_indices {
+            debug_assert_eq!(statement_indices.len(), transaction_write_row_count(&write));
+        }
         // Staging is transaction-local. Commit validates and materializes from
         // one coherent snapshot, then fences that snapshot in the durable
         // write. Re-checking it for every staged batch only repeats point
@@ -1022,6 +1041,15 @@ where
                 return Err(error);
             }
         };
+        if let Some(statement_indices) = &statement_indices
+            && statement_indices.len() != prepared_transaction_write_rows(&write).len()
+        {
+            discard_plugin_actor_publications(actor_publications).await;
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "parameter batch normalization changed row cardinality",
+            ));
+        }
         if let Err(error) = self
             .preflight_derived_path_stability_before_stage(&write)
             .instrument(tracing::debug_span!(
@@ -1035,12 +1063,17 @@ where
         }
         let affects_filesystem_path_index =
             prepared_transaction_write_affects_filesystem_path_index(&write);
-        let outcome = match tracing::debug_span!(
+        let stage_result = tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.transaction_buffer_stage"
         )
-        .in_scope(|| self.staged_writes.stage_write(write))
-        {
+        .in_scope(|| match statement_indices {
+            Some(indices) => self
+                .staged_writes
+                .stage_parameter_batch_insert(write, indices),
+            None => self.staged_writes.stage_write(write),
+        });
+        let outcome = match stage_result {
             Ok(outcome) => outcome,
             Err(error) => {
                 discard_plugin_actor_publications(actor_publications).await;
@@ -6294,6 +6327,31 @@ where
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError> {
         Self::stage_write(self, write).await
+    }
+
+    async fn stage_parameter_batch_insert(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        let statement_indices = (0..rows.len())
+            .map(|index| {
+                u32::try_from(index).map_err(|_| {
+                    LixError::new(
+                        LixError::CODE_INVALID_PARAM,
+                        "parameter batch row count exceeds u32",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::stage_parameter_batch_insert(
+            self,
+            TransactionWrite::Rows {
+                mode: TransactionWriteMode::Insert,
+                rows,
+            },
+            statement_indices,
+        )
+        .await
     }
 
     async fn execute_diff_command(

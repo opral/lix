@@ -24,7 +24,9 @@ use crate::live_state::{
 use crate::plugin::PluginRuntimeHost;
 use crate::storage_adapter::StorageAdapterRead;
 use crate::tracked_state::TrackedStateScanRequest;
-use crate::transaction::types::{TransactionWrite, TransactionWriteOutcome};
+use crate::transaction::types::{
+    RawWriteBatch, TransactionWrite, TransactionWriteMode, TransactionWriteOutcome,
+};
 use crate::wasm::UnsupportedWasmRuntime;
 
 use super::change_materialization::MaterializedChange;
@@ -208,6 +210,17 @@ pub(crate) trait SqlWriteExecutionContext: Send {
         &mut self,
         write: TransactionWrite,
     ) -> Result<TransactionWriteOutcome, LixError>;
+
+    async fn stage_parameter_batch_insert(
+        &mut self,
+        rows: RawWriteBatch,
+    ) -> Result<TransactionWriteOutcome, LixError> {
+        self.stage_write(TransactionWrite::Rows {
+            mode: TransactionWriteMode::Insert,
+            rows,
+        })
+        .await
+    }
 
     async fn execute_diff_command(
         &mut self,

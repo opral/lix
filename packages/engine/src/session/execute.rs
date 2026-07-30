@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::ops::ControlFlow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::branch::BranchRefReader;
@@ -1342,72 +1343,86 @@ where
         idempotency: Option<ExecuteIdempotency>,
     ) -> Result<Vec<ExecuteResult>, LixError> {
         let telemetry_sink = self.telemetry.clone();
-        self.with_write_transaction(move |transaction| {
-            Box::pin(async move {
-                if let Some(results) = try_execute_transaction_parameter_batch(
-                    transaction,
-                    &statements,
-                    &parsed,
-                    &options,
-                    &statement_metadata,
-                    telemetry_sink.as_ref(),
-                )
-                .await?
-                {
+        let statements = Arc::new(statements);
+        let transaction_statements = Arc::clone(&statements);
+        let parameter_route = Arc::new(AtomicBool::new(false));
+        let transaction_parameter_route = Arc::clone(&parameter_route);
+        let transaction_telemetry_sink = telemetry_sink.clone();
+        let result = self
+            .with_write_transaction(move |transaction| {
+                Box::pin(async move {
+                    if let Some(results) = try_execute_transaction_parameter_batch(
+                        transaction,
+                        &transaction_statements,
+                        &parsed,
+                        &options,
+                        &statement_metadata,
+                        &transaction_parameter_route,
+                    )
+                    .await?
+                    {
+                        if let Some(idempotency) = &idempotency {
+                            let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
+                            transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
+                        }
+                        return Ok(results);
+                    }
+                    let mut results = Vec::with_capacity(transaction_statements.len());
+                    let parsed = parsed.into_vec();
+                    for (statement_index, ((statement, parsed), metadata)) in transaction_statements
+                        .iter()
+                        .zip(parsed)
+                        .zip(statement_metadata)
+                        .enumerate()
+                    {
+                        let telemetry = SqlStatementTelemetry::start(
+                            transaction_telemetry_sink.as_ref(),
+                            &statement.sql,
+                            "batch",
+                            Some(statement_index),
+                        );
+                        let operation = async {
+                            execute_transaction_statement(
+                                transaction,
+                                &statement.sql,
+                                parsed,
+                                &statement.params,
+                                options.clone(),
+                                metadata,
+                            )
+                            .await
+                            .map_err(|error| {
+                                with_batch_statement_index(
+                                    normalize_sql_surface_error(error, &statement.sql),
+                                    statement_index,
+                                )
+                            })
+                        };
+                        let result = match telemetry.as_ref() {
+                            Some(telemetry) => telemetry.instrument(operation).await,
+                            None => operation.await,
+                        };
+                        if let Some(telemetry) = telemetry {
+                            telemetry.finish(&result);
+                        }
+                        results.push(result?);
+                    }
                     if let Some(idempotency) = &idempotency {
                         let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
                         transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
                     }
-                    return Ok(results);
-                }
-                let mut results = Vec::with_capacity(statements.len());
-                let parsed = parsed.into_vec();
-                for (statement_index, ((statement, parsed), metadata)) in statements
-                    .iter()
-                    .zip(parsed)
-                    .zip(statement_metadata)
-                    .enumerate()
-                {
-                    let telemetry = SqlStatementTelemetry::start(
-                        telemetry_sink.as_ref(),
-                        &statement.sql,
-                        "batch",
-                        Some(statement_index),
-                    );
-                    let operation = async {
-                        execute_transaction_statement(
-                            transaction,
-                            &statement.sql,
-                            parsed,
-                            &statement.params,
-                            options.clone(),
-                            metadata,
-                        )
-                        .await
-                        .map_err(|error| {
-                            with_batch_statement_index(
-                                normalize_sql_surface_error(error, &statement.sql),
-                                statement_index,
-                            )
-                        })
-                    };
-                    let result = match telemetry.as_ref() {
-                        Some(telemetry) => telemetry.instrument(operation).await,
-                        None => operation.await,
-                    };
-                    if let Some(telemetry) = telemetry {
-                        telemetry.finish(&result);
-                    }
-                    results.push(result?);
-                }
-                if let Some(idempotency) = &idempotency {
-                    let receipt = ExecuteIdempotencyReceipt::batch(idempotency, &results)?;
-                    transaction.stage_execute_idempotency_receipt(idempotency, &receipt)?;
-                }
-                Ok(results)
+                    Ok(results)
+                })
             })
-        })
-        .await
+            .await;
+        if parameter_route.load(Ordering::Relaxed) {
+            finish_parameter_batch_statement_telemetry(
+                telemetry_sink.as_ref(),
+                &statements,
+                &result,
+            );
+        }
+        result
     }
 
     async fn execute_read_only_batch(
@@ -2222,7 +2237,7 @@ async fn try_execute_transaction_parameter_batch<StorageImpl>(
     parsed: &TransactionBatchStatements,
     options: &ExecuteOptions,
     statement_metadata: &[ExecuteStatementMetadata],
-    telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
+    parameter_route: &AtomicBool,
 ) -> Result<Option<Vec<ExecuteResult>>, LixError>
 where
     StorageImpl: Storage + Clone + Send + Sync + 'static,
@@ -2286,17 +2301,19 @@ where
                 with_batch_statement_index(error, 0)
             }
         });
-    finish_parameter_batch_statement_telemetry(telemetry_sink, statements, &result);
+    if !matches!(result, Ok(None)) {
+        parameter_route.store(true, Ordering::Relaxed);
+    }
     result
 }
 
 fn finish_parameter_batch_statement_telemetry(
     telemetry_sink: Option<&Arc<dyn crate::telemetry::TelemetrySink>>,
     statements: &[ExecuteBatchStatement],
-    result: &Result<Option<Vec<ExecuteResult>>, LixError>,
+    result: &Result<Vec<ExecuteResult>, LixError>,
 ) {
     match result {
-        Ok(Some(results)) => {
+        Ok(results) => {
             for (statement_index, (statement, result)) in statements.iter().zip(results).enumerate()
             {
                 let Some(telemetry) = SqlStatementTelemetry::start(
@@ -2325,7 +2342,6 @@ fn finish_parameter_batch_statement_telemetry(
             };
             telemetry.finish(&Err(error.clone()));
         }
-        Ok(None) => {}
     }
 }
 
@@ -4026,13 +4042,14 @@ mod tests {
             len: first_statements.len(),
         };
         let mut first_transaction = first.begin_transaction().await.unwrap();
+        let parameter_route = AtomicBool::new(false);
         let staged = try_execute_transaction_parameter_batch(
             first_transaction.transaction_mut().unwrap(),
             &first_statements,
             &parsed,
             &ExecuteOptions::default(),
             &vec![ExecuteStatementMetadata::default(); first_statements.len()],
-            None,
+            &parameter_route,
         )
         .await
         .unwrap();
@@ -4066,6 +4083,7 @@ mod tests {
             .await
             .expect_err("commit snapshot must observe the concurrent identity");
         assert_eq!(error.code, LixError::CODE_UNIQUE);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
         let rows = second
             .execute(
                 "SELECT value FROM concurrent_parameter_insert_probe WHERE id = 'shared'",

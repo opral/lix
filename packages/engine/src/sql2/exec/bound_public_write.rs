@@ -244,7 +244,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
     };
     drop(conflict_attribution_span);
     drop(committed);
-    stage_rows(ctx, TransactionWriteMode::Insert, write_rows)
+    ctx.stage_parameter_batch_insert(write_rows)
         .instrument(tracing::debug_span!(
             target: "lix_perf",
             "lix.perf.entity_insert_parameter_batch.stage_rows"
