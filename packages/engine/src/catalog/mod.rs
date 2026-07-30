@@ -11,4 +11,5 @@ pub(crate) use schema::{
 };
 pub(crate) use snapshot::{
     CatalogFingerprint, CatalogSnapshot, DefaultPlan, StateDeleteReferencePlan, TransactionCatalog,
+    TypedJsonObjectFieldRef, TypedJsonScalarRef,
 };

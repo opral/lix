@@ -409,6 +409,19 @@ pub(crate) struct CertifiedPluginRow {
     pub(crate) normalized: Option<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TypedJsonScalarRef<'a> {
+    Null,
+    Boolean,
+    String(&'a str),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TypedJsonObjectFieldRef<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) value: TypedJsonScalarRef<'a>,
+}
+
 impl SchemaPlan {
     pub(crate) fn fingerprint(&self) -> &SchemaPlanFingerprint {
         self.fingerprint.as_ref()
@@ -422,6 +435,114 @@ impl SchemaPlan {
         self.fast_object_validation
             .as_ref()
             .is_some_and(|plan| plan.accepts(value))
+    }
+
+    /// Certifies one already-typed object row without constructing or parsing
+    /// a JSON DOM.
+    ///
+    /// Typed producers can keep scalar columns in their native representation,
+    /// validate them against the same compiled schema plan, and serialize
+    /// canonical storage bytes only once.
+    pub(crate) fn certify_typed_object_row(
+        &self,
+        schema_key: &str,
+        fields: &[TypedJsonObjectFieldRef<'_>],
+        entity_pk: &[&str],
+    ) -> Result<(), LixError> {
+        if !self.accepts_canonical_certificate() {
+            return Err(LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "typed object certification requires a canonical schema plan",
+            ));
+        }
+        if schema_key != self.key.schema_key {
+            return Err(LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed snapshot schema '{schema_key}' does not match schema plan '{}'",
+                    self.key.schema_key
+                ),
+            ));
+        }
+        let validation = self
+            .fast_object_validation
+            .as_ref()
+            .expect("certificate eligibility requires fast object validation");
+        if fields.len() < validation.min_properties {
+            return Err(typed_object_validation_error(
+                &self.key.schema_key,
+                "object has fewer properties than minProperties",
+            ));
+        }
+        if let Some(required) = validation
+            .required
+            .iter()
+            .find(|required| !fields.iter().any(|field| field.name == required.as_str()))
+        {
+            return Err(typed_object_validation_error(
+                &self.key.schema_key,
+                &format!("required property '{required}' is missing"),
+            ));
+        }
+        for field in fields {
+            let accepted = validation
+                .properties
+                .get(field.name)
+                .map_or(validation.additional_properties, |property| {
+                    property.accepts_typed(field.value)
+                });
+            if !accepted {
+                return Err(typed_object_validation_error(
+                    &self.key.schema_key,
+                    &format!("property '{}' does not satisfy its schema", field.name),
+                ));
+            }
+        }
+
+        let primary_key_paths = self
+            .primary_key
+            .as_deref()
+            .expect("certificate eligibility requires a primary key");
+        if primary_key_paths.len() != entity_pk.len() {
+            return Err(typed_object_validation_error(
+                &self.key.schema_key,
+                "snapshot primary-key component count does not match the emitted entity_pk",
+            ));
+        }
+        for (path, expected) in primary_key_paths.iter().zip(entity_pk) {
+            let [name] = path.as_slice() else {
+                unreachable!("certificate eligibility requires top-level primary keys");
+            };
+            let actual =
+                fields
+                    .iter()
+                    .find(|field| field.name == name)
+                    .and_then(|field| match field.value {
+                        TypedJsonScalarRef::String(value) => Some(value),
+                        TypedJsonScalarRef::Null | TypedJsonScalarRef::Boolean => None,
+                    });
+            if actual != Some(*expected) {
+                return Err(typed_object_validation_error(
+                    &self.key.schema_key,
+                    &format!(
+                        "snapshot primary-key property '{name}' does not match the emitted entity_pk"
+                    ),
+                ));
+            }
+        }
+        let component_types = self
+            .primary_key_component_types
+            .as_deref()
+            .expect("certificate eligibility requires typed primary-key components");
+        EntityPk::validate_external_parts(entity_pk, component_types).map_err(|error| {
+            LixError::new(
+                LixError::CODE_SCHEMA_VALIDATION,
+                format!(
+                    "typed entity_pk is invalid for schema '{}': {error}",
+                    self.key.schema_key
+                ),
+            )
+        })
     }
 
     /// Parses, validates, and, only when necessary, canonicalizes one v2
@@ -836,6 +957,37 @@ impl FastValueValidation {
         }
     }
 
+    fn accepts_typed(&self, value: TypedJsonScalarRef<'_>) -> bool {
+        match (self, value) {
+            (Self::Types(types), TypedJsonScalarRef::Null) => {
+                types.accepts_canonical_kind(CanonicalJsonKind::Null)
+            }
+            (Self::Types(types), TypedJsonScalarRef::Boolean) => {
+                types.accepts_canonical_kind(CanonicalJsonKind::Boolean)
+            }
+            (Self::Types(types), TypedJsonScalarRef::String(_)) => {
+                types.accepts_canonical_kind(CanonicalJsonKind::String)
+            }
+            (Self::String(validation), TypedJsonScalarRef::String(value)) => {
+                validation.accepts(value)
+            }
+            (Self::StringOrNull(_), TypedJsonScalarRef::Null) => true,
+            (Self::StringOrNull(validation), TypedJsonScalarRef::String(value)) => {
+                validation.accepts(value)
+            }
+            (
+                Self::String(_) | Self::StringOrNull(_),
+                TypedJsonScalarRef::Boolean | TypedJsonScalarRef::Null,
+            )
+            | (
+                Self::Array(_) | Self::Object(_),
+                TypedJsonScalarRef::Null
+                | TypedJsonScalarRef::Boolean
+                | TypedJsonScalarRef::String(_),
+            ) => false,
+        }
+    }
+
     fn supports_canonical_streaming(&self) -> bool {
         match self {
             Self::Types(_) | Self::String(_) | Self::StringOrNull(_) => true,
@@ -846,6 +998,13 @@ impl FastValueValidation {
             Self::Object(validation) => validation.supports_canonical_streaming(),
         }
     }
+}
+
+fn typed_object_validation_error(schema_key: &str, message: &str) -> LixError {
+    LixError::new(
+        LixError::CODE_SCHEMA_VALIDATION,
+        format!("snapshot_content validation failed for schema '{schema_key}': {message}"),
+    )
 }
 
 fn fast_property_keyword(key: &str) -> bool {
@@ -2847,6 +3006,63 @@ mod tests {
             assert!(!plan.accepts_row_content_fast(&value));
             assert!(!plan.compiled_schema.is_valid(&value));
         }
+    }
+
+    #[test]
+    fn typed_object_certification_matches_compiled_scalar_constraints() {
+        let plan = SchemaPlan::compile(
+            SchemaCatalogKey {
+                schema_key: "typed_rows".to_string(),
+            },
+            json!({
+                "type": "object",
+                "properties": {
+                    "active": { "type": "boolean" },
+                    "id": { "type": "string", "minLength": 2 }
+                },
+                "required": ["active", "id"],
+                "additionalProperties": false,
+                "x-lix-key": "typed_rows",
+                "x-lix-primary-key": ["/id"]
+            }),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .expect("typed-row schema should compile");
+        assert!(plan.accepts_canonical_certificate());
+
+        let fields = [
+            TypedJsonObjectFieldRef {
+                name: "active",
+                value: TypedJsonScalarRef::Boolean,
+            },
+            TypedJsonObjectFieldRef {
+                name: "id",
+                value: TypedJsonScalarRef::String("row-1"),
+            },
+        ];
+        plan.certify_typed_object_row("typed_rows", &fields, &["row-1"])
+            .expect("matching typed row should certify");
+
+        let short_id = [
+            fields[0],
+            TypedJsonObjectFieldRef {
+                name: "id",
+                value: TypedJsonScalarRef::String("x"),
+            },
+        ];
+        assert!(
+            plan.certify_typed_object_row("typed_rows", &short_id, &["x"])
+                .is_err()
+        );
+        assert!(
+            plan.certify_typed_object_row("typed_rows", &fields, &["other"])
+                .is_err()
+        );
+        assert!(
+            plan.certify_typed_object_row("other", &fields, &["row-1"])
+                .is_err()
+        );
     }
 
     #[test]
