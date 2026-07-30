@@ -61,14 +61,14 @@ use crate::live_state::{
     overlay_load_exact_batch, overlay_scan_batch,
 };
 use crate::plugin::{
-    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256, PLUGIN_OWNER_KEY,
-    PLUGIN_REGISTRY_KEY, PluginActorCache, PluginActorColdInstall, PluginActorColdOpen,
-    PluginActorKey, PluginActorLease, PluginActorStore, PluginActorStorePermit,
-    PluginArchiveInstallPlan, PluginContentType, PluginFileOwner, PluginMaterialization,
-    PluginObservation, PluginRegistry, PluginRegistryEntry, PluginRegistryEntryInput,
-    PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition, ValidatedFileTransition,
-    ValidatedSameLengthOutputSplice, VecEntityChangeSource, VecEntityConflictSource,
-    VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
+    ArcByteSource, BoundCreateContext, CompiledPluginCatalog, FileBytesSha256,
+    LiveBatchEntitySource, PLUGIN_OWNER_KEY, PLUGIN_REGISTRY_KEY, PluginActorCache,
+    PluginActorColdInstall, PluginActorColdOpen, PluginActorKey, PluginActorLease,
+    PluginActorStore, PluginActorStorePermit, PluginArchiveInstallPlan, PluginContentType,
+    PluginFileOwner, PluginMaterialization, PluginObservation, PluginRegistry, PluginRegistryEntry,
+    PluginRegistryEntryInput, PluginRuntimeHost, V2SchemaAllowlist, ValidatedConflictTransition,
+    ValidatedFileTransition, ValidatedSameLengthOutputSplice, VecEntityChangeSource,
+    VecEntityConflictSource, VecEntitySource, build_file_update_splices, canonicalize_v2_snapshot,
     drain_conflict_transition_resolutions, drain_entity_transition_edits,
     drain_file_transition_changes, host_entity_change_with_lazy_snapshot,
     host_entity_with_lazy_snapshot, inferred_media_type_for_path, is_plugin_storage_path,
@@ -1347,6 +1347,7 @@ where
                 Err(error) => return Err(error),
             }
         };
+        let limits = WasmTransitionLimits::default();
         let rows = overlay_scan_batch(
             &base,
             &staged,
@@ -1363,10 +1364,9 @@ where
             },
         )
         .await?;
-        let limits = WasmTransitionLimits::default();
-        let entities =
-            v2_host_entities_from_live_batch(&rows, &file_key, plugin.schema_keys(), limits)?;
-        let entity_count = entities.len();
+        let entity_ordinals =
+            v2_host_entity_ordinals_from_live_batch(&rows, &file_key, plugin.schema_keys())?;
+        let entity_count = entity_ordinals.len();
         let mut actor = factory.instantiate_actor().await?;
         if let VisibleV2MaterializationBytes::Derived { path, .. } = &materialization.bytes
             && descriptor.path.as_deref() != Some(path.as_str())
@@ -1407,7 +1407,7 @@ where
                     )
                 })?
                 .into();
-                let source = VecEntitySource::new(entities, limits)?;
+                let source = LiveBatchEntitySource::new(rows, entity_ordinals, limits)?;
                 let transition = match actor
                     .open_entities(
                         limits,
@@ -1447,7 +1447,7 @@ where
             VisibleV2MaterializationBytes::Derived {
                 sha256, size_bytes, ..
             } => {
-                let source = VecEntitySource::new(entities, limits)?;
+                let source = LiveBatchEntitySource::new(rows, entity_ordinals, limits)?;
                 let transition = match actor
                     .open_entities(
                         limits,
@@ -6498,15 +6498,15 @@ fn v2_host_entities_from_live_batch_ordinals(
     Ok(entities)
 }
 
-fn v2_host_entities_from_live_batch(
+fn v2_host_entity_ordinals_from_live_batch(
     rows: &MaterializedLiveStateBatch,
     file_key: &PluginFileWriteKey,
     schema_keys: &[String],
-    limits: WasmTransitionLimits,
-) -> Result<Vec<WasmHostEntity>, LixError> {
-    let mut entities = rows
+) -> Result<Vec<u32>, LixError> {
+    let mut ordinals = rows
         .iter()
-        .filter(|row| {
+        .enumerate()
+        .filter(|(_, row)| {
             row.branch_id() == file_key.branch_id
                 && row.file_id() == Some(file_key.file_id.as_str())
                 && !row.global()
@@ -6516,30 +6516,33 @@ fn v2_host_entities_from_live_batch(
                     .binary_search_by(|schema_key| schema_key.as_str().cmp(row.schema_key()))
                     .is_ok()
         })
-        .map(|row| {
-            host_entity_with_lazy_snapshot(
-                WasmEntityKey::from_owned_parts(
-                    row.schema_key().to_owned(),
-                    row.entity_pk().clone().into_parts(),
-                ),
-                row.snapshot_content()
-                    .expect("filtered v2 row carries a live snapshot")
-                    .clone()
-                    .into_bytes(),
-                limits,
-            )
+        .map(|(ordinal, _)| {
+            u32::try_from(ordinal).map_err(|_| {
+                LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "durable plugin state exceeds u32 row ordinals",
+                )
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    entities.sort_by(|left, right| left.key.cmp(&right.key));
-    for pair in entities.windows(2) {
-        if pair[0].key == pair[1].key {
+    ordinals.sort_unstable_by(|left, right| {
+        let left = rows.row(*left as usize);
+        let right = rows.row(*right as usize);
+        left.schema_key()
+            .cmp(right.schema_key())
+            .then_with(|| left.entity_pk().cmp(right.entity_pk()))
+    });
+    for pair in ordinals.windows(2) {
+        let left = rows.row(pair[0] as usize);
+        let right = rows.row(pair[1] as usize);
+        if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
             return Err(LixError::new(
                 LixError::CODE_INTERNAL_ERROR,
                 "durable v2 entity hydration returned duplicate keys",
             ));
         }
     }
-    Ok(entities)
+    Ok(ordinals)
 }
 
 fn v2_host_changes_from_prepared_rows(

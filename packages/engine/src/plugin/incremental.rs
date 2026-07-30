@@ -18,6 +18,7 @@ use tracing::Instrument as _;
 use crate::catalog::{CatalogSnapshot, SchemaPlan, SchemaPlanFingerprint};
 use crate::common::{RequestBlobSpliceProvenance, SharedStr};
 use crate::entity_pk::EntityPk;
+use crate::live_state::MaterializedLiveStateBatch;
 use crate::wasm::{
     EDIT_SPLICE_METADATA_BYTES, PACKET_FORMAT_V1, WasmByteOutputsHandle, WasmByteSource,
     WasmCanonicalJson, WasmCanonicalJsonCertificate, WasmCertifiedEntityBatch,
@@ -1200,6 +1201,117 @@ impl WasmEntitySource for VecEntitySource {
                     .pop_front()
                     .expect("front entity was just inspected"),
             );
+        }
+        self.state.accept_page(page_bytes, page_refs)?;
+        Ok(Some(WasmEntityPage { entities }))
+    }
+}
+
+/// Page-lazy complete-entity source backed by the engine's columnar live-state
+/// batch. This keeps shared snapshot buffers in their storage-native owner and
+/// constructs generic Wasm entities only for the page currently crossing the
+/// component boundary.
+#[derive(Debug)]
+pub(crate) struct LiveBatchEntitySource {
+    rows: MaterializedLiveStateBatch,
+    ordinals: VecDeque<u32>,
+    pending: Option<WasmHostEntity>,
+    state: VecSourceState,
+}
+
+impl LiveBatchEntitySource {
+    pub(crate) fn new(
+        rows: MaterializedLiveStateBatch,
+        ordinals: Vec<u32>,
+        limits: WasmTransitionLimits,
+    ) -> Result<Self, LixError> {
+        for pair in ordinals.windows(2) {
+            let left = rows.row(pair[0] as usize);
+            let right = rows.row(pair[1] as usize);
+            if left.schema_key() == right.schema_key() && left.entity_pk() == right.entity_pk() {
+                return Err(LixError::new(
+                    LixError::CODE_INTERNAL_ERROR,
+                    "durable v2 entity hydration returned duplicate keys",
+                ));
+            }
+        }
+        Ok(Self {
+            rows,
+            ordinals: ordinals.into(),
+            pending: None,
+            state: VecSourceState::new(limits)?,
+        })
+    }
+
+    fn next_entity(&mut self) -> Result<Option<WasmHostEntity>, LixError> {
+        if let Some(entity) = self.pending.take() {
+            return Ok(Some(entity));
+        }
+        let Some(ordinal) = self.ordinals.pop_front() else {
+            return Ok(None);
+        };
+        let row = self.rows.get(ordinal as usize).ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin state selection references a row outside its batch owner",
+            )
+        })?;
+        let snapshot = row.snapshot_content().ok_or_else(|| {
+            LixError::new(
+                LixError::CODE_INTERNAL_ERROR,
+                "plugin state selection references a tombstoned row",
+            )
+        })?;
+        host_entity_with_lazy_snapshot(
+            crate::wasm::WasmEntityKey::from_owned_parts(
+                row.schema_key().to_owned(),
+                row.entity_pk().clone().into_parts(),
+            ),
+            snapshot.clone().into_bytes(),
+            self.state.limits,
+        )
+        .map(Some)
+    }
+}
+
+impl WasmEntitySource for LiveBatchEntitySource {
+    fn next_page(&mut self, max_bytes: u32) -> Result<Option<WasmEntityPage>, LixError> {
+        if self.state.reached_eof {
+            return Ok(None);
+        }
+        let page_limit = self.state.page_limit(max_bytes)?;
+        let mut page_bytes = 0_u64;
+        let mut page_refs = 0_u32;
+        let mut entities = Vec::new();
+        while let Some(entity) = self.next_entity()? {
+            let record_bytes = encoded_entity_record_bytes(&entity)?;
+            if record_bytes > u64::from(self.state.limits.max_record_bytes) {
+                return Err(invalid_input("v2 entity record exceeds max_record_bytes"));
+            }
+            let framed_bytes = record_bytes
+                .checked_add(4)
+                .ok_or_else(|| invalid_input("v2 entity frame length overflowed"))?;
+            if page_bytes
+                .checked_add(framed_bytes)
+                .is_none_or(|size| size > page_limit)
+            {
+                if entities.is_empty() {
+                    return Err(invalid_input(
+                        "v2 entity record does not fit the requested page",
+                    ));
+                }
+                self.pending = Some(entity);
+                break;
+            }
+            page_bytes += framed_bytes;
+            page_refs = page_refs
+                .checked_add(host_bytes_attachment_refs(&entity.snapshot_content))
+                .ok_or_else(|| invalid_input("v2 entity attachment count overflowed"))?;
+            entities.push(entity);
+        }
+        if entities.is_empty() {
+            self.state.reached_eof = true;
+            return Ok(None);
         }
         self.state.accept_page(page_bytes, page_refs)?;
         Ok(Some(WasmEntityPage { entities }))
