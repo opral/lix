@@ -195,8 +195,8 @@ async function runBrowserSmoke(browser, port, cspMode) {
 		assert.deepEqual(result, {
 			message: "production",
 			bundledPluginKeys: [
-				"plugin_csv_v2",
-				"plugin_markdown_incremental_v2",
+				"plugin_csv",
+				"plugin_markdown",
 			],
 		});
 		assert.deepEqual(browserErrors, []);

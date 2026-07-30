@@ -335,7 +335,7 @@ export function registerMemoryStorageContract({
 						bundledPluginArchives(),
 						"load bundled plugin archives",
 					);
-					const csv = archives.find((plugin) => plugin.key === "plugin_csv_v2");
+					const csv = archives.find((plugin) => plugin.key === "plugin_csv");
 					if (!csv) throw new Error("expected bundled CSV plugin");
 					await writeBytes(
 						lix,

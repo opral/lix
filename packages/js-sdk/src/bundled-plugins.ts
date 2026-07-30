@@ -6,12 +6,12 @@ export type BundledPluginArchive = {
 
 const BUNDLED_PLUGIN_MANIFEST = [
 	{
-		key: "plugin_markdown_incremental_v2",
-		fileName: "plugin_markdown_incremental_v2.lixplugin",
+		key: "plugin_markdown",
+		fileName: "plugin_markdown.lixplugin",
 	},
 	{
-		key: "plugin_csv_v2",
-		fileName: "plugin_csv_v2.lixplugin",
+		key: "plugin_csv",
+		fileName: "plugin_csv.lixplugin",
 	},
 ] as const;
 
