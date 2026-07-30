@@ -4031,6 +4031,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_batch_preserves_later_missing_branch_index() {
+        let session = open_session().await;
+        let schema = serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "x-lix-key": "parameter_insert_branch_probe",
+            "x-lix-primary-key": ["/id"],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "value": { "type": "string" }
+            },
+            "required": ["id", "value"],
+            "additionalProperties": false
+        });
+        session
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                &[Value::Text(schema.to_string())],
+            )
+            .await
+            .unwrap();
+        let active_branch_id = session
+            .execute("SELECT lix_active_branch_id() AS id", &[])
+            .await
+            .unwrap()
+            .rows()[0]
+            .get::<String>("id")
+            .unwrap();
+
+        let sql = "INSERT INTO parameter_insert_branch_probe_by_branch \
+                   (id, value, lixcol_branch_id) VALUES ($1, $2, $3)";
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("a".to_string()),
+                        Value::Text("value-a".to_string()),
+                        Value::Text(active_branch_id),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("value-b".to_string()),
+                        Value::Text("00000000-0000-7000-8000-000000000404".to_string()),
+                    ],
+                },
+            ])
+            .await
+            .expect_err("the second row's missing branch must retain its statement index");
+        assert_eq!(error.code, LixError::CODE_BRANCH_NOT_FOUND);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
+
+        let rows = session
+            .execute(
+                "SELECT id FROM parameter_insert_branch_probe WHERE id = 'a'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.is_empty(),
+            "the valid prefix must roll back with the missing-branch batch"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_batch_lowers_distinct_bound_entity_updates_once() {
         let session = open_session().await;
         let schema = serde_json::json!({

@@ -119,6 +119,13 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         None
     };
     let layout = InsertRowLayout::from_values(&spec, values)?;
+    if layout
+        .columns
+        .iter()
+        .any(|target| matches!(target, InsertColumnTarget::BranchId))
+    {
+        return Ok(None);
+    }
     let mut write_rows = RawWriteBatch::with_capacity(parameter_batch.num_rows());
     let mut unique_identities =
         std::collections::HashSet::with_capacity(parameter_batch.num_rows());
