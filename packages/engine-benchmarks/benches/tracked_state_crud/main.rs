@@ -18,7 +18,7 @@ mod storage;
 mod transaction_api;
 mod workload;
 
-use storage::{STORAGE_PROFILES, StorageProfile};
+use storage::{KV_STORAGE_PROFILES, STORAGE_PROFILES, StorageProfile};
 use workload::{REAL_WORKLOAD_ROWS, SMOKE_ROWS, WorkloadRow, fixture_rows, row_label};
 
 const READ_MANY_PK_COUNT: usize = 10;
@@ -28,41 +28,41 @@ fn tracked_state_crud_benches(c: &mut Criterion) {
         .enable_all()
         .build()
         .expect("create tokio runtime for tracked_state_crud benchmarks");
-    let rows = fixture_rows();
     if std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE").is_some() {
-        let row_count = profile_row_count(rows.len());
-        profile_operation(&runtime, &rows[..row_count]);
+        let rows = fixture_rows(profile_row_count());
+        profile_operation(&runtime, &rows);
         return;
     }
+    let rows = fixture_rows(REAL_WORKLOAD_ROWS);
     io_stats::maybe_print_io_report();
     accounting::maybe_print_accounting_report(&runtime, &rows[..SMOKE_ROWS]);
 
     for (label, row_count) in [("smoke", SMOKE_ROWS), ("real_workload", REAL_WORKLOAD_ROWS)] {
         bench_raw_sqlite(c, &rows[..row_count], label);
-        for profile in STORAGE_PROFILES {
+        for &profile in KV_STORAGE_PROFILES {
             bench_kv_layout(c, &runtime, profile, &rows[..row_count], label);
+        }
+        for &profile in STORAGE_PROFILES {
             bench_transaction_api(c, &runtime, profile, &rows[..row_count], label);
             bench_sql_session(c, &runtime, profile, &rows[..row_count], label);
         }
     }
 }
 
-/// Profile mode defaults to the representative 10k fixture, but supports a
-/// bounded prefix for scaling studies without changing the steady-state
-/// Criterion benchmark definitions.
-fn profile_row_count(max_rows: usize) -> usize {
+/// Profile mode defaults to the representative 10k fixture and extends it with
+/// deterministic ordered rows for explicit scaling studies without inflating
+/// the steady-state Criterion benchmark definitions.
+fn profile_row_count() -> usize {
     let Some(value) = std::env::var_os("LIX_TRACKED_STATE_CRUD_PROFILE_ROW_COUNT") else {
         return REAL_WORKLOAD_ROWS;
     };
     let value = value.to_string_lossy();
     let row_count = value.parse::<usize>().unwrap_or_else(|_| {
-        panic!(
-            "LIX_TRACKED_STATE_CRUD_PROFILE_ROW_COUNT must be an integer between 1 and {max_rows}, got '{value}'"
-        )
+        panic!("LIX_TRACKED_STATE_CRUD_PROFILE_ROW_COUNT must be a positive integer, got '{value}'")
     });
     assert!(
-        (1..=max_rows).contains(&row_count),
-        "LIX_TRACKED_STATE_CRUD_PROFILE_ROW_COUNT must be between 1 and {max_rows}, got {row_count}"
+        row_count > 0,
+        "LIX_TRACKED_STATE_CRUD_PROFILE_ROW_COUNT must be positive"
     );
     row_count
 }
@@ -328,8 +328,10 @@ fn profile_sql_session_storage() -> StorageProfile {
     match std::env::var("LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE").as_deref() {
         Ok("sqlite") => StorageProfile::SQLite,
         Ok("rocksdb") | Err(_) => StorageProfile::RocksDB,
+        #[cfg(feature = "slatedb")]
+        Ok("slatedb") => StorageProfile::SlateDB,
         Ok(other) => panic!(
-            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb or sqlite"
+            "unknown LIX_TRACKED_STATE_CRUD_PROFILE_STORAGE '{other}'; expected rocksdb, sqlite, or slatedb"
         ),
     }
 }

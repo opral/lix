@@ -12,12 +12,34 @@ pub(crate) struct WorkloadRow {
     pub(crate) updated_value_json: String,
 }
 
-pub(crate) fn fixture_rows() -> Vec<WorkloadRow> {
+pub(crate) fn fixture_rows(row_count: usize) -> Vec<WorkloadRow> {
+    assert!(row_count > 0, "tracked-state CRUD fixture cannot be empty");
     let json: JsonValue = serde_json::from_str(PNPM_LOCK_JSON).expect("parse pnpm-lock fixture");
     let mut rows = Vec::new();
     flatten_json("", &json, &mut rows);
     rows.sort_by(|left, right| left.path.cmp(&right.path));
     assert!(rows.len() >= REAL_WORKLOAD_ROWS);
+    if row_count <= rows.len() {
+        rows.truncate(row_count);
+        return rows;
+    }
+
+    rows.reserve(row_count - rows.len());
+    for ordinal in rows.len()..row_count {
+        let path = format!("/~lix-scale/{ordinal:09}");
+        let value_json = format!(r#"{{"ordinal":{ordinal},"lane":"scale"}}"#);
+        let updated_value_json =
+            format!(r#"{{"ordinal":{ordinal},"lane":"scale","updated":true}}"#);
+        rows.push(WorkloadRow {
+            path,
+            value_json,
+            updated_value_json,
+        });
+    }
+    // Synthetic rows intentionally extend the real fixture rather than
+    // replacing it. Restore physical-key order once so dense mutation profiles
+    // at 1M rows exercise the same ordered transaction path as the 10k case.
+    rows.sort_by(|left, right| left.path.cmp(&right.path));
     rows
 }
 
@@ -60,6 +82,7 @@ pub(crate) fn row_label(row_count: usize) -> &'static str {
     match row_count {
         SMOKE_ROWS => "1k",
         REAL_WORKLOAD_ROWS => "10k",
+        1_000_000 => "1m",
         _ => "custom",
     }
 }
