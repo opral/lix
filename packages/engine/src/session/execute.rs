@@ -3859,7 +3859,7 @@ mod tests {
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
-                "value": { "type": "string" }
+                "value": { "type": "string", "minLength": 3 }
             },
             "required": ["id", "value"],
             "additionalProperties": false
@@ -3951,6 +3951,25 @@ mod tests {
             rows.is_empty(),
             "the fresh prefix must roll back with the conflicting batch"
         );
+
+        let error = session
+            .execute_batch(&[
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![
+                        Value::Text("b".to_string()),
+                        Value::Text("duplicate-b".to_string()),
+                    ],
+                },
+                ExecuteBatchStatement {
+                    sql: sql.to_string(),
+                    params: vec![Value::Text("d".to_string()), Value::Text("x".to_string())],
+                },
+            ])
+            .await
+            .expect_err("the later normalization error must precede the committed conflict");
+        assert_eq!(error.code, LixError::CODE_SCHEMA_VALIDATION);
+        assert_eq!(error.details.unwrap()["statementIndex"], 1);
     }
 
     #[tokio::test]

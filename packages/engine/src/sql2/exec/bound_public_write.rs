@@ -170,7 +170,9 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
         write_rows.append_taken_row(&mut row, 0);
     }
     let committed = scan_entity_conflict_candidates(ctx, &spec, &write_rows).await?;
-    if !committed.is_empty() {
+    let committed_conflict = if committed.is_empty() {
+        None
+    } else {
         let committed_identities = committed
             .iter()
             .map(|row| {
@@ -185,6 +187,7 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
                 )
             })
             .collect::<std::collections::HashMap<_, _>>();
+        let mut conflict = None;
         for (row_index, row) in write_rows.iter().enumerate() {
             let entity_pk = row
                 .entity_pk
@@ -227,21 +230,24 @@ pub(crate) async fn try_execute_entity_insert_parameter_batch(
                     ),
                 )
             };
-            return Err(with_parameter_batch_statement_index(error, row_index));
+            conflict = Some(with_parameter_batch_statement_index(error, row_index));
+            break;
         }
+        conflict
+    };
+    stage_rows(ctx, TransactionWriteMode::Insert, write_rows).await?;
+    if let Some(error) = committed_conflict {
+        return Err(error);
     }
-    stage_rows(ctx, TransactionWriteMode::Insert, write_rows)
-        .await
-        .map(|_| {
-            #[cfg(test)]
-            CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
-                executions.set(executions.get().saturating_add(1));
-            });
-            (0..parameter_batch.num_rows())
-                .map(|_| SqlWriteResult::affected(1))
-                .collect()
-        })
-        .map(Some)
+    #[cfg(test)]
+    CERTIFIED_ENTITY_INSERT_PARAMETER_BATCH_EXECUTIONS.with(|executions| {
+        executions.set(executions.get().saturating_add(1));
+    });
+    Ok(Some(
+        (0..parameter_batch.num_rows())
+            .map(|_| SqlWriteResult::affected(1))
+            .collect(),
+    ))
 }
 
 /// Executes a certified run of independent point updates as one physical
