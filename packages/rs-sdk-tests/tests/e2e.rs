@@ -1274,7 +1274,6 @@ async fn v2_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
 }
 
 #[tokio::test]
-#[ignore = "blocked by inherited certified-row FK validation on non-active branches"]
 async fn v3_markdown_same_paragraph_branch_merge_composes_word_edge_inserts() {
     let lix = open_lix(OpenLixOptions::default()).await.unwrap();
     install_reference_plugin_in_blank_registry(
