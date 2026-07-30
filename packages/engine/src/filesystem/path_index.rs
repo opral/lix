@@ -1321,6 +1321,68 @@ impl FilesystemPathIndexCache {
             entries.remove(0);
         }
     }
+
+    /// Advances cached views whose revision can be mapped to a successor.
+    ///
+    /// Transaction-local path indexes use a composite revision that changes
+    /// after every staged descriptor batch. Applying that batch directly
+    /// avoids rebuilding the complete visible filesystem for the next
+    /// statement in the same transaction.
+    pub(crate) fn advance_revisions(
+        &self,
+        rows: &[MaterializedLiveStateRow],
+        next_revision_for: impl Fn(&[u8]) -> Option<Vec<u8>>,
+    ) {
+        let invalidates_delta = rows.iter().any(|row| row.global || row.untracked);
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("filesystem path cache lock poisoned");
+        let mut advanced = Vec::new();
+        entries.retain(|candidate| {
+            let Some(previous_revision) = candidate.key.revision.as_deref() else {
+                return true;
+            };
+            let Some(next_revision) = next_revision_for(previous_revision) else {
+                return true;
+            };
+            if invalidates_delta || candidate.key.branch_ids.len() != 1 {
+                return false;
+            }
+            let request = FilesystemPathIndexRequest::new(candidate.key.branch_ids.clone())
+                .with_blob_refs(candidate.key.include_blob_refs)
+                .with_cached_blob_data(candidate.key.cache_small_blob_data);
+            if let Ok(index) =
+                candidate
+                    .index
+                    .apply_committed_rows(&request, rows, Some(next_revision.as_slice()))
+            {
+                advanced.push((request, next_revision, Arc::new(index)));
+            }
+            false
+        });
+        for (request, revision, index) in advanced {
+            let key = CacheKey {
+                branch_ids: request.branch_ids,
+                revision: Some(revision),
+                include_blob_refs: request.include_blob_refs,
+                cache_small_blob_data: request.cache_small_blob_data,
+            };
+            let bytes = size_of::<CachedIndex>()
+                + key.estimated_heap_bytes()
+                + index.estimated_heap_bytes();
+            entries.push(CachedIndex { key, index, bytes });
+        }
+        while entries.len() > 1
+            && entries
+                .iter()
+                .map(|candidate| candidate.bytes)
+                .sum::<usize>()
+                > MAX_CACHE_BYTES
+        {
+            entries.remove(0);
+        }
+    }
 }
 
 pub(crate) async fn load_path_index_revision(
