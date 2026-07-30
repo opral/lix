@@ -145,6 +145,21 @@ impl Root<'_> {
             .get_state(key)
             .map_err(|error| Error::invalid_input(format!("host state read failed: {error:?}")))
     }
+
+    pub fn state_len(&self, key: &[u8]) -> Option<u64> {
+        self.inner.state_len(key)
+    }
+
+    pub fn read_state_range(
+        &self,
+        key: &[u8],
+        offset: u64,
+        length: u32,
+    ) -> Result<Option<Vec<u8>>> {
+        self.inner.read_state(key, offset, length).map_err(|error| {
+            Error::invalid_input(format!("host state range read failed: {error:?}"))
+        })
+    }
 }
 
 pub struct Transaction {

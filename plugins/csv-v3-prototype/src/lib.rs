@@ -12,18 +12,23 @@ use serde_json::Value;
 
 struct CsvV3Prototype;
 
+const CERTIFIED_CSV_PAGE_BYTES: usize = 256 * 1024;
+const CSV_INDEX_KEY: &[u8] = b"csv/index-v1";
+const CSV_INDEX_HEADER_BYTES: u32 = 36;
+
 impl sdk::FormatPlugin for CsvV3Prototype {
     fn open_file(input: &sdk::OpenFile<'_>, sink: &mut sdk::Sink<'_>) -> sdk::Result<()> {
         let bytes = input.accepted.read_all()?;
         let mut import = ColdInitialImport::open(bytes, input.file.path.as_deref())
             .map_err(sdk::Error::invalid_input)?;
         let state = import.arena_state(input.creates.namespace_bytes());
-        input.successor.put_state(b"csv/index-v1", &state)?;
+        input.successor.put_state(CSV_INDEX_KEY, &state)?;
         let mut encoder = BatchEncoder::new(sink.max_batch_bytes());
         encoder.push(import.table_change(), input.creates, sink)?;
         encoder.flush(sink)?;
+        let page_bytes = (sink.max_batch_bytes() as usize).min(CERTIFIED_CSV_PAGE_BYTES);
         while let Some((payload, row_count)) = import
-            .next_typed_batch(sink.max_batch_bytes() as usize)
+            .next_typed_batch(page_bytes)
             .map_err(sdk::Error::invalid_input)?
         {
             sink.emit_csv_rows(row_count, payload)?;
@@ -55,13 +60,31 @@ impl sdk::FormatPlugin for CsvV3Prototype {
                 "arena CSV prototype currently requires a length-preserving edit",
             ));
         }
-        let state = update
+        let state_len = update
             .before
-            .get_state(b"csv/index-v1")?
+            .state_len(CSV_INDEX_KEY)
             .ok_or_else(|| sdk::Error::invalid_input("CSV arena root has no row index"))?;
-        let index = ArenaRowIndex::decode(&state).map_err(sdk::Error::invalid_input)?;
+        let header = update
+            .before
+            .read_state_range(CSV_INDEX_KEY, 0, CSV_INDEX_HEADER_BYTES)?
+            .ok_or_else(|| sdk::Error::invalid_input("CSV arena root has no row index"))?;
+        let index =
+            ArenaRowIndex::decode_header(&header, state_len).map_err(sdk::Error::invalid_input)?;
         let (ordinal, row_start, row_end) = index
-            .row_range_for_edit(edit.offset, edit.delete_len)
+            .row_range_for_edit_reader(edit.offset, edit.delete_len, |ordinal| {
+                let offset = u64::from(CSV_INDEX_HEADER_BYTES)
+                    .checked_add(u64::from(ordinal) * 4)
+                    .ok_or_else(|| "CSV arena row-index offset overflowed".to_owned())?;
+                let bytes = update
+                    .before
+                    .read_state_range(CSV_INDEX_KEY, offset, 4)
+                    .map_err(|error| format!("CSV arena row-index read failed: {error:?}"))?
+                    .ok_or_else(|| "CSV arena row index disappeared".to_owned())?;
+                let bytes: [u8; 4] = bytes
+                    .try_into()
+                    .map_err(|_| "CSV arena row-index read was truncated".to_owned())?;
+                Ok(u32::from_le_bytes(bytes))
+            })
             .map_err(sdk::Error::invalid_input)?;
         let mut row = update.before.read_range(row_start, row_end - row_start)?;
         let local_start = usize::try_from(edit.offset - row_start)

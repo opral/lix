@@ -488,6 +488,17 @@ impl MapArena {
             .transpose()
     }
 
+    pub fn value_len(&self, key: &[u8]) -> Option<u64> {
+        self.entries.get(key).map(ByteArena::len)
+    }
+
+    pub fn read(&self, key: &[u8], offset: u64, length: u64) -> Result<Option<Vec<u8>>, Error> {
+        self.entries
+            .get(key)
+            .map(|value| value.read(offset, length))
+            .transpose()
+    }
+
     pub fn value_id(&self, key: &[u8]) -> Option<Digest> {
         self.entries.get(key).map(ByteArena::id)
     }

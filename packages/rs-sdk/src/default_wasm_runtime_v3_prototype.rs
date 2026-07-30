@@ -295,6 +295,56 @@ impl bindings::lix::plugin::host::HostRoot for WasiHostState {
         Ok(value)
     }
 
+    fn state_len(&mut self, resource: Resource<RootResource>, key: Vec<u8>) -> Option<u64> {
+        let (root, state) = {
+            let resource = self
+                .table
+                .get(&resource)
+                .expect("v3 root resource must be live");
+            (resource.root.clone(), resource.state.clone())
+        };
+        let length = root.state.value_len(&key);
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        state.counters.component_boundary_bytes = state
+            .counters
+            .component_boundary_bytes
+            .saturating_add(key.len() as u64);
+        length
+    }
+
+    fn read_state(
+        &mut self,
+        resource: Resource<RootResource>,
+        key: Vec<u8>,
+        offset: u64,
+        length: u32,
+    ) -> Result<Option<Vec<u8>>, bindings::lix::plugin::host::HostError> {
+        let (root, state) = {
+            let resource = self.table.get(&resource).map_err(host_table_error)?;
+            (resource.root.clone(), resource.state.clone())
+        };
+        let value = root
+            .state
+            .read(&key, offset, u64::from(length))
+            .map_err(|error| bindings::lix::plugin::host::HostError::Rejected(error.to_string()))?;
+        let mut state = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.charge_source(key.len().saturating_add(value.as_ref().map_or(0, Vec::len)))?;
+        state.counters.component_import_calls =
+            state.counters.component_import_calls.saturating_add(1);
+        state.counters.source_read_calls = state.counters.source_read_calls.saturating_add(1);
+        state.counters.source_bytes_read = state
+            .counters
+            .source_bytes_read
+            .saturating_add(value.as_ref().map_or(0, |bytes| bytes.len()) as u64);
+        Ok(value)
+    }
+
     fn drop(&mut self, resource: Resource<RootResource>) -> wasmtime::Result<()> {
         self.table.delete(resource)?;
         Ok(())

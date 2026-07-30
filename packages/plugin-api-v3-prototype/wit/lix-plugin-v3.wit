@@ -17,6 +17,8 @@ interface host {
     read-file: func(offset: u64, length: u32) -> result<bytes, host-error>;
     get-entity: func(key: bytes) -> result<option<bytes>, host-error>;
     get-state: func(key: bytes) -> result<option<bytes>, host-error>;
+    state-len: func(key: bytes) -> option<u64>;
+    read-state: func(key: bytes, offset: u64, length: u32) -> result<option<bytes>, host-error>;
   }
 
   /// A host-staged copy-on-write successor. File splices are installed before

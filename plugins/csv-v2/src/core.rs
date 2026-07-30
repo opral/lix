@@ -2842,6 +2842,7 @@ pub struct ArenaRowIndex {
     namespace: [u8; 12],
     file_len: u64,
     dialect: Dialect,
+    row_count: u32,
     starts: Vec<u32>,
 }
 
@@ -2904,7 +2905,54 @@ impl ArenaRowIndex {
                 quote,
                 terminator,
             },
+            row_count: u32::try_from(row_count).expect("decoded CSV row count came from u32"),
             starts,
+        })
+    }
+
+    pub fn decode_header(bytes: &[u8], state_len: u64) -> Result<Self, String> {
+        const HEADER_BYTES: usize = 36;
+        if bytes.len() != HEADER_BYTES || &bytes[..8] != b"LIXCSV3\0" {
+            return Err("CSV arena state has an invalid header".to_owned());
+        }
+        let namespace = bytes[8..20]
+            .try_into()
+            .expect("validated CSV arena namespace");
+        let file_len = u64::from_le_bytes(
+            bytes[20..28]
+                .try_into()
+                .expect("validated CSV arena file length"),
+        );
+        let delimiter = bytes[28];
+        let quote = (bytes[29] != 0).then_some(bytes[29]);
+        let terminator = match bytes[30] {
+            1 => Terminator::Lf,
+            2 => Terminator::CrLf,
+            3 => Terminator::Cr,
+            _ => return Err("CSV arena state has an invalid terminator".to_owned()),
+        };
+        let row_count = u32::from_le_bytes(
+            bytes[32..36]
+                .try_into()
+                .expect("validated CSV arena row count"),
+        );
+        let expected = u64::try_from(HEADER_BYTES)
+            .expect("header size fits u64")
+            .checked_add(u64::from(row_count).saturating_mul(4))
+            .ok_or_else(|| "CSV arena state size overflowed".to_owned())?;
+        if state_len != expected || row_count == 0 {
+            return Err("CSV arena state row index is truncated".to_owned());
+        }
+        Ok(Self {
+            namespace,
+            file_len,
+            dialect: Dialect {
+                delimiter,
+                quote,
+                terminator,
+            },
+            row_count,
+            starts: Vec::new(),
         })
     }
 
@@ -2940,6 +2988,43 @@ impl ArenaRowIndex {
         ))
     }
 
+    pub fn row_range_for_edit_reader(
+        &self,
+        offset: u64,
+        delete_len: u64,
+        mut read_start: impl FnMut(u32) -> Result<u32, String>,
+    ) -> Result<(u32, u64, u64), String> {
+        let delete_end = offset
+            .checked_add(delete_len)
+            .ok_or_else(|| "CSV arena edit range overflowed".to_owned())?;
+        if delete_end > self.file_len || self.row_count == 0 {
+            return Err("CSV arena edit exceeds the accepted file".to_owned());
+        }
+        let offset_u32 =
+            u32::try_from(offset).map_err(|_| "CSV arena edit offset exceeds u32".to_owned())?;
+        let mut low = 0_u32;
+        let mut high = self.row_count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if read_start(middle)? <= offset_u32 {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        let ordinal = low.saturating_sub(1);
+        let start = read_start(ordinal)?;
+        let end = if ordinal + 1 < self.row_count {
+            u64::from(read_start(ordinal + 1)?)
+        } else {
+            self.file_len
+        };
+        if u64::from(start) > offset || u64::from(start) >= end || delete_end > end {
+            return Err("CSV arena edit crosses a row boundary".to_owned());
+        }
+        Ok((ordinal, u64::from(start), end))
+    }
+
     pub fn row_change(&self, ordinal: u32, row_bytes: Vec<u8>) -> Result<EntityChange, String> {
         let mut rows = scan_rows(&row_bytes, 0, row_bytes.len(), self.dialect)?;
         if rows.len() != 1 {
@@ -2947,7 +3032,7 @@ impl ArenaRowIndex {
         }
         let mut row = rows.remove(0);
         row.id_slot = Some(ordinal);
-        let denominator = u128::try_from(self.starts.len() + 1).expect("usize fits u128");
+        let denominator = u128::from(self.row_count) + 1;
         let numerator = u128::from(ordinal + 1) * u128::from(u64::MAX);
         row.order_rank = Some(u64::try_from(numerator / denominator).expect("rank fits u64") | 1);
         let mut next_key = 0;
