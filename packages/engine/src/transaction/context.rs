@@ -1066,10 +1066,30 @@ where
             | TransactionWrite::RowsWithFileData { rows, .. } => rows,
         };
         let staged = self.staged_writes.staging_overlay()?;
+        let mut first_checked_scope = None;
+        let mut additional_checked_scopes = None;
         for row in rows.iter() {
             if row.schema_key.as_str()
                 == crate::collection_generation::COLLECTION_GENERATION_SCHEMA_KEY
             {
+                continue;
+            }
+            let scope = (
+                row.branch_id.as_str(),
+                row.schema_key.as_str(),
+                row.file_id.map(SharedStr::as_str),
+            );
+            let already_checked = match first_checked_scope {
+                None => {
+                    first_checked_scope = Some(scope);
+                    false
+                }
+                Some(first) if first == scope => true,
+                Some(first) => !additional_checked_scopes
+                    .get_or_insert_with(|| std::collections::HashSet::from([first]))
+                    .insert(scope),
+            };
+            if already_checked {
                 continue;
             }
             if StagedLiveStateRows::collection_replaced(
