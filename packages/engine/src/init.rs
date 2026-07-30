@@ -39,13 +39,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 /// Repository-wide compatibility gate for physical storage protocols.
 ///
-/// V23 replaces the per-row file projection with conservative schema-level
-/// membership markers. Opening an older store must fail closed because the
-/// physical space ID remains stable and V22 stores do not contain markers.
+/// V24 compresses packed commit-delta sidecars under the existing manifest
+/// and segment space IDs. Opening an older store must fail closed before its
+/// differently framed LXCD5 values are decoded as the current layout.
 pub(crate) const REPOSITORY_PROTOCOL_SPACE: StorageSpace =
     StorageSpace::new(StorageSpaceId(0x0004_0011), "repository.protocol.v1");
 pub(crate) const REPOSITORY_PROTOCOL_KEY: &[u8] = b"current";
-const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"schema-file-membership.v23";
+const REPOSITORY_PROTOCOL_VALUE: &[u8] = b"commit-delta-sidecar-zstd.v24";
 
 /// Raw status of the repository protocol marker. Engine opening consults this
 /// before it touches any tracked-head space, whose physical IDs deliberately
