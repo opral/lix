@@ -19,7 +19,7 @@ use crate::{
 };
 
 pub const PACKET_FORMAT_V1: u16 = 1;
-pub const WASM_COMPONENT_API_VERSION: &str = "3.0.0";
+pub const WASM_COMPONENT_API_VERSION: &str = "4.0.0";
 /// Canonical ABI page charge for one renderer splice before inline insert
 /// bytes. Both inline and output-backed edits pay this fixed metadata cost.
 pub const EDIT_SPLICE_METADATA_BYTES: u64 = 24;
@@ -2262,7 +2262,7 @@ mod tests {
     #[test]
     fn production_wit_is_versioned_and_fused() {
         let wit = include_str!("../../../plugin-api/wit/lix-plugin.wit");
-        assert!(wit.starts_with("package lix:plugin@3.0.0;"));
+        assert!(wit.starts_with("package lix:plugin@4.0.0;"));
         assert!(wit.contains("resource transition"));
         assert!(wit.contains("apply:"));
         assert!(wit.contains("entities-changed:"));

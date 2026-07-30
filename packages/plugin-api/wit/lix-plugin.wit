@@ -1,4 +1,4 @@
-package lix:plugin@3.0.0;
+package lix:plugin@4.0.0;
 
 interface host {
   type bytes = list<u8>;

@@ -1,7 +1,7 @@
 {
   "key": "plugin_csv",
   "runtime": "wasm-component",
-  "api_version": "3.0.0",
+  "api_version": "4.0.0",
   "materialization": "blob",
   "match": {
     "path_glob": "*.{csv,tsv}",

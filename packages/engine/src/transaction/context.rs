@@ -3773,6 +3773,7 @@ where
                         }
                     };
                     if cold_successor_candidate {
+                        let cold_limits = cold_successor_transition_limits(submitted_bytes.len());
                         let cold_open_guard = cache.cold_open_guard().await;
                         let visible_materialization = self
                         .visible_materialization(&file_key)
@@ -3842,7 +3843,7 @@ where
                                             Some(FileBytesSha256::compute(&before_bytes)),
                                             write.data(),
                                             write.splice_provenance(),
-                                            limits,
+                                            cold_limits,
                                         )
                                     })?;
                                     let same_length_blob_splice = built_splices
@@ -3909,8 +3910,11 @@ where
                                 selected.schema_keys(),
                             )?;
                             let entity_count = entity_ordinals.len();
-                            let entity_source =
-                                LiveBatchEntitySource::new(entity_rows, entity_ordinals, limits)?;
+                            let entity_source = LiveBatchEntitySource::new(
+                                entity_rows,
+                                entity_ordinals,
+                                cold_limits,
+                            )?;
                             drop(base);
                             drop(read);
                             let store_permit = loop {
@@ -3944,7 +3948,7 @@ where
                                 .await?;
                             let transition = match actor
                                 .cold_file_changed(
-                                    limits,
+                                    cold_limits,
                                     WasmColdFileUpdate {
                                         before_descriptor: v2_file_descriptor_from_actor_key(
                                             &actor_key,
@@ -3975,7 +3979,7 @@ where
                                 actor.as_mut(),
                                 transition,
                                 &schemas,
-                                limits,
+                                cold_limits,
                             )
                             .instrument(tracing::debug_span!(
                                 target: "lix_perf",
@@ -8998,6 +9002,10 @@ fn retain_large_import_actor(plugin: &PluginRegistryEntry) -> bool {
     true
 }
 
+fn cold_successor_transition_limits(file_bytes: usize) -> WasmTransitionLimits {
+    WasmTransitionLimits::for_cold_file_bytes(u64::try_from(file_bytes).unwrap_or(u64::MAX))
+}
+
 fn duplicate_plugin_lifecycle_mutation() -> LixError {
     LixError::new(
         LixError::CODE_CONSTRAINT_VIOLATION,
@@ -9270,6 +9278,21 @@ mod tests {
     }
 
     const SCHEMA_FIXTURE_COMMIT_ID: &str = "01920000-0000-7000-8000-0000000000f1";
+
+    #[test]
+    fn cold_successor_deadline_scales_with_submitted_file_size() {
+        let file_bytes = 10 * 1024 * 1024;
+        let limits = cold_successor_transition_limits(file_bytes);
+
+        assert_eq!(
+            limits,
+            WasmTransitionLimits::for_cold_file_bytes(file_bytes as u64)
+        );
+        assert!(
+            limits.total_deadline_nanoseconds
+                > WasmTransitionLimits::default().total_deadline_nanoseconds
+        );
+    }
 
     #[test]
     fn prospective_overlay_keeps_ten_thousand_rows_in_one_dictionary_batch() {
@@ -9885,13 +9908,13 @@ mod tests {
         PluginRegistryEntry::new(PluginRegistryEntryInput {
             key: "plugin_csv".to_string(),
             runtime: crate::plugin::PluginRuntime::WasmComponent,
-            api_version: "3.0.0".to_string(),
+            api_version: "4.0.0".to_string(),
             path_glob: "*.csv".to_string(),
             content_type: Some(PluginContentType::Text),
             entry: "plugin.wasm".to_string(),
             schema_keys: vec!["csv_row".to_string()],
             create_schema_keys: vec!["csv_row".to_string()],
-            manifest_json: r#"{"api_version":"3.0.0","entry":"plugin.wasm","key":"plugin_csv","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}"#.to_string(),
+            manifest_json: r#"{"api_version":"4.0.0","entry":"plugin.wasm","key":"plugin_csv","match":{"content_type":"text","path_glob":"*.csv"},"materialization":"blob","runtime":"wasm-component","schemas":["schema/csv_row.json"]}"#.to_string(),
             archive_file_id: crate::plugin::plugin_storage_archive_file_id("plugin_csv"),
             archive_path: "/.lix/plugins/plugin_csv.lixplugin".to_string(),
             archive_blob_hash: hash.clone(),
